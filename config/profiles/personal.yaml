@@ -1,0 +1,15 @@
+# Personal Mode Profile
+# 個人利用向け - キャラクター会話＆音声機能フル有効
+
+# プロファイル説明
+name: personal
+description: 個人利用向けの全機能有効プロファイル
+
+# Feature Flags
+features:
+  voice_input: true       # マイク入力（音声認識）
+  tts_output: true        # 音声読み上げ（TTS）
+  discord_bot: true       # Discord Bot機能
+  crawler_status: true    # クローラーステータス監視
+  entertainment: true     # Spotify/YouTube/ニコニコ等
+  code_agent: false       # コード保守エージェント

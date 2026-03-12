@@ -1,0 +1,15 @@
+# Enterprise Mode Profile
+# 企業利用向け - コード保守＆エージェント機能に特化
+
+# プロファイル説明
+name: enterprise
+description: 企業利用向けのコード保守特化プロファイル
+
+# Feature Flags
+features:
+  voice_input: false      # マイク入力（無効）
+  tts_output: false       # 音声読み上げ（無効）
+  discord_bot: false      # Discord Bot（無効）
+  crawler_status: false   # クローラーステータス監視（無効）
+  entertainment: false    # Spotify/YouTube等（無効）
+  code_agent: true        # コード保守エージェント（有効）

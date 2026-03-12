@@ -1,0 +1,300 @@
+default_character: ずんだもん
+llm_model: gemini-3-flash-preview
+llm_provider: gemini-cli
+mode: terminal
+sglang:
+  auto_start: true
+  model: default
+  port: 30000
+  host: 0.0.0.0
+  mem_fraction_static: 0.9
+  tensor_parallel_size: 1
+  max_model_len: null
+  dtype: auto
+  startup_timeout: 300
+mode_switch:
+  restart_delay_seconds: 3
+  allowed_discord_user_ids: []
+device_index: 0
+external_llm:
+  auto_approve: true
+  tools:
+  - web_search
+  - grok_x_search
+memory:
+  enabled: true
+  enable_history_logging: true
+  enable_search: false
+  auto_cleanup_enabled: true
+  embedding_model: all-MiniLM-L6-v2
+  exclude_patterns: []
+  history_batch_size: 100
+  history_retention_days: 180
+  log_retention_days: 365
+  max_active_messages: 10
+  max_context_tokens: 8000
+  max_search_results: 5
+  max_summary_retries: 3
+  preload_embedding_model: false
+  save_assistant_messages: true
+  save_function_calls: true
+  save_successful_only: false
+  save_system_messages: false
+  save_user_messages: true
+  search_timeout: 3.0
+  similarity_threshold: 0.3
+  summary_max_tokens: 500
+  summary_overlap: 2
+discord:
+  default_mode: text
+  max_history_length: 20
+  memory_prefill_message_count: 12
+  session:
+    cleanup_interval: 300
+    inactive_timeout: 3600
+  sync_commands: false
+  vision_model: gemini-3-flash-preview
+  voice:
+    auto_disconnect_timeout: 300
+    channels: 2
+    sample_rate: 48000
+keyword_detection:
+  enabled: true
+  llm_model: gpt-5-mini
+  speech_rate:
+    confidence_threshold: 0.7
+    enabled: true
+    fallback_to_regex: true
+    use_llm_extraction: true
+  spotify:
+    auto_queue:
+      exclude_hours: 2.0
+      exclude_window_size: 20
+    confidence_threshold: 0.7
+    enabled: true
+    fallback_to_regex: true
+    use_llm_extraction: true
+skills:
+  enabled: true
+  directory: config/skills
+heartbeat:
+  enabled: true
+  directory: config/heartbeats
+  default_interval_minutes: 30
+mcp_enabled: true
+mcp:
+  servers:
+    clickup:
+      windows:
+        command: "venv\\Scripts\\python.exe"
+        args: ["scripts/clickup_mcp_server.py"]
+      linux:
+        command: "venv/bin/python"
+        args: ["scripts/clickup_mcp_server.py"]
+      env:
+        CLICKUP_API_KEY: "${CLICKUP_API_KEY}"
+        CLICKUP_TEAM_ID: "${CLICKUP_TEAM_ID}"
+        CLICKUP_DEFAULT_LIST_ID: "${CLICKUP_DEFAULT_LIST_ID}"
+        CLICKUP_TARGET_FOLDER_IDS: "${CLICKUP_TARGET_FOLDER_IDS}"
+        POSTGRES_HOST: "${POSTGRES_HOST}"
+        POSTGRES_PORT: "${POSTGRES_PORT}"
+        POSTGRES_DB: "${POSTGRES_DB}"
+        POSTGRES_USER: "${POSTGRES_USER}"
+        POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+    utility:
+      windows:
+        command: "venv\\Scripts\\python.exe"
+        args: ["scripts/utility_mcp_server.py"]
+      linux:
+        command: "venv/bin/python"
+        args: ["scripts/utility_mcp_server.py"]
+      env:
+        OPENWEATHER_API_KEY: "${OPENWEATHER_API_KEY}"
+    web_search:
+      windows:
+        command: "venv\\Scripts\\python.exe"
+        args: ["scripts/web_search_mcp_server.py"]
+      linux:
+        command: "venv/bin/python"
+        args: ["scripts/web_search_mcp_server.py"]
+      env:
+        OPENAI_API_KEY: "${OPENAI_API_KEY}"
+        XAI_API_KEY: "${XAI_API_KEY}"
+    x_search:
+      windows:
+        command: "venv\\Scripts\\python.exe"
+        args: ["scripts/x_search_mcp_server.py"]
+      linux:
+        command: "venv/bin/python"
+        args: ["scripts/x_search_mcp_server.py"]
+      env:
+        XAI_API_KEY: "${XAI_API_KEY}"
+    workspace:
+      windows:
+        command: "venv\\Scripts\\python.exe"
+        args: ["scripts/workspace_mcp_server.py"]
+      linux:
+        command: "venv/bin/python"
+        args: ["scripts/workspace_mcp_server.py"]
+      env:
+        AOITALK_WORKSPACES_DIR: "${AOITALK_WORKSPACES_DIR}"
+    memory_rag:
+      windows:
+        command: "venv\\Scripts\\python.exe"
+        args: ["scripts/memory_rag_mcp_server.py"]
+      linux:
+        command: "venv/bin/python"
+        args: ["scripts/memory_rag_mcp_server.py"]
+      env:
+        POSTGRES_HOST: "${POSTGRES_HOST}"
+        POSTGRES_PORT: "${POSTGRES_PORT}"
+        POSTGRES_DB: "${POSTGRES_DB}"
+        POSTGRES_USER: "${POSTGRES_USER}"
+        POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+    os_operations:
+      windows:
+        command: "venv\\Scripts\\python.exe"
+        args: ["scripts/os_operations_mcp_server.py"]
+      linux:
+        command: "venv/bin/python"
+        args: ["scripts/os_operations_mcp_server.py"]
+      env:
+        AOITALK_WORKSPACES_DIR: "${AOITALK_WORKSPACES_DIR}"
+    media:
+      windows:
+        command: "venv\\Scripts\\python.exe"
+        args: ["scripts/media_mcp_server.py"]
+      linux:
+        command: "venv/bin/python"
+        args: ["scripts/media_mcp_server.py"]
+      env: {}
+speech_recognition:
+  auto_calibrate: true
+  current_engine: whisper
+  echo_cancellation: true
+  energy_threshold: 5.0e-06
+  engines:
+    gemini:
+      chunk_length: 1.5
+      language: ja
+      model: gemini-3-flash-preview
+    parakeet:
+      batch_size: 4
+      device: cuda
+      model: nvidia/parakeet-tdt_ctc-0.6b-ja
+      stream_chunk_duration: 1.0
+    whisper:
+      chunk_length: 1.0
+      fp16: true
+      language: ja
+      model: large-v3
+      temperature: 0.0
+  hallucination_detection: true
+  min_audio_duration: 0.2
+  min_confidence: 0.5
+  silence_duration: 1.5
+  silence_ratio_threshold: 0.9
+  silence_threshold: 15.0
+  voice_threshold: 20.0
+reasoning:
+  enabled: false
+  complexity_threshold: 0.6
+  max_steps: 5
+  step_timeout: 30
+  overall_timeout: 120
+  show_planning: true
+  parallel_execution: false
+  display_mode: progress
+  always_use_llm: false
+  add_emoji: true
+  max_retries: 3
+  retry_delay: 2
+  evaluation_weights:
+    multi_tool: 0.3
+    dependencies: 0.3
+    conditional: 0.2
+    data_transformation: 0.2
+tts:
+  speed_adjustment: 1.0
+tts_settings:
+  voicevox:
+    host: 127.0.0.1
+    port: 50021
+  aivisspeech:
+    host: 127.0.0.1
+    port: 10101
+    use_gpu: false
+  qwen3tts:
+    model_name: "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+    cache_dir: "cache/qwen3_models"
+    voices_dir: "cache/qwen3_voices"
+    use_gpu: true
+moderations: false
+use_tools: true
+rag:
+  enabled: true
+  qdrant:
+    local_path: cache/qdrant
+    collection_name: aoitalk_documents
+  embedding:
+    model: BAAI/bge-m3
+    batch_size: 32
+    device: cpu
+  reranker:
+    model: BAAI/bge-reranker-v2-gemma
+    top_n: 5
+    device: cpu
+  chunking:
+    chunk_size: 512
+    chunk_overlap: 50
+  search:
+    top_k: 20
+    top_n: 5
+  source:
+    directories: []
+    include_patterns:
+    - '*.md'
+    - '*.txt'
+    - '*.pdf'
+    exclude_patterns:
+    - .*
+    - __pycache__
+clickup_sync:
+  enabled: true
+  sync_interval_minutes: 15
+spotify:
+  enabled: false
+web_interface:
+  host: 0.0.0.0
+  port: 3000
+  auto_open_browser: true
+  video_http_server:
+    enabled: true
+    port: 3001
+  auth:
+    enabled: true
+    username: ''
+    password: ''
+    secret: ''
+    session_ttl_minutes: 15768000
+os_operations:
+  protected_paths:
+  - C:\
+  - D:\
+  - E:\
+  - F:\
+  - G:\
+  # User/project directories that are always accessible within user_files
+  allowed_workspace_dirs:
+  - _users      # User personal directories: user_files/_users/user_{uuid}
+  - _projects   # Project shared directories: user_files/_projects/project_{uuid}
+agents:
+  filesystem:
+    enabled: true
+  # ClickUpはMCP経由に移行済み（config.yaml mcp セクション参照）
+  spotify:
+    enabled: false
+mobile_ui:
+  enabled: true
+  default_view: chat
+  quick_commands: []

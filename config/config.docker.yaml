@@ -1,0 +1,156 @@
+# ============================================================================
+# AoiTalk Docker環境用設定
+# docker-compose環境でのプリセット設定
+# ============================================================================
+
+default_character: ずんだもん
+llm_model: gemini-3-flash-preview
+llm_provider: gemini
+mode: terminal
+
+# SGLang設定 (ローカルLLM使用時)
+sglang:
+  auto_start: false  # Docker内での自動起動は無効
+  model: default
+  port: 30000
+  host: 0.0.0.0
+
+# モード切替設定
+mode_switch:
+  restart_delay_seconds: 3
+  allowed_discord_user_ids: []
+
+# 音声デバイス (Docker内では使用しない)
+device_index: 0
+
+# 外部LLM設定
+external_llm:
+  auto_approve: true
+  tools:
+  - web_search
+  - grok_x_search
+
+# メモリ設定
+memory:
+  enabled: true
+  enable_history_logging: true
+  enable_search: false
+  auto_cleanup_enabled: true
+  embedding_model: all-MiniLM-L6-v2
+  history_batch_size: 100
+  history_retention_days: 180
+  log_retention_days: 365
+  max_active_messages: 10
+  max_context_tokens: 8000
+  max_search_results: 5
+  preload_embedding_model: false
+  save_assistant_messages: true
+  save_function_calls: true
+  save_user_messages: true
+
+# Discord設定
+discord:
+  default_mode: text
+  max_history_length: 20
+  memory_prefill_message_count: 12
+  sync_commands: false
+
+# 音声認識設定
+speech_recognition:
+  auto_calibrate: true
+  current_engine: whisper
+  engines:
+    whisper:
+      chunk_length: 1.0
+      fp16: true
+      language: ja
+      model: large-v3
+      temperature: 0.0
+    gemini:
+      chunk_length: 1.5
+      language: ja
+      model: gemini-3-flash-preview
+  hallucination_detection: true
+  min_audio_duration: 0.2
+  min_confidence: 0.5
+  silence_duration: 1.5
+
+# TTS設定 (Docker Compose サービス名を使用)
+tts:
+  speed_adjustment: 1.0
+tts_settings:
+  voicevox:
+    host: voicevox  # docker-composeサービス名
+    port: 50021
+  aivisspeech:
+    host: aivisspeech  # docker-composeサービス名
+    port: 10101
+    use_gpu: false
+
+# MCPは無効化 (Docker内でのプロセス起動は複雑)
+mcp_enabled: false
+use_tools: true
+
+# RAG設定 (Docker Compose サービス名を使用)
+rag:
+  enabled: true
+  qdrant:
+    host: qdrant  # docker-composeサービス名
+    port: 6333
+    local_path: null  # リモート接続時はnull
+    collection_name: aoitalk_documents
+  embedding:
+    model: BAAI/bge-m3
+    batch_size: 32
+    device: cpu
+  reranker:
+    model: BAAI/bge-reranker-v2-gemma
+    top_n: 5
+    device: cpu
+  chunking:
+    chunk_size: 512
+    chunk_overlap: 50
+  search:
+    top_k: 20
+    top_n: 5
+
+# Web Interface設定
+web_interface:
+  host: 0.0.0.0  # 全インターフェースでリッスン (Docker必須)
+  port: 3000
+  auto_open_browser: false  # Docker内ではブラウザ起動しない
+  video_http_server:
+    enabled: false  # Docker内では無効推奨
+    port: 3001
+  auth:
+    enabled: true
+    username: ''
+    password: ''
+    secret: ''
+    session_ttl_minutes: 15768000
+
+# OS操作 (Docker内では制限)
+os_operations:
+  protected_paths:
+  - /
+  - /etc
+  - /usr
+  - /var
+  allowed_workspace_dirs:
+  - _users
+  - _projects
+
+# エージェント設定
+agents:
+  filesystem:
+    enabled: true
+  clickup:
+    enabled: false
+  spotify:
+    enabled: false
+
+# モバイルUI設定
+mobile_ui:
+  enabled: true
+  default_view: chat
+  quick_commands: []

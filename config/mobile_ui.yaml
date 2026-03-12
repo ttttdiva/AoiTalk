@@ -1,0 +1,4 @@
+mobile_ui:
+  enabled: true
+  default_view: chat
+  quick_commands: []

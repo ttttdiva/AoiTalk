@@ -1,0 +1,87 @@
+# ============================================================================
+# AoiTalk .dockerignore
+# Dockerビルド時に除外するファイル・ディレクトリ
+# ============================================================================
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+*.whl
+
+# Git
+.git/
+.github/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+
+# Logs & Cache
+logs/
+*.log
+cache/
+*.cache
+temp/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# User Data (should be mounted as volumes)
+workspaces/
+*.sqlite
+*.db
+
+# SSL Certificates
+certs/
+
+# Documentation (not needed at runtime)
+docs/
+memory-bank/
+*.md
+!README.md
+
+# Test files
+tests/
+test_*.py
+*_test.py
+conftest.py
+
+# Development files
+*.bat
+setup.bat
+run.bat
+*.ps1
+
+# Sample files
+sample_*/
+*.sample
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Misc
+.DS_Store
+Thumbs.db
+*.bak
+*.orig

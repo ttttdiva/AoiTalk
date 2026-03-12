@@ -1,0 +1,22 @@
+name: A.I.VOICEサンプル
+voice:
+  engine: aivoice
+  voice_name: "琴葉 茜"  # A.I.VOICEの音声プリセット名
+  # または voice_index を使用: voice_index: 0
+  parameters:
+    speed: 1.0        # 話速 (0.5-2.0)
+    pitch: 1.0        # 音程 (0.5-2.0)
+    volume: 1.0       # 音量 (0.0-2.0)
+    intonation: 1.0   # 抑揚 (0.0-2.0)
+personality:
+  greeting: こんにちは！
+  invalidContentReply: 申し訳ございませんが、そのような内容にはお答えできません。
+  fallbackReply: すみません、よく聞き取れませんでした。もう一度お話しください。
+  goodbyeReply: それでは、また次回お会いしましょう！
+  details: >
+    あなたは親切で丁寧なアシスタントです。
+    常に敬語で話し、ユーザーの質問に真摯に答えます。
+recognition_aliases:
+  - AIボイス
+  - エーアイボイス
+  - アシスタント

@@ -1,0 +1,1766 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#10b981">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>AoiTalk - Voice & Chat Assistant</title>
+    <link rel="manifest" href="/static/manifest.json">
+    <link rel="apple-touch-icon" href="/static/icons/icon-192.png">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;700&display=swap"
+        rel="stylesheet">
+    <script>
+        // Register Service Worker for PWA
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/static/sw.js')
+                .then(reg => console.log('[PWA] Service Worker registered'))
+                .catch(err => console.warn('[PWA] Service Worker registration failed:', err));
+        }
+    </script>
+    <style>
+        body {
+            font-family: 'Noto Sans JP', sans-serif;
+        }
+
+        /* Mobile-safe viewport height */
+        .h-screen-safe {
+            height: 100vh;
+            height: 100dvh;
+        }
+
+        /* Ensure header is always visible */
+        .header-safe {
+            flex-shrink: 0;
+            min-height: fit-content;
+        }
+
+        /* Custom scrollbar for dark theme */
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: #1f2937;
+        }
+
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: #4b5563;
+            border-radius: 4px;
+        }
+
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: #6b7280;
+        }
+
+        /* Animations */
+        @keyframes pulse-dot {
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.5;
+            }
+        }
+
+        .pulse-dot {
+            animation: pulse-dot 2s infinite;
+        }
+
+        @keyframes flash-dot {
+
+            0%,
+            50% {
+                opacity: 1;
+            }
+
+            51%,
+            100% {
+                opacity: 0.3;
+            }
+        }
+
+        .flash-dot {
+            animation: flash-dot 1s infinite;
+        }
+
+        /* Tailwind animations */
+        @keyframes fade-in {
+            from {
+                opacity: 0;
+            }
+
+            to {
+                opacity: 1;
+            }
+        }
+
+        @keyframes slide-in-from-bottom {
+            from {
+                transform: translateY(0.5rem);
+            }
+
+            to {
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes slide-in-from-right {
+            from {
+                transform: translateX(100%);
+            }
+
+            to {
+                transform: translateX(0);
+            }
+        }
+
+        @keyframes slide-out-to-right {
+            from {
+                transform: translateX(0);
+            }
+
+            to {
+                transform: translateX(100%);
+            }
+        }
+
+        .animate-in {
+            animation-duration: 300ms;
+            animation-fill-mode: both;
+        }
+
+        .animate-out {
+            animation-duration: 300ms;
+            animation-fill-mode: both;
+        }
+
+        .fade-in {
+            animation-name: fade-in;
+        }
+
+        .slide-in-from-bottom-2 {
+            animation-name: fade-in, slide-in-from-bottom;
+        }
+
+        .slide-in-from-right {
+            animation-name: slide-in-from-right;
+        }
+
+        .slide-out-to-right {
+            animation-name: slide-out-to-right;
+        }
+
+        /* Sidebar resize handle */
+        .resize-handle {
+            position: absolute;
+            top: 0;
+            right: -4px;
+            width: 8px;
+            height: 100%;
+            cursor: col-resize;
+            z-index: 20;
+            transition: background-color 0.15s ease;
+        }
+
+        .resize-handle:hover,
+        .resize-handle.active {
+            background-color: rgba(16, 185, 129, 0.5);
+        }
+
+        .resize-handle::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 4px;
+            height: 40px;
+            border-radius: 2px;
+            background-color: transparent;
+            transition: background-color 0.15s ease;
+        }
+
+        .resize-handle:hover::after,
+        .resize-handle.active::after {
+            background-color: rgba(16, 185, 129, 0.8);
+        }
+
+        /* Prevent text selection during resize */
+        body.resizing {
+            user-select: none;
+            cursor: col-resize !important;
+        }
+
+        body.resizing * {
+            cursor: col-resize !important;
+        }
+
+        /* LLM Mode Selector */
+        #llmModeFastBtn.active,
+        #llmModeThinkingBtn.active {
+            background-color: rgb(5, 150, 105);
+            /* emerald-600 */
+            color: white;
+        }
+
+        #llmModeThinkingBtn.active {
+            background-color: rgb(124, 58, 237);
+            /* violet-600 */
+        }
+    </style>
+</head>
+
+<body class="bg-gray-900 overflow-hidden">
+    <!-- Global Menu Button (Always visible, fixed top-left) -->
+    <button id="globalMenuBtn"
+        class="fixed top-2 left-2 z-50 p-2.5 bg-gray-800/90 hover:bg-gray-700 backdrop-blur-sm rounded-xl border border-gray-700 shadow-lg transition-all hover:scale-105"
+        title="ファイル/履歴">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round" class="text-gray-300">
+            <line x1="3" y1="6" x2="21" y2="6" />
+            <line x1="3" y1="12" x2="21" y2="12" />
+            <line x1="3" y1="18" x2="21" y2="18" />
+        </svg>
+    </button>
+
+    <div class="flex flex-col h-screen-safe w-full bg-gray-800 shadow-2xl">
+        <!-- Header -->
+        <header
+            class="header-safe bg-gradient-to-r from-gray-800 to-gray-900 text-white p-2 sm:p-4 shadow-lg border-b border-gray-700">
+            <div class="max-w-5xl mx-auto w-full border-x border-gray-700">
+                <div class="max-w-5xl mx-auto w-full border-x border-gray-700">
+                    <div class="flex flex-col gap-2 sm:gap-4">
+                        <div class="flex justify-between items-center gap-2 sm:gap-4">
+                            <div class="flex items-center gap-2 sm:gap-3 flex-wrap ml-10 sm:ml-12">
+                                <h1 class="text-lg sm:text-2xl font-bold">
+                                    <span class="text-blue-400">AoiTalk</span>
+                                </h1>
+                                <div class="relative">
+                                    <select id="characterSelect"
+                                        class="appearance-none bg-gray-700 text-gray-100 px-4 py-2 pr-8 rounded-full text-base font-medium cursor-pointer hover:bg-gray-600 transition-colors focus:outline-none focus:ring-2 focus:ring-purple-500">
+                                        <option>Loading...</option>
+                                    </select>
+                                    <div
+                                        class="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-300">
+                                        <svg class="fill-current h-4 w-4" xmlns="http://www.w3.org/2000/svg"
+                                            viewBox="0 0 20 20">
+                                            <path
+                                                d="M9.293 12.95l.707.707L15.657 8l-1.414-1.414L10 10.828 5.757 6.586 4.343 8z" />
+                                        </svg>
+                                    </div>
+                                </div>
+                                <div class="relative">
+                                    <select id="projectSelect"
+                                        class="appearance-none bg-gray-700 text-gray-100 px-4 py-2 pr-8 rounded-full text-sm font-medium cursor-pointer hover:bg-gray-600 transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                                        <option value="">すべてのプロジェクト</option>
+                                        <option value="none">プロジェクトなし</option>
+                                    </select>
+                                    <div
+                                        class="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-300">
+                                        <svg class="fill-current h-4 w-4" xmlns="http://www.w3.org/2000/svg"
+                                            viewBox="0 0 20 20">
+                                            <path
+                                                d="M9.293 12.95l.707.707L15.657 8l-1.414-1.414L10 10.828 5.757 6.586 4.343 8z" />
+                                        </svg>
+                                    </div>
+                                </div>
+                                <div class="hidden sm:flex items-center gap-3 text-sm text-gray-300">
+                                    <span class="flex items-center gap-1">
+                                        <span class="text-gray-400">LLM:</span>
+                                        <span id="llmModel" class="font-medium"></span>
+                                    </span>
+                                    <span class="text-gray-500">|</span>
+                                    <span class="flex items-center gap-1">
+                                        <span class="text-gray-400">ASR:</span>
+                                        <span id="asrModel" class="font-medium"></span>
+                                    </span>
+                                </div>
+                                <div class="hidden sm:flex items-center gap-2 text-sm text-gray-300 flex-wrap">
+                                    <span class="text-gray-400">モード:</span>
+                                    <div id="modeSwitch"
+                                        class="flex bg-gray-700 rounded-full p-1 text-xs font-semibold">
+                                        <button data-mode-option="terminal"
+                                            class="px-3 py-1 rounded-full text-gray-300 hover:text-white transition">Terminal</button>
+                                        <button data-mode-option="voice_chat"
+                                            class="px-3 py-1 rounded-full text-gray-300 hover:text-white transition">Voice</button>
+                                        <button data-mode-option="discord"
+                                            class="px-3 py-1 rounded-full text-gray-300 hover:text-white transition">Discord</button>
+                                    </div>
+                                    <span id="modeSwitchStatus" class="text-xs text-gray-400"></span>
+                                </div>
+                            </div>
+
+                            <div class="flex items-center gap-2 sm:gap-4 flex-wrap">
+                                <!-- Voice Status (hidden on mobile) -->
+                                <div class="hidden sm:flex flex-col gap-2">
+                                    <div id="voiceStatus" class="flex items-center gap-2 text-sm">
+                                        <span id="voiceStatusDot"
+                                            class="w-2 h-2 rounded-full bg-yellow-400 pulse-dot"></span>
+                                        <span id="voiceStatusText">音声認識準備中...</span>
+                                    </div>
+                                    <!-- Mic Level -->
+                                    <div class="flex items-center gap-2 text-xs">
+                                        <span class="text-gray-400">マイクレベル:</span>
+                                        <div
+                                            class="relative w-24 h-4 bg-gray-700 rounded-full border border-gray-600 overflow-hidden">
+                                            <div id="micLevelFill"
+                                                class="h-full bg-green-500 transition-all duration-100 rounded-full">
+                                            </div>
+                                            <span id="micLevelValue"
+                                                class="absolute right-1 top-1/2 -translate-y-1/2 text-xs text-gray-200 font-semibold">0</span>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- New Conversation Button (hidden on mobile) -->
+                                <button id="newConversationBtn"
+                                    class="hidden sm:flex items-center gap-2 px-3 py-2 bg-emerald-700 hover:bg-emerald-600 rounded-lg text-sm font-medium transition-colors"
+                                    title="新規会話 (Ctrl+Shift+O)">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                        stroke-width="2">
+                                        <path d="M12 5v14M5 12h14" />
+                                    </svg>
+                                    新規会話
+                                </button>
+
+                                <!-- Options Button -->
+                                <button id="commandLauncherBtn"
+                                    class="flex items-center gap-2 p-2 bg-gray-600 hover:bg-gray-500 rounded-lg text-sm font-semibold shadow-lg transition-colors"
+                                    title="オプション">
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                        stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <path
+                                            d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z">
+                                        </path>
+                                        <circle cx="12" cy="12" r="3"></circle>
+                                    </svg>
+                                </button>
+
+                                <!-- Connection Status -->
+                                <div id="connectionStatus" class="flex items-center gap-2 text-sm">
+                                    <span id="connectionDot"
+                                        class="w-2 h-2 rounded-full bg-yellow-400 pulse-dot"></span>
+                                    <span id="connectionText" class="hidden sm:inline">接続中...</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+        </header>
+
+        <!-- Main Content Area -->
+        <div class="flex-1 flex overflow-hidden min-h-0">
+            <!-- Sidebar with Tabs (LEFT, fixed full-height, toggle for all screen sizes) -->
+            <aside id="fileExplorerSidebar"
+                class="hidden fixed left-0 top-0 bottom-0 border-r border-gray-700 flex-col overflow-hidden z-40 w-full sm:w-80"
+                style="background: #1a1d23;">
+                <!-- Tab Header (with top padding for menu button) -->
+                <div class="flex items-center border-b border-gray-700 bg-gray-800/50 mt-12">
+                    <button id="sidebarTabFiles" data-sidebar-tab="files"
+                        class="flex-1 flex items-center justify-center gap-1.5 py-2.5 text-sm font-medium text-emerald-400 border-b-2 border-emerald-400 transition-all"
+                        title="ファイル">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                        </svg>
+                        <span>ファイル</span>
+                    </button>
+                    <button id="sidebarTabHistory" data-sidebar-tab="history"
+                        class="flex-1 flex items-center justify-center gap-1.5 py-2.5 text-sm font-medium text-gray-400 hover:text-gray-200 border-b-2 border-transparent transition-all"
+                        title="会話履歴">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                        </svg>
+                        <span>履歴</span>
+                    </button>
+                </div>
+
+                <!-- Tab Content: Files -->
+                <div id="sidebarContentFiles" class="flex-1 overflow-hidden" data-sidebar-content="files">
+                    <div id="fileExplorerSidebarContainer" class="h-full">
+                        <!-- FileExplorer will be initialized here -->
+                    </div>
+                </div>
+
+                <!-- Tab Content: Conversation History -->
+                <div id="sidebarContentHistory" class="flex-1 overflow-hidden hidden" data-sidebar-content="history">
+                    <div class="flex flex-col h-full">
+                        <!-- History Header -->
+                        <div class="flex items-center justify-between px-3 py-2 border-b border-gray-700/50">
+                            <span class="text-xs text-gray-400 font-medium">会話履歴</span>
+                            <button id="refreshHistoryBtn" class="p-1 hover:bg-gray-700 rounded transition-colors"
+                                title="更新">
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="2" class="text-gray-400">
+                                    <path
+                                        d="M4 4v5h.582m15.356 2A8.001 8.001 0 014.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                </svg>
+                            </button>
+                        </div>
+                        <!-- Project Filter -->
+                        <div class="px-3 py-2 border-b border-gray-700/50">
+                            <select id="historyProjectFilter"
+                                class="w-full bg-gray-700 text-gray-100 px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer hover:bg-gray-600 transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                                <option value="">すべてのプロジェクト</option>
+                                <option value="none">プロジェクトなし</option>
+                            </select>
+                        </div>
+                        <!-- History List -->
+                        <div id="conversationHistoryList" class="flex-1 overflow-y-auto custom-scrollbar p-2 space-y-1">
+                            <div class="text-xs text-gray-500 text-center py-4">読み込み中...</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Resize Handle (PC only) -->
+                <div id="sidebarResizeHandle" class="resize-handle hidden sm:block" title="ドラッグして幅を調整"></div>
+            </aside>
+
+            <!-- Sidebar Overlay (for closing on mobile) -->
+            <div id="sidebarOverlay" class="hidden fixed inset-0 bg-black/50 z-35 sm:hidden"></div>
+
+            <!-- Chat Section (Centered with max-width) -->
+            <section id="chatPane"
+                class="flex flex-col flex-1 bg-gray-800 min-h-0 max-w-5xl mx-auto w-full border-x border-gray-700">
+                <!-- Chat Messages -->
+                <main class="flex-1 overflow-hidden min-h-0">
+                    <div id="chatMessages" class="h-full overflow-y-auto p-4 space-y-4 custom-scrollbar bg-gray-800">
+                        <!-- Messages will be inserted here -->
+                    </div>
+                    <!-- Processing Indicator -->
+                    <div id="processingIndicator" class="hidden px-4 pb-2">
+                        <div class="flex items-center gap-3 px-4 py-3 bg-gray-700/50 border border-gray-600 rounded-xl">
+                            <div class="flex gap-1">
+                                <span class="w-2 h-2 bg-purple-400 rounded-full animate-bounce"
+                                    style="animation-delay: 0ms;"></span>
+                                <span class="w-2 h-2 bg-purple-400 rounded-full animate-bounce"
+                                    style="animation-delay: 150ms;"></span>
+                                <span class="w-2 h-2 bg-purple-400 rounded-full animate-bounce"
+                                    style="animation-delay: 300ms;"></span>
+                            </div>
+                            <span id="processingText" class="text-sm text-gray-300">処理中...</span>
+                        </div>
+                    </div>
+                </main>
+
+                <!-- Input Area -->
+                <footer class="bg-gray-700 border-t border-gray-600 p-4">
+                    <!-- Image Preview Area -->
+                    <div id="imagePreviewContainer" class="hidden mb-3">
+                        <div class="inline-flex items-center gap-2 bg-gray-600/50 rounded-xl p-2 pr-3">
+                            <div class="relative">
+                                <img id="imagePreview" class="w-16 h-16 object-cover rounded-lg border border-gray-500">
+                                <button id="removeImageBtn" type="button"
+                                    class="absolute -top-2 -right-2 w-5 h-5 bg-red-500 hover:bg-red-400 rounded-full text-white text-xs flex items-center justify-center transition-colors">&times;</button>
+                            </div>
+                            <span id="imageFileName" class="text-xs text-gray-300 max-w-[150px] truncate"></span>
+                        </div>
+                    </div>
+                    <div class="flex gap-3 items-end">
+                        <!-- Image Upload Button -->
+                        <label
+                            class="cursor-pointer p-3 bg-gray-600 hover:bg-gray-500 rounded-xl transition-all flex-shrink-0"
+                            title="画像を添付">
+                            <input type="file" id="imageInput" accept="image/*" class="hidden">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-gray-300">
+                                <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                                <circle cx="8.5" cy="8.5" r="1.5" />
+                                <polyline points="21 15 16 10 5 21" />
+                            </svg>
+                        </label>
+                        <textarea id="messageInput" placeholder="メッセージを入力..." rows="1"
+                            maxlength="2000"
+                            class="flex-1 px-4 py-3 bg-gray-600 text-gray-100 placeholder-gray-400 border-2 border-gray-500 rounded-xl resize-none focus:outline-none focus:border-purple-400 focus:ring-2 focus:ring-purple-800 transition-all"></textarea>
+                        <button id="sendBtn"
+                            class="p-3 bg-slate-600 text-white rounded-xl hover:bg-slate-700 transition-all hover:shadow-lg active:scale-95">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <line x1="22" y1="2" x2="11" y2="13"></line>
+                                <polygon points="22,2 15,22 11,13 2,9"></polygon>
+                            </svg>
+                        </button>
+                    </div>
+
+                    <div class="flex justify-between items-center mt-2 text-xs text-gray-400">
+                        <div class="flex items-center gap-3">
+                            <span id="charCount">0/2000</span>
+                            <!-- LLM Mode Selector -->
+                            <div class="flex items-center gap-2 border-l border-gray-600 pl-3">
+                                <span id="llmModeIndicator" class="text-lg" title="高速モード">⚡</span>
+                                <div class="flex bg-gray-600 rounded-lg p-0.5">
+                                    <button id="llmModeFastBtn"
+                                        class="px-2 py-0.5 rounded text-xs font-medium transition-colors active bg-emerald-600 text-white"
+                                        onclick="window.chatClient?.setLlmMode('fast')" title="高速モード (Alt+1)">
+                                        Fast
+                                    </button>
+                                    <button id="llmModeThinkingBtn"
+                                        class="px-2 py-0.5 rounded text-xs font-medium transition-colors text-gray-300 hover:text-white"
+                                        onclick="window.chatClient?.setLlmMode('thinking')" title="思考モード (Alt+2)">
+                                        Thinking
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                        <span>Ctrl+Enterで送信、Alt+1/2でモード切替</span>
+                    </div>
+                </footer>
+            </section>
+        </div>
+    </div>
+
+    <!-- Notifications -->
+    <div id="notifications" class="fixed top-4 right-4 z-50 space-y-2"></div>
+
+    <!-- Command Overlay -->
+    <div id="commandOverlay" class="hidden fixed inset-0 z-40 bg-black/80 backdrop-blur-sm">
+        <div class="absolute inset-0 flex flex-col items-center justify-center p-4 sm:p-8">
+            <div
+                class="flex flex-col bg-gray-900 border border-gray-800 rounded-3xl shadow-2xl shadow-black/80 w-full max-w-6xl h-full lg:h-[90vh] lg:max-h-[900px] overflow-hidden">
+                <div class="flex flex-col gap-2 sm:gap-4 p-4 sm:p-6 border-b border-gray-800">
+                    <div class="flex items-start justify-between gap-2 sm:gap-4">
+                        <div class="flex-1">
+                            <p class="text-xs sm:text-sm text-gray-400 font-semibold">SETTINGS
+                            </p>
+                            <h2 class="text-lg sm:text-2xl font-bold text-white mt-0.5 sm:mt-1">
+                                オプション</h2>
+                            <p class="text-xs sm:text-sm text-gray-400 mt-1 sm:mt-2">
+                                アプリケーションの設定とカスタムコマンドを管理します。</p>
+                        </div>
+                        <div class="flex gap-3 flex-shrink-0">
+                            <button id="commandOverlayRefresh"
+                                class="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-xl text-sm font-semibold text-gray-100 border border-gray-700 transition">再読み込み</button>
+                            <button id="commandOverlayClose"
+                                class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-xl text-sm font-semibold text-gray-100 transition">閉じる</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="flex-1 overflow-hidden flex flex-col lg:flex-row">
+                    <div class="flex-1 overflow-y-auto p-6 space-y-4" id="commandButtonList">
+                        <!-- Settings Section -->
+                        <div id="settingsSection" class="mb-6">
+                            <div class="flex items-center justify-between mb-3">
+                                <p class="text-xs text-blue-400 font-semibold uppercase tracking-wide">
+                                    Settings</p>
+                                <button id="settingsRefreshBtn"
+                                    class="text-xs text-gray-400 hover:text-blue-300 transition flex items-center gap-1">
+                                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                            d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                    </svg>
+                                    更新
+                                </button>
+                            </div>
+                            <div id="settingsPanel" class="space-y-3">
+                                <!-- Toggle Switches -->
+                                <div class="grid grid-cols-1 gap-3">
+
+
+                                    <!-- External LLM Auto Approve -->
+                                    <div
+                                        class="bg-gray-800/50 rounded-xl p-4 border border-gray-700 flex items-center justify-between">
+                                        <div>
+                                            <label class="text-sm text-gray-300">外部LLM自動承認</label>
+                                            <p class="text-xs text-gray-500">API呼び出し確認をスキップ</p>
+                                        </div>
+                                        <button id="toggleExternalLlmApprove" data-setting="external_llm.auto_approve"
+                                            data-enabled="true"
+                                            class="relative w-12 h-6 rounded-full bg-blue-600 transition-colors">
+                                            <span
+                                                class="absolute left-1 top-1 w-4 h-4 bg-white rounded-full transition-transform translate-x-6"></span>
+                                        </button>
+                                    </div>
+                                    <!-- RAG Enabled -->
+                                    <div
+                                        class="bg-gray-800/50 rounded-xl p-4 border border-gray-700 flex items-center justify-between">
+                                        <div>
+                                            <label class="text-sm text-gray-300">RAG機能</label>
+                                            <p class="text-xs text-gray-500">ドキュメント検索</p>
+                                        </div>
+                                        <button id="toggleRagEnabled" data-setting="rag.enabled" data-enabled="false"
+                                            class="relative w-12 h-6 rounded-full bg-gray-600 transition-colors">
+                                            <span
+                                                class="absolute left-1 top-1 w-4 h-4 bg-white rounded-full transition-transform"></span>
+                                        </button>
+                                    </div>
+                                    <!-- Reasoning Enabled -->
+                                    <div
+                                        class="bg-gray-800/50 rounded-xl p-4 border border-gray-700 flex items-center justify-between">
+                                        <div>
+                                            <label class="text-sm text-gray-300">推論モード</label>
+                                            <p class="text-xs text-gray-500">複雑なタスクの分解</p>
+                                        </div>
+                                        <button id="toggleReasoningEnabled" data-setting="reasoning.enabled"
+                                            data-enabled="false"
+                                            class="relative w-12 h-6 rounded-full bg-gray-600 transition-colors">
+                                            <span
+                                                class="absolute left-1 top-1 w-4 h-4 bg-white rounded-full transition-transform"></span>
+                                        </button>
+                                    </div>
+                                    <!-- Reasoning Display Mode -->
+                                    <div class="bg-gray-800/50 rounded-xl p-4 border border-gray-700">
+                                        <label class="text-sm text-gray-300 block mb-2">推論表示モード</label>
+                                        <select id="reasoningDisplayMode" data-setting="reasoning.display_mode"
+                                            class="w-full bg-gray-700 text-gray-100 rounded-lg px-3 py-2 text-sm border border-gray-600 focus:outline-none focus:border-blue-500">
+                                            <option value="silent">Silent</option>
+                                            <option value="progress" selected>Progress</option>
+                                            <option value="detailed">Detailed</option>
+                                            <option value="debug">Debug</option>
+                                        </select>
+                                    </div>
+
+                                    <!-- Agent/Tool Toggles -->
+                                    <div class="col-span-full">
+                                        <div class="border-t border-gray-700 my-3"></div>
+                                    </div>
+
+                                    <!-- FileSystem Agent -->
+                                    <div
+                                        class="bg-gray-800/50 rounded-xl p-4 border border-gray-700 flex items-center justify-between">
+                                        <div>
+                                            <label class="text-sm text-gray-300">FileSystemAgent</label>
+                                            <p class="text-xs text-gray-500">ファイル操作機能</p>
+                                        </div>
+                                        <button id="toggleFilesystemAgent" data-setting="agents.filesystem.enabled"
+                                            data-enabled="true"
+                                            class="relative w-12 h-6 rounded-full bg-blue-600 transition-colors">
+                                            <span
+                                                class="absolute left-1 top-1 w-4 h-4 bg-white rounded-full transition-transform translate-x-6"></span>
+                                        </button>
+                                    </div>
+
+                                    <!-- ClickUp Agent -->
+                                    <div
+                                        class="bg-gray-800/50 rounded-xl p-4 border border-gray-700 flex items-center justify-between">
+                                        <div>
+                                            <label class="text-sm text-gray-300">ClickUpAgent</label>
+                                            <p class="text-xs text-gray-500">ClickUp連携機能</p>
+                                        </div>
+                                        <button id="toggleClickupAgent" data-setting="agents.clickup.enabled"
+                                            data-enabled="true"
+                                            class="relative w-12 h-6 rounded-full bg-blue-600 transition-colors">
+                                            <span
+                                                class="absolute left-1 top-1 w-4 h-4 bg-white rounded-full transition-transform translate-x-6"></span>
+                                        </button>
+                                    </div>
+
+                                    <!-- Spotify Agent -->
+                                    <div
+                                        class="bg-gray-800/50 rounded-xl p-4 border border-gray-700 flex items-center justify-between">
+                                        <div>
+                                            <label class="text-sm text-gray-300">SpotifyAgent</label>
+                                            <p class="text-xs text-gray-500">Spotify連携機能</p>
+                                        </div>
+                                        <button id="toggleSpotifyAgent" data-setting="agents.spotify.enabled"
+                                            data-enabled="true"
+                                            class="relative w-12 h-6 rounded-full bg-blue-600 transition-colors">
+                                            <span
+                                                class="absolute left-1 top-1 w-4 h-4 bg-white rounded-full transition-transform translate-x-6"></span>
+                                        </button>
+                                    </div>
+
+                                    <!-- ClickUp Sync -->
+                                    <div
+                                        class="bg-gray-800/50 rounded-xl p-4 border border-gray-700 flex items-center justify-between">
+                                        <div>
+                                            <label class="text-sm text-gray-300">ClickUp同期</label>
+                                            <p class="text-xs text-gray-500">自動同期機能</p>
+                                        </div>
+                                        <button id="toggleClickupSync" data-setting="clickup_sync.enabled"
+                                            data-enabled="false"
+                                            class="relative w-12 h-6 rounded-full bg-gray-600 transition-colors">
+                                            <span
+                                                class="absolute left-1 top-1 w-4 h-4 bg-white rounded-full transition-transform"></span>
+                                        </button>
+                                    </div>
+
+                                    <!-- Spotify Feature -->
+                                    <div
+                                        class="bg-gray-800/50 rounded-xl p-4 border border-gray-700 flex items-center justify-between">
+                                        <div>
+                                            <label class="text-sm text-gray-300">Spotify機能</label>
+                                            <p class="text-xs text-gray-500">Spotify統合</p>
+                                        </div>
+                                        <button id="toggleSpotify" data-setting="spotify.enabled" data-enabled="true"
+                                            class="relative w-12 h-6 rounded-full bg-blue-600 transition-colors">
+                                            <span
+                                                class="absolute left-1 top-1 w-4 h-4 bg-white rounded-full transition-transform translate-x-6"></span>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Quick Commands will be dynamically inserted here -->
+
+                        <!-- User Management Section -->
+                        <div id="userManagementSection" class="mb-6">
+                            <div class="flex items-center justify-between mb-3">
+                                <p class="text-xs text-indigo-400 font-semibold uppercase tracking-wide">
+                                    User & Account
+                                </p>
+                            </div>
+                            <div class="grid grid-cols-2 gap-2">
+                                <button id="openPasswordChangeBtn"
+                                    class="bg-gray-800/50 hover:bg-gray-700 rounded-xl p-4 border border-gray-700 text-left transition group">
+                                    <div class="flex items-center gap-3">
+                                        <div
+                                            class="w-8 h-8 rounded-lg bg-blue-600/20 flex items-center justify-center group-hover:bg-blue-600/30 transition">
+                                            <svg class="w-4 h-4 text-blue-400" fill="none" stroke="currentColor"
+                                                viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                    d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
+                                            </svg>
+                                        </div>
+                                        <div>
+                                            <p class="text-sm text-gray-200 font-medium">パスワード変更</p>
+                                            <p class="text-xs text-gray-500">自分のパスワードを変更</p>
+                                        </div>
+                                    </div>
+                                </button>
+                                <button id="openUserManagementBtn"
+                                    class="bg-gray-800/50 hover:bg-gray-700 rounded-xl p-4 border border-gray-700 text-left transition group">
+                                    <div class="flex items-center gap-3">
+                                        <div
+                                            class="w-8 h-8 rounded-lg bg-indigo-600/20 flex items-center justify-center group-hover:bg-indigo-600/30 transition">
+                                            <svg class="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor"
+                                                viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                    d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
+                                            </svg>
+                                        </div>
+                                        <div>
+                                            <p class="text-sm text-gray-200 font-medium">ユーザー管理</p>
+                                            <p class="text-xs text-gray-500">ユーザー追加・編集（管理者）</p>
+                                        </div>
+                                    </div>
+                                </button>
+                                <button id="openProjectManagerBtn"
+                                    class="bg-gray-800/50 hover:bg-gray-700 rounded-xl p-4 border border-gray-700 text-left transition group">
+                                    <div class="flex items-center gap-3">
+                                        <div
+                                            class="w-8 h-8 rounded-lg bg-emerald-600/20 flex items-center justify-center group-hover:bg-emerald-600/30 transition">
+                                            <svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor"
+                                                viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                    d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                                            </svg>
+                                        </div>
+                                        <div>
+                                            <p class="text-sm text-gray-200 font-medium">プロジェクト管理</p>
+                                            <p class="text-xs text-gray-500">共有ストレージ・メンバー管理</p>
+                                        </div>
+                                    </div>
+                                </button>
+                                <button id="logoutBtn"
+                                    class="col-span-2 bg-red-900/30 hover:bg-red-800/50 rounded-xl p-4 border border-red-700/50 text-left transition group">
+                                    <div class="flex items-center gap-3">
+                                        <div
+                                            class="w-8 h-8 rounded-lg bg-red-600/20 flex items-center justify-center group-hover:bg-red-600/30 transition">
+                                            <svg class="w-4 h-4 text-red-400" fill="none" stroke="currentColor"
+                                                viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                    d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                                            </svg>
+                                        </div>
+                                        <div>
+                                            <p class="text-sm text-red-300 font-medium">ログアウト</p>
+                                            <p class="text-xs text-gray-500">セッションを終了してログイン画面に戻る</p>
+                                        </div>
+                                    </div>
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Crawler Status Section -->
+                        <div id="crawlerStatusSection" class="mb-6">
+
+
+                            <div class="flex items-center justify-between mb-3">
+                                <p class="text-xs text-cyan-400 font-semibold uppercase tracking-wide">
+                                    Crawler Status
+                                </p>
+                                <button id="crawlerStatusRefresh"
+                                    class="text-xs text-gray-400 hover:text-cyan-300 transition flex items-center gap-1">
+                                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                            d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                    </svg>
+                                    更新
+                                </button>
+                            </div>
+                            <div id="crawlerStatusList" class="grid gap-2">
+                                <p class="text-xs text-gray-500">ステータスを読み込み中...</p>
+                            </div>
+                        </div>
+
+                        <!-- Media Browser Section -->
+                        <div id="mediaBrowserSection" class="mb-6">
+                            <div class="flex items-center justify-between mb-3">
+                                <p class="text-xs text-emerald-400 font-semibold uppercase tracking-wide">Media
+                                    Browser
+                                </p>
+                                <div class="flex gap-2">
+                                    <!-- View Mode Toggle -->
+                                    <div class="flex bg-gray-800 rounded-lg p-0.5 mr-2" id="mediaViewModeToggle">
+                                        <button id="mediaViewModeThumbnail"
+                                            class="text-xs px-2 py-1 rounded-md text-emerald-300 bg-emerald-900/50 transition flex items-center gap-1"
+                                            title="サムネイル表示">
+                                            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                    d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zm10 0a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zm10 0a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
+                                            </svg>
+                                        </button>
+                                        <button id="mediaViewModeList"
+                                            class="text-xs px-2 py-1 rounded-md text-gray-400 hover:text-gray-300 transition flex items-center gap-1"
+                                            title="一覧表示">
+                                            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                    d="M4 6h16M4 10h16M4 14h16M4 18h16" />
+                                            </svg>
+                                        </button>
+                                    </div>
+                                    <button id="mediaAddBookmarkBtn"
+                                        class="text-xs text-gray-400 hover:text-emerald-300 transition flex items-center gap-1"
+                                        title="現在のフォルダをブックマークに追加">
+                                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z" />
+                                        </svg>
+                                        ブックマーク
+                                    </button>
+                                    <button id="mediaGoUpBtn"
+                                        class="text-xs text-gray-400 hover:text-emerald-300 transition flex items-center gap-1 disabled:opacity-30"
+                                        title="親フォルダへ移動">
+                                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                d="M5 10l7-7m0 0l7 7m-7-7v18" />
+                                        </svg>
+                                        上へ
+                                    </button>
+                                    <button id="mediaBackBtn"
+                                        class="text-xs text-gray-400 hover:text-emerald-300 transition flex items-center gap-1 disabled:opacity-30"
+                                        title="前のフォルダに戻る">
+                                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                d="M15 19l-7-7 7-7" />
+                                        </svg>
+                                        戻る
+                                    </button>
+                                    <button id="mediaHomeBtn"
+                                        class="text-xs text-gray-400 hover:text-emerald-300 transition flex items-center gap-1">
+                                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
+                                        </svg>
+                                        ホーム
+                                    </button>
+                                </div>
+                            </div>
+                            <!-- Bookmarks Row -->
+                            <div id="mediaBookmarks" class="flex flex-wrap gap-2 mb-3"></div>
+                            <!-- Current Path -->
+                            <div id="mediaBreadcrumb" class="text-xs text-gray-400 mb-2 truncate"></div>
+                            <!-- Folder List -->
+                            <div id="mediaFolderList" class="grid gap-2 mb-3"></div>
+                            <!-- File Grid -->
+                            <div id="mediaFileGrid" class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-2">
+                            </div>
+                        </div>
+
+                        <!-- Divider -->
+                        <div class="border-t border-gray-700 mb-4"></div>
+
+                    </div>
+                    <div
+                        class="hidden lg:block w-full lg:w-80 border-t lg:border-t-0 lg:border-l border-gray-800 p-6 bg-gray-950/40">
+                        <p class="text-xs text-gray-400 font-semibold mb-3">最近の実行</p>
+                        <div id="commandHistoryList" class="space-y-3 text-xs text-gray-300"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="modeRestartOverlay"
+        class="hidden fixed inset-0 bg-black bg-opacity-70 z-40 flex items-center justify-center">
+        <div class="bg-gray-800 rounded-2xl px-8 py-6 text-center space-y-3 border border-gray-700 shadow-2xl">
+            <p class="text-lg font-semibold text-white">モードを切り替え中です…</p>
+            <p id="modeRestartMessage" class="text-sm text-gray-300"></p>
+            <p class="text-xs text-gray-400" id="modeRestartCountdown"></p>
+        </div>
+    </div>
+
+    <!-- Login Overlay -->
+    <div id="loginOverlay"
+        class="hidden fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center px-4">
+        <div class="w-full max-w-md bg-gray-900 border border-gray-800 rounded-3xl shadow-2xl p-8">
+            <div class="space-y-2">
+                <p class="text-sm text-blue-300 font-semibold">AUTH REQUIRED</p>
+                <h2 class="text-2xl font-bold text-white">ログインが必要です</h2>
+                <p class="text-sm text-gray-400">WebUIにアクセスするにはIDとパスワードを入力してください。</p>
+            </div>
+            <form id="loginForm" class="mt-6 space-y-4">
+                <div>
+                    <label class="text-xs text-gray-400">ユーザーID</label>
+                    <input id="loginUser" type="text" autocomplete="username"
+                        class="mt-1 w-full px-4 py-3 bg-gray-800 text-gray-100 rounded-xl border border-gray-700 focus:outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-900" />
+                </div>
+                <div>
+                    <label class="text-xs text-gray-400">パスワード</label>
+                    <input id="loginPass" type="password" autocomplete="current-password"
+                        class="mt-1 w-full px-4 py-3 bg-gray-800 text-gray-100 rounded-xl border border-gray-700 focus:outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-900" />
+                </div>
+                <p id="loginError" class="hidden text-sm text-red-400"></p>
+                <button id="loginSubmit" type="submit"
+                    class="w-full py-3 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold transition">
+                    ログイン
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Document Editor Modal -->
+    <div id="documentEditorModal"
+        class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div
+            class="w-full max-w-2xl bg-gray-900 border border-gray-800 rounded-2xl shadow-2xl flex flex-col max-h-[90vh]">
+            <div class="flex items-center justify-between p-4 border-b border-gray-800">
+                <div>
+                    <p class="text-xs text-amber-400 font-semibold">DOCUMENT EDITOR</p>
+                    <input id="documentEditorName" type="text" placeholder="ドキュメント名"
+                        class="mt-1 bg-transparent text-lg font-bold text-white placeholder-gray-500 focus:outline-none w-full" />
+                </div>
+                <button id="documentEditorClose" class="p-2 text-gray-400 hover:text-white transition">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+            <div class="flex-1 p-4 overflow-hidden">
+                <textarea id="documentEditorContent" placeholder="ドキュメントの内容を入力..."
+                    class="w-full h-full min-h-[300px] bg-gray-800 text-gray-100 placeholder-gray-500 border border-gray-700 rounded-xl p-4 resize-none focus:outline-none focus:border-amber-500 focus:ring-2 focus:ring-amber-900"></textarea>
+            </div>
+            <div class="flex items-center justify-between p-4 border-t border-gray-800">
+                <button id="documentEditorDelete"
+                    class="px-4 py-2 bg-red-600/20 hover:bg-red-600/40 text-red-400 rounded-lg text-sm font-medium transition">
+                    削除
+                </button>
+                <div class="flex gap-2">
+                    <button id="documentEditorCancel"
+                        class="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-100 rounded-lg text-sm font-medium transition">
+                        キャンセル
+                    </button>
+                    <button id="documentEditorSave"
+                        class="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-lg text-sm font-semibold transition">
+                        保存
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Media Viewer Modal -->
+    <div id="mediaViewerModal" class="hidden fixed inset-0 z-[100] bg-black/95 flex items-center justify-center">
+        <!-- Audio-only mode toggle (only for videos) -->
+        <button id="mediaViewerAudioToggle"
+            class="hidden absolute top-4 right-20 p-3 text-white/70 hover:text-white bg-black/50 rounded-full transition z-10"
+            title="音声のみモード">
+            <svg id="mediaViewerAudioIcon" class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                    d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
+            </svg>
+        </button>
+        <button id="mediaViewerClose"
+            class="absolute top-4 right-4 p-3 text-white/70 hover:text-white bg-black/50 rounded-full transition z-10">
+            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+        </button>
+        <!-- Prev Button -->
+        <button id="mediaViewerPrev"
+            class="absolute left-4 top-1/2 -translate-y-1/2 p-3 text-white/70 hover:text-white bg-black/50 hover:bg-black/70 rounded-full transition z-10 disabled:opacity-30">
+            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+            </svg>
+        </button>
+        <!-- Next Button -->
+        <button id="mediaViewerNext"
+            class="absolute right-4 top-1/2 -translate-y-1/2 p-3 text-white/70 hover:text-white bg-black/50 hover:bg-black/70 rounded-full transition z-10 disabled:opacity-30">
+            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+            </svg>
+        </button>
+        <div id="mediaViewerContent" class="w-full h-full p-4 flex items-center justify-center">
+            <!-- Image or video will be inserted here -->
+        </div>
+        <div id="mediaViewerInfo" class="absolute bottom-4 left-4 right-4 text-center">
+            <p id="mediaViewerFileName" class="text-white/80 text-sm truncate"></p>
+            <p id="mediaViewerCounter" class="text-white/50 text-xs mt-1"></p>
+        </div>
+    </div>
+
+    <!-- External LLM Permission Modal -->
+    <div id="externalLLMPermissionModal"
+        class="hidden fixed inset-0 z-[110] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="w-full max-w-md bg-gray-900 border border-gray-800 rounded-2xl shadow-2xl overflow-hidden">
+            <div class="p-6 border-b border-gray-800">
+                <div class="flex items-center gap-3 mb-2">
+                    <div class="w-10 h-10 rounded-xl bg-amber-600/20 flex items-center justify-center">
+                        <svg class="w-5 h-5 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                        </svg>
+                    </div>
+                    <div>
+                        <p class="text-xs text-amber-400 font-semibold">EXTERNAL API PERMISSION</p>
+                        <h3 class="text-lg font-bold text-white">外部APIの使用許可</h3>
+                    </div>
+                </div>
+                <p class="text-sm text-gray-400 mt-3">以下の外部LLM APIを実行しようとしています:</p>
+            </div>
+            <div class="p-6 space-y-4">
+                <div class="bg-gray-800/50 rounded-xl p-4 border border-gray-700">
+                    <p class="text-xs text-gray-400 mb-1">ツール名</p>
+                    <p id="permissionToolName" class="text-white font-medium">-</p>
+                </div>
+                <div class="bg-gray-800/50 rounded-xl p-4 border border-gray-700">
+                    <p class="text-xs text-gray-400 mb-1">実行内容</p>
+                    <p id="permissionDescription" class="text-white">-</p>
+                </div>
+            </div>
+            <div class="flex gap-3 p-6 bg-gray-950/50 border-t border-gray-800">
+                <button id="permissionDenyBtn"
+                    class="flex-1 py-3 rounded-xl bg-gray-700 hover:bg-gray-600 text-white font-medium transition">
+                    拒否
+                </button>
+                <button id="permissionApproveBtn"
+                    class="flex-1 py-3 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-semibold transition">
+                    許可
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Password Change Modal -->
+    <div id="passwordChangeModal"
+        class="hidden fixed inset-0 z-[120] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="w-full max-w-md bg-gray-900 border border-gray-800 rounded-2xl shadow-2xl">
+            <div class="p-6 border-b border-gray-800">
+                <div class="flex items-center gap-3">
+                    <div class="w-10 h-10 rounded-xl bg-blue-600/20 flex items-center justify-center">
+                        <svg class="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
+                        </svg>
+                    </div>
+                    <div>
+                        <p class="text-xs text-blue-400 font-semibold">PASSWORD CHANGE</p>
+                        <h3 id="passwordChangeTitle" class="text-lg font-bold text-white">パスワードを変更</h3>
+                    </div>
+                </div>
+                <p id="passwordChangeDescription" class="text-sm text-gray-400 mt-3">新しいパスワードを入力してください。
+                </p>
+            </div>
+            <form id="passwordChangeForm" class="p-6 space-y-4">
+                <div id="currentPasswordField">
+                    <label class="text-xs text-gray-400">現在のパスワード</label>
+                    <input id="currentPassword" type="password" autocomplete="current-password"
+                        class="mt-1 w-full px-4 py-3 bg-gray-800 text-gray-100 rounded-xl border border-gray-700 focus:outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-900" />
+                </div>
+                <div>
+                    <label class="text-xs text-gray-400">新しいパスワード</label>
+                    <input id="newPassword" type="password" autocomplete="new-password"
+                        class="mt-1 w-full px-4 py-3 bg-gray-800 text-gray-100 rounded-xl border border-gray-700 focus:outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-900" />
+                </div>
+                <div>
+                    <label class="text-xs text-gray-400">新しいパスワード（確認）</label>
+                    <input id="confirmPassword" type="password" autocomplete="new-password"
+                        class="mt-1 w-full px-4 py-3 bg-gray-800 text-gray-100 rounded-xl border border-gray-700 focus:outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-900" />
+                </div>
+                <p id="passwordChangeError" class="hidden text-sm text-red-400"></p>
+                <p id="passwordChangeSuccess" class="hidden text-sm text-green-400"></p>
+                <div class="flex gap-3 pt-2">
+                    <button type="button" id="passwordChangeCancelBtn"
+                        class="flex-1 py-3 rounded-xl bg-gray-700 hover:bg-gray-600 text-white font-medium transition">
+                        キャンセル
+                    </button>
+                    <button type="submit" id="passwordChangeSubmitBtn"
+                        class="flex-1 py-3 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold transition">
+                        変更する
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- User Management Modal (Admin) -->
+    <div id="userManagementModal"
+        class="hidden fixed inset-0 z-[115] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div
+            class="w-full max-w-2xl bg-gray-900 border border-gray-800 rounded-2xl shadow-2xl flex flex-col max-h-[90vh]">
+            <div class="flex items-center justify-between p-4 border-b border-gray-800">
+                <div>
+                    <p class="text-xs text-indigo-400 font-semibold">USER MANAGEMENT</p>
+                    <h3 class="text-lg font-bold text-white">ユーザー管理</h3>
+                </div>
+                <button id="userManagementCloseBtn" class="p-2 text-gray-400 hover:text-white transition">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+            <!-- User List -->
+            <div class="flex-1 overflow-y-auto p-4">
+                <div class="flex justify-between items-center mb-4">
+                    <p class="text-sm text-gray-400">登録ユーザー一覧</p>
+                    <div class="flex gap-2">
+                        <!-- CSV Export Button -->
+                        <button id="exportUsersBtn"
+                            class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-200 text-xs font-medium rounded-lg transition flex items-center gap-1"
+                            title="CSVエクスポート">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                            </svg>
+                            エクスポート
+                        </button>
+                        <!-- CSV Import Button -->
+                        <button id="importUsersBtn"
+                            class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-200 text-xs font-medium rounded-lg transition flex items-center gap-1"
+                            title="CSVインポート">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                            </svg>
+                            インポート
+                        </button>
+                        <!-- Hidden file input for CSV import -->
+                        <input type="file" id="userCsvFileInput" accept=".csv" class="hidden" />
+                        <!-- Add User Button -->
+                        <button id="addUserBtn"
+                            class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-lg transition flex items-center gap-1">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                            </svg>
+                            ユーザー追加
+                        </button>
+                    </div>
+                </div>
+                <div id="userList" class="space-y-2">
+                    <p class="text-xs text-gray-500 text-center py-4">読み込み中...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add/Edit User Modal -->
+    <div id="userEditModal"
+        class="hidden fixed inset-0 z-[130] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="w-full max-w-md bg-gray-900 border border-gray-800 rounded-2xl shadow-2xl">
+            <div class="p-6 border-b border-gray-800">
+                <p class="text-xs text-indigo-400 font-semibold">USER</p>
+                <h3 id="userEditTitle" class="text-lg font-bold text-white">新規ユーザー</h3>
+            </div>
+            <form id="userEditForm" class="p-6 space-y-4">
+                <input type="hidden" id="userEditId" />
+                <div>
+                    <label class="text-xs text-gray-400">ユーザー名 <span class="text-red-400">*</span></label>
+                    <input id="userEditUsername" type="text" required
+                        class="mt-1 w-full px-4 py-3 bg-gray-800 text-gray-100 rounded-xl border border-gray-700 focus:outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-900" />
+                </div>
+                <div id="userEditPasswordField">
+                    <label class="text-xs text-gray-400">パスワード <span class="text-red-400">*</span></label>
+                    <input id="userEditPassword" type="password"
+                        class="mt-1 w-full px-4 py-3 bg-gray-800 text-gray-100 rounded-xl border border-gray-700 focus:outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-900" />
+                    <p class="text-xs text-gray-500 mt-1">（編集時は空欄で変更なし）</p>
+                </div>
+                <div>
+                    <label class="text-xs text-gray-400">表示名</label>
+                    <input id="userEditDisplayName" type="text"
+                        class="mt-1 w-full px-4 py-3 bg-gray-800 text-gray-100 rounded-xl border border-gray-700 focus:outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-900" />
+                </div>
+                <div>
+                    <label class="text-xs text-gray-400">メールアドレス</label>
+                    <input id="userEditEmail" type="email"
+                        class="mt-1 w-full px-4 py-3 bg-gray-800 text-gray-100 rounded-xl border border-gray-700 focus:outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-900" />
+                </div>
+                <div>
+                    <label class="text-xs text-gray-400">ロール</label>
+                    <select id="userEditRole"
+                        class="mt-1 w-full px-4 py-3 bg-gray-800 text-gray-100 rounded-xl border border-gray-700 focus:outline-none focus:border-indigo-400">
+                        <option value="user">User</option>
+                        <option value="admin">Admin</option>
+                    </select>
+                </div>
+                <div class="flex items-center gap-2">
+                    <input type="checkbox" id="userEditActive" checked
+                        class="w-4 h-4 rounded bg-gray-700 border-gray-600 text-indigo-500 focus:ring-indigo-500">
+                    <label for="userEditActive" class="text-sm text-gray-300">アクティブ</label>
+                </div>
+                <p id="userEditError" class="hidden text-sm text-red-400"></p>
+
+                <!-- RAGコレクション紐づけ（ユーザー編集時のみ表示） -->
+                <div id="userRagSection" class="hidden mt-2 pt-4 border-t border-gray-700">
+                    <h4 class="text-xs font-semibold text-indigo-400 mb-2">RAGコレクション紐づけ</h4>
+                    <div id="userRagList" class="space-y-1 mb-3 max-h-36 overflow-y-auto text-sm">
+                        <!-- JS で動的生成 -->
+                    </div>
+                    <div class="flex gap-2 items-center">
+                        <select id="userRagAddSelect"
+                            class="flex-1 px-3 py-2 bg-gray-800 text-gray-100 rounded-lg border border-gray-700 text-sm focus:outline-none focus:border-indigo-400">
+                            <option value="">-- コレクション選択 --</option>
+                        </select>
+                        <select id="userRagAddPerm"
+                            class="px-3 py-2 bg-gray-800 text-gray-100 rounded-lg border border-gray-700 text-sm focus:outline-none focus:border-indigo-400">
+                            <option value="read">read</option>
+                            <option value="write">write</option>
+                        </select>
+                        <button type="button" id="userRagAddBtn"
+                            class="px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition whitespace-nowrap">
+                            追加
+                        </button>
+                    </div>
+                </div>
+
+                <div class="flex gap-3 pt-2">
+                    <button type="button" id="userEditCancelBtn"
+                        class="flex-1 py-3 rounded-xl bg-gray-700 hover:bg-gray-600 text-white font-medium transition">
+                        キャンセル
+                    </button>
+                    <button type="submit" id="userEditSubmitBtn"
+                        class="flex-1 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold transition">
+                        保存
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Mini Player Bar (Music) -->
+    <div id="miniPlayerBar"
+        class="hidden fixed bottom-0 left-0 right-0 z-30 bg-gray-900/95 backdrop-blur-lg border-t border-gray-700 shadow-2xl safe-area-inset-bottom">
+        <div class="max-w-6xl mx-auto px-3 py-2">
+            <!-- Progress Bar -->
+            <div class="h-1 bg-gray-700 rounded-full mb-2 cursor-pointer group" id="miniPlayerProgress">
+                <div id="miniPlayerProgressFill" class="h-full bg-emerald-500 rounded-full relative transition-all"
+                    style="width: 0%">
+                    <div
+                        class="absolute right-0 top-1/2 -translate-y-1/2 w-3 h-3 bg-white rounded-full opacity-0 group-hover:opacity-100 transition shadow">
+                    </div>
+                </div>
+            </div>
+            <div class="flex items-center gap-3">
+                <!-- Album Art / Expand Button -->
+                <button id="miniPlayerExpand"
+                    class="w-12 h-12 flex-shrink-0 rounded-lg bg-gray-800 flex items-center justify-center overflow-hidden hover:ring-2 hover:ring-emerald-500 transition">
+                    <div id="miniPlayerArt"
+                        class="w-full h-full bg-gradient-to-br from-emerald-600 to-teal-800 flex items-center justify-center">
+                        <svg class="w-6 h-6 text-white/80" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
+                        </svg>
+                    </div>
+                </button>
+                <!-- Track Info -->
+                <div class="flex-1 min-w-0">
+                    <p id="miniPlayerTitle" class="text-sm text-white font-medium truncate">再生中の曲がありません
+                    </p>
+                    <p id="miniPlayerArtist" class="text-xs text-gray-400 truncate">-</p>
+                </div>
+                <!-- Time Display -->
+                <div class="hidden sm:flex items-center gap-1 text-xs text-gray-400 flex-shrink-0">
+                    <span id="miniPlayerCurrentTime">0:00</span>
+                    <span>/</span>
+                    <span id="miniPlayerDuration">0:00</span>
+                </div>
+                <!-- Volume (desktop only) -->
+                <div class="hidden md:flex items-center gap-2 text-xs text-gray-400 flex-shrink-0">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M11 5L6 9H3v6h3l5 4V5z" />
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M15.5 8.5a4 4 0 010 7" />
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18 6a7 7 0 010 12" />
+                    </svg>
+                    <input id="miniPlayerVolume" type="range" min="0" max="100" value="80" aria-label="音量"
+                        class="w-24 accent-emerald-500 cursor-pointer">
+                </div>
+                <!-- Controls -->
+                <div class="flex items-center gap-1 sm:gap-2">
+                    <button id="miniPlayerPrev" class="p-2 text-gray-400 hover:text-white transition">
+                        <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M6 6h2v12H6V6zm3.5 6l8.5 6V6l-8.5 6z" />
+                        </svg>
+                    </button>
+                    <button id="miniPlayerPlayPause"
+                        class="p-2 w-10 h-10 bg-emerald-600 hover:bg-emerald-500 text-white rounded-full transition flex items-center justify-center">
+                        <svg id="miniPlayerPlayIcon" class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M8 5v14l11-7z" />
+                        </svg>
+                        <svg id="miniPlayerPauseIcon" class="w-5 h-5 hidden" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" />
+                        </svg>
+                    </button>
+                    <button id="miniPlayerNext" class="p-2 text-gray-400 hover:text-white transition">
+                        <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" />
+                        </svg>
+                    </button>
+                    <button id="miniPlayerClose" class="p-2 text-gray-500 hover:text-red-400 transition ml-1">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Full Screen Music Player Modal -->
+    <div id="musicPlayerModal"
+        class="hidden fixed inset-0 z-[100] bg-gradient-to-b from-gray-900 via-gray-900 to-black overflow-y-auto">
+        <div class="min-h-full flex flex-col p-4 safe-area-inset">
+            <!-- Header -->
+            <div class="flex items-center justify-between mb-6">
+                <button id="musicPlayerClose" class="p-2 text-gray-400 hover:text-white transition">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+                    </svg>
+                </button>
+                <p class="text-xs text-gray-400 uppercase tracking-wide">プレイリストから再生中</p>
+                <button id="musicPlayerPlaylist" class="p-2 text-gray-400 hover:text-white transition">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M4 6h16M4 10h16M4 14h16M4 18h16" />
+                    </svg>
+                </button>
+            </div>
+
+            <!-- Album Art -->
+            <div class="flex-1 flex items-center justify-center mb-6">
+                <div id="musicPlayerArt"
+                    class="w-72 h-72 sm:w-80 sm:h-80 rounded-2xl bg-gradient-to-br from-emerald-600 to-teal-800 shadow-2xl flex items-center justify-center overflow-hidden">
+                    <svg class="w-24 h-24 text-white/60" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                            d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
+                    </svg>
+                </div>
+            </div>
+
+            <!-- Track Info -->
+            <div class="text-center mb-6">
+                <p id="musicPlayerTitle" class="text-xl font-bold text-white truncate mb-1">曲名</p>
+                <p id="musicPlayerArtist" class="text-sm text-gray-400">アーティスト</p>
+            </div>
+
+            <!-- Progress Bar -->
+            <div class="mb-4">
+                <div class="h-1.5 bg-gray-700 rounded-full cursor-pointer group" id="musicPlayerProgress">
+                    <div id="musicPlayerProgressFill" class="h-full bg-emerald-500 rounded-full relative"
+                        style="width: 0%">
+                        <div
+                            class="absolute right-0 top-1/2 -translate-y-1/2 w-4 h-4 bg-white rounded-full opacity-0 group-hover:opacity-100 transition shadow-lg">
+                        </div>
+                    </div>
+                </div>
+                <div class="flex justify-between text-xs text-gray-400 mt-1">
+                    <span id="musicPlayerCurrentTime">0:00</span>
+                    <span id="musicPlayerDuration">0:00</span>
+                </div>
+            </div>
+
+            <!-- Volume -->
+            <div class="flex items-center justify-center gap-3 mb-6">
+                <svg class="w-5 h-5 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5L6 9H3v6h3l5 4V5z" />
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.5 8.5a4 4 0 010 7" />
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18 6a7 7 0 010 12" />
+                </svg>
+                <input id="musicPlayerVolume" type="range" min="0" max="100" value="80" aria-label="音量"
+                    class="w-56 sm:w-64 accent-emerald-500 cursor-pointer">
+            </div>
+
+            <!-- Main Controls -->
+            <div class="flex items-center justify-center gap-6 mb-6">
+                <button id="musicPlayerShuffle" class="p-3 text-gray-400 hover:text-white transition" title="シャッフル">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                </button>
+                <button id="musicPlayerPrev" class="p-3 text-white transition hover:scale-110">
+                    <svg class="w-8 h-8" fill="currentColor" viewBox="0 0 24 24">
+                        <path d="M6 6h2v12H6V6zm3.5 6l8.5 6V6l-8.5 6z" />
+                    </svg>
+                </button>
+                <button id="musicPlayerPlayPause"
+                    class="p-4 w-16 h-16 bg-white text-gray-900 rounded-full transition hover:scale-105 flex items-center justify-center shadow-lg">
+                    <svg id="musicPlayerPlayIcon" class="w-8 h-8" fill="currentColor" viewBox="0 0 24 24">
+                        <path d="M8 5v14l11-7z" />
+                    </svg>
+                    <svg id="musicPlayerPauseIcon" class="w-8 h-8 hidden" fill="currentColor" viewBox="0 0 24 24">
+                        <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" />
+                    </svg>
+                </button>
+                <button id="musicPlayerNext" class="p-3 text-white transition hover:scale-110">
+                    <svg class="w-8 h-8" fill="currentColor" viewBox="0 0 24 24">
+                        <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" />
+                    </svg>
+                </button>
+                <button id="musicPlayerRepeat" class="p-3 text-gray-400 hover:text-white transition" title="リピート">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                    <span id="musicPlayerRepeatBadge"
+                        class="hidden absolute -top-1 -right-1 w-4 h-4 bg-emerald-500 rounded-full text-xs text-white flex items-center justify-center">1</span>
+                </button>
+            </div>
+
+            <!-- Playlist Panel (hidden by default) -->
+            <div id="musicPlayerPlaylistPanel" class="hidden bg-gray-800/50 rounded-2xl p-4 max-h-60 overflow-y-auto">
+                <p class="text-xs text-gray-400 uppercase tracking-wide mb-3">再生キュー</p>
+                <div id="musicPlayerPlaylistItems" class="space-y-2">
+                    <!-- Playlist items will be inserted here -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scripts -->
+    <script src="/static/js/file-explorer.js?v=1.2"></script>
+    <script src="/static/js/rag-collection-manager.js?v=1.0"></script>
+    <script src="/static/js/project-manager.js?v=1.0"></script>
+    <script src="/static/js/chat.js?v=2.2"></script>
+    <script src="/static/js/conversation-history.js?v=1.0"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            // FileExplorer初期化
+            const container = document.getElementById('fileExplorerSidebarContainer');
+            if (window.FileExplorer && container) {
+                window.fileExplorer = new FileExplorer('fileExplorerSidebarContainer');
+            }
+
+            // サイドバー開閉（オーバーレイ方式：メインUIに影響なし）
+            const sidebar = document.getElementById('fileExplorerSidebar');
+            const toggleBtn = document.getElementById('globalMenuBtn');
+            const sidebarOverlay = document.getElementById('sidebarOverlay');
+
+            const isMobile = () => window.innerWidth < 640;
+
+            const showSidebar = () => {
+                if (!sidebar) return;
+                sidebar.classList.remove('hidden');
+                sidebar.classList.add('flex');
+                if (sidebarOverlay && isMobile()) {
+                    sidebarOverlay.classList.remove('hidden');
+                }
+                localStorage.setItem('sidebarVisible', 'true');
+            };
+
+            const hideSidebar = () => {
+                if (!sidebar) return;
+                sidebar.classList.add('hidden');
+                sidebar.classList.remove('flex');
+                if (sidebarOverlay) {
+                    sidebarOverlay.classList.add('hidden');
+                }
+                localStorage.setItem('sidebarVisible', 'false');
+            };
+
+            const toggleSidebar = () => {
+                if (sidebar.classList.contains('hidden')) {
+                    showSidebar();
+                } else {
+                    hideSidebar();
+                }
+            };
+
+            // 状態復元（PCのみ、モバイルはデフォルト非表示）
+            if (!isMobile() && localStorage.getItem('sidebarVisible') !== 'false') {
+                showSidebar();
+            }
+
+            if (toggleBtn) {
+                toggleBtn.addEventListener('click', toggleSidebar);
+            }
+
+            // オーバーレイクリックでサイドバーを閉じる
+            if (sidebarOverlay) {
+                sidebarOverlay.addEventListener('click', hideSidebar);
+            }
+
+            // ── サイドバーリサイズ機能 ──────────────────────────────────
+            const resizeHandle = document.getElementById('sidebarResizeHandle');
+            if (resizeHandle && sidebar) {
+                let isResizing = false;
+                let startX = 0;
+                let startWidth = 0;
+                const MIN_WIDTH = 200;
+                const MAX_WIDTH = 800;
+
+                // 保存された幅を復元
+                const savedWidth = localStorage.getItem('sidebarWidth');
+                if (savedWidth) {
+                    const width = parseInt(savedWidth, 10);
+                    if (width >= MIN_WIDTH && width <= MAX_WIDTH) {
+                        sidebar.style.width = width + 'px';
+                    }
+                }
+
+                const startResize = (e) => {
+                    isResizing = true;
+                    startX = e.clientX || e.touches?.[0]?.clientX || 0;
+                    startWidth = sidebar.offsetWidth;
+                    resizeHandle.classList.add('active');
+                    document.body.classList.add('resizing');
+                    e.preventDefault();
+                };
+
+                const doResize = (e) => {
+                    if (!isResizing) return;
+                    const clientX = e.clientX || e.touches?.[0]?.clientX || 0;
+                    const deltaX = clientX - startX;
+                    let newWidth = startWidth + deltaX;
+                    newWidth = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, newWidth));
+                    sidebar.style.width = newWidth + 'px';
+                };
+
+                const stopResize = () => {
+                    if (!isResizing) return;
+                    isResizing = false;
+                    resizeHandle.classList.remove('active');
+                    document.body.classList.remove('resizing');
+                    localStorage.setItem('sidebarWidth', sidebar.offsetWidth);
+                };
+
+                resizeHandle.addEventListener('mousedown', startResize);
+                document.addEventListener('mousemove', doResize);
+                document.addEventListener('mouseup', stopResize);
+                resizeHandle.addEventListener('touchstart', startResize, { passive: false });
+                document.addEventListener('touchmove', doResize, { passive: false });
+                document.addEventListener('touchend', stopResize);
+            }
+        });
+    </script>
+
+    <!-- Project Selection for Chat -->
+    <script>
+        // Project selection functionality
+        (function () {
+            let projects = [];
+
+            async function fetchAndRenderProjects() {
+                try {
+                    const response = await fetch('/api/projects', {
+                        credentials: 'include'
+                    });
+
+                    if (!response.ok) {
+                        console.warn('Failed to fetch projects');
+                        return;
+                    }
+
+                    const data = await response.json();
+                    projects = data.projects || [];
+
+                    renderProjectSelect();
+                    renderHistoryProjectFilter();
+
+                } catch (error) {
+                    console.error('Error fetching projects:', error);
+                }
+            }
+
+            function renderProjectSelect() {
+                const select = document.getElementById('projectSelect');
+                if (!select) return;
+
+                const currentValue = select.value;
+
+                // Remove only project options (keep default 'all' and 'none')
+                while (select.children.length > 2) {
+                    select.removeChild(select.lastChild);
+                }
+
+                projects.forEach(project => {
+                    const option = document.createElement('option');
+                    option.value = project.id;
+                    option.textContent = project.name;
+                    select.appendChild(option);
+                });
+
+                if (currentValue) {
+                    select.value = currentValue;
+                }
+            }
+
+            function renderHistoryProjectFilter() {
+                const select = document.getElementById('historyProjectFilter');
+                if (!select) return;
+
+                const currentValue = select.value;
+
+                // Remove only project options (keep default 'all' and 'none')
+                while (select.children.length > 2) {
+                    select.removeChild(select.lastChild);
+                }
+
+                projects.forEach(project => {
+                    const option = document.createElement('option');
+                    option.value = project.id;
+                    option.textContent = project.name;
+                    select.appendChild(option);
+                });
+
+                if (currentValue) {
+                    select.value = currentValue;
+                }
+            }
+
+            // Public API for chat.js to access selected project
+            // 複数ソースからproject_idを取得（優先順位付きフォールバック）
+            window.getSelectedProjectId = function () {
+                const select = document.getElementById('projectSelect');
+                const historyFilter = document.getElementById('historyProjectFilter');
+
+                // 特殊値をフィルタリングするヘルパー
+                const isValidProjectId = (value) => {
+                    return value && value !== 'none' && value !== 'all' && value !== '';
+                };
+
+                // 1. projectSelectから取得
+                const selectValue = select?.value;
+                if (isValidProjectId(selectValue)) {
+                    return selectValue;
+                }
+
+                // 2. historyProjectFilterからフォールバック
+                const filterValue = historyFilter?.value;
+                if (isValidProjectId(filterValue)) {
+                    return filterValue;
+                }
+
+                // 3. localStorageからフォールバック
+                const savedValue = localStorage.getItem('selectedProjectId');
+                if (isValidProjectId(savedValue)) {
+                    return savedValue;
+                }
+
+                return null;
+            };
+
+            window.getProjects = function () {
+                return projects;
+            };
+
+            // Create conversation session with project_id
+            window.createConversationSession = async function (characterName) {
+                const projectId = window.getSelectedProjectId();
+
+                try {
+                    const payload = {
+                        character_name: characterName
+                    };
+
+                    // Include project_id only if a project is selected
+                    if (projectId) {
+                        payload.project_id = projectId;
+                    }
+
+                    const response = await fetch('/api/conversations', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        credentials: 'include',
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (!response.ok) {
+                        console.error('Failed to create conversation session');
+                        return null;
+                    }
+
+                    const data = await response.json();
+                    console.log('Created conversation session:', data.session);
+                    return data.session;
+                } catch (error) {
+                    console.error('Error creating conversation session:', error);
+                    return null;
+                }
+            };
+
+            // Sync project selection between header and history filter
+            function syncProjectSelections() {
+                const projectSelect = document.getElementById('projectSelect');
+                const historyProjectFilter = document.getElementById('historyProjectFilter');
+
+                if (!projectSelect || !historyProjectFilter) return;
+
+                // When history filter changes, update header select and localStorage
+                historyProjectFilter.addEventListener('change', () => {
+                    projectSelect.value = historyProjectFilter.value;
+                    // Save to localStorage for chat.js to access
+                    if (historyProjectFilter.value) {
+                        localStorage.setItem('selectedProjectId', historyProjectFilter.value);
+                    } else {
+                        localStorage.removeItem('selectedProjectId');
+                    }
+                });
+
+                // When header select changes, update history filter and localStorage
+                projectSelect.addEventListener('change', () => {
+                    const newProjectId = projectSelect.value;
+                    historyProjectFilter.value = newProjectId;
+
+                    // Save to localStorage for chat.js to access
+                    // Only save valid project UUIDs, not special values like 'none' or ''
+                    if (newProjectId && newProjectId !== 'none' && newProjectId !== 'all') {
+                        localStorage.setItem('selectedProjectId', newProjectId);
+                    } else {
+                        localStorage.removeItem('selectedProjectId');
+                    }
+
+                    // Start a new chat when project changes
+                    // This ensures the next message will create a new session with the selected project_id
+                    if (window.conversationHistoryManager) {
+                        window.conversationHistoryManager.resetCurrentSession();
+                        window.conversationHistoryManager.loadConversations();
+                    }
+
+                    // Reset chat client's session cache
+                    if (window.chatClient && typeof window.chatClient.resetConversationSession === 'function') {
+                        window.chatClient.resetConversationSession();
+                    }
+                });
+
+                // Restore from localStorage on page load
+                const savedProjectId = localStorage.getItem('selectedProjectId');
+                if (savedProjectId) {
+                    projectSelect.value = savedProjectId;
+                    historyProjectFilter.value = savedProjectId;
+                }
+            }
+
+            // Initialize when DOM is ready
+            document.addEventListener('DOMContentLoaded', () => {
+                fetchAndRenderProjects();
+                syncProjectSelections();
+            });
+        })();
+    </script>
+</body>
+
+</html>

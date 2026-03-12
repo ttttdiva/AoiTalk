@@ -1,0 +1,180 @@
+# ============================================================================
+# AoiTalk Docker Compose Configuration
+# Linux/WSL2環境向けサービス構成
+# ============================================================================
+#
+# 使用方法:
+#   基本起動:      docker compose up -d
+#   VOICEVOX付き:  docker compose --profile voicevox up -d
+#   全サービス:    docker compose --profile voicevox --profile aivisspeech up -d
+#   停止:          docker compose down
+#   ログ表示:      docker compose logs -f aoitalk
+#
+# ============================================================================
+
+services:
+  # ==========================================================================
+  # AoiTalk メインアプリケーション
+  # ==========================================================================
+  aoitalk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aoitalk
+    ports:
+      - "3000:3000"
+    environment:
+      # PostgreSQL接続
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=aoitalk_memory
+      - POSTGRES_USER=aoitalk
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      - USE_POSTGRESQL=true
+      # Qdrant接続
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      # TTS設定 (docker-composeサービス名)
+      - VOICEVOX_HOST=voicevox
+      - VOICEVOX_PORT=50021
+      - AIVISSPEECH_HOST=aivisspeech
+      - AIVISSPEECH_PORT=10101
+      # API Keys (ホストの.envから引き継ぎ)
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - XAI_API_KEY=${XAI_API_KEY:-}
+      - NIJIVOICE_API_KEY=${NIJIVOICE_API_KEY:-}
+      - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY:-}
+      # WebUI認証
+      - AOITALK_WEB_AUTH_USER=${AOITALK_WEB_AUTH_USER:-}
+      - AOITALK_WEB_AUTH_PASSWORD=${AOITALK_WEB_AUTH_PASSWORD:-}
+      - AOITALK_WEB_AUTH_SECRET=${AOITALK_WEB_AUTH_SECRET:-}
+      # Docker固有設定
+      - AOITALK_HEADLESS=true
+      - AOITALK_WEB_AUTO_OPEN=false
+    volumes:
+      # 設定ファイル (読み取り専用)
+      - ./config:/app/config:ro
+      # 永続化ディレクトリ
+      - ./workspaces:/app/workspaces
+      - ./cache:/app/cache
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    networks:
+      - aoitalk-network
+    restart: unless-stopped
+
+  # ==========================================================================
+  # PostgreSQL + pgvector (会話履歴・ユーザー管理)
+  # ==========================================================================
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: aoitalk-postgres
+    environment:
+      - POSTGRES_USER=aoitalk
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      - POSTGRES_DB=aoitalk_memory
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aoitalk -d aoitalk_memory"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - aoitalk-network
+    restart: unless-stopped
+
+  # ==========================================================================
+  # Qdrant (ベクトル検索・RAG)
+  # ==========================================================================
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: aoitalk-qdrant
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    networks:
+      - aoitalk-network
+    restart: unless-stopped
+
+  # ==========================================================================
+  # VOICEVOX Engine (TTS - オプション)
+  # profileを指定して起動: docker compose --profile voicevox up -d
+  # ==========================================================================
+  voicevox:
+    image: voicevox/voicevox_engine:cpu-ubuntu20.04-latest
+    container_name: aoitalk-voicevox
+    ports:
+      - "50021:50021"
+    networks:
+      - aoitalk-network
+    restart: unless-stopped
+    profiles:
+      - voicevox
+
+  # ==========================================================================
+  # VOICEVOX Engine GPU版 (NVIDIA GPU必須)
+  # profileを指定して起動: docker compose --profile voicevox-gpu up -d
+  # ==========================================================================
+  voicevox-gpu:
+    image: voicevox/voicevox_engine:nvidia-ubuntu20.04-latest
+    container_name: aoitalk-voicevox-gpu
+    ports:
+      - "50021:50021"
+    networks:
+      - aoitalk-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles:
+      - voicevox-gpu
+
+  # ==========================================================================
+  # AivisSpeech Engine (TTS - オプション)
+  # 注意: 公式Dockerイメージが存在しないため、ローカルビルドが必要
+  # profileを指定して起動: docker compose --profile aivisspeech up -d
+  # ==========================================================================
+  # aivisspeech:
+  #   build:
+  #     context: ./docker/aivisspeech
+  #     dockerfile: Dockerfile
+  #   container_name: aoitalk-aivisspeech
+  #   ports:
+  #     - "10101:10101"
+  #   networks:
+  #     - aoitalk-network
+  #   restart: unless-stopped
+  #   profiles:
+  #     - aivisspeech
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  aoitalk-network:
+    driver: bridge
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  postgres_data:
+    driver: local
+  qdrant_data:
+    driver: local

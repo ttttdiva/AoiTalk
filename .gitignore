@@ -1,0 +1,112 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+venv_wsl/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment variables
+.env
+
+# Cache files
+.cache/
+cache/
+
+# Logs
+*.log
+/logs/
+
+# Audio files
+*.wav
+*.mp3
+
+# OS
+.DS_Store
+Thumbs.db
+
+/old/
+
+# Node.js
+node_modules/
+
+# Test files (legacy)
+temp.md
+
+.mypy_cache/
+.pytest_cache/
+mypy.ini
+
+# Test coverage and reports
+htmlcov/
+.coverage
+coverage.xml
+.pytest_cache/
+*.cover
+.hypothesis/
+.tox/
+
+# Security scan reports
+bandit-report.json
+safety-report.json
+
+logs/
+debug_audio/
+
+.claude/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary documentation
+CLAUDE_*.md
+GEMINI*.md
+temp_*.md
+temp/
+
+# Backup files
+*.bak
+*.backup
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Credentials and tokens
+*_token.json
+*_credentials.json
+.mcp.json
+
+# SSL certificates (private keys should never be committed)
+certs/
+
+sample_livedoor_news/
+
+# User workspace data (user files, projects)
+workspaces/
