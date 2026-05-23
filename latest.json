@@ -1,8 +1,8 @@
 {
     "mobile":  {
-                   "date":  "2026-05-16",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.62/aoitalk-mobile.apk",
-                   "version":  "0.1.62",
-                   "notes":  "チャット画面の不要なボタンを削除"
+                   "date":  "2026-05-23",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.63/aoitalk-mobile.apk",
+                   "version":  "0.1.63",
+                   "notes":  "v0.1.63 リリース"
                }
 }
