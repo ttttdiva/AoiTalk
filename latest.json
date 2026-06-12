@@ -1,8 +1,8 @@
 {
-    "mobile":  {
-                   "date":  "2026-06-09",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.70/aoitalk-mobile.apk",
-                   "version":  "0.1.70",
-                   "notes":  "v0.1.70 リリース"
-               }
+  "mobile": {
+    "version": "0.1.71",
+    "url": "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.71/aoitalk-mobile.apk",
+    "notes": "v0.1.71 リリース",
+    "date": "2026-06-12"
+  }
 }
