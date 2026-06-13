@@ -1,0 +1,53 @@
+name: project_information_update
+description: タスク説明や会話から、案件情報DBのカテゴリ・重要資料・ファクトを更新する。前回反映以降に更新されたタスクだけを対象にする。
+prompt_template: |
+  タスク内容や入力内容から、案件情報DBを更新してください。
+
+  {input}
+
+  ## 基本方針
+  - 案件情報DBはユーザーとチャットエージェントが共有する正本です。
+  - 案件情報DBの主語は資料ではなく案件そのものです。資料は根拠リンクとして扱い、資料要約だけのファクトは作りません。
+  - タスクの進捗・ステータス・作業予定はタスク側に残し、案件情報DBへは移しません。
+  - Markdown表、CSV/Excel行、接続一覧、機器一覧、WBS行、課題表行はファクト本文に入れず、必要なら台帳/record tableへ分離します。
+  - 案件情報DBへ反映するのは、案件の理解に長く効く情報です。
+    - 案件概要、前提、スコープ
+    - 構成、詳細設計、パラメーター、接続情報
+    - 検証方針、検証結果、注意点
+    - 決定事項、要確認事項、制約
+    - 重要資料リンク、台帳、構成図、パラメーターシート
+
+  ## 手順
+  1. project_management_assistant の get_project_context で対象案件を確認する。
+  2. list_project_information で現在のカテゴリ、重要資料、既存ファクト、同期状態を読む。
+  3. 入力で明示されたタスクや資料がある場合はそれを優先する。指定がない場合は list_project_tasks_changed_since を使い、前回同期カーソル以降に更新されたタスクだけ読む。
+  4. タスク説明から案件情報として残すべき内容を抽出する。単なる進捗や「完了/未着手」だけの情報は反映しない。
+  5. 必要な大項目カテゴリがなければ upsert_project_info_category で作る。カテゴリは案件ごとに柔軟に判断する。
+     - 概要と重要資料は基本カテゴリとして扱う。
+     - 構成、詳細設計、検証は必要な案件だけ有効化・作成する。
+     - 運用など、案件に不要なカテゴリは作らない。
+  6. 重要資料が見つかったら register_project_document で登録する。
+  7. 案件情報として残す内容は upsert_project_fact で登録・更新する。source_task_id または source_ref に根拠タスクを入れる。
+  8. タスク差分を処理した場合、最後に set_project_information_sync_state で recommended_next_checkpoint を保存する。
+
+  ## 出力
+  - 更新したカテゴリ、重要資料、ファクトを簡潔に列挙する。
+  - 反映しなかった情報があれば理由を添える。
+  - 同期カーソルを更新したかを明記する。
+trigger_mode: both
+aliases:
+  - 案件情報更新
+  - 案件情報反映
+  - project_info_update
+  - task_to_project_info
+bound_tools:
+  - project_management_assistant
+examples:
+  - "/project_information_update"
+  - "このタスクの説明から案件情報を更新して"
+  - "前回以降に更新されたタスク内容を案件情報に反映して"
+tags:
+  - 案件管理
+  - 案件情報
+  - ナレッジ
+parameters: {}

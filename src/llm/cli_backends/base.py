@@ -5,6 +5,7 @@ Provides common interface for Gemini CLI, Claude Code, Codex CLI, etc.
 """
 
 import logging
+import locale
 import os
 import shutil
 import subprocess
@@ -18,6 +19,37 @@ logger = logging.getLogger(__name__)
 # コマンドライン引数の長さ上限（安全マージン込み）
 # Windows: 約32,767文字だが余裕を持たせる
 _MAX_ARG_LENGTH = 8000
+
+
+def _decode_cli_output(data: bytes | str | None) -> str:
+    """Decode CLI output without letting console encoding mismatches crash a turn."""
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    if not data:
+        return ""
+
+    candidates = ["utf-8"]
+    preferred = locale.getpreferredencoding(False)
+    if preferred and preferred.lower() != "utf-8":
+        candidates.append(preferred)
+    candidates.append("cp932")
+
+    seen = set()
+    for encoding in candidates:
+        normalized = encoding.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        except LookupError:
+            continue
+
+    return data.decode("utf-8", errors="replace")
 
 
 class CLIBackendBase(ABC):
@@ -73,12 +105,21 @@ class CLIBackendBase(ABC):
         """
         return raw_output.strip()
 
+    def parse_error_output(self, stdout: str, stderr: str, exit_code: int) -> Optional[str]:
+        """
+        Parse provider-specific error output into a user-facing message.
+
+        CLI tools that emit structured events on failure can override this to avoid
+        leaking raw JSONL or unrelated wrapper stderr into chat responses.
+        """
+        return None
+
     def parse_tool_calls(self, cli_output: str) -> List[Dict[str, Any]]:
         """
         Parse tool calls from CLI output
 
         Subclasses can override to detect and parse tool call requests.
-        Default returns empty list (no tool calls).
+        Default parses the shared [TOOL_CALL: ...] format.
 
         Args:
             cli_output: Parsed CLI output text
@@ -86,7 +127,9 @@ class CLIBackendBase(ABC):
         Returns:
             List of tool call dicts, empty if no tool calls detected
         """
-        return []
+        from ...tools.adapters import CLIAdapter
+
+        return CLIAdapter.parse_tool_calls(cli_output)
 
     def execute_prompt(
         self,
@@ -150,24 +193,28 @@ class CLIBackendBase(ABC):
 
         for attempt in range(max_retries):
             try:
+                stdin_input_bytes = (
+                    stdin_input.encode("utf-8") if stdin_input is not None else None
+                )
                 result = subprocess.run(
                     cmd,
-                    input=stdin_input,
+                    input=stdin_input_bytes,
                     cwd=str(cwd) if cwd else None,
-                    text=True,
                     capture_output=True,
                     check=False,
-                    encoding="utf-8",
                     timeout=timeout,
                 )
 
+                stdout_text = _decode_cli_output(result.stdout)
+                stderr_text = _decode_cli_output(result.stderr)
+
                 if result.returncode == 0:
-                    output = self.parse_output(result.stdout)
+                    output = self.parse_output(stdout_text)
                     logger.info(f"[{self.provider_name}] Execution successful: {len(output)} chars")
                     return True, output
 
-                stderr = result.stderr.strip()
-                stdout = result.stdout.strip()
+                stderr = stderr_text.strip()
+                stdout = stdout_text.strip()
                 logger.warning(
                     f"[{self.provider_name}] Attempt {attempt+1}/{max_retries} "
                     f"failed (exit code {result.returncode})"
@@ -192,13 +239,18 @@ class CLIBackendBase(ABC):
                     retry_delay *= 2
                     continue
 
-                error_msg = f"CLI failed (exit code {result.returncode})"
-                if stderr:
-                    error_msg += f"\nSTDERR: {stderr}"
-                    logger.error(f"[{self.provider_name}] {stderr}")
-                if stdout:
-                    error_msg += f"\nSTDOUT: {stdout}"
-                    logger.warning(f"[{self.provider_name}] {stdout}")
+                parsed_error = self.parse_error_output(stdout, stderr, result.returncode)
+                if parsed_error:
+                    error_msg = parsed_error
+                    logger.error(f"[{self.provider_name}] {parsed_error}")
+                else:
+                    error_msg = f"CLI failed (exit code {result.returncode})"
+                    if stderr:
+                        error_msg += f"\nSTDERR: {stderr}"
+                        logger.error(f"[{self.provider_name}] {stderr}")
+                    if stdout:
+                        error_msg += f"\nSTDOUT: {stdout}"
+                        logger.warning(f"[{self.provider_name}] {stdout}")
 
                 return False, error_msg
 
@@ -216,6 +268,27 @@ class CLIBackendBase(ABC):
                 return False, error_msg
 
         return False, "Max retries exceeded"
+
+    def prepare_image_attachment(
+        self, image_data: Dict[str, Any], cwd: Optional[Path] = None
+    ) -> Optional[Tuple[str, Any]]:
+        """
+        Prepare image for CLI prompt injection
+
+        Subclasses override this to handle image input (e.g., save base64 to
+        a temp file and return "@filepath" to append to the prompt).
+
+        Args:
+            image_data: Image dict {data: base64 data URL, mimeType: str, name: str}
+            cwd: Working directory for the CLI process. Used to save temp files
+                 within the project scope when the CLI enforces path sandboxing.
+
+        Returns:
+            (prompt_suffix, cleanup_fn) or None if images are not supported.
+            prompt_suffix is appended to the user prompt (e.g., " @/tmp/img.png").
+            cleanup_fn is called after CLI execution to remove temp files.
+        """
+        return None
 
     def get_mcp_args(self, mcp_servers: Dict[str, Any]) -> List[str]:
         """
@@ -257,7 +330,6 @@ class CLIBackendBase(ABC):
             result = subprocess.run(
                 [bin_path, "--version"],
                 capture_output=True,
-                text=True,
                 timeout=5,
             )
             return result.returncode == 0

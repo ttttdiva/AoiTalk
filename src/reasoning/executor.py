@@ -1,6 +1,7 @@
 """各ステップを実行するモジュール"""
 
 import asyncio
+import inspect
 import time
 import logging
 from typing import Dict, Any, Optional, List
@@ -25,7 +26,12 @@ class StepExecutor:
         self.max_retries = self.config.get('max_retries', 3)
         self.retry_delay = self.config.get('retry_delay', 2)  # リトライ間隔（秒）
     
-    async def execute_plan(self, context: ReasoningContext, progress_callback=None) -> List[StepResult]:
+    async def execute_plan(
+        self,
+        context: ReasoningContext,
+        progress_callback=None,
+        steering_callback=None,
+    ) -> List[StepResult]:
         """
         実行計画全体を実行
         
@@ -56,12 +62,19 @@ class StepExecutor:
                 break
             
             # 並列実行の可否を確認
+            await self._apply_pending_steering(context, steering_callback, progress_callback)
+
             if self.config.get('parallel_execution', False) and len(executable_steps) > 1:
                 # 並列実行
                 step_results = await self._execute_parallel(executable_steps, context, progress_callback)
             else:
                 # 順次実行
-                step_results = await self._execute_sequential(executable_steps, context, progress_callback)
+                step_results = await self._execute_sequential(
+                    executable_steps,
+                    context,
+                    progress_callback,
+                    steering_callback=steering_callback,
+                )
             
             # 結果をコンテキストに追加
             for result in step_results:
@@ -76,6 +89,39 @@ class StepExecutor:
                         results.append(recovery_result)
         
         return results
+
+    async def _apply_pending_steering(
+        self,
+        context: ReasoningContext,
+        steering_callback=None,
+        progress_callback=None,
+    ) -> None:
+        if not steering_callback:
+            return
+        try:
+            result = steering_callback()
+            if inspect.isawaitable(result):
+                result = await result
+            if isinstance(result, str):
+                result = [result]
+            if not isinstance(result, list):
+                return
+            instructions = [
+                str(item).strip()
+                for item in result
+                if str(item).strip()
+            ]
+            if not instructions:
+                return
+            context.shared_data.setdefault("additional_instructions", []).extend(
+                instructions
+            )
+            if progress_callback:
+                await progress_callback(
+                    "steering_applied", {"instructions": instructions}
+                )
+        except Exception as exc:
+            logger.warning("Failed to apply steering instructions: %s", exc)
     
     async def execute_step(self, step: TaskStep, context: ReasoningContext) -> StepResult:
         """
@@ -175,12 +221,20 @@ class StepExecutor:
             }
         }
     
-    async def _execute_sequential(self, steps: List[TaskStep], context: ReasoningContext, 
-                                  progress_callback=None) -> List[StepResult]:
+    async def _execute_sequential(
+        self,
+        steps: List[TaskStep],
+        context: ReasoningContext,
+        progress_callback=None,
+        steering_callback=None,
+    ) -> List[StepResult]:
         """ステップを順次実行"""
         results = []
-        
+
         for step in steps:
+            await self._apply_pending_steering(
+                context, steering_callback, progress_callback
+            )
             # 進捗通知
             if progress_callback:
                 await progress_callback('executing', {

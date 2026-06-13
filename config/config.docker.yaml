@@ -1,12 +1,17 @@
 # ============================================================================
 # AoiTalk Docker環境用設定
-# docker-compose環境でのプリセット設定
+# docker-compose環境での設定
 # ============================================================================
 
 default_character: ずんだもん
 llm_model: gemini-3-flash-preview
 llm_provider: gemini
-mode: terminal
+
+openrouter:
+  base_url: https://openrouter.ai/api/v1
+  model: openai/gpt-4o-mini
+  app_name: AoiTalk
+  site_url: ''
 
 # SGLang設定 (ローカルLLM使用時)
 sglang:
@@ -15,10 +20,19 @@ sglang:
   port: 30000
   host: 0.0.0.0
 
-# モード切替設定
-mode_switch:
-  restart_delay_seconds: 3
+runtime_feature_permissions:
   allowed_discord_user_ids: []
+
+runtime_features:
+  web_ui: true
+  local_mic: false
+  local_speaker: false
+  tts: false
+  discord_bot: false
+  discord_text: false
+  discord_vc_input: false
+  discord_vc_output: false
+  console_input: true
 
 # 音声デバイス (Docker内では使用しない)
 device_index: 0
@@ -28,7 +42,12 @@ external_llm:
   auto_approve: true
   tools:
   - web_search
-  - grok_x_search
+
+search:
+  provider: openai
+  x_enabled: false
+  grok_x_enabled: false
+  knowledge_enabled: false
 
 # メモリ設定
 memory:
@@ -91,20 +110,20 @@ tts_settings:
 mcp_enabled: false
 use_tools: true
 
-# RAG設定 (Docker Compose サービス名を使用)
+# Knowledge Index backend設定 (Docker Compose サービス名を使用)
 rag:
   enabled: true
   qdrant:
     host: qdrant  # docker-composeサービス名
     port: 6333
     local_path: null  # リモート接続時はnull
-    collection_name: aoitalk_documents
+    collection_name: aoitalk_knowledge
   embedding:
     model: BAAI/bge-m3
     batch_size: 32
     device: cpu
   reranker:
-    model: BAAI/bge-reranker-v2-gemma
+    model: BAAI/bge-reranker-v2-m3
     top_n: 5
     device: cpu
   chunking:
@@ -144,8 +163,8 @@ os_operations:
 agents:
   filesystem:
     enabled: true
-  clickup:
-    enabled: false
+  project_management:
+    enabled: true
   spotify:
     enabled: false
 

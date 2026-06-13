@@ -28,23 +28,23 @@ class ReasoningPlanner:
         self.step_patterns = {
             'search': {
                 'keywords': ['検索', '調べ', '探す', '確認', '取得'],
-                'tools': ['search_memory', 'search_rag', 'WebSearchTool']
+                'tools': ['web_search', 'grok_x_search', 'search_memory', 'knowledge_search']
             },
             'create': {
                 'keywords': ['作成', '登録', '追加', '生成', '保存'],
-                'tools': ['use_mcp_tool', 'spotify', 'execute_file_operation']
+                'tools': ['project_management_assistant', 'spotify_assistant', 'filesystem_assistant', 'media_assistant', 'skills_assistant']
             },
             'analyze': {
                 'keywords': ['分析', '解析', '評価', '判定', '比較'],
-                'tools': ['calculate', 'analyze_data']
+                'tools': ['search_memory', 'knowledge_search', 'utility_assistant']
             },
             'fetch': {
                 'keywords': ['取得', '読み込み', 'ダウンロード', 'アクセス'],
-                'tools': ['execute_file_operation', 'web_fetch']
+                'tools': ['filesystem_assistant', 'project_management_assistant', 'spotify_assistant']
             },
             'transform': {
                 'keywords': ['変換', '整形', 'フォーマット', '加工', '抽出'],
-                'tools': ['data_transform']
+                'tools': ['filesystem_assistant', 'project_management_assistant', 'spotify_assistant', 'skills_assistant']
             }
         }
     
@@ -170,7 +170,7 @@ class ReasoningPlanner:
     
     def _llm_select_tools(self, segment: str, step_type: str, available_tools: List[str]) -> List[str]:
         """LLMを使用してツールを選択"""
-        from ..prompts import TOOL_SELECTION_PROMPT
+        from .prompts import TOOL_SELECTION_PROMPT
         
         # ツールの説明を含むリストを作成（実際の実装では各ツールの説明を取得）
         tools_with_desc = self._get_tools_with_descriptions(available_tools)
@@ -197,10 +197,16 @@ class ReasoningPlanner:
         # 実際の実装では各ツールの説明を動的に取得
         tool_descriptions = {
             'search_memory': '過去の会話履歴や記憶を検索',
-            'search_rag': 'ドキュメントや資料をベクトル検索',
+            'knowledge_search': 'Knowledge Workspaceの文書や資料を検索',
             'WebSearch': 'インターネットから最新情報を検索',
-            'spotify_assistant': 'Spotify音楽の再生、検索、プレイリスト管理',
-            'use_mcp_tool': 'ClickUpタスク管理（MCP経由: create_task, search_tasks等）',
+            'web_search': 'General web search for fresh information',
+            'grok_x_search': 'Fresh X/Twitter search via Grok',
+            'project_management_assistant': 'Task management, project/case information DB, WBS checks, and management action planning',
+            'spotify_assistant': 'Spotify auth, playback, queue, playlist, and activity operations',
+            'filesystem_assistant': 'Local file browsing, editing, workspace management, and command execution',
+            'utility_assistant': 'Time, weather, and calculation operations',
+            'media_assistant': 'Image generation and YouTube/NicoNico playback',
+            'skills_assistant': 'Invoke installed skills for domain-specific tasks',
             'execute_file_operation': 'ローカルファイルの編集・参照（OS操作ツール）',
             'get_weather': '天気予報と気象情報の取得',
         }

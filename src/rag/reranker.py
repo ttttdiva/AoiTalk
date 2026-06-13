@@ -51,11 +51,9 @@ class BgeReranker:
     - cross-encoder/ms-marco-MiniLM-L-12-v2 (better quality)
     """
     
-    # Model mapping for config compatibility
+    # Model mapping for config compatibility. Do not remap BGE multilingual
+    # rerankers to English MS MARCO fallbacks.
     MODEL_MAPPING = {
-        "BAAI/bge-reranker-v2-gemma": "cross-encoder/ms-marco-MiniLM-L-6-v2",  # Fallback
-        "BAAI/bge-reranker-base": "cross-encoder/ms-marco-MiniLM-L-6-v2",  # Fallback
-        "BAAI/bge-reranker-large": "cross-encoder/ms-marco-MiniLM-L-12-v2",  # Fallback
     }
     
     def __init__(self, config: RerankerConfig):

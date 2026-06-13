@@ -160,20 +160,11 @@ class IndexTaskManager:
         points_count: Optional[int] = None,
         error_message: Optional[str] = None,
     ):
-        """Update collection status in the database."""
-        if self._db_manager is None:
-            return
-        try:
-            from ..memory.rag_collection_repository import RagCollectionRepository
-            from uuid import UUID
+        """Legacy hook retained for internal index tasks.
 
-            async with self._db_manager.get_session() as session:
-                await RagCollectionRepository.update_status(
-                    session, UUID(collection_id), status,
-                    points_count=points_count, error_message=error_message
-                )
-        except Exception as e:
-            logger.error(f"Failed to update DB status: {e}")
+        Knowledge Source status is now updated by src.knowledge.service.
+        """
+        return
 
     def get_task_status(self, collection_id: str) -> Optional[Dict]:
         """Get current status of an indexing task."""

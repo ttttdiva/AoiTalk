@@ -1,0 +1,11 @@
+name: weather_check
+description: 現在の天気を確認する
+prompt_template: '指定された場所の現在の天気を検索して報告してください。
+
+  場所: {input}'
+trigger_mode: both
+aliases: []
+bound_tools: []
+examples: []
+tags: []
+parameters: {}

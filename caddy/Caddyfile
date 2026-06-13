@@ -1,0 +1,73 @@
+# AoiTalk リバースプロキシ設定
+# Caddy は外部ポート6002 (HTTPS) で受けて内部サービスに振り分ける
+{
+	# 証明書はlegoで管理するため自動HTTPS無効化
+	auto_https off
+}
+
+# HTTPS リバースプロキシ (ポート6002)
+https://nk-h01.f5.si:6002 {
+	# 証明書パスは .env の AOITALK_CERT_CRT / AOITALK_CERT_KEY から受け取る。
+	# {$VAR:default} はパース時展開で、未設定でも default にフォールバックする。
+	# 親プロセス (main.py) が python-dotenv で .env を読み込み、subprocess.Popen で
+	# caddy を起動するときに環境変数を継承する前提。
+	tls {$AOITALK_CERT_CRT:D:/Dev/41_AoiTalk/certs/certificates/nk-h01.f5.si.crt} {$AOITALK_CERT_KEY:D:/Dev/41_AoiTalk/certs/certificates/nk-h01.f5.si.key}
+
+	# Standard Hydrus Client API-compatible reverse proxy.
+	@hydrus_client_api {
+		path /api_version /session_key /get_services /get_files/* /add_tags/* /edit_ratings/* /add_files/*
+	}
+	handle @hydrus_client_api {
+		reverse_proxy 127.0.0.1:3000
+	}
+
+	# ── FastAPI (モバイルアプリ専用の Bearer 認証エンドポイント) ──
+	# モバイル専用パスのみ FastAPI に流す。それ以外の /api/* は Next.js 行き。
+	# 詳細は memory-bank/systemPatterns.md「Caddy リバースプロキシ規約」参照。
+	# NOTE: Windows では `localhost` が IPv6 ([::1]) に解決されることがあり、
+	# Next.js/FastAPI が IPv4 のみ Listen している場合に 502 になる。
+	# 明示的に 127.0.0.1 を指定して回避する。
+	handle /api/auth/login/mobile {
+		reverse_proxy 127.0.0.1:3000
+	}
+	handle /api/auth/refresh {
+		reverse_proxy 127.0.0.1:3000
+	}
+	handle /api/filer/* {
+		reverse_proxy 127.0.0.1:3000
+	}
+	handle /api/google-calendar/oauth/callback {
+		reverse_proxy 127.0.0.1:3000
+	}
+	handle /api/agent-harness/* {
+		reverse_proxy 127.0.0.1:3000
+	}
+
+	# モバイルアプリは Bearer token で FastAPI の同名 /api/* を直接使う。
+	# ブラウザは Cookie 認証で Next.js の /api/* を使うため、Authorization: Bearer
+	# があるリクエストだけ FastAPI に分岐させる。
+	@mobile_bearer_api {
+		path /api/*
+		header Authorization "Bearer *"
+	}
+	handle @mobile_bearer_api {
+		reverse_proxy 127.0.0.1:3000
+	}
+
+	# WebSocket（FastAPI）
+	handle /ws* {
+		reverse_proxy 127.0.0.1:3000
+	}
+
+	# ── Next.js (ブラウザ用 Cookie 認証エンドポイント) ──
+	# 上記 FastAPI 専用パスで拾われなかった /api/* は全て Next.js に流す。
+	# Next.js 側で Drizzle 経由の DB アクセスと Cookie セッション処理を行う。
+	handle /api/* {
+		reverse_proxy 127.0.0.1:3002
+	}
+
+	# Next.js フロントエンド（デフォルト）
+	handle {
+		reverse_proxy 127.0.0.1:3002
+	}
+}

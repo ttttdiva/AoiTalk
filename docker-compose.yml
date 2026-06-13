@@ -29,7 +29,7 @@ services:
       - POSTGRES_PORT=5432
       - POSTGRES_DB=aoitalk_memory
       - POSTGRES_USER=aoitalk
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-aoitalk_password}
       - USE_POSTGRESQL=true
       # Qdrant接続
       - QDRANT_HOST=qdrant
@@ -41,14 +41,17 @@ services:
       - AIVISSPEECH_PORT=10101
       # API Keys (ホストの.envから引き継ぎ)
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENROUTER_SITE_URL=${OPENROUTER_SITE_URL:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - XAI_API_KEY=${XAI_API_KEY:-}
       - NIJIVOICE_API_KEY=${NIJIVOICE_API_KEY:-}
       - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY:-}
-      # WebUI認証
-      - AOITALK_WEB_AUTH_USER=${AOITALK_WEB_AUTH_USER:-}
-      - AOITALK_WEB_AUTH_PASSWORD=${AOITALK_WEB_AUTH_PASSWORD:-}
+      # WebUI/API認証 (アカウントはDB管理)
+      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:-}
       - AOITALK_WEB_AUTH_SECRET=${AOITALK_WEB_AUTH_SECRET:-}
+      - AOITALK_JWT_SECRET=${AOITALK_JWT_SECRET:-}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY:-}
       # Docker固有設定
       - AOITALK_HEADLESS=true
       - AOITALK_WEB_AUTO_OPEN=false
@@ -76,13 +79,13 @@ services:
     container_name: aoitalk-postgres
     environment:
       - POSTGRES_USER=aoitalk
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-aoitalk_password}
       - POSTGRES_DB=aoitalk_memory
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U aoitalk -d aoitalk_memory"]
       interval: 10s
@@ -102,8 +105,8 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
     networks:
       - aoitalk-network
     restart: unless-stopped

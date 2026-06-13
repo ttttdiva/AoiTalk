@@ -197,7 +197,26 @@ class AuthService:
         """
         payload = self.verify_token(token)
         if not payload:
-            return None
+            try:
+                raw_payload = jwt.decode(
+                    token,
+                    self.secret_key,
+                    algorithms=[self.algorithm],
+                    options={"verify_exp": False},
+                )
+                issued_at = datetime.fromtimestamp(raw_payload["iat"])
+                if datetime.utcnow() - issued_at > timedelta(days=30):
+                    return None
+                payload = TokenPayload(
+                    user_id=raw_payload["user_id"],
+                    username=raw_payload["username"],
+                    role=raw_payload["role"],
+                    exp=datetime.fromtimestamp(raw_payload["exp"]),
+                    iat=issued_at,
+                )
+            except Exception as exc:
+                logger.warning(f"Token refresh decode failed: {exc}")
+                return None
         
         return self.create_access_token(
             user_id=payload.user_id,

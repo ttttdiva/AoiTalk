@@ -10,8 +10,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -78,8 +78,6 @@ safety-report.json
 logs/
 debug_audio/
 
-.claude/
-
 # Database files
 *.db
 *.sqlite
@@ -90,6 +88,7 @@ CLAUDE_*.md
 GEMINI*.md
 temp_*.md
 temp/
+/query
 
 # Backup files
 *.bak
@@ -106,7 +105,26 @@ temp/
 # SSL certificates (private keys should never be committed)
 certs/
 
+# Caddy / lego binaries
+caddy/caddy.exe
+caddy/lego.exe
+
 sample_livedoor_news/
 
 # User workspace data (user files, projects)
 workspaces/
+
+# Next.js frontend build output
+frontend/.next/
+frontend/node_modules/
+
+# Expo mobile app (AoiTalk モバイル)
+mobile/node_modules/
+mobile/.expo/
+mobile/dist/
+mobile/android/
+mobile/ios/
+
+# Playwright debug screenshots (自動生成)
+frontend/screenshots/
+aoitalk-mobile.apk

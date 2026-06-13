@@ -17,17 +17,17 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 logger = logging.getLogger(__name__)
 
-# Import media browser functions
+# Import absolute filer path helpers shared with the file explorer.
 try:
-    from ..tools.media_browser import (
+    from ..tools.absolute_filer_paths import (
         get_file_path,
-        get_media_mime_type,
+        get_filer_mime_type,
     )
-    MEDIA_BROWSER_AVAILABLE = True
+    ABSOLUTE_FILER_PATHS_AVAILABLE = True
 except ImportError:
-    MEDIA_BROWSER_AVAILABLE = False
+    ABSOLUTE_FILER_PATHS_AVAILABLE = False
     get_file_path = None
-    get_media_mime_type = None
+    get_filer_mime_type = None
 
 
 def create_video_http_app() -> FastAPI:
@@ -44,20 +44,20 @@ def create_video_http_app() -> FastAPI:
         expose_headers=["Content-Range", "Accept-Ranges", "Content-Length"],
     )
     
-    @app.get("/api/media/file")
+    @app.get("/api/filer/file")
     async def serve_video_file(path: str, request: Request):
         """Serve a video file with Range request support (no authentication)"""
-        if not MEDIA_BROWSER_AVAILABLE:
+        if not ABSOLUTE_FILER_PATHS_AVAILABLE:
             raise HTTPException(
                 status_code=503,
-                detail="Media browser is not available"
+                detail="Absolute filer path support is not available"
             )
         
         file_path = get_file_path(path)
         if file_path is None:
             raise HTTPException(status_code=404, detail="File not found")
         
-        mime_type = get_media_mime_type(file_path)
+        mime_type = get_filer_mime_type(file_path)
         
         # Only serve video files on this endpoint
         if not mime_type.startswith('video/'):

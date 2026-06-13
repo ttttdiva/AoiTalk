@@ -3,6 +3,7 @@ Response handling for AoiTalk Voice Assistant Framework
 """
 
 import asyncio
+import inspect
 import time
 from typing import Optional, Set, Dict, Any
 from src.tools.keyword.character_manager import get_character_manager
@@ -179,12 +180,10 @@ class ResponseHandler:
                 print(f"[{task_id}] 応答生成を中断しました")
                 return None
                 
-            print(f"応答: {response}")
-            
             # Add response to hallucination filter for echo detection (if available)
             if hasattr(self.llm_client, 'recognizer') and self.llm_client.recognizer:
                 self.llm_client.recognizer.add_assistant_output(response)
-            
+
             # For web input, proceed with TTS and playback using resource locks
             # For chat input, return response without TTS
             if input_type == 'chat':
@@ -206,37 +205,66 @@ class ResponseHandler:
         finally:
             self.is_generating = False
             
-    async def _generate_response_only(self, task_id: str, text: str, input_type: str, image_data: dict = None) -> Optional[str]:
+    async def _generate_response_only(
+        self,
+        task_id: str,
+        text: str,
+        input_type: str,
+        image_data: dict = None,
+        stream_callback=None,
+        steering_callback=None,
+    ) -> Optional[str]:
         """Generate response without TTS/playback"""
         try:
             self.is_generating = True
             current_task = asyncio.current_task()
-            
-            # Check if task cancelled before generation
+
             if current_task and current_task.cancelled():
                 print(f"[{task_id}] 応答生成前にキャンセル検出")
                 return None
-            
+
             print(f"[{task_id}] 応答生成中...")
-            
-            # Generate response using LLM
-            response = self.llm_client.generate_response(text, image_data=image_data)
-            
+
+            if hasattr(self.llm_client, 'generate_response_async'):
+                async_generate = self.llm_client.generate_response_async
+                call_kwargs = {}
+                try:
+                    signature = inspect.signature(async_generate)
+                    parameters = signature.parameters
+                    accepts_kwargs = any(
+                        param.kind == inspect.Parameter.VAR_KEYWORD
+                        for param in parameters.values()
+                    )
+                    if accepts_kwargs or "image_data" in parameters:
+                        call_kwargs["image_data"] = image_data
+                    if accepts_kwargs or "stream_callback" in parameters:
+                        call_kwargs["stream_callback"] = stream_callback
+                    if accepts_kwargs or "steering_callback" in parameters:
+                        call_kwargs["steering_callback"] = steering_callback
+                except (TypeError, ValueError):
+                    call_kwargs = {
+                        "image_data": image_data,
+                        "stream_callback": stream_callback,
+                    }
+                response = await async_generate(text, **call_kwargs)
+            else:
+                response = await asyncio.to_thread(
+                    self.llm_client.generate_response,
+                    text,
+                    image_data=image_data,
+                )
+
             if not response:
                 print(f"[{task_id}] 応答生成失敗")
                 return None
-            
-            print(f"応答: {response}")
-            
-            # Add response to hallucination filter for echo detection (if available)
+
             if hasattr(self.llm_client, 'recognizer') and self.llm_client.recognizer:
                 self.llm_client.recognizer.add_assistant_output(response)
-            
-            # Process semantic memory (Mem0) - unified across all LLM providers
-            await self._process_semantic_memory(text, response)
-            
+
+            asyncio.create_task(self._process_dreaming_memory(text, response))
+
             return response
-            
+
         except asyncio.CancelledError:
             print(f"[{task_id}] 応答生成がキャンセルされました")
             raise
@@ -555,37 +583,40 @@ class ResponseHandler:
         
         print("[タスク管理] 全タスクのキャンセル完了")
     
-    async def _process_semantic_memory(self, user_input: str, assistant_response: str):
-        """Process conversation with Mem0 semantic memory - unified across all LLM providers
-        
-        This method ensures that semantic memory processing happens regardless of which
-        LLM provider (OpenAI, Gemini, etc.) is being used, removing the dependency on
-        provider-specific implementations.
-        
+    async def _process_dreaming_memory(self, user_input: str, assistant_response: str):
+        """会話からDreamingメモリを自動抽出して保存する（バックグラウンドタスク）。
+
         Args:
-            user_input: The user's input text
-            assistant_response: The assistant's response text
+            user_input: ユーザーの入力テキスト
+            assistant_response: アシスタントの応答テキスト
         """
-        print(f"[ResponseHandler] _process_semantic_memory開始")
-        print(f"[ResponseHandler] LLM client type: {type(self.llm_client).__name__}")
-        print(f"[ResponseHandler] Has semantic_memory_manager: {hasattr(self.llm_client, 'semantic_memory_manager')}")
-        
         try:
-            # Check if semantic memory manager exists in LLM client
-            if hasattr(self.llm_client, 'semantic_memory_manager') and self.llm_client.semantic_memory_manager:
-                # Use the process_conversation method to extract and store semantic facts
-                success = await self.llm_client.semantic_memory_manager.process_conversation(
-                    user_input=user_input,
-                    assistant_response=assistant_response,
-                    user_id="default_user",
-                    character_name=self.character_name  # Pass the actual character name
-                )
-                if success:
-                    print(f"[ResponseHandler] Mem0自動抽出完了")
-                else:
-                    print(f"[ResponseHandler] Mem0自動抽出スキップ（短い会話）")
-            else:
-                print(f"[ResponseHandler] Semantic memory manager not available")
+            from ..memory.dreaming_extractor import DreamingMemoryExtractor
+            from ..services.dreaming_memory_service import (
+                list_memories,
+                bulk_create_memories,
+            )
+
+            user_id = "default_user"
+            if hasattr(self.llm_client, '_get_session_user_id'):
+                user_id = self.llm_client._get_session_user_id()
+
+            # 既存メモリを取得（重複排除用）
+            existing = await list_memories(user_id, active_only=True)
+            existing_contents = [m["content"] for m in existing]
+
+            # LLMでDreamingメモリ候補を抽出
+            extractor = DreamingMemoryExtractor()
+            new_memories = await extractor.extract(
+                user_input, assistant_response, existing_contents
+            )
+
+            if new_memories:
+                session_id = getattr(self.llm_client, 'current_session_id', None)
+                metadata = {"session_id": session_id} if session_id else {}
+                created = await bulk_create_memories(user_id, new_memories, metadata=metadata)
+                if created:
+                    print(f"[DreamingMemory] {len(created)}件の新規メモリを抽出: {created}")
         except Exception as e:
-            # Don't let memory processing errors affect the main response flow
-            print(f"[ResponseHandler] Mem0処理エラー（無視）: {e}")
+            # メモリ処理エラーはメイン応答フローに影響させない
+            print(f"[DreamingMemory] 抽出エラー（無視）: {e}")

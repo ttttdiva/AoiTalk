@@ -294,19 +294,21 @@ class MCPPlugin:
             if servers:  # Check if servers is not None and not empty
                 for name, server_config in servers.items():
                     # Handle platform-specific configuration
+                    shared_env = {}
                     if isinstance(server_config, dict) and ('windows' in server_config or 'linux' in server_config):
+                        shared_env = server_config.get('env', {})
                         platform_name = 'windows' if platform.system() == 'Windows' else 'linux'
                         if platform_name in server_config:
-                            actual_config = server_config[platform_name]
+                            actual_config = dict(server_config[platform_name])
                         else:
                             logger.warning(f"No configuration for platform '{platform_name}' found for server '{name}'")
                             continue
                     else:
-                        actual_config = server_config
+                        actual_config = dict(server_config)
                     
                     # Start with current process environment (PATH, etc.)
                     # then overlay config-specified env vars
-                    env = actual_config.get('env', {})
+                    env = {**shared_env, **actual_config.get('env', {})}
                     expanded_env = dict(os.environ)
                     expanded_env['PYTHONIOENCODING'] = 'utf-8'
                     for key, value in env.items():

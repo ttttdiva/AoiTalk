@@ -60,6 +60,69 @@ class TestGetStatus:
 
 
 @pytest.mark.asyncio
+class TestStartupBehavior:
+    async def test_start_defers_initial_enabled_heartbeat(self):
+        runner = HeartbeatRunner()
+
+        from src.heartbeat.registry import get_heartbeat_registry
+
+        registry = get_heartbeat_registry()
+        hb = HeartbeatDefinition(
+            name="startup_defer_test",
+            description="テスト",
+            checklist="- 起動直後に実行しない",
+            interval_minutes=120,
+        )
+        registry.register(hb)
+
+        try:
+            before = datetime_now_timestamp()
+            await runner.start()
+            after = datetime_now_timestamp()
+            assert before <= runner._last_run["startup_defer_test"] <= after
+        finally:
+            await runner.stop()
+            registry.unregister("startup_defer_test")
+
+    async def test_trigger_returns_timeout_result(self):
+        runner = HeartbeatRunner()
+        runner._heartbeat_timeout_seconds = 0.01
+        runner._get_project_contexts = AsyncMock(return_value=[])
+
+        mock_llm = AsyncMock()
+
+        async def slow_response(_prompt):
+            await asyncio.sleep(60)
+            return HEARTBEAT_OK
+
+        mock_llm.generate_response_async = slow_response
+        runner.set_llm_client(mock_llm)
+
+        from src.heartbeat.registry import get_heartbeat_registry
+
+        registry = get_heartbeat_registry()
+        hb = HeartbeatDefinition(
+            name="timeout_test",
+            description="テスト",
+            checklist="- timeout",
+        )
+        registry.register(hb)
+
+        try:
+            result = await runner.trigger("timeout_test")
+            assert result["status"] == "timeout"
+            assert "timed out" in result["response"]
+        finally:
+            registry.unregister("timeout_test")
+
+
+def datetime_now_timestamp():
+    import datetime
+
+    return datetime.datetime.now().timestamp()
+
+
+@pytest.mark.asyncio
 class TestTrigger:
     async def test_trigger_nonexistent(self):
         runner = HeartbeatRunner()

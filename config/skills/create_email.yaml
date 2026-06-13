@@ -1,0 +1,70 @@
+name: create_email
+description: メールテンプレートからメール文を生成する。workspace_root配下のknowledge/email-templates/から適切なテンプレートを選択し、変数を埋めてメール文を作成する。
+prompt_template: |
+  メール文を作成してください。
+
+  【入力】
+  {input}
+
+  ## 手順
+
+  ### 1. テンプレート一覧の取得
+  filesystem_assistant で workspace_root の knowledge/email-templates/ 配下の全 .md ファイルを読み込み、一覧を把握する。
+  （README.md はテンプレートではないので除外する）
+
+  ### 2. テンプレート選択
+  - ユーザーが入力でテンプレート名を指定している場合 → そのテンプレートを使用
+  - 入力内容からテンプレートを推定できる場合 → 推定したテンプレートを提案
+    - 「週次」「週報」→ weekly_report.md
+    - 「資料送付」「アップロード」→ document_delivery.md
+    - 「打ち合わせ」「日程」→ meeting_schedule.md
+  - 推定できない場合 → 一覧を提示してユーザーに選択させる
+  - テンプレートが1つもない場合 → 汎用的なビジネスメールを作成
+
+  ### 3. テンプレートの解析
+  選択されたテンプレートを読み込み:
+  - frontmatter（YAML）から variables 定義を抽出
+  - 本文中の {{変数名}} プレースホルダーを抽出
+
+  ### 4. 変数の収集と自動補完
+  - knowledge/projectInfo.md から自動取得を試みる変数:
+    - project_name → 案件名
+    - customer_name → 顧客名（weekly_report_config.json の email セクションも参照）
+    - sender_name → 送信者名（同上）
+  - knowledge/weekly_report_config.json の email セクションから:
+    - file_location → 共有フォルダパス
+    - ファイル名関連
+  - frontmatter の default がある項目はデフォルト値を使用
+  - 自動補完できない変数はユーザーに確認する
+
+  ### 5. メール生成
+  - テンプレートの {{変数名}} を収集した値で置換
+  - <!-- CLAUDE: ... --> の指示がある場合、その指示に従って文面を調整・生成
+  - **ユーザーの表記・言い回しを勝手に変えない**（テンプレートの「致しました」「宜しく」等はそのまま使う）
+  - 生成したメール全文をコードブロックで表示:
+
+  ```
+  件名: ...
+
+  本文:
+  ...
+  ```
+
+  ### 6. 修正対応
+  ユーザーから修正指示があれば反映して再表示。
+  「OK」「これでいい」等の承認があれば完了。
+trigger_mode: both
+aliases:
+  - メール作成
+  - メール
+  - email
+bound_tools:
+  - filesystem_assistant
+examples:
+  - "/create_email 来週火曜に打ち合わせを設定したい"
+  - "/create_email 移行資料をBoxにアップしたので連絡メール"
+  - "/create_email weekly_report"
+tags:
+  - 案件管理
+  - メール
+parameters: {}

@@ -5,6 +5,12 @@ Configuration for memory management system
 from dataclasses import dataclass
 from typing import Optional
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 
 @dataclass
@@ -38,7 +44,7 @@ class MemoryConfig:
     postgres_port: int = int(os.getenv("POSTGRES_PORT", "5432"))
     postgres_db: str = os.getenv("POSTGRES_DB", "aoitalk_memory")
     postgres_user: str = os.getenv("POSTGRES_USER", "aoitalk")
-    postgres_password: str = os.getenv("POSTGRES_PASSWORD", "")
+    postgres_password: str = os.getenv("POSTGRES_PASSWORD", "aoitalk_password")
     
     # Database compatibility - needed for legacy code
     database_path: Optional[str] = None  # Not used for PostgreSQL, but needed for compatibility

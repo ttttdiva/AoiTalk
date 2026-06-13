@@ -1,6 +1,7 @@
 """推論モード全体の制御を行うマネージャー"""
 
 import asyncio
+import inspect
 import logging
 from typing import Dict, Any, Optional, Callable, List
 from .evaluator import ComplexityEvaluator
@@ -59,7 +60,8 @@ class ReasoningManager:
         return complexity.score
     
     async def execute_reasoning_mode(self, user_input: str, context: Dict[str, Any],
-                                     progress_callback: Optional[Callable] = None) -> str:
+                                     progress_callback: Optional[Callable] = None,
+                                     steering_callback: Optional[Callable] = None) -> str:
         """
         推論モードでタスクを実行
         
@@ -91,19 +93,39 @@ class ReasoningManager:
                 })
                 # ユーザーが計画を確認できるよう少し待機
                 await asyncio.sleep(1.0)
-            
+
+            steering_instructions = await self._consume_steering_instructions(
+                steering_callback, progress_callback
+            )
+            if steering_instructions:
+                user_input = self._append_steering_to_input(
+                    user_input, steering_instructions
+                )
+
             # 4. 推論コンテキストを作成
             reasoning_context = ReasoningContext(
                 user_input=user_input,
                 plan=plan
             )
-            
+            if steering_instructions:
+                reasoning_context.shared_data["additional_instructions"] = steering_instructions
+
             # 5. ステップを実行
             results = await self.executor.execute_plan(
-                reasoning_context, 
-                self._create_progress_wrapper(progress_callback)
+                reasoning_context,
+                self._create_progress_wrapper(progress_callback),
+                steering_callback=steering_callback
             )
-            
+
+            final_steering = await self._consume_steering_instructions(
+                steering_callback, progress_callback
+            )
+            if final_steering:
+                user_input = self._append_steering_to_input(user_input, final_steering)
+                reasoning_context.shared_data.setdefault(
+                    "additional_instructions", []
+                ).extend(final_steering)
+
             # 6. 最終応答を生成
             response = self.generator.generate_response(user_input, plan, results)
             
@@ -122,6 +144,39 @@ class ReasoningManager:
         except Exception as e:
             logger.error(f"Reasoning mode execution failed: {e}")
             return f"申し訳ございません。推論モードの実行中にエラーが発生しました: {str(e)}"
+
+    async def _consume_steering_instructions(
+        self,
+        steering_callback: Optional[Callable],
+        progress_callback: Optional[Callable] = None,
+    ) -> List[str]:
+        if not steering_callback:
+            return []
+        try:
+            result = steering_callback()
+            if inspect.isawaitable(result):
+                result = await result
+            if isinstance(result, str):
+                result = [result]
+            if not isinstance(result, list):
+                return []
+            instructions = [
+                str(item).strip()
+                for item in result
+                if str(item).strip()
+            ]
+            if instructions and progress_callback and self.mode != ReasoningMode.SILENT:
+                await self._notify_progress(progress_callback, 'steering_applied', {
+                    'instructions': instructions
+                })
+            return instructions
+        except Exception as exc:
+            logger.warning("Failed to consume steering instructions: %s", exc)
+            return []
+
+    def _append_steering_to_input(self, user_input: str, instructions: List[str]) -> str:
+        instruction_block = "\n".join(f"- {instruction}" for instruction in instructions)
+        return f"{user_input}\n\n追加指示:\n{instruction_block}"
     
     def _create_progress_wrapper(self, original_callback: Optional[Callable]) -> Optional[Callable]:
         """元のコールバックをラップして、推論モード固有の進捗情報を追加"""

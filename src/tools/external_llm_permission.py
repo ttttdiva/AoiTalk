@@ -1,8 +1,10 @@
 """
-External LLM Permission Manager
+LLM tool permission manager.
 
-Manages user permission requests for external LLM API calls (e.g., web_search, grok_x_search).
-When auto_approve is disabled in config, sends permission requests to WebUI and waits for user response.
+Manages user permission requests for LLM initiated actions such as external
+search, file writes/deletes, and command execution. When the active generation
+policy requires confirmation, a request is sent to the WebUI and execution waits
+for the user's approve/deny response.
 """
 
 import asyncio
@@ -11,6 +13,8 @@ import uuid
 from typing import Any, Callable, Dict, Optional
 from dataclasses import dataclass, field
 from enum import Enum
+
+from ..llm.generation_policy import PermissionPolicy, get_current_generation_policy
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +36,34 @@ class PermissionRequest:
     description: str
     status: PermissionStatus = PermissionStatus.PENDING
     future: Optional[asyncio.Future] = field(default=None, repr=False)
+    loop: Optional[asyncio.AbstractEventLoop] = field(default=None, repr=False)
+
+
+FILE_WRITE_TOOLS = {
+    "create_file",
+    "append_to_file",
+    "edit_file",
+    "insert_to_file",
+    "undo_edit",
+    "create_workspace_directory",
+    "upload_workspace_file",
+    "move_workspace_item",
+    "upload_user_file",
+}
+
+FILE_DELETE_TOOLS = {
+    "delete_file",
+    "delete_workspace_item",
+    "delete_user_file",
+}
+
+COMMAND_TOOLS = {"execute_command"}
+
+EXTERNAL_SEARCH_TOOLS = {"web_search", "grok_x_search"}
+
+DEFAULT_PERMISSION_TOOLS = sorted(
+    EXTERNAL_SEARCH_TOOLS | FILE_WRITE_TOOLS | FILE_DELETE_TOOLS | COMMAND_TOOLS
+)
 
 
 class ExternalLLMPermissionManager:
@@ -61,8 +93,8 @@ class ExternalLLMPermissionManager:
     
     def _load_config(self):
         """Load configuration settings"""
-        self.auto_approve = True  # Default to current behavior
-        self.enabled_tools = ["web_search", "grok_x_search"]
+        self.auto_approve = True  # Default to current behavior outside agent modes
+        self.enabled_tools = DEFAULT_PERMISSION_TOOLS.copy()
         
         if self.config is None:
             return
@@ -99,6 +131,14 @@ class ExternalLLMPermissionManager:
         Returns:
             True if permission is required (auto_approve=False and tool is in list)
         """
+        permission_policy = get_current_generation_policy().permission_policy
+        if permission_policy == PermissionPolicy.AUTO_APPROVE:
+            return False
+        if permission_policy == PermissionPolicy.CONFIRM_MUTATIONS:
+            return tool_name in (FILE_WRITE_TOOLS | FILE_DELETE_TOOLS | COMMAND_TOOLS)
+        if permission_policy == PermissionPolicy.CONFIRM_ALL_TOOLS:
+            return tool_name in self.enabled_tools
+
         if self.auto_approve:
             return False
         return tool_name in self.enabled_tools
@@ -120,18 +160,14 @@ class ExternalLLMPermissionManager:
         Returns:
             True if approved, False if denied or timeout
         """
-        # Auto-approve if configured
-        if self.auto_approve:
-            return True
-        
-        # Check if tool requires permission
-        if tool_name not in self.enabled_tools:
+        # Auto-approve if configured/current mode allows it.
+        if not self.is_permission_required(tool_name):
             return True
         
         # Require broadcast callback
         if self._broadcast_callback is None:
-            logger.warning("[ExternalLLMPermission] No broadcast callback set, auto-approving")
-            return True
+            logger.warning("[ExternalLLMPermission] No broadcast callback set, denying")
+            return False
         
         # Create request
         request_id = str(uuid.uuid4())
@@ -143,7 +179,8 @@ class ExternalLLMPermissionManager:
             tool_name=tool_name,
             tool_args=tool_args,
             description=description or self._generate_description(tool_name, tool_args),
-            future=future
+            future=future,
+            loop=loop,
         )
         
         self._pending_requests[request_id] = request
@@ -173,9 +210,83 @@ class ExternalLLMPermissionManager:
                 
         except Exception as e:
             logger.error(f"[ExternalLLMPermission] Error requesting permission: {e}")
-            return True  # Fail open to maintain functionality
+            return False
         finally:
             # Clean up
+            self._pending_requests.pop(request_id, None)
+
+    async def request_external_model_prompt(
+        self,
+        prompt: str,
+        *,
+        redacted_prompt: str = "",
+        redaction_findings: Optional[list[dict[str, str]]] = None,
+        provider: str,
+        model: str,
+        description: str = "",
+        confirm: bool = True,
+        notify: bool = True,
+        request_kind: str = "external_model_prompt",
+    ) -> Optional[str]:
+        """Ask the WebUI to approve or edit a prompt before an external model call."""
+        outbound_prompt = (redacted_prompt or "").strip() or prompt
+        if not confirm:
+            return outbound_prompt
+
+        if self._broadcast_callback is None:
+            logger.warning("[ExternalLLMPermission] No broadcast callback set, denying external model prompt")
+            return None
+
+        request_id = str(uuid.uuid4())
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+
+        request = PermissionRequest(
+            request_id=request_id,
+            tool_name=request_kind,
+            tool_args={
+                "provider": provider,
+                "model": model,
+                "prompt": prompt,
+                "redacted_prompt": outbound_prompt,
+            },
+            description=description
+            or f"分担先モデル {provider}/{model} へ送信するプロンプトを確認してください",
+            future=future,
+            loop=loop,
+        )
+        self._pending_requests[request_id] = request
+
+        try:
+            await self._broadcast_callback(
+                {
+                    "type": "external_model_prompt_request",
+                    "data": {
+                        "request_id": request_id,
+                        "provider": provider,
+                        "model": model,
+                        "prompt": prompt,
+                        "original_prompt": prompt,
+                        "redacted_prompt": outbound_prompt,
+                        "redaction_findings": redaction_findings or [],
+                        "description": request.description,
+                        "notify": notify,
+                    },
+                }
+            )
+            result = await asyncio.wait_for(future, timeout=self._timeout_seconds)
+            if isinstance(result, dict) and result.get("approved"):
+                edited_prompt = str(result.get("prompt") or "").strip()
+                return edited_prompt or outbound_prompt
+            return None
+        except asyncio.TimeoutError:
+            logger.warning("[ExternalLLMPermission] External model prompt request timed out: %s", request_id)
+            request.status = PermissionStatus.TIMEOUT
+            return None
+        except Exception as e:
+            logger.error("[ExternalLLMPermission] External model prompt request failed: %s", e)
+            return None
+        finally:
             self._pending_requests.pop(request_id, None)
     
     def handle_permission_response(self, request_id: str, approved: bool):
@@ -194,15 +305,64 @@ class ExternalLLMPermissionManager:
         request.status = PermissionStatus.APPROVED if approved else PermissionStatus.DENIED
         
         if request.future and not request.future.done():
-            request.future.set_result(approved)
+            if request.loop and request.loop.is_running():
+                request.loop.call_soon_threadsafe(request.future.set_result, approved)
+            else:
+                request.future.set_result(approved)
         
         logger.info(f"[ExternalLLMPermission] Permission response: {request_id} -> {'approved' if approved else 'denied'}")
+
+    def handle_external_model_prompt_response(
+        self,
+        request_id: str,
+        approved: bool,
+        prompt: str = "",
+    ):
+        """Handle user response for an external model prompt request."""
+        request = self._pending_requests.get(request_id)
+        if not request:
+            logger.warning("[ExternalLLMPermission] Unknown external model prompt request ID: %s", request_id)
+            return
+
+        request.status = PermissionStatus.APPROVED if approved else PermissionStatus.DENIED
+        payload = {"approved": approved, "prompt": prompt}
+
+        if request.future and not request.future.done():
+            if request.loop and request.loop.is_running():
+                request.loop.call_soon_threadsafe(request.future.set_result, payload)
+            else:
+                request.future.set_result(payload)
+
+        logger.info(
+            "[ExternalLLMPermission] External model prompt response: %s -> %s",
+            request_id,
+            "approved" if approved else "denied",
+        )
     
     def _generate_description(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
         """Generate a human-readable description of the action"""
         descriptions = {
-            "web_search": lambda args: f"Web検索: 「{args.get('query', '')}」",
-            "grok_x_search": lambda args: f"X (Twitter) 検索: 「{args.get('query', '')}」"
+            "web_search": lambda args: f"OpenAI APIによるWeb検索: 「{args.get('query', '')}」",
+            "grok_x_search": lambda args: f"X (Twitter) 検索: 「{args.get('query', '')}」",
+            "execute_command": lambda args: f"コマンド実行: {args.get('command', '')}",
+            "create_file": lambda args: f"ファイル作成: {args.get('path', '')}",
+            "append_to_file": lambda args: f"ファイル追記: {args.get('path', '')}",
+            "edit_file": lambda args: f"ファイル編集: {args.get('path', '')}",
+            "insert_to_file": lambda args: f"ファイル挿入: {args.get('path', '')}",
+            "undo_edit": lambda args: f"ファイル編集の取り消し: {args.get('path', '')}",
+            "delete_file": lambda args: f"ファイル/フォルダ削除: {args.get('path', '')}",
+            "create_workspace_directory": lambda args: (
+                f"ワークスペースフォルダ作成: {args.get('path', '')}/{args.get('name', '')}"
+            ),
+            "upload_workspace_file": lambda args: (
+                f"ワークスペースファイル保存: {args.get('path', '')}/{args.get('filename', '')}"
+            ),
+            "delete_workspace_item": lambda args: f"ワークスペース項目削除: {args.get('path', '')}",
+            "move_workspace_item": lambda args: (
+                f"ワークスペース項目移動: {args.get('src', '')} -> {args.get('dest', '')}"
+            ),
+            "upload_user_file": lambda args: f"ユーザーファイル保存: {args.get('filename', '')}",
+            "delete_user_file": lambda args: f"ユーザーファイル削除: {args.get('filename', '')}",
         }
         
         generator = descriptions.get(tool_name)
@@ -226,6 +386,36 @@ def set_permission_manager(manager: ExternalLLMPermissionManager):
     _permission_manager = manager
 
 
+async def request_external_model_prompt(
+    prompt: str,
+    *,
+    redacted_prompt: str = "",
+    redaction_findings: Optional[list[dict[str, str]]] = None,
+    provider: str,
+    model: str,
+    description: str = "",
+    confirm: bool = True,
+    notify: bool = True,
+    request_kind: str = "external_model_prompt",
+) -> Optional[str]:
+    manager = get_permission_manager()
+    if manager is None:
+        outbound_prompt = (redacted_prompt or "").strip() or prompt
+        return outbound_prompt if not confirm else None
+
+    return await manager.request_external_model_prompt(
+        prompt,
+        redacted_prompt=redacted_prompt,
+        redaction_findings=redaction_findings,
+        provider=provider,
+        model=model,
+        description=description,
+        confirm=confirm,
+        notify=notify,
+        request_kind=request_kind,
+    )
+
+
 async def check_permission(tool_name: str, tool_args: Dict[str, Any], description: str = "") -> bool:
     """
     Convenience function to check permission for a tool.
@@ -243,3 +433,32 @@ async def check_permission(tool_name: str, tool_args: Dict[str, Any], descriptio
         return True
     
     return await manager.request_permission(tool_name, tool_args, description)
+
+
+def check_permission_sync(
+    tool_name: str,
+    tool_args: Dict[str, Any],
+    description: str = "",
+    timeout: int = 360,
+) -> bool:
+    """Synchronously check permission from sync tool functions."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            context = contextvars.copy_context()
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    lambda: context.run(
+                        asyncio.run,
+                        check_permission(tool_name, tool_args, description),
+                    )
+                )
+                return bool(future.result(timeout=timeout))
+        return bool(asyncio.run(check_permission(tool_name, tool_args, description)))
+    except RuntimeError:
+        return bool(asyncio.run(check_permission(tool_name, tool_args, description)))
+    except Exception as exc:
+        logger.error("[ExternalLLMPermission] Permission check failed: %s", exc)
+        return False

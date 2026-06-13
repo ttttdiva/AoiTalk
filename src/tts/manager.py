@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from .engines.voicevox_engine import VoicevoxEngine
 from .engines.aivisspeech_engine import AivisSpeechEngine
 from .engines.nijivoice_engine import NijivoiceEngine
-from .engines.qwen3_tts_engine import Qwen3TTSEngine
+IrodoriTTSEngine = None
 
 # Windows-only TTS engines (require pythonnet, pywin32, etc.)
 # These are conditionally imported to allow running on Linux/Docker
@@ -368,39 +368,66 @@ class TTSManager:
             
         return engine
         
-    async def create_qwen3_tts_engine(
+    async def create_irodori_tts_engine(
         self,
-        model_name: Optional[str] = None,
+        hf_checkpoint: Optional[str] = None,
+        voice_design_checkpoint: Optional[str] = None,
+        codec_repo: Optional[str] = None,
+        refs_dir: Optional[str] = None,
         cache_dir: Optional[str] = None,
-        voices_dir: Optional[str] = None,
         use_gpu: Optional[bool] = None,
-    ) -> Optional[Qwen3TTSEngine]:
-        """Create and initialize Qwen3-TTS engine
-        
+    ) -> Optional[Any]:
+        """Create and initialize Irodori-TTS engine
+
         Args:
-            model_name: HuggingFace model name or local path
-            cache_dir: Directory to cache the model
-            voices_dir: Directory to store voice embeddings
+            hf_checkpoint: HuggingFace model repo id or local checkpoint path
+            voice_design_checkpoint: HuggingFace VoiceDesign repo id or local checkpoint path
+            codec_repo: HuggingFace codec repo id
+            refs_dir: Directory with reference voice audio files
+            cache_dir: Directory for downloaded checkpoints
             use_gpu: Whether to use GPU acceleration
-            
+
         Returns:
-            Initialized Qwen3TTSEngine or None
+            Initialized IrodoriTTSEngine or None
         """
-        # Get Qwen3-TTS settings from config
-        qwen3_settings = self.config.get('tts_settings', {}).get('qwen3tts', {})
-        
+        global IrodoriTTSEngine
+        if IrodoriTTSEngine is None:
+            from .engines.irodori_tts_engine import IrodoriTTSEngine as _IrodoriTTSEngine
+            IrodoriTTSEngine = _IrodoriTTSEngine
+
+        irodori_settings = self.config.get('tts_settings', {}).get('irodori_tts', {})
+
         # Use provided values or fall back to config
-        model_name = model_name or qwen3_settings.get('model_name', 'Qwen/Qwen3-TTS-12Hz-1.7B-Base')
-        cache_dir = cache_dir or qwen3_settings.get('cache_dir', 'cache/qwen3_models')
-        voices_dir = voices_dir or qwen3_settings.get('voices_dir', 'cache/qwen3_voices')
-        use_gpu = use_gpu if use_gpu is not None else qwen3_settings.get('use_gpu', True)
-        
-        # Pass Config object to engine (for accessing existing Gemini settings)
-        engine = Qwen3TTSEngine(
-            model_name=model_name,
+        hf_checkpoint = hf_checkpoint or irodori_settings.get('hf_checkpoint')
+        voice_design_checkpoint = (
+            voice_design_checkpoint or irodori_settings.get('voice_design_checkpoint')
+        )
+        codec_repo = codec_repo or irodori_settings.get('codec_repo')
+        refs_dir = refs_dir or irodori_settings.get('refs_dir')
+        cache_dir = cache_dir or irodori_settings.get('cache_dir')
+        use_gpu = use_gpu if use_gpu is not None else irodori_settings.get('use_gpu', True)
+
+        engine = IrodoriTTSEngine(
+            hf_checkpoint=hf_checkpoint,
+            voice_design_checkpoint=voice_design_checkpoint,
+            codec_repo=codec_repo,
+            refs_dir=refs_dir,
             cache_dir=cache_dir,
-            voices_dir=voices_dir,
+            model_device=irodori_settings.get('model_device', 'cuda'),
+            codec_device=irodori_settings.get('codec_device', 'cuda'),
+            model_precision=irodori_settings.get('model_precision', 'fp32'),
+            codec_precision=irodori_settings.get('codec_precision', 'fp32'),
             use_gpu=use_gpu,
+            num_steps=irodori_settings.get('num_steps', 6),
+            t_schedule_mode=irodori_settings.get('t_schedule_mode', 'sway'),
+            sway_coeff=irodori_settings.get('sway_coeff', -1.0),
+            seconds=irodori_settings.get('seconds', 30.0),
+            max_ref_seconds=irodori_settings.get('max_ref_seconds', 30.0),
+            ref_normalize_db=irodori_settings.get('ref_normalize_db'),
+            ref_ensure_max=irodori_settings.get('ref_ensure_max', True),
+            cfg_scale_text=irodori_settings.get('cfg_scale_text', 3.0),
+            cfg_scale_caption=irodori_settings.get('cfg_scale_caption', 3.0),
+            cfg_scale_speaker=irodori_settings.get('cfg_scale_speaker', 5.0),
             config=self.config,
         )
         
@@ -439,16 +466,8 @@ class TTSManager:
             
         engine = self.engines[self.current_engine]
         
-        # Get global speed adjustment from config (reload config to get latest value)
-        import yaml
-        import os
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../config/config.yaml')
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                current_config = yaml.safe_load(f)
-            speed_adjustment = current_config.get('tts', {}).get('speed_adjustment', 1.0)
-        except:
-            speed_adjustment = self.config.get('tts', {}).get('speed_adjustment', 1.0)
+        # Get global speed adjustment from the DB-backed app config.
+        speed_adjustment = self.config.get('tts', {}).get('speed_adjustment', 1.0)
         
         # Get character configuration if specified
         if character_name and character_name in self.character_configs:
@@ -481,7 +500,7 @@ class TTSManager:
                     'intonation': params.get('intonation', kwargs.get('intonation', 1.0)),
                     'volume': params.get('volume', kwargs.get('volume', 1.0))
                 })
-                
+
             elif self.current_engine == "voiceroid" and VoiceroidEngine is not None and isinstance(engine, VoiceroidEngine):
                 selection = self._resolve_voiceroid_voice(char_config, kwargs, speed_adjustment)
 
@@ -649,24 +668,38 @@ class TTSManager:
                     'format': params.get('format', kwargs.get('format', 'mp3'))
                 })
                 
-            elif self.current_engine == "qwen3tts" and isinstance(engine, Qwen3TTSEngine):
+            elif IrodoriTTSEngine is not None and self.current_engine == "irodori_tts" and isinstance(engine, IrodoriTTSEngine):
                 voice_config = char_config.get('voice', {})
                 params = voice_config.get('parameters', {})
-                
+
                 # Handle voice selection
                 voice_name = voice_config.get('voice_name', kwargs.get('voice_name'))
-                language = voice_config.get('language', kwargs.get('language', 'Auto'))
-                
-                # Note: Qwen3-TTS generates at a fixed rate, so we'll pass these
-                # as generation kwargs instead
-                kwargs.update({
+
+                irodori_kwargs = {
                     'voice_name': voice_name,
-                    'character_name': character_name,  # Pass character_name for auto-selection
-                    'language': language,
-                    'temperature': params.get('temperature', kwargs.get('temperature', 0.9)),
-                    'top_p': params.get('top_p', kwargs.get('top_p', 1.0)),
-                    'top_k': params.get('top_k', kwargs.get('top_k', 50)),
-                })
+                    'character_name': character_name,
+                    'ref_wav': voice_config.get('ref_wav', kwargs.get('ref_wav')),
+                    'ref_latent': voice_config.get('ref_latent', kwargs.get('ref_latent')),
+                    'caption': voice_config.get('caption', params.get('caption', kwargs.get('caption'))),
+                    'no_ref': voice_config.get('no_ref', params.get('no_ref', kwargs.get('no_ref'))),
+                    'voice_design': voice_config.get(
+                        'voice_design',
+                        params.get('voice_design', kwargs.get('voice_design', False)),
+                    ),
+                    'num_steps': params.get('num_steps', kwargs.get('num_steps')),
+                    't_schedule_mode': params.get(
+                        't_schedule_mode',
+                        kwargs.get('t_schedule_mode'),
+                    ),
+                    'sway_coeff': params.get('sway_coeff', kwargs.get('sway_coeff')),
+                    'ref_normalize_db': params.get('ref_normalize_db', kwargs.get('ref_normalize_db')),
+                    'ref_ensure_max': params.get('ref_ensure_max', kwargs.get('ref_ensure_max')),
+                    'cfg_scale_text': params.get('cfg_scale_text', kwargs.get('cfg_scale_text')),
+                    'cfg_scale_caption': params.get('cfg_scale_caption', kwargs.get('cfg_scale_caption')),
+                    'cfg_scale_speaker': params.get('cfg_scale_speaker', kwargs.get('cfg_scale_speaker')),
+                    'seed': params.get('seed', kwargs.get('seed')),
+                }
+                kwargs.update({key: value for key, value in irodori_kwargs.items() if value is not None})
                 
         # Synthesize audio with processed text
         try:

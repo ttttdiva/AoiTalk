@@ -9,6 +9,12 @@ import yaml
 from dotenv import load_dotenv
 import logging
 from .config_validator import ConfigValidator
+from .app_config_store import (
+    load_app_config_sync,
+    save_app_config_sync,
+    update_app_config_key_sync,
+)
+from .security.field_crypto import redact_secret_value
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +73,18 @@ class Config:
     # 環境変数マッピング
     ENV_MAPPINGS = {
         'openai_api_key': 'OPENAI_API_KEY',
+        'openrouter_api_key': 'OPENROUTER_API_KEY',
+        'openrouter_base_url': 'OPENROUTER_BASE_URL',
+        'openrouter_site_url': 'OPENROUTER_SITE_URL',
+        'openrouter_app_name': 'OPENROUTER_APP_NAME',
         'discord_bot_token': 'DISCORD_BOT_TOKEN',
         'gemini_api_key': 'GEMINI_API_KEY',
+        'ollama_api_key': 'OLLAMA_API_KEY',
+        'ollama_base_url': 'OLLAMA_BASE_URL',
+        'ollama_model': 'OLLAMA_MODEL',
+        'openai_compatible_local_api_key': 'OPENAI_COMPATIBLE_LOCAL_API_KEY',
+        'openai_compatible_local_base_url': 'OPENAI_COMPATIBLE_LOCAL_BASE_URL',
+        'openai_compatible_local_model': 'OPENAI_COMPATIBLE_LOCAL_MODEL',
         'nijivoice_api_key': 'NIJIVOICE_API_KEY',
         'openweather_api_key': 'OPENWEATHER_API_KEY',
         'voicevox_engine_path': 'VOICEVOX_ENGINE_PATH',
@@ -80,10 +96,11 @@ class Config:
     }
     
     # TTSエンジン設定
-    TTS_ENGINES = ['voicevox', 'voiceroid', 'cevio', 'aivoice', 'aivisspeech']
+    TTS_ENGINES = ['voicevox', 'voiceroid', 'cevio', 'aivoice', 'aivisspeech', 'irodori_tts']
     
-    # 必須環境変数
-    REQUIRED_ENV_VARS = ['OPENAI_API_KEY']
+    # グローバル必須環境変数は持たない。
+    # LLM APIキーは llm_provider ごとに validate_config() で確認する。
+    REQUIRED_ENV_VARS: List[str] = []
     
     def __init__(self, config_path: Optional[str] = None):
         """Initialize configuration manager
@@ -104,12 +121,8 @@ class Config:
         self._validate_environment()
         
     def _load_config(self) -> Dict[str, Any]:
-        """Load configuration from YAML file"""
-        if not self.config_path.exists():
-            raise FileNotFoundError(f"Configuration file not found: {self.config_path}")
-            
-        with open(self.config_path, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f) or {}
+        """Load configuration from the database, seeding from legacy YAML if present."""
+        config = load_app_config_sync(self.config_path)
             
         # 環境別設定をマージ
         environment = os.environ.get("AIVTUBER_ENV")
@@ -133,11 +146,12 @@ class Config:
         self._load_mobile_ui_settings(config)
 
         # 設定のバリデーション
-        validator = ConfigValidator(str(self.config_path))
-        if not validator.validate(environment):
-            logger.warning("Configuration validation failed:")
-            for error in validator.get_errors():
-                logger.warning(f"  - {error}")
+        if self.config_path.exists():
+            validator = ConfigValidator(str(self.config_path))
+            if not validator.validate(environment):
+                logger.warning("Configuration validation failed:")
+                for error in validator.get_errors():
+                    logger.warning(f"  - {error}")
         
         return config
         
@@ -275,9 +289,12 @@ class Config:
             issues['errors'].append('default_characterが設定されていません')
             
         # API キーの確認
-        if not self.config.get('openai_api_key'):
+        provider = str(self.config.get('llm_provider', '')).lower()
+        if provider == 'openai' and not self.config.get('openai_api_key'):
             issues['warnings'].append('OpenAI APIキーが設定されていません')
-            
+        if provider == 'openrouter' and not self.config.get('openrouter_api_key'):
+            issues['warnings'].append('OpenRouter APIキーが設定されていません')
+
         return issues
         
     def get(self, key: str, default: Any = None) -> Any:
@@ -319,9 +336,9 @@ class Config:
         
         # Set the final key
         config[keys[-1]] = value
-    
+
     def save_to_file(self, key: str, value: Any) -> bool:
-        """Save a specific configuration value to config.yaml
+        """Save a specific configuration value to the database.
         
         This method updates both the in-memory config and the file.
         
@@ -336,24 +353,9 @@ class Config:
             # First update in-memory config
             self.set(key, value)
             
-            # Read the existing file config
-            with open(self.config_path, 'r', encoding='utf-8') as f:
-                file_config = yaml.safe_load(f) or {}
-            
-            # Navigate to the parent and set the value
-            keys = key.split('.')
-            current = file_config
-            for k in keys[:-1]:
-                if k not in current:
-                    current[k] = {}
-                current = current[k]
-            current[keys[-1]] = value
-            
-            # Write back to file
-            with open(self.config_path, 'w', encoding='utf-8') as f:
-                yaml.dump(file_config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-            
-            logger.info(f"Config saved: {key} = {value}")
+            if not update_app_config_key_sync(key, value):
+                return False
+            logger.info("Config saved: %s = %s", key, redact_secret_value(key, value))
             return True
         except Exception as e:
             logger.error(f"Failed to save config: {e}")
@@ -361,82 +363,71 @@ class Config:
         
         
     def get_character_config(self, character_name: str) -> Dict[str, Any]:
-        """Load character configuration
-        
+        """Load character configuration from DB.
+
         Args:
-            character_name: Name of the character
-            
+            character_name: Name or slug of the character
+
         Returns:
-            Character configuration dictionary
+            Character configuration dictionary (YAML互換形式)
         """
-        # First, try direct character name lookup
-        characters_dir = self.root_dir / 'config' / 'characters'
-        
-        # Try exact match first
-        file_name = character_name.replace(' ', '_').lower() + '.yaml'
-        character_path = characters_dir / file_name
-        
-        if character_path.exists():
-            with open(character_path, 'r', encoding='utf-8') as f:
-                return yaml.safe_load(f)
-        
-        # If not found, try all available character files
-        for yaml_file in characters_dir.glob('*.yaml'):
-            try:
-                with open(yaml_file, 'r', encoding='utf-8') as f:
-                    char_config = yaml.safe_load(f)
-                    # Check if this character config matches the requested name
-                    if self._character_name_matches(character_name, char_config, yaml_file.stem):
-                        return char_config
-            except Exception:
-                continue
-                
+        db_config = self._get_character_from_db(character_name)
+        if db_config is not None:
+            return db_config
+
         raise FileNotFoundError(f"Character configuration not found: {character_name}")
-    
-    def _character_name_matches(self, requested_name: str, char_config: Dict[str, Any], file_stem: str) -> bool:
-        """Check if a character config matches the requested name"""
-        # Check against file stem
-        if requested_name.lower() == file_stem.lower():
-            return True
-            
-        # Check against name field in config
-        if 'name' in char_config and requested_name.lower() == char_config['name'].lower():
-            return True
-            
-        # Check against recognition aliases if they exist
-        if 'recognition_aliases' in char_config:
-            aliases = char_config['recognition_aliases']
-            if isinstance(aliases, list):
-                for alias in aliases:
-                    if requested_name.lower() == alias.lower():
-                        return True
-                        
-        return False
+
+    def _get_character_from_db(self, character_name: str) -> Optional[Dict[str, Any]]:
+        """DBからキャラクターを取得し、YAML互換形式に変換する。"""
+        try:
+            from .services.character_service import get_character_for_prompt, _run_sync
+            char = _run_sync(get_character_for_prompt(character_name))
+            if char is None:
+                return None
+            return self._db_char_to_yaml_format(char)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _db_char_to_yaml_format(char: Dict[str, Any]) -> Dict[str, Any]:
+        """DB Character dictをYAML互換形式に変換する。"""
+        return {
+            "name": char.get("name", ""),
+            "voice": {
+                "engine": char.get("voice_engine", ""),
+                "voice_name": char.get("voice_name", ""),
+                "voice_id": char.get("voice_id", ""),
+                "speaker_id": char.get("speaker_id"),
+                "parameters": char.get("voice_parameters", {}),
+            },
+            "personality": {
+                "greeting": char.get("greeting", ""),
+                "invalidContentReply": char.get("invalid_content_reply", ""),
+                "fallbackReply": char.get("fallback_reply", ""),
+                "goodbyeReply": char.get("goodbye_reply", ""),
+                "details": char.get("system_prompt", ""),
+            },
+            "recognition_aliases": char.get("recognition_aliases", []),
+            # DB固有フィールド（新機能用）
+            "_db_character": char,
+        }
     
     def get_available_characters(self) -> list[str]:
-        """Get list of available character names from config files"""
-        characters_dir = self.root_dir / 'config' / 'characters'
-        character_names = []
-        
-        for yaml_file in characters_dir.glob('*.yaml'):
-            try:
-                with open(yaml_file, 'r', encoding='utf-8') as f:
-                    char_config = yaml.safe_load(f)
-                    # Use the name field if available, otherwise use file stem
-                    name = char_config.get('name', yaml_file.stem)
-                    character_names.append(name)
-            except Exception:
-                # If config is invalid, use file stem as fallback
-                character_names.append(yaml_file.stem)
-                
-        return sorted(character_names)
+        """Get list of available character names from DB."""
+        try:
+            from .services.character_service import list_characters, _run_sync
+            db_chars = _run_sync(list_characters(enabled_only=True))
+            return sorted(c["name"] for c in db_chars)
+        except Exception:
+            default_character = self.get("default_character")
+            return [default_character] if default_character else []
             
     @property
     def llm_model(self) -> str:
         """Get LLM model name"""
         model = self.get('llm_model')
         if model is None:
-            raise ValueError("llm_model must be specified in config.yaml")
+            raise ValueError("llm_model must be specified in app configuration")
         return model
         
     @property
@@ -444,7 +435,7 @@ class Config:
         """Get default character name"""
         character = self.get('default_character')
         if character is None:
-            raise ValueError("default_character must be specified in config.yaml")
+            raise ValueError("default_character must be specified in app configuration")
         return character
         
     @property
@@ -452,7 +443,7 @@ class Config:
         """Get audio device index"""
         device = self.get('device_index')
         if device is None:
-            raise ValueError("device_index must be specified in config.yaml")
+            raise ValueError("device_index must be specified in app configuration")
         return device
         
     @property
@@ -495,11 +486,6 @@ class Config:
     def get_tts_settings(self) -> dict:
         """Get TTS settings"""
         return self.get('tts_settings', {})
-    
-    @property
-    def chat_mode(self) -> bool:
-        """Get chat mode setting"""
-        return self.get('chat_mode', False)
     
     def get_chat_window_config(self) -> dict:
         """Get chat window configuration

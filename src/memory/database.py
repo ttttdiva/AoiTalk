@@ -12,6 +12,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import NullPool
 from .models import Base
+from .migrations import run_migrations
 from .config import MemoryConfig
 from ..utils.windows_optimization import get_windows_optimizer
 
@@ -142,6 +143,10 @@ class DatabaseManager:
             print("[DatabaseManager] Docker environment detected, using connection retry logic")
             for attempt in range(max_retries):
                 try:
+                    try:
+                        await asyncio.to_thread(run_migrations, self.sync_database_url)
+                    except Exception as migration_error:
+                        print(f"[DatabaseManager] Alembic upgrade skipped: {migration_error}")
                     async with self.engine.begin() as conn:
                         await conn.run_sync(Base.metadata.create_all)
                     
@@ -172,6 +177,10 @@ class DatabaseManager:
         
         # Non-Docker environment - original logic
         try:
+            try:
+                await asyncio.to_thread(run_migrations, self.sync_database_url)
+            except Exception as migration_error:
+                print(f"[DatabaseManager] Alembic upgrade skipped: {migration_error}")
             # PostgreSQL initialization - no Windows-specific timeout wrapper
             # asyncpg already has its own timeout settings from connect_args
             async with self.engine.begin() as conn:

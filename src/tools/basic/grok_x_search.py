@@ -1,5 +1,4 @@
 """Grok (xAI) X search tool integration."""
-import asyncio
 import os
 import json
 from datetime import datetime
@@ -7,7 +6,7 @@ from typing import List, Optional
 
 import requests
 
-from ..external_llm_permission import check_permission
+from ..external_llm_permission import check_permission_sync
 
 from ..core import tool as function_tool
 
@@ -144,31 +143,11 @@ def grok_x_search(
     """Grok 4.1のX検索ツールで最新ポストを調査します"""
     print(f"[Tool] grok_x_search called: query='{query}' max_results={max_results}")
     
-    # Check user permission for external LLM API call
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(
-                    asyncio.run,
-                    check_permission(
-                        tool_name="grok_x_search",
-                        tool_args={"query": query, "max_results": max_results},
-                        description=f"X (Twitter) 検索: 「{query}」"
-                    )
-                )
-                approved = future.result(timeout=60)
-        else:
-            approved = asyncio.run(
-                check_permission(
-                    tool_name="grok_x_search",
-                    tool_args={"query": query, "max_results": max_results},
-                    description=f"X (Twitter) 検索: 「{query}」"
-                )
-            )
-    except RuntimeError:
-        approved = True  # Fallback to allow if async context unavailable
+    approved = check_permission_sync(
+        tool_name="grok_x_search",
+        tool_args={"query": query, "max_results": max_results},
+        description=f"X (Twitter) 検索: 「{query}」",
+    )
     
     if not approved:
         return "ユーザーによってX検索がキャンセルされました。"

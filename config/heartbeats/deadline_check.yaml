@@ -1,0 +1,17 @@
+name: deadline_check
+description: アクティブなプロジェクトの期限チェック。workspace_rootのknowledge/progress.mdとWBS（weekly_report_config.json経由）から期限が近い・超過したタスクを検出する。
+checklist: |
+  - アクティブなプロジェクトの workspace_root を確認する
+  - knowledge/progress.md を読み、「次のマイルストーン」セクションの日付を今日と比較する
+  - knowledge/activeContext.md を読み、「次のアクション」に期限が記載されているものを確認する
+  - knowledge/weekly_report_config.json が存在する場合、WBSファイルのパスを確認する
+  - WBSファイルが存在する場合、spreadsheet/openpyxl 等で期限3日以内・超過タスクを検出する
+  - 6.お客様受領資料/10_M.プロジェクト管理/ の課題管理表の期限も確認する
+  - 問題がある場合は、案件名・タスク名・期限・状況を簡潔に報告する
+interval_minutes: 60
+enabled: true
+active_hours:
+  start: "09:00"
+  end: "20:00"
+  timezone: Asia/Tokyo
+notify_channel: websocket

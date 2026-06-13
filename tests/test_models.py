@@ -51,22 +51,8 @@ class TestConfigModels:
         from src.models.config_models import BaseConfig
 
         cfg = BaseConfig()
-        assert cfg.mode == "terminal"
         assert cfg.default_character == "ずんだもん"
         assert cfg.debug is False
-
-    def test_base_config_invalid_mode(self):
-        from src.models.config_models import BaseConfig
-
-        with pytest.raises(ValidationError):
-            BaseConfig(mode="invalid_mode")
-
-    def test_base_config_valid_modes(self):
-        from src.models.config_models import BaseConfig
-
-        for mode in ("terminal", "voice_chat", "discord"):
-            cfg = BaseConfig(mode=mode)
-            assert cfg.mode == mode
 
     def test_llm_config(self):
         from src.models.config_models import LLMConfig

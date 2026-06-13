@@ -7,12 +7,12 @@ Used for managing chat history with PostgreSQL persistence.
 
 import uuid
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, delete, desc, and_
+from sqlalchemy import select, update, delete, desc, and_, or_
 from sqlalchemy.orm import selectinload
 
-from .models import ConversationSession, ConversationMessage
+from .models import ConversationSession, ConversationMessage, ConversationParticipant
 from .database import get_database_manager
 
 
@@ -38,7 +38,7 @@ class ConversationRepository:
     
     async def create_session(
         self,
-        user_id: str,
+        user_id: Union[str, List[str]],
         character_name: str,
         title: str = '',
         project_id: Optional[str] = None
@@ -78,7 +78,8 @@ class ConversationRepository:
     async def get_session_by_id(
         self,
         session_id: str,
-        with_messages: bool = False
+        with_messages: bool = False,
+        include_deleted: bool = False,
     ) -> Optional[ConversationSession]:
         """Get session by ID
         
@@ -91,11 +92,15 @@ class ConversationRepository:
         """
         session = await self._get_session()
         try:
-            query = select(ConversationSession).where(
-                ConversationSession.id == uuid.UUID(session_id)
-            )
+            conditions = [ConversationSession.id == uuid.UUID(session_id)]
+            if not include_deleted:
+                conditions.append(ConversationSession.deleted_at.is_(None))
+
+            query = select(ConversationSession).where(and_(*conditions))
+            options = [selectinload(ConversationSession.participants)]
             if with_messages:
-                query = query.options(selectinload(ConversationSession.messages))
+                options.append(selectinload(ConversationSession.messages))
+            query = query.options(*options)
             
             result = await session.execute(query)
             return result.scalar_one_or_none()
@@ -114,7 +119,7 @@ class ConversationRepository:
         """Get sessions for a user
         
         Args:
-            user_id: User ID
+            user_id: User ID or list of visible user IDs
             limit: Max number of sessions to return
             offset: Offset for pagination
             include_inactive: Include inactive sessions
@@ -128,8 +133,23 @@ class ConversationRepository:
         """
         session = await self._get_session()
         try:
+            user_ids = [user_id] if isinstance(user_id, str) else list(user_id)
+            participant_session_ids = (
+                select(ConversationParticipant.session_id)
+                .where(
+                    and_(
+                        ConversationParticipant.participant_type == "user",
+                        ConversationParticipant.participant_id.in_(user_ids),
+                        ConversationParticipant.status.in_(["joined", "invited"]),
+                    )
+                )
+                .scalar_subquery()
+            )
             conditions = [
-                ConversationSession.user_id == user_id,
+                or_(
+                    ConversationSession.user_id.in_(user_ids),
+                    ConversationSession.id.in_(participant_session_ids),
+                ),
                 ConversationSession.deleted_at.is_(None)  # ソフトデリートされていないもののみ
             ]
             
@@ -143,7 +163,9 @@ class ConversationRepository:
                     conditions.append(ConversationSession.project_id == uuid.UUID(project_id))
             # If project_id is None, don't add any project filter (return all)
             
-            query = select(ConversationSession).where(and_(*conditions))
+            query = select(ConversationSession).where(and_(*conditions)).options(
+                selectinload(ConversationSession.participants)
+            )
             
             if not include_inactive:
                 query = query.where(ConversationSession.is_active == True)
@@ -185,7 +207,9 @@ class ConversationRepository:
             if user_id:
                 conditions.append(ConversationSession.user_id == user_id)
             
-            query = select(ConversationSession).where(and_(*conditions))
+            query = select(ConversationSession).where(and_(*conditions)).options(
+                selectinload(ConversationSession.participants)
+            )
             query = query.order_by(desc(ConversationSession.last_activity))
             query = query.limit(limit).offset(offset)
             
@@ -213,7 +237,8 @@ class ConversationRepository:
         try:
             conditions = [
                 ConversationSession.user_id == user_id,
-                ConversationSession.is_active == True
+                ConversationSession.is_active == True,
+                ConversationSession.deleted_at.is_(None),
             ]
             if character_name:
                 conditions.append(ConversationSession.character_name == character_name)
@@ -231,6 +256,7 @@ class ConversationRepository:
     async def update_session(
         self,
         session_id: str,
+        touch_activity: bool = True,
         **kwargs
     ) -> bool:
         """Update session fields
@@ -244,11 +270,14 @@ class ConversationRepository:
         """
         session = await self._get_session()
         try:
-            kwargs['last_activity'] = datetime.utcnow()
+            if touch_activity:
+                kwargs['last_activity'] = datetime.utcnow()
             
-            stmt = update(ConversationSession).where(
-                ConversationSession.id == uuid.UUID(session_id)
-            ).values(**kwargs)
+            conditions = [ConversationSession.id == uuid.UUID(session_id)]
+            if "deleted_at" not in kwargs:
+                conditions.append(ConversationSession.deleted_at.is_(None))
+
+            stmt = update(ConversationSession).where(and_(*conditions)).values(**kwargs)
             
             result = await session.execute(stmt)
             await session.commit()
@@ -263,7 +292,8 @@ class ConversationRepository:
     async def update_session_title(
         self,
         session_id: str,
-        title: str
+        title: str,
+        source: Optional[str] = None,
     ) -> bool:
         """Update session title
         
@@ -274,9 +304,22 @@ class ConversationRepository:
         Returns:
             True if updated
         """
-        return await self.update_session(session_id, title=title)
+        updates: Dict[str, Any] = {"title": title}
+        if source:
+            existing = await self.get_session_by_id(session_id, with_messages=False)
+            current_context = getattr(existing, "context", None) if existing else None
+            context = (
+                dict(current_context) if isinstance(current_context, dict) else {}
+            )
+            context["title_generation"] = {"source": source}
+            updates["context"] = context
+        return await self.update_session(session_id, **updates)
     
-    async def deactivate_session(self, session_id: str) -> bool:
+    async def deactivate_session(
+        self,
+        session_id: str,
+        touch_activity: bool = True,
+    ) -> bool:
         """Mark session as inactive
         
         Args:
@@ -285,7 +328,11 @@ class ConversationRepository:
         Returns:
             True if updated
         """
-        return await self.update_session(session_id, is_active=False)
+        return await self.update_session(
+            session_id,
+            is_active=False,
+            touch_activity=touch_activity,
+        )
     
     async def delete_session(self, session_id: str) -> bool:
         """Soft delete a session (mark as deleted, actual deletion after 3 months)
@@ -329,7 +376,153 @@ class ConversationRepository:
             if not self._session:
                 await session.close()
     
+    # ─── Participant CRUD ────────────────────────────────────────────────
+
+    async def ensure_participant(
+        self,
+        session_id: str,
+        participant_type: str,
+        participant_id: str,
+        *,
+        display_name: str = "",
+        role: str = "member",
+        status: str = "joined",
+        auto_respond: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> ConversationParticipant:
+        """Create or update one conversation participant."""
+        session = await self._get_session()
+        try:
+            uid = uuid.UUID(session_id)
+            result = await session.execute(
+                select(ConversationParticipant).where(
+                    and_(
+                        ConversationParticipant.session_id == uid,
+                        ConversationParticipant.participant_type == participant_type,
+                        ConversationParticipant.participant_id == participant_id,
+                    )
+                )
+            )
+            participant = result.scalar_one_or_none()
+            if participant:
+                participant.display_name = display_name or participant.display_name
+                participant.role = role or participant.role
+                participant.status = status or participant.status
+                participant.auto_respond = auto_respond
+                participant.participant_metadata = metadata or participant.participant_metadata or {}
+            else:
+                participant = ConversationParticipant(
+                    session_id=uid,
+                    participant_type=participant_type,
+                    participant_id=participant_id,
+                    display_name=display_name,
+                    role=role,
+                    status=status,
+                    auto_respond=auto_respond,
+                    participant_metadata=metadata or {},
+                )
+                session.add(participant)
+            await session.commit()
+            await session.refresh(participant)
+            return participant
+        except Exception as e:
+            await session.rollback()
+            raise e
+        finally:
+            if not self._session:
+                await session.close()
+
+    async def get_session_participants(
+        self, session_id: str
+    ) -> List[ConversationParticipant]:
+        session = await self._get_session()
+        try:
+            result = await session.execute(
+                select(ConversationParticipant)
+                .where(ConversationParticipant.session_id == uuid.UUID(session_id))
+                .order_by(ConversationParticipant.created_at, ConversationParticipant.id)
+            )
+            return list(result.scalars().all())
+        finally:
+            if not self._session:
+                await session.close()
+
+    async def user_has_session_access(self, session_id: str, user_id: str) -> bool:
+        session = await self._get_session()
+        try:
+            result = await session.execute(
+                select(ConversationSession.id)
+                .where(
+                    and_(
+                        ConversationSession.id == uuid.UUID(session_id),
+                        ConversationSession.deleted_at.is_(None),
+                        or_(
+                            ConversationSession.user_id == user_id,
+                            ConversationSession.id.in_(
+                                select(ConversationParticipant.session_id).where(
+                                    and_(
+                                        ConversationParticipant.session_id
+                                        == uuid.UUID(session_id),
+                                        ConversationParticipant.participant_type
+                                        == "user",
+                                        ConversationParticipant.participant_id == user_id,
+                                        ConversationParticipant.status.in_(
+                                            ["joined", "invited"]
+                                        ),
+                                    )
+                                )
+                            ),
+                        ),
+                    )
+                )
+                .limit(1)
+            )
+            return result.scalar_one_or_none() is not None
+        finally:
+            if not self._session:
+                await session.close()
+
     # ─── Message CRUD ───────────────────────────────────────────────────
+
+    async def _ensure_linear_parent_links(
+        self, session: AsyncSession, session_id: str
+    ) -> None:
+        result = await session.execute(
+            select(ConversationMessage)
+            .where(ConversationMessage.session_id == uuid.UUID(session_id))
+            .order_by(ConversationMessage.created_at, ConversationMessage.id)
+        )
+        previous: Optional[ConversationMessage] = None
+        changed = False
+        for message in result.scalars().all():
+            if message.is_active_branch is None:
+                message.is_active_branch = True
+                changed = True
+            if previous and message.parent_message_id is None:
+                message.parent_message_id = previous.id
+                if message.branch_index is None:
+                    message.branch_index = 0
+                changed = True
+            if message.is_active_branch:
+                previous = message
+        if changed:
+            await session.flush()
+
+    async def _latest_active_message(
+        self, session: AsyncSession, session_id: str
+    ) -> Optional[ConversationMessage]:
+        result = await session.execute(
+            select(ConversationMessage)
+            .where(
+                and_(
+                    ConversationMessage.session_id == uuid.UUID(session_id),
+                    ConversationMessage.is_active_branch == True,
+                )
+            )
+            .order_by(desc(ConversationMessage.created_at), desc(ConversationMessage.id))
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
     
     async def add_message(
         self,
@@ -337,7 +530,10 @@ class ConversationRepository:
         role: str,
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
-        token_count: Optional[int] = None
+        token_count: Optional[int] = None,
+        sender_type: Optional[str] = None,
+        sender_id: Optional[str] = None,
+        sender_display_name: Optional[str] = None,
     ) -> ConversationMessage:
         """Add a message to a session
         
@@ -353,18 +549,45 @@ class ConversationRepository:
         """
         session = await self._get_session()
         try:
+            await self._ensure_linear_parent_links(session, session_id)
+            result = await session.execute(
+                select(ConversationSession.id).where(
+                    and_(
+                        ConversationSession.id == uuid.UUID(session_id),
+                        ConversationSession.deleted_at.is_(None),
+                    )
+                )
+            )
+            if result.scalar_one_or_none() is None:
+                raise ValueError("Session not found or deleted")
+
+            parent = await self._latest_active_message(session, session_id)
+            parent_message_id = parent.id if parent else None
+            branch_index = await self._count_branch_siblings(
+                session, session_id, str(parent_message_id) if parent_message_id else None
+            )
+
             message = ConversationMessage(
                 session_id=uuid.UUID(session_id),
                 role=role,
                 content=content,
+                parent_message_id=parent_message_id,
+                branch_index=branch_index,
+                is_active_branch=True,
                 message_metadata=metadata or {},
+                sender_type=sender_type,
+                sender_id=sender_id,
+                sender_display_name=sender_display_name,
                 token_count=token_count
             )
             session.add(message)
             
             # Update session message count and last activity
             stmt = update(ConversationSession).where(
-                ConversationSession.id == uuid.UUID(session_id)
+                and_(
+                    ConversationSession.id == uuid.UUID(session_id),
+                    ConversationSession.deleted_at.is_(None),
+                )
             ).values(
                 message_count=ConversationSession.message_count + 1,
                 last_activity=datetime.utcnow()
@@ -399,6 +622,7 @@ class ConversationRepository:
         """
         session = await self._get_session()
         try:
+            await self._ensure_linear_parent_links(session, session_id)
             query = select(ConversationMessage).where(
                 ConversationMessage.session_id == uuid.UUID(session_id)
             ).order_by(ConversationMessage.created_at)
@@ -495,6 +719,17 @@ class ConversationRepository:
         """
         session = await self._get_session()
         try:
+            result = await session.execute(
+                select(ConversationSession.id).where(
+                    and_(
+                        ConversationSession.id == uuid.UUID(session_id),
+                        ConversationSession.deleted_at.is_(None),
+                    )
+                )
+            )
+            if result.scalar_one_or_none() is None:
+                raise ValueError("Session not found or deleted")
+
             message = ConversationMessage(
                 session_id=uuid.UUID(session_id),
                 role=role,
@@ -509,7 +744,10 @@ class ConversationRepository:
             
             # Update session message count and last activity
             stmt = update(ConversationSession).where(
-                ConversationSession.id == uuid.UUID(session_id)
+                and_(
+                    ConversationSession.id == uuid.UUID(session_id),
+                    ConversationSession.deleted_at.is_(None),
+                )
             ).values(
                 message_count=ConversationSession.message_count + 1,
                 last_activity=datetime.utcnow()
@@ -546,6 +784,17 @@ class ConversationRepository:
         """
         session = await self._get_session()
         try:
+            # Repair old flat history before branching so descendants can be
+            # deactivated and branch siblings can be found consistently.
+            message_result = await session.execute(
+                select(ConversationMessage.session_id).where(
+                    ConversationMessage.id == uuid.UUID(message_id)
+                )
+            )
+            session_uuid = message_result.scalar_one_or_none()
+            if session_uuid:
+                await self._ensure_linear_parent_links(session, str(session_uuid))
+
             # Get the original message
             query = select(ConversationMessage).where(
                 ConversationMessage.id == uuid.UUID(message_id)
@@ -578,6 +827,14 @@ class ConversationRepository:
                 token_count=None  # Will be recalculated
             )
             session.add(new_message)
+            await session.execute(
+                update(ConversationSession)
+                .where(ConversationSession.id == original_msg.session_id)
+                .values(
+                    message_count=ConversationSession.message_count + 1,
+                    last_activity=datetime.utcnow(),
+                )
+            )
             await session.commit()
             await session.refresh(new_message)
             return new_message
@@ -659,6 +916,9 @@ class ConversationRepository:
             
             if not message:
                 return []
+
+            await self._ensure_linear_parent_links(session, str(message.session_id))
+            await session.refresh(message)
             
             # Find all siblings (same parent_message_id)
             if message.parent_message_id:
@@ -678,16 +938,7 @@ class ConversationRepository:
             result = await session.execute(sibling_query)
             siblings = list(result.scalars().all())
             
-            return [
-                {
-                    'id': str(s.id),
-                    'content': s.content,
-                    'branch_index': s.branch_index,
-                    'is_active_branch': s.is_active_branch,
-                    'created_at': s.created_at.isoformat() if s.created_at else None
-                }
-                for s in siblings
-            ]
+            return [s.to_dict() for s in siblings]
         finally:
             if not self._session:
                 await session.close()
@@ -708,6 +959,7 @@ class ConversationRepository:
         """
         session = await self._get_session()
         try:
+            await self._ensure_linear_parent_links(session, session_id)
             # Get the target message
             query = select(ConversationMessage).where(
                 ConversationMessage.id == uuid.UUID(target_message_id)
@@ -794,6 +1046,7 @@ class ConversationRepository:
         """
         session = await self._get_session()
         try:
+            await self._ensure_linear_parent_links(session, session_id)
             query = select(ConversationMessage).where(
                 and_(
                     ConversationMessage.session_id == uuid.UUID(session_id),

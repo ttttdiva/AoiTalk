@@ -4,7 +4,6 @@ Repository for User account management
 
 import bcrypt
 from datetime import datetime
-import secrets
 from typing import List, Optional, Dict, Any
 from uuid import UUID
 from sqlalchemy import select, delete, update, and_, or_
@@ -342,8 +341,8 @@ class UserRepository:
     async def ensure_admin_exists(
         session: AsyncSession,
         default_username: str = 'admin',
-        default_password: Optional[str] = None
-    ) -> str | None:
+        default_password: str = 'admin123'
+    ) -> bool:
         """Ensure at least one admin user exists
         
         Creates a default admin if no admin exists.
@@ -351,27 +350,24 @@ class UserRepository:
         Args:
             session: Database session
             default_username: Default admin username
-            default_password: Default admin password. If omitted, a random
-                password is generated.
+            default_password: Default admin password
             
         Returns:
-            Created password if admin was created, None if admin already existed
+            bool: True if admin was created, False if admin already existed
         """
         admin_count = await UserRepository.count_admins(session)
         
         if admin_count > 0:
             # Admin already exists
-            return None
-
-        password = default_password or secrets.token_urlsafe(16)
+            return False
         
         # Create default admin
         await UserRepository.create_user(
             session=session,
             username=default_username,
-            password=password,
+            password=default_password,
             role='admin',
             display_name='Administrator',
             is_password_reset_required=True  # Force password change
         )
-        return password
+        return True

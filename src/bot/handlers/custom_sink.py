@@ -2,7 +2,6 @@
 Custom AudioSink for discord-ext-voice-recv
 """
 
-import struct
 import logging
 from discord.ext import voice_recv
 
@@ -27,7 +26,7 @@ class UserAudioSink(voice_recv.AudioSink):
             user: Discord user/member object
             data: VoiceData object containing PCM audio
         """
-        logger.info(f"🎤 AudioSink.write called! User: {user.name if user else 'None'}")
+        logger.debug(f"AudioSink.write called. User: {user.name if user else 'None'}")
         
         if not user:
             logger.warning("write() called with None user")

@@ -19,8 +19,13 @@ logger = logging.getLogger(__name__)
 class ClaudeCLIBackend(CLIBackendBase):
     """Claude Code CLI backend implementation"""
 
-    def __init__(self, model: Optional[str] = None):
+    def __init__(
+        self,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+    ):
         self._model = model
+        self._reasoning_effort = reasoning_effort
         super().__init__()
 
     def get_cli_command(self, prompt: str) -> List[str]:
@@ -41,6 +46,10 @@ class ClaudeCLIBackend(CLIBackendBase):
         model = self._model or os.getenv("CLAUDE_MODEL")
         if model:
             cmd.extend(["--model", model])
+
+        reasoning_effort = self._reasoning_effort or os.getenv("CLAUDE_EFFORT")
+        if reasoning_effort:
+            cmd.extend(["--effort", reasoning_effort])
 
         # ターン数制限
         max_turns = os.getenv("CLAUDE_MAX_TURNS")

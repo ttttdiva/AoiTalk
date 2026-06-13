@@ -4,7 +4,7 @@ Heartbeatシステム - データモデル
 HeartbeatDefinition: 定期チェック条件の定義
 """
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -17,6 +17,7 @@ class HeartbeatDefinition:
     enabled: bool = True
     active_hours: Optional[Dict[str, str]] = None
     notify_channel: str = "websocket"
+    actions: List[Dict[str, Any]] = field(default_factory=list)
     source_path: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -28,6 +29,7 @@ class HeartbeatDefinition:
             "interval_minutes": self.interval_minutes,
             "enabled": self.enabled,
             "notify_channel": self.notify_channel,
+            "actions": self.actions,
         }
         if self.active_hours:
             result["active_hours"] = self.active_hours

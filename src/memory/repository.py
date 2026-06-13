@@ -96,19 +96,63 @@ class ConversationRepository:
 
             return sessions[0]
     
-    async def get_session_by_id(self, session_id: Union[str, uuid.UUID]) -> Optional[ConversationSession]:
+    async def get_session_by_id(
+        self,
+        session_id: Union[str, uuid.UUID],
+        with_messages: bool = False,
+    ) -> Optional[ConversationSession]:
         """Get session by ID
-        
+
         Args:
             session_id: Session identifier
-            
+            with_messages: Whether to eager load messages
+
         Returns:
             Optional[ConversationSession]: Session if exists
         """
+        if isinstance(session_id, str):
+            session_id = uuid.UUID(session_id)
+
         async with await get_db_session() as session:
             stmt = select(ConversationSession).where(ConversationSession.id == session_id)
+            if with_messages:
+                stmt = stmt.options(selectinload(ConversationSession.messages))
             result = await session.execute(stmt)
             return result.scalar_one_or_none()
+
+    async def update_session_title(
+        self,
+        session_id: Union[str, uuid.UUID],
+        title: str,
+        source: Optional[str] = None,
+    ) -> bool:
+        """Update the title for a conversation session."""
+        if isinstance(session_id, str):
+            session_id = uuid.UUID(session_id)
+
+        async with await get_db_session() as session:
+            values = {"title": title, "last_activity": datetime.utcnow()}
+            if source:
+                result = await session.execute(
+                    select(ConversationSession.context).where(
+                        ConversationSession.id == session_id
+                    )
+                )
+                current_context = result.scalar_one_or_none()
+                context = (
+                    dict(current_context) if isinstance(current_context, dict) else {}
+                )
+                context["title_generation"] = {"source": source}
+                values["context"] = context
+
+            stmt = (
+                update(ConversationSession)
+                .where(ConversationSession.id == session_id)
+                .values(**values)
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            return result.rowcount > 0
     
     async def update_session_activity(self, session_id: Union[str, uuid.UUID]):
         """Update session last activity timestamp
@@ -142,8 +186,93 @@ class ConversationRepository:
             await session.execute(stmt)
             await session.commit()
     
-    async def add_message(self, session_id: Union[str, uuid.UUID], role: str, content: str, 
-                         metadata: Optional[Dict[str, Any]] = None) -> ConversationMessage:
+    async def _ensure_linear_parent_links(
+        self, session: AsyncSession, session_id: Union[str, uuid.UUID]
+    ) -> None:
+        """Backfill parent links for old linear conversations.
+
+        Older chat rows were stored as a flat list. Branching needs each
+        message to point to the previous message in the active path.
+        """
+        stmt = (
+            select(ConversationMessage)
+            .where(ConversationMessage.session_id == session_id)
+            .order_by(ConversationMessage.created_at, ConversationMessage.id)
+        )
+        result = await session.execute(stmt)
+        messages = list(result.scalars().all())
+        previous: Optional[ConversationMessage] = None
+        changed = False
+        for message in messages:
+            if message.is_active_branch is None:
+                message.is_active_branch = True
+                changed = True
+            if previous and message.parent_message_id is None:
+                message.parent_message_id = previous.id
+                if message.branch_index is None:
+                    message.branch_index = 0
+                changed = True
+            if message.is_active_branch:
+                previous = message
+        if changed:
+            await session.flush()
+
+    async def _deactivate_branch_from_message(
+        self, session: AsyncSession, message_id: uuid.UUID
+    ) -> None:
+        await session.execute(
+            update(ConversationMessage)
+            .where(ConversationMessage.id == message_id)
+            .values(is_active_branch=False)
+        )
+        child_rows = await session.execute(
+            select(ConversationMessage).where(
+                ConversationMessage.parent_message_id == message_id,
+                ConversationMessage.is_active_branch == True,
+            )
+        )
+        for child in child_rows.scalars().all():
+            await self._deactivate_branch_from_message(session, child.id)
+
+    async def _latest_active_message(
+        self, session: AsyncSession, session_id: Union[str, uuid.UUID]
+    ) -> Optional[ConversationMessage]:
+        result = await session.execute(
+            select(ConversationMessage)
+            .where(
+                ConversationMessage.session_id == session_id,
+                ConversationMessage.is_active_branch == True,
+            )
+            .order_by(desc(ConversationMessage.created_at), desc(ConversationMessage.id))
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    async def _count_siblings(
+        self,
+        session: AsyncSession,
+        session_id: Union[str, uuid.UUID],
+        parent_message_id: Optional[uuid.UUID],
+    ) -> int:
+        conditions = [ConversationMessage.session_id == session_id]
+        if parent_message_id:
+            conditions.append(ConversationMessage.parent_message_id == parent_message_id)
+        else:
+            conditions.append(ConversationMessage.parent_message_id.is_(None))
+        result = await session.execute(select(func.count()).where(and_(*conditions)))
+        return int(result.scalar() or 0)
+
+    async def add_message(
+        self,
+        session_id: Union[str, uuid.UUID],
+        role: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        branch_from_message_id: Optional[str] = None,
+        sender_type: Optional[str] = None,
+        sender_id: Optional[str] = None,
+        sender_display_name: Optional[str] = None,
+    ) -> ConversationMessage:
         """Add message to conversation session
         
         Args:
@@ -176,12 +305,45 @@ class ConversationRepository:
                 embedding_data = None
         
         async with await get_db_session() as session:
+            await self._ensure_linear_parent_links(session, session_id)
+
+            parent_message_id: Optional[uuid.UUID] = None
+            branch_index = 0
+            if branch_from_message_id and role == "user":
+                original_id = uuid.UUID(branch_from_message_id)
+                original_result = await session.execute(
+                    select(ConversationMessage).where(
+                        ConversationMessage.id == original_id,
+                        ConversationMessage.session_id == session_id,
+                    )
+                )
+                original = original_result.scalar_one_or_none()
+                if original is None:
+                    raise ValueError(f"Message not found: {branch_from_message_id}")
+                parent_message_id = original.parent_message_id
+                await self._deactivate_branch_from_message(session, original.id)
+                branch_index = await self._count_siblings(
+                    session, session_id, parent_message_id
+                )
+            else:
+                parent = await self._latest_active_message(session, session_id)
+                parent_message_id = parent.id if parent else None
+                branch_index = await self._count_siblings(
+                    session, session_id, parent_message_id
+                )
+
             message = ConversationMessage(
                 session_id=session_id,
                 role=role,
                 content=content,
                 # embedding removed - using Qdrant for vector search instead
                 message_metadata=metadata or {},
+                sender_type=sender_type,
+                sender_id=sender_id,
+                sender_display_name=sender_display_name,
+                parent_message_id=parent_message_id,
+                branch_index=branch_index,
+                is_active_branch=True,
                 token_count=len(content.split())  # Simple token estimation
             )
             
@@ -192,7 +354,10 @@ class ConversationRepository:
                 update(ConversationSession).where(
                     ConversationSession.id == session_id
                 ).values(
-                    message_count=ConversationSession.message_count + 1,
+                    message_count=func.coalesce(
+                        ConversationSession.message_count, 0
+                    )
+                    + 1,
                     last_activity=datetime.utcnow()
                 )
             )
@@ -221,7 +386,25 @@ class ConversationRepository:
             
             result = await session.execute(stmt)
             return result.scalars().all()
-    
+
+    async def get_active_branch_messages(self, session_id: Union[str, uuid.UUID]) -> List[ConversationMessage]:
+        """Get messages on the currently active branch for a session."""
+        if isinstance(session_id, str):
+            session_id = uuid.UUID(session_id)
+
+        async with await get_db_session() as session:
+            await self._ensure_linear_parent_links(session, session_id)
+            stmt = (
+                select(ConversationMessage)
+                .where(
+                    ConversationMessage.session_id == session_id,
+                    ConversationMessage.is_active_branch == True,
+                )
+                .order_by(ConversationMessage.created_at, ConversationMessage.id)
+            )
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
     async def get_recent_messages(self, session_id: Union[str, uuid.UUID], count: int) -> List[ConversationMessage]:
         """Get recent messages from a session
         

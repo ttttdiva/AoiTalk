@@ -5,6 +5,7 @@ Discord voice channel handler with voice recognition and TTS support
 import asyncio
 import logging
 import io
+import time
 import wave
 from typing import Dict, Optional, Set
 from collections import defaultdict
@@ -12,6 +13,8 @@ import numpy as np
 
 import discord
 from discord.ext import voice_recv
+
+from ...runtime_features import runtime_feature_manager
 from .custom_sink import UserAudioSink
 from .speech_detector import SpeechDetector
 
@@ -32,9 +35,12 @@ class VoiceHandler:
     def __init__(self, config: Config):
         self.config = config
         self.voice_connections: Dict[int, discord.VoiceClient] = {}  # guild_id -> VoiceClient
+        self._connection_locks: Dict[int, asyncio.Lock] = {}
+        self.audio_sinks: Dict[int, UserAudioSink] = {}  # guild_id -> active audio sink
         self.user_audio_buffers: Dict[int, Dict[int, bytearray]] = {}  # guild_id -> {user_id: audio_buffer}
         self.user_speaking_states: Dict[int, Dict[int, bool]] = {}  # guild_id -> {user_id: is_speaking}
         self.active_sessions: Dict[int, Set[int]] = {}  # guild_id -> set of user_ids
+        self.guild_empty_since: Dict[int, float] = {}  # guild_id -> monotonic timestamp when VC became empty
         self.user_last_speech_time: Dict[int, Dict[int, float]] = {}  # guild_id -> {user_id: timestamp}
         self.user_processing_lock: Dict[int, Dict[int, asyncio.Lock]] = {}  # guild_id -> {user_id: lock}
         self.user_processing_queue: Dict[int, Dict[int, asyncio.Queue]] = {}  # guild_id -> {user_id: queue}
@@ -42,16 +48,22 @@ class VoiceHandler:
         self._main_loop = None  # Store the main event loop
         self._bot_instance = None  # Store bot instance reference
         
-        # Initialize audio components
+        # Initialize audio components lazily. Loading Whisper here delays Discord login.
         speech_config = config.get('speech_recognition', {})
-        current_engine = speech_config.get('current_engine', 'whisper')
-        self.audio_manager = AudioManager(current_engine, speech_config)
+        self._speech_config = speech_config
+        self._current_speech_engine = speech_config.get('current_engine', 'whisper')
+        self.audio_manager: Optional[AudioManager] = None
+        self._audio_manager_lock = asyncio.Lock()
         self.tts_manager = TTSManager(config.config)  # Pass the underlying config dict
         self._tts_initialized = False
         
         # Voice detection parameters
-        self.sample_rate = 48000  # Discord's sample rate
-        self.channels = 2  # Discord uses stereo
+        self.sample_rate = int(config.get('discord.voice.sample_rate', 48000))
+        self.channels = int(config.get('discord.voice.channels', 2))
+        if self.channels not in (1, 2):
+            logger.warning("Invalid discord.voice.channels '%s'; falling back to stereo", self.channels)
+            self.channels = 2
+        self.auto_disconnect_timeout = int(config.get('discord.voice.auto_disconnect_timeout', 300))
         self.silence_threshold = config.get('speech_recognition.silence_threshold', 15.0)
         self.silence_duration = config.get('speech_recognition.silence_duration', 1.5)
         
@@ -92,6 +104,8 @@ class VoiceHandler:
             # Remove from active sessions
             if guild_id in self.active_sessions:
                 self.active_sessions[guild_id].discard(member.id)
+                if not self.active_sessions[guild_id]:
+                    self.guild_empty_since[guild_id] = time.monotonic()
             
         # ユーザーがボイスチャンネルに参加した場合
         elif not before.channel and after.channel:
@@ -102,6 +116,7 @@ class VoiceHandler:
             if guild_id not in self.active_sessions:
                 self.active_sessions[guild_id] = set()
             self.active_sessions[guild_id].add(member.id)
+            self.guild_empty_since.pop(guild_id, None)
             
         # ユーザーがミュート/アンミュートした場合
         elif before.self_mute != after.self_mute:
@@ -109,7 +124,25 @@ class VoiceHandler:
                 logger.debug(f"User {member.name} muted themselves")
             else:
                 logger.debug(f"User {member.name} unmuted themselves")
-    
+
+    def _get_connection_lock(self, guild_id: int) -> asyncio.Lock:
+        lock = self._connection_locks.get(guild_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._connection_locks[guild_id] = lock
+        return lock
+
+    def _store_voice_connection(self, channel: discord.VoiceChannel, voice_client: discord.VoiceClient) -> None:
+        guild_id = channel.guild.id
+        self.voice_connections[guild_id] = voice_client
+        self.active_sessions[guild_id] = {
+            member.id for member in channel.members if not member.bot
+        }
+        if self.active_sessions[guild_id]:
+            self.guild_empty_since.pop(guild_id, None)
+        else:
+            self.guild_empty_since[guild_id] = time.monotonic()
+
     async def connect_voice_channel(self, channel: discord.VoiceChannel) -> Optional[discord.VoiceClient]:
         """Connect to a voice channel with receive support
         
@@ -119,26 +152,62 @@ class VoiceHandler:
         Returns:
             VoiceClient or None
         """
+        async with self._get_connection_lock(channel.guild.id):
+            return await self._connect_voice_channel_locked(channel)
+
+    async def _connect_voice_channel_locked(self, channel: discord.VoiceChannel) -> Optional[discord.VoiceClient]:
         try:
-            # Initialize TTS if not already done
-            if not self._tts_initialized:
-                await self._initialize_tts()
-            
             # Store the main event loop
             self._main_loop = asyncio.get_running_loop()
             logger.info(f"Attempting to connect to voice channel: {channel.name}")
-            
+
+            existing = self.voice_connections.get(channel.guild.id)
+            if existing and existing.is_connected():
+                if getattr(existing, "channel", None) != channel:
+                    logger.info("Moving existing voice connection to channel: %s", channel.name)
+                    await existing.move_to(channel)
+                self._store_voice_connection(channel, existing)
+                if not await self.ensure_listening(channel.guild.id):
+                    logger.warning(
+                        "Voice connection is active but receive listening did not start for guild %s",
+                        channel.guild.id,
+                    )
+                return existing
+
+            guild_voice_client = channel.guild.voice_client
+            if guild_voice_client and guild_voice_client.is_connected():
+                if not hasattr(guild_voice_client, "listen"):
+                    logger.warning(
+                        "Existing guild voice client lacks receive support; reconnecting with VoiceRecvClient"
+                    )
+                    await guild_voice_client.disconnect(force=True)
+                else:
+                    if getattr(guild_voice_client, "channel", None) != channel:
+                        logger.info("Moving guild voice client to channel: %s", channel.name)
+                        await guild_voice_client.move_to(channel)
+                    self._store_voice_connection(channel, guild_voice_client)
+                    if not await self.ensure_listening(channel.guild.id):
+                        logger.warning(
+                            "Voice connection is active but receive listening did not start for guild %s",
+                            channel.guild.id,
+                        )
+                    return guild_voice_client
+
             # Connect to voice channel with voice receive support
             # Reverting self_deaf=True because we need to receive audio
-            voice_client = await channel.connect(cls=voice_recv.VoiceRecvClient)
+            voice_client = await channel.connect(
+                cls=voice_recv.VoiceRecvClient,
+                timeout=20.0,
+                reconnect=False,
+            )
             logger.info(f"Voice client type: {type(voice_client)}")
-            
+
             # Store connection
-            self.voice_connections[channel.guild.id] = voice_client
-            
+            self._store_voice_connection(channel, voice_client)
+
             # Add a small delay to ensure connection is stable before listening
             await asyncio.sleep(1.0)
-            
+
             # Check connection status
             if not voice_client.is_connected():
                 logger.warning("Voice client reports not connected after connect()")
@@ -148,28 +217,15 @@ class VoiceHandler:
                     raise Exception("Failed to establish voice connection (is_connected() returned False)")
 
             # Set up voice receive callback
-            logger.info(f"Checking for listen method on voice_client...")
-            if hasattr(voice_client, 'listen'):
-                logger.info(f"listen method found, creating audio sink...")
-                # Create custom audio sink with callback
-                audio_sink = UserAudioSink(self)
-                logger.info(f"Audio sink created: {type(audio_sink)}")
-                
-                try:
-                    voice_client.listen(audio_sink)
-                    logger.info(f"Voice receive listening started successfully")
-                except Exception as e:
-                    logger.error(f"Failed to start listening: {e}")
-                    # If listening fails, we should probably disconnect
-                    await voice_client.disconnect()
-                    raise e
-            else:
-                logger.error(f"Voice client does not have 'listen' method!")
-                logger.error(f"Available methods: {dir(voice_client)}")
-            
+            if not await self.ensure_listening(channel.guild.id):
+                logger.warning(
+                    "Voice connection is active but receive listening did not start for guild %s",
+                    channel.guild.id,
+                )
+
             logger.info(f"Connected to voice channel: {channel.name} with voice receive support")
             return voice_client
-            
+
         except Exception as e:
             logger.error(f"Failed to connect to voice channel: {e}")
             logger.error(f"Exception type: {type(e)}")
@@ -200,8 +256,7 @@ class VoiceHandler:
             try:
                 voice_client = self.voice_connections[guild_id]
                 # Stop listening before disconnect
-                if hasattr(voice_client, 'stop_listening'):
-                    voice_client.stop_listening()
+                self.stop_listening(guild_id)
                 await voice_client.disconnect()
                 del self.voice_connections[guild_id]
                 
@@ -210,10 +265,89 @@ class VoiceHandler:
                     del self.user_audio_buffers[guild_id]
                 if guild_id in self.active_sessions:
                     del self.active_sessions[guild_id]
+                self.guild_empty_since.pop(guild_id, None)
+                self.audio_sinks.pop(guild_id, None)
                     
                 logger.info(f"Disconnected from voice channel in guild {guild_id}")
             except Exception as e:
                 logger.error(f"Error disconnecting from voice channel: {e}")
+
+    def is_listening(self, guild_id: int) -> bool:
+        """Return whether the Discord voice client is currently receiving audio."""
+        voice_client = self.voice_connections.get(guild_id)
+        if not voice_client or not voice_client.is_connected():
+            return False
+
+        if hasattr(voice_client, 'is_listening'):
+            try:
+                return bool(voice_client.is_listening())
+            except Exception as exc:
+                logger.warning("Failed to query Discord listening state: %s", exc)
+
+        return guild_id in self.audio_sinks
+
+    async def ensure_listening(self, guild_id: int) -> bool:
+        """Ensure voice receive is active for an existing voice connection."""
+        voice_client = self.voice_connections.get(guild_id)
+        if not voice_client or not voice_client.is_connected():
+            logger.warning("Cannot start listening: no active voice connection for guild %s", guild_id)
+            return False
+
+        if self.is_listening(guild_id):
+            return True
+
+        if not hasattr(voice_client, 'listen'):
+            logger.error("Voice client does not have a listen method. Type=%s", type(voice_client))
+            return False
+
+        try:
+            audio_sink = UserAudioSink(self)
+            voice_client.listen(audio_sink)
+            self.audio_sinks[guild_id] = audio_sink
+            logger.info("Discord voice receive listening started for guild %s", guild_id)
+            return True
+        except Exception as exc:
+            logger.error("Failed to start Discord voice receive listening: %s", exc, exc_info=True)
+            self.audio_sinks.pop(guild_id, None)
+            return False
+
+    def stop_listening(self, guild_id: int) -> bool:
+        """Stop voice receive for a guild without disconnecting the bot."""
+        voice_client = self.voice_connections.get(guild_id)
+        if not voice_client or not voice_client.is_connected():
+            self.audio_sinks.pop(guild_id, None)
+            return False
+
+        stopped = False
+        if hasattr(voice_client, 'stop_listening'):
+            try:
+                if not hasattr(voice_client, 'is_listening') or voice_client.is_listening():
+                    voice_client.stop_listening()
+                    stopped = True
+            except Exception as exc:
+                logger.warning("Failed to stop Discord voice receive listening: %s", exc)
+        elif guild_id in self.audio_sinks:
+            logger.warning("Voice client cannot stop listening explicitly. Type=%s", type(voice_client))
+
+        self.audio_sinks.pop(guild_id, None)
+        return stopped
+
+    def get_connection_status(self, guild_id: int) -> dict:
+        """Return a compact voice/TTS status snapshot for Discord commands."""
+        voice_client = self.voice_connections.get(guild_id)
+        connected = bool(voice_client and voice_client.is_connected())
+        channel_name = None
+        if connected and getattr(voice_client, 'channel', None):
+            channel_name = voice_client.channel.name
+
+        return {
+            "connected": connected,
+            "channel_name": channel_name,
+            "listening": self.is_listening(guild_id),
+            "active_users": len(self.active_sessions.get(guild_id, set())),
+            "tts_engine": self.tts_manager.current_engine,
+            "available_tts_engines": list(self.tts_manager.engines.keys()),
+        }
     
     def _on_voice_receive(self, data: bytes, user):
         """Callback for voice data reception
@@ -410,9 +544,11 @@ class VoiceHandler:
                 framerate = wav_file.getframerate()
                 frames = wav_file.readframes(wav_file.getnframes())
             
+            audio_manager = await self._ensure_audio_manager()
+
             # Use existing speech recognition system
             result = await asyncio.to_thread(
-                self.audio_manager.recognize,
+                audio_manager.recognize,
                 frames,  # raw PCM data
                 sample_rate=framerate,
                 channels=channels,
@@ -421,15 +557,30 @@ class VoiceHandler:
             
             if result:
                 # Apply hallucination filter
-                if self.audio_manager.hallucination_filter.is_hallucination(result):
+                if audio_manager.hallucination_filter.is_hallucination(result):
                     logger.debug(f"Filtered hallucination: {result}")
                     return None
                 return result
-                
+
         except Exception as e:
             logger.error(f"Speech recognition error: {e}")
-            
+
         return None
+
+    async def _ensure_audio_manager(self) -> AudioManager:
+        """Initialize the ASR manager on first real audio input."""
+        if self.audio_manager is not None:
+            return self.audio_manager
+
+        async with self._audio_manager_lock:
+            if self.audio_manager is None:
+                logger.info("Initializing Discord ASR engine: %s", self._current_speech_engine)
+                self.audio_manager = await asyncio.to_thread(
+                    AudioManager,
+                    self._current_speech_engine,
+                    self._speech_config,
+                )
+        return self.audio_manager
     
     async def _process_voice_command(self, bot, session, text: str, guild_id: int, user_id: int):
         """Process voice command and generate response
@@ -500,13 +651,13 @@ class VoiceHandler:
                             else:
                                 logger.warning("No suitable text channel found for response")
                     
-                    # Generate and play TTS audio
-                    character = session.character or self.config.get('default_character', 'ずんだもん')
-                    audio_data = await self._generate_tts(response, character)
-                    
-                    if audio_data:
-                        # Play audio in voice channel
-                        await self.play_audio(guild_id, audio_data)
+                    # Generate and play TTS audio when Discord VC output is enabled.
+                    if runtime_feature_manager.feature_enabled("discord_vc_output"):
+                        character = session.character or self.config.get('default_character', 'ずんだもん')
+                        audio_data = await self._generate_tts(response, character)
+
+                        if audio_data:
+                            await self.play_audio(guild_id, audio_data)
                         
         except Exception as e:
             logger.error(f"Error processing voice command: {e}")
@@ -522,6 +673,9 @@ class VoiceHandler:
             Audio data or None
         """
         try:
+            if not self._tts_initialized:
+                await self._initialize_tts()
+
             logger.info(f"Generating TTS for character: {character}")
             logger.info(f"TTS Manager state - Current engine: {self.tts_manager.current_engine}, Available engines: {list(self.tts_manager.engines.keys())}")
             
@@ -624,43 +778,95 @@ class VoiceHandler:
     async def _initialize_tts(self):
         """Initialize TTS engine based on configuration"""
         try:
-            # Default to VOICEVOX if not specified
-            default_engine = 'voicevox'
-            
-            logger.info(f"Initializing TTS with default engine: {default_engine}")
-            
-            # Initialize VOICEVOX engine (most commonly used)
-            if default_engine == 'voicevox':
-                # Try to get VOICEVOX path from multiple possible locations
-                voicevox_path = (self.config.get('voicevox_engine_path') or 
-                               self.config.get('tts_settings.voicevox.path') or
-                               self.config.get('tts.voicevox_path'))
-                
-                logger.info(f"VOICEVOX path: {voicevox_path}")
-                if voicevox_path:
-                    engine = await self.tts_manager.create_voicevox_engine(voicevox_path)
-                    if engine:
-                        self.tts_manager.register_engine('voicevox', engine)
-                        self.tts_manager.set_engine('voicevox')
-                        logger.info(f"VOICEVOX TTS engine initialized successfully. Current engine: {self.tts_manager.current_engine}")
-                        logger.info(f"Available engines: {list(self.tts_manager.engines.keys())}")
-                    else:
-                        logger.warning("Failed to initialize VOICEVOX engine")
-                else:
-                    logger.warning("VOICEVOX path not configured")
-            
             # Register character configurations
             characters = self.config.get('characters', {})
             logger.info(f"Registering {len(characters)} character(s)")
             for char_name, char_config in characters.items():
                 self.tts_manager.register_character(char_name, char_config)
                 logger.info(f"Registered character: {char_name}")
-            
+
+            preferred_engine = self._get_preferred_tts_engine()
+            logger.info("Initializing Discord TTS with preferred engine: %s", preferred_engine)
+            engine_initialized = await self._initialize_tts_engine(preferred_engine)
+
+            if not engine_initialized and preferred_engine != 'voicevox':
+                logger.warning("Preferred TTS engine '%s' failed; trying VOICEVOX fallback", preferred_engine)
+                engine_initialized = await self._initialize_tts_engine('voicevox')
+
+            if not engine_initialized:
+                logger.warning("Discord TTS was not initialized. Voice recognition still works, but replies will be text-only.")
+
             self._tts_initialized = True
             logger.info("TTS initialization completed")
-                
+
         except Exception as e:
             logger.error(f"Error initializing TTS: {e}", exc_info=True)
+            self._tts_initialized = True
+
+    def _get_preferred_tts_engine(self) -> str:
+        """Resolve the TTS engine Discord voice replies should use."""
+        configured = (
+            self.config.get('discord.voice.tts_engine')
+            or self.config.get('tts.engine')
+            or self.config.get('tts.default_engine')
+        )
+        if configured:
+            return str(configured)
+
+        default_character = self.config.get('default_character')
+        if default_character:
+            character_config = self.config.get_character_config(default_character)
+            voice_config = character_config.get('voice', {}) if character_config else {}
+            if voice_config.get('engine'):
+                return str(voice_config['engine'])
+
+        return 'voicevox'
+
+    async def _initialize_tts_engine(self, engine_name: str) -> bool:
+        """Initialize one TTS engine by name."""
+        try:
+            engine = None
+            if engine_name == 'voicevox':
+                engine_path = self.config.voicevox_path
+                logger.info("VOICEVOX path: %s", engine_path)
+                engine = await self.tts_manager.create_voicevox_engine(engine_path)
+            elif engine_name == 'aivisspeech':
+                engine_path = (
+                    self.config.get('aivisspeech_engine_path')
+                    or self.config.get('tts_settings.aivisspeech.engine_path')
+                    or self.config.get('tts_settings.aivisspeech.path')
+                )
+                if not engine_path:
+                    logger.warning("AivisSpeech engine path is not configured")
+                    return False
+                engine = await self.tts_manager.create_aivisspeech_engine(engine_path)
+            elif engine_name == 'irodori_tts':
+                engine = await self.tts_manager.create_irodori_tts_engine()
+            elif engine_name == 'voiceroid':
+                character_config = self.config.get_character_config(self.config.get('default_character'))
+                engine = await self.tts_manager.create_voiceroid_engine(character_config)
+            elif engine_name == 'aivoice':
+                engine_path = self.config.get('aivoice_engine_path') or self.config.get('tts_settings.aivoice.engine_path')
+                engine = await self.tts_manager.create_aivoice_engine(engine_path)
+            elif engine_name == 'cevio':
+                engine = await self.tts_manager.create_cevio_engine()
+            elif engine_name == 'nijivoice':
+                engine = await self.tts_manager.create_nijivoice_engine(self.config.get('nijivoice_api_key'))
+            else:
+                logger.warning("Unsupported Discord TTS engine: %s", engine_name)
+                return False
+
+            if not engine:
+                logger.warning("Failed to initialize %s TTS engine", engine_name)
+                return False
+
+            self.tts_manager.register_engine(engine_name, engine)
+            self.tts_manager.set_engine(engine_name)
+            logger.info("Initialized %s TTS engine successfully", engine_name)
+            return True
+        except Exception as exc:
+            logger.error("Error initializing %s TTS engine: %s", engine_name, exc, exc_info=True)
+            return False
     
     async def _process_user_queue(self, guild_id: int, user_id: int):
         """Process queued speech data for a user"""
@@ -698,8 +904,10 @@ class VoiceHandler:
         self.user_audio_buffers.clear()
         self.user_speaking_states.clear()
         self.active_sessions.clear()
+        self.guild_empty_since.clear()
         self.user_processing_queue.clear()
         self.processing_tasks.clear()
+        self.audio_sinks.clear()
         logger.info("Voice handler cleanup complete")
     
     async def _periodic_timeout_check(self):
@@ -746,7 +954,37 @@ class VoiceHandler:
                                 self.processing_tasks[guild_id][user_id] = asyncio.create_task(
                                     self._process_user_queue(guild_id, user_id)
                                 )
-                        
+
+                await self._disconnect_empty_voice_channels()
+
             except Exception as e:
                 logger.error(f"Error in timeout check: {e}")
                 await asyncio.sleep(1)  # Wait longer on error
+
+    async def _disconnect_empty_voice_channels(self):
+        """Disconnect from empty voice channels after the configured timeout."""
+        if self.auto_disconnect_timeout <= 0:
+            return
+
+        now = time.monotonic()
+        for guild_id, voice_client in list(self.voice_connections.items()):
+            if not voice_client or not voice_client.is_connected():
+                continue
+
+            channel = getattr(voice_client, 'channel', None)
+            members = {
+                member.id for member in getattr(channel, 'members', [])
+                if not getattr(member, 'bot', False)
+            }
+            self.active_sessions[guild_id] = members
+            if members:
+                self.guild_empty_since.pop(guild_id, None)
+                continue
+
+            empty_since = self.guild_empty_since.setdefault(guild_id, now)
+            if now - empty_since >= self.auto_disconnect_timeout:
+                logger.info(
+                    "Auto-disconnecting from empty Discord voice channel in guild %s",
+                    guild_id
+                )
+                await self.disconnect_voice_channel(guild_id)

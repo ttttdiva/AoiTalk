@@ -3,7 +3,7 @@ Pydantic models for configuration
 """
 
 from typing import Dict, Any, Optional, List
-from pydantic import BaseModel, Field, field_validator, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class LLMConfig(BaseModel):
@@ -54,22 +54,13 @@ class MemoryConfig(BaseModel):
 
 class BaseConfig(BaseModel):
     """Base configuration model"""
-    mode: str = Field(default="terminal", description="Application mode")
     default_character: str = Field(default="ずんだもん", description="Default character")
     debug: bool = Field(default=False, description="Debug mode")
-    
+
     # Sub-configurations
     llm: LLMConfig = Field(default_factory=LLMConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
     speech_recognition: SpeechRecognitionConfig = Field(default_factory=SpeechRecognitionConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
-    
+
     model_config = ConfigDict(extra="allow")
-        
-    @field_validator('mode')
-    @classmethod
-    def validate_mode(cls, v):
-        valid_modes = ['terminal', 'voice_chat', 'discord']
-        if v not in valid_modes:
-            raise ValueError(f'Mode must be one of {valid_modes}')
-        return v

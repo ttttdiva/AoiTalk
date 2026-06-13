@@ -10,8 +10,6 @@ from typing import List, Optional, Tuple
 
 from openai import OpenAI
 
-from ...tools.basic.web_search import web_search_impl
-
 logger = logging.getLogger(__name__)
 
 
@@ -26,6 +24,8 @@ class NanobananaProService:
     def fetch_summary(self) -> str:
         """Fetch summary text via web_search tool"""
         logger.info("Fetching Nanobanana Pro summary via web_search tool")
+        from ...tools.basic.web_search import web_search_impl
+
         result = web_search_impl(self.SEARCH_QUERY)
         if not isinstance(result, str) or not result.strip():
             return "Nanobanana Proの最新情報を取得できませんでした。"

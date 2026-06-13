@@ -1,62 +1,77 @@
 """
-Web search tool for Gemini models using OpenAI's gpt-4o as proxy
+Web search tool for normal chat agents.
+
+The backend can use either OpenAI's hosted WebSearchTool or the local
+lightweight search service, depending on `search.provider`.
 """
 import os
 import asyncio
 from ..core import tool as function_tool
 
-from ..external_llm_permission import check_permission
+from ..external_llm_permission import check_permission_sync
+from ...services.quick_search_service import (
+    SEARCH_PROVIDER_LOCAL,
+    get_search_provider,
+    local_web_search,
+)
 
 
-def web_search_impl(query: str) -> str:
-    """Web検索を実行します（純粋関数版）
-    
+def _load_default_config():
+    try:
+        from ...config import Config
+
+        return Config()
+    except Exception:
+        return None
+
+
+def _run_async(coro_factory, timeout: int = 45):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro_factory())
+
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(lambda: asyncio.run(coro_factory()))
+        return future.result(timeout=timeout)
+
+
+def openai_web_search_impl(query: str) -> str:
+    """OpenAI APIのHosted WebSearchToolで検索します。
+
     Args:
         query: 検索クエリ
-        
+
     Returns:
         検索結果のサマリー
     """
     print(f"[Tool] web_search が呼び出されました: query='{query}'")
-    
+
     try:
         # OpenAI APIキーを確認
         api_key = os.getenv('OPENAI_API_KEY')
         if not api_key:
             return "Web検索を使用するにはOPENAI_API_KEYが必要です。"
-        
-        # OpenAI Agents SDKを使ってWeb検索を実行
+
+        # OpenAI Agents SDKを使って検索を実行
         try:
             from agents import Agent, WebSearchTool, Runner
-            
-            # WebSearchTool付きのAgentを作成
+
             agent = Agent(
                 name="web-search-agent",
                 model="gpt-4o",
                 tools=[WebSearchTool()],
                 instructions="あなたはWeb検索アシスタントです。与えられたクエリについて最新の情報を検索し、簡潔で正確な回答を日本語で提供してください。"
             )
-            
-            # Runnerを使って検索を実行（非同期）
+
             async def run_search():
                 runner = Runner()
                 return await runner.run(agent, f"以下について検索して教えてください：{query}")
-            
-            # 同期実行
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # イベントループが既に実行中の場合
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
-                        future = executor.submit(asyncio.run, run_search())
-                        response = future.result(timeout=30)
-                else:
-                    response = asyncio.run(run_search())
-            except RuntimeError:
-                # asyncio.runを使用
-                response = asyncio.run(run_search())
-            
+
+            response = _run_async(run_search, timeout=45)
+
             if response and hasattr(response, 'text'):
                 result = response.text
                 print(f"[Tool] web_search 結果: {len(result)}文字")
@@ -67,66 +82,68 @@ def web_search_impl(query: str) -> str:
                 return result
             else:
                 return "検索結果を取得できませんでした。"
-                
+
         except Exception as e:
             error_msg = f"OpenAI Web検索エラー: {str(e)}"
             print(f"[Tool] web_search エラー: {error_msg}")
             return error_msg
-        
+
     except Exception as e:
         error_msg = f"Web検索エラー: {str(e)}"
         print(f"[Tool] web_search エラー: {error_msg}")
         return error_msg
 
 
-async def web_search_with_permission(query: str) -> str:
-    """Web検索を許可チェック付きで実行します
-    
-    Args:
-        query: 検索クエリ
-        
-    Returns:
-        検索結果のサマリー、または拒否時のメッセージ
-    """
-    # Check user permission
-    approved = await check_permission(
+def local_web_search_impl(query: str, config=None) -> str:
+    """AoiTalk側の汎用Web検索で検索します。"""
+    print(f"[Tool] local web_search が呼び出されました: query='{query}'")
+    try:
+        return local_web_search(query, config=config)
+    except Exception as e:
+        error_msg = f"汎用Web検索エラー: {str(e)}"
+        print(f"[Tool] web_search エラー: {error_msg}")
+        return error_msg
+
+
+def web_search_impl(query: str, config=None) -> str:
+    """設定された通常検索プロバイダでWeb検索を実行します。"""
+    return web_search_with_config(query, config=config)
+
+
+def web_search_with_config(query: str, config=None) -> str:
+    """設定に応じてOpenAI Hosted Searchまたは汎用Web検索を実行します。"""
+    active_config = config if config is not None else _load_default_config()
+    provider = get_search_provider(active_config)
+
+    if provider == SEARCH_PROVIDER_LOCAL:
+        return local_web_search_impl(query, active_config)
+
+    approved = check_permission_sync(
         tool_name="web_search",
         tool_args={"query": query},
-        description=f"Web検索: 「{query}」"
+        description=f"OpenAI APIによるWeb検索: 「{query}」",
     )
-    
+
     if not approved:
         return "ユーザーによって検索がキャンセルされました。"
-    
-    # Execute the actual search
-    return web_search_impl(query)
+
+    return openai_web_search_impl(query)
+
+
+def web_search_with_permission(query: str) -> str:
+    """後方互換用: 設定された通常検索プロバイダで検索します。"""
+    return web_search_with_config(query)
 
 
 @function_tool
 def web_search(query: str) -> str:
-    """Web検索を実行します（Gemini向けOpenAI proxy実装）
-    
+    """Web検索を実行します。
+
     Args:
         query: 検索クエリ
-        
+
     Returns:
         検索結果のサマリー
     """
-    # Check if we're in a running event loop
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # Event loop is running - we're being called from async context (e.g., Gemini tool execution)
-            # Permission check via WebSocket won't work from ThreadPoolExecutor, so skip it
-            # and execute the search directly in a background thread
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(web_search_impl, query)
-                return future.result(timeout=60)
-        else:
-            # No running loop - safe to use asyncio.run with permission check
-            return asyncio.run(web_search_with_permission(query))
-    except RuntimeError:
-        # Fallback to sync version without permission check
-        return web_search_impl(query)
+    return web_search_with_permission(query)
 

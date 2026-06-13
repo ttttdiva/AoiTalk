@@ -9,20 +9,18 @@ from dataclasses import dataclass, field
 import yaml
 
 
-DEFAULT_COLLECTION_NAME = "aoitalk_documents"
+DEFAULT_COLLECTION_NAME = "aoitalk_knowledge"
 
 
 def get_project_collection_name(project_id: Optional[str] = None) -> str:
-    """Get collection name for a project.
+    """Get the internal shared Knowledge Index collection name.
     
     Args:
-        project_id: Project UUID string. If None, returns default collection.
+        project_id: Ignored. Filtering is handled through payload metadata.
         
     Returns:
-        Collection name: 'project_{id}_documents' or 'aoitalk_documents'
+        Shared internal collection name.
     """
-    if project_id:
-        return f"project_{project_id}_documents"
     return DEFAULT_COLLECTION_NAME
 
 
@@ -76,7 +74,7 @@ class EmbeddingConfig:
 @dataclass
 class RerankerConfig:
     """Reranker model configuration."""
-    model: str = "BAAI/bge-reranker-v2-gemma"
+    model: str = "BAAI/bge-reranker-v2-m3"
     top_n: int = 5
     device: str = "cuda"
     
@@ -180,10 +178,9 @@ class RagConfig:
     
     @classmethod
     def from_yaml(cls, config_path: str) -> 'RagConfig':
-        """Load configuration from YAML file."""
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config_data = yaml.safe_load(f)
-        
+        """Load configuration from the DB-backed app config."""
+        from ..config import Config
+        config_data = Config(config_path).config
         rag_config = config_data.get('rag', {})
         return cls.from_dict(rag_config)
 
@@ -208,10 +205,6 @@ def get_rag_config(config_path: Optional[str] = None) -> RagConfig:
             # Default config path
             config_path = str(Path(__file__).parents[2] / "config" / "config.yaml")
         
-        if Path(config_path).exists():
-            _rag_config = RagConfig.from_yaml(config_path)
-        else:
-            # Use defaults
-            _rag_config = RagConfig()
+        _rag_config = RagConfig.from_yaml(config_path)
     
     return _rag_config

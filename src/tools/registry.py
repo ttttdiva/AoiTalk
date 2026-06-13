@@ -67,3 +67,13 @@ def register_tool(tool_def: ToolDefinition):
 def get_registry() -> ToolRegistry:
     """グローバルレジストリを取得"""
     return _global_registry
+
+
+def init_global_tools_registry(config: Any | None = None) -> ToolRegistry:
+    """旧ツール初期化APIとの互換用エントリポイント。
+
+    LLM 実行時のツール一覧は `build_runtime_tool_registry()` が構築する。
+    ここでは古い呼び出し元が NameError/ImportError にならないよう、
+    `src.tools` import 時に初期登録済みのグローバルレジストリを返す。
+    """
+    return _global_registry

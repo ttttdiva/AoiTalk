@@ -9,8 +9,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, Optional, Any
 
-from ..modes.discord_mode import DiscordMode
-
 logger = logging.getLogger(__name__)
 
 
@@ -23,7 +21,7 @@ class DiscordSession:
     voice_channel_id: Optional[int] = None
     mode: str = 'text'  # 'text' or 'voice'
     character: Optional[str] = None
-    assistant: Optional[DiscordMode] = None
+    assistant: Optional[Any] = None
     created_at: datetime = field(default_factory=datetime.now)
     last_activity: datetime = field(default_factory=datetime.now)
     memory_prefilled: bool = False
@@ -35,11 +33,19 @@ class DiscordSession:
 
 class SessionHandler:
     """Manage Discord user sessions"""
-    
-    def __init__(self):
+
+    def __init__(self, config=None):
+        discord_config = config.get('discord', {}) if config else {}
+        session_config = discord_config.get('session', {}) if isinstance(discord_config, dict) else {}
         self.sessions: Dict[str, DiscordSession] = {}  # session_key -> session
         self._lock = asyncio.Lock()
-        
+        self.default_mode = str(discord_config.get('default_mode', 'text')) if isinstance(discord_config, dict) else 'text'
+        if self.default_mode not in {'text', 'voice'}:
+            logger.warning("Invalid discord.default_mode '%s'; falling back to text", self.default_mode)
+            self.default_mode = 'text'
+        self.cleanup_interval = int(session_config.get('cleanup_interval', 300))
+        self.inactive_timeout = int(session_config.get('inactive_timeout', 3600))
+
         # セッション自動クリーンアップタスク
         self._cleanup_task = None
         
@@ -68,7 +74,8 @@ class SessionHandler:
             # 新しいセッションを作成
             session = DiscordSession(
                 guild_id=guild_id,
-                user_id=user_id
+                user_id=user_id,
+                mode=self.default_mode
             )
             self.sessions[session_key] = session
             
@@ -172,9 +179,9 @@ class SessionHandler:
         """Periodically cleanup inactive sessions"""
         while True:
             try:
-                await asyncio.sleep(300)  # 5分ごとにチェック
-                
-                inactive_threshold = 3600  # 1時間
+                await asyncio.sleep(self.cleanup_interval)
+
+                inactive_threshold = self.inactive_timeout
                 now = datetime.now()
                 sessions_to_remove = []
                 

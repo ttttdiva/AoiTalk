@@ -2,27 +2,31 @@
 ツール関連のユーティリティ関数
 GeminiとOpenAI間でツールを共通化するための機能を提供
 """
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from src.tools.core import ToolDefinition
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from agents import FunctionTool
 import inspect
 import json
 
 
-def extract_original_function(function_tool: FunctionTool) -> Callable:
-    """FunctionToolオブジェクトから元の関数を抽出
+def extract_original_function(function_tool: Union[FunctionTool, ToolDefinition]) -> Callable:
+    """FunctionTool または ToolDefinition オブジェクトから元の関数を抽出
     
     Args:
-        function_tool: FunctionToolオブジェクト
+        function_tool: FunctionTool または ToolDefinition オブジェクト
         
     Returns:
         元の関数
         
     Raises:
-        TypeError: FunctionToolオブジェクトでない場合
+        TypeError: 対応していないオブジェクト型の場合
         ValueError: 元の関数を抽出できない場合
     """
+    if isinstance(function_tool, ToolDefinition):
+        return function_tool.function
+
     if not isinstance(function_tool, FunctionTool):
-        raise TypeError(f"Expected FunctionTool, got {type(function_tool)}")
+        raise TypeError(f"Expected FunctionTool or ToolDefinition, got {type(function_tool)}")
     
     # on_invoke_toolにアクセス
     on_invoke = function_tool.on_invoke_tool
@@ -39,15 +43,23 @@ def extract_original_function(function_tool: FunctionTool) -> Callable:
     raise ValueError("Could not extract original function from FunctionTool")
 
 
-def get_tool_info(function_tool: FunctionTool) -> Dict[str, Any]:
-    """FunctionToolから情報を抽出
+def get_tool_info(function_tool: Union[FunctionTool, ToolDefinition]) -> Dict[str, Any]:
+    """FunctionTool または ToolDefinition から情報を抽出
     
     Args:
-        function_tool: FunctionToolオブジェクト
+        function_tool: FunctionTool または ToolDefinition オブジェクト
         
     Returns:
         ツール情報の辞書
     """
+    if isinstance(function_tool, ToolDefinition):
+        return {
+            "name": function_tool.name,
+            "description": function_tool.description,
+            "parameters": function_tool.to_json_schema(),
+            "function": function_tool.function
+        }
+
     return {
         "name": function_tool.name,
         "description": function_tool.description,
@@ -69,18 +81,24 @@ def _clean_schema_for_gemini(schema: Dict[str, Any]) -> Dict[str, Any]:
         return schema
     
     cleaned = {}
-    
+
     for key, value in schema.items():
         # Geminiでサポートされていないフィールドをスキップ
         if key in ['title', '$schema', 'additionalProperties', 'default']:
             continue
-        
+        if key == 'properties' and isinstance(value, dict):
+            cleaned[key] = {
+                prop_name: _clean_schema_for_gemini(prop_schema)
+                for prop_name, prop_schema in value.items()
+            }
+            continue
+
         # anyOfフィールドの処理
         if key == 'anyOf' and isinstance(value, list):
             # anyOfから最初の非null型を選択
             for option in value:
                 if isinstance(option, dict) and option.get('type') != 'null':
-                    cleaned.update(option)
+                    cleaned.update(_clean_schema_for_gemini(option))
                     break
             continue
         
@@ -212,4 +230,9 @@ def register_tool(function_tool: FunctionTool):
 
 def get_tool_registry() -> ToolRegistry:
     """グローバルレジストリを取得"""
+    return _global_registry
+
+
+def init_global_tools_registry() -> ToolRegistry:
+    """旧ツール初期化APIとの互換用エントリポイント。"""
     return _global_registry

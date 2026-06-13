@@ -5,6 +5,7 @@ Provides compatibility layer for existing VoiceChatMode
 """
 
 import asyncio
+import socket
 import threading
 import uvicorn
 from pathlib import Path
@@ -26,29 +27,37 @@ class WebChatInterface:
         self.uvicorn_server = None
         self.video_http_server = None
         self.video_http_thread = None
-        
+        self._server_loop = None  # uvicornスレッドのイベントループ
+
         # Expose server methods
         self.add_assistant_message = self._async_wrapper(self.server.add_assistant_message)
         self.add_system_message = self._async_wrapper(self.server.add_system_message)
         self.add_user_message = self._async_wrapper(self.server.add_user_message)
+        self.broadcast_stream_event = self._async_wrapper(self.server.broadcast_stream_event)
         self.set_voice_recognition_ready = self.server.set_voice_recognition_ready
         self.update_rms = self.server.update_rms
         self.set_recording_state = self.server.set_recording_state
         
     def _async_wrapper(self, async_func):
-        """Wrap async function for sync calls"""
+        """Wrap async function for sync/cross-thread calls.
+
+        WebSocket broadcast must run on uvicorn's event loop (the thread that
+        owns the ASGI connections).  When called from the main event loop
+        (e.g. via run_coroutine_threadsafe), we forward the coroutine to
+        _server_loop instead of creating a task on the caller's loop.
+        """
         def wrapper(*args, **kwargs):
+            # uvicornのイベントループが保存されていれば、そこにスケジュール
+            if self._server_loop and self._server_loop.is_running():
+                asyncio.run_coroutine_threadsafe(async_func(*args, **kwargs), self._server_loop)
+                return
             try:
-                # Try to get current event loop
                 loop = asyncio.get_event_loop()
                 if loop.is_running():
-                    # Schedule coroutine
                     asyncio.create_task(async_func(*args, **kwargs))
                 else:
-                    # Run in new event loop
                     asyncio.run(async_func(*args, **kwargs))
             except RuntimeError:
-                # No event loop, create new one
                 asyncio.run(async_func(*args, **kwargs))
         return wrapper
         
@@ -59,6 +68,14 @@ class WebChatInterface:
     def set_clear_chat_callback(self, callback):
         """Set clear chat callback (called when user starts a new conversation)"""
         self.server.set_clear_chat_callback(callback)
+
+    def set_llm_client_change_callback(self, callback):
+        """Set callback invoked when the server switches LLM clients."""
+        self.server.set_llm_client_change_callback(callback)
+
+    def set_llm_client(self, llm_client):
+        """Set the active LLM client on the server."""
+        self.server.set_llm_client(llm_client)
     
     def _get_video_http_port(self, main_port: int) -> int:
         """Get video HTTP port from config or default to main_port + 1"""
@@ -79,6 +96,17 @@ class WebChatInterface:
             return video_config.get('enabled', True)
         except Exception:
             return True
+
+    def _can_bind(self, host: str, port: int) -> bool:
+        """Return whether uvicorn can bind the requested host/port."""
+        bind_host = "::" if host == "[::]" else host
+        family = socket.AF_INET6 if ":" in bind_host else socket.AF_INET
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as probe:
+                probe.bind((bind_host, port))
+            return True
+        except OSError:
+            return False
     
     def _start_video_http_server(self, host: str, video_port: int):
         """Start HTTP video server in a separate thread"""
@@ -123,7 +151,15 @@ class WebChatInterface:
         """
         use_ssl = ssl_keyfile and ssl_certfile
         protocol = "https" if use_ssl else "http"
-        
+
+        if not self._can_bind(host, port):
+            print(
+                f"[WebUI] Port {port} is already in use on {host}; "
+                "FastAPI server was not started."
+            )
+            self.is_running = False
+            return None
+
         # Start HTTP video server if using SSL AND enabled in config (for Android compatibility)
         if use_ssl and self._is_video_http_enabled():
             video_port = self._get_video_http_port(port)
@@ -139,6 +175,7 @@ class WebChatInterface:
                 # Create new event loop for the thread
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
+                self._server_loop = loop  # broadcast用に保存
                 
                 config = uvicorn.Config(
                     app=self.app,
@@ -147,7 +184,9 @@ class WebChatInterface:
                     log_level="warning" if not debug else "info",
                     access_log=False,
                     ssl_keyfile=ssl_keyfile if use_ssl else None,
-                    ssl_certfile=ssl_certfile if use_ssl else None
+                    ssl_certfile=ssl_certfile if use_ssl else None,
+                    ws_ping_interval=30,
+                    ws_ping_timeout=10,
                 )
                 self.uvicorn_server = uvicorn.Server(config)
                 loop.run_until_complete(self.uvicorn_server.serve())

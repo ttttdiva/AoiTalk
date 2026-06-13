@@ -74,7 +74,7 @@ class EnhancedBaseAssistant(ABC):
         else:
             print("[標準モード] 基本的なLLMクライアントを使用します")
         
-        self.llm_client = create_llm_client(self.config, use_agent=use_tools)
+        self.llm_client = create_llm_client(self.config)
         
         # Set LLM system prompt
         personality = self.character_config.get('personality', {})

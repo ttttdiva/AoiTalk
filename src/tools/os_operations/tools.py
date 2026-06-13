@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..core import tool as function_tool
+from ..external_llm_permission import check_permission_sync
 
 from .command_executor import get_command_executor
 from .file_editor import get_file_editor, FileEditorError
@@ -73,6 +74,17 @@ def clear_user_context():
         "is_admin": True,
         "project_ids": []
     }
+
+
+def _confirm_tool_action(
+    tool_name: str,
+    tool_args: Dict[str, Any],
+    denied_message: str,
+) -> Optional[Dict[str, Any]]:
+    """Ask the user before executing a guarded LLM tool action."""
+    if check_permission_sync(tool_name, tool_args):
+        return None
+    return {"success": False, "error": denied_message}
 
 
 def _get_protected_paths() -> List[str]:
@@ -482,6 +494,14 @@ def execute_command(
     protection_error = _check_command_protection(command, working_directory)
     if protection_error:
         return protection_error
+
+    permission_error = _confirm_tool_action(
+        "execute_command",
+        {"command": command, "working_directory": working_directory},
+        "ユーザーによってコマンド実行がキャンセルされました。",
+    )
+    if permission_error:
+        return permission_error
     
     executor = get_command_executor()
     result = executor.execute(command, cwd=working_directory)
@@ -590,6 +610,14 @@ def create_file(
     protection_error = _check_path_protection(path, "作成")
     if protection_error:
         return protection_error
+
+    permission_error = _confirm_tool_action(
+        "create_file",
+        {"path": path},
+        "ユーザーによってファイル作成がキャンセルされました。",
+    )
+    if permission_error:
+        return permission_error
     
     try:
         editor = get_file_editor()
@@ -645,6 +673,14 @@ def delete_file(path: str) -> Dict[str, Any]:
     protection_error = _check_path_protection(path, "削除")
     if protection_error:
         return protection_error
+
+    permission_error = _confirm_tool_action(
+        "delete_file",
+        {"path": path},
+        "ユーザーによってファイル削除がキャンセルされました。",
+    )
+    if permission_error:
+        return permission_error
     
     try:
         if not os.path.exists(path):
@@ -710,6 +746,14 @@ def append_to_file(path: str, content: str) -> Dict[str, Any]:
     protection_error = _check_path_protection(path, "編集")
     if protection_error:
         return protection_error
+
+    permission_error = _confirm_tool_action(
+        "append_to_file",
+        {"path": path},
+        "ユーザーによってファイル追記がキャンセルされました。",
+    )
+    if permission_error:
+        return permission_error
     
     try:
         if not os.path.exists(path):
@@ -775,6 +819,14 @@ def edit_file(
     protection_error = _check_path_protection(path, "編集")
     if protection_error:
         return protection_error
+
+    permission_error = _confirm_tool_action(
+        "edit_file",
+        {"path": path},
+        "ユーザーによってファイル編集がキャンセルされました。",
+    )
+    if permission_error:
+        return permission_error
     
     try:
         editor = get_file_editor()
@@ -830,6 +882,14 @@ def insert_to_file(
     protection_error = _check_path_protection(path, "編集")
     if protection_error:
         return protection_error
+
+    permission_error = _confirm_tool_action(
+        "insert_to_file",
+        {"path": path, "line_number": line_number},
+        "ユーザーによってファイル挿入がキャンセルされました。",
+    )
+    if permission_error:
+        return permission_error
     
     try:
         editor = get_file_editor()
@@ -870,6 +930,14 @@ def undo_edit(path: str) -> Dict[str, Any]:
     
     # Resolve relative paths to user's workspace
     path = _resolve_path_for_user(path)
+
+    permission_error = _confirm_tool_action(
+        "undo_edit",
+        {"path": path},
+        "ユーザーによって編集取り消しがキャンセルされました。",
+    )
+    if permission_error:
+        return permission_error
     
     try:
         editor = get_file_editor()

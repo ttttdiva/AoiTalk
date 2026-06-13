@@ -1,104 +1,165 @@
-"""
-MCP (Model Context Protocol) integration tools
-"""
-import json
+"""MCP (Model Context Protocol) integration tools."""
+
+from __future__ import annotations
+
 import asyncio
+import concurrent.futures
+import json
 import traceback
+from typing import Any
+
 import nest_asyncio
 
-# Apply nest_asyncio to allow nested event loops
-nest_asyncio.apply()
+from src.services.failure_recorder import record_failure_event
 from ..core import tool as _tool_decorator
 
-# Global MCP plugin instance (will be set by AgentLLMClient)
+# Agent tool callbacks may need to re-enter the current loop.
+nest_asyncio.apply()
+
+# Global MCP plugin instance (set by the active LLM client).
 _mcp_plugin = None
 
+
 def set_mcp_plugin(plugin):
-    """Set the global MCP plugin instance"""
+    """Set the global MCP plugin instance."""
     global _mcp_plugin
     _mcp_plugin = plugin
 
 
-@_tool_decorator
-def use_mcp_tool(server_name: str, tool_name: str, arguments_json: str = "{}") -> str:
-    """MCPサーバーのツールを実行する
-    
-    Args:
-        server_name: MCPサーバー名
-        tool_name: ツール名
-        arguments_json: ツールの引数（JSON文字列形式）
-    """
-    print(f"[Tool] use_mcp_tool が呼び出されました: {server_name}.{tool_name}({arguments_json})")
-    
+def _format_mcp_result(result: Any, *, server_name: str, tool_name: str) -> str:
+    if result is None:
+        return f"Failed to execute tool {tool_name} on server {server_name}"
+
+    if result.get("isError", False):
+        return f"Tool execution error: {result.get('content', 'Unknown error')}"
+
+    content = result.get("content", [])
+    if isinstance(content, list):
+        texts = []
+        for item in content:
+            if hasattr(item, "text"):
+                texts.append(str(item.text))
+            elif isinstance(item, dict) and "text" in item:
+                texts.append(str(item["text"]))
+            else:
+                texts.append(str(item))
+        return "\n".join(texts)
+    return str(content)
+
+
+def _parse_arguments(arguments_json: Any) -> dict[str, Any]:
+    if isinstance(arguments_json, dict):
+        return arguments_json
+    if arguments_json in ("", None):
+        return {}
+    return json.loads(arguments_json)
+
+
+async def call_mcp_tool_async(
+    server_name: str,
+    tool_name: str,
+    arguments_json: Any = "{}",
+) -> str:
+    """Execute an MCP tool asynchronously."""
+    print(
+        f"[Tool] call_mcp_tool_async invoked: "
+        f"{server_name}.{tool_name}({arguments_json})"
+    )
+
     global _mcp_plugin
-    
+
     if _mcp_plugin is None:
-        return "MCPプラグインが初期化されていません"
-    
+        return "MCP plugin is not initialized"
+
     if not _mcp_plugin.is_initialized():
-        return "MCPプラグインが有効ではありません"
-    
+        return "MCP plugin is not active"
+
     try:
-        # Parse JSON arguments
-        arguments = json.loads(arguments_json)
+        arguments = _parse_arguments(arguments_json)
     except json.JSONDecodeError as e:
-        return f"引数のJSON解析エラー: {arguments_json} - {str(e)}"
-    
-    # Build tool call format expected by MCP plugin
-    tool_call = {
-        'name': f'mcp_{server_name}_{tool_name}',
-        'arguments': arguments
-    }
-    
-    print(f"[Tool] MCPツール実行開始: {tool_call['name']}")
-    
+        return f"Invalid arguments JSON: {arguments_json} - {str(e)}"
+
     try:
-        # Create a new event loop for MCP operations to avoid conflicts
-        import asyncio
-        
-        # Save current loop state
-        try:
-            current_loop = asyncio.get_running_loop()
-            has_loop = True
-        except RuntimeError:
-            has_loop = False
-        
-        # Create new isolated loop for MCP
-        new_loop = asyncio.new_event_loop()
-        old_loop = None
-        
-        try:
-            # Temporarily set the new loop
-            if has_loop:
-                old_loop = asyncio.get_event_loop()
-            asyncio.set_event_loop(new_loop)
-            
-            # Execute MCP tool in new loop
-            result = new_loop.run_until_complete(_mcp_plugin.execute_tool(tool_call))
-            
-            print(f"[Tool] MCPツール実行完了: {result}")
-            return result
-            
-        finally:
-            # Restore original loop state
-            new_loop.close()
-            if old_loop:
-                asyncio.set_event_loop(old_loop)
-            elif not has_loop:
-                asyncio.set_event_loop(None)
-        
+        server_exists = server_name in getattr(_mcp_plugin.client, "sessions", {})
+        if server_exists:
+            print(f"[Tool] Executing MCP tool: {server_name}.{tool_name}")
+            result = await _mcp_plugin.client.call_tool(server_name, tool_name, arguments)
+            formatted = _format_mcp_result(
+                result,
+                server_name=server_name,
+                tool_name=tool_name,
+            )
+            print(f"[Tool] MCP tool result: {formatted}")
+            return formatted
+
+        tool_call = {
+            "name": f"mcp_{server_name}_{tool_name}",
+            "arguments": arguments,
+        }
+        print(f"[Tool] Executing MCP tool via fallback: {tool_call['name']}")
+        result = await _mcp_plugin.execute_tool(tool_call)
+        print(f"[Tool] MCP tool result: {result}")
+        return result
     except Exception as e:
-        error_msg = f"MCPツール実行エラー: {str(e)}"
+        error_msg = f"MCP tool execution error: {str(e)}"
         print(f"[Tool] {error_msg}")
         traceback.print_exc()
+        await record_failure_event(
+            source="tool",
+            operation="mcp_tool",
+            tool_name=f"{server_name}.{tool_name}",
+            error=e,
+            input_summary={"arguments": arguments_json},
+        )
         return error_msg
 
 
-def create_mcp_tool_wrapper(mcp_plugin):
-    """Create a wrapper for MCP tools
+def call_mcp_tool(
+    server_name: str,
+    tool_name: str,
+    arguments_json: Any = "{}",
+) -> str:
+    """Execute an MCP tool from synchronous code."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
 
-    This function is used to integrate MCP with the agent.
-    Returns ToolDefinition objects (use adapters to convert for specific backends).
+    if loop is None:
+        return asyncio.run(call_mcp_tool_async(server_name, tool_name, arguments_json))
+
+    # Re-enter the loop that owns the MCP client sessions.
+    if (
+        _mcp_plugin is not None
+        and hasattr(_mcp_plugin, "is_initialized_in_current_loop")
+        and _mcp_plugin.is_initialized_in_current_loop()
+    ):
+        return loop.run_until_complete(
+            call_mcp_tool_async(server_name, tool_name, arguments_json)
+        )
+
+    # Fallback for callers that are executing in a different async context.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            asyncio.run,
+            call_mcp_tool_async(server_name, tool_name, arguments_json),
+        )
+        return future.result()
+
+
+@_tool_decorator
+def use_mcp_tool(server_name: str, tool_name: str, arguments_json: str = "{}") -> str:
+    """Execute an MCP tool.
+
+    Args:
+        server_name: MCP server name
+        tool_name: MCP tool name
+        arguments_json: Tool arguments as a JSON string
     """
+    return call_mcp_tool(server_name, tool_name, arguments_json)
+
+
+def create_mcp_tool_wrapper(mcp_plugin):
+    """Create a wrapper for MCP tools."""
     set_mcp_plugin(mcp_plugin)
     return [use_mcp_tool]

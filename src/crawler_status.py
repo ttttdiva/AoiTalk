@@ -25,11 +25,18 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Crawler paths configuration
-DISCORD_CRAWLER_PATH = Path(os.environ["DISCORD_CRAWLER_PATH"]) if os.environ.get("DISCORD_CRAWLER_PATH") else None
-EVENT_MONITOR_PATH = Path(os.environ["EVENT_MONITOR_PATH"]) if os.environ.get("EVENT_MONITOR_PATH") else None
-HYDRUS_EXECUTABLE = Path(os.environ["HYDRUS_EXECUTABLE"]) if os.environ.get("HYDRUS_EXECUTABLE") else None
-VIDEO_CRAWLER_URL = "https://topgunm-as-partionpeek.hf.space"
+def _configured_path(env_name: str) -> Path:
+    value = os.environ.get(env_name)
+    if value:
+        return Path(value).expanduser()
+    return Path("__aoitalk_not_configured__") / env_name
+
+
+DISCORD_CRAWLER_PATH = _configured_path("DISCORD_CRAWLER_PATH")
+EVENT_MONITOR_PATH = _configured_path("EVENT_MONITOR_PATH")
+VIDEO_CRAWLER_URL = os.environ.get("VIDEO_CRAWLER_URL", "")
+VIDEO_CRAWLER_RUNTIME_URL = os.environ.get("VIDEO_CRAWLER_RUNTIME_URL", "")
+VIDEO_CRAWLER_SPACE_URL = os.environ.get("VIDEO_CRAWLER_SPACE_URL", "")
 
 
 class CrawlerStatusChecker:
@@ -38,9 +45,9 @@ class CrawlerStatusChecker:
     def __init__(self):
         self.timeout = 10.0  # seconds
 
-    def _is_process_running(self, script_name: str, target_cwd: Optional[Path]) -> bool:
+    def _is_process_running(self, script_name: str, target_cwd: Path) -> bool:
         """Check if a python script is running in specific directory"""
-        if not psutil or not target_cwd:
+        if not psutil:
             return False
             
         try:
@@ -94,10 +101,11 @@ class CrawlerStatusChecker:
                 return False
         elif crawler_name == "VideoCrawler":
             # HuggingFace Space health check
+            if not VIDEO_CRAWLER_RUNTIME_URL:
+                return False
             try:
                 async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    runtime_url = "https://huggingface.co/api/spaces/TopgunM/as-partionpeek/runtime"
-                    response = await client.get(runtime_url)
+                    response = await client.get(VIDEO_CRAWLER_RUNTIME_URL)
                     if response.status_code == 200:
                         stage = response.json().get("stage", "")
                         return stage == "RUNNING"
@@ -114,11 +122,15 @@ class CrawlerStatusChecker:
             "can_restart": False,
             "is_alive": False
         }
+
+        if not VIDEO_CRAWLER_RUNTIME_URL:
+            result["status"] = "not_configured"
+            result["error"] = "VIDEO_CRAWLER_RUNTIME_URL is not configured"
+            return result
         
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                runtime_url = "https://huggingface.co/api/spaces/TopgunM/as-partionpeek/runtime"
-                response = await client.get(runtime_url)
+                response = await client.get(VIDEO_CRAWLER_RUNTIME_URL)
                 
                 if response.status_code == 200:
                     runtime_data = response.json()
@@ -264,7 +276,11 @@ class CrawlerStatusChecker:
             result["message"] = "ブラウザ自動化用のライブラリが見つかりません"
             return result
         
-        space_url = "https://huggingface.co/spaces/TopgunM/as-partionpeek"
+        space_url = VIDEO_CRAWLER_SPACE_URL
+        if not space_url:
+            result["error"] = "VIDEO_CRAWLER_SPACE_URL is not configured"
+            result["message"] = "VideoCrawlerのHugging Face Space URLが設定されていません"
+            return result
         
         try:
             async with async_playwright() as p:
@@ -379,11 +395,6 @@ class CrawlerStatusChecker:
             "message": "",
             "error": None
         }
-
-        if not DISCORD_CRAWLER_PATH:
-            result["error"] = "DISCORD_CRAWLER_PATH is not configured"
-            result["message"] = "DiscordCrawler のパスが設定されていません"
-            return result
         
         try:
             # Check if running
@@ -437,11 +448,6 @@ class CrawlerStatusChecker:
             "message": "",
             "error": None
         }
-
-        if not EVENT_MONITOR_PATH:
-            result["error"] = "EVENT_MONITOR_PATH is not configured"
-            result["message"] = "EventMonitor のパスが設定されていません"
-            return result
         
         try:
             # Check if running
@@ -509,9 +515,7 @@ class CrawlerStatusChecker:
                         pass
             
             # Launch HydrusClient
-            hydrus_exe = HYDRUS_EXECUTABLE
-            if not hydrus_exe:
-                raise FileNotFoundError("HYDRUS_EXECUTABLE is not configured")
+            hydrus_exe = Path(r"C:\Hydrus Network\hydrus_client.exe")
             if not hydrus_exe.exists():
                 raise FileNotFoundError(f"HydrusClient not found: {hydrus_exe}")
             
@@ -538,11 +542,6 @@ class CrawlerStatusChecker:
             "message": "",
             "error": None
         }
-
-        if not DISCORD_CRAWLER_PATH:
-            result["error"] = "DISCORD_CRAWLER_PATH is not configured"
-            result["message"] = "DiscordCrawler のパスが設定されていません"
-            return result
         
         try:
             # Check if running
@@ -587,11 +586,6 @@ class CrawlerStatusChecker:
             "message": "",
             "error": None
         }
-
-        if not EVENT_MONITOR_PATH:
-            result["error"] = "EVENT_MONITOR_PATH is not configured"
-            result["message"] = "EventMonitor のパスが設定されていません"
-            return result
         
         try:
             # Check if running

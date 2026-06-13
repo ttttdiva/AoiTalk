@@ -1,0 +1,66 @@
+{
+  "expo": {
+    "name": "AoiTalk",
+    "slug": "aoitalk",
+    "version": "0.1.71",
+    "orientation": "default",
+    "scheme": "aoitalk",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#1a1a2e"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.aoitalk.mobile"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#1a1a2e"
+      },
+      "permissions": [
+        "android.permission.REQUEST_INSTALL_PACKAGES",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.POST_NOTIFICATIONS"
+      ],
+      "versionCode": 71,
+      "package": "com.aoitalk.mobile"
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "static",
+      "favicon": "./assets/icon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-notifications",
+      "expo-secure-store",
+      [
+        "expo-screen-orientation",
+        {
+          "initialOrientation": "PORTRAIT_UP"
+        }
+      ],
+      "expo-asset",
+      "expo-font",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ]
+    ],
+    "extra": {
+      "router": {
+        "origin": false
+      }
+    }
+  }
+}

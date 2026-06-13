@@ -1,4 +1,21 @@
 mobile_ui:
   enabled: true
   default_view: chat
-  quick_commands: []
+  quick_commands:
+    - id: status_check
+      label: Status
+      hint: Report current status briefly.
+      icon: sparkles
+      accent: indigo
+      category: Session
+      action: send_message
+      payload: Please report the current status and next action briefly.
+
+    - id: memory_summary
+      label: Summary
+      hint: Summarize the conversation so far.
+      icon: sparkles
+      accent: violet
+      category: Memo
+      action: send_message
+      payload: Please summarize the important points in three lines or less.

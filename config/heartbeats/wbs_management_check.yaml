@@ -1,0 +1,15 @@
+name: wbs_management_check
+description: WBS同期と要依頼事項の定期確認。プロジェクトのWBSから直近タスク・期限超過・確認待ちを検出する。
+checklist: |
+  - アクティブなプロジェクトの project_management_assistant を使い、get_upcoming_wbs_tasks で未完了WBSタスクを確認する
+  - 期限超過、3日以内、確認待ち、保留中のWBSタスクがあれば案件名・WBS番号・タスク名・期限を報告する
+  - summarize_project_requests で顧客または社内に確認すべき事項を確認する
+  - 要依頼事項がある場合は、依頼先・確認内容・根拠行を簡潔に報告する
+  - 問題がなければ HEARTBEAT_OK とだけ回答する
+interval_minutes: 120
+enabled: true
+active_hours:
+  start: "09:00"
+  end: "20:00"
+  timezone: Asia/Tokyo
+notify_channel: websocket

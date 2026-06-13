@@ -264,8 +264,12 @@ class ConversationMemoryManager:
         return message
     
     async def add_message_to_session(self, session_id: str, role: str, content: str,
-                                     metadata: Optional[Dict[str, Any]] = None, 
-                                     success: bool = True) -> ConversationMessage:
+                                     metadata: Optional[Dict[str, Any]] = None,
+                                     success: bool = True,
+                                     branch_from_message_id: Optional[str] = None,
+                                     sender_type: Optional[str] = None,
+                                     sender_id: Optional[str] = None,
+                                     sender_display_name: Optional[str] = None) -> ConversationMessage:
         """Add message to a specific conversation session by ID
         
         Args:
@@ -293,7 +297,14 @@ class ConversationMemoryManager:
         
         # Add message directly to the specified session
         message = await self.repository.add_message(
-            session_id, role, content, metadata
+            session_id,
+            role,
+            content,
+            metadata,
+            branch_from_message_id=branch_from_message_id,
+            sender_type=sender_type,
+            sender_id=sender_id,
+            sender_display_name=sender_display_name,
         )
         
         # Get session info for history logging
@@ -321,7 +332,7 @@ class ConversationMemoryManager:
             print(f"[ConversationMemoryManager] Warning: Could not log to history: {e}")
         
         # Index message in cross-session memory for future retrieval (fire-and-forget)
-        if message:
+        if message and self.config.enable_search:
             async def _index_in_background():
                 try:
                     cross_session_memory = get_cross_session_memory()
@@ -544,7 +555,10 @@ class ConversationMemoryManager:
         """
         if not self._initialized:
             await self.initialize()
-        
+
+        if self.search_service is None:
+            return []
+
         return await self.search_service.search_memory(
             user_id, character_name, query, time_range, max_results
         )

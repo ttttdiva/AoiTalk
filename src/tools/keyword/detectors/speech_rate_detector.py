@@ -219,24 +219,11 @@ JSON以外の説明は不要です。"""
     
     def _apply_speed_adjustment(self, speed_adjustment: float):
         """設定ファイルに話速調整を保存"""
-        import yaml
-        import os
-        
-        config_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            '../../../../config/config.yaml'
-        )
+        from ....app_config_store import update_app_config_key_sync
+        update_app_config_key_sync('tts.speed_adjustment', float(speed_adjustment))
         
         # 設定ファイルを読み込み
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
         
         # TTSセクションに話速調整を追加
-        if 'tts' not in config:
-            config['tts'] = {}
-        
-        config['tts']['speed_adjustment'] = float(speed_adjustment)
         
         # 設定ファイルに書き戻し
-        with open(config_path, 'w', encoding='utf-8') as f:
-            yaml.dump(config, f, default_flow_style=False, allow_unicode=True)

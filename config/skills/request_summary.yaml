@@ -1,0 +1,29 @@
+name: request_summary
+description: WBSや案件ワークスペースから顧客・社内に確認すべき事項を抽出する。
+prompt_template: |
+  アクティブな案件で、顧客または社内に確認・依頼すべき事項を整理してください。
+
+  {input}
+
+  ## 手順
+  1. project_management_assistant の get_project_context で対象案件を確認する。
+  2. summarize_project_requests を実行し、依頼候補を抽出する。
+  3. 依頼先、確認内容、期限、根拠行を含めて一覧化する。
+  4. 顧客向けに送れる文面が必要そうなものは、短い依頼文ドラフトも添える。
+  5. 根拠が弱い推測は「推測」と明記する。
+trigger_mode: both
+aliases:
+  - 要依頼事項
+  - 確認事項まとめ
+  - 依頼事項まとめ
+  - request
+bound_tools:
+  - project_management_assistant
+examples:
+  - "/request_summary"
+  - "この案件で客に確認すべきことをまとめて"
+  - "未回答の確認事項を出して"
+tags:
+  - 案件管理
+  - 確認事項
+parameters: {}

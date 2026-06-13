@@ -48,18 +48,8 @@ class TestValidatorConfig:
             default_character="zundamon",
             llm_model="gemini-3-flash-preview",
             llm_provider="gemini",
-            mode="terminal",
         )
         assert cfg.llm_model == "gemini-3-flash-preview"
-
-    def test_invalid_mode(self):
-        with pytest.raises(ValidationError):
-            ValidatorConfig(
-                default_character="zundamon",
-                llm_model="gemini-3-flash-preview",
-                llm_provider="gemini",
-                mode="invalid",
-            )
 
     def test_invalid_provider(self):
         with pytest.raises(ValidationError):
@@ -67,7 +57,6 @@ class TestValidatorConfig:
                 default_character="zundamon",
                 llm_model="gemini-3-flash-preview",
                 llm_provider="invalid_provider",
-                mode="terminal",
             )
 
     def test_openai_provider_accepts_gpt_models(self):
@@ -75,7 +64,6 @@ class TestValidatorConfig:
             default_character="zundamon",
             llm_model="gpt-4o",
             llm_provider="openai",
-            mode="terminal",
         )
         assert cfg.llm_model == "gpt-4o"
 
@@ -84,7 +72,6 @@ class TestValidatorConfig:
             default_character="zundamon",
             llm_model="o1-preview",
             llm_provider="openai",
-            mode="terminal",
         )
         assert cfg.llm_model == "o1-preview"
 
@@ -93,9 +80,24 @@ class TestValidatorConfig:
             default_character="zundamon",
             llm_model="my-custom-model",
             llm_provider="sglang",
-            mode="terminal",
         )
         assert cfg.llm_model == "my-custom-model"
+
+    def test_ollama_any_model_accepted(self):
+        cfg = ValidatorConfig(
+            default_character="zundamon",
+            llm_model="gemma4:e4b",
+            llm_provider="ollama",
+        )
+        assert cfg.llm_model == "gemma4:e4b"
+
+    def test_openrouter_provider_accepts_provider_qualified_models(self):
+        cfg = ValidatorConfig(
+            default_character="zundamon",
+            llm_model="anthropic/claude-3.5-sonnet",
+            llm_provider="openrouter",
+        )
+        assert cfg.llm_model == "anthropic/claude-3.5-sonnet"
 
 
 class TestConfigValidatorMerge:

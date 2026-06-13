@@ -1,0 +1,214 @@
+import { NextRequest, NextResponse } from "next/server";
+import { db } from "@/db";
+import {
+  conversationMessages,
+  conversationParticipants,
+  conversationSessions,
+} from "@/db/schema";
+import { eq, and, isNull, desc, sql, or, isNotNull } from "drizzle-orm";
+import { getSession } from "@/lib/auth";
+import { decryptTextIfNeeded, encryptText } from "@/lib/server/field-crypto";
+import { messageToSnake } from "@/lib/server/conversation-route-utils";
+
+function sessionToSnake(row: Record<string, unknown>): Record<string, unknown> {
+  const map: Record<string, string> = {
+    id: "id",
+    userId: "user_id",
+    characterName: "character_name",
+    title: "title",
+    sessionStart: "session_start",
+    lastActivity: "last_activity",
+    messageCount: "message_count",
+    context: "context",
+    currentSummary: "current_summary",
+    isActive: "is_active",
+    deletedAt: "deleted_at",
+    projectId: "project_id",
+    isGroupChat: "is_group_chat",
+    groupCharacterNames: "group_character_names",
+  };
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(row)) {
+    out[map[k] ?? k] =
+      k === "currentSummary" && typeof v === "string"
+        ? decryptTextIfNeeded(v, "conversation_sessions.current_summary")
+        : v;
+  }
+  return out;
+}
+
+function isScenarioWorkflowSession(row: Record<string, unknown>): boolean {
+  const characterName = String(row.characterName ?? "");
+  const title = String(row.title ?? "");
+  return (
+    /^scenario_roleplay:[^:]+:[^:]+$/.test(characterName) ||
+    characterName.startsWith("scenario_") ||
+    characterName.startsWith("trpg_room_") ||
+    title.startsWith("[シナリオ]") ||
+    title.startsWith("[執筆]") ||
+    title.startsWith("[TRPG]")
+  );
+}
+
+export async function GET(request: NextRequest) {
+  const user = await getSession();
+  if (!user) {
+    return NextResponse.json({ detail: "認証が必要です" }, { status: 401 });
+  }
+
+  const { searchParams } = new URL(request.url);
+  const projectId = searchParams.get("project_id");
+
+  const conditions = [
+    or(
+      eq(conversationSessions.userId, user.id),
+      isNotNull(conversationParticipants.id),
+    ),
+    isNull(conversationSessions.deletedAt),
+  ];
+
+  if (projectId) {
+    conditions.push(eq(conversationSessions.projectId, projectId));
+  }
+
+  const rows = await db
+    .select({
+      session: conversationSessions,
+      lastMessageAt: sql<Date | null>`max(${conversationMessages.createdAt})`,
+      actualMessageCount: sql<number>`count(${conversationMessages.id})`,
+    })
+    .from(conversationSessions)
+    .leftJoin(
+      conversationParticipants,
+      and(
+        eq(conversationParticipants.sessionId, conversationSessions.id),
+        eq(conversationParticipants.participantType, "user"),
+        eq(conversationParticipants.participantId, user.id),
+        or(
+          eq(conversationParticipants.status, "joined"),
+          eq(conversationParticipants.status, "invited"),
+        ),
+      ),
+    )
+    .leftJoin(
+      conversationMessages,
+      eq(conversationMessages.sessionId, conversationSessions.id),
+    )
+    .where(and(...conditions))
+    .groupBy(conversationSessions.id)
+    .orderBy(
+      desc(
+        sql`coalesce(max(${conversationMessages.createdAt}), ${conversationSessions.sessionStart}, ${conversationSessions.lastActivity})`,
+      ),
+      desc(conversationSessions.sessionStart),
+      desc(conversationSessions.id),
+    );
+
+  const result = rows
+    .filter(
+      (r) =>
+        Number(r.actualMessageCount ?? 0) > 0 &&
+        !isScenarioWorkflowSession(r.session as unknown as Record<string, unknown>),
+    )
+    .map((r) =>
+      sessionToSnake({
+        ...(r.session as unknown as Record<string, unknown>),
+        lastActivity:
+          r.lastMessageAt ??
+          r.session.sessionStart ??
+          r.session.lastActivity,
+      }),
+    );
+
+  return NextResponse.json({ conversations: result, total: result.length });
+}
+
+export async function POST(request: NextRequest) {
+  const user = await getSession();
+  if (!user) {
+    return NextResponse.json({ detail: "認証が必要です" }, { status: 401 });
+  }
+
+  const body = await request.json();
+  const { character_name, project_id } = body;
+  const initialMessage =
+    body?.initial_message && typeof body.initial_message === "object"
+      ? body.initial_message
+      : null;
+  const initialContent =
+    typeof initialMessage?.content === "string" ? initialMessage.content : "";
+  const initialClientMessageId =
+    typeof initialMessage?.client_message_id === "string"
+      ? initialMessage.client_message_id
+      : null;
+
+  if (!character_name) {
+    return NextResponse.json(
+      { detail: "character_nameは必須です" },
+      { status: 400 }
+    );
+  }
+
+  const now = new Date();
+  const result = await db.transaction(async (tx) => {
+    const [session] = await tx
+      .insert(conversationSessions)
+      .values({
+        userId: user.id,
+        characterName: character_name,
+        projectId: project_id || null,
+        sessionStart: now,
+        lastActivity: now,
+        messageCount: initialContent.trim() ? 1 : 0,
+        isActive: true,
+      })
+      .returning();
+
+    await tx.insert(conversationParticipants).values({
+      sessionId: session.id,
+      participantType: "user",
+      participantId: user.id,
+      displayName: user.displayName || user.username || user.email || user.id,
+      role: "owner",
+      status: "joined",
+      autoRespond: false,
+      participantMetadata: {},
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    let initial_message: typeof conversationMessages.$inferSelect | undefined;
+    if (initialContent.trim()) {
+      [initial_message] = await tx
+        .insert(conversationMessages)
+        .values({
+          sessionId: session.id,
+          role: "user",
+          content: encryptText(initialContent, "conversation_messages.content"),
+          messageMetadata: {
+            ...(initialClientMessageId
+              ? { client_message_id: initialClientMessageId }
+              : {}),
+          },
+          senderType: "user",
+          senderId: user.id,
+          senderDisplayName:
+            user.displayName || user.username || user.email || user.id,
+          createdAt: now,
+          branchIndex: 0,
+          isActiveBranch: true,
+        })
+        .returning();
+    }
+
+    return { session, initial_message };
+  });
+
+  return NextResponse.json({
+    success: true,
+    session: sessionToSnake(result.session as unknown as Record<string, unknown>),
+    initial_message: result.initial_message
+      ? messageToSnake(result.initial_message)
+      : undefined,
+  });
+}

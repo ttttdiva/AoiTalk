@@ -14,6 +14,7 @@ import google.generativeai as genai
 
 from ...assistant.base import BaseAssistant
 from ...config import Config
+from ...llm.generation_policy import GenerationProfile, generation_policy_for_profile
 from ...memory.history import HistoryManager
 
 logger = logging.getLogger(__name__)
@@ -247,6 +248,9 @@ class DiscordMode(BaseAssistant):
             self.llm_client.set_session_context(
                 user_id=memory_user_id,
                 metadata=metadata
+            )
+            self.llm_client.generation_policy = generation_policy_for_profile(
+                GenerationProfile.CHAT
             )
         except Exception as exc:
             logger.debug(f"Failed to set session context: {exc}")

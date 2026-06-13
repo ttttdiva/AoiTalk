@@ -4,11 +4,11 @@ Heartbeat API Routes
 Heartbeatの一覧取得・詳細・作成・更新・削除・手動トリガー・ステータスを提供する REST API。
 """
 import logging
-from typing import Optional, List
+from typing import Any, Optional, List
 
 from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,7 @@ class CreateHeartbeatRequest(BaseModel):
     enabled: bool = True
     active_hours: Optional[dict] = None
     notify_channel: str = "websocket"
+    actions: List[dict[str, Any]] = Field(default_factory=list)
 
 
 class UpdateHeartbeatRequest(BaseModel):
@@ -32,6 +33,7 @@ class UpdateHeartbeatRequest(BaseModel):
     enabled: Optional[bool] = None
     active_hours: Optional[dict] = None
     notify_channel: Optional[str] = None
+    actions: Optional[List[dict[str, Any]]] = None
 
 
 def create_heartbeat_router(require_auth) -> APIRouter:
@@ -111,6 +113,7 @@ def create_heartbeat_router(require_auth) -> APIRouter:
                 enabled=req.enabled,
                 active_hours=req.active_hours,
                 notify_channel=req.notify_channel,
+                actions=req.actions,
             )
 
             if not save_heartbeat_to_yaml(heartbeat):
@@ -144,10 +147,12 @@ def create_heartbeat_router(require_auth) -> APIRouter:
                 heartbeat.interval_minutes = req.interval_minutes
             if req.enabled is not None:
                 heartbeat.enabled = req.enabled
-            if req.active_hours is not None:
+            if "active_hours" in req.model_fields_set:
                 heartbeat.active_hours = req.active_hours
             if req.notify_channel is not None:
                 heartbeat.notify_channel = req.notify_channel
+            if req.actions is not None:
+                heartbeat.actions = req.actions
 
             if not save_heartbeat_to_yaml(heartbeat):
                 raise HTTPException(status_code=500, detail="YAML保存に失敗しました")

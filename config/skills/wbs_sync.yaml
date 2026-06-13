@@ -1,0 +1,28 @@
+name: wbs_sync
+description: プロジェクトに設定されたWBS Excelを読み取り、AoiTalkのタスクへ同期する。
+prompt_template: |
+  アクティブな案件のWBSを確認し、必要なタスク同期を行ってください。
+
+  {input}
+
+  ## 手順
+  1. project_management_assistant の get_project_context で workspace_root と wbs_file を確認する。
+  2. sync_wbs_tasks を dry_run=true で実行し、作成候補件数を確認する。
+  3. ユーザーが明示的に同期実行を求めている場合のみ dry_run=false で同期する。
+  4. 同期後、list_tasks または get_upcoming_wbs_tasks で直近タスクを要約する。
+  5. WBSが未設定、ファイルなし、読取不可の場合は設定すべき項目を具体的に返す。
+trigger_mode: both
+aliases:
+  - WBS同期
+  - wbs
+  - WBSタスク化
+bound_tools:
+  - project_management_assistant
+examples:
+  - "/wbs_sync"
+  - "この案件のWBSをタスク化して"
+  - "WBSの直近タスクを確認して"
+tags:
+  - 案件管理
+  - WBS
+parameters: {}

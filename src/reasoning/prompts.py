@@ -1,180 +1,166 @@
-"""推論モードで使用するプロンプトテンプレート"""
+"""Prompt templates used by the reasoning subsystem."""
 
-# 複雑度評価用プロンプト
 COMPLEXITY_EVALUATION_PROMPT = """
-以下のユーザー入力の複雑度を評価してください。
+Evaluate the complexity of the following user request.
 
-ユーザー入力: {user_input}
+User input: {user_input}
 
-利用可能なツール:
+Available tools:
 {available_tools}
 
-以下の観点で評価し、JSON形式で回答してください:
-1. multi_tool_score (0.0-1.0): 複数のツールが必要か
-2. dependency_score (0.0-1.0): タスク間に依存関係があるか
-3. conditional_score (0.0-1.0): 条件分岐が必要か
-4. transformation_score (0.0-1.0): データの変換・加工が必要か
-5. reasoning (string): 評価の理由
+Return JSON with these fields:
+1. multi_tool_score (0.0-1.0)
+2. dependency_score (0.0-1.0)
+3. conditional_score (0.0-1.0)
+4. transformation_score (0.0-1.0)
+5. reasoning (string)
 
-回答例:
+Example:
 {{
     "multi_tool_score": 0.8,
     "dependency_score": 0.6,
     "conditional_score": 0.2,
     "transformation_score": 0.4,
-    "reasoning": "メモリ検索とClickUp MCP登録の2つのツールが必要で、検索結果を登録に使用する依存関係がある"
+    "reasoning": "The request needs multiple tools and depends on combining their results."
 }}
 """
 
-# タスク分解用プロンプト
+
 TASK_DECOMPOSITION_PROMPT = """
-以下のユーザー入力を実行可能なステップに分解してください。
+Break the following user request into concrete execution steps.
 
-ユーザー入力: {user_input}
+User input: {user_input}
 
-利用可能なツール:
+Available tools:
 {available_tools}
 
-現在のコンテキスト:
+Conversation context:
 {context}
 
-以下の形式でステップを定義してください:
-1. 各ステップは単一の明確なアクションであること
-2. ステップ間の依存関係を明確にすること
-3. 必要なツールを特定すること
-
-JSON形式で回答してください:
+Return JSON with this structure:
 {{
     "steps": [
         {{
             "id": "step_1",
-            "description": "ステップの説明",
-            "tool_requirements": ["必要なツール名"],
+            "description": "Describe the step",
+            "tool_requirements": ["tool_name"],
             "dependencies": [],
-            "expected_output": "期待される出力の説明"
-        }},
-        ...
+            "expected_output": "Describe the output"
+        }}
     ]
 }}
 """
 
-# ツール選択用プロンプト
+
 TOOL_SELECTION_PROMPT = """
-以下のタスクに最適なツールを選択してください。
+Select the most appropriate tools for the task below.
 
-タスク説明: {task_description}
-タスクタイプ: {task_type}
+Task description: {task_description}
+Task type: {task_type}
 
-利用可能なツール:
+Available tools:
 {available_tools_with_descriptions}
 
-選択基準:
-1. タスクの目的に最も適したツールを選ぶ
-2. 複数のツールが必要な場合はすべて列挙する
-3. ツールの説明を参考に、実際の機能を理解して選択する
+Selection rules:
+- Use `search_memory`, `knowledge_search`, or web search for information lookup.
+- Use `project_management_assistant` for task/TODO work, project/case information, project DB facts/documents, WBS checks, and follow-up planning.
+- Use `spotify_assistant` for Spotify work.
+- Use `filesystem_assistant` for local file work.
+- Use `utility_assistant` for time, weather, or calculation requests.
+- Use `media_assistant` for image generation or YouTube/NicoNico playback.
+- Use `skills_assistant` when an installed skill should handle the task.
 
-以下の点を考慮してください:
-- 「調べる」「検索する」場合:
-  - 過去の会話や記憶を探す → search_memory
-  - 技術文書や知識を探す → search_rag  
-  - 最新情報やイベント、一般的な情報 → WebSearch
-- 「音楽」「再生」「Spotify」関連 → spotify_assistant
-- 「タスク」「予定」「ClickUp」関連 → use_mcp_tool (server_name='clickup')
-- 「ローカルファイル」「編集」「リファクタリング」操作 → execute_file_operation (OS操作ツール)
-- 「天気」「天候」情報 → get_weather
-
-JSON形式で回答してください:
+Return JSON:
 {{
-    "selected_tools": ["ツール名1", "ツール名2"],
-    "reasoning": "選択理由の説明"
+    "selected_tools": ["tool_name"],
+    "reasoning": "Why these tools were selected"
 }}
 """
 
-# ステップ実行用プロンプト
+
 STEP_EXECUTION_PROMPT = """
-以下のステップを実行してください。
+Execute the following step with the required tools.
 
-ステップ: {step_description}
-必要なツール: {required_tools}
+Step: {step_description}
+Required tools: {required_tools}
 
-前のステップの結果:
+Previous step results:
 {previous_results}
 
-共有コンテキスト:
+Shared context:
 {shared_context}
-
-このステップの目的を達成するために、適切なツールを使用して実行してください。
 """
 
-# 最終応答生成用プロンプト
+
 RESPONSE_GENERATION_PROMPT = """
-以下の実行結果を基に、ユーザーへの最終的な応答を生成してください。
+Generate the final user-facing response from the execution results.
 
-元のユーザー入力: {user_input}
+Original user input: {user_input}
 
-実行計画:
+Execution plan:
 {execution_plan}
 
-実行結果:
+Execution results:
 {execution_results}
 
-以下の点に注意して応答を生成してください:
-1. 元の質問に対する明確な回答を含めること
-2. 重要な結果を強調すること
-3. エラーがあった場合は適切に説明すること
-4. 自然で分かりやすい日本語で応答すること
+Response requirements:
+1. Answer the user's request directly.
+2. Summarize important results clearly.
+3. Mention errors only when relevant.
+4. Use concrete facts rather than vague statements.
 """
 
-# エラーリカバリー用プロンプト
+
 ERROR_RECOVERY_PROMPT = """
-以下のステップでエラーが発生しました。代替案を提案してください。
+One execution step failed. Propose a recovery plan.
 
-失敗したステップ: {failed_step}
-エラー内容: {error_message}
-利用可能なツール: {available_tools}
+Failed step: {failed_step}
+Error: {error_message}
+Available tools: {available_tools}
 
-代替案を以下の形式で提案してください:
+Return JSON:
 {{
-    "alternative_approach": "代替アプローチの説明",
+    "alternative_approach": "Describe the fallback",
     "new_steps": [
         {{
-            "description": "新しいステップの説明",
-            "tool_requirements": ["必要なツール"]
+            "description": "Describe the new step",
+            "tool_requirements": ["tool_name"]
         }}
     ],
-    "explanation": "なぜこの代替案が有効か"
+    "explanation": "Why this fallback should work"
 }}
 """
 
-# 進捗表示用テンプレート
+
 PROGRESS_TEMPLATES = {
-    "analyzing": "🤔 タスクを分析中...",
-    "planning": "📋 実行計画を作成中...",
-    "plan_display": """📋 実行計画:
+    "analyzing": "Analyzing the task...",
+    "planning": "Building an execution plan...",
+    "plan_display": """Execution plan:
 {plan_steps}""",
-    "executing": "🔄 実行中... ({current}/{total})",
-    "step_complete": "✅ {step_description}",
-    "step_failed": "❌ {step_description}: {error}",
-    "complete": "✨ 完了: {summary}",
-    "partial_complete": "⚠️ 部分的に完了: {summary}"
+    "executing": "Executing steps... ({current}/{total})",
+    "steering_applied": "追加指示を反映します",
+    "step_complete": "Completed: {step_description}",
+    "step_failed": "Failed: {step_description}: {error}",
+    "complete": "Done: {summary}",
+    "partial_complete": "Partially complete: {summary}",
 }
 
 
 def format_plan_steps(steps):
-    """実行計画のステップをフォーマット"""
+    """Format execution plan steps for display."""
     formatted = []
     for i, step in enumerate(steps, 1):
-        deps = f" (依存: {', '.join(step.dependencies)})" if step.dependencies else ""
+        deps = f" (dependencies: {', '.join(step.dependencies)})" if step.dependencies else ""
         formatted.append(f"  {i}. {step.description}{deps}")
     return "\n".join(formatted)
 
 
 def format_execution_results(results):
-    """実行結果をフォーマット"""
+    """Format execution results for display."""
     formatted = []
     for step_id, result in results.items():
         if result.success:
-            formatted.append(f"- {step_id}: ✅ 成功")
+            formatted.append(f"- {step_id}: success")
         else:
-            formatted.append(f"- {step_id}: ❌ 失敗 ({result.error})")
+            formatted.append(f"- {step_id}: failed ({result.error})")
     return "\n".join(formatted)

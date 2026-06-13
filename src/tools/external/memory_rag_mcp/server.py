@@ -22,22 +22,26 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     stream=sys.stderr,
 )
-logger = logging.getLogger("memory-rag-mcp")
+logger = logging.getLogger("memory-knowledge-mcp")
 
 sys.stdout = real_stdout
 sys.stdout.reconfigure(line_buffering=True)
 
-mcp = FastMCP("memory_rag")
+mcp = FastMCP("memory_knowledge")
 
-from .tools import memory, rag
+from .tools import knowledge, memory
 
 memory.register(mcp)
-rag.register(mcp)
+knowledge.register(mcp)
 
-logger.info("Memory/RAG MCP サーバー初期化完了")
+logger.info("Memory/Knowledge MCP サーバー初期化完了")
 
 
 def main():
     """MCP サーバーを起動する。"""
-    logger.info("Memory/RAG MCP サーバーを起動します...")
+    logger.info("Memory/Knowledge MCP サーバーを起動します...")
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,112 @@
+name: weekly_report
+description: 週次レポートを生成する。WBS・課題管理表・リスク管理表のExcelをスキャンし、ユーザーに確認した上でExcelを更新し、週次報告メールを作成する。
+prompt_template: |
+  週次レポートを作成してください。
+
+  {input}
+
+  ## 手順
+
+  ### 1. 設定の確認
+  filesystem_assistant で workspace_root を特定し、knowledge/weekly_report_config.json を読み込む。
+
+  存在しない場合 → 初回セットアップを実行:
+  1. ユーザーに以下を確認:
+     - WBSファイルのパス（通常: 6.お客様受領資料/10_M.プロジェクト管理/配下）
+     - 課題管理表のパス
+     - リスク管理表のパス
+     - 共有フォルダパス（メール本文に記載する格納先）
+     - 宛先情報（会社名・担当者名）
+     - 送信者名
+  2. 各Excelの構造を spreadsheet/openpyxl 等で確認:
+     ```
+     python -m openpyxl
+     ```
+  3. ヘッダ行から列マッピングを特定して weekly_report_config.json を作成
+
+  ### 2. Excelスキャン
+  spreadsheet/openpyxl 等でスキャン実行:
+  ```
+  # legacy helper removed; use spreadsheet/openpyxl directly
+  ```
+  --days は weekly_report_config.json の deadline_threshold_days を使用（デフォルト {threshold_days} 日）。
+  結果はJSON形式で出力される。
+
+  ### 3. WBS の確認・更新
+  スキャン結果のWBSタスクを一覧表示:
+
+  ```
+  以下のWBSタスクの予定終了日が近づいています:
+  | # | WBS番号 | タスク名 | 予定終了日 | 進捗率 | 担当 |
+  |---|---------|----------|-----------|--------|------|
+  | 1 | ...     | ...      | ...       | ...    | ...  |
+
+  完了しているタスクや進捗を更新するタスクはありますか？番号で教えてください。
+  ```
+
+  ユーザーの回答に基づいて updates.json を作成:
+  - 完了タスク: actual_end = 今日の日付, progress = 1.0
+  - actual_start が空なら planned_start と同じ値をセット
+  - 進捗変更: progress = ユーザー指定の値
+
+  ```
+  # legacy helper removed; use spreadsheet/openpyxl directly
+  ```
+
+  **重要**: updates.json は更新完了後に削除する。
+
+  ### 4. 課題管理表・リスク管理表の確認
+  スキャン結果に期限の近い項目がある場合、一覧を提示してユーザーに確認:
+
+  ```
+  以下の課題/リスクの期限が近づいています:
+  | # | ID | 内容 | 期限 | 状態 |
+  |---|----|------|------|------|
+  ```
+
+  - xlsx形式 → openpyxl で対応内容列に追記可能
+  - xls形式（旧形式）→ 読み取りのみ。更新が必要な場合はユーザーに手動更新を依頼
+  - 更新なしの場合 → 「更新なし」と記録
+
+  ### 5. メール生成
+  knowledge/email-templates/weekly_report.md テンプレートを読み込み、変数を埋めてメールを生成:
+
+  - project_name: knowledge/projectInfo.md から
+  - customer_name, sender_name: config の email セクション
+  - file_location, ファイル名: config の email セクション
+  - wbs_updates: WBS更新箇所の要約（完了タスク一覧、予定変更など）
+  - risk_updates: リスク管理表更新箇所（なければ「・更新なし」）
+  - issue_updates: 課題管理表更新箇所（なければ「・更新なし」）
+
+  **ユーザーの表記・言い回しを勝手に変えない**。テンプレートの表記をそのまま使う。
+
+  ### 6. knowledge/ 更新
+  更新した内容を knowledge/ にも反映:
+  - activeContext.md の「最終更新」日付を更新
+  - progress.md に完了タスクがあれば反映
+
+  ### 7. 修正対応
+  ユーザーから修正指示があれば反映して再表示。承認されたら完了。
+
+  ## 注意事項
+  - WBSが .xlsm（マクロ付き）の場合、更新スクリプトは自動的に keep_vba=True で保存する
+  - リスク管理表が .xls 形式の場合、読み取りのみ対応（xlrd使用）
+  - バックアップファイル（_backup_YYYYMMDD_HHMMSS）が自動作成される
+  - スキャンで検出されなかったタスクでも、ユーザーが追加で報告したい項目があれば手動でメールに追記する
+trigger_mode: both
+aliases:
+  - 週次レポート
+  - 週報
+  - weekly
+bound_tools:
+  - filesystem_assistant
+examples:
+  - "/weekly_report"
+  - "/weekly_report 今週はNW切替作業があったことを強調"
+tags:
+  - 案件管理
+  - レポート
+parameters:
+  threshold_days:
+    description: 期限アラートの閾値（日数）
+    default: "14"

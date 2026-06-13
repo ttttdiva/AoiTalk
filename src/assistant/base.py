@@ -68,7 +68,7 @@ class BaseAssistant(ABC):
             print("[標準モード] 基本的なLLMクライアントを使用します")
         
         print("[BaseAssistant] LLMクライアント作成開始")
-        self.llm_client = create_llm_client(self.config, use_agent=use_tools)
+        self.llm_client = create_llm_client(self.config)
         print("[BaseAssistant] LLMクライアント作成完了")
         
         # Set LLM system prompt
@@ -76,7 +76,22 @@ class BaseAssistant(ABC):
         system_prompt = personality.get('details', 'あなたは親切なAIアシスタントです。')
         self.llm_client.set_system_prompt(system_prompt)
         print("[BaseAssistant] _init_common_components完了")
-        
+
+    def _activate_llm_client(self, llm_client):
+        """Replace the LLM client used by assistant response generation."""
+        self.llm_client = llm_client
+
+        personality = self.character_config.get('personality', {})
+        system_prompt = personality.get('details', 'あなたは親切なAIアシスタントです。')
+        if hasattr(self.llm_client, 'set_system_prompt'):
+            self.llm_client.set_system_prompt(system_prompt)
+
+        if hasattr(self, 'response_handler') and self.response_handler:
+            self.response_handler.llm_client = self.llm_client
+
+        if self.web_interface and hasattr(self.llm_client, 'clear_history'):
+            self.web_interface.set_clear_chat_callback(self.llm_client.clear_history)
+
     async def initialize(self) -> bool:
         """Initialize assistant components
         
@@ -183,11 +198,11 @@ class BaseAssistant(ABC):
             # Verify files exist
             if not Path(ssl_keyfile).exists():
                 print(f"⚠️  SSL key file not found: {ssl_keyfile}")
-                print("   Run: python scripts/generate_ssl_cert.py")
+                print("   Set AOITALK_SSL_KEYFILE and AOITALK_SSL_CERTFILE to existing certificate files")
                 return False, None, None
             if not Path(ssl_certfile).exists():
                 print(f"⚠️  SSL cert file not found: {ssl_certfile}")
-                print("   Run: python scripts/generate_ssl_cert.py")
+                print("   Set AOITALK_SSL_KEYFILE and AOITALK_SSL_CERTFILE to existing certificate files")
                 return False, None, None
         
         return ssl_enabled, ssl_keyfile if ssl_enabled else None, ssl_certfile if ssl_enabled else None
@@ -209,7 +224,9 @@ class BaseAssistant(ABC):
             self.web_interface = create_web_interface(self.config, self.character_name)
             current_loop = asyncio.get_running_loop()
             self.web_interface.set_user_input_callback(input_callback, current_loop)
-            
+            self.web_interface.set_llm_client_change_callback(self._activate_llm_client)
+            self.web_interface.set_llm_client(self.llm_client)
+
             # Set clear chat callback to start new session when user clicks "New Conversation"
             if hasattr(self.llm_client, 'clear_history'):
                 self.web_interface.set_clear_chat_callback(self.llm_client.clear_history)

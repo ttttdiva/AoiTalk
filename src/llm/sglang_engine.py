@@ -12,6 +12,7 @@ import signal
 import logging
 import subprocess
 import asyncio
+import concurrent.futures
 import aiohttp
 from typing import Optional, List, Dict, Any, Union, Generator
 from pathlib import Path
@@ -20,8 +21,27 @@ from openai import OpenAI
 
 from ..config import Config
 from ..memory.history import HistoryManager
+from ..services.project_context import (
+    ProjectContextResolver,
+    reset_runtime_project_context,
+    set_runtime_project_context,
+)
 from ..tools.registry import get_registry
 from ..tools.adapters import OpenAIAPIAdapter
+from .generation_policy import (
+    DEFAULT_GENERATION_POLICY,
+    get_client_generation_policy,
+    reset_current_generation_policy,
+    set_current_generation_policy,
+)
+from .agent_runtime import (
+    build_required_delegation_context_sync,
+    compose_required_delegation_user_message,
+    run_openai_tool_call_loop,
+)
+from .runtime_tool_registry import build_runtime_tool_registry
+from .tool_policy import reset_current_user_input, set_current_user_input
+from .provider_capabilities import ProviderCapabilities
 
 logger = logging.getLogger(__name__)
 
@@ -326,13 +346,30 @@ class SGLangClient:
             base_url=self.base_url,
             api_key=api_key
         )
+        self.capabilities = ProviderCapabilities(
+            supports_stream=True,
+            supports_tools=True,
+            supports_response_format=False,
+            supports_model_pull=False,
+            supports_model_delete=False,
+            supports_extra_body=True,
+        )
 
         # Initialize history manager
         self.history_manager = HistoryManager()
+        if config and config.get("use_tools", True):
+            self._tool_registry = build_runtime_tool_registry(config)
+        else:
+            self._tool_registry = get_registry()
 
         # Session context
         self.session_user_id = "default_user"
         self.session_metadata: Dict[str, Any] = {}
+        self.current_session_id: Optional[str] = None
+        self.current_project_id: Optional[str] = None
+        self.generation_policy = DEFAULT_GENERATION_POLICY
+        self.current_include_project_context: Optional[bool] = None
+        self.current_edit_message_id: Optional[str] = None
 
         # Build system prompt
         self.system_prompt = self._build_system_prompt()
@@ -511,6 +548,93 @@ class SGLangClient:
 
         return messages
 
+    def _run_async_sync(self, coro):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result()
+
+    def _resolve_project_context_sync(self) -> Optional[dict[str, Any]]:
+        current_project_id = getattr(self, "current_project_id", None)
+        current_session_id = getattr(self, "current_session_id", None)
+        if not current_project_id and not current_session_id:
+            return None
+
+        resolver = ProjectContextResolver()
+        try:
+            return self._run_async_sync(
+                resolver.resolve_context(
+                    project_id=current_project_id,
+                    session_id=current_session_id,
+                )
+            )
+        except Exception as exc:
+            logger.warning("[SGLangClient] Failed to resolve project context: %s", exc)
+            return None
+
+    def _build_required_delegation_context(self, user_input: str) -> str:
+        return build_required_delegation_context_sync(
+            user_input=user_input,
+            registry=self._tool_registry,
+            policy=get_client_generation_policy(self),
+            log_prefix="SGLangClient",
+        )
+
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens or 1024,
+        )
+        return response.choices[0].message.content or ""
+
+    def stream_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+    ) -> Generator[str, None, None]:
+        stream = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens or 1024,
+            stream=True,
+        )
+        for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+
+    def list_models(self) -> List[Dict[str, Any]]:
+        response = self.client.models.list()
+        data = getattr(response, "data", response)
+        models = []
+        for item in data:
+            model_id = getattr(item, "id", None)
+            if model_id is None and isinstance(item, dict):
+                model_id = item.get("id")
+            if model_id:
+                models.append({"id": model_id})
+        return models
+
+    def health_check(self) -> Dict[str, Any]:
+        try:
+            models = self.list_models()
+            return {"ok": True, "base_url": self.base_url, "model_count": len(models)}
+        except Exception as exc:
+            return {"ok": False, "base_url": self.base_url, "error": str(exc)}
+
     def generate_response(
         self,
         user_input: str,
@@ -533,9 +657,24 @@ class SGLangClient:
         """
         if image_data:
             logger.warning("[SGLangClient] 画像入力はこのプロバイダーでサポートされていません。画像は無視されます。")
+        project_token = None
+        tool_policy_token = set_current_user_input(user_input)
+        generation_policy_token = set_current_generation_policy(
+            get_client_generation_policy(self)
+        )
         try:
+            project_context = self._resolve_project_context_sync()
+            project_token = set_runtime_project_context(project_context)
+            required_delegation_context = self._build_required_delegation_context(
+                user_input
+            )
+            model_user_input = compose_required_delegation_user_message(
+                user_input,
+                required_delegation_context,
+            )
+
             # Build messages
-            messages = self._build_messages(user_input)
+            messages = self._build_messages(model_user_input)
 
             # Mode-specific parameters (Qwen3 thinking mode support)
             if self._thinking_mode:
@@ -551,7 +690,7 @@ class SGLangClient:
                 extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
 
             # Build tools from unified registry
-            registry = get_registry()
+            registry = self._tool_registry
             api_tools = OpenAIAPIAdapter.convert_all(registry.get_all()) if len(registry) > 0 else None
 
             # Make API call
@@ -597,8 +736,8 @@ class SGLangClient:
                         response_text = raw_response_text
 
                 # Add to history
-                self.history_manager.add("user", user_input)
-                self.history_manager.add("assistant", response_text)
+                self.history_manager.add_message("user", user_input)
+                self.history_manager.add_message("assistant", response_text)
 
                 logger.info(f"[SGLangClient] 応答生成完了: {len(response_text)}文字")
                 return response_text
@@ -609,14 +748,19 @@ class SGLangClient:
             traceback.print_exc()
 
             fallback = self._get_fallback_response()
-            self.history_manager.add("user", user_input)
-            self.history_manager.add("assistant", fallback)
+            self.history_manager.add_message("user", user_input)
+            self.history_manager.add_message("assistant", fallback)
 
             if stream:
                 def error_generator():
                     yield fallback
                 return error_generator()
             return fallback
+        finally:
+            if project_token is not None:
+                reset_runtime_project_context(project_token)
+            reset_current_generation_policy(generation_policy_token)
+            reset_current_user_input(tool_policy_token)
 
     def _handle_tool_calls(
         self,
@@ -626,73 +770,15 @@ class SGLangClient:
         registry: "ToolRegistry",
         max_rounds: int = 5
     ) -> str:
-        """Handle tool calls from model response
-
-        Executes tools and re-prompts the model with results until a text
-        response is produced or max_rounds is reached.
-        """
-        import json as _json
-
-        current_messages = list(messages)
-        current_tool_calls = assistant_message.tool_calls
-        current_content = assistant_message.content
-
-        for round_num in range(max_rounds):
-            # Append assistant message with tool calls
-            current_messages.append({
-                "role": "assistant",
-                "content": current_content or "",
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in current_tool_calls
-                ],
-            })
-
-            # Execute each tool call
-            for tc in current_tool_calls:
-                fn_name = tc.function.name
-                try:
-                    fn_args = _json.loads(tc.function.arguments)
-                except _json.JSONDecodeError:
-                    fn_args = {}
-
-                try:
-                    result = registry.execute(fn_name, **fn_args)
-                    result_str = str(result)
-                except Exception as e:
-                    result_str = f"Error: {e}"
-
-                current_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result_str,
-                })
-
-                logger.info(f"[SGLangClient] Tool {fn_name} → {result_str[:100]}")
-
-            # Re-call the model with tool results
-            follow_up_kwargs = dict(api_kwargs)
-            follow_up_kwargs["messages"] = current_messages
-            response = self.client.chat.completions.create(**follow_up_kwargs)
-            choice = response.choices[0]
-
-            if choice.message.tool_calls:
-                current_tool_calls = choice.message.tool_calls
-                current_content = choice.message.content
-                continue
-            else:
-                return choice.message.content or ""
-
-        # Exceeded max rounds
-        logger.warning("[SGLangClient] Tool call loop exceeded max rounds")
-        return current_content or ""
+        return run_openai_tool_call_loop(
+            initial_messages=messages,
+            assistant_message=assistant_message,
+            api_kwargs=api_kwargs,
+            registry=registry,
+            create_completion=lambda kwargs: self.client.chat.completions.create(**kwargs),
+            log_prefix="SGLangClient",
+            max_rounds=max_rounds,
+        )
 
     def _stream_response(
         self,
@@ -751,8 +837,8 @@ class SGLangClient:
                     yield content
 
             # Add to history after streaming is complete
-            self.history_manager.add("user", user_input)
-            self.history_manager.add("assistant", full_response)
+            self.history_manager.add_message("user", user_input)
+            self.history_manager.add_message("assistant", full_response)
 
         except Exception as e:
             logger.error(f"[SGLangClient] ストリーミングエラー: {e}")
@@ -798,8 +884,13 @@ def create_sglang_client(config: Config) -> SGLangClient:
 
     # Get configuration values
     sglang_config = config.get('sglang', {}) or {}
+    response_model = (
+        config.get('llm_model')
+        if config.get('response_model_selection_active')
+        else None
+    )
     base_url = config.get('sglang_base_url', os.getenv('SGLANG_BASE_URL', server_manager.base_url))
-    model = sglang_config.get('model') or config.get('sglang_model', os.getenv('SGLANG_MODEL', config.get('llm_model', 'default')))
+    model = response_model or sglang_config.get('model') or config.get('sglang_model', os.getenv('SGLANG_MODEL', config.get('llm_model', 'default')))
     api_key = config.get('sglang_api_key', os.getenv('SGLANG_API_KEY', 'dummy'))
 
     client = SGLangClient(

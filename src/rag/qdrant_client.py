@@ -20,6 +20,7 @@ except ImportError:
     QDRANT_AVAILABLE = False
 
 from .config import QdrantConfig
+from ..security.field_crypto import decrypt_text_if_needed, encrypt_text
 
 logger = logging.getLogger(__name__)
 
@@ -179,17 +180,18 @@ class QdrantManager:
                 info = self.client.get_collection(self.config.collection_name)
                 self._point_id_counter = info.points_count or 0
             
-            # Ensure payload indexes exist for fast filtering
-            self.client.create_payload_index(
-                collection_name=self.config.collection_name,
-                field_name="doc_id",
-                field_schema=models.PayloadSchemaType.KEYWORD
-            )
-            self.client.create_payload_index(
-                collection_name=self.config.collection_name,
-                field_name="source_file",
-                field_schema=models.PayloadSchemaType.KEYWORD
-            )
+            # Local Qdrant ignores payload indexes and emits noisy warnings.
+            if not self._is_local_mode:
+                self.client.create_payload_index(
+                    collection_name=self.config.collection_name,
+                    field_name="doc_id",
+                    field_schema=models.PayloadSchemaType.KEYWORD
+                )
+                self.client.create_payload_index(
+                    collection_name=self.config.collection_name,
+                    field_name="source_file",
+                    field_schema=models.PayloadSchemaType.KEYWORD
+                )
             
             self._initialized = True
             mode_str = "local storage" if self._is_local_mode else f"server ({self.config.host}:{self.config.port})"
@@ -226,7 +228,7 @@ class QdrantManager:
             points = []
             for doc_id, embedding, text, metadata in zip(ids, embeddings, texts, metadata_list):
                 payload = {
-                    "text": text,
+                    "text": encrypt_text(text, aad=f"qdrant.payload.text:{doc_id}"),
                     "doc_id": doc_id,
                     **metadata
                 }
@@ -293,10 +295,14 @@ class QdrantManager:
             
             search_results = []
             for hit in results:
+                doc_id = hit.payload.get("doc_id", str(hit.id))
                 search_results.append(SearchResult(
-                    id=hit.payload.get("doc_id", str(hit.id)),
+                    id=doc_id,
                     score=hit.score,
-                    text=hit.payload.get("text", ""),
+                    text=decrypt_text_if_needed(
+                        hit.payload.get("text", ""),
+                        aad=f"qdrant.payload.text:{doc_id}",
+                    ),
                     metadata={k: v for k, v in hit.payload.items() 
                              if k not in ["text", "doc_id"]}
                 ))

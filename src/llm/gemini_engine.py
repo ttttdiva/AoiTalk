@@ -4,6 +4,7 @@ Gemini LLM engine implementation with Function Calling support
 import os
 import asyncio
 import threading
+import concurrent.futures
 from typing import Optional, List, Dict, Any, Union, Generator
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold, FunctionDeclaration, Tool
@@ -13,15 +14,32 @@ from ..tools.registry import get_registry
 from ..tools.adapters import GeminiAdapter
 from ..memory.manager import ConversationMemoryManager
 from ..memory.config import MemoryConfig
-# Conditionally import semantic memory to avoid SQLite issues
-try:
-    from ..memory.semantic_memory import SemanticMemoryManager
-    SEMANTIC_MEMORY_AVAILABLE = True
-except (ImportError, Exception) as e:
-    print(f"[GeminiLLMClient] Semantic memory not available: {e}")
-    SEMANTIC_MEMORY_AVAILABLE = False
-    SemanticMemoryManager = None
-from ..tools.external.mcp_plugin import MCPPlugin
+from ..services.project_context import (
+    ProjectContextResolver,
+    format_project_context_for_chat_prompt,
+    get_runtime_project_context,
+    reset_runtime_project_context,
+    set_runtime_project_context,
+)
+from ..services.context_builder import ContextBuilder, ContextBundle
+from ..services.scenario_chat_context import (
+    build_scenario_chat_context,
+    is_scenario_workflow_tool_allowed,
+)
+from .prompts import build_unified_instructions
+from .runtime_tool_registry import build_runtime_tool_registry
+from .generation_policy import (
+    DEFAULT_GENERATION_POLICY,
+    get_client_generation_policy,
+    reset_current_generation_policy,
+    set_current_generation_policy,
+)
+from .agent_runtime import (
+    build_required_delegation_context_sync,
+    compose_required_delegation_user_message,
+)
+from .tool_policy import reset_current_user_input, set_current_user_input
+from ..services.user_settings_service import get_user_custom_instructions_sync
 
 
 class GeminiLLMClient:
@@ -43,12 +61,14 @@ class GeminiLLMClient:
         self.session_metadata: Dict[str, Any] = {}
         self.current_session_id: Optional[str] = None  # For session-specific message storage and history loading
         self.current_project_id: Optional[str] = None  # For project-specific session creation
+        self.generation_policy = DEFAULT_GENERATION_POLICY
+        self.current_edit_message_id: Optional[str] = None
+        self._current_context_bundle: Optional[ContextBundle] = None
         self._loaded_session_id: Optional[str] = None  # Track which session's history is already loaded
         self._history_lock = threading.Lock()  # Protect conversation_history from concurrent access
 
         # Initialize memory manager
         self.memory_manager = None
-        self.semantic_memory_manager = None
         self._memory_enabled = config.get('memory', {}).get('enabled', True) if config else True
         self._cleanup_done = False
         self._memory_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -56,20 +76,14 @@ class GeminiLLMClient:
         if self._memory_enabled:
             memory_config = MemoryConfig()
             if config:
-                # Override with app config if available
+                memory_settings = config.get("memory", {})
                 memory_config.llm_provider = config.get('llm_provider', 'gemini')
                 memory_config.llm_model = config.get('llm_model', 'gemini-3-flash-preview')
+                memory_config.enable_search = memory_settings.get("enable_search", False)
+                memory_config.preload_embedding_model = memory_settings.get(
+                    "preload_embedding_model", False
+                )
             self.memory_manager = ConversationMemoryManager(memory_config)
-
-            # Initialize semantic memory (Mem0) if available
-            if SEMANTIC_MEMORY_AVAILABLE and SemanticMemoryManager:
-                try:
-                    self.semantic_memory_manager = SemanticMemoryManager(config)
-                except Exception as e:
-                    print(f"[GeminiLLMClient] Failed to initialize semantic memory: {e}")
-                    self.semantic_memory_manager = None
-            else:
-                self.semantic_memory_manager = None
 
             # Start persistent memory event loop thread
             self._memory_loop = asyncio.new_event_loop()
@@ -78,18 +92,23 @@ class GeminiLLMClient:
             )
             self._memory_thread.start()
 
-            # Pre-warm cross-session memory (embedding model + Qdrant) in background
-            asyncio.run_coroutine_threadsafe(self._warmup_cross_session_memory(), self._memory_loop)
+            memory_settings = config.get("memory", {}) if config else {}
+            if memory_settings.get("enable_search", False):
+                # Pre-warm cross-session memory only when semantic memory search is enabled.
+                asyncio.run_coroutine_threadsafe(
+                    self._warmup_cross_session_memory(), self._memory_loop
+                )
 
-        # Initialize MCP plugin
-        self.mcp_plugin = MCPPlugin()
-        self._mcp_initialized = False
-        
         # Configure Gemini
         genai.configure(api_key=api_key)
         
         # Initialize system prompt based on character
         self.system_prompt = self._build_system_prompt()
+        self._tool_registry = (
+            build_runtime_tool_registry(config)
+            if config
+            else get_registry()
+        )
         
         # Initialize available tools from unified registry
         self.tools = self._setup_tools()
@@ -119,22 +138,14 @@ class GeminiLLMClient:
             else:
                 print(f"[GeminiLLMClient] Spotify初期化スキップ（設定不完全）")
         
-        # Initialize MCP plugin synchronously if enabled
-        if self.config and self.config.get('mcp_enabled', False):
-            print(f"[GeminiLLMClient] MCP初期化を開始...")
-            # Force synchronous initialization without event loop checks
-            self._force_mcp_init_sync()
-        else:
-            print(f"[GeminiLLMClient] MCPは無効です")
-        
         print(f"[GeminiLLMClient] Geminiクライアント初期化: {self.character_name}")
         print(f"[GeminiLLMClient] 使用モデル: {model}")
-        print(f"[GeminiLLMClient] 利用可能ツール数: {len(get_registry())}")
+        print(f"[GeminiLLMClient] 利用可能ツール数: {len(self._tool_registry)}")
     
     def _setup_tools(self) -> List[Tool]:
         """Setup Function Calling tools for Gemini using the unified registry"""
         try:
-            registry = get_registry()
+            registry = self._tool_registry
             all_tools = registry.get_all()
             if not all_tools:
                 return []
@@ -158,32 +169,37 @@ class GeminiLLMClient:
     
     def _build_system_prompt(self) -> str:
         """Build system prompt based on character configuration"""
-        tools_info = "検索、天気、計算、時間確認、記憶検索、音楽、タスク管理などのツールが使えます。"
-        memory_info = "過去の会話を質問されたらsearch_memoryで検索してください。"
-        # Critical instruction to prevent hallucination with tool results
-        tool_result_instruction = "重要：ツールを使用した場合は、ツールから返された結果をそのまま正確に引用して回答してください。結果を勝手に解釈したり、存在しない情報を追加しないでください。"
+        return build_unified_instructions(
+            character_name=self.character_name,
+            config=self.config,
+            custom_instructions=get_user_custom_instructions_sync(
+                self._get_session_user_id()
+            ),
+        )
 
-        # スキル情報を取得
-        skills_info = ""
-        try:
-            from .prompts import _build_skills_section
-            skills_section = _build_skills_section()
-            if skills_section:
-                skills_info = f"\n{skills_section}"
-        except Exception:
-            pass
+    def _build_effective_system_prompt(self, scenario_context=None) -> str:
+        if scenario_context:
+            return scenario_context.prompt
+        return self._build_system_prompt()
 
-        if not self.config:
-            return f"親切なAIアシスタントです。{tools_info}{memory_info}{tool_result_instruction}{skills_info}"
+    def _get_effective_gemini_tools(self, scenario_context=None) -> List[Tool]:
+        if not scenario_context:
+            return self.tools
 
-        # Load character configuration
-        character_config = self.config.get_character_config(self.character_name)
-        personality = character_config.get('personality', {})
-        character_name = character_config.get('name', self.character_name)
-
-        # Build character instructions
-        details = personality.get('details', '')
-        return f"あなたは{character_name}です。{details}{tools_info}{memory_info}{tool_result_instruction}{skills_info}"
+        filtered_tools: List[Tool] = []
+        for tool in self.tools:
+            declarations = list(getattr(tool, "function_declarations", []) or [])
+            kept = [
+                declaration
+                for declaration in declarations
+                if is_scenario_workflow_tool_allowed(
+                    str(getattr(declaration, "name", "")),
+                    scenario_context,
+                )
+            ]
+            if kept:
+                filtered_tools.append(Tool(function_declarations=kept))
+        return filtered_tools
     
     def transcribe_audio(self, file_path) -> Optional[str]:
         """Transcribe audio file to text using Gemini
@@ -307,9 +323,20 @@ class GeminiLLMClient:
         """Execute a tool function and return its result"""
         try:
             print(f"[GeminiLLMClient] ツール実行: {function_name} with {arguments}")
-            
+
+            scenario_context = self._get_scenario_chat_context_sync()
+            if scenario_context and not is_scenario_workflow_tool_allowed(
+                function_name,
+                scenario_context,
+            ):
+                return (
+                    f"{function_name} is not available in this scenario "
+                    f"{scenario_context.mode} session. Continue using the scenario "
+                    "workflow context only."
+                )
+
             # 統一レジストリからツール取得・実行
-            registry = get_registry()
+            registry = self._tool_registry
             tool_def = registry.get(function_name)
             if not tool_def:
                 return f"エラー: 未知の関数 '{function_name}'"
@@ -339,24 +366,49 @@ class GeminiLLMClient:
     def _build_conversation_context(self, user_input: str) -> List[Dict[str, str]]:
         """Build conversation context from history for Gemini chat"""
         messages = []
-        
-        # Get relevant memories for context enhancement
-        memory_context = ""
-        if SEMANTIC_MEMORY_AVAILABLE and self.semantic_memory_manager and self._memory_enabled:
+
+        scenario_context = self._get_scenario_chat_context_sync()
+        # Scenario workflow sessions use a dedicated system prompt instead of
+        # the globally selected app-header assistant prompt.
+        enhanced_system_prompt = self._build_effective_system_prompt(scenario_context)
+        context_builder_block = (
+            self._current_context_bundle.render_for_prompt()
+            if not scenario_context and self._current_context_bundle
+            else ""
+        )
+        if context_builder_block:
+            enhanced_system_prompt = f"{enhanced_system_prompt}\n\n{context_builder_block}"
+        include_project_context = bool(
+            getattr(self, "current_include_project_context", True)
+        )
+        project_context = (
+            None
+            if scenario_context or not include_project_context
+            else get_runtime_project_context()
+        )
+        if project_context and not context_builder_block:
+            project_block = format_project_context_for_chat_prompt(project_context)
+            if project_block:
+                enhanced_system_prompt = f"{enhanced_system_prompt}\n\n{project_block}"
+
+        # シナリオ情報の取得
+        from ..services.scenario_service import get_play_session_by_conversation_id
+        session_id = getattr(self, "current_session_id", None)
+        if session_id and not scenario_context:
             try:
-                # Only attempt if semantic memory is properly initialized
-                if hasattr(self.semantic_memory_manager, '_initialized') and self.semantic_memory_manager._initialized:
-                    memory_context = self._safe_memory_operation(self._retrieve_relevant_memories_sync, user_input)
-                    if memory_context:
-                        print(f"[GeminiLLMClient] 関連記憶を取得: {len(memory_context)}文字")
+                play_session = self._run_async_sync(get_play_session_by_conversation_id(session_id))
+                if play_session:
+                    import json
+                    scenario_data = {
+                        "scenario_title": play_session.get("scenario", {}).get("title"),
+                        "current_scene": play_session.get("current_scene", {}).get("title"),
+                        "player_state": play_session.get("player_state", {}),
+                        "status": play_session.get("status"),
+                    }
+                    enhanced_system_prompt = f"{enhanced_system_prompt}\n\n## Active TRPG Scenario State:\n{json.dumps(scenario_data, ensure_ascii=False, indent=2)}"
             except Exception as e:
-                print(f"[GeminiLLMClient] Memory retrieval failed: {e}")
-        
-        # Build enhanced system prompt with memories
-        enhanced_system_prompt = self.system_prompt
-        if memory_context:
-            enhanced_system_prompt = f"{self.system_prompt}\n\n{memory_context}"
-        
+                print(f"[GeminiLLMClient] Failed to get scenario state: {e}")
+
         # Add enhanced system prompt as the first user message
         messages.append({
             "role": "user",
@@ -388,8 +440,80 @@ class GeminiLLMClient:
         })
         
         return messages
-    
-    def generate_response(self, 
+
+    def _get_routed_model(self, user_input: str) -> Optional[str]:
+        return None
+
+    def _resolve_project_context_sync(self) -> Optional[dict[str, Any]]:
+        if not self.current_project_id and not self.current_session_id:
+            return None
+
+        if self._get_scenario_chat_context_sync():
+            return None
+
+        resolver = ProjectContextResolver()
+        try:
+            return self._run_async_sync(
+                resolver.resolve_context(
+                    project_id=self.current_project_id,
+                    session_id=self.current_session_id,
+                )
+            )
+        except Exception as e:
+            print(f"[GeminiLLMClient] Failed to resolve project context: {e}")
+            return None
+
+    def _get_scenario_chat_context_sync(self):
+        if not self.current_session_id:
+            return None
+        try:
+            return self._run_async_sync(
+                build_scenario_chat_context(self.current_session_id)
+            )
+        except Exception as e:
+            print(f"[GeminiLLMClient] Failed to resolve scenario chat context: {e}")
+            return None
+
+    def _run_async_sync(self, coro):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result()
+
+    def _build_context_bundle_sync(
+        self, user_input: str, project_context: Optional[dict[str, Any]]
+    ) -> Optional[ContextBundle]:
+        if self._get_scenario_chat_context_sync():
+            return None
+        try:
+            return self._run_async_sync(
+                ContextBuilder().build_context(
+                    user_id=self._get_session_user_id(),
+                    message=user_input,
+                    project_id=self.current_project_id,
+                    session_id=self.current_session_id,
+                    project_context=project_context,
+                    include_project_context=bool(
+                        getattr(self, "current_include_project_context", True)
+                    ),
+                )
+            )
+        except Exception as e:
+            print(f"[GeminiLLMClient] ContextBuilder failed; fallback to legacy context: {e}")
+            return None
+
+    def _build_required_delegation_context(self, user_input: str) -> str:
+        return build_required_delegation_context_sync(
+            user_input=user_input,
+            registry=self._tool_registry,
+            policy=get_client_generation_policy(self),
+            log_prefix="GeminiLLMClient",
+        )
+
+    def generate_response(self,
                          user_input: str,
                          temperature: float = 0.7,
                          max_tokens: Optional[int] = None,
@@ -409,8 +533,21 @@ class GeminiLLMClient:
         """
         # Capture session_id locally to prevent race conditions with concurrent requests
         session_id = self.current_session_id
+        edit_message_id = self.current_edit_message_id
+        external_persistence = bool(getattr(self, "external_persistence_enabled", False))
+        project_token = None
+        tool_policy_token = set_current_user_input(user_input)
+        generation_policy_token = set_current_generation_policy(
+            get_client_generation_policy(self)
+        )
 
         try:
+            project_context = self._resolve_project_context_sync()
+            project_token = set_runtime_project_context(project_context)
+            self._current_context_bundle = self._build_context_bundle_sync(
+                user_input, project_context
+            )
+
             # Lock protects conversation_history and _loaded_session_id from concurrent access
             with self._history_lock:
                 # Load conversation history from database only when session changes
@@ -429,13 +566,25 @@ class GeminiLLMClient:
                 # Build conversation context (reads conversation_history)
                 context = self._build_conversation_context(user_input)
 
+            model_user_input = user_input
+            required_delegation_context = self._build_required_delegation_context(
+                user_input
+            )
+            model_user_input = compose_required_delegation_user_message(
+                user_input,
+                required_delegation_context,
+            )
+            if required_delegation_context:
+                if context:
+                    context[-1]["parts"] = [model_user_input]
+
             # Initialize memory manager if needed and save user message (outside lock, fire-and-forget)
-            if self.memory_manager and self._memory_enabled:
+            if self.memory_manager and self._memory_enabled and not external_persistence:
                 try:
                     if session_id:
                         # Use session-specific storage (fire-and-forget for speed)
                         self._safe_memory_operation(
-                            self._save_user_message_to_session, user_input, session_id,
+                            self._save_user_message_to_session, user_input, session_id, edit_message_id,
                             fire_and_forget=True
                         )
                     # Note: If no session_id, we skip saving to avoid creating project_id=None sessions
@@ -488,8 +637,29 @@ class GeminiLLMClient:
 
 
             
-            # Start conversation with the model
-            chat = self.model.start_chat(history=context[:-1])  # All except last message
+            # モデルルーティング: 有効なら動的モデル選択
+            scenario_context = self._get_scenario_chat_context_sync()
+            effective_tools = self._get_effective_gemini_tools(scenario_context)
+            routed_model = self._get_routed_model(user_input)
+            if routed_model and routed_model != self.model_name:
+                print(f"[GeminiLLMClient] モデルルーティング: {self.model_name} → {routed_model}")
+                routed_genai_model = genai.GenerativeModel(
+                    model_name=routed_model,
+                    safety_settings=self.model._safety_settings if hasattr(self.model, '_safety_settings') else None,
+                    tools=effective_tools if effective_tools else None,
+                    system_instruction=self.model._system_instruction if hasattr(self.model, '_system_instruction') else None,
+                )
+                chat = routed_genai_model.start_chat(history=context[:-1])
+            elif scenario_context:
+                scenario_model = genai.GenerativeModel(
+                    model_name=self.model_name,
+                    safety_settings=self.model._safety_settings if hasattr(self.model, '_safety_settings') else None,
+                    tools=effective_tools if effective_tools else None,
+                    system_instruction=self.model._system_instruction if hasattr(self.model, '_system_instruction') else None,
+                )
+                chat = scenario_model.start_chat(history=context[:-1])
+            else:
+                chat = self.model.start_chat(history=context[:-1])  # All except last message
             
             max_tool_calls = 5  # Prevent infinite loops (increased from 3 to support multi-step operations)
             tool_call_count = 0
@@ -528,7 +698,7 @@ class GeminiLLMClient:
             
             # Add text if provided
             if user_input:
-                message_parts.append(user_input)
+                message_parts.append(model_user_input)
             
             # Use the original context[-1]["parts"] or the new multimodal parts
             latest_message = message_parts if message_parts else context[-1]["parts"]
@@ -701,7 +871,7 @@ class GeminiLLMClient:
                         self.conversation_history.append({"role": "assistant", "content": response_text})
                     
                     # Save assistant response to memory
-                    if self.memory_manager and self._memory_enabled:
+                    if self.memory_manager and self._memory_enabled and not external_persistence:
                         try:
                             if session_id:
                                 # Use session-specific storage (fire-and-forget for speed)
@@ -780,6 +950,12 @@ class GeminiLLMClient:
                     yield fallback
                 return error_generator()
             return fallback
+        finally:
+            reset_current_generation_policy(generation_policy_token)
+            reset_current_user_input(tool_policy_token)
+            if project_token is not None:
+                reset_runtime_project_context(project_token)
+            self._current_context_bundle = None
     
     def _get_fallback_response(self) -> str:
         """Get fallback response for errors"""
@@ -901,7 +1077,12 @@ class GeminiLLMClient:
             print(f"[GeminiLLMClient] Failed to load session history: {e}")
             return []
     
-    async def _save_user_message_to_session(self, user_input: str, session_id: str):
+    async def _save_user_message_to_session(
+        self,
+        user_input: str,
+        session_id: str,
+        branch_from_message_id: Optional[str] = None,
+    ):
         """Save user message to specific session
         
         Args:
@@ -915,7 +1096,8 @@ class GeminiLLMClient:
             session_id=session_id,
             role="user",
             content=user_input,
-            metadata=self._get_memory_metadata()
+            metadata=self._get_memory_metadata(),
+            branch_from_message_id=branch_from_message_id,
         )
     
     async def _save_assistant_message_to_session(self, response_text: str, session_id: str):
@@ -934,104 +1116,6 @@ class GeminiLLMClient:
             content=response_text,
             metadata=self._get_memory_metadata()
         )
-    
-    # Semantic memory processing moved to ResponseHandler for unified handling across all LLM providers
-    
-    async def _retrieve_relevant_memories(self, user_input: str) -> str:
-        """Retrieve relevant memories for context enhancement
-        
-        Args:
-            user_input: User's input to search for relevant memories
-            
-        Returns:
-            Formatted memory context string
-        """
-        if not SEMANTIC_MEMORY_AVAILABLE or not self.semantic_memory_manager:
-            return ""
-            
-        try:
-            # Search for relevant semantic facts
-            results = await self.semantic_memory_manager.search_semantic_facts(
-                user_id=self._get_session_user_id(),
-                character_name=self.character_name,
-                query=user_input,
-                limit=3
-            )
-            
-            if not results:
-                return ""
-            
-            # Format relevant memories for context
-            memory_context = "関連する記憶:\n"
-            for result in results:
-                memory_context += f"- {result['content']}\n"
-            
-            return memory_context
-            
-        except Exception as e:
-            print(f"[GeminiLLMClient] Memory retrieval error: {e}")
-            return ""
-    
-    async def _initialize_mcp(self, mcp_config: Dict[str, Any]):
-        """Initialize MCP plugin asynchronously
-        
-        Args:
-            mcp_config: MCP configuration from config file
-        """
-        try:
-            if self.mcp_plugin:
-                success = await self.mcp_plugin.initialize(mcp_config)
-                if success:
-                    from ..tools.external.mcp_tools import set_mcp_plugin
-                    set_mcp_plugin(self.mcp_plugin)
-                    print(f"[GeminiLLMClient] MCP plugin初期化成功")
-                    
-                    # List available tools from MCP servers
-                    tools_info = await self.mcp_plugin.client.list_tools()
-                    total_mcp_tools = sum(len(tools) for tools in tools_info.values())
-                    print(f"[GeminiLLMClient] MCP tools available: {total_mcp_tools}")
-                    
-                else:
-                    print(f"[GeminiLLMClient] MCP plugin初期化失敗")
-        except Exception as e:
-            print(f"[GeminiLLMClient] MCP初期化エラー: {e}")
-
-    async def _retrieve_relevant_memories_sync(self, user_input: str) -> str:
-        """Async memory retrieval for safe operation
-        
-        Args:
-            user_input: User's input to search for relevant memories
-            
-        Returns:
-            Formatted memory context string
-        """
-        if not SEMANTIC_MEMORY_AVAILABLE or not self.semantic_memory_manager:
-            return ""
-            
-        try:
-            # Search for relevant semantic facts
-            results = await self.semantic_memory_manager.search_semantic_facts(
-                user_id=self._get_session_user_id(),
-                character_name=self.character_name,
-                query=user_input,
-                limit=3
-            )
-            
-            if not results:
-                return ""
-            
-            # Format memory context
-            memory_context = "## 関連する記憶:\n"
-            for i, result in enumerate(results[:3], 1):
-                content = result.get("content", "")
-                score = result.get("relevance_score", 0.0)
-                memory_context += f"{i}. {content} (関連度: {score:.2f})\n"
-            
-            return memory_context
-            
-        except Exception as e:
-            print(f"[GeminiLLMClient] Memory retrieval error: {e}")
-            return ""
     
     async def generate_response_async(self, user_input: str, temperature: float = 0.7, max_tokens: Optional[int] = None, image_data: Optional[Dict[str, Any]] = None) -> str:
         """Async version of generate_response - Gemini API is synchronous, so this just wraps the sync call
@@ -1099,111 +1183,6 @@ class GeminiLLMClient:
                 print(f"[GeminiLLMClient] Error during memory cleanup: {e}")
         
         print(f"[GeminiLLMClient] クリーンアップ完了")
-
-    def _force_mcp_init_sync(self):
-        """Force MCP initialization synchronously without event loop checks"""
-        import asyncio
-        
-        # Check if MCP is enabled in configuration
-        if not self.config or not self.config.get('mcp_enabled', False):
-            print("[GeminiLLMClient] MCP disabled in configuration")
-            return
-            
-        if not self.mcp_plugin.is_available():
-            print("[GeminiLLMClient] MCP SDK not available")
-            return
-        
-        try:
-            # Always create a new event loop for MCP initialization
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            try:
-                result = loop.run_until_complete(self._do_mcp_init())
-                if result:
-                    print("[GeminiLLMClient] MCP forced synchronous initialization completed")
-            finally:
-                # Don't close the loop immediately, keep it for MCP operations
-                # loop.close()
-                # asyncio.set_event_loop(None)
-                pass
-                
-        except Exception as e:
-            print(f"[GeminiLLMClient] MCP initialization error: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def _initialize_mcp_sync(self):
-        """Initialize MCP plugin synchronously"""
-        import asyncio
-        
-        # Check if MCP is enabled in configuration
-        if not self.config or not self.config.get('mcp_enabled', False):
-            print("[GeminiLLMClient] MCP disabled in configuration")
-            return
-            
-        if not self.mcp_plugin.is_available():
-            print("[GeminiLLMClient] MCP SDK not available")
-            return
-        
-        try:
-            # Try to use existing event loop if possible
-            try:
-                loop = asyncio.get_running_loop()
-                # If we're in an event loop, defer initialization
-                print("[GeminiLLMClient] Event loop detected, deferring MCP initialization")
-                return
-            except RuntimeError:
-                # No running loop, we can create one
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                
-                try:
-                    result = loop.run_until_complete(self._do_mcp_init())
-                    if result:
-                        print("[GeminiLLMClient] MCP synchronous initialization completed")
-                finally:
-                    loop.close()
-                    asyncio.set_event_loop(None)
-                    
-        except Exception as e:
-            print(f"[GeminiLLMClient] MCP initialization error: {e}")
-            import traceback
-            traceback.print_exc()
-
-    async def _do_mcp_init(self):
-        """Actual MCP initialization logic"""
-        try:
-            # Get MCP configuration from config
-            mcp_config = self.config.get('mcp', {}) if self.config else {}
-            success = await self.mcp_plugin.initialize(mcp_config)
-            if success:
-                self._mcp_initialized = True
-                print("[GeminiLLMClient] MCP plugin initialized successfully")
-                
-                # Set up MCP plugin for tools
-                from ..tools.external.mcp_tools import set_mcp_plugin
-                set_mcp_plugin(self.mcp_plugin)
-                
-                # Log available MCP tools
-                tools = await self.mcp_plugin.get_tools_for_agent()
-                if tools:
-                    print(f"[GeminiLLMClient] MCP tools available: {len(tools)}")
-                    
-                    for tool in tools:
-                        server_name = tool.get('server_name', 'unknown')
-                        tool_name = tool.get('tool_name', 'unknown')
-                        description = tool['function']['description']
-                        print(f"  - {server_name}.{tool_name}: {description}")
-                    return True
-            else:
-                print("[GeminiLLMClient] Failed to initialize MCP plugin")
-                return False
-        except Exception as e:
-            print(f"[GeminiLLMClient] Error initializing MCP: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
 
 
 def create_gemini_client(config: Config) -> GeminiLLMClient:

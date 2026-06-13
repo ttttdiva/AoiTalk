@@ -1,4 +1,4 @@
-"""RAG設定モジュールのテスト"""
+"""Knowledge Index backend設定モジュールのテスト"""
 import pytest
 
 
@@ -7,13 +7,13 @@ class TestGetProjectCollectionName:
         from src.rag.config import get_project_collection_name
 
         result = get_project_collection_name("abc-123")
-        assert result == "project_abc-123_documents"
+        assert result == "aoitalk_knowledge"
 
     def test_without_project_id(self):
         from src.rag.config import get_project_collection_name
 
-        assert get_project_collection_name(None) == "aoitalk_documents"
-        assert get_project_collection_name("") == "aoitalk_documents"
+        assert get_project_collection_name(None) == "aoitalk_knowledge"
+        assert get_project_collection_name("") == "aoitalk_knowledge"
 
 
 class TestQdrantConfig:
@@ -23,7 +23,7 @@ class TestQdrantConfig:
         cfg = QdrantConfig()
         assert cfg.host == "localhost"
         assert cfg.port == 6333
-        assert cfg.collection_name == "aoitalk_documents"
+        assert cfg.collection_name == "aoitalk_knowledge"
         assert cfg.api_key is None
 
     def test_from_dict(self):
@@ -43,8 +43,8 @@ class TestQdrantConfig:
         from src.rag.config import QdrantConfig
 
         cfg = QdrantConfig()
-        assert cfg.get_collection_name_for_project("proj1") == "project_proj1_documents"
-        assert cfg.get_collection_name_for_project(None) == "aoitalk_documents"
+        assert cfg.get_collection_name_for_project("proj1") == "aoitalk_knowledge"
+        assert cfg.get_collection_name_for_project(None) == "aoitalk_knowledge"
 
 
 class TestEmbeddingConfig:
@@ -68,6 +68,7 @@ class TestRerankerConfig:
         from src.rag.config import RerankerConfig
 
         cfg = RerankerConfig()
+        assert cfg.model == "BAAI/bge-reranker-v2-m3"
         assert cfg.top_n == 5
 
     def test_from_dict(self):

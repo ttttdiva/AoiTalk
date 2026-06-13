@@ -1,0 +1,104 @@
+name: draft_document
+description: xlsx/pptx等の成果物の下書きをMarkdownで作成し、openpyxlスクリプト経由でExcelに反映する。設計書・手順書・計画書などの作成・更新に使う。
+prompt_template: |
+  資料の下書きを作成（または更新）してください。
+
+  【入力】
+  {input}
+
+  ## 手順
+
+  ### 1. 対象資料の特定
+  filesystem_assistant で workspace_root を特定し、以下を確認:
+  - CLAUDE.md（資料更新ワークフローの確認）
+  - knowledge/projectInfo.md（成果物一覧と格納先の確認）
+  - ユーザーの入力から対象となる資料を特定
+
+  対象資料の格納先は通常以下のいずれか:
+  - 2.設計書_構成資料/ — 詳細設計書、パラメータシート、ヒアリングシート
+  - 3.検証資料/ — テスト計画書、テスト項目書、結果報告書
+  - 4.ログ_作業用資料/ — 移行計画書、作業手順書、作業スケジュール
+  - 9.完成図書/ — 完成図書一式
+
+  ### 2. 既存資料の構造把握
+  対象が既存xlsxの更新の場合:
+  ```
+  python -m openpyxl
+  ```
+  出力をもとに、drafts/<資料名>/_structure.md に構造を記録。
+
+  対象がpptxの場合:
+  ```
+  python -m markitdown "対象ファイルのフルパス"
+  ```
+  文字化けする場合は python-pptx で直接抽出:
+  ```python
+  from pptx import Presentation
+  prs = Presentation("ファイルパス")
+  for slide in prs.slides:
+      for shape in slide.shapes:
+          if shape.has_text_frame:
+              print(shape.text)
+  ```
+
+  ### 3. 情報収集
+  下書きに必要な情報を収集:
+  - knowledge/ 配下の関連ファイル
+  - knowledge/source_docs/ のmd変換済み参考資料
+  - 番号付きフォルダ内の #参考/ サブフォルダ（旧版や参考資料）
+  - 設計ヒアリング/ のヒアリングシート
+  - 7.打合せ資料/ の議事録
+  - 6.お客様受領資料/ の受領資料
+
+  必要な情報が不足している場合はユーザーに確認する。
+
+  ### 4. Markdown下書きの作成
+  drafts/<資料名>/ ディレクトリに下書きを作成:
+  - section_01_セクション名.md
+  - section_02_セクション名.md
+  - ...
+
+  xlsx の場合: 列構造を Markdown テーブルで再現
+  pptx の場合: スライドごとにセクション分け
+
+  ### 5. ユーザー確認
+  下書き内容を提示し、修正指示があれば反映。
+
+  ### 6. xlsx への反映
+  承認後、以下の方法でxlsxに反映:
+
+  **方法A（推奨）**: openpyxl経由で直接書き込み
+  - 反映前に元ファイルのバックアップを作成（ファイル名_backup_YYYYMMDD_HHMMSS.xlsx）
+  - 書式は保持したまま値のみ書き込み
+  - .xlsm の場合は keep_vba=True で保存
+
+  **方法B**: ユーザーに Markdown を提示して手動転記を依頼
+  - 手動転記が適切な場合（複雑な書式や結合セルが多い場合）
+
+  ### 7. 成果物の記録
+  - knowledge/projectInfo.md の成果物一覧を更新（最新ファイル名・ステータス）
+  - knowledge/activeContext.md に作業結果を記録
+
+  ## Visio (.vsd) の場合
+  - 読み書き不可
+  - ユーザーにPDF/画像エクスポートを依頼 → 読み取り → テキストで構成案を提示
+
+  ## ファイル命名規則
+  - 成果物: 【プロジェクト名】資料名_YYYYMMDD.extension
+  - 下書き: drafts/<資料名>/section_NN_セクション名.md
+trigger_mode: both
+aliases:
+  - 資料作成
+  - 下書き
+  - draft
+  - 資料更新
+bound_tools:
+  - filesystem_assistant
+examples:
+  - "/draft_document 詳細設計書を最新のヒアリングシートの内容で更新したい"
+  - "/draft_document 完成図書の目次を作成してほしい"
+  - "/draft_document 作業手順書に新しい手順を追加"
+tags:
+  - 案件管理
+  - 資料
+parameters: {}

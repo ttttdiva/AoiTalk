@@ -13,3 +13,4 @@ features:
   crawler_status: false   # クローラーステータス監視（無効）
   entertainment: false    # Spotify/YouTube等（無効）
   code_agent: true        # コード保守エージェント（有効）
+  remote_server_view: false  # 外部AoiTalkサーバー接続・閲覧（無効/逆方向接続の禁止）

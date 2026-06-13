@@ -1,0 +1,43 @@
+name: next_actions
+description: 案件情報DB、タスク、WBS、要確認事項から次アクションを整理する。
+prompt_template: |
+  案件の次アクションを整理してください。
+
+  {input}
+
+  ## 手順
+  1. project_management_assistant の get_project_context で対象案件を確認する。
+  2. list_project_information で案件情報DBの要確認事項、決定事項、重要資料を読む。
+  3. list_tasks で未完了タスクを読む。
+  4. get_upcoming_wbs_tasks と summarize_project_requests を使い、WBS由来の期限・確認依頼を読む。
+  5. 次にやるべきことを以下の観点で整理する。
+     - 期限超過または期限が近い
+     - 他タスクのブロッカー
+     - 顧客/社内確認が必要
+     - 重要資料や設計情報の不足
+  6. 案件情報DBの要確認事項に不足がある場合は、upsert_project_fact で追加するか、追加提案を出す。
+
+  ## 出力
+  - 次アクション一覧
+  - ブロッカー
+  - 確認依頼
+  - 案件情報DBに追加/更新すべき項目
+trigger_mode: both
+aliases:
+  - 次アクション
+  - next
+  - todo整理
+bound_tools:
+  - project_management_assistant
+examples:
+  - "/next_actions"
+  - "/next_actions 今週中に終わらせるべきものだけ"
+  - "/next_actions 顧客提出が必要なものを優先で"
+tags:
+  - 案件管理
+  - 計画
+  - 案件情報
+parameters:
+  threshold_days:
+    description: 期限アラートの閾値（日数）
+    default: "14"

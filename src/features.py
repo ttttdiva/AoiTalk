@@ -34,8 +34,9 @@ class Features:
         "crawler_status": True,    # クローラーステータス監視
         "entertainment": True,     # Spotify/YouTube/ニコニコ等
         "code_agent": False,       # コード保守エージェント（企業用）
+        "remote_server_view": True,  # 外部AoiTalkサーバー接続・閲覧（個人版で有効）
     }
-    
+
     # Enterprise profile - minimal features for code maintenance
     ENTERPRISE_DEFAULTS: Dict[str, bool] = {
         "voice_input": False,
@@ -44,6 +45,8 @@ class Features:
         "crawler_status": False,
         "entertainment": False,
         "code_agent": True,
+        # 会社版は外向きの外部サーバー接続をしない（逆方向接続の禁止）
+        "remote_server_view": False,
     }
     
     _profile_cache: Optional[Dict[str, bool]] = None
@@ -179,3 +182,8 @@ class Features:
     def code_agent(cls) -> bool:
         """Check if code maintenance agent is enabled"""
         return cls.is_enabled("code_agent")
+
+    @classmethod
+    def remote_server_view(cls) -> bool:
+        """Check if outbound external AoiTalk server connection is enabled"""
+        return cls.is_enabled("remote_server_view")

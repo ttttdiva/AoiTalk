@@ -31,6 +31,7 @@ def load_heartbeat_from_yaml(path: Path) -> Optional[HeartbeatDefinition]:
             enabled=data.get("enabled", True),
             active_hours=data.get("active_hours"),
             notify_channel=data.get("notify_channel", "websocket"),
+            actions=data.get("actions") or [],
             source_path=str(path),
         )
     except Exception as e:
@@ -70,6 +71,7 @@ def save_heartbeat_to_yaml(heartbeat: HeartbeatDefinition, heartbeats_dir: Optio
         "interval_minutes": heartbeat.interval_minutes,
         "enabled": heartbeat.enabled,
         "notify_channel": heartbeat.notify_channel,
+        "actions": heartbeat.actions or [],
     }
     if heartbeat.active_hours:
         data["active_hours"] = heartbeat.active_hours

@@ -1,0 +1,4 @@
+appId: com.aoitalk.mobile
+---
+- launchApp
+- assertVisible: "Chat"

@@ -41,3 +41,7 @@ def main():
     """MCP サーバーを起動する。"""
     logger.info("Web Search MCP サーバーを起動します...")
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

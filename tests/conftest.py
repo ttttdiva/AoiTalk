@@ -23,7 +23,6 @@ def sample_config_dict():
         "default_character": "zundamon",
         "llm_model": "gemini-3-flash-preview",
         "llm_provider": "gemini",
-        "mode": "terminal",
         "device_index": 0,
         "web_interface": {"port": 3000},
         "memory": {"enabled": True},

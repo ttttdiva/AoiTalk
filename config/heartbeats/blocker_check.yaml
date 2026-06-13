@@ -1,0 +1,17 @@
+name: blocker_check
+description: ブロッカー・課題の検出。workspace_rootのknowledge/からブロッカーを検出し、長期間未解決の課題をアラートする。
+checklist: |
+  - アクティブなプロジェクトの workspace_root を確認する
+  - knowledge/activeContext.md の「未解決・調査中」セクションを読む
+  - knowledge/progress.md の「リスク・課題」セクションを読む
+  - 3日以上前から記載されているのに解消されていないブロッカーがないか確認する
+  - 日付の不整合（資料間で異なる日付が記載されているなど）がないか確認する
+  - knowledge/decisions/ に最近の決定事項で未反映のものがないか確認する
+  - 問題がある場合は、案件名・課題内容・記載日からの経過日数を報告する
+interval_minutes: 120
+enabled: true
+active_hours:
+  start: "09:00"
+  end: "20:00"
+  timezone: Asia/Tokyo
+notify_channel: websocket

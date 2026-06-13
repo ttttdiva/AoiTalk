@@ -5,12 +5,23 @@ Repository for Project management
 import re
 from datetime import datetime
 from typing import List, Optional, Dict, Any, Tuple
-from uuid import UUID
+from uuid import UUID, uuid4
 from sqlalchemy import select, delete, update, and_, or_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from .models import Project, ProjectMember, ProjectJoinRequest, User
+from .models import (
+    Project, ProjectMember, ProjectJoinRequest, User, Space, Tag, TaskTag,
+    ConversationSession, LocalTask, Task, TaskAssignee, TaskComment, TaskActivity,
+    TaskDependency, TaskRecurrenceRule, TaskOccurrence, TimeEntry,
+    ProjectNotificationSetting, NotificationDelivery, KnowledgeSourcePermission,
+    RecordField, RecordRow, RecordTable,
+)
+
+
+INBOX_NAME = "Inbox"
+INBOX_DESCRIPTION = "未整理のタスクを一時的に置く場所"
+INBOX_COLOR = "#6b7280"
 
 
 def generate_slug(name: str) -> str:
@@ -21,9 +32,201 @@ def generate_slug(name: str) -> str:
     return slug[:100] if slug else 'project'
 
 
+def user_inbox_project_slug(user_id: UUID) -> str:
+    """ユーザー専用 Inbox プロジェクトの slug（フロント ensureInboxDefaultProject と同期）."""
+    return f"inbox-project-{user_id}"
+
+
+def user_inbox_space_slug(user_id: UUID) -> str:
+    """ユーザー専用 Inbox スペースの slug（フロント ensureInboxSpace と同期）."""
+    return f"inbox-{user_id}"
+
+
+def legacy_user_default_space_slug(user_id: UUID) -> str:
+    """過去の FastAPI 実装が作成していた legacy Default スペース slug."""
+    return f"default-{user_id}"
+
+
 class ProjectRepository:
     """Repository for managing projects and memberships"""
-    
+
+    # ─── User Inbox Project ──────────────────────────────────────────────
+
+    @staticmethod
+    async def _get_user_space_by_slug(
+        session: AsyncSession, user_id: UUID, slug: str
+    ) -> Optional[Space]:
+        result = await session.execute(
+            select(Space)
+            .where(Space.owner_id == user_id, Space.slug == slug)
+            .order_by(Space.created_at.asc(), Space.id.asc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def _merge_legacy_default_space(
+        session: AsyncSession,
+        *,
+        inbox_space: Space,
+        legacy_space: Space,
+    ) -> None:
+        if legacy_space.id == inbox_space.id:
+            return
+
+        await session.execute(
+            update(Project)
+            .where(Project.space_id == legacy_space.id)
+            .values(space_id=inbox_space.id)
+        )
+
+        legacy_tags = (
+            await session.execute(select(Tag).where(Tag.space_id == legacy_space.id))
+        ).scalars().all()
+        for legacy_tag in legacy_tags:
+            existing_result = await session.execute(
+                select(Tag).where(
+                    Tag.space_id == inbox_space.id,
+                    Tag.name == legacy_tag.name,
+                )
+            )
+            existing_tag = existing_result.scalar_one_or_none()
+            if existing_tag is None:
+                legacy_tag.space_id = inbox_space.id
+                continue
+
+            duplicate_task_ids = select(TaskTag.task_id).where(
+                TaskTag.tag_id == existing_tag.id
+            )
+            await session.execute(
+                delete(TaskTag).where(
+                    TaskTag.tag_id == legacy_tag.id,
+                    TaskTag.task_id.in_(duplicate_task_ids),
+                )
+            )
+            await session.execute(
+                update(TaskTag)
+                .where(TaskTag.tag_id == legacy_tag.id)
+                .values(tag_id=existing_tag.id)
+            )
+            await session.delete(legacy_tag)
+
+        await session.flush()
+        await session.delete(legacy_space)
+
+    @staticmethod
+    async def ensure_user_inbox_setup(
+        session: AsyncSession, user_id: UUID
+    ) -> tuple[Space, Project]:
+        """ユーザーの既定スペース/プロジェクトを Inbox として保証する。
+
+        過去の FastAPI 経路が作成した `Default` / `default-*` スペースは
+        Inbox にリネームまたは吸収し、UI/API へ露出しない。
+        """
+
+        inbox_slug = user_inbox_space_slug(user_id)
+        legacy_slug = legacy_user_default_space_slug(user_id)
+
+        inbox_space = await ProjectRepository._get_user_space_by_slug(
+            session, user_id, inbox_slug
+        )
+        legacy_space = await ProjectRepository._get_user_space_by_slug(
+            session, user_id, legacy_slug
+        )
+
+        if inbox_space is None:
+            if legacy_space is not None:
+                inbox_space = legacy_space
+                inbox_space.name = INBOX_NAME
+                inbox_space.slug = inbox_slug
+                inbox_space.description = inbox_space.description or INBOX_DESCRIPTION
+                inbox_space.color = inbox_space.color or INBOX_COLOR
+                inbox_space.sort_order = min(inbox_space.sort_order or 0, 0)
+            else:
+                inbox_space = Space(
+                    name=INBOX_NAME,
+                    slug=inbox_slug,
+                    description=INBOX_DESCRIPTION,
+                    color=INBOX_COLOR,
+                    owner_id=user_id,
+                    sort_order=9999,
+                )
+                session.add(inbox_space)
+            await session.flush()
+        elif legacy_space is not None:
+            await ProjectRepository._merge_legacy_default_space(
+                session,
+                inbox_space=inbox_space,
+                legacy_space=legacy_space,
+            )
+
+        inbox_project_slug = user_inbox_project_slug(user_id)
+        project_result = await session.execute(
+            select(Project).where(Project.slug == inbox_project_slug)
+        )
+        inbox_project = project_result.scalar_one_or_none()
+
+        if inbox_project is None:
+            inbox_project = Project(
+                name=INBOX_NAME,
+                slug=inbox_project_slug,
+                description=INBOX_DESCRIPTION,
+                owner_id=user_id,
+                space_id=inbox_space.id,
+                project_metadata={
+                    "aliases": ["inbox"],
+                    "color": INBOX_COLOR,
+                    "isInboxDefault": True,
+                },
+            )
+            session.add(inbox_project)
+            await session.flush()
+        else:
+            inbox_project.name = INBOX_NAME
+            inbox_project.description = inbox_project.description or INBOX_DESCRIPTION
+            inbox_project.space_id = inbox_space.id
+            inbox_project.deleted_at = None
+            metadata = dict(inbox_project.project_metadata or {})
+            aliases = metadata.get("aliases")
+            if not isinstance(aliases, list):
+                aliases = []
+            metadata["aliases"] = sorted({*aliases, "inbox"})
+            metadata.setdefault("color", INBOX_COLOR)
+            metadata["isInboxDefault"] = True
+            inbox_project.project_metadata = metadata
+
+        member_result = await session.execute(
+            select(ProjectMember).where(
+                ProjectMember.project_id == inbox_project.id,
+                ProjectMember.user_id == user_id,
+            )
+        )
+        if member_result.scalar_one_or_none() is None:
+            session.add(
+                ProjectMember(
+                    project_id=inbox_project.id,
+                    user_id=user_id,
+                    role="admin",
+                )
+            )
+
+        await session.flush()
+        return inbox_space, inbox_project
+
+    @staticmethod
+    async def get_user_inbox_project_id(
+        session: AsyncSession, user_id: UUID
+    ) -> Optional[UUID]:
+        """ユーザー専用 Inbox プロジェクトの ID を返す（無ければ None）。
+
+        Inbox プロジェクトの作成はフロントエンド(/api/spaces GET)が担当する。
+        バックエンドは初回ログイン後に存在する前提で参照のみ行う。
+        """
+        slug = user_inbox_project_slug(user_id)
+        result = await session.execute(select(Project.id).where(Project.slug == slug))
+        row = result.scalar_one_or_none()
+        return row if row else None
+
     # ─── Project CRUD ───────────────────────────────────────────────────
     
     @staticmethod
@@ -32,9 +235,12 @@ class ProjectRepository:
         owner_id: UUID,
         name: str,
         description: Optional[str] = None,
+        project_id: Optional[UUID] = None,
         slug: Optional[str] = None,
+        aliases: Optional[list[str]] = None,
         allow_join_requests: bool = True,
-        storage_quota_mb: int = 1000
+        storage_quota_mb: int = 1000,
+        project_metadata: Optional[Dict[str, Any]] = None,
     ) -> Project:
         """Create a new project
         
@@ -46,7 +252,8 @@ class ProjectRepository:
             slug: Optional custom slug (auto-generated if not provided)
             allow_join_requests: Whether to accept join requests
             storage_quota_mb: Storage quota in MB
-            
+            project_metadata: Optional project metadata payload
+
         Returns:
             Created Project
         """
@@ -66,12 +273,15 @@ class ProjectRepository:
             counter += 1
         
         project = Project(
+            id=project_id or uuid4(),
             name=name,
             description=description,
             slug=final_slug,
+            aliases=aliases or [],
             owner_id=owner_id,
             allow_join_requests=allow_join_requests,
-            storage_quota_mb=storage_quota_mb
+            storage_quota_mb=storage_quota_mb,
+            project_metadata=project_metadata or {},
         )
         session.add(project)
         await session.flush()
@@ -122,7 +332,7 @@ class ProjectRepository:
         Returns:
             Project or None
         """
-        query = select(Project).where(Project.id == project_id)
+        query = select(Project).where(Project.id == project_id, Project.deleted_at.is_(None))
         if include_members:
             query = query.options(selectinload(Project.members))
         
@@ -145,7 +355,7 @@ class ProjectRepository:
         Returns:
             Project or None
         """
-        query = select(Project).where(Project.slug == slug)
+        query = select(Project).where(Project.slug == slug, Project.deleted_at.is_(None))
         if include_members:
             query = query.options(selectinload(Project.members))
         
@@ -172,7 +382,7 @@ class ProjectRepository:
         query = (
             select(Project, ProjectMember)
             .join(ProjectMember, Project.id == ProjectMember.project_id)
-            .where(ProjectMember.user_id == user_id)
+            .where(ProjectMember.user_id == user_id, Project.deleted_at.is_(None))
             .order_by(Project.updated_at.desc())
         )
         
@@ -204,7 +414,7 @@ class ProjectRepository:
             Updated Project or None
         """
         allowed_fields = {
-            'name', 'description', 'allow_join_requests',
+            'name', 'description', 'aliases', 'allow_join_requests',
             'storage_quota_mb', 'project_metadata'
         }
         
@@ -228,20 +438,100 @@ class ProjectRepository:
         session: AsyncSession,
         project_id: UUID
     ) -> bool:
-        """Delete a project and all associated data
-        
-        Args:
-            session: Database session
-            project_id: Project UUID
-            
-        Returns:
-            bool: True if deleted
+        """Soft-delete a project and tombstone syncable descendants.
+
+        Sync 対象の `projects` / `tasks` / `task_occurrences` / `time_entries`
+        は `deleted_at` tombstone を付与する。非同期対象の補助テーブルは
+        既存どおり物理削除し、会話セッションは project_id を NULL にして保持する。
         """
-        result = await session.execute(
-            delete(Project).where(Project.id == project_id)
+        project = await ProjectRepository.get_by_id(session, project_id)
+        if project is None:
+            return False
+
+        now = datetime.utcnow()
+
+        # タスク配下を tombstone 化
+        await session.execute(
+            update(TimeEntry)
+            .where(
+                TimeEntry.task_id.in_(
+                    select(Task.id).where(
+                        Task.project_id == project_id,
+                        Task.deleted_at.is_(None),
+                    )
+                ),
+                TimeEntry.deleted_at.is_(None),
+            )
+            .values(deleted_at=now, updated_at=now)
         )
+        await session.execute(
+            update(TaskOccurrence)
+            .where(
+                TaskOccurrence.task_id.in_(
+                    select(Task.id).where(
+                        Task.project_id == project_id,
+                        Task.deleted_at.is_(None),
+                    )
+                ),
+                TaskOccurrence.deleted_at.is_(None),
+            )
+            .values(deleted_at=now, updated_at=now)
+        )
+        await session.execute(
+            update(Task)
+            .where(Task.project_id == project_id, Task.deleted_at.is_(None))
+            .values(deleted_at=now, updated_at=now)
+        )
+
+        # 非sync補助テーブルは物理削除
+        task_ids_result = await session.execute(
+            select(Task.id).where(Task.project_id == project_id)
+        )
+        task_ids = [row[0] for row in task_ids_result.all()]
+        if task_ids:
+            await session.execute(delete(TaskRecurrenceRule).where(TaskRecurrenceRule.task_id.in_(task_ids)))
+            await session.execute(delete(TaskDependency).where(TaskDependency.task_id.in_(task_ids)))
+            await session.execute(delete(TaskActivity).where(TaskActivity.task_id.in_(task_ids)))
+            await session.execute(delete(TaskComment).where(TaskComment.task_id.in_(task_ids)))
+            await session.execute(delete(TaskAssignee).where(TaskAssignee.task_id.in_(task_ids)))
+
+        await session.execute(delete(NotificationDelivery).where(NotificationDelivery.project_id == project_id))
+        await session.execute(delete(LocalTask).where(LocalTask.project_id == project_id))
+        await session.execute(delete(ProjectNotificationSetting).where(ProjectNotificationSetting.project_id == project_id))
+        await session.execute(delete(KnowledgeSourcePermission).where(KnowledgeSourcePermission.project_id == project_id))
+        await session.execute(delete(ProjectJoinRequest).where(ProjectJoinRequest.project_id == project_id))
+        await session.execute(
+            update(RecordRow)
+            .where(RecordRow.project_id == project_id, RecordRow.deleted_at.is_(None))
+            .values(deleted_at=now, updated_at=now)
+        )
+        await session.execute(
+            update(RecordField)
+            .where(
+                RecordField.table_id.in_(
+                    select(RecordTable.id).where(RecordTable.project_id == project_id)
+                ),
+                RecordField.deleted_at.is_(None),
+            )
+            .values(deleted_at=now, updated_at=now)
+        )
+        await session.execute(
+            update(RecordTable)
+            .where(RecordTable.project_id == project_id, RecordTable.deleted_at.is_(None))
+            .values(deleted_at=now, updated_at=now)
+        )
+
+        # 会話セッションは project_id を外して残す
+        await session.execute(
+            update(ConversationSession)
+            .where(ConversationSession.project_id == project_id)
+            .values(project_id=None, updated_at=now)
+        )
+
+        project.deleted_at = now
+        project.updated_at = now
         await session.commit()
-        return result.rowcount > 0
+        return True
     
     # ─── Member Management ──────────────────────────────────────────────
     

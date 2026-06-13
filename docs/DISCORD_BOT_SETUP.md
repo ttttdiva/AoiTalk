@@ -29,6 +29,7 @@ Discord Developer Portal で以下の権限を設定します：
 ### Bot Permissions:
 - Send Messages
 - Read Message History
+- Use Application Commands
 - Connect (音声チャンネル用)
 - Speak (音声チャンネル用)
 - Use Voice Activity
@@ -40,7 +41,7 @@ Discord Developer Portal で以下の権限を設定します：
 ## 4. Bot をサーバーに招待
 
 1. Discord Developer Portal の「OAuth2」→「URL Generator」を開く
-2. Scopes で「bot」を選択
+2. Scopes で「bot」と「applications.commands」を選択
 3. Bot Permissions で必要な権限を選択
 4. 生成されたURLをコピーしてブラウザで開く
 5. 招待したいサーバーを選択
@@ -49,15 +50,19 @@ Discord Developer Portal で以下の権限を設定します：
 
 ### 通常起動
 ```bash
-python main.py --mode discord
+venv\Scripts\python.exe main.py
 ```
 
-### デバッグモード（トークンなし）
+Linux/macOS の場合:
 ```bash
-python main_debug.py --mode discord
+venv/bin/python main.py
 ```
 
 ## 6. 使い方
+
+### AoiTalk 機能トグル
+Discord Bot や VC 音声入出力は `config/config.yaml` の `runtime_features` で有効化します。
+Discord から `/feature` を使うユーザーIDは、`runtime_feature_permissions.allowed_discord_user_ids` に登録します。
 
 ### テキストチャット
 - Botをメンションして話しかける: `@AoiTalk こんにちは`
@@ -71,10 +76,33 @@ python main_debug.py --mode discord
 ### その他のコマンド
 - `/help` - ヘルプを表示
 - `/character [name]` - キャラクターを変更
-- `/mode [text/voice]` - モードを切り替え
+- `/mode [text/voice]` - Discord セッション内の応答モードを切り替え
+- `/feature [feature] [true/false]` - AoiTalk 機能トグルを変更
+- `/status` - 現在の状態を表示
+- `/settings` - Discordセッション、音声、同期、会話履歴設定を表示
+- `/clear` - 会話履歴をクリア
 - `/nanobanana` - Nanobanana Proを検索し、生成イメージ付きで紹介
+- `/setavatar [image]` - Botアイコンを変更（管理者のみ）
 
-> ⚠️ `/character` や `/nanobanana` などのスラッシュコマンドが見つからない場合は、`.env` に `DISCORD_SYNC_COMMANDS=true` を一時的に設定するか、`config/config.yaml` の `discord.sync_commands` を `true` にしてBotを再起動し、コマンド同期を実行してください。
+### Spotify コマンド
+- `/spotify_auth` - Spotify認証URLを表示
+- `/spotify_code [code]` - リダイレクトURLの `code` を登録
+- `/search [query] [search_type] [limit]` - 楽曲/アルバム/アーティスト/プレイリストを検索
+- `/play [query]` - 曲を検索して即時再生
+- `/pause` - 再生を一時停止
+- `/skip` - 次の曲にスキップ
+- `/previous` - 前の曲に戻る
+- `/queue [query]` - 曲を内部キューとSpotifyキューに追加
+- `/show_queue` - 内部キューを表示
+- `/clear_queue` - 内部キューをクリア
+- `/remove_queue [position]` - 内部キューから指定位置の曲を削除
+- `/nowplaying` - 現在再生中の曲を表示
+- `/playlists [limit]` - ユーザーのプレイリスト一覧を表示
+- `/create_playlist [name] [description] [public]` - プレイリストを作成
+- `/play_playlist [uri]` - プレイリストを再生
+- `/queue_playlist [uri] [shuffle]` - プレイリストをキューに追加
+
+> ⚠️ スラッシュコマンドが見つからない場合は、Botを再起動して `config/config.yaml` の `discord.sync_commands: true` による同期ログを確認してください。`discord.sync_command_scope: guild_and_global` ではギルドコマンドが即時反映され、グローバルコマンドはDiscord側の反映待ちになります。
 
 ### セッション記憶
 - 同じユーザーが同じサーバーで話しかけると過去の会話を自動的に再読み込みします。Botを再起動しても対話の流れが繋がります。
