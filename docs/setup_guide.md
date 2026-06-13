@@ -42,7 +42,7 @@ cd 41_AoiTalk
 ### 2.2 依存パッケージ
 | OS | 推奨コマンド |
 | --- | --- |
-| Windows | `setup.bat`（Python venv作成 + 基本依存 + PostgreSQL導入） |
+| Windows | `setup.bat`（対話式 `.env` 作成 + PostgreSQL/Python/Node.js導入 + DB初期化 + ビルド） |
 | Linux / macOS | `python3 -m venv venv && source venv/bin/activate && pip install -e ".[audio,test]"` |
 
 - Irodori-TTS を使う場合は `pip install -e ".[audio,irodori]"` と `pip install --no-deps "dacvae @ git+https://github.com/facebookresearch/dacvae" descript-audiotools argbind julius pystoi torch-stoi flatten-dict markdown2 randomname importlib-resources` を追加。推論 runtime は AoiTalk に同梱され、重みは初回合成時に Hugging Face から自動取得されます。
@@ -109,7 +109,13 @@ WebUIのログインユーザー/パスワードは `.env` ではなく PostgreS
 AoiTalk のデータベースは PostgreSQL を使用します（ベクトル検索はQdrant RAGを使用）。以下はローカル DB 前提の統合手順です。
 
 ### 5.1 インストール
-- **Windows**: `setup.bat` に PostgreSQL 16 導入タスクあり。失敗した場合は EnterpriseDB 公式インストーラーで 16.x を導入。
+- **Windows**: 管理者権限を持つユーザーで `setup.bat` を実行します。必要に応じてUACが表示され、次の情報を対話入力します。
+  - 初回のみ: PostgreSQLホスト、ポート、AoiTalk用DB名、DBユーザー
+  - 任意: Gemini APIキー（空欄なら後から `.env` に設定可能）
+  - PostgreSQL管理者 `postgres` のパスワード（確認入力あり、`.env` には保存しない）
+- PostgreSQL未導入時は、入力した管理者パスワードを使ってPostgreSQL 16を無人インストールし、そのままサービス起動待ち、AoiTalk用DB作成、スキーマ初期化まで続行します。
+- AoiTalk用DBパスワードとWeb認証シークレットは自動生成して `.env` に保存します。既存の `.env` がある場合は接続設定を維持し、空の認証シークレットだけを補完します。
+- セットアップに失敗した場合は、表示されたエラーを解消して同じ `setup.bat` を再実行できます。処理は再実行可能です。
 - **Linux/macOS**: OS標準パッケージを利用。
 
 ### 5.2 サービス/デーモン確認と自動起動設定
