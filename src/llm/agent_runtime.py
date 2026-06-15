@@ -59,6 +59,8 @@ REQUIRED_DELEGATION_RULES: tuple[RequiredDelegationRule, ...] = (
             "For task creation/update/delete/scheduling requests, perform the mutation and verify the resulting task state before answering.",
             "For task creation requests, never ask for project, classification, or priority when the user already provided the task content. Use the selected runtime project. If no runtime project exists, create the task in Inbox with priority medium.",
             "For project information DB completion requests, inspect existing project information, organize project filer documents when available, and include WBS.dbtable sync and issue-table sync when those files are configured or present; do not create normal task-list items from WBS unless the user explicitly asks for WBS task mirroring.",
+            "If the user request itself introduces new durable project information, save that information with upsert_project_fact using source_type='conversation', even when the primary requested action is a task, WBS, schedule, issue, or record-table update.",
+            "Preserve uncertainty in conversation-derived facts: wording such as 'らしい', '見込み', 'かもしれない', 'probably', or 'may' should be saved as unconfirmed with confidence below 1.0.",
             "Do not report a task, schedule, timer, record table, or project-information change as completed unless a tool result confirms it.",
             "Include created or updated task IDs and the final status/time fields when available.",
         ),

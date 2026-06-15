@@ -47,8 +47,25 @@ def looks_like_utility_request(text: str) -> bool:
     return _looks_like_utility_request(text)
 
 
+def _extract_delegated_user_request(text: str) -> str:
+    raw = str(text or "")
+    markers = (
+        "\nUser request:\n",
+        "\r\nUser request:\r\n",
+        "User request:\n",
+        "\nCurrent user request:\n",
+        "\r\nCurrent user request:\r\n",
+        "Current user request:\n",
+    )
+    for marker in markers:
+        if marker in raw:
+            return raw.rsplit(marker, 1)[-1].strip()
+    return raw.strip()
+
+
 def project_management_required_mutation_tools(text: str) -> set[str]:
-    normalized = str(text or "").casefold()
+    policy_text = _extract_delegated_user_request(text)
+    normalized = policy_text.casefold()
     if not normalized.strip():
         return set()
 
@@ -109,6 +126,45 @@ def project_management_required_mutation_tools(text: str) -> set[str]:
         "課題管理表",
         "要確認",
         "確認事項",
+    )
+    durable_fact_terms = (
+        "決定",
+        "確定",
+        "決まった",
+        "要確認",
+        "未確認",
+        "見込み",
+        "らしい",
+        "かもしれない",
+        "リスク",
+        "課題",
+        "遅れ",
+        "遅延",
+        "延期",
+        "前倒し",
+        "変更になった",
+        "milestone",
+        "decided",
+        "confirmed",
+        "unconfirmed",
+        "probably",
+        "might",
+        "risk",
+        "delayed",
+        "postponed",
+    )
+    lookup_terms = (
+        "教えて",
+        "見せて",
+        "表示",
+        "一覧",
+        "知りたい",
+        "確認したい",
+        "what",
+        "show",
+        "list",
+        "?",
+        "？",
     )
     folder_terms = (
         "folder",
@@ -177,12 +233,24 @@ def project_management_required_mutation_tools(text: str) -> set[str]:
     has_wbs = any(term.casefold() in normalized for term in wbs_terms)
     has_issue = any(term.casefold() in normalized for term in issue_terms)
     has_folder = any(term.casefold() in normalized for term in folder_terms)
+    has_project_reference = _contains_any(
+        normalized,
+        ("案件", "プロジェクト", "project"),
+    )
+    has_durable_project_fact = (
+        (has_project_reference or has_project_info or has_wbs or has_issue)
+        and any(term.casefold() in normalized for term in durable_fact_terms)
+    )
     has_project_database = has_project_info and any(
         term in normalized
         for term in ("db", "database", "データベース", "台帳", "一覧表")
     )
     has_create_or_update = any(
         term.casefold() in normalized for term in create_terms + update_terms
+    )
+    is_lookup_only = (
+        any(term.casefold() in normalized for term in lookup_terms)
+        and not has_create_or_update
     )
     tools: set[str] = set()
     if has_task and any(term.casefold() in normalized for term in create_terms):
@@ -209,6 +277,8 @@ def project_management_required_mutation_tools(text: str) -> set[str]:
                 "upsert_project_fact",
             }
         )
+    if has_durable_project_fact and not is_lookup_only:
+        tools.add("upsert_project_fact")
     if (has_record_table or has_project_database) and has_create_or_update:
         tools.add("create_record_table")
     return tools

@@ -436,6 +436,14 @@ def _clamp_project_info_importance(value: int | str) -> int:
     return max(1, min(10, parsed))
 
 
+def _clamp_project_info_confidence(value: float | int | str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = 1.0
+    return max(0.0, min(1.0, parsed))
+
+
 def _parse_json_array(payload: str, field_name: str) -> list[Any]:
     text = (payload or "").strip()
     if not text:

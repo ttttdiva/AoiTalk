@@ -117,3 +117,31 @@ def test_project_policy_detects_project_database_mutations():
     for text, expected_tools in cases.items():
         assert looks_like_project_management_mutation_request(text)
         assert expected_tools & project_management_required_mutation_tools(text)
+
+
+def test_project_policy_detects_conversation_derived_project_fact():
+    text = "この案件、機器納期が8月に遅れるらしい。WBSの期日修正して"
+
+    assert looks_like_project_management_mutation_request(text)
+    assert "upsert_project_fact" in project_management_required_mutation_tools(text)
+
+
+def test_project_policy_ignores_delegation_instructions_for_required_tools():
+    delegated = "\n".join(
+        [
+            "Handle this project/task/schedule request before the main assistant answers.",
+            "For task creation/update/delete/scheduling requests, perform the mutation.",
+            "For project information DB completion requests, inspect existing project information.",
+            "",
+            "User request:",
+            "今日は雑談だけ",
+        ]
+    )
+
+    assert project_management_required_mutation_tools(delegated) == set()
+
+
+def test_project_policy_does_not_save_project_fact_for_lookup_only_request():
+    text = "この案件の決定事項を教えて"
+
+    assert "upsert_project_fact" not in project_management_required_mutation_tools(text)

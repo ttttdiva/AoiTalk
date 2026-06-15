@@ -50,6 +50,20 @@ def test_required_delegation_skips_plain_chat():
     assert registry.calls == []
 
 
+def test_project_delegation_request_includes_conversation_fact_rule():
+    registry = FakeRegistry({"project_management_assistant"})
+    build_required_delegation_context_sync(
+        user_input="この案件、機器納期が8月に遅れるらしい。WBSの期日修正して",
+        registry=registry,
+        policy=generation_policy_for_profile(GenerationProfile.CHAT),
+    )
+
+    request = registry.calls[0][1]["request"]
+    assert "upsert_project_fact" in request
+    assert "source_type='conversation'" in request
+    assert "confidence below 1.0" in request
+
+
 def test_compose_required_delegation_user_message_keeps_original_request():
     message = compose_required_delegation_user_message(
         "what time is it?",

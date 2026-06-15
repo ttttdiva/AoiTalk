@@ -27,6 +27,7 @@ from .common import (
     _project_info_category_key,
     _parse_optional_uuid,
     _clamp_project_info_importance,
+    _clamp_project_info_confidence,
     _resolve_record_table,
     _ensure_project_info_defaults,
     _resolve_project_info_category,
@@ -628,6 +629,7 @@ def build_project_info_tools() -> list:
         category_id: str = "",
         fact_id: str = "",
         fact_type: str = "fact",
+        confidence: float = 1.0,
         importance: int = 5,
         status: str = "active",
         source_type: str = "agent",
@@ -635,7 +637,7 @@ def build_project_info_tools() -> list:
         source_document_id: str = "",
         source_task_id: str = "",
     ) -> str:
-        """Create or update a durable project fact extracted from tasks, documents, or conversation."""
+        """Create or update a durable project fact extracted from tasks, documents, or conversation. Use source_type='conversation' for user-provided facts from the current chat."""
         from ...memory.database import get_database_manager
         from ...memory.models import ProjectFact
 
@@ -696,6 +698,7 @@ def build_project_info_tools() -> list:
                 fact.title = target_title[:255]
                 fact.content = target_content
                 fact.fact_type = _clean_text(fact_type, "fact")[:64]
+                fact.confidence = _clamp_project_info_confidence(confidence)
                 fact.importance = _clamp_project_info_importance(importance)
                 fact.status = _one_of(status, project_info_item_statuses, "active")
                 fact.source_type = _clean_text(source_type, "agent")[:32]

@@ -201,6 +201,17 @@ def test_project_management_agent_guides_date_only_task_schedules():
     assert "予定日" in properties["due_date"]["description"]
 
 
+def test_project_management_agent_records_conversation_project_facts():
+    agent = ProjectManagementAgent(model="gpt-4o-mini").agent
+    upsert_fact_tool = next(tool for tool in agent.tools if tool.name == "upsert_project_fact")
+    properties = upsert_fact_tool.params_json_schema["properties"]
+
+    assert "new durable project information" in agent.instructions
+    assert 'source_type="conversation"' in agent.instructions
+    assert "Preserve uncertainty" in agent.instructions
+    assert "confidence" in properties
+
+
 def test_date_only_due_date_normalizes_to_all_day_task_range():
     start_at, end_at, all_day = _normalize_task_schedule_inputs(
         due_date="2026-05-30"
