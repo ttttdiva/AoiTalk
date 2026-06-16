@@ -1,20 +1,17 @@
 # AoiTalk
 
-AoiTalkは、音声認識と複数TTSによる読み上げを備えた、OpenClaw + ClickUp 的なタスク管理・プロジェクト実行ワークスペースです。
-単なるチャットUIではなく、会話、タスク、予定、作業時間、資料、外部ツールを同じ文脈で扱えるようにすることを目標にしています。
+[日本語](/README.md) /
+[英語](/docs_i18n/README_en.md)
 
-AoiTalk is an OpenClaw + ClickUp-like task and project workspace with speech recognition and read-aloud output through multiple TTS engines.
-It is not just a chat UI. It keeps conversations, tasks, schedules, time records, documents, and tool-assisted work in the same operating context.
+AoiTalkは、音声認識と複数TTSによる読み上げに対応した、OpenClaw + ClickUp 的なタスク管理・プロジェクト実行ワークスペースです。
+会話だけで終わるAIチャットではなく、相談、タスク化、予定確認、作業時間、資料参照、外部ツール実行を同じ文脈で扱うためのアプリです。
 
-## 位置づけ / Positioning
+## 位置づけ
 
 個人版および公開版のAoiTalkは、声で相談し、AIに作業を分担させ、その結果をタスク管理へ戻すためのワークスペースです。
-プロジェクト管理を中心に据えつつ、WebUI、音声入力、TTS、Discord、ファイル操作、検索、RAG、カレンダー連携を必要に応じて組み合わせます。
+中心はタスク・プロジェクト管理です。そこにWebUIチャット、音声入力、読み上げ、Discord、ファイル操作、検索、RAG、カレンダー連携を必要に応じて組み合わせます。
 
-The original and public AoiTalk builds are for voice-capable personal and project work.
-They center on task and project management, then add WebUI chat, speech input, TTS output, Discord, file operations, search, RAG, and calendar integrations where they help the workflow.
-
-## 中核機能 / Core Capabilities
+## 中核機能
 
 - **音声対応の会話操作**: Whisper、Parakeet、Google Speech、Gemini系の認識器と、VOICEVOX、VOICEROID、A.I.VOICE、CeVIO、AivisSpeech、Nijivoice、Azure TTS、gTTS、Irodori TTS などの読み上げエンジンを構成に応じて利用できます。
 - **タスク・プロジェクト管理**: プロジェクト、スペース、タスク、ステータス、期日、繰り返し、発生日、通知、作業時間、レポートをPostgreSQL上で管理します。
@@ -22,25 +19,14 @@ They center on task and project management, then add WebUI chat, speech input, T
 - **資料と知識の活用**: ファイラー、Office/PDF読取、QdrantベースのRAG、知識ワークスペース、プロジェクト情報整理を使い、案件資料や作業メモを再利用しやすくします。
 - **外部連携**: Google Calendar、MCPサーバー、OpenAI互換LLM、OpenRouter、Gemini、Ollama、SGLangなどを構成に応じて使えます。
 
-- **Voice-capable interaction**: Depending on configuration, AoiTalk can use recognition engines such as Whisper, Parakeet, Google Speech, and Gemini, plus TTS engines such as VOICEVOX, VOICEROID, A.I.VOICE, CeVIO, AivisSpeech, Nijivoice, Azure TTS, gTTS, and Irodori TTS.
-- **Task and project management**: Projects, spaces, tasks, statuses, due dates, recurrence rules, task occurrences, notifications, time entries, and reports are stored in PostgreSQL.
-- **Specialist AI agents**: Runtime delegation covers project management, filesystem work, utility tasks, media, Spotify, and skills so the assistant can perform work instead of only discussing it.
-- **Documents and knowledge**: The filer, Office/PDF reading, Qdrant-backed RAG, knowledge workspaces, and project information organizers help reuse project material and working notes.
-- **Integrations**: Google Calendar, MCP servers, OpenAI-compatible LLMs, OpenRouter, Gemini, Ollama, and SGLang can be enabled as needed.
+## アプリ構成
 
-## アプリ構成 / Applications
-
-- **Web app**: `frontend/` にある Next.js UI が現在の主要開発対象です。
+- **Webアプリ**: `frontend/` にある Next.js UI が現在の主要開発対象です。
 - **Backend API**: FastAPI、SQLAlchemy、Alembic、PostgreSQL、WebSocketで構成されています。
-- **Mobile app**: `mobile/` は Expo + React Native です。現在はメンテナンス中心で、明示的なモバイル作業以外では変更対象にしません。
-- **Voice and bot runtime**: `src/audio/`、`src/tts/`、`src/bot/`、`src/assistant/` が音声入出力、Discord、会話実行を担当します。
+- **Mobileアプリ**: `mobile/` は Expo + React Native です。現在はメンテナンス中心で、明示的なモバイル作業以外では変更対象にしません。
+- **音声・Botランタイム**: `src/audio/`、`src/tts/`、`src/bot/`、`src/assistant/` が音声入出力、Discord、会話実行を担当します。
 
-- **Web app**: The main active UI lives in `frontend/` and uses Next.js.
-- **Backend API**: The backend uses FastAPI, SQLAlchemy, Alembic, PostgreSQL, and WebSocket.
-- **Mobile app**: `mobile/` is an Expo + React Native app. It is currently maintained conservatively and is not changed unless mobile work is explicitly requested.
-- **Voice and bot runtime**: `src/audio/`, `src/tts/`, `src/bot/`, and `src/assistant/` handle audio I/O, Discord, and conversation execution.
-
-## セットアップ / Setup
+## セットアップ
 
 ### Windows
 
@@ -59,8 +45,6 @@ alembic upgrade head
 
 `run.bat` はPython APIとNext.js WebUIを起動します。起動前にルート `.env` を `frontend/.env` へコピーします。
 
-`run.bat` starts the Python API and the Next.js WebUI. Before startup, it copies the root `.env` to `frontend/.env`.
-
 ### Linux / WSL2
 
 Debian/Ubuntu系、WSL2を含む環境では以下のスクリプトで一括セットアップできます。
@@ -76,9 +60,7 @@ chmod +x setup.sh run.sh
 
 `setup.sh` は PostgreSQL 16 + pgvector、Node.js、Python venv、Alembic migration をまとめて準備します。`sudo` が必要です。
 
-`setup.sh` prepares PostgreSQL 16 + pgvector, Node.js, the Python virtual environment, and Alembic migrations. It requires `sudo`.
-
-## 重要な環境変数 / Important Environment Variables
+## 重要な環境変数
 
 ```env
 NEXTAUTH_SECRET=
@@ -102,14 +84,9 @@ NIJIVOICE_API_KEY=
 WebUIのログインアカウントはPostgreSQLの `users` テーブルで管理します。`.env` に固定ログイン用のユーザー名やパスワードは置きません。
 詳細は `.env.sample` と `docs/setup_guide.md` を参照してください。
 
-WebUI login accounts are stored in the PostgreSQL `users` table. Do not put fixed login usernames or passwords in `.env`.
-See `.env.sample` and `docs/setup_guide.md` for details.
-
-## タスク管理API / Task Management APIs
+## タスク管理API
 
 タスク管理はAoiTalk本体に組み込まれています。`project_management_assistant` は別のMCPサーバーではなく、アプリのバックエンドとAPIを直接操作します。
-
-Task management is built into AoiTalk. `project_management_assistant` works directly through the app backend and APIs rather than through a separate MCP server.
 
 - `/api/tasks`
 - `/api/task-occurrences`
@@ -120,7 +97,7 @@ Task management is built into AoiTalk. `project_management_assistant` works dire
 
 ## Specialist Tools
 
-Runtime specialist delegation is managed in `src/llm/runtime_tool_registry.py`.
+Runtime specialist delegation は `src/llm/runtime_tool_registry.py` で管理しています。
 
 - `project_management_assistant`
 - `filesystem_assistant`
@@ -131,7 +108,7 @@ Runtime specialist delegation is managed in `src/llm/runtime_tool_registry.py`.
 
 ## MCP Servers
 
-Configured MCP servers live under the `mcp` section of `config/config.yaml`.
+MCPサーバー設定は `config/config.yaml` の `mcp` セクションで管理します。
 
 - `utility`
 - `web_search`
@@ -141,15 +118,13 @@ Configured MCP servers live under the `mcp` section of `config/config.yaml`.
 - `os_operations`
 - `media`
 
-## READMEの使い分け / README Variants
+## READMEの使い分け
 
-- `README.md`: 開発元リポジトリと公開版Publishで使うREADMEです。音声入力、複数TTS、個人向け/公開向け機能を含めて説明します。
-- `README.enterprise.md`: 開発リポジトリ側に置くEnterprise出力用のREADMEソースです。`publish_enterprise.bat` / `scripts/publish_enterprise.ps1` が生成先の `README.md` と `ENTERPRISE_PUBLISH_README.md` に反映します。公開版Publishには含めません。
-- `scripts/publish_public.ps1`: 公開版では `README.md` を使い、Enterprise専用READMEや内部運用資料を公開成果物から除外します。
-
-- `README.md`: Used by the development repository and public publish. It describes voice input, multiple TTS engines, and the personal/public feature set.
-- `README.enterprise.md`: Enterprise README source kept in the development repository. `publish_enterprise.bat` / `scripts/publish_enterprise.ps1` writes it to the generated `README.md` and `ENTERPRISE_PUBLISH_README.md`. It is excluded from public publish output.
-- `scripts/publish_public.ps1`: The public publisher uses `README.md` and excludes the Enterprise-specific README and internal operation files.
+- `README.md`: 開発元リポジトリと公開版Publishで使う日本語READMEです。
+- `docs_i18n/README_en.md`: 公開版向けの英語READMEです。
+- `README.enterprise.md`: 開発リポジトリ側に置くEnterprise出力用の日本語READMEソースです。公開版Publishには含めません。
+- `README.enterprise.en.md`: Enterprise出力用の英語READMEソースです。公開版Publishには含めません。
+- `scripts/publish_enterprise.ps1`: Enterprise出力先の `README.md` / `docs_i18n/README_en.md` / `ENTERPRISE_PUBLISH_README.md` をEnterprise用テンプレートから生成します。
 
 ## Docs
 
