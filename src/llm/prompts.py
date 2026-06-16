@@ -129,6 +129,22 @@ Filesystem delegation requirements:
   was read separately from what was only found. Project scope is tool metadata
   and remains available to tools even when optional project prompt context is
   disabled.
+Instant app and macro generation:
+- When the user asks to create a small WebUI app, AoiTalk-hosted static app,
+  downloadable local WebUI app, or Windows .bat macro, call
+  `create_instant_app_package`.
+- Build the requested app or macro contents before calling the tool. For
+  multi-file apps, pass a JSON object or array through `files_json` with safe
+  relative paths such as `app/index.html`, `app/main.js`, `app/style.css`,
+  `scripts/macro.bat`, and `README.md`.
+- Prefer self-contained static WebUI packages for AoiTalk-hosted previews and
+  local WebUI downloads unless the user explicitly needs a heavier runtime.
+- The tool returns chat-ready Markdown links. Include the download link
+  verbatim in the final chat message.
+- Do not route executable macro package delivery through the normal file
+  explorer; use the app factory download link.
+- For script or macro packages, remind the user to review the files before
+  running them.
 """
     return instructions.strip()
 

@@ -131,6 +131,48 @@ def test_project_management_ollama_prefers_confirmed_tool_result_over_final_text
     assert "プロジェクトが不明" not in result
 
 
+def test_project_management_ollama_deferred_fact_requires_list_and_upsert():
+    runner = object.__new__(ProjectManagementDelegationRunner)
+
+    result = runner._validate_ollama_tool_loop_result(
+        "Deferred project fact reflection after the user-facing response.",
+        JsonToolLoopResult(
+            final_output="Updated.",
+            tool_calls=[
+                JsonToolCallRecord(
+                    tool="list_project_information",
+                    arguments={},
+                    result='{"facts":[]}',
+                )
+            ],
+        ),
+        {"list_project_information", "upsert_project_fact"},
+    )
+
+    assert "requested mutation was not completed" in result
+    assert "Missing required tools: upsert_project_fact" in result
+
+
+def test_project_management_formats_upsert_fact_result():
+    runner = object.__new__(ProjectManagementDelegationRunner)
+
+    result = runner._format_mutation_tool_result(
+        JsonToolCallRecord(
+            tool="upsert_project_fact",
+            arguments={"title": "納期遅延見込み"},
+            result=(
+                '{"success":true,"fact":{"id":"fact-1","title":"納期遅延見込み",'
+                '"project_id":"project-123","fact_type":"risk","confidence":0.7,'
+                '"status":"active"}}'
+            ),
+        )
+    )
+
+    assert "案件情報を更新しました" in result
+    assert "fact_id: fact-1" in result
+    assert "fact_type: risk" in result
+
+
 def test_specialist_runner_sets_runtime_project_context_for_tools(monkeypatch):
     seen_contexts = []
 

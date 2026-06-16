@@ -255,6 +255,15 @@ except ImportError:
     AGENT_HARNESS_ROUTES_AVAILABLE = False
     create_agent_harness_router = None
 
+# Import app factory artifact routes
+try:
+    from .app_factory_routes import create_app_factory_router
+
+    APP_FACTORY_ROUTES_AVAILABLE = True
+except ImportError:
+    APP_FACTORY_ROUTES_AVAILABLE = False
+    create_app_factory_router = None
+
 # Import hydrus browser routes
 try:
     from ..tools.hydrus_browser import create_hydrus_compat_router, create_hydrus_router
@@ -539,6 +548,10 @@ class WebChatServer:
         # Register agent harness status routes if available
         if AGENT_HARNESS_ROUTES_AVAILABLE and create_agent_harness_router:
             self._register_agent_harness_routes()
+
+        # Register app factory artifact routes if available
+        if APP_FACTORY_ROUTES_AVAILABLE and create_app_factory_router:
+            self._register_app_factory_routes()
 
         # Register hydrus browser routes if available
         if HYDRUS_ROUTES_AVAILABLE and create_hydrus_router:
@@ -2545,6 +2558,20 @@ class WebChatServer:
         if stop_hook:
             self._shutdown_background_tasks.append(stop_hook)
         logger.info("Agent harness routes registered")
+
+    def _register_app_factory_routes(self):
+        """Register app factory artifact routes."""
+        if not APP_FACTORY_ROUTES_AVAILABLE:
+            logger.warning("App factory routes not available")
+            return
+
+        require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
+        router = create_app_factory_router(
+            require_auth_dependency=require_auth,
+            config=self.config if hasattr(self, "config") else {},
+        )
+        self.app.include_router(router)
+        logger.info("App factory routes registered")
 
     def _register_hydrus_routes(self):
         """Register Hydrus Browser API routes"""

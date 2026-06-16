@@ -50,7 +50,7 @@ def test_required_delegation_skips_plain_chat():
     assert registry.calls == []
 
 
-def test_project_delegation_request_includes_conversation_fact_rule():
+def test_project_delegation_request_defers_incidental_conversation_facts():
     registry = FakeRegistry({"project_management_assistant"})
     build_required_delegation_context_sync(
         user_input="この案件、機器納期が8月に遅れるらしい。WBSの期日修正して",
@@ -59,8 +59,8 @@ def test_project_delegation_request_includes_conversation_fact_rule():
     )
 
     request = registry.calls[0][1]["request"]
-    assert "upsert_project_fact" in request
-    assert "source_type='conversation'" in request
+    assert "do not block the user-facing result" in request
+    assert "reflected asynchronously after the main response" in request
     assert "confidence below 1.0" in request
 
 
@@ -116,3 +116,40 @@ def test_openai_tool_call_loop_executes_common_registry_tool():
         "tool_call_id": "call-1",
         "content": "2026-06-09 12:34 JST",
     }
+
+
+def test_openai_tool_call_loop_relaxes_required_tool_choice_after_tool_result():
+    registry = FakeRegistry({"utility_assistant"}, "2026-06-09 12:34 JST")
+    tool_call = SimpleNamespace(
+        id="call-1",
+        function=SimpleNamespace(
+            name="utility_assistant",
+            arguments='{"request":"current time"}',
+        ),
+    )
+    assistant_message = SimpleNamespace(content=None, tool_calls=[tool_call])
+    completions: list[dict] = []
+
+    def create_completion(kwargs):
+        completions.append(kwargs)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="It is 2026-06-09 12:34 JST.",
+                        tool_calls=None,
+                    )
+                )
+            ]
+        )
+
+    response = run_openai_tool_call_loop(
+        initial_messages=[{"role": "user", "content": "what time is it?"}],
+        assistant_message=assistant_message,
+        api_kwargs={"model": "local-test", "tool_choice": "required"},
+        registry=registry,
+        create_completion=create_completion,
+    )
+
+    assert response == "It is 2026-06-09 12:34 JST."
+    assert completions[0]["tool_choice"] == "auto"

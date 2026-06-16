@@ -8,13 +8,12 @@ for the user's approve/deny response.
 """
 
 import asyncio
+import contextvars
 import logging
 import uuid
 from typing import Any, Callable, Dict, Optional
 from dataclasses import dataclass, field
 from enum import Enum
-
-from ..llm.generation_policy import PermissionPolicy, get_current_generation_policy
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +130,13 @@ class ExternalLLMPermissionManager:
         Returns:
             True if permission is required (auto_approve=False and tool is in list)
         """
+        # Import lazily because src.llm package initialization imports src.tools.
+        # An eager import here creates a cycle before this module exposes its helpers.
+        from ..llm.generation_policy import (
+            PermissionPolicy,
+            get_current_generation_policy,
+        )
+
         permission_policy = get_current_generation_policy().permission_policy
         if permission_policy == PermissionPolicy.AUTO_APPROVE:
             return False

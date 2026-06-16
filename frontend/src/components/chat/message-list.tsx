@@ -14,6 +14,9 @@ import {
   FileText,
   Image as ImageIcon,
   AlertTriangle,
+  Download,
+  ExternalLink,
+  Package,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -48,6 +51,47 @@ function generatedImageSrc(imagePath: string): string {
     return imagePath;
   }
   return `/api/python-proxy/filer/image-thumbnail?path=${encodeURIComponent(imagePath)}&size=1024`;
+}
+
+function isAppFactoryDownloadLink(href?: string): boolean {
+  return Boolean(
+    href?.includes("/api/app-factory/artifacts/") && href.includes("/download"),
+  );
+}
+
+type AppFactoryDownloadLink = {
+  artifactId: string;
+  title: string;
+  downloadHref: string;
+  previewHref?: string;
+};
+
+function extractAppFactoryDownloadLinks(content: string): AppFactoryDownloadLink[] {
+  const downloadPattern =
+    /\[([^\]]+)\]\(((?:\/api\/python-proxy)?\/api\/app-factory\/artifacts\/([A-Za-z0-9_.-]+)\/download)\)/g;
+  const previewPattern =
+    /\[[^\]]+\]\(((?:\/api\/python-proxy)?\/api\/app-factory\/artifacts\/([A-Za-z0-9_.-]+)\/preview)\)/g;
+  const previewById = new Map<string, string>();
+  const linksById = new Map<string, AppFactoryDownloadLink>();
+
+  for (const match of content.matchAll(previewPattern)) {
+    previewById.set(match[2], match[1]);
+  }
+
+  for (const match of content.matchAll(downloadPattern)) {
+    const title = match[1].replace(/[`*_]/g, "").trim() || "app-factory.zip";
+    const artifactId = match[3];
+    if (!linksById.has(artifactId)) {
+      linksById.set(artifactId, {
+        artifactId,
+        title,
+        downloadHref: match[2],
+        previewHref: previewById.get(artifactId),
+      });
+    }
+  }
+
+  return Array.from(linksById.values());
 }
 
 /** @[[type:id:name]] パターンをリンクに変換して表示 */
@@ -307,11 +351,64 @@ function WaitingIndicator({ message = "考え中..." }: { message?: string }) {
 }
 
 /** [GENERATED_IMAGE:path] タグを画像として表示し、残りをMarkdownで描画 */
+function AppFactoryArtifactCards({
+  links,
+}: {
+  links: AppFactoryDownloadLink[];
+}) {
+  if (links.length === 0) return null;
+
+  return (
+    <div className="mt-2 space-y-2">
+      {links.map((link) => (
+        <div
+          key={link.artifactId}
+          className="flex max-w-full flex-wrap items-center gap-2 rounded-md border border-border bg-muted/60 p-2"
+        >
+          <span className="flex size-9 shrink-0 items-center justify-center rounded bg-background text-muted-foreground">
+            <Package className="size-4" />
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-xs font-semibold">
+              {link.title}
+            </span>
+            <span className="block truncate text-[11px] text-muted-foreground">
+              {link.artifactId}
+            </span>
+          </span>
+          <span className="flex shrink-0 items-center gap-1">
+            <a
+              href={link.downloadHref}
+              download
+              className="inline-flex h-8 items-center gap-1 rounded-md border border-border bg-background px-2 text-xs font-medium hover:bg-accent hover:text-accent-foreground"
+            >
+              <Download className="size-3.5" />
+              ZIP
+            </a>
+            {link.previewHref && (
+              <a
+                href={link.previewHref}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex h-8 items-center gap-1 rounded-md border border-border bg-background px-2 text-xs font-medium hover:bg-accent hover:text-accent-foreground"
+              >
+                <ExternalLink className="size-3.5" />
+                Preview
+              </a>
+            )}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function MessageContent({ content }: { content: string }) {
   const visibleContent = content
     .replace(/\[SCENE_DESCRIPTION:[\s\S]*?\]/g, "")
     .replace(/\[IMAGE_TRIGGER:[\s\S]*?\]/g, "")
     .trim();
+  const artifactLinks = extractAppFactoryDownloadLinks(visibleContent);
   const parts = visibleContent.split(/(\[GENERATED_IMAGE:[^\]]+\])/g);
   return (
     <>
@@ -334,6 +431,7 @@ function MessageContent({ content }: { content: string }) {
         if (!part.trim()) return null;
         return <MarkdownContent key={i} content={part} />;
       })}
+      <AppFactoryArtifactCards links={artifactLinks} />
     </>
   );
 }
@@ -423,16 +521,20 @@ function MarkdownContent({ content }: { content: string }) {
         td: ({ children }) => (
           <td className="border border-border px-3 py-1.5">{children}</td>
         ),
-        a: ({ href, children }) => (
-          <a
-            href={href}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-primary underline [overflow-wrap:anywhere] hover:text-primary/80"
-          >
-            {children}
-          </a>
-        ),
+        a: ({ href, children }) => {
+          const isDownloadLink = isAppFactoryDownloadLink(href);
+          return (
+            <a
+              href={href}
+              target={isDownloadLink ? undefined : "_blank"}
+              rel={isDownloadLink ? undefined : "noopener noreferrer"}
+              download={isDownloadLink ? true : undefined}
+              className="text-primary underline [overflow-wrap:anywhere] hover:text-primary/80"
+            >
+              {children}
+            </a>
+          );
+        },
         hr: () => <hr className="my-3 border-border" />,
       }}
     >

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from pathlib import Path
 from uuid import UUID
 
 from agents import function_tool
@@ -33,6 +34,29 @@ from .common import (
     _resolve_project_info_category,
     _management_documents_from_project,
 )
+
+
+def _normalize_management_file_path(
+    project_id: UUID,
+    storage_root: Path,
+    value: str,
+) -> str:
+    text = str(value or "").strip().replace("\\", "/")
+    prefix = f"_projects/project_{project_id}/"
+    if text.lower().startswith(prefix.lower()):
+        text = text[len(prefix) :]
+    text = text.lstrip("/")
+    if not text or Path(text).is_absolute():
+        raise ValueError("Management file path must be relative to the project workspace.")
+
+    target = (storage_root / Path(text)).resolve()
+    try:
+        target.relative_to(storage_root.resolve())
+    except ValueError as exc:
+        raise ValueError("Management file path escapes the project workspace.") from exc
+    if not target.is_file():
+        raise FileNotFoundError(f"Management file was not found: {text}")
+    return text
 
 
 def build_project_info_tools() -> list:
@@ -318,6 +342,91 @@ def build_project_info_tools() -> list:
 
         try:
             return _json(_run_async(_organize()))
+        except Exception as exc:
+            return _json({"success": False, "error": str(exc)})
+
+    @function_tool
+    def configure_project_management_files(
+        project: str = "",
+        project_id: str = "",
+        wbs_file: str = "",
+        issue_file: str = "",
+        risk_file: str = "",
+        request_files_json: str = "",
+    ) -> str:
+        """Set project WBS, issue, risk, and request files using paths relative to the project workspace."""
+        from ...memory.database import get_database_manager
+        from ...memory.models import Project
+        from ...memory.project_repository import ProjectRepository
+        from ...tools.file_explorer import get_root_dir as get_workspace_root
+
+        async def _configure():
+            db = get_database_manager()
+            session = await db.get_session()
+            try:
+                _, resolved_project_id = await _resolve_actor_and_project(
+                    session,
+                    project=project,
+                    project_id=project_id,
+                )
+                if resolved_project_id is None:
+                    raise ValueError("No project could be resolved.")
+                project_obj = await session.get(Project, resolved_project_id)
+                if project_obj is None:
+                    raise ValueError("Project not found.")
+
+                storage_path = await ProjectRepository.get_storage_path(
+                    resolved_project_id
+                )
+                storage_root = (get_workspace_root() / storage_path).resolve()
+                storage_root.mkdir(parents=True, exist_ok=True)
+
+                metadata = dict(project_obj.project_metadata or {})
+                management = dict(metadata.get("management") or {})
+                updates = {
+                    "wbs_file": wbs_file,
+                    "issue_file": issue_file,
+                    "risk_file": risk_file,
+                }
+                for key, value in updates.items():
+                    if str(value or "").strip():
+                        management[key] = _normalize_management_file_path(
+                            resolved_project_id,
+                            storage_root,
+                            value,
+                        )
+
+                if request_files_json.strip():
+                    decoded = json.loads(request_files_json)
+                    if not isinstance(decoded, list):
+                        raise ValueError("request_files_json must be a JSON array.")
+                    management["request_files"] = [
+                        _normalize_management_file_path(
+                            resolved_project_id,
+                            storage_root,
+                            str(value),
+                        )
+                        for value in decoded
+                    ]
+
+                metadata["management"] = management
+                project_obj.project_metadata = metadata
+                project_obj.updated_at = datetime.utcnow()
+                await session.commit()
+                return {
+                    "success": True,
+                    "project_id": str(resolved_project_id),
+                    "project_name": project_obj.name,
+                    "management": management,
+                }
+            except Exception:
+                await session.rollback()
+                raise
+            finally:
+                await session.close()
+
+        try:
+            return _json(_run_async(_configure()))
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
 
@@ -922,6 +1031,7 @@ def build_project_info_tools() -> list:
         list_projects,
         list_project_information,
         organize_project_information_from_folder,
+        configure_project_management_files,
         upsert_project_info_category,
         register_project_document,
         archive_project_info_category,

@@ -18,8 +18,6 @@ import {
   StarOff,
   LayoutGrid,
   List,
-  Shield,
-  ShieldOff,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -39,13 +37,9 @@ export function ExplorerToolbar({
     setViewMode,
     bookmarks,
     refreshBookmarks,
-    isAdmin,
     isAbsoluteFilerPath,
-    isSystemMode,
     filerTab,
     contextRootPath,
-    enterSystemMode,
-    exitSystemMode,
   } = useExplorer();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -92,7 +86,6 @@ export function ExplorerToolbar({
   const canWrite = !isAbsoluteFilerPath;
   const canCreateRecordTable =
     canWrite &&
-    !isSystemMode &&
     filerTab === "workspace" &&
     !!contextRootPath &&
     currentPath === contextRootPath &&
@@ -164,27 +157,6 @@ export function ExplorerToolbar({
           <LayoutGrid className="size-3.5" />
         )}
       </Button>
-      {/* 管理者のみ: システムモードトグル */}
-      {isAdmin && (
-        <div className="ml-auto">
-          <Button
-            variant={isSystemMode ? "default" : "ghost"}
-            size="icon-sm"
-            onClick={isSystemMode ? exitSystemMode : enterSystemMode}
-            title={
-              isSystemMode
-                ? "システムモード解除"
-                : "システムモード（全ファイルシステム）"
-            }
-          >
-            {isSystemMode ? (
-              <ShieldOff className="size-3.5" />
-            ) : (
-              <Shield className="size-3.5" />
-            )}
-          </Button>
-        </div>
-      )}
     </div>
   );
 }

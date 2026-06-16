@@ -537,12 +537,90 @@ def resolve_wbs_path(project_context: dict[str, Any]) -> Optional[Path]:
     return resolved
 
 
-def read_wbs_rows(project_context: dict[str, Any]) -> tuple[list[WbsTaskRow], list[str]]:
+def read_wbs_file(
+    file_path: Path,
+    *,
+    relative_file_path: Optional[str] = None,
+) -> tuple[list[WbsTaskRow], list[str]]:
+    """Read every task row from a supported WBS workbook."""
     try:
         from openpyxl import load_workbook
     except Exception as exc:  # pragma: no cover - depends on local environment
         return [], [f"openpyxl を読み込めません: {exc}"]
 
+    path = Path(file_path).expanduser().resolve()
+    source_path = relative_file_path or path.name
+    if not path.exists():
+        return [], [f"WBSファイルが見つかりません: {source_path}"]
+    if path.suffix.lower() not in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+        return [], [f"未対応のWBS形式です: {path.suffix or '(拡張子なし)'}"]
+
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    rows: list[WbsTaskRow] = []
+
+    try:
+        for sheet in workbook.worksheets:
+            numbered_rows = _non_empty_sheet_rows(sheet)
+            values = [row for _, row in numbered_rows]
+            detected = _detect_header(values)
+            if not detected:
+                layered = _detect_layered_wbs_header(values)
+                if layered:
+                    rows.extend(
+                        _read_layered_wbs_rows(
+                            numbered_rows,
+                            layered,
+                            source_path,
+                            sheet.title,
+                        )
+                    )
+                continue
+            header_index, columns = detected
+            for compact_index in range(header_index + 1, len(numbered_rows)):
+                index, row = numbered_rows[compact_index]
+                title = _clean(_cell(row, columns, "title"))
+                if not title:
+                    continue
+                planned_start = _to_iso_date(_cell(row, columns, "planned_start"))
+                planned_end = _to_iso_date(_cell(row, columns, "planned_end"))
+                actual_start = _to_iso_date(_cell(row, columns, "actual_start"))
+                actual_end = _to_iso_date(_cell(row, columns, "actual_end"))
+                progress = _parse_progress(_cell(row, columns, "progress"))
+                status = _map_status(_cell(row, columns, "status"), progress, actual_end)
+                raw = {field: _cell(row, columns, field) for field in columns}
+                wbs_id = _clean(_cell(row, columns, "wbs_id"))
+                source_key = f"{source_path}::{sheet.title}::{wbs_id or f'row-{index}'}"
+                rows.append(
+                    WbsTaskRow(
+                        source_key=source_key,
+                        row_hash=_row_hash(raw),
+                        file_path=source_path,
+                        sheet_name=sheet.title,
+                        row_number=index,
+                        wbs_id=wbs_id,
+                        title=title,
+                        description=_clean(_cell(row, columns, "description")),
+                        assignee=_clean(_cell(row, columns, "assignee")),
+                        status=status,
+                        priority=_map_priority(planned_end, status),
+                        planned_start=planned_start,
+                        planned_end=planned_end,
+                        actual_start=actual_start,
+                        actual_end=actual_end,
+                        progress=progress,
+                        request_text=_clean(_cell(row, columns, "request_text")),
+                        raw=raw,
+                    )
+                )
+    finally:
+        workbook.close()
+
+    if not rows:
+        return [], ["WBSとして読めるシートまたはタスク行が見つかりませんでした"]
+    return rows, []
+
+
+def read_wbs_rows(project_context: dict[str, Any]) -> tuple[list[WbsTaskRow], list[str]]:
     file_path = resolve_wbs_path(project_context)
     if file_path is None:
         return [], ["WBSファイルが設定されていません"]
@@ -550,69 +628,7 @@ def read_wbs_rows(project_context: dict[str, Any]) -> tuple[list[WbsTaskRow], li
         project_context.get("wbs_file"),
         _clean(project_context.get("id")),
     ) or file_path.name
-    if not file_path.exists():
-        return [], [f"WBSファイルが見つかりません: {relative_file_path}"]
-
-    workbook = load_workbook(file_path, read_only=True, data_only=True)
-    rows: list[WbsTaskRow] = []
-
-    for sheet in workbook.worksheets:
-        numbered_rows = _non_empty_sheet_rows(sheet)
-        values = [row for _, row in numbered_rows]
-        detected = _detect_header(values)
-        if not detected:
-            layered = _detect_layered_wbs_header(values)
-            if layered:
-                rows.extend(
-                    _read_layered_wbs_rows(
-                        numbered_rows,
-                        layered,
-                        relative_file_path,
-                        sheet.title,
-                    )
-                )
-            continue
-        header_index, columns = detected
-        for compact_index in range(header_index + 1, len(numbered_rows)):
-            index, row = numbered_rows[compact_index]
-            title = _clean(_cell(row, columns, "title"))
-            if not title:
-                continue
-            planned_start = _to_iso_date(_cell(row, columns, "planned_start"))
-            planned_end = _to_iso_date(_cell(row, columns, "planned_end"))
-            actual_start = _to_iso_date(_cell(row, columns, "actual_start"))
-            actual_end = _to_iso_date(_cell(row, columns, "actual_end"))
-            progress = _parse_progress(_cell(row, columns, "progress"))
-            status = _map_status(_cell(row, columns, "status"), progress, actual_end)
-            raw = {field: _cell(row, columns, field) for field in columns}
-            wbs_id = _clean(_cell(row, columns, "wbs_id"))
-            source_key = f"{relative_file_path}::{sheet.title}::{wbs_id or f'row-{index}'}"
-            rows.append(
-                WbsTaskRow(
-                    source_key=source_key,
-                    row_hash=_row_hash(raw),
-                    file_path=relative_file_path,
-                    sheet_name=sheet.title,
-                    row_number=index,
-                    wbs_id=wbs_id,
-                    title=title,
-                    description=_clean(_cell(row, columns, "description")),
-                    assignee=_clean(_cell(row, columns, "assignee")),
-                    status=status,
-                    priority=_map_priority(planned_end, status),
-                    planned_start=planned_start,
-                    planned_end=planned_end,
-                    actual_start=actual_start,
-                    actual_end=actual_end,
-                    progress=progress,
-                    request_text=_clean(_cell(row, columns, "request_text")),
-                    raw=raw,
-                )
-            )
-
-    if not rows:
-        return [], ["WBSとして読めるシートまたはタスク行が見つかりませんでした"]
-    return rows, []
+    return read_wbs_file(file_path, relative_file_path=relative_file_path)
 
 
 def summarize_request_items(rows: list[WbsTaskRow], limit: int = 20) -> list[dict[str, Any]]:

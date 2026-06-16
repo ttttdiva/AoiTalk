@@ -50,9 +50,6 @@ export function computeNextRecurringScheduleAfter({
 }): { startAt: Date; endAt: Date | null; advancedBy: number } | null {
   const currentStartLocal = dbTimestampToLocalDate(currentStartAt);
   if (!currentStartLocal) return null;
-  const currentEndLocal = currentEndAt
-    ? dbTimestampToLocalDate(currentEndAt)
-    : null;
   const threshold =
     after.getTime() > currentStartLocal.getTime() ? after : currentStartLocal;
   const lookaheadCount = estimateLookaheadCount(
@@ -62,10 +59,7 @@ export function computeNextRecurringScheduleAfter({
   );
   if (lookaheadCount <= 0) return null;
 
-  const durationMs =
-    currentEndLocal && !isNaN(currentEndLocal.getTime())
-      ? currentEndLocal.getTime() - currentStartLocal.getTime()
-      : null;
+  const durationMs = getOccurrenceDurationMs(currentStartLocal, currentEndAt);
 
   const candidates = computeUpcomingOccurrences(
     currentStartLocal,
@@ -77,8 +71,7 @@ export function computeNextRecurringScheduleAfter({
     const startAt = copyDateWithTime(candidates[i], currentStartLocal);
     if (startAt.getTime() <= threshold.getTime()) continue;
 
-    const endAt =
-      durationMs !== null ? new Date(startAt.getTime() + durationMs) : null;
+    const endAt = applyOccurrenceDuration(startAt, durationMs);
     return {
       startAt: localDateToDbTimestampDate(startAt) ?? startAt,
       endAt: endAt ? (localDateToDbTimestampDate(endAt) ?? endAt) : null,
@@ -106,4 +99,23 @@ export function computeNextRecurringSchedule({
     config,
     after: now,
   });
+}
+
+export function getOccurrenceDurationMs(
+  startAt: DbTimestampValue,
+  endAt: DbTimestampValue,
+): number | null {
+  const startLocal = dbTimestampToLocalDate(startAt);
+  const endLocal = dbTimestampToLocalDate(endAt);
+  if (!startLocal || !endLocal) return null;
+  return Math.max(0, endLocal.getTime() - startLocal.getTime());
+}
+
+export function applyOccurrenceDuration(
+  startAt: Date,
+  durationMs: number | null,
+): Date | null {
+  return durationMs !== null
+    ? new Date(startAt.getTime() + durationMs)
+    : null;
 }

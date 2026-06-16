@@ -6,6 +6,7 @@ from typing import Any
 
 from ..services.project_context import get_runtime_project_context
 from ..skills.executor import invoke_skill
+from ..tools.app_factory import create_instant_app_package, set_app_factory_tool_config
 from ..tools.core import tool as tool_decorator
 from ..tools.registry import ToolRegistry
 from ..services.model_sharing_service import model_sharing_enabled
@@ -31,6 +32,17 @@ def _agent_enabled(config: Any, domain_key: str, default: bool = True) -> bool:
     if not config:
         return default
     return bool(config.get("agents", {}).get(domain_key, {}).get("enabled", default))
+
+
+def _app_factory_enabled(config: Any, default: bool = True) -> bool:
+    if not config:
+        return default
+    if isinstance(config, dict):
+        return bool((config.get("app_factory") or {}).get("enabled", default))
+    getter = getattr(config, "get", None)
+    if callable(getter):
+        return bool(getter("app_factory.enabled", default))
+    return default
 
 
 def _register_delegation_tool(
@@ -76,6 +88,10 @@ def build_runtime_tool_registry(config: Any) -> ToolRegistry:
 
     if config and config.get("skills", {}).get("enabled", True) and invoke_skill is not None:
         registry.register(invoke_skill)
+
+    if _app_factory_enabled(config, True):
+        set_app_factory_tool_config(config)
+        registry.register(create_instant_app_package)
 
     if not config:
         return registry

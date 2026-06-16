@@ -87,6 +87,17 @@ const SHORTCUT_SECTIONS: ShortcutSection[] = [
     ],
   },
   {
+    title: "ファイラー",
+    items: [
+      { keys: ["Alt", "←"], description: "戻る" },
+      { keys: ["Alt", "Backspace"], description: "戻る" },
+      { keys: ["Alt", "→"], description: "進む" },
+      { keys: ["Alt", "↑"], description: "上の階層へ移動" },
+      { keys: ["Ctrl", "I"], description: "選択中の項目をZIP圧縮" },
+      { keys: ["Ctrl", "U"], description: "選択中のZIPを展開" },
+    ],
+  },
+  {
     title: "エディタ",
     items: [
       { keys: ["Ctrl", "]"], description: "Markdown見出しレベルを上げる" },

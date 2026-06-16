@@ -47,8 +47,10 @@ import {
 } from "lucide-react";
 import type { ExplorerDirectory, ExplorerFile } from "@/lib/explorer-api";
 import {
+  explorerArchive,
   explorerCopy,
   explorerDelete,
+  explorerExtract,
   explorerFullContent,
   explorerMove,
   explorerRemoveBookmark,
@@ -62,6 +64,7 @@ import {
 import { getFileServeUrl } from "@/lib/explorer-serve-url";
 import { HF_PREFIX } from "@/lib/hf/virtual-path";
 import dynamic from "next/dynamic";
+import { toast } from "sonner";
 
 const DocumentEditor = dynamic(
   () =>
@@ -96,6 +99,10 @@ function isVideo(type: string) {
 }
 function isAudio(type: string) {
   return type.startsWith("audio");
+}
+type ExplorerItem = ExplorerDirectory | ExplorerFile;
+function isExplorerDirectory(item: ExplorerItem): item is ExplorerDirectory {
+  return !("type" in item);
 }
 
 // 画像表示（onError フォールバック付き）
@@ -666,6 +673,8 @@ function ExplorerContent() {
   const {
     currentPath,
     navigate,
+    goBack,
+    goForward,
     goUp,
     refresh,
     browseData,
@@ -679,11 +688,12 @@ function ExplorerContent() {
     contextRootPath,
     isAdmin,
     isAbsoluteFilerPath,
-    isSystemMode,
     isHfMode,
     isHydrusMode,
     setBrowseData,
     selectedItems,
+    focusedItemPath,
+    selectItem,
     selectAll,
     clearSelection,
     clipboard,
@@ -735,13 +745,16 @@ function ExplorerContent() {
         })),
     [browseData, contextRootPath, currentPath, isAbsoluteFilerPath],
   );
+  const visibleItems = useMemo<ExplorerItem[]>(
+    () =>
+      browseData
+        ? ([...browseData.directories, ...browseData.files] as ExplorerItem[])
+        : [],
+    [browseData],
+  );
   const itemByPath = useMemo(() => {
-    const entries = [
-      ...(browseData?.directories ?? []),
-      ...(browseData?.files ?? []),
-    ] as Array<ExplorerDirectory | ExplorerFile>;
-    return new Map(entries.map((entry) => [entry.path, entry]));
-  }, [browseData]);
+    return new Map(visibleItems.map((entry) => [entry.path, entry]));
+  }, [visibleItems]);
   const selectedPaths = useMemo(
     () => Array.from(selectedItems).filter((path) => itemByPath.has(path)),
     [itemByPath, selectedItems],
@@ -754,6 +767,21 @@ function ExplorerContent() {
       }),
     [itemByPath, selectedPaths],
   );
+  const selectedZipPaths = useMemo(
+    () =>
+      selectedRegularPaths.filter((path) => {
+        const item = itemByPath.get(path);
+        if (!item || !("type" in item)) return false;
+        const extension = (item.extension || "").toLowerCase();
+        return extension === ".zip" || item.name.toLowerCase().endsWith(".zip");
+      }),
+    [itemByPath, selectedRegularPaths],
+  );
+  const activePath =
+    focusedItemPath && itemByPath.has(focusedItemPath)
+      ? focusedItemPath
+      : selectedPaths[0] ?? null;
+  const activeItem = activePath ? itemByPath.get(activePath) ?? null : null;
   const canUseFileShortcuts =
     !isAbsoluteFilerPath && !isHfMode && filerTab !== "hydrus";
   const isExplorerInteractionBlocked =
@@ -791,6 +819,44 @@ function ExplorerContent() {
       window.setTimeout(() => setRecordTableFile(file), 0);
     }
   }, [searchParams, openEditor]);
+
+  // ファイルを開く
+  const handleFileClick = useCallback(
+    (file: ExplorerFile) => {
+      if (isRecordTableFile(file)) {
+        setRecordTableFile(file);
+        closeEditor();
+        setPreviewFile(null);
+      } else if (isAudio(file.type || "")) {
+        audioPlayer.play(
+          {
+            name: file.name,
+            path: file.path,
+            type: file.type || "audio",
+            rootPath: isAbsoluteFilerPath ? currentPath : contextRootPath || "",
+            sourceKind: isAbsoluteFilerPath ? "filer" : "explorer",
+          },
+          audioFiles,
+        );
+      } else if (isImage(file.type || "") || isVideo(file.type || "")) {
+        setViewerFile(file);
+      } else if (TEXT_EXTS.has(file.extension || "")) {
+        // テキストファイルはエディタで開く
+        openEditor(file);
+      } else {
+        setPreviewFile(file);
+      }
+    },
+    [
+      audioPlayer,
+      audioFiles,
+      closeEditor,
+      contextRootPath,
+      currentPath,
+      isAbsoluteFilerPath,
+      openEditor,
+    ],
+  );
 
   // F7 / Shift+F7 ショートカット（ファイラー・エディタ画面共通、書き込み可能時のみ）
   useEffect(() => {
@@ -846,6 +912,73 @@ function ExplorerContent() {
     setClipboard,
   ]);
 
+  const archiveSelectedItems = useCallback(async () => {
+    let targetPaths = selectedRegularPaths;
+    if (
+      targetPaths.length === 0 &&
+      activeItem &&
+      (!("type" in activeItem) || !isRecordTableFile(activeItem))
+    ) {
+      targetPaths = [activeItem.path];
+    }
+    if (!canUseFileShortcuts || targetPaths.length === 0) return;
+    try {
+      const result = await explorerArchive(targetPaths, currentPath);
+      clearSelection();
+      await refresh();
+      toast.success(`${result.archive_name}を作成しました`);
+    } catch {
+      toast.error("zip圧縮に失敗しました");
+    }
+  }, [
+    canUseFileShortcuts,
+    clearSelection,
+    currentPath,
+    refresh,
+    activeItem,
+    selectedRegularPaths,
+  ]);
+
+  const extractSelectedItems = useCallback(async () => {
+    const activeItemExtension =
+      activeItem && "type" in activeItem
+        ? (activeItem.extension || "").toLowerCase()
+        : "";
+    let targetPaths = selectedZipPaths;
+    if (
+      targetPaths.length === 0 &&
+      activeItem &&
+      "type" in activeItem &&
+      (activeItemExtension === ".zip" ||
+        activeItem.name.toLowerCase().endsWith(".zip"))
+    ) {
+      targetPaths = [activeItem.path];
+    }
+    if (!canUseFileShortcuts || (!activeItem && selectedPaths.length === 0)) {
+      return;
+    }
+    if (targetPaths.length === 0) {
+      toast.error("展開できるZIPファイルを選択してください");
+      return;
+    }
+    try {
+      const result = await explorerExtract(targetPaths, currentPath);
+      clearSelection();
+      await refresh();
+      toast.success(`${result.extracted.length}件のZIPを展開しました`);
+    } catch {
+      toast.error("zip展開に失敗しました");
+    }
+  }, [
+    canUseFileShortcuts,
+    clearSelection,
+    currentPath,
+    refresh,
+    activeItem,
+    selectedPaths.length,
+    selectedZipPaths,
+  ]);
+
   const deleteSelectedItems = useCallback(async () => {
     if (!canUseFileShortcuts || selectedPaths.length === 0) return;
     for (const path of selectedPaths) {
@@ -861,6 +994,62 @@ function ExplorerContent() {
     clearSelection();
     await refresh();
   }, [canUseFileShortcuts, clearSelection, itemByPath, refresh, selectedPaths]);
+
+  const getGridColumnCount = useCallback(() => {
+    if (viewMode !== "grid") return 1;
+    const grid = explorerRootRef.current?.querySelector(
+      '[data-explorer-grid="true"]',
+    );
+    if (!(grid instanceof HTMLElement)) return 1;
+    const columns = window
+      .getComputedStyle(grid)
+      .gridTemplateColumns.split(" ")
+      .filter(Boolean).length;
+    return Math.max(1, columns);
+  }, [viewMode]);
+
+  const getRenderedItemPaths = useCallback(() => {
+    const renderedPaths = Array.from(
+      explorerRootRef.current?.querySelectorAll<HTMLElement>(
+        "[data-explorer-item-path]",
+      ) ?? [],
+    )
+      .map((item) => item.dataset.explorerItemPath)
+      .filter((path): path is string => !!path && itemByPath.has(path));
+    return renderedPaths.length > 0
+      ? renderedPaths
+      : visibleItems.map((item) => item.path);
+  }, [itemByPath, visibleItems]);
+
+  const focusItemByOffset = useCallback(
+    (offset: number) => {
+      const itemPaths = getRenderedItemPaths();
+      if (itemPaths.length === 0) return;
+      const currentIndex = activePath
+        ? itemPaths.findIndex((path) => path === activePath)
+        : -1;
+      const nextIndex =
+        currentIndex < 0
+          ? offset < 0
+            ? itemPaths.length - 1
+            : 0
+          : Math.max(0, Math.min(itemPaths.length - 1, currentIndex + offset));
+      const nextPath = itemPaths[nextIndex];
+      if (nextPath) selectItem(nextPath);
+    },
+    [activePath, getRenderedItemPaths, selectItem],
+  );
+
+  const openExplorerItem = useCallback(
+    (item: ExplorerItem) => {
+      if (isExplorerDirectory(item)) {
+        navigate(item.path);
+      } else {
+        handleFileClick(item);
+      }
+    },
+    [handleFileClick, navigate],
+  );
 
   useEffect(() => {
     const isTextInput = (target: EventTarget | null) => {
@@ -884,6 +1073,24 @@ function ExplorerContent() {
       const key = e.key.toLowerCase();
       const primaryModifier = e.ctrlKey || e.metaKey;
 
+      if (!primaryModifier && e.altKey && !e.shiftKey) {
+        if (e.key === "ArrowLeft" || e.key === "Backspace") {
+          e.preventDefault();
+          goBack();
+          return;
+        }
+        if (e.key === "ArrowRight") {
+          e.preventDefault();
+          goForward();
+          return;
+        }
+        if (e.key === "ArrowUp") {
+          e.preventDefault();
+          goUp();
+          return;
+        }
+      }
+
       if (primaryModifier && key === "a") {
         e.preventDefault();
         selectAll();
@@ -904,9 +1111,48 @@ function ExplorerContent() {
         void pasteClipboardItems();
         return;
       }
+      if (primaryModifier && !e.altKey && !e.shiftKey && key === "i") {
+        e.preventDefault();
+        void archiveSelectedItems();
+        return;
+      }
+      if (primaryModifier && !e.altKey && !e.shiftKey && key === "u") {
+        e.preventDefault();
+        void extractSelectedItems();
+        return;
+      }
+      if (!primaryModifier && !e.altKey && !e.shiftKey) {
+        let offset = 0;
+        if (e.key === "ArrowLeft") offset = -1;
+        if (e.key === "ArrowRight") offset = 1;
+        if (e.key === "ArrowUp") offset = -getGridColumnCount();
+        if (e.key === "ArrowDown") offset = getGridColumnCount();
+        if (offset !== 0) {
+          e.preventDefault();
+          focusItemByOffset(offset);
+          return;
+        }
+      }
+      if (!primaryModifier && !e.altKey && !e.shiftKey && e.key === "Enter") {
+        if (activeItem) {
+          e.preventDefault();
+          openExplorerItem(activeItem);
+        }
+        return;
+      }
+      if (!primaryModifier && !e.altKey && !e.shiftKey && e.key === "F2") {
+        if (canUseFileShortcuts && activeItem) {
+          e.preventDefault();
+          setRenameTarget(activeItem);
+        }
+        return;
+      }
       if (
         canUseFileShortcuts &&
         selectedPaths.length > 0 &&
+        !primaryModifier &&
+        !e.altKey &&
+        !e.shiftKey &&
         (e.key === "Delete" || e.key === "Backspace")
       ) {
         e.preventDefault();
@@ -917,43 +1163,22 @@ function ExplorerContent() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [
     canUseFileShortcuts,
+    archiveSelectedItems,
     copySelectedItems,
     deleteSelectedItems,
+    extractSelectedItems,
+    activeItem,
+    focusItemByOffset,
+    getGridColumnCount,
+    goBack,
+    goForward,
+    goUp,
     isExplorerInteractionBlocked,
+    openExplorerItem,
     pasteClipboardItems,
     selectAll,
     selectedPaths.length,
   ]);
-
-  // ファイルクリック
-  const handleFileClick = useCallback(
-    (file: ExplorerFile) => {
-      if (isRecordTableFile(file)) {
-        setRecordTableFile(file);
-        closeEditor();
-        setPreviewFile(null);
-      } else if (isAudio(file.type || "")) {
-        audioPlayer.play(
-          {
-            name: file.name,
-            path: file.path,
-            type: file.type || "audio",
-            rootPath: isAbsoluteFilerPath ? currentPath : contextRootPath || "",
-            sourceKind: isAbsoluteFilerPath ? "filer" : "explorer",
-          },
-          audioFiles,
-        );
-      } else if (isImage(file.type || "") || isVideo(file.type || "")) {
-        setViewerFile(file);
-      } else if (TEXT_EXTS.has(file.extension || "")) {
-        // テキストファイルはエディタで開く
-        openEditor(file);
-      } else {
-        setPreviewFile(file);
-      }
-    },
-    [audioPlayer, audioFiles, closeEditor, contextRootPath, currentPath, isAbsoluteFilerPath, openEditor],
-  );
 
   // コンテキストメニュー（アイテム）
   const handleContextMenu = useCallback(
@@ -988,8 +1213,8 @@ function ExplorerContent() {
       if (subPath) crumbs.push(...subPath.split("/").filter(Boolean));
       return crumbs;
     }
-    // 絶対パス閲覧やシステムモード時はフルパス表示
-    if (isAbsoluteFilerPath || isSystemMode) {
+    // 絶対パス閲覧時はフルパス表示
+    if (isAbsoluteFilerPath) {
       return currentPath.split(/[/\\]/).filter(Boolean);
     }
     // コンテキストルートを省略して相対パスのみ
@@ -1000,7 +1225,7 @@ function ExplorerContent() {
       return relative ? relative.split(/[/\\]/).filter(Boolean) : [];
     }
     return currentPath.split(/[/\\]/).filter(Boolean);
-  }, [currentPath, contextRootPath, isAbsoluteFilerPath, isSystemMode, isHfMode]);
+  }, [currentPath, contextRootPath, isAbsoluteFilerPath, isHfMode]);
 
   // ブックマーク: 非管理者は絶対パス（絶対パス閲覧）を非表示
   const filteredBookmarks = useMemo(() => {
@@ -1018,14 +1243,12 @@ function ExplorerContent() {
 
   // Homeボタンのナビゲート先
   const homeNavigate = useCallback(() => {
-    if (isSystemMode) {
-      navigate("");
-    } else if (isHfMode) {
+    if (isHfMode) {
       navigate(HF_PREFIX);
     } else {
       navigate(contextRootPath || "");
     }
-  }, [navigate, contextRootPath, isSystemMode, isHfMode]);
+  }, [navigate, contextRootPath, isHfMode]);
 
   return (
     <div ref={explorerRootRef} className="flex flex-col h-full">
@@ -1069,7 +1292,7 @@ function ExplorerContent() {
             <div className="flex gap-1 border-b border-border pb-2">
               <Button
                 variant={
-                  filerTab === "workspace" && !isAbsoluteFilerPath && !isSystemMode
+                  filerTab === "workspace" && !isAbsoluteFilerPath
                     ? "default"
                     : "outline"
                 }
@@ -1080,7 +1303,7 @@ function ExplorerContent() {
               </Button>
               <Button
                 variant={
-                  filerTab === "user" && !isAbsoluteFilerPath && !isSystemMode
+                  filerTab === "user" && !isAbsoluteFilerPath
                     ? "default"
                     : "outline"
                 }
@@ -1212,7 +1435,7 @@ function ExplorerContent() {
                         partialPath = repoBase + "|" + subCrumbs.join("/");
                       }
                     }
-                  } else if (isAbsoluteFilerPath || isSystemMode) {
+                  } else if (isAbsoluteFilerPath) {
                     const allSegments = currentPath
                       .split(/[/\\]/)
                       .filter(Boolean);

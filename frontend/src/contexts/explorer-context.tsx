@@ -43,6 +43,8 @@ interface ExplorerContextType {
   // Navigation
   currentPath: string;
   navigate: (path: string) => void;
+  goBack: () => void;
+  goForward: () => void;
   goUp: () => void;
   refresh: () => Promise<void>;
 
@@ -58,6 +60,8 @@ interface ExplorerContextType {
 
   // Selection
   selectedItems: Set<string>;
+  focusedItemPath: string | null;
+  selectItem: (path: string) => void;
   toggleSelect: (path: string) => void;
   selectAll: () => void;
   clearSelection: () => void;
@@ -80,13 +84,9 @@ interface ExplorerContextType {
   storageCtxList: StorageContext[];
   isAdmin: boolean;
 
-  // Admin system mode
-  isSystemMode: boolean;
   isAbsoluteFilerPath: boolean;
   isHfMode: boolean;
   isHydrusMode: boolean;
-  enterSystemMode: () => void;
-  exitSystemMode: () => void;
 
   // Editor
   editingFile: { path: string; name: string; extension: string } | null;
@@ -191,17 +191,19 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   const [error, setError] = useState<string | null>(null);
   const [viewMode, setViewModeState] = useState<ViewMode>("grid");
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
+  const [focusedItemPath, setFocusedItemPath] = useState<string | null>(null);
   const [clipboard, setClipboard] = useState<ClipboardState | null>(null);
   const [bookmarks, setBookmarks] = useState<ExplorerBookmark[]>([]);
   const [storageCtx, setStorageCtx] = useState<StorageContext | null>(null);
   const [storageCtxList, setStorageCtxList] = useState<StorageContext[]>([]);
   const [isAdmin, setIsAdmin] = useState(false);
-  const [isSystemMode, setIsSystemMode] = useState(false);
   const [isAbsoluteFilerPath, setIsAbsoluteFilerPath] = useState(false);
   const [isHfMode, setIsHfMode] = useState(false);
   const [isHydrusMode, setIsHydrusMode] = useState(false);
   const [filerTab, setFilerTabState] = useState<FilerTab>("workspace");
   const activeFilerTabRef = useRef<FilerTab>("workspace");
+  const historyBackRef = useRef<string[]>([]);
+  const historyForwardRef = useRef<string[]>([]);
   const [userId, setUserId] = useState<string | null>(null);
   const fetchingRef = useRef(false);
   const pendingFetchPathRef = useRef<string | null>(null);
@@ -248,9 +250,13 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     [],
   );
 
+  const clearNavigationHistory = useCallback(() => {
+    historyBackRef.current = [];
+    historyForwardRef.current = [];
+  }, []);
+
   // コンテキストルートパス（タブに応じた基準パス）
   const contextRootPath = useMemo(() => {
-    if (isSystemMode) return "";
     if (isAbsoluteFilerPath) return "";
     if (filerTab === "workspace" && selectedProjectId) {
       return workspaceRoot(selectedProjectId);
@@ -259,7 +265,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       return userRoot(userId);
     }
     return "";
-  }, [filerTab, selectedProjectId, userId, isSystemMode, isAbsoluteFilerPath]);
+  }, [filerTab, selectedProjectId, userId, isAbsoluteFilerPath]);
 
   const initialPathForTab = useCallback(
     (tab: FilerTab, uid: string | null = userId): string | null => {
@@ -284,7 +290,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
 
   const rememberCurrentPath = useCallback(
     (path: string) => {
-      if (!path || isSystemMode) return;
+      if (!path || isAbsolutePath(path)) return;
       if (isHfPath(path)) {
         writeLastPath("hf", path);
         return;
@@ -307,7 +313,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
         activeTab === "user" ? userId : selectedProjectId,
       );
     },
-    [isSystemMode, selectedProjectId, userId],
+    [selectedProjectId, userId],
   );
 
   // ディレクトリ読み込み（explorer API or filer path API or HF API を自動判定）
@@ -385,31 +391,17 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
               setHfCreatorMapping(null);
               setHfSearchQuery("");
             }
-          } else if (useAbsoluteFilerPath) {
-            const data = await filerBrowse(targetPath);
+          } else if (useAbsoluteFilerPath && isAdmin) {
+            const data = await explorerList(targetPath);
             setIsAbsoluteFilerPath(true);
             setIsHfMode(false);
             setIsHydrusMode(false);
-            setBrowseDataState({
-              success: true,
-              current_path: data.current_path,
-              parent_path: data.parent_path,
-              can_go_up: data.can_go_up,
-              directories: data.folders.map((f) => ({
-                name: f.name,
-                path: f.path,
-                item_count: f.item_count,
-              })),
-              files: data.files.map((f) => ({
-                name: f.name,
-                path: f.path,
-                type: f.type,
-                size: f.size,
-              })),
-              total_items: data.folders.length + data.files.length,
-            });
+            setBrowseDataState(data);
             setCurrentPath(data.current_path);
             rememberCurrentPath(data.current_path);
+          } else if (useAbsoluteFilerPath) {
+            await filerBrowse(targetPath);
+            throw new Error("absolute path access denied");
           } else {
             const data = await explorerList(targetPath);
             setIsAbsoluteFilerPath(false);
@@ -420,6 +412,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
             rememberCurrentPath(data.current_path);
           }
           setSelectedItems(new Set());
+          setFocusedItemPath(null);
         } catch {
           setError("ディレクトリの読み込みに失敗しました");
         } finally {
@@ -430,21 +423,46 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
         }
       }
     },
-    [attachRecordTables, rememberCurrentPath],
+    [attachRecordTables, isAdmin, rememberCurrentPath],
   );
 
   const navigate = useCallback(
     (path: string) => {
+      if (currentPath && currentPath !== path) {
+        historyBackRef.current = [...historyBackRef.current, currentPath];
+        historyForwardRef.current = [];
+      }
       fetchDirectory(path);
     },
-    [fetchDirectory],
+    [currentPath, fetchDirectory],
   );
 
+  const goBack = useCallback(() => {
+    const previousPath = historyBackRef.current.at(-1);
+    if (!previousPath) return;
+
+    historyBackRef.current = historyBackRef.current.slice(0, -1);
+    if (currentPath && currentPath !== previousPath) {
+      historyForwardRef.current = [currentPath, ...historyForwardRef.current];
+    }
+    fetchDirectory(previousPath);
+  }, [currentPath, fetchDirectory]);
+
+  const goForward = useCallback(() => {
+    const nextPath = historyForwardRef.current[0];
+    if (!nextPath) return;
+
+    historyForwardRef.current = historyForwardRef.current.slice(1);
+    if (currentPath && currentPath !== nextPath) {
+      historyBackRef.current = [...historyBackRef.current, currentPath];
+    }
+    fetchDirectory(nextPath);
+  }, [currentPath, fetchDirectory]);
+
   const goUp = useCallback(() => {
-    // コンテキストルートより上には行かせない（管理者・システムモード・絶対パス閲覧時は制限なし）
+    // コンテキストルートより上には行かせない（管理者・絶対パス閲覧時は制限なし）
     if (
       !isAdmin &&
-      !isSystemMode &&
       !isAbsoluteFilerPath &&
       contextRootPath &&
       currentPath === contextRootPath
@@ -459,7 +477,6 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     navigate,
     currentPath,
     contextRootPath,
-    isSystemMode,
     isAbsoluteFilerPath,
     isAdmin,
   ]);
@@ -469,6 +486,11 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   }, [fetchDirectory, currentPath]);
 
   // 選択
+  const selectItem = useCallback((path: string) => {
+    setSelectedItems(new Set([path]));
+    setFocusedItemPath(path);
+  }, []);
+
   const toggleSelect = useCallback((path: string) => {
     setSelectedItems((prev) => {
       const next = new Set(prev);
@@ -476,19 +498,25 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       else next.add(path);
       return next;
     });
+    setFocusedItemPath(path);
   }, []);
 
   const selectAll = useCallback(() => {
     if (!browseData) return;
-    const all = new Set([
+    const allPaths = [
       ...browseData.directories.map((d) => d.path),
       ...browseData.files.map((f) => f.path),
-    ]);
+    ];
+    const all = new Set(allPaths);
     setSelectedItems(all);
+    setFocusedItemPath((current) =>
+      current && all.has(current) ? current : allPaths[0] ?? null,
+    );
   }, [browseData]);
 
   const clearSelection = useCallback(() => {
     setSelectedItems(new Set());
+    setFocusedItemPath(null);
   }, []);
 
   // ブックマーク
@@ -504,10 +532,10 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   // タブ切り替え
   const setFilerTab = useCallback(
     (tab: FilerTab) => {
+      clearNavigationHistory();
       activeFilerTabRef.current = tab;
       setFilerTabState(tab);
       setIsAbsoluteFilerPath(false);
-      setIsSystemMode(false);
       writeLocalStorage(FILER_TAB_STORAGE_KEY, tab);
       const restorePath = initialPathForTab(tab);
       if (tab === "workspace" && restorePath) {
@@ -539,7 +567,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
         setLoading(false);
       }
     },
-    [fetchDirectory, initialPathForTab],
+    [clearNavigationHistory, fetchDirectory, initialPathForTab],
   );
 
   // ユーザー情報取得（/api/auth/status → userId, isAdmin）
@@ -584,26 +612,6 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     return null;
   }, []);
 
-  // システムモード（管理者専用）
-  const enterSystemMode = useCallback(() => {
-    setIsSystemMode(true);
-    setIsAbsoluteFilerPath(false);
-    setCurrentPath("");
-    fetchDirectory("");
-  }, [fetchDirectory]);
-
-  const exitSystemMode = useCallback(() => {
-    setIsSystemMode(false);
-    setIsAbsoluteFilerPath(false);
-    // 現在のタブのルートに戻る
-    const restorePath = initialPathForTab(filerTab);
-    if (restorePath) {
-      fetchDirectory(restorePath);
-    } else {
-      fetchDirectory("");
-    }
-  }, [fetchDirectory, filerTab, initialPathForTab]);
-
   // ── Editor state ───────────────────────────────────────────────────
   const [editingFile, setEditingFile] = useState<{
     path: string;
@@ -628,7 +636,8 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   // プロジェクト変更時（初期ロード含む）にワークスペースタブなら自動ナビゲート
   useEffect(() => {
     if (!selectedProjectId) return;
-    if (filerTab === "workspace" && !isSystemMode && !isAbsoluteFilerPath) {
+    if (filerTab === "workspace" && !isAbsoluteFilerPath) {
+      clearNavigationHistory();
       fetchDirectory(
         readLastPath("workspace", selectedProjectId) ??
           workspaceRoot(selectedProjectId),
@@ -689,6 +698,8 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       value={{
         currentPath,
         navigate,
+        goBack,
+        goForward,
         goUp,
         refresh,
         browseData,
@@ -698,6 +709,8 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
         viewMode,
         setViewMode,
         selectedItems,
+        focusedItemPath,
+        selectItem,
         toggleSelect,
         selectAll,
         clearSelection,
@@ -711,12 +724,9 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
         storageCtx,
         storageCtxList,
         isAdmin,
-        isSystemMode,
         isAbsoluteFilerPath,
         isHfMode,
         isHydrusMode,
-        enterSystemMode,
-        exitSystemMode,
         editingFile,
         openEditor,
         closeEditor,

@@ -9,6 +9,9 @@ from src.services.project_information_organizer import (
     resolve_project_folder,
     scan_project_folder,
 )
+from src.agents.project_management.project_info_tools import (
+    _normalize_management_file_path,
+)
 
 
 def test_normalize_project_folder_path_accepts_project_filer_prefix():
@@ -35,6 +38,31 @@ def test_resolve_project_folder_blocks_outside_paths(tmp_path: Path):
 
     with pytest.raises(FileNotFoundError):
         resolve_project_folder(tmp_path, project_id, "../../outside")
+
+
+def test_normalize_management_file_path_requires_project_file(tmp_path: Path):
+    project_id = uuid4()
+    target = tmp_path / "管理" / "WBS.xlsx"
+    target.parent.mkdir()
+    target.write_bytes(b"xlsx")
+
+    assert (
+        _normalize_management_file_path(project_id, tmp_path, "管理/WBS.xlsx")
+        == "管理/WBS.xlsx"
+    )
+    assert (
+        _normalize_management_file_path(
+            project_id,
+            tmp_path,
+            f"_projects/project_{project_id}/管理/WBS.xlsx",
+        )
+        == "管理/WBS.xlsx"
+    )
+
+    with pytest.raises(ValueError, match="escapes"):
+        _normalize_management_file_path(project_id, tmp_path, "../outside.xlsx")
+    with pytest.raises(FileNotFoundError):
+        _normalize_management_file_path(project_id, tmp_path, "管理/missing.xlsx")
 
 
 def test_scan_project_folder_extracts_supported_files(tmp_path: Path):

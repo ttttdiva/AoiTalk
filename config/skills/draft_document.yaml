@@ -22,9 +22,10 @@ prompt_template: |
 
   ### 2. 既存資料の構造把握
   対象が既存xlsxの更新の場合:
+  ```powershell
+  venv\Scripts\python.exe scripts\inspect_excel_workbook.py "対象ファイルのフルパス"
   ```
-  python -m openpyxl
-  ```
+  openpyxl はライブラリであり `python -m openpyxl` では実行できない。
   出力をもとに、drafts/<資料名>/_structure.md に構造を記録。
 
   対象がpptxの場合:

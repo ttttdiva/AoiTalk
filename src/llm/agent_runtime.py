@@ -33,6 +33,27 @@ class RequiredDelegationRule:
     context_lines: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class OpenAIToolCallRecord:
+    tool: str
+    arguments: dict[str, Any]
+    result: str
+
+    @property
+    def successful(self) -> bool:
+        lowered = self.result.strip().lower()
+        return not (
+            lowered.startswith("tool not found:")
+            or lowered.startswith("error:")
+        )
+
+
+@dataclass(frozen=True)
+class OpenAIToolCallLoopResult:
+    final_output: str
+    tool_calls: list[OpenAIToolCallRecord]
+
+
 REQUIRED_DELEGATION_RULES: tuple[RequiredDelegationRule, ...] = (
     RequiredDelegationRule(
         tool_name="filesystem_assistant",
@@ -59,7 +80,9 @@ REQUIRED_DELEGATION_RULES: tuple[RequiredDelegationRule, ...] = (
             "For task creation/update/delete/scheduling requests, perform the mutation and verify the resulting task state before answering.",
             "For task creation requests, never ask for project, classification, or priority when the user already provided the task content. Use the selected runtime project. If no runtime project exists, create the task in Inbox with priority medium.",
             "For project information DB completion requests, inspect existing project information, organize project filer documents when available, and include WBS.dbtable sync and issue-table sync when those files are configured or present; do not create normal task-list items from WBS unless the user explicitly asks for WBS task mirroring.",
-            "If the user request itself introduces new durable project information, save that information with upsert_project_fact using source_type='conversation', even when the primary requested action is a task, WBS, schedule, issue, or record-table update.",
+            "If the primary requested action is a task, WBS, schedule, issue-table, or record-table mutation, complete that primary action first and do not block the user-facing result on incidental conversation-derived project fact reflection.",
+            "Incidental durable project information from those requests is reflected asynchronously after the main response. Only save conversation-derived facts in this required delegation when the user explicitly asks for a project-information/fact update.",
+            "For explicit project-information/fact updates, inspect existing project information first unless the relevant facts are already in context, then use upsert_project_fact with source_type='conversation'. Update existing facts when the new information duplicates, corrects, supersedes, or refines them; create a new fact only when it is genuinely new.",
             "Preserve uncertainty in conversation-derived facts: wording such as 'らしい', '見込み', 'かもしれない', 'probably', or 'may' should be saved as unconfirmed with confidence below 1.0.",
             "Do not report a task, schedule, timer, record table, or project-information change as completed unless a tool result confirms it.",
             "Include created or updated task IDs and the final status/time fields when available.",
@@ -161,11 +184,21 @@ def run_openai_tool_call_loop(
     create_completion: Callable[[dict[str, Any]], Any],
     log_prefix: str = "AgentRuntime",
     max_rounds: int = 5,
-) -> str:
+    return_result: bool = False,
+) -> str | OpenAIToolCallLoopResult:
     """Execute OpenAI-compatible tool calls and re-prompt until text output."""
     current_messages = list(initial_messages)
     current_tool_calls = getattr(assistant_message, "tool_calls", None) or []
     current_content = getattr(assistant_message, "content", None)
+    records: list[OpenAIToolCallRecord] = []
+
+    def _finish(output: str) -> str | OpenAIToolCallLoopResult:
+        if return_result:
+            return OpenAIToolCallLoopResult(
+                final_output=output,
+                tool_calls=list(records),
+            )
+        return output
 
     for _ in range(max_rounds):
         current_messages.append(
@@ -183,6 +216,13 @@ def run_openai_tool_call_loop(
                 result_text = str(result)
             except Exception as exc:
                 result_text = f"Error: {exc}"
+            records.append(
+                OpenAIToolCallRecord(
+                    tool=function_name,
+                    arguments=dict(function_args),
+                    result=result_text,
+                )
+            )
             current_messages.append(
                 {
                     "role": "tool",
@@ -194,6 +234,8 @@ def run_openai_tool_call_loop(
 
         follow_up_kwargs = dict(api_kwargs)
         follow_up_kwargs["messages"] = current_messages
+        if follow_up_kwargs.get("tool_choice") == "required":
+            follow_up_kwargs["tool_choice"] = "auto"
         response = create_completion(follow_up_kwargs)
         choice = response.choices[0]
         message = choice.message
@@ -202,10 +244,10 @@ def run_openai_tool_call_loop(
             current_tool_calls = next_tool_calls
             current_content = getattr(message, "content", None)
             continue
-        return getattr(message, "content", None) or ""
+        return _finish(getattr(message, "content", None) or "")
 
     logger.warning("[%s] Tool call loop exceeded max rounds", log_prefix)
-    return current_content or ""
+    return _finish(current_content or "")
 
 
 def _should_run_rule(

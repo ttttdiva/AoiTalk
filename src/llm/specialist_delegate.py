@@ -34,7 +34,7 @@ from ..tools.core import ToolDefinition, ToolParam
 from ..tools.external import MCPPlugin, set_mcp_plugin
 from ..tools.external_llm_permission import request_external_model_prompt
 from ..tools.registry import ToolRegistry
-from .agent_runtime import run_openai_tool_call_loop
+from .agent_runtime import OpenAIToolCallLoopResult, run_openai_tool_call_loop
 from .json_tool_loop import (
     JsonToolCallRecord,
     JsonToolLoopResult,
@@ -486,6 +486,7 @@ class SpecialistDelegationRunner:
             return response.choices[0].message.content or ""
 
         required_tools = self._required_ollama_tool_names(request)
+        require_all_tools = self._require_all_required_tools(request, required_tools)
         result = run_json_tool_loop(
             create_completion=_create,
             initial_messages=initial_messages,
@@ -493,6 +494,7 @@ class SpecialistDelegationRunner:
             original_request=request,
             required_tool_names=required_tools,
             required_tool_reason=self._required_ollama_tool_reason(request, required_tools),
+            require_all_required_tools=require_all_tools,
             return_result=bool(required_tools),
         )
         if isinstance(result, JsonToolLoopResult):
@@ -580,12 +582,15 @@ class SpecialistDelegationRunner:
         }
         if len(registry) > 0:
             api_kwargs["tools"] = OpenAIAPIAdapter.convert_all(registry.get_all())
-            api_kwargs["tool_choice"] = "auto"
+            required_tools = self._required_openai_compatible_tool_names(request)
+            api_kwargs["tool_choice"] = "required" if required_tools else "auto"
+        else:
+            required_tools = set()
 
         response = self._create_openai_compatible_completion(client, api_kwargs)
         message = response.choices[0].message
         if getattr(message, "tool_calls", None):
-            return run_openai_tool_call_loop(
+            result = run_openai_tool_call_loop(
                 initial_messages=messages,
                 assistant_message=message,
                 api_kwargs=api_kwargs,
@@ -593,6 +598,23 @@ class SpecialistDelegationRunner:
                 create_completion=lambda kwargs: self._create_openai_compatible_completion(client, kwargs),
                 log_prefix=f"{self.display_name}DelegationRunner",
                 max_rounds=5,
+                return_result=bool(required_tools),
+            )
+            if isinstance(result, OpenAIToolCallLoopResult):
+                return self._validate_openai_tool_loop_result(
+                    request,
+                    result,
+                    required_tools,
+                )
+            return result
+        if required_tools:
+            return self._validate_openai_tool_loop_result(
+                request,
+                OpenAIToolCallLoopResult(
+                    final_output=getattr(message, "content", None) or "",
+                    tool_calls=[],
+                ),
+                required_tools,
             )
         return getattr(message, "content", None) or ""
 
@@ -619,6 +641,16 @@ class SpecialistDelegationRunner:
     def _required_ollama_tool_names(self, request: str) -> set[str]:
         return set()
 
+    def _required_openai_compatible_tool_names(self, request: str) -> set[str]:
+        return self._required_ollama_tool_names(request)
+
+    def _require_all_required_tools(
+        self,
+        request: str,
+        required_tools: set[str],
+    ) -> bool:
+        return False
+
     def _required_ollama_tool_reason(
         self,
         request: str,
@@ -630,6 +662,14 @@ class SpecialistDelegationRunner:
         self,
         request: str,
         result: JsonToolLoopResult,
+        required_tools: set[str],
+    ) -> str:
+        return result.final_output
+
+    def _validate_openai_tool_loop_result(
+        self,
+        request: str,
+        result: OpenAIToolCallLoopResult,
         required_tools: set[str],
     ) -> str:
         return result.final_output
@@ -882,6 +922,8 @@ class SkillsDelegationRunner(SpecialistDelegationRunner):
 
 
 class ProjectManagementDelegationRunner(SpecialistDelegationRunner):
+    _DEFERRED_FACT_MARKER = "Deferred project fact reflection"
+
     def __init__(self, config: Config, model: Optional[str] = None):
         from ..agents.project_management_agent import ProjectManagementAgent
 
@@ -894,7 +936,19 @@ class ProjectManagementDelegationRunner(SpecialistDelegationRunner):
         )
 
     def _required_ollama_tool_names(self, request: str) -> set[str]:
+        if self._is_deferred_project_fact_reflection(request):
+            return {"list_project_information", "upsert_project_fact"}
         return project_management_required_mutation_tools(request)
+
+    def _require_all_required_tools(
+        self,
+        request: str,
+        required_tools: set[str],
+    ) -> bool:
+        return bool(required_tools) and self._is_deferred_project_fact_reflection(request)
+
+    def _is_deferred_project_fact_reflection(self, request: str) -> bool:
+        return self._DEFERRED_FACT_MARKER in str(request or "")
 
     def _required_ollama_tool_reason(
         self,
@@ -918,6 +972,16 @@ class ProjectManagementDelegationRunner(SpecialistDelegationRunner):
         if not required_tools:
             return result.final_output
 
+        if self._require_all_required_tools(request, required_tools):
+            successful_names = {
+                call.tool
+                for call in result.tool_calls
+                if call.tool in required_tools and call.successful
+            }
+            missing = sorted(required_tools - successful_names)
+            if missing:
+                return self._format_missing_required_tools(required_tools, result.tool_calls, missing)
+
         successful_calls = [
             call
             for call in result.tool_calls
@@ -940,20 +1004,99 @@ class ProjectManagementDelegationRunner(SpecialistDelegationRunner):
             ]
         )
 
-    def _format_mutation_tool_result(self, call: JsonToolCallRecord) -> str:
+    def _validate_openai_tool_loop_result(
+        self,
+        request: str,
+        result: OpenAIToolCallLoopResult,
+        required_tools: set[str],
+    ) -> str:
+        if not required_tools:
+            return result.final_output
+
+        if self._require_all_required_tools(request, required_tools):
+            successful_names = {
+                call.tool
+                for call in result.tool_calls
+                if call.tool in required_tools and call.successful
+            }
+            missing = sorted(required_tools - successful_names)
+            if missing:
+                return self._format_missing_required_tools(required_tools, result.tool_calls, missing)
+
+        successful_calls = [
+            call
+            for call in result.tool_calls
+            if call.tool in required_tools and call.successful
+        ]
+        if successful_calls:
+            return self._format_mutation_tool_result(successful_calls[-1])
+
+        return self._format_missing_required_tools(
+            required_tools,
+            result.tool_calls,
+            sorted(required_tools),
+        )
+
+    def _format_missing_required_tools(
+        self,
+        required_tools: set[str],
+        tool_calls: Sequence[Any],
+        missing: Sequence[str],
+    ) -> str:
+        tools = ", ".join(f"`{name}`" for name in sorted(required_tools))
+        attempted = ", ".join(
+            f"{call.tool}: {str(call.result)[:200]}"
+            for call in tool_calls
+        ) or "none"
+        return "\n".join(
+            [
+                "ProjectManagement delegation error: requested mutation was not completed.",
+                f"Required tool confirmation was missing. Expected: {tools}.",
+                f"Missing required tools: {', '.join(missing)}.",
+                f"Executed tool calls: {attempted}",
+                "Do not tell the user the task, schedule, or project information was updated.",
+            ]
+        )
+
+    def _format_mutation_tool_result(self, call: Any) -> str:
         try:
             payload = json.loads(call.result)
         except Exception:
             payload = None
 
+        if call.tool == "upsert_project_fact":
+            fact = payload.get("fact") if isinstance(payload, dict) else None
+            if isinstance(fact, dict):
+                lines = ["案件情報を更新しました。", f"- tool: {call.tool}"]
+                field_labels = {
+                    "id": "fact_id",
+                    "title": "title",
+                    "project_id": "project_id",
+                    "fact_type": "fact_type",
+                    "confidence": "confidence",
+                    "status": "status",
+                }
+                for field, label in field_labels.items():
+                    value = fact.get(field)
+                    if value is not None and str(value).strip():
+                        lines.append(f"- {label}: {value}")
+                return "\n".join(lines)
+
+        task_tools = {
+            "create_task",
+            "update_task",
+            "delete_task",
+            "assign_task",
+            "schedule_task",
+        }
         task = payload
-        if isinstance(payload, dict):
+        if call.tool in task_tools and isinstance(payload, dict):
             for key in ("task", "created_task", "updated_task", "result"):
                 if isinstance(payload.get(key), dict):
                     task = payload[key]
                     break
 
-        if isinstance(task, dict):
+        if call.tool in task_tools and isinstance(task, dict):
             lines = ["タスク操作を完了しました。", f"- tool: {call.tool}"]
             field_labels = {
                 "id": "task_id",
@@ -974,7 +1117,7 @@ class ProjectManagementDelegationRunner(SpecialistDelegationRunner):
 
         return "\n".join(
             [
-                "タスク操作を完了しました。",
+                "プロジェクト管理操作を完了しました。",
                 f"- tool: {call.tool}",
                 f"- tool_result: {call.result}",
             ]

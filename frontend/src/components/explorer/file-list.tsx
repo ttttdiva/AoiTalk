@@ -82,8 +82,15 @@ function SortHeader({
 }
 
 export function FileList({ onFileClick, onContextMenu }: FileListProps) {
-  const { browseData, navigate, selectedItems, toggleSelect, refresh } =
-    useExplorer();
+  const {
+    browseData,
+    navigate,
+    selectedItems,
+    focusedItemPath,
+    selectItem,
+    toggleSelect,
+    refresh,
+  } = useExplorer();
   const [sortKey, setSortKey] = useState<SortKey>("name");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
   const [dropTarget, setDropTarget] = useState<string | null>(null);
@@ -103,12 +110,18 @@ export function FileList({ onFileClick, onContextMenu }: FileListProps) {
   const handleClick = (
     e: React.MouseEvent,
     item: ExplorerDirectory | ExplorerFile,
-    isDir: boolean,
   ) => {
     if (e.ctrlKey || e.metaKey) {
       toggleSelect(item.path);
       return;
     }
+    selectItem(item.path);
+  };
+
+  const handleDoubleClick = (
+    item: ExplorerDirectory | ExplorerFile,
+    isDir: boolean,
+  ) => {
     if (isDir) {
       navigate(item.path);
     } else {
@@ -219,17 +232,21 @@ export function FileList({ onFileClick, onContextMenu }: FileListProps) {
           {sortedDirs.map((dir) => (
             <tr
               key={dir.path}
+              data-explorer-item-path={dir.path}
               draggable
               className={cn(
                 "cursor-pointer hover:bg-muted",
                 selectedItems.has(dir.path) && "bg-accent",
+                focusedItemPath === dir.path && "outline outline-2 outline-primary/45",
                 dropTarget === dir.path &&
                   "ring-2 ring-blue-400 bg-blue-500/10",
               )}
-              onClick={(e) => handleClick(e, dir, true)}
+              onClick={(e) => handleClick(e, dir)}
+              onDoubleClick={() => handleDoubleClick(dir, true)}
               onContextMenu={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
+                if (!selectedItems.has(dir.path)) selectItem(dir.path);
                 onContextMenu(e, dir);
               }}
               onDragStart={(e) => handleDragStart(e, dir)}
@@ -255,15 +272,19 @@ export function FileList({ onFileClick, onContextMenu }: FileListProps) {
           {sortedFiles.map((file) => (
             <tr
               key={file.path}
+              data-explorer-item-path={file.path}
               draggable={!isRecordTableFile(file)}
               className={cn(
                 "cursor-pointer hover:bg-muted",
                 selectedItems.has(file.path) && "bg-accent",
+                focusedItemPath === file.path && "outline outline-2 outline-primary/45",
               )}
-              onClick={(e) => handleClick(e, file, false)}
+              onClick={(e) => handleClick(e, file)}
+              onDoubleClick={() => handleDoubleClick(file, false)}
               onContextMenu={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
+                if (!selectedItems.has(file.path)) selectItem(file.path);
                 onContextMenu(e, file);
               }}
               onDragStart={(e) => {

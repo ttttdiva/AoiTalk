@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 from pathlib import Path
 
@@ -19,6 +20,7 @@ def test_project_management_tool_bridge_exposes_project_information_tools():
 
     expected = {
         "list_project_information",
+        "configure_project_management_files",
         "upsert_project_info_category",
         "register_project_document",
         "upsert_project_fact",
@@ -47,3 +49,18 @@ def test_project_management_tool_bridge_merges_json_and_key_value_args():
         "labels": ["a", "b"],
         "note": "plain text",
     }
+
+
+def test_project_management_tool_bridge_supplies_non_null_tool_context():
+    bridge = load_bridge_module()
+
+    class FakeTool:
+        name = "fake_tool"
+
+        def on_invoke_tool(self, context, payload):
+            assert context is not None
+            return '{"success": true}'
+
+    result = asyncio.run(bridge.invoke_tool(FakeTool(), {}))
+
+    assert result == {"success": True}

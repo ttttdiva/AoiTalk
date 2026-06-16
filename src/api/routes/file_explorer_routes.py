@@ -38,6 +38,8 @@ try:
         rename_item as explorer_rename_item,
         move_item as explorer_move_item,
         copy_item as explorer_copy_item,
+        archive_items as explorer_archive_items,
+        extract_archives as explorer_extract_archives,
         delete_item as explorer_delete_item,
         get_file_info as explorer_get_file_info,
         get_preview as explorer_get_preview,
@@ -62,6 +64,8 @@ except ImportError:
     explorer_rename_item = None
     explorer_move_item = None
     explorer_copy_item = None
+    explorer_archive_items = None
+    explorer_extract_archives = None
     explorer_delete_item = None
     explorer_get_file_info = None
     explorer_get_preview = None
@@ -92,14 +96,21 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
     """filer / explorer / bookmark / editor 系ルートを登録する"""
     require_auth = cookie_auth_dependency(server._enforce_cookie_auth)
 
+    async def require_admin_filer_access(request: Request) -> None:
+        if not await server._is_admin_user(request):
+            raise HTTPException(status_code=403, detail="管理者権限が必要です")
+
     @app.get("/api/filer/config")
-    async def get_absolute_filer_path_config(_: None = Depends(require_auth)):
+    async def get_absolute_filer_path_config(
+        request: Request, _: None = Depends(require_auth)
+    ):
         """Get filer path configuration"""
         if not ABSOLUTE_FILER_PATHS_AVAILABLE:
             raise HTTPException(
                 status_code=503,
                 detail="Absolute filer path support is not available",
             )
+        await require_admin_filer_access(request)
 
         try:
             result = get_filer_config()
@@ -109,13 +120,16 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get("/api/filer/browse")
-    async def browse_filer_folder(path: str = "", _: None = Depends(require_auth)):
+    async def browse_filer_folder(
+        request: Request, path: str = "", _: None = Depends(require_auth)
+    ):
         """List contents of a directory (both images and videos)"""
         if not ABSOLUTE_FILER_PATHS_AVAILABLE:
             raise HTTPException(
                 status_code=503,
                 detail="Absolute filer path support is not available",
             )
+        await require_admin_filer_access(request)
 
         try:
             result = list_folder_contents(path)
@@ -132,13 +146,16 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get("/api/filer/file")
-    async def serve_filer_file(path: str, _: None = Depends(require_auth)):
+    async def serve_filer_file(
+        request: Request, path: str, _: None = Depends(require_auth)
+    ):
         """Serve a file by absolute path"""
         if not ABSOLUTE_FILER_PATHS_AVAILABLE:
             raise HTTPException(
                 status_code=503,
                 detail="Absolute filer path support is not available",
             )
+        await require_admin_filer_access(request)
 
         file_path = get_file_path(path)
         if file_path is None:
@@ -153,13 +170,16 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
         )
 
     @app.get("/api/filer/video-thumbnail")
-    async def serve_video_thumbnail(path: str, _: None = Depends(require_auth)):
+    async def serve_video_thumbnail(
+        request: Request, path: str, _: None = Depends(require_auth)
+    ):
         """Serve a video thumbnail (generated via FFmpeg)"""
         if not ABSOLUTE_FILER_PATHS_AVAILABLE:
             raise HTTPException(
                 status_code=503,
                 detail="Absolute filer path support is not available",
             )
+        await require_admin_filer_access(request)
 
         thumbnail_path = get_video_thumbnail_path(path)
         if thumbnail_path is None:
@@ -191,6 +211,10 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
     class ExplorerCopyPayload(BaseModel):
         src: str
         dest: str
+
+    class ExplorerArchivePayload(BaseModel):
+        paths: list[str]
+        dest: str = ""
 
     @app.get("/api/explorer/tree")
     async def get_explorer_tree(root: str = "", _: None = Depends(require_auth)):
@@ -497,9 +521,13 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
 
     @app.get("/api/filer/image-thumbnail")
     async def filer_image_thumbnail(
-        path: str, size: int = 320, _: None = Depends(require_auth)
+        request: Request,
+        path: str,
+        size: int = 320,
+        _: None = Depends(require_auth),
     ):
         """絶対パスから画像サムネイルを生成して返す（管理者向け絶対パス閲覧対応）。"""
+        await require_admin_filer_access(request)
         try:
             file_path = Path(path)
             if not file_path.exists() or not file_path.is_file():
@@ -685,6 +713,62 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
             raise
         except Exception as e:
             logger.error(f"Failed to copy: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/explorer/archive")
+    async def explorer_archive(
+        payload: ExplorerArchivePayload,
+        request: Request,
+        _: None = Depends(require_auth),
+    ):
+        """Create a zip archive from selected files or directories"""
+        if not FILE_EXPLORER_AVAILABLE:
+            raise HTTPException(
+                status_code=503, detail="File explorer is not available"
+            )
+
+        try:
+            is_admin = await server._is_admin_user(request)
+            result = explorer_archive_items(
+                payload.paths, payload.dest, is_admin=is_admin
+            )
+            if not result.get("success"):
+                raise HTTPException(
+                    status_code=400, detail=result.get("error", "Failed to archive")
+                )
+            return JSONResponse(result)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to archive: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/explorer/extract")
+    async def explorer_extract(
+        payload: ExplorerArchivePayload,
+        request: Request,
+        _: None = Depends(require_auth),
+    ):
+        """Extract selected zip archives"""
+        if not FILE_EXPLORER_AVAILABLE:
+            raise HTTPException(
+                status_code=503, detail="File explorer is not available"
+            )
+
+        try:
+            is_admin = await server._is_admin_user(request)
+            result = explorer_extract_archives(
+                payload.paths, payload.dest, is_admin=is_admin
+            )
+            if not result.get("success"):
+                raise HTTPException(
+                    status_code=400, detail=result.get("error", "Failed to extract")
+                )
+            return JSONResponse(result)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to extract: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.delete("/api/explorer/delete")

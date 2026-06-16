@@ -150,6 +150,9 @@ keyword_detection:
 skills:
   enabled: true
   directory: config/skills
+app_factory:
+  enabled: true
+  artifact_dir: cache/app_factory
 heartbeat:
   enabled: true
   directory: config/heartbeats

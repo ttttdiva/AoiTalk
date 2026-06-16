@@ -183,6 +183,7 @@ class ResponseHandler:
             # Add response to hallucination filter for echo detection (if available)
             if hasattr(self.llm_client, 'recognizer') and self.llm_client.recognizer:
                 self.llm_client.recognizer.add_assistant_output(response)
+            self._schedule_deferred_project_fact_reflection(text, response)
 
             # For web input, proceed with TTS and playback using resource locks
             # For chat input, return response without TTS
@@ -262,6 +263,7 @@ class ResponseHandler:
                 self.llm_client.recognizer.add_assistant_output(response)
 
             asyncio.create_task(self._process_dreaming_memory(text, response))
+            self._schedule_deferred_project_fact_reflection(text, response)
 
             return response
 
@@ -273,6 +275,97 @@ class ResponseHandler:
             return None
         finally:
             self.is_generating = False
+
+    def _schedule_deferred_project_fact_reflection(
+        self,
+        user_input: str,
+        assistant_response: str,
+    ) -> None:
+        """Schedule incidental project fact reflection after the main response."""
+        try:
+            from ..llm.tool_policy import looks_like_deferred_project_fact_request
+
+            if not looks_like_deferred_project_fact_request(user_input):
+                return
+
+            config = getattr(self.llm_client, "config", None)
+            if config is None:
+                print("[ProjectFactReflection] config がないため反映をスキップしました")
+                return
+
+            project_context = self._capture_project_context_for_background()
+            task = asyncio.create_task(
+                self._process_deferred_project_fact_reflection(
+                    user_input,
+                    assistant_response,
+                    config,
+                    project_context,
+                )
+            )
+            task.add_done_callback(self._log_background_task_error)
+        except Exception as e:
+            print(f"[ProjectFactReflection] スケジュールエラー（無視）: {e}")
+
+    def _capture_project_context_for_background(self) -> Optional[Dict[str, Any]]:
+        resolver = getattr(self.llm_client, "_resolve_project_context_sync", None)
+        if callable(resolver):
+            try:
+                context = resolver()
+                if isinstance(context, dict) and context.get("id"):
+                    return dict(context)
+            except Exception as e:
+                print(f"[ProjectFactReflection] project context 解決エラー（継続）: {e}")
+
+        project_id = getattr(self.llm_client, "current_project_id", None)
+        if project_id:
+            return {"id": str(project_id)}
+        return None
+
+    @staticmethod
+    def _log_background_task_error(task: asyncio.Task) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"[ProjectFactReflection] バックグラウンドエラー（無視）: {e}")
+
+    async def _process_deferred_project_fact_reflection(
+        self,
+        user_input: str,
+        assistant_response: str,
+        config: Any,
+        project_context: Optional[Dict[str, Any]],
+    ) -> None:
+        try:
+            from ..llm.specialist_delegate import ProjectManagementDelegationRunner
+
+            request = "\n".join(
+                [
+                    "Deferred project fact reflection after the user-facing response.",
+                    "The primary requested action has already been handled; do not create, update, delete, or schedule tasks.",
+                    "Do not sync WBS rows, issue tables, or record tables in this deferred pass.",
+                    "Reflect only durable project information introduced by the original user message.",
+                    "First call list_project_information for the target project unless the relevant existing facts are already present in this request context.",
+                    "Compare new information with existing facts by meaning. If it duplicates, corrects, supersedes, or refines an existing fact, update that fact with upsert_project_fact using fact_id when available.",
+                    "Create a new fact only when it is genuinely new. Use source_type=\"conversation\" and preserve uncertainty with confidence below 1.0 when the user's wording is uncertain.",
+                    "",
+                    "Original user message:",
+                    user_input,
+                    "",
+                    "Assistant response already sent:",
+                    assistant_response,
+                ]
+            )
+            result = await ProjectManagementDelegationRunner(config).run_async(
+                request,
+                project_context=project_context,
+            )
+            summary = str(result or "").strip().splitlines()
+            if summary:
+                print(f"[ProjectFactReflection] 完了: {summary[0][:200]}")
+        except Exception as e:
+            print(f"[ProjectFactReflection] 反映エラー（無視）: {e}")
     
     async def _speak_response_background(self, task_id: str, response: str):
         """Handle TTS and playback in background"""

@@ -19,18 +19,21 @@ prompt_template: |
      - 宛先情報（会社名・担当者名）
      - 送信者名
   2. 各Excelの構造を spreadsheet/openpyxl 等で確認:
+     ```powershell
+     venv\Scripts\python.exe scripts\inspect_excel_workbook.py "対象ファイルのフルパス"
      ```
-     python -m openpyxl
-     ```
+     openpyxl はライブラリであり `python -m openpyxl` では実行できない。
   3. ヘッダ行から列マッピングを特定して weekly_report_config.json を作成
 
   ### 2. Excelスキャン
-  spreadsheet/openpyxl 等でスキャン実行:
-  ```
-  # legacy helper removed; use spreadsheet/openpyxl directly
+  WBSの期限確認は専用スクリプトで全タスク行を走査:
+  ```powershell
+  venv\Scripts\python.exe scripts\scan_wbs_deadlines.py "WBSファイルのフルパス" --days N
   ```
   --days は weekly_report_config.json の deadline_threshold_days を使用（デフォルト {threshold_days} 日）。
-  結果はJSON形式で出力される。
+  結果はJSON形式で出力される。`inspect_excel_workbook.py` の先頭行サンプルを期限スキャン結果として使わないこと。
+
+  課題管理表・リスク管理表は、初回セットアップで特定した期限・状態列を使い、openpyxlで全データ行を走査する。先頭20行だけで判定しない。
 
   ### 3. WBS の確認・更新
   スキャン結果のWBSタスクを一覧表示:

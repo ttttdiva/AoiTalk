@@ -13,6 +13,10 @@ import { getSession } from "@/lib/auth";
 import { computeOccurrencesInRange } from "@/lib/recurrence-preview";
 import type { RecurrencePreviewConfig } from "@/lib/recurrence-preview";
 import {
+  applyOccurrenceDuration,
+  getOccurrenceDurationMs,
+} from "@/lib/recurrence-schedule";
+import {
   isRecurrenceOverrideSourceKind,
   isRecurrenceSkipSourceKind,
   resolveOccurrenceOriginalStartAt,
@@ -325,10 +329,9 @@ export async function GET(request: NextRequest) {
       const baseStartLocal = dbTimestampToLocalDate(baseStart);
       const baseEndLocal = baseEnd ? dbTimestampToLocalDate(baseEnd) : null;
       if (!baseStartLocal) continue;
-      const durationMs =
-        baseStartLocal && baseEndLocal
-          ? baseEndLocal.getTime() - baseStartLocal.getTime()
-          : 0;
+      const durationMs = task.endAt
+        ? getOccurrenceDurationMs(baseStart, baseEnd)
+        : null;
 
       if (
         baseStart &&
@@ -384,7 +387,7 @@ export async function GET(request: NextRequest) {
         previewConfig,
       );
       const occurrenceRangeStart =
-        durationMs > 0
+        durationMs !== null && durationMs > 0
           ? new Date(rangeStart.getTime() - durationMs)
           : rangeStart;
       const upcomingStarts = computeOccurrencesInRange(
@@ -396,8 +399,7 @@ export async function GET(request: NextRequest) {
       );
 
       for (const nextStart of upcomingStarts) {
-        const nextEnd =
-          durationMs > 0 ? new Date(nextStart.getTime() + durationMs) : null;
+        const nextEnd = applyOccurrenceDuration(nextStart, durationMs);
         if (!overlapsRange(nextStart, nextEnd, rangeStart, rangeEnd)) {
           continue;
         }

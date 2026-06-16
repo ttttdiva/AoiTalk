@@ -343,6 +343,24 @@ export async function explorerCopy(src: string, dest: string) {
   );
 }
 
+export async function explorerArchive(paths: string[], dest: string) {
+  return pyFetchJson<{
+    success: boolean;
+    message: string;
+    archive_name: string;
+    archive_path: string;
+    count: number;
+  }>("/explorer/archive", { paths, dest });
+}
+
+export async function explorerExtract(paths: string[], dest: string) {
+  return pyFetchJson<{
+    success: boolean;
+    message: string;
+    extracted: { archive_name: string; path: string; name: string }[];
+  }>("/explorer/extract", { paths, dest });
+}
+
 export async function explorerDelete(path: string) {
   return pyFetch<{ success: boolean; message: string }>(
     `/explorer/delete?path=${encodeURIComponent(path)}`,

@@ -14,20 +14,27 @@ from typing import Any, Optional
 
 HEADER_ALIASES = {
     "number": {"no", "no.", "番号", "#"},
-    "kind": {"区分", "type", "種別"},
+    "kind": {"区分", "分類", "type", "種別"},
     "phase": {"フェーズ", "phase", "工程"},
     "status": {"status", "ステータス", "状態", "状況"},
     "created_at": {"起票日", "作成日", "created", "created at"},
     "reporter": {"起票者", "報告者", "reporter"},
     "importance": {"重要度", "priority", "importance"},
-    "title": {"課題概要", "概要", "件名", "title", "summary"},
+    "title": {"課題概要", "概要", "件名", "タイトル", "title", "summary"},
     "detail": {"課題詳細", "詳細", "内容", "detail", "description"},
     "action_plan": {"actionplan", "action plan", "対応方針", "対策", "アクション"},
     "close_condition": {"課題close条件", "close condition", "完了条件"},
     "due_date": {"対応期限", "期限", "期日", "due", "due date"},
-    "owner": {"主担当者", "担当者", "owner", "assignee"},
-    "history": {"対応経緯", "経緯", "history", "対応履歴"},
-    "resolved_at": {"対策終了日", "対応完了日", "resolved", "resolved at"},
+    "owner": {"主担当者", "担当者", "対応者", "owner", "assignee"},
+    "history": {
+        "対応経緯",
+        "経緯",
+        "回答・対応",
+        "回答・対応（更新は赤字追記)",
+        "history",
+        "対応履歴",
+    },
+    "resolved_at": {"対策終了日", "対応完了日", "完了日", "resolved", "resolved at"},
     "approved_at": {"完了承認日", "承認日", "approved", "approved at"},
     "approver": {"完了承認者", "承認者", "approver"},
     "notes": {"備考", "notes", "note"},
@@ -144,7 +151,7 @@ def _normalize_project_file_path(value: Any, project_id: Optional[str] = None) -
     return "/".join(parts)
 
 
-def _issue_candidate_score(path: Path, storage_root: Path) -> tuple[float, int]:
+def _issue_candidate_score(path: Path, storage_root: Path) -> tuple[int, float, int]:
     relative = str(path.relative_to(storage_root)).replace("\\", "/")
     haystack = f"{path.name}\n{relative}".casefold()
     score = 0
@@ -154,9 +161,8 @@ def _issue_candidate_score(path: Path, storage_root: Path) -> tuple[float, int]:
         score += 30
     if "issue" in haystack:
         score += 20
-    if "management/" in relative.casefold():
-        score += 5
-    return (path.stat().st_mtime, score)
+    location_score = 1 if "management/" in relative.casefold() else 0
+    return (score, path.stat().st_mtime, location_score)
 
 
 def resolve_issue_path(
@@ -284,6 +290,10 @@ def read_issue_rows(
                 continue
             raw = {field: _cell(row, columns, field) for field in columns}
             source_key = f"{relative_file_path}::{sheet.title}::{number}"
+            resolved_at = _to_iso_date(_cell(row, columns, "resolved_at"))
+            status = _clean(_cell(row, columns, "status"))
+            if not status:
+                status = "完了" if resolved_at else "未着手"
             rows.append(
                 IssueTableRow(
                     source_key=source_key,
@@ -294,7 +304,7 @@ def read_issue_rows(
                     number=number,
                     kind=_clean(_cell(row, columns, "kind")),
                     phase=_clean(_cell(row, columns, "phase")),
-                    status=_clean(_cell(row, columns, "status")) or "未着手",
+                    status=status,
                     created_at=_to_iso_date(_cell(row, columns, "created_at")),
                     reporter=_clean(_cell(row, columns, "reporter")),
                     importance=_clean(_cell(row, columns, "importance")),
@@ -305,7 +315,7 @@ def read_issue_rows(
                     due_date=_to_iso_date(_cell(row, columns, "due_date")),
                     owner=_clean(_cell(row, columns, "owner")),
                     history=_clean(_cell(row, columns, "history")),
-                    resolved_at=_to_iso_date(_cell(row, columns, "resolved_at")),
+                    resolved_at=resolved_at,
                     approved_at=_to_iso_date(_cell(row, columns, "approved_at")),
                     approver=_clean(_cell(row, columns, "approver")),
                     notes=_clean(_cell(row, columns, "notes")),

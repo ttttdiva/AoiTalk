@@ -4,8 +4,10 @@ import io
 import zipfile
 
 from src.tools.file_explorer.file_explorer_service import (
+    archive_items,
     create_directory,
     download_file,
+    extract_archives,
     get_full_content,
     list_directory,
     rename_item,
@@ -52,6 +54,21 @@ def test_list_directory_returns_parent_path_for_admin_absolute_path(
     assert result["can_go_up"] is True
     assert result["is_admin_mode"] is True
     assert result["directories"][0]["path"] == str(child).replace("\\", "/")
+
+
+def test_list_directory_rejects_absolute_path_for_non_admin(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    monkeypatch.setenv("AOITALK_WORKSPACES_DIR", str(workspace))
+
+    result = list_directory(str(outside), is_admin=False)
+
+    assert result["success"] is False
+    assert "無効" in result["error"]
+    assert list(workspace.iterdir()) == []
 
 
 def test_admin_file_operations_allow_absolute_paths(tmp_path, monkeypatch):
@@ -145,3 +162,106 @@ def test_download_file_returns_zip_for_folder(tmp_path, monkeypatch):
     with zipfile.ZipFile(io.BytesIO(content)) as archive:
         assert sorted(archive.namelist()) == ["chapter/note.txt", "readme.md"]
         assert archive.read("readme.md") == b"hello"
+
+
+def test_archive_items_creates_zip_for_selected_items(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    folder = workspace / "docs"
+    nested = folder / "chapter"
+    nested.mkdir(parents=True)
+    (workspace / "readme.md").write_text("hello", encoding="utf-8")
+    (nested / "note.txt").write_text("nested", encoding="utf-8")
+    monkeypatch.setenv("AOITALK_WORKSPACES_DIR", str(workspace))
+
+    result = archive_items(["readme.md", "docs"], "")
+
+    assert result["success"] is True
+    assert result["archive_name"] == "archive.zip"
+    archive_path = workspace / "archive.zip"
+    assert archive_path.exists()
+    with zipfile.ZipFile(archive_path) as archive:
+        assert sorted(archive.namelist()) == [
+            "docs/chapter/note.txt",
+            "readme.md",
+        ]
+        assert archive.read("docs/chapter/note.txt") == b"nested"
+
+
+def test_archive_items_uses_source_name_for_single_folder(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    folder = workspace / "docs"
+    folder.mkdir(parents=True)
+    (folder / "readme.md").write_text("hello", encoding="utf-8")
+    monkeypatch.setenv("AOITALK_WORKSPACES_DIR", str(workspace))
+
+    result = archive_items(["docs"], "")
+
+    assert result["success"] is True
+    assert result["archive_name"] == "docs.zip"
+    assert (workspace / "docs.zip").exists()
+
+
+def test_extract_archives_extracts_zip_to_named_folder(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    archive_path = workspace / "bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("chapter/note.txt", "nested")
+        archive.writestr("readme.md", "hello")
+    monkeypatch.setenv("AOITALK_WORKSPACES_DIR", str(workspace))
+
+    result = extract_archives(["bundle.zip"], "")
+
+    assert result["success"] is True
+    assert result["extracted"][0]["path"] == "bundle"
+    assert (workspace / "bundle" / "readme.md").read_text(encoding="utf-8") == "hello"
+    assert (
+        workspace / "bundle" / "chapter" / "note.txt"
+    ).read_text(encoding="utf-8") == "nested"
+
+
+def test_extract_archives_rejects_zip_slip_paths(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    archive_path = workspace / "bad.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("../evil.txt", "bad")
+    monkeypatch.setenv("AOITALK_WORKSPACES_DIR", str(workspace))
+
+    result = extract_archives(["bad.zip"], "")
+
+    assert result["success"] is False
+    assert not (workspace / "bad").exists()
+    assert not (tmp_path / "evil.txt").exists()
+
+
+def test_extract_archives_cleans_up_previous_extract_on_later_failure(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    good_archive = workspace / "good.zip"
+    bad_archive = workspace / "bad.zip"
+    with zipfile.ZipFile(good_archive, "w") as archive:
+        archive.writestr("readme.md", "hello")
+    with zipfile.ZipFile(bad_archive, "w") as archive:
+        archive.writestr("../evil.txt", "bad")
+    monkeypatch.setenv("AOITALK_WORKSPACES_DIR", str(workspace))
+
+    result = extract_archives(["good.zip", "bad.zip"], "")
+
+    assert result["success"] is False
+    assert not (workspace / "good").exists()
+    assert not (workspace / "bad").exists()
+
+
+def test_extract_archives_rejects_non_zip_files(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "note.txt").write_text("hello", encoding="utf-8")
+    monkeypatch.setenv("AOITALK_WORKSPACES_DIR", str(workspace))
+
+    result = extract_archives(["note.txt"], "")
+
+    assert result["success"] is False
+    assert "ZIPファイルではありません" in result["error"]

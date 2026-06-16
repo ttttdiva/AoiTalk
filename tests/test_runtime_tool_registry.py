@@ -14,6 +14,7 @@ def _base_config() -> dict:
         "memory": {"enabled": True, "enable_search": True},
         "spotify": {"enabled": True},
         "skills": {"enabled": True},
+        "app_factory": {"enabled": True},
         "agents": {
             "search": {"enabled": True},
             "project_management": {"enabled": True},
@@ -94,6 +95,7 @@ def test_runtime_tool_registry_exposes_search_plus_specialists(monkeypatch):
     assert "writing_assistant" in names
     assert "import_assistant" in names
     assert "invoke_skill" in names
+    assert "create_instant_app_package" in names
     assert "skills_assistant" not in names
     
     assert "use_mcp_tool" not in registry
@@ -122,11 +124,13 @@ def test_runtime_tool_registry_respects_specialist_feature_flags(monkeypatch):
     config = _base_config()
     config["spotify"]["enabled"] = False
     config["skills"]["enabled"] = False
+    config["app_factory"]["enabled"] = False
 
     registry = build_runtime_tool_registry(config)
 
     assert "spotify_assistant" not in registry
     assert "invoke_skill" not in registry
+    assert "create_instant_app_package" not in registry
     assert "project_management_assistant" in registry
     assert "filesystem_assistant" in registry
 

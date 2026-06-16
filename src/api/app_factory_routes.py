@@ -1,0 +1,113 @@
+"""App factory artifact API routes."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+
+from ..services.app_factory_service import (
+    delete_app_factory_artifact,
+    list_app_factory_artifacts,
+    load_artifact_manifest,
+    resolve_artifact_download,
+    resolve_artifact_preview,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def create_app_factory_router(
+    *,
+    require_auth_dependency,
+    config: Any,
+) -> APIRouter:
+    router = APIRouter(prefix="/api/app-factory", tags=["app-factory"])
+
+    @router.get("/artifacts")
+    async def list_artifacts(
+        request: Request,
+        limit: int = 50,
+        _=Depends(require_auth_dependency),
+    ):
+        try:
+            artifacts = list_app_factory_artifacts(config=config, limit=limit)
+            return JSONResponse(content={"success": True, "artifacts": artifacts})
+        except Exception as exc:
+            logger.exception("App factory list failed")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.get("/artifacts/{artifact_id}")
+    async def get_artifact(
+        artifact_id: str,
+        request: Request,
+        _=Depends(require_auth_dependency),
+    ):
+        try:
+            manifest = load_artifact_manifest(artifact_id, config=config)
+            return JSONResponse(content={"success": True, "artifact": manifest})
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("App factory manifest failed")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.delete("/artifacts/{artifact_id}")
+    async def delete_artifact(
+        artifact_id: str,
+        request: Request,
+        _=Depends(require_auth_dependency),
+    ):
+        try:
+            manifest = delete_app_factory_artifact(artifact_id, config=config)
+            return JSONResponse(content={"success": True, "artifact": manifest})
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("App factory delete failed")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.get("/artifacts/{artifact_id}/download")
+    async def download_artifact(
+        artifact_id: str,
+        request: Request,
+        _=Depends(require_auth_dependency),
+    ):
+        try:
+            zip_path, filename = resolve_artifact_download(artifact_id, config=config)
+            return FileResponse(
+                zip_path,
+                media_type="application/zip",
+                filename=filename,
+                headers={
+                    "Cache-Control": "no-store",
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                },
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("App factory download failed")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.get("/artifacts/{artifact_id}/preview", response_class=HTMLResponse)
+    async def preview_artifact(
+        artifact_id: str,
+        request: Request,
+        _=Depends(require_auth_dependency),
+    ):
+        try:
+            preview_path = resolve_artifact_preview(artifact_id, config=config)
+            return HTMLResponse(
+                content=preview_path.read_text(encoding="utf-8"),
+                headers={"Cache-Control": "no-store"},
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("App factory preview failed")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return router

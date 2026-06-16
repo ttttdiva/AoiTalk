@@ -72,6 +72,7 @@ def run_json_tool_loop(
     original_request: str | None = None,
     required_tool_names: set[str] | None = None,
     required_tool_reason: str | None = None,
+    require_all_required_tools: bool = False,
     return_result: bool = False,
 ) -> str | JsonToolLoopResult:
     """Run a text JSON tool loop and return the final user-facing response."""
@@ -92,6 +93,13 @@ def run_json_tool_loop(
     def _has_required_tool() -> bool:
         if not required_tools:
             return True
+        if require_all_required_tools:
+            successful = {
+                call.tool
+                for call in tool_calls
+                if call.tool in required_tools and call.successful
+            }
+            return required_tools.issubset(successful)
         return any(
             call.tool in required_tools and call.successful
             for call in tool_calls
@@ -112,6 +120,7 @@ def run_json_tool_loop(
                             original_request,
                             required_tools,
                             required_tool_reason,
+                            require_all_required_tools,
                         ),
                     }
                 )
@@ -147,6 +156,7 @@ def run_json_tool_loop(
                             original_request,
                             required_tools,
                             required_tool_reason,
+                            require_all_required_tools,
                         ),
                     }
                 )
@@ -311,11 +321,13 @@ def _build_required_tool_prompt(
     original_request: str | None,
     required_tool_names: set[str],
     reason: str | None,
+    require_all: bool = False,
 ) -> str:
     tools = ", ".join(f"`{name}`" for name in sorted(required_tool_names))
+    requirement = "all of these tools" if require_all else "one of these tools"
     lines = [
         "Your previous response did not complete the required tool action.",
-        f"You must call one of these tools before returning a final answer: {tools}.",
+        f"You must call {requirement} before returning a final answer: {tools}.",
     ]
     if reason:
         lines.append(f"Reason: {reason}")

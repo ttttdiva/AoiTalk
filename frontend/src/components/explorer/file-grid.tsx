@@ -244,8 +244,15 @@ interface FileGridProps {
 const DND_MIME = "application/x-explorer-paths";
 
 export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
-  const { browseData, navigate, selectedItems, toggleSelect, refresh } =
-    useExplorer();
+  const {
+    browseData,
+    navigate,
+    selectedItems,
+    focusedItemPath,
+    selectItem,
+    toggleSelect,
+    refresh,
+  } = useExplorer();
   const containerRef = useRef<HTMLDivElement>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
 
@@ -284,12 +291,18 @@ export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
   const handleClick = (
     e: React.MouseEvent,
     item: ExplorerDirectory | ExplorerFile,
-    isDir: boolean,
   ) => {
     if (e.ctrlKey || e.metaKey) {
       toggleSelect(item.path);
       return;
     }
+    selectItem(item.path);
+  };
+
+  const handleDoubleClick = (
+    item: ExplorerDirectory | ExplorerFile,
+    isDir: boolean,
+  ) => {
     if (isDir) {
       navigate(item.path);
     } else {
@@ -366,6 +379,7 @@ export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
       </div>
 
       <div
+        data-explorer-grid="true"
         className="grid gap-1 p-2"
         style={{
           gridTemplateColumns: gridTemplate,
@@ -375,16 +389,20 @@ export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
         {browseData.directories.map((dir) => (
           <div
             key={dir.path}
+            data-explorer-item-path={dir.path}
             draggable
             className={cn(
               "flex cursor-pointer flex-col items-center gap-1 rounded-lg p-2 text-center hover:bg-muted",
               selectedItems.has(dir.path) && "bg-accent",
+              focusedItemPath === dir.path && "ring-2 ring-primary/45",
               dropTarget === dir.path && "ring-2 ring-blue-400 bg-blue-500/10",
             )}
-            onClick={(e) => handleClick(e, dir, true)}
+            onClick={(e) => handleClick(e, dir)}
+            onDoubleClick={() => handleDoubleClick(dir, true)}
             onContextMenu={(e) => {
               e.preventDefault();
               e.stopPropagation();
+              if (!selectedItems.has(dir.path)) selectItem(dir.path);
               onContextMenu(e, dir);
             }}
             onDragStart={(e) => handleDragStart(e, dir)}
@@ -427,15 +445,19 @@ export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
         {browseData.files.map((file) => (
           <div
             key={file.path}
+            data-explorer-item-path={file.path}
             draggable={!isRecordTableFile(file)}
             className={cn(
               "flex cursor-pointer flex-col items-center gap-1 rounded-lg p-2 text-center hover:bg-muted",
               selectedItems.has(file.path) && "bg-accent",
+              focusedItemPath === file.path && "ring-2 ring-primary/45",
             )}
-            onClick={(e) => handleClick(e, file, false)}
+            onClick={(e) => handleClick(e, file)}
+            onDoubleClick={() => handleDoubleClick(file, false)}
             onContextMenu={(e) => {
               e.preventDefault();
               e.stopPropagation();
+              if (!selectedItems.has(file.path)) selectItem(file.path);
               onContextMenu(e, file);
             }}
             onDragStart={(e) => {

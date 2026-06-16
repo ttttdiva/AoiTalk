@@ -1,6 +1,9 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  experimental: {
+    proxyClientMaxBodySize: "100mb",
+  },
   // LAN内の他端末からもアクセスを許可
   allowedDevOrigins: ["127.0.0.1", "localhost", "192.168.*.*", "10.*.*.*", "172.16.*.*", "100.*.*.*"],
   async rewrites() {

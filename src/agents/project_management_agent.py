@@ -26,6 +26,7 @@ _TOOL_ORDER = (
     "list_project_information",
     "render_project_diagram",
     "organize_project_information_from_folder",
+    "configure_project_management_files",
     "upsert_project_info_category",
     "archive_project_info_category",
     "register_project_document",
@@ -100,11 +101,14 @@ Behavior rules:
 - When the user asks to make a DB/table/台帳 from provided content, infer useful columns and rows, then create_record_table or append_record_rows.
 - When the user asks to complete a project DB from WBS, call sync_wbs_tasks with project/project_id when available; by default it syncs WBS.dbtable only and must not create normal task-list items.
 - When the user asks to complete a project information DB, first inspect existing project information, organize project filer documents when a folder/path is available, and include WBS.dbtable sync when a WBS file is configured or WBS/工程表/進捗管理 is mentioned.
+- After organizing project documents, call configure_project_management_files when WBS, issue, risk, or request files were identified but are not yet configured on the project.
 - Include issue-tracker sync when a project has an issue_file, when a newer 課題管理表 exists in the project filer, or when 課題管理表/issue/要確認 is mentioned.
 - Treat project information as durable knowledge about the project itself: overview, assumptions, scope, requirements, decisions, open questions, risks, issues, design details, and verification notes belong in project information; task status and progress belong in tasks.
-- When a user request contains new durable project information, save it with upsert_project_fact even if the primary request is to update a task, WBS, schedule, issue table, or record table. Use source_type="conversation"; use fact_type="decision" for confirmed decisions, "milestone" for delivery/date milestone changes, "risk" for likely but unconfirmed negative impacts, "open_question" for unresolved items, and "fact" otherwise.
+- When the primary request is to create/update/delete a task, WBS, schedule, issue table, or record table, complete that requested operation first. Do not delay the user-facing completion result to reflect incidental conversation-derived project facts; those are handled by deferred project fact reflection.
+- When the user explicitly asks to update project information or facts, or when the request is a deferred project fact reflection request, inspect existing project information with list_project_information before saving unless the relevant facts are already present in the request context. Use source_type="conversation"; use fact_type="decision" for confirmed decisions, "milestone" for delivery/date milestone changes, "risk" for likely but unconfirmed negative impacts, "open_question" for unresolved items, and "fact" otherwise.
+- For project facts, compare the new information with existing facts by meaning, not just exact text. If it duplicates, corrects, supersedes, or refines an existing fact, update that fact using fact_id when available, or the same title/category when identifiable. Create a new fact only when it is genuinely new.
 - Preserve uncertainty from the user's wording. For phrases like "らしい", "見込み", "かもしれない", "probably", or "may", use confidence below 1.0 and word the content as unconfirmed instead of a settled fact.
-- If the new information supersedes an existing project fact, update the existing fact when you can identify it by title/category; do not create duplicate facts with slightly different titles.
+- For deferred project fact reflection requests, do not create/update/delete tasks, schedules, WBS rows, issue tables, or record tables. Only list existing project information and upsert durable project facts that came from the user message.
 - Treat documents as evidence links, not as the subject of project information. Do not create facts that only summarize a document, list input files, or repeat a document title.
 - Treat markdown tables, CSV/Excel rows, equipment lists, connection lists, WBS rows, issue rows, and parameter rows as record table data. Do not put raw table rows into ProjectFact.content.
 - When reflecting task descriptions into project information, read only tasks changed after the project information sync state when possible, then update the sync state after successful reflection.

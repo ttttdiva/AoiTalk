@@ -43,6 +43,25 @@ def looks_like_project_management_mutation_request(text: str) -> bool:
     return bool(project_management_required_mutation_tools(text))
 
 
+def looks_like_deferred_project_fact_request(text: str) -> bool:
+    policy_text = _extract_delegated_user_request(text)
+    normalized = policy_text.casefold()
+    if not normalized.strip():
+        return False
+
+    features = _project_management_fact_features(normalized)
+    if not features["has_durable_project_fact"] or features["is_lookup_only"]:
+        return False
+
+    # Explicit project-information/fact update requests are handled synchronously
+    # by project_management_assistant. This path is for incidental durable facts
+    # that accompany another primary action, or a plain chat turn that introduced
+    # durable project information.
+    return "upsert_project_fact" not in project_management_required_mutation_tools(
+        policy_text
+    )
+
+
 def looks_like_utility_request(text: str) -> bool:
     return _looks_like_utility_request(text)
 
@@ -226,6 +245,21 @@ def project_management_required_mutation_tools(text: str) -> set[str]:
         "スケジュール",
         "カレンダー",
     )
+    explicit_fact_persistence_terms = (
+        "save",
+        "record",
+        "remember",
+        "保存",
+        "残して",
+        "登録",
+        "記録",
+        "覚えて",
+        "メモ",
+        "fact",
+        "facts",
+        "案件情報",
+        "プロジェクト情報",
+    )
 
     has_task = any(term.casefold() in normalized for term in task_terms)
     has_project_info = any(term.casefold() in normalized for term in project_info_terms)
@@ -277,11 +311,147 @@ def project_management_required_mutation_tools(text: str) -> set[str]:
                 "upsert_project_fact",
             }
         )
-    if has_durable_project_fact and not is_lookup_only:
+    if (
+        has_durable_project_fact
+        and not is_lookup_only
+        and any(term.casefold() in normalized for term in explicit_fact_persistence_terms)
+        and not (has_task or has_wbs or has_issue or has_record_table)
+    ):
         tools.add("upsert_project_fact")
     if (has_record_table or has_project_database) and has_create_or_update:
         tools.add("create_record_table")
     return tools
+
+
+def _project_management_fact_features(normalized: str) -> dict[str, bool]:
+    project_info_terms = (
+        "project information",
+        "project info",
+        "案件情報",
+        "プロジェクト情報",
+        "案件情報db",
+        "案件情報DB",
+        "案件db",
+        "案件DB",
+        "重要資料",
+        "決定事項",
+        "要確認",
+        "fact",
+        "facts",
+    )
+    wbs_terms = (
+        "wbs",
+        "WBS",
+        "工程表",
+        "進捗管理",
+    )
+    issue_terms = (
+        "issue",
+        "issues",
+        "issue tracker",
+        "課題",
+        "課題管理",
+        "課題管理表",
+        "要確認",
+        "確認事項",
+    )
+    durable_fact_terms = (
+        "決定",
+        "確定",
+        "決まった",
+        "要確認",
+        "未確認",
+        "見込み",
+        "らしい",
+        "かもしれない",
+        "リスク",
+        "課題",
+        "遅れ",
+        "遅延",
+        "延期",
+        "前倒し",
+        "変更になった",
+        "milestone",
+        "decided",
+        "confirmed",
+        "unconfirmed",
+        "probably",
+        "might",
+        "risk",
+        "delayed",
+        "postponed",
+    )
+    lookup_terms = (
+        "教えて",
+        "見せて",
+        "表示",
+        "一覧",
+        "知りたい",
+        "確認したい",
+        "what",
+        "show",
+        "list",
+        "?",
+        "？",
+    )
+    create_terms = (
+        "add",
+        "create",
+        "register",
+        "save",
+        "record",
+        "追加",
+        "作成",
+        "登録",
+        "保存",
+        "入れて",
+        "残して",
+        "まとめ",
+        "整理",
+        "完成",
+        "作って",
+        "反映",
+        "db化",
+        "DB化",
+    )
+    update_terms = (
+        "update",
+        "edit",
+        "change",
+        "complete",
+        "done",
+        "更新",
+        "変更",
+        "修正",
+        "完了",
+        "完成",
+        "整理",
+        "同期",
+        "反映",
+    )
+
+    has_project_info = any(term.casefold() in normalized for term in project_info_terms)
+    has_wbs = any(term.casefold() in normalized for term in wbs_terms)
+    has_issue = any(term.casefold() in normalized for term in issue_terms)
+    has_project_reference = _contains_any(
+        normalized,
+        ("案件", "プロジェクト", "project"),
+    )
+    has_durable_project_fact = (
+        (has_project_reference or has_project_info or has_wbs or has_issue)
+        and any(term.casefold() in normalized for term in durable_fact_terms)
+    )
+    has_create_or_update = any(
+        term.casefold() in normalized for term in create_terms + update_terms
+    )
+    is_lookup_only = (
+        any(term.casefold() in normalized for term in lookup_terms)
+        and not has_create_or_update
+    )
+    return {
+        "has_durable_project_fact": has_durable_project_fact,
+        "is_lookup_only": is_lookup_only,
+    }
 
 
 def is_memory_search_enabled(config: Any) -> bool:

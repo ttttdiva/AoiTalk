@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from src.llm.sglang_engine import SGLangClient
 from src.llm.tool_policy import (
+    looks_like_deferred_project_fact_request,
     looks_like_project_management_mutation_request,
     project_management_required_mutation_tools,
 )
@@ -119,11 +120,21 @@ def test_project_policy_detects_project_database_mutations():
         assert expected_tools & project_management_required_mutation_tools(text)
 
 
-def test_project_policy_detects_conversation_derived_project_fact():
+def test_project_policy_defers_incidental_conversation_derived_project_fact():
     text = "この案件、機器納期が8月に遅れるらしい。WBSの期日修正して"
 
     assert looks_like_project_management_mutation_request(text)
+    assert "sync_wbs_tasks" in project_management_required_mutation_tools(text)
+    assert "upsert_project_fact" not in project_management_required_mutation_tools(text)
+    assert looks_like_deferred_project_fact_request(text)
+
+
+def test_project_policy_keeps_explicit_project_fact_update_synchronous():
+    text = "この案件情報DBに、機器納期が8月に遅れるらしいことを保存して"
+
+    assert looks_like_project_management_mutation_request(text)
     assert "upsert_project_fact" in project_management_required_mutation_tools(text)
+    assert not looks_like_deferred_project_fact_request(text)
 
 
 def test_project_policy_ignores_delegation_instructions_for_required_tools():

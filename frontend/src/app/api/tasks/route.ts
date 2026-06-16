@@ -27,6 +27,10 @@ import { normalizeTaskStatus } from "@/lib/task-status";
 import { enqueueAutoSyncGoogleCalendarForTask } from "@/lib/server/google-calendar-auto-sync";
 import { computeOccurrencesInRange } from "@/lib/recurrence-preview";
 import {
+  applyOccurrenceDuration,
+  getOccurrenceDurationMs,
+} from "@/lib/recurrence-schedule";
+import {
   correctLikelyTimerStartedAt,
   dbTimestampToLocalDate,
   localDateToDbTimestampDate,
@@ -99,13 +103,6 @@ function serializeTaskListTimestamp(
 
 function occurrenceKey(taskId: string, value: DbTimestampValue): string {
   return `${taskId}:${toLocalTimestampKey(value)}`;
-}
-
-function taskDurationMs(task: Pick<TaskListRow, "startAt" | "endAt">): number {
-  const startAt = dbTimestampToLocalDate(task.startAt);
-  const endAt = dbTimestampToLocalDate(task.endAt);
-  if (!startAt || !endAt) return 0;
-  return Math.max(0, endAt.getTime() - startAt.getTime());
 }
 
 async function resolveTaskListEffectiveOccurrences(
@@ -230,9 +227,13 @@ async function resolveTaskListEffectiveOccurrences(
           ? serializeDbTimestamp(rule.endDate)
           : null,
     };
-    const durationMs = taskDurationMs(task);
+    const durationMs = task.endAt
+      ? getOccurrenceDurationMs(baseStart, baseEnd)
+      : null;
     const occurrenceRangeStart =
-      durationMs > 0 ? new Date(rangeStart.getTime() - durationMs) : rangeStart;
+      durationMs !== null && durationMs > 0
+        ? new Date(rangeStart.getTime() - durationMs)
+        : rangeStart;
     const count = estimateOccurrenceCount(baseStartLocal, rangeEnd, config);
     const upcomingStarts = computeOccurrencesInRange(
       baseStartLocal,
@@ -243,8 +244,7 @@ async function resolveTaskListEffectiveOccurrences(
     );
 
     for (const nextStart of upcomingStarts) {
-      const nextEnd =
-        durationMs > 0 ? new Date(nextStart.getTime() + durationMs) : null;
+      const nextEnd = applyOccurrenceDuration(nextStart, durationMs);
       if (!overlapsRange(nextStart, nextEnd, rangeStart, rangeEnd)) continue;
 
       const nextStartDb = localDateToDbTimestampDate(nextStart) ?? nextStart;

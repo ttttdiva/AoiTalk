@@ -14,6 +14,7 @@ import inspect
 import json
 import os
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -102,9 +103,26 @@ def normalize_result(result: Any) -> Any:
     return result
 
 
+def build_tool_context(tool: Any, payload: str) -> Any:
+    tool_name = str(getattr(tool, "name", "") or "project_management_tool")
+    try:
+        from agents.tool_context import ToolContext
+
+        return ToolContext(
+            context=None,
+            tool_name=tool_name,
+            tool_call_id=f"agent-project-management-{uuid.uuid4()}",
+            tool_arguments=payload,
+        )
+    except (ImportError, TypeError):
+        from agents import RunContextWrapper
+
+        return RunContextWrapper(context=None)
+
+
 async def invoke_tool(tool: Any, args: dict[str, Any]) -> Any:
     payload = json.dumps(args, ensure_ascii=False)
-    result = tool.on_invoke_tool(None, payload)
+    result = tool.on_invoke_tool(build_tool_context(tool, payload), payload)
     if inspect.isawaitable(result):
         result = await result
     return normalize_result(result)

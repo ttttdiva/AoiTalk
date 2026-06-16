@@ -851,6 +851,7 @@ function FilerSidebar() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
+  const [isAdmin, setIsAdmin] = useState(false);
   const [isAbsoluteFilerPath, setIsAbsoluteFilerPath] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -903,28 +904,14 @@ function FilerSidebar() {
       setError(null);
       const useAbsoluteFilerPath = isAbsolutePath(path);
       try {
-        if (useAbsoluteFilerPath) {
-          const data = await filerBrowse(path);
+        if (useAbsoluteFilerPath && isAdmin) {
+          const data = await explorerList(path);
           setIsAbsoluteFilerPath(true);
-          setBrowseData({
-            success: true,
-            current_path: data.current_path,
-            parent_path: data.parent_path,
-            can_go_up: data.can_go_up,
-            directories: data.folders.map((f) => ({
-              name: f.name,
-              path: f.path,
-              item_count: f.item_count,
-            })),
-            files: data.files.map((f) => ({
-              name: f.name,
-              path: f.path,
-              type: f.type,
-              size: f.size,
-            })),
-            total_items: data.folders.length + data.files.length,
-          });
+          setBrowseData(data);
           setCurrentPath(data.current_path);
+        } else if (useAbsoluteFilerPath) {
+          await filerBrowse(path);
+          throw new Error("absolute path access denied");
         } else {
           const data = await explorerList(path);
           let nextData = data;
@@ -956,7 +943,7 @@ function FilerSidebar() {
         setLoading(false);
       }
     },
-    [selectedProjectId],
+    [isAdmin, selectedProjectId],
   );
 
   const navigate = useCallback(
@@ -967,10 +954,22 @@ function FilerSidebar() {
   );
 
   const goUp = useCallback(() => {
-    if (!isAbsoluteFilerPath && contextRootPath && currentPath === contextRootPath)
+    if (
+      !isAdmin &&
+      !isAbsoluteFilerPath &&
+      contextRootPath &&
+      currentPath === contextRootPath
+    )
       return;
     if (browseData?.parent_path != null) navigate(browseData.parent_path);
-  }, [browseData, navigate, currentPath, contextRootPath, isAbsoluteFilerPath]);
+  }, [
+    browseData,
+    navigate,
+    currentPath,
+    contextRootPath,
+    isAbsoluteFilerPath,
+    isAdmin,
+  ]);
 
   const goHome = useCallback(() => {
     navigate(contextRootPath || "");
@@ -1224,6 +1223,7 @@ function FilerSidebar() {
           const data = await res.json();
           if (data.authenticated && data.user) {
             setUserId(data.user.id);
+            setIsAdmin(data.user.role === "admin");
           }
         }
       } catch {

@@ -8,7 +8,6 @@ import base64
 from typing import Any, Dict
 
 from ..core import tool as function_tool
-from ..external_llm_permission import check_permission_sync
 
 from .file_explorer_service import (
     list_directory,
@@ -22,6 +21,12 @@ from .file_explorer_service import (
     get_preview,
     inspect_workspace_tree as service_inspect_workspace_tree,
 )
+
+
+def _check_permission_sync(tool_name: str, args: Dict[str, Any]) -> bool:
+    from ..external_llm_permission import check_permission_sync
+
+    return check_permission_sync(tool_name, args)
 
 
 @function_tool
@@ -94,7 +99,7 @@ def create_workspace_directory(path: str, name: str) -> Dict[str, Any]:
         Dict[str, Any]: 作成結果
     """
     print(f"[Tool] create_workspace_directory が呼び出されました: path={path}, name={name}")
-    if not check_permission_sync(
+    if not _check_permission_sync(
         "create_workspace_directory",
         {"path": path, "name": name},
     ):
@@ -117,7 +122,7 @@ def upload_workspace_file(path: str, filename: str, content_base64: str) -> Dict
         Dict[str, Any]: アップロード結果
     """
     print(f"[Tool] upload_workspace_file が呼び出されました: path={path}, filename={filename}")
-    if not check_permission_sync(
+    if not _check_permission_sync(
         "upload_workspace_file",
         {"path": path, "filename": filename},
     ):
@@ -158,7 +163,7 @@ def delete_workspace_item(path: str) -> Dict[str, Any]:
         Dict[str, Any]: 削除結果
     """
     print(f"[Tool] delete_workspace_item が呼び出されました: path={path}")
-    if not check_permission_sync("delete_workspace_item", {"path": path}):
+    if not _check_permission_sync("delete_workspace_item", {"path": path}):
         return {"success": False, "error": "ユーザーによって削除がキャンセルされました。"}
     return delete_item(path)
 
@@ -175,7 +180,7 @@ def move_workspace_item(src: str, dest: str) -> Dict[str, Any]:
         Dict[str, Any]: 移動結果
     """
     print(f"[Tool] move_workspace_item が呼び出されました: src={src}, dest={dest}")
-    if not check_permission_sync("move_workspace_item", {"src": src, "dest": dest}):
+    if not _check_permission_sync("move_workspace_item", {"src": src, "dest": dest}):
         return {"success": False, "error": "ユーザーによって移動がキャンセルされました。"}
     return move_item(src, dest)
 
