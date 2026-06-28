@@ -87,17 +87,22 @@ class ConversationMemoryManager:
                 self._initialized = True
                 print("[ConversationMemoryManager] Memory system initialized")
                 
-                # Always preload embedding model if search is enabled
-                if hasattr(self.config, 'enable_search') and self.config.enable_search:
+                # Search is enabled by default, but model preload must stay opt-in
+                # so startup and first response are not slowed down.
+                if (
+                    hasattr(self.config, 'enable_search')
+                    and self.config.enable_search
+                    and getattr(self.config, 'preload_embedding_model', False)
+                ):
                     try:
                         from .embedding import get_embedding_manager
                         embedding_manager = get_embedding_manager(self.config.embedding_model)
                         await embedding_manager.preload_model()
-                        print("[ConversationMemoryManager] Embedding model preloaded (enable_search: true)")
+                        print("[ConversationMemoryManager] Embedding model preloaded")
                     except Exception as e:
                         print(f"[ConversationMemoryManager] Failed to preload embedding model: {e}")
                 else:
-                    print("[ConversationMemoryManager] Memory search is disabled, skipping embedding model loading")
+                    print("[ConversationMemoryManager] Memory search preload skipped")
             else:
                 print("[ConversationMemoryManager] Database initialization failed, continuing without memory")
                 self._initialized = False
@@ -224,7 +229,8 @@ class ConversationMemoryManager:
                 role=role,
                 content=content,
                 metadata=metadata,
-                success=success
+                success=success,
+                llm_client=llm_client,
             )
         
         # No session_id provided, use get_or_create_session
@@ -244,23 +250,25 @@ class ConversationMemoryManager:
         message = await self.repository.add_message(
             str(session.id), role, content, metadata
         )
+        updated_session = await self.repository.get_session_by_id(session.id)
+        summary_session = updated_session or session
         
         # Log to history if history logging is enabled
         if self.config.enable_history_logging:
             await self.history_service.log_message(
                 user_id=user_id,
-                session_id=session.id,
-                character_name=character_name,
+                session_id=summary_session.id,
+                character_name=summary_session.character_name,
                 role=role,
                 content=content,
                 metadata=metadata
             )
-        
+
         # Check if summarization is needed
-        if session.message_count >= self.config.max_active_messages:
+        if (summary_session.message_count or 0) >= self.config.max_active_messages:
             # Start summarization in background
-            await self._trigger_summarization(session, llm_client)
-        
+            await self._trigger_summarization(summary_session, llm_client)
+
         return message
     
     async def add_message_to_session(self, session_id: str, role: str, content: str,
@@ -269,7 +277,8 @@ class ConversationMemoryManager:
                                      branch_from_message_id: Optional[str] = None,
                                      sender_type: Optional[str] = None,
                                      sender_id: Optional[str] = None,
-                                     sender_display_name: Optional[str] = None) -> ConversationMessage:
+                                     sender_display_name: Optional[str] = None,
+                                     llm_client = None) -> ConversationMessage:
         """Add message to a specific conversation session by ID
         
         Args:
@@ -307,52 +316,41 @@ class ConversationMemoryManager:
             sender_display_name=sender_display_name,
         )
         
-        # Get session info for history logging
+        session_info = None
+        # Get session info once for history logging, background indexing and summarization.
         try:
-            from .database import get_db_session
-            from .models import ConversationSession
-            from sqlalchemy import select
-            
-            async with await get_db_session() as db_session:
-                result = await db_session.execute(
-                    select(ConversationSession).where(ConversationSession.id == session_id)
+            session_info = await self.repository.get_session_by_id(session_id)
+            if session_info and self.config.enable_history_logging:
+                await self.history_service.log_message(
+                    user_id=session_info.user_id,
+                    session_id=session_info.id,
+                    character_name=session_info.character_name,
+                    role=role,
+                    content=content,
+                    metadata=metadata
                 )
-                session = result.scalar_one_or_none()
-                
-                if session and self.config.enable_history_logging:
-                    await self.history_service.log_message(
-                        user_id=session.user_id,
-                        session_id=session.id,
-                        character_name=session.character_name,
-                        role=role,
-                        content=content,
-                        metadata=metadata
-                    )
         except Exception as e:
             print(f"[ConversationMemoryManager] Warning: Could not log to history: {e}")
-        
+
         # Index message in cross-session memory for future retrieval (fire-and-forget)
-        if message and self.config.enable_search:
+        if message and self.config.enable_search and session_info:
+            message_id = str(message.id)
+            message_created_at = message.created_at
+            index_user_id = session_info.user_id
+            index_character_name = session_info.character_name
+
             async def _index_in_background():
                 try:
                     cross_session_memory = get_cross_session_memory()
-                    # Get session info for indexing
-                    async with await get_db_session() as db_session:
-                        result = await db_session.execute(
-                            select(ConversationSession).where(ConversationSession.id == session_id)
-                        )
-                        session = result.scalar_one_or_none()
-                        
-                        if session:
-                            await cross_session_memory.index_message(
-                                message_id=str(message.id),
-                                session_id=session_id,
-                                user_id=session.user_id,
-                                role=role,
-                                content=content,
-                                character_name=session.character_name,
-                                timestamp=message.created_at
-                            )
+                    await cross_session_memory.index_message(
+                        message_id=message_id,
+                        session_id=session_id,
+                        user_id=index_user_id,
+                        role=role,
+                        content=content,
+                        character_name=index_character_name,
+                        timestamp=message_created_at,
+                    )
                 except Exception as e:
                     # Indexing failure should not affect main flow
                     print(f"[ConversationMemoryManager] Warning: Cross-session indexing failed: {e}")
@@ -360,7 +358,10 @@ class ConversationMemoryManager:
             # Fire-and-forget: don't await, let it run in background
             import asyncio
             asyncio.create_task(_index_in_background())
-        
+
+        if session_info and (session_info.message_count or 0) >= self.config.max_active_messages:
+            await self._trigger_summarization(session_info, llm_client)
+
         return message
     
     def _should_save_message(self, role: str, success: bool) -> bool:
@@ -420,29 +421,17 @@ class ConversationMemoryManager:
             session: Conversation session
             llm_client: LLM client for summarization
         """
-        # Temporarily disable summarization to avoid cleanup errors
-        # TODO: Re-enable with proper async task management
-        return
-        
         # Skip if cleanup is in progress
         if self._cleanup_done:
             return
-            
-        session_key = f"{session.user_id}:{session.character_name}"
-        
-        # Cancel existing summarization task if running
+
+        session_key = str(session.id)
+
+        # Do not block the response path waiting for an existing summary task.
         if session_key in self._summarization_tasks:
             existing_task = self._summarization_tasks[session_key]
             if not existing_task.done():
-                try:
-                    existing_task.cancel()
-                    # Wait briefly for cancellation to complete
-                    try:
-                        await asyncio.wait_for(existing_task, timeout=0.1)
-                    except (asyncio.CancelledError, asyncio.TimeoutError):
-                        pass
-                except Exception:
-                    pass
+                return
         
         # Start new summarization task with proper error handling
         try:
@@ -463,7 +452,7 @@ class ConversationMemoryManager:
             session: Conversation session
             llm_client: LLM client for summarization
         """
-        session_key = f"{session.user_id}:{session.character_name}"
+        session_key = str(session.id)
         
         try:
             await self._summarize_session(session, llm_client)
@@ -527,12 +516,14 @@ class ConversationMemoryManager:
             end_time=end_time,
             metadata={"summarization_config": self.config.__dict__}
         )
-        
+
+        await self.repository.update_session_summary(session.id, summary)
+
         # Delete old messages (keep recent ones)
         deleted_count = await self.repository.delete_old_messages(
             session.id, self.config.summary_overlap
         )
-        
+
         print(f"[ConversationMemoryManager] Summarization complete:")
         print(f"  - Archive ID: {archive.id}")
         print(f"  - Messages summarized: {len(messages_to_summarize)}")

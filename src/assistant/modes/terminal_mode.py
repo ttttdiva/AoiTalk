@@ -1157,7 +1157,7 @@ class TerminalMode(BaseAssistant):
                     web_interface=self.web_interface,
                     session_id=session_id,
                     chat_persistence=chat_persistence,
-                    config=self.config,
+                    config=getattr(self, "config", None),
                     log_prefix="TerminalMode",
                 )
             except Exception as e:
@@ -1320,7 +1320,7 @@ class TerminalMode(BaseAssistant):
                         used_streaming = True
                         try:
                             event_data = _enrich_agent_run_event_payload(
-                                self.config,
+                                getattr(self, "config", None),
                                 dict(data),
                             )
                             if session_id:

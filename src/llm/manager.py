@@ -201,9 +201,11 @@ class AgentLLMClient:
         if self._memory_enabled:
             memory_config = MemoryConfig()
             if config:
-                memory_config.llm_provider = get_config_value("llm_provider", "gemini")
+                memory_config.llm_provider = get_config_value(
+                    "llm_provider", memory_config.llm_provider
+                )
                 memory_config.llm_model = get_config_value(
-                    "llm_model", "gemini-3-flash-preview"
+                    "llm_model", memory_config.llm_model
                 )
                 memory_settings = get_config_value("memory", {})
                 memory_config.embedding_model = memory_settings.get(
@@ -1489,6 +1491,39 @@ Updated summary:
         except Exception as e:
             print(f"[AgentLLMClient] Error generating summary: {e}")
             raise e
+
+    async def generate_memory_extraction_async(
+        self,
+        prompt: str,
+        *,
+        system_prompt: str,
+    ) -> str:
+        """Generate Dreaming extraction JSON without mutating chat history or using tools."""
+        messages = [
+            {"role": "system", "content": system_prompt or ""},
+            {"role": "user", "content": prompt or ""},
+        ]
+        kwargs: Dict[str, Any] = {
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": 1200,
+        }
+        try:
+            response = await self._openai_client.chat.completions.create(**kwargs)
+        except Exception as first_error:
+            # Some OpenAI-compatible providers reject optional sampling params.
+            try:
+                response = await self._openai_client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                )
+            except Exception:
+                print(f"[AgentLLMClient] Dreamingメモリ抽出に失敗: {first_error}")
+                raise first_error
+        choice = response.choices[0]
+        message = choice.message
+        return str(getattr(message, "content", "") or "")
 
     async def generate_response_async(
         self,

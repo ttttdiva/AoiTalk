@@ -136,8 +136,12 @@ class CLILLMClient:
         if self._memory_enabled:
             try:
                 memory_config = MemoryConfig()
-                memory_config.llm_provider = get_config_value('llm_provider', 'gemini')
-                memory_config.llm_model = get_config_value('llm_model', 'gemini-3-flash-preview')
+                memory_config.llm_provider = get_config_value(
+                    'llm_provider', memory_config.llm_provider
+                )
+                memory_config.llm_model = get_config_value(
+                    'llm_model', memory_config.llm_model
+                )
                 memory_settings = get_config_value('memory', {})
                 memory_config.embedding_model = memory_settings.get(
                     'embedding_model', memory_config.embedding_model

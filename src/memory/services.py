@@ -8,7 +8,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from .config import MemoryConfig
 from .repository import ConversationRepository
 from .models import ConversationMessage, ConversationArchive
-from .embedding import get_embedding_manager
+from .cross_session_memory import get_cross_session_memory
 import os
 
 # pgvector search removed - using Qdrant RAG for vector search instead
@@ -237,14 +237,7 @@ class MemorySearchService:
         # Pass enable_search to repository to avoid loading embedding model when search is disabled
         self.repository = ConversationRepository(enable_search=config.enable_search)
         
-        # Only initialize embedding manager if search is enabled
-        # Note: Vector search now uses Qdrant RAG instead of pgvector
-        if hasattr(config, 'enable_search') and config.enable_search:
-            self.embedding_manager = get_embedding_manager(config.embedding_model)
-        else:
-            self.embedding_manager = None
-        self.search_engine = None  # pgvector search removed - use Qdrant RAG instead
-    
+
     async def search_memory(self, user_id: str, character_name: str, query: str,
                           time_range: str = "all", max_results: Optional[int] = None) -> List[Dict[str, Any]]:
         """Search conversation memory
@@ -266,55 +259,35 @@ class MemorySearchService:
         if not hasattr(self.config, 'enable_search') or not self.config.enable_search:
             print("[MemorySearchService] Memory search is disabled")
             return []
-        
-        if not self.search_engine:
-            print("[MemorySearchService] Search engine not initialized (search disabled)")
-            return []
-        
+
         max_results = max_results or self.config.max_search_results
-        
+
         try:
-            # Use PostgreSQL search
-            from .database import get_database_manager
-            db_manager = get_database_manager()
-            async with db_manager.SessionLocal() as session:
-                # Search messages
-                message_results = await self.search_engine.search_messages(
-                    session, query, user_id, max_results, time_range, self.config.similarity_threshold
-                )
-                
-                # Search archives
-                archive_results = await self.search_engine.search_archives(
-                    session, query, user_id, max_results, time_range, self.config.similarity_threshold
-                )
-                
-                # Combine and format results
-                all_results = []
-                
-                for msg in message_results:
-                    all_results.append({
-                        "type": "active_message",
-                        "content": msg["content"],
-                        "role": msg["role"],
-                        "relevance_score": msg["similarity"],
-                        "timestamp": msg["created_at"],
-                        "character_name": msg.get("character_name", character_name)
-                    })
-                
-                for archive in archive_results:
-                    all_results.append({
-                        "type": "archived_summary",
-                        "content": archive["summary"],
-                        "relevance_score": archive["similarity"],
-                        "timestamp": archive["end_time"],
-                        "message_count": archive["message_count"],
-                        "character_name": archive["character_name"]
-                    })
-                
-                # Sort by relevance and return top results
-                all_results.sort(key=lambda x: x['relevance_score'], reverse=True)
-                return all_results[:max_results]
-        
+            cross_session_memory = get_cross_session_memory({
+                "min_relevance_score": self.config.similarity_threshold,
+                "max_results": max_results,
+            })
+            results = await asyncio.wait_for(
+                cross_session_memory.search_relevant_conversations(
+                    user_id=user_id,
+                    query=query,
+                    limit=max_results,
+                ),
+                timeout=self.config.search_timeout,
+            )
+            return [
+                {
+                    "type": "active_message",
+                    "content": result.get("content", ""),
+                    "role": result.get("role"),
+                    "relevance_score": result.get("relevance_score", 0.0),
+                    "timestamp": result.get("timestamp"),
+                    "session_id": result.get("session_id"),
+                    "character_name": result.get("character_name") or character_name,
+                }
+                for result in results
+            ]
+
         except Exception as e:
             print(f"[MemorySearchService] Search failed: {e}")
             return []
@@ -338,34 +311,7 @@ class MemorySearchService:
         Returns:
             List[Dict[str, Any]]: Active message search results
         """
-        # Get active session
-        session = await self.repository.get_active_session(user_id, character_name)
-        if not session:
-            return []
-        
-        # Get session messages
-        messages = await self.repository.get_session_messages(session.id)
-        
-        results = []
-        for message in messages:
-            if message.embedding:
-                msg_embedding = self.embedding_manager.deserialize_embedding(message.embedding)
-                if msg_embedding:
-                    similarity = self.embedding_manager.calculate_similarity(
-                        query_embedding, msg_embedding
-                    )
-                    
-                    if similarity >= self.config.similarity_threshold:
-                        results.append({
-                            'type': 'active_message',
-                            'content': message.content,
-                            'role': message.role,
-                            'timestamp': message.created_at.isoformat(),
-                            'relevance_score': similarity,
-                            'metadata': message.message_metadata
-                        })
-        
-        return results
+        return []
     
     async def _search_archives(self, user_id: str, character_name: str,
                              query_embedding: List[float]) -> List[Dict[str, Any]]:

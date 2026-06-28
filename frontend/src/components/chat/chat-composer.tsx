@@ -501,6 +501,7 @@ export function ChatComposer({
   const [generationProfileMenuOpen, setGenerationProfileMenuOpen] =
     useState(false);
   const [llmModeMenuOpen, setLlmModeMenuOpen] = useState(false);
+  const [toolsMenuOpen, setToolsMenuOpen] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const slashMenuRef = useRef<HTMLDivElement>(null);
@@ -613,6 +614,10 @@ export function ChatComposer({
         setLlmModeMenuOpen(true);
         return;
       }
+      if (action === "tools_menu") {
+        if (!disabled && !isSteeringMode) setToolsMenuOpen(true);
+        return;
+      }
 
       if (webSearchActive) {
         setActiveCommand(null);
@@ -630,6 +635,8 @@ export function ChatComposer({
     onProjectContextToggle,
     projectContextEnabled,
     searchCommand,
+    disabled,
+    isSteeringMode,
     webSearchActive,
   ]);
 
@@ -773,6 +780,11 @@ export function ChatComposer({
     },
     [searchCommand, webSearchActive],
   );
+
+  const handleToolsMenuOpenChange = useCallback((open: boolean) => {
+    setToolsMenuOpen(open);
+    if (!open) requestAnimationFrame(() => textareaRef.current?.focus());
+  }, []);
 
   const applySlashMenuItem = useCallback(
     (item: SlashMenuItem) => {
@@ -1097,7 +1109,10 @@ export function ChatComposer({
             />
           )}
 
-          <DropdownMenu>
+          <DropdownMenu
+            open={toolsMenuOpen}
+            onOpenChange={handleToolsMenuOpenChange}
+          >
             <DropdownMenuTrigger
               render={
                 <Button
@@ -1110,7 +1125,7 @@ export function ChatComposer({
                       "border border-primary/40 text-primary shadow-sm",
                   )}
                   disabled={disabled || isSteeringMode}
-                  title="ツール"
+                  title="ツール (Ctrl+.)"
                   aria-label="ツール"
                   aria-pressed={toolsMenuActive}
                 />

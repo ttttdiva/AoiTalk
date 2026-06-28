@@ -53,7 +53,7 @@ search:
 memory:
   enabled: true
   enable_history_logging: true
-  enable_search: false
+  enable_search: true
   auto_cleanup_enabled: true
   embedding_model: all-MiniLM-L6-v2
   history_batch_size: 100

@@ -31,7 +31,6 @@ export function MemorySection() {
   const [isNew, setIsNew] = useState(false);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState<string | null>(null);
-  const [toggling, setToggling] = useState<string | null>(null);
 
   // フォーム
   const [formContent, setFormContent] = useState("");
@@ -127,23 +126,6 @@ export function MemorySection() {
   }, [fetchMemories]);
 
   // トグル
-  const handleToggleEnabled = useCallback(
-    async (mem: DreamingMemory) => {
-      setToggling(mem.id);
-      try {
-        await memoryApi.toggle(mem.id);
-        await fetchMemories();
-      } catch {
-        // ignore
-      } finally {
-        setToggling(null);
-      }
-    },
-    [fetchMemories],
-  );
-
-  const activeCount = memories.filter((m) => m.status === "active").length;
-
   return (
     <>
       <Card size="sm">
@@ -157,7 +139,7 @@ export function MemorySection() {
               Dreamingメモリ
               {memories.length > 0 && (
                 <Badge variant="secondary" className="text-[10px]">
-                  {activeCount}/{memories.length}件
+                  {memories.length}件
                 </Badge>
               )}
             </span>
@@ -215,9 +197,7 @@ export function MemorySection() {
                 {memories.map((mem) => (
                   <div
                     key={mem.id}
-                    className={`flex items-start justify-between gap-2 rounded-md border p-2.5 ${
-                      mem.status !== "active" ? "opacity-50" : ""
-                    }`}
+                    className="flex items-start justify-between gap-2 rounded-md border p-2.5"
                   >
                     <div className="flex-1 min-w-0">
                       <p className="text-sm leading-snug break-words">
@@ -248,24 +228,6 @@ export function MemorySection() {
 
                     <div className="flex gap-0.5 shrink-0">
                       {/* トグル */}
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="size-7 p-0"
-                        onClick={() => handleToggleEnabled(mem)}
-                      >
-                        {toggling === mem.id ? (
-                          <Loader2 className="size-3 animate-spin" />
-                        ) : (
-                          <span
-                            className={`size-3 rounded-full border-2 ${
-                              mem.status === "active"
-                                ? "bg-green-500 border-green-500"
-                                : "border-muted-foreground"
-                            }`}
-                          />
-                        )}
-                      </Button>
                       {/* 編集 */}
                       <Button
                         variant="ghost"

@@ -330,10 +330,7 @@ export interface DreamingMemory {
 }
 
 export const memoryApi = {
-  list: (activeOnly = false) =>
-    get<{ success: boolean; memories: DreamingMemory[] }>(
-      `/memories${activeOnly ? "?active_only=true" : ""}`,
-    ),
+  list: () => get<{ success: boolean; memories: DreamingMemory[] }>("/memories"),
 
   create: (data: { content: string; memory_type?: string; title?: string }) =>
     post<{ success: boolean; memory: DreamingMemory }>("/memories", data),
@@ -342,9 +339,6 @@ export const memoryApi = {
     patch<{ success: boolean; memory: DreamingMemory }>(`/memories/${id}`, data),
 
   delete: (id: string) => del<void>(`/memories/${id}`),
-
-  toggle: (id: string) =>
-    post<{ success: boolean; memory: DreamingMemory }>(`/memories/${id}/toggle`),
 
   deleteAll: () => del<void>("/memories/all"),
 };

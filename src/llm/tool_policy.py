@@ -302,6 +302,10 @@ def looks_like_search_request(text: str) -> bool:
     return _looks_like_search_request(text)
 
 
+def looks_like_memory_request(text: str) -> bool:
+    return _looks_like_memory_request(text)
+
+
 def looks_like_bare_search_followup_request(text: str) -> bool:
     return _looks_like_bare_search_followup_request(text)
 
@@ -845,6 +849,10 @@ def _looks_like_memory_request(text: str) -> bool:
             "記憶",
             "会話履歴",
             "話した",
+            "言った",
+            "remember",
+            "previously mentioned",
+            "told you",
         ),
     )
 

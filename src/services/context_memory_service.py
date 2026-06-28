@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 
 from ..memory.database import get_db_session
 from ..memory.models import ContextMemory
@@ -25,10 +25,26 @@ def _coerce_uuid(value: Optional[str]) -> Optional[uuid.UUID]:
         return None
 
 
+_ASCII_WORD_RE = re.compile(r"[A-Za-z0-9_\-]{3,}")
+_CJK_RUN_RE = re.compile(r"[ぁ-んァ-ン一-龥]{2,}")
+
+
 def _keywords(text: Optional[str]) -> set[str]:
     if not text:
         return set()
-    return {part.casefold() for part in re.findall(r"[\w\-]{3,}", text)}
+    raw = str(text)
+    terms = {part.casefold() for part in _ASCII_WORD_RE.findall(raw)}
+    for run in _CJK_RUN_RE.findall(raw):
+        clipped = run[:64]
+        terms.add(clipped.casefold())
+        for size in (2, 3, 4):
+            if len(clipped) < size:
+                continue
+            for index in range(0, len(clipped) - size + 1):
+                terms.add(clipped[index : index + size].casefold())
+                if len(terms) >= 120:
+                    return terms
+    return terms
 
 
 class ContextMemoryService:
@@ -190,22 +206,49 @@ class ContextMemoryService:
         async with await get_db_session() as session:
             conditions = [
                 ContextMemory.scope_type == "global",
-                ContextMemory.user_id == str(user_id),
+                and_(
+                    ContextMemory.scope_type == "user",
+                    ContextMemory.user_id == str(user_id),
+                ),
             ]
             if project_uuid:
-                conditions.append(ContextMemory.project_id == project_uuid)
+                conditions.append(
+                    and_(
+                        ContextMemory.project_id == project_uuid,
+                        or_(
+                            ContextMemory.user_id.is_(None),
+                            ContextMemory.user_id == str(user_id),
+                        ),
+                    )
+                )
                 conditions.append(
                     (ContextMemory.scope_type == "project")
                     & (ContextMemory.scope_id == str(project_id))
                 )
             if task_uuid:
-                conditions.append(ContextMemory.task_id == task_uuid)
+                conditions.append(
+                    and_(
+                        ContextMemory.task_id == task_uuid,
+                        or_(
+                            ContextMemory.user_id.is_(None),
+                            ContextMemory.user_id == str(user_id),
+                        ),
+                    )
+                )
                 conditions.append(
                     (ContextMemory.scope_type == "task")
                     & (ContextMemory.scope_id == str(task_id))
                 )
             if session_uuid:
-                conditions.append(ContextMemory.session_id == session_uuid)
+                conditions.append(
+                    and_(
+                        ContextMemory.session_id == session_uuid,
+                        or_(
+                            ContextMemory.user_id.is_(None),
+                            ContextMemory.user_id == str(user_id),
+                        ),
+                    )
+                )
                 conditions.append(
                     (ContextMemory.scope_type == "session")
                     & (ContextMemory.scope_id == str(session_id))

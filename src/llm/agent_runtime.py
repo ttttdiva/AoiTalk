@@ -31,6 +31,7 @@ from .tool_policy import (
     looks_like_media_request,
     looks_like_project_management_request,
     project_progress_review_active,
+    looks_like_memory_request,
     looks_like_search_request,
     looks_like_utility_request,
 )
@@ -89,6 +90,8 @@ DIRECT_SEARCH_TOOL_HINT_NAMES: tuple[str, ...] = (
     "knowledge_search",
     "search_memory",
 )
+
+DIRECT_MEMORY_TOOL_HINT_NAMES: tuple[str, ...] = ("search_memory",)
 
 DIRECT_FILESYSTEM_TOOL_HINT_NAMES: tuple[str, ...] = (
     "find_workspace_items",
@@ -293,6 +296,7 @@ def build_tool_hint_context_sync(
         matched_rules.append(rule)
 
     direct_search_hint = _should_hint_direct_search_tools(user_input, registry)
+    direct_memory_hint = _should_hint_direct_memory_tools(user_input, registry)
     direct_filesystem_hint = _should_hint_direct_filesystem_tools(user_input, registry)
     direct_project_hint = _should_hint_direct_project_tools(user_input, registry)
     project_progress_review_hint = _should_hint_project_progress_review(
@@ -305,6 +309,7 @@ def build_tool_hint_context_sync(
         policy=policy,
         max_result_chars=max_result_chars,
         direct_search_hint=direct_search_hint,
+        direct_memory_hint=direct_memory_hint,
         direct_filesystem_hint=direct_filesystem_hint,
         direct_project_hint=direct_project_hint,
         project_progress_review_hint=project_progress_review_hint,
@@ -330,6 +335,7 @@ async def build_tool_hint_context_async(
         matched_rules.append(rule)
 
     direct_search_hint = _should_hint_direct_search_tools(user_input, registry)
+    direct_memory_hint = _should_hint_direct_memory_tools(user_input, registry)
     direct_filesystem_hint = _should_hint_direct_filesystem_tools(user_input, registry)
     direct_project_hint = _should_hint_direct_project_tools(user_input, registry)
     project_progress_review_hint = _should_hint_project_progress_review(
@@ -342,6 +348,7 @@ async def build_tool_hint_context_async(
         policy=policy,
         max_result_chars=max_result_chars,
         direct_search_hint=direct_search_hint,
+        direct_memory_hint=direct_memory_hint,
         direct_filesystem_hint=direct_filesystem_hint,
         direct_project_hint=direct_project_hint,
         project_progress_review_hint=project_progress_review_hint,
@@ -679,6 +686,12 @@ def _should_hint_direct_search_tools(user_input: str, registry: ToolRegistry) ->
     )
 
 
+def _should_hint_direct_memory_tools(user_input: str, registry: ToolRegistry) -> bool:
+    return looks_like_memory_request(user_input) and any(
+        tool_name in registry for tool_name in DIRECT_MEMORY_TOOL_HINT_NAMES
+    )
+
+
 def _should_hint_direct_filesystem_tools(user_input: str, registry: ToolRegistry) -> bool:
     return looks_like_filesystem_request(user_input) and any(
         tool_name in registry for tool_name in DIRECT_FILESYSTEM_TOOL_HINT_NAMES
@@ -704,6 +717,7 @@ def _build_context_block(
     policy: GenerationPolicy,
     max_result_chars: int = DEFAULT_TOOL_HINT_CONTEXT_CHARS,
     direct_search_hint: bool = False,
+    direct_memory_hint: bool = False,
     direct_filesystem_hint: bool = False,
     direct_project_hint: bool = False,
     project_progress_review_hint: bool = False,
@@ -711,6 +725,7 @@ def _build_context_block(
     if (
         not rules
         and not direct_search_hint
+        and not direct_memory_hint
         and not direct_filesystem_hint
         and not direct_project_hint
         and not project_progress_review_hint
@@ -721,6 +736,11 @@ def _build_context_block(
         tool_lines.append(
             "- 公開Webや最新情報は `web_search`、X/Twitterは `grok_x_search`、"
             "Knowledge Sourceは `knowledge_search`、過去会話は `search_memory` を使って確認してください。"
+        )
+    if direct_memory_hint:
+        tool_lines.append(
+            "- 過去会話、以前話した内容、ユーザーが覚えているか確認している内容は "
+            "`search_memory` を使って確認してください。"
         )
     if direct_filesystem_hint:
         tool_lines.append(
@@ -755,6 +775,8 @@ def _build_context_block(
     matched_tool_names = [rule.tool_name for rule in rules]
     if direct_search_hint:
         matched_tool_names.append("search_tools")
+    if direct_memory_hint:
+        matched_tool_names.append("memory_tools")
     if direct_filesystem_hint:
         matched_tool_names.append("filesystem_tools")
     if direct_project_hint:

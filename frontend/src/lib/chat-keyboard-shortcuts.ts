@@ -2,6 +2,7 @@ export type ChatComposerShortcutAction =
   | "project_context"
   | "generation_profile_menu"
   | "llm_mode_menu"
+  | "tools_menu"
   | "web_search";
 
 export type KeyboardShortcutEvent = Pick<
@@ -19,6 +20,7 @@ export const CHAT_SHORTCUT_HELP_ITEMS: ShortcutHelpItem[] = [
   { keys: ["Ctrl", "J"], description: "チャット入力欄にフォーカス" },
   { keys: ["Ctrl", "F"], description: "会話検索を開く" },
   { keys: ["Ctrl", "M"], description: "動作モードメニューを開く" },
+  { keys: ["Ctrl", "."], description: "ツールメニューを開く" },
   {
     keys: ["Ctrl", "Shift", "M"],
     description: "LLM mode/effortメニューを開く",
@@ -77,6 +79,16 @@ export function getChatComposerShortcutAction(
     key === "m"
   ) {
     return "generation_profile_menu";
+  }
+
+  if (
+    event.ctrlKey &&
+    !event.shiftKey &&
+    !event.altKey &&
+    !event.metaKey &&
+    key === "."
+  ) {
+    return "tools_menu";
   }
 
   if (

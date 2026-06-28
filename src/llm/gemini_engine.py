@@ -84,8 +84,12 @@ class GeminiLLMClient:
             memory_config = MemoryConfig()
             if config:
                 memory_settings = config.get("memory", {})
-                memory_config.llm_provider = config.get('llm_provider', 'gemini')
-                memory_config.llm_model = config.get('llm_model', 'gemini-3-flash-preview')
+                memory_config.llm_provider = config.get(
+                    'llm_provider', memory_config.llm_provider
+                )
+                memory_config.llm_model = config.get(
+                    'llm_model', memory_config.llm_model
+                )
                 memory_config.enable_search = memory_settings.get("enable_search", False)
                 memory_config.preload_embedding_model = memory_settings.get(
                     "preload_embedding_model", False
@@ -182,6 +186,7 @@ class GeminiLLMClient:
             custom_instructions=get_user_custom_instructions_sync(
                 self._get_session_user_id()
             ),
+            include_static_tool_reference=False,
         )
 
     def _build_effective_system_prompt(self, scenario_context=None) -> str:

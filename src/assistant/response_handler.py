@@ -269,6 +269,7 @@ class ResponseHandler:
                     response,
                     user_id=dreaming_context["user_id"],
                     session_id=dreaming_context["session_id"],
+                    llm_client=self.llm_client,
                 )
             )
             self._schedule_deferred_project_fact_reflection(text, response)
@@ -679,6 +680,7 @@ class ResponseHandler:
         *,
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        llm_client=None,
     ):
         """会話からDreamingメモリを自動抽出して保存する（バックグラウンドタスク）。
 
@@ -699,22 +701,34 @@ class ResponseHandler:
                 user_id = self._capture_dreaming_memory_context()["user_id"]
 
             # 既存メモリを取得（重複排除用）
-            existing = await list_memories(user_id, active_only=True)
-            existing_contents = [m["content"] for m in existing]
+            existing = await list_memories(user_id)
 
             # LLMでDreamingメモリ候補を抽出
             extractor = DreamingMemoryExtractor()
             new_memories = await extractor.extract(
-                user_input, assistant_response, existing_contents
+                user_input,
+                assistant_response,
+                existing,
+                llm_client=llm_client or self.llm_client,
             )
 
             if new_memories:
                 if session_id is None:
                     session_id = self._capture_dreaming_memory_context()["session_id"]
                 metadata = {"session_id": session_id} if session_id else {}
-                created = await bulk_create_memories(user_id, new_memories, metadata=metadata)
+                created = await bulk_create_memories(
+                    user_id,
+                    new_memories,
+                    metadata=metadata,
+                    user_input=user_input,
+                )
                 if created:
                     print(f"[DreamingMemory] {len(created)}件の新規メモリを抽出: {created}")
+                else:
+                    print(
+                        "[DreamingMemory] 抽出候補はありましたが保存対象は0件でした "
+                        f"(user_id={user_id}, session_id={session_id}, candidates={len(new_memories)})"
+                    )
         except Exception as e:
             # メモリ処理エラーはメイン応答フローに影響させない
             print(f"[DreamingMemory] 抽出エラー（無視）: {e}")

@@ -1302,7 +1302,6 @@ def create_ecc_router(app_instance: Any) -> APIRouter:
     @memory_router.get("")
     async def list_dreaming_memories(
         request: Request,
-        active_only: bool = Query(False),
         _=Depends(require_auth),
     ):
         """Dreamingメモリ一覧を取得"""
@@ -1310,7 +1309,7 @@ def create_ecc_router(app_instance: Any) -> APIRouter:
             from ..services.dreaming_memory_service import list_memories
 
             user_id = await _get_user_id(request)
-            memories = await list_memories(user_id, active_only=active_only)
+            memories = await list_memories(user_id)
             return JSONResponse(content={"success": True, "memories": memories})
         except Exception as e:
             logger.error("メモリ一覧取得エラー: %s", e)
@@ -1404,27 +1403,6 @@ def create_ecc_router(app_instance: Any) -> APIRouter:
             raise
         except Exception as e:
             logger.error("メモリ削除エラー: %s", e)
-            raise HTTPException(status_code=500, detail=str(e))
-
-    @memory_router.post("/{memory_id}/toggle")
-    async def toggle_dreaming_memory(
-        memory_id: str,
-        request: Request,
-        _=Depends(require_auth),
-    ):
-        """メモリの有効/無効を切り替え"""
-        try:
-            from ..services.dreaming_memory_service import toggle_memory
-
-            user_id = await _get_user_id(request)
-            mem = await toggle_memory(memory_id, user_id=user_id)
-            if mem is None:
-                raise HTTPException(status_code=404, detail="メモリが見つかりません")
-            return JSONResponse(content={"success": True, "memory": mem})
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error("メモリトグルエラー: %s", e)
             raise HTTPException(status_code=500, detail=str(e))
 
     context_router = APIRouter(

@@ -2,7 +2,6 @@
 Repository layer for conversation memory data access
 """
 
-import asyncio
 import uuid
 import logging
 from datetime import datetime, timedelta
@@ -13,8 +12,6 @@ from sqlalchemy.orm import selectinload
 
 from .database import get_db_session
 from .models import ConversationSession, ConversationMessage, ConversationArchive, ConversationHistory
-from .embedding import get_embedding_manager
-
 logger = logging.getLogger(__name__)
 
 
@@ -23,14 +20,6 @@ class ConversationRepository:
     
     def __init__(self, enable_search: bool = True):
         self.enable_search = enable_search
-        self._embedding_manager = None
-    
-    @property
-    def embedding_manager(self):
-        """Lazy initialization of embedding manager"""
-        if self._embedding_manager is None and self.enable_search:
-            self._embedding_manager = get_embedding_manager()
-        return self._embedding_manager
     
     async def create_session(self, user_id: str, character_name: str) -> ConversationSession:
         """Create a new conversation session
@@ -284,26 +273,6 @@ class ConversationRepository:
         Returns:
             ConversationMessage: Created message
         """
-        # Generate embedding for the message (skip for very long content or function results)
-        embedding_data = None
-        if self.enable_search:
-            try:
-                # Skip embedding for very long content (>1000 chars) or function call results
-                should_skip_embedding = (
-                    len(content) > 1000 or 
-                    (metadata and metadata.get('function_call_data')) or
-                    'RunResult:' in content  # Web search results
-                )
-                
-                if not should_skip_embedding and self.embedding_manager:
-                    embedding = await self.embedding_manager.generate_embedding(content)
-                    if embedding:
-                        # Store as JSON list for SQLite compatibility
-                        embedding_data = embedding
-            except Exception as e:
-                print(f"[Repository] Embedding generation failed, skipping: {e}")
-                embedding_data = None
-        
         async with await get_db_session() as session:
             await self._ensure_linear_parent_links(session, session_id)
 
@@ -365,6 +334,24 @@ class ConversationRepository:
             await session.commit()
             await session.refresh(message)
             return message
+
+    async def update_session_summary(
+        self,
+        session_id: Union[str, uuid.UUID],
+        summary: str,
+    ) -> bool:
+        """Update the current summary stored on a conversation session."""
+        if isinstance(session_id, str):
+            session_id = uuid.UUID(session_id)
+
+        async with await get_db_session() as session:
+            conversation = await session.get(ConversationSession, session_id)
+            if not conversation:
+                return False
+            conversation.current_summary = summary
+            conversation.last_activity = datetime.utcnow()
+            await session.commit()
+            return True
     
     async def get_session_messages(self, session_id: Union[str, uuid.UUID], limit: Optional[int] = None) -> List[ConversationMessage]:
         """Get messages for a session
@@ -445,6 +432,19 @@ class ConversationRepository:
             
             if not keep_ids:
                 return 0
+
+            await session.execute(
+                update(ConversationMessage)
+                .where(
+                    and_(
+                        ConversationMessage.session_id == session_id,
+                        ConversationMessage.id.in_(keep_ids),
+                        ConversationMessage.parent_message_id.is_not(None),
+                        ~ConversationMessage.parent_message_id.in_(keep_ids),
+                    )
+                )
+                .values(parent_message_id=None, branch_index=0)
+            )
             
             # Delete messages not in keep list
             delete_stmt = delete(ConversationMessage).where(
@@ -455,8 +455,13 @@ class ConversationRepository:
             )
             
             result = await session.execute(delete_stmt)
+            await session.execute(
+                update(ConversationSession)
+                .where(ConversationSession.id == session_id)
+                .values(message_count=len(keep_ids), last_activity=datetime.utcnow())
+            )
             await session.commit()
-            
+
             return result.rowcount
     
     async def create_archive(self, user_id: str, character_name: str, original_session_id: Union[str, uuid.UUID],
@@ -477,26 +482,12 @@ class ConversationRepository:
         Returns:
             ConversationArchive: Created archive
         """
-        # Generate embedding for summary
-        embedding_data = None
-        if self.enable_search:
-            try:
-                if len(summary) <= 2000 and self.embedding_manager:  # Only generate embeddings for reasonable-length summaries
-                    embedding = await self.embedding_manager.generate_embedding(summary)
-                    if embedding:
-                        # Store as JSON string for SQLite compatibility
-                        embedding_data = self.embedding_manager.serialize_embedding(embedding)
-            except Exception as e:
-                print(f"[Repository] Summary embedding generation failed, skipping: {e}")
-                embedding_data = None
-        
         async with await get_db_session() as session:
             archive = ConversationArchive(
                 user_id=user_id,
                 character_name=character_name,
-                original_session_id=original_session_id,
+                original_session_id=str(original_session_id),
                 summary=summary,
-                summary_embedding=embedding_data,
                 message_count=message_count,
                 start_time=start_time,
                 end_time=end_time,
@@ -523,30 +514,7 @@ class ConversationRepository:
         Returns:
             List[Tuple[ConversationArchive, float]]: Archives with similarity scores
         """
-        async with await get_db_session() as session:
-            stmt = select(ConversationArchive).where(
-                and_(
-                    ConversationArchive.user_id == user_id,
-                    ConversationArchive.character_name == character_name
-                )
-            ).order_by(desc(ConversationArchive.archived_at))
-            
-            result = await session.execute(stmt)
-            archives = result.scalars().all()
-            
-            # Calculate similarities and filter
-            results = []
-            for archive in archives:
-                if archive.summary_embedding:
-                    archive_embedding = self.embedding_manager.deserialize_embedding(archive.summary_embedding)
-                    if archive_embedding:
-                        similarity = self.embedding_manager.calculate_similarity(query_embedding, archive_embedding)
-                        if similarity >= similarity_threshold:
-                            results.append((archive, similarity))
-            
-            # Sort by similarity and limit
-            results.sort(key=lambda x: x[1], reverse=True)
-            return results[:limit]
+        return []
     
     async def add_to_history(self, user_id: str, session_id: str, character_name: str,
                            role: str, content: str, metadata: Optional[Dict[str, Any]] = None,

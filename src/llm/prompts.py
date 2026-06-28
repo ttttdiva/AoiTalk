@@ -6,6 +6,8 @@ import logging
 from typing import Dict, Optional
 
 from ..config import Config
+from .tool_policy import is_memory_search_enabled
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,6 +28,7 @@ def build_unified_instructions(
     available_mcp_servers: Optional[Dict] = None,
     rp_settings: Optional[Dict] = None,
     custom_instructions: Optional[str] = None,
+    include_static_tool_reference: bool = True,
 ) -> str:
     """Build the shared system prompt for LLM clients.
 
@@ -49,9 +52,17 @@ def build_unified_instructions(
         elif char_type == "writer":
             instructions = _build_writer_prompt(character_config, db_char)
         else:
-            instructions = _build_assistant_prompt(character_name, config)
+            instructions = _build_assistant_prompt(
+                character_name,
+                config,
+                include_static_tool_reference=include_static_tool_reference,
+            )
     else:
-        instructions = _build_assistant_prompt(character_name, config)
+        instructions = _build_assistant_prompt(
+            character_name,
+            config,
+            include_static_tool_reference=include_static_tool_reference,
+        )
 
     extra = str(custom_instructions or "").strip()
     if not extra:
@@ -67,6 +78,8 @@ def build_unified_instructions(
 def _build_assistant_prompt(
     character_name: str,
     config: Optional[Config] = None,
+    *,
+    include_static_tool_reference: bool = True,
 ) -> str:
     """従来のアシスタント用システムプロンプトを構築する。"""
     if config:
@@ -96,8 +109,31 @@ def _build_assistant_prompt(
 - 引数が不要な場合は次の形式で出力してください。
 [TOOL_CALL: tool_name()]
 - ツールを使う必要がない場合は、そのまま通常回答してください。
+{_build_static_tool_reference_section(config) if include_static_tool_reference else ""}
 """
     return instructions.strip()
+
+
+def _build_static_tool_reference_section(config: Optional[Config]) -> str:
+    return f"""
+利用できる主なツール:
+- 公開Webや最新情報が必要な場合は `web_search` を使ってください。X/Twitter上の情報が必要な場合は `grok_x_search`、Knowledge Source内の情報が必要な場合は `knowledge_search` を使ってください。
+- 過去会話、以前話した内容、ユーザーが覚えているか確認している内容は `search_memory` を使って確認してください。
+- 「検索して」「search it」など短い追撃は、直前の会話から検索対象を解決する必要があります。
+- 案件情報や進捗の確認・更新には `get_project_progress`、`list_project_information`、`list_record_tables`、`list_tasks`、`list_calendar`、`get_time_report`、`organize_project_information_from_folder` を使ってください。
+- 案件情報、進捗、タスク、予定、作業時間、案件内DB、record table を必要に応じて確認してください。
+- 実行時に渡されるProject文脈で対象Projectが一意に分かるならIDを聞き返さないでください。
+- ユーザーがProjectを指定していない限り、現在のProject文脈へ勝手に寄せないでください。
+- ワークスペースやファイル確認は `find_workspace_items`、`read_workspace_file`、`search_files`、`list_directory` を使ってください。
+- 一般的な補助処理は `utility_assistant`、画像や音声などのメディア処理は `media_assistant`、Spotify操作は `spotify_assistant`、TRPG/シナリオ支援は `scenario_assistant`、文章作成支援は `writing_assistant`、取り込み処理は `import_assistant`、明示されたスキル実行は `invoke_skill` を使ってください。
+{_memory_search_disabled_notice(config)}
+""".rstrip()
+
+
+def _memory_search_disabled_notice(config: Optional[Config]) -> str:
+    if is_memory_search_enabled(config):
+        return ""
+    return "- セマンティックメモリ検索は無効です。過去会話を検索したように装わないでください。"
 
 
 def _build_roleplay_prompt(

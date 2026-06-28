@@ -25,7 +25,7 @@ class MemoryConfig:
     # Embedding and search
     embedding_model: str = "all-MiniLM-L6-v2"  # Sentence transformer model
     preload_embedding_model: bool = False  # Preload model at startup to avoid first-use delay
-    enable_search: bool = False            # Enable/disable memory search functionality (controls embedding model loading)
+    enable_search: bool = True             # Enable memory search tools; heavy work stays lazy/background
     search_timeout: float = 3.0            # Search timeout in seconds (changed from 30.0)
     max_search_results: int = 10           # Maximum search results to return (changed from 5)
     similarity_threshold: float = 0.3      # Minimum similarity score for search results
@@ -56,9 +56,9 @@ class MemoryConfig:
     cache_ttl: int = 3600                  # Cache TTL in seconds
     enable_hybrid_search: bool = True      # Enable hybrid search
     
-    # LLM provider for summarization
-    llm_provider: str = "gemini"          # "openai" or "gemini"
-    llm_model: str = "gemini-3-flash-preview"  # Model for summarization
+    # LLM provider metadata. Runtime memory extraction uses the active LLM client.
+    llm_provider: str = "active"
+    llm_model: str = ""
     
     # Conversation logging settings (now unified with memory_enabled)
     save_user_messages: bool = True
