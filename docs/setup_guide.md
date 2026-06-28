@@ -12,7 +12,7 @@ AoiTalkを最短で動かすための手順を1ファイルに集約しました
 - Node.js 22+ はフロントエンド実行に必須です（Next.js サーバー）。
 
 ## 0. 必要条件とゴール
-- Python 3.10 以上
+- Python 3.12 以上
 - Node.js 22 以上（フロントエンドのビルド/テスト時のみ）
 - Windows 10/11、Linux (WSL2含む)、macOS のいずれか
 - ネットワークアクセス（LLM/API利用）
@@ -43,9 +43,10 @@ cd 41_AoiTalk
 | OS | 推奨コマンド |
 | --- | --- |
 | Windows | `setup.bat`（対話式 `.env` 作成 + PostgreSQL/Python/Node.js導入 + DB初期化 + ビルド） |
-| Linux / macOS | `python3 -m venv venv && source venv/bin/activate && pip install -e ".[audio,test]"` |
+| Linux / macOS | `python3.12 -m venv venv && source venv/bin/activate && pip install -e ".[audio,test]"` |
 
 - Irodori-TTS を使う場合は `pip install -e ".[audio,irodori]"` と `pip install --no-deps "dacvae @ git+https://github.com/facebookresearch/dacvae" descript-audiotools argbind julius pystoi torch-stoi flatten-dict markdown2 randomname importlib-resources` を追加。推論 runtime は AoiTalk に同梱され、重みは初回合成時に Hugging Face から自動取得されます。
+- MioTTS を使う場合は `pip install -e ".[audio,miotts]"` を追加。推論 runtime は AoiTalk 内で動き、重みは初回合成時に Hugging Face から自動取得されます。
 - A.I.VOICE / VOICEROID / CeVIO など Windows専用 TTS を使う場合は `pip install -e ".[audio,windows]"` を追加。
 - 依存定義の一次情報は `pyproject.toml`。
 
@@ -92,18 +93,22 @@ XAI_API_KEY=your-xai-api-key                # Grok X 検索を使う場合
 - ローカル音楽: `AUDIO_PLAYER_DIR`
 - ファイラー絶対パス閲覧: `FILER_ROOT_PATH`, `FILER_VIDEO_THUMBNAIL_CACHE`
 - Grok設定: `XAI_GROK_MODEL`, `XAI_API_BASE`
+- ローカルOpenAI互換サーバーのcontext window: AoiTalkはサーバーmetadataから自動検出します。
 
 WebUIのログインユーザー/パスワードは `.env` ではなく PostgreSQL の `users` テーブルで管理します。
 固定ログイン用のユーザー名/パスワード環境変数は現行実装では使用しません。
 
-通常のローカル起動では、`OPENROUTER_BASE_URL`、`OPENROUTER_APP_NAME`、`PYTHON_API_URL`、`OLLAMA_BASE_URL`、`VOICEVOX_HOST`、`QDRANT_HOST` のような既定URL/ホストは `.env` に書く必要はありません。標準値はコード側で持ち、サービス側URLやポートを意図的に変える時だけ `.env.sample` のコメントアウトされたoverrideを有効化してください。
+通常のローカル起動では、`OPENROUTER_BASE_URL`、`OPENROUTER_APP_NAME`、`PYTHON_API_URL`、`OLLAMA_BASE_URL`、`VOICEVOX_HOST`、`QDRANT_HOST` のような既定URL/ホストは `.env` に書く必要はありません。標準値はコード側で持ち、サービス側URLやポートを意図的に変える時だけ `.env.sample` のコメントアウトされたoverrideを有効化してください。ローカルOpenAI互換サーバーのcontext windowはサーバーmetadataから自動検出します。同梱Qwopus / Luce DFlash launcherは、AoiTalk側から `llama-server --ctx-size` や DFlash `--max-ctx` を指定しません。
+
+macOS では設定タブの「ローカルOpenAI互換サーバー」に exo / MLX LM の候補が自動で追加されます。exo は `http://127.0.0.1:52415/v1`、MLX LM は `http://127.0.0.1:8080/v1` を既定の Base URL として保存します。既定コマンドで起動できない環境では、`EXO_COMMAND`、`EXO_ROOT`、`MLX_LM_COMMAND` または `config/config.yaml` の `openai_compatible_local.exo.*` / `openai_compatible_local.mlx_lm.*` を設定してください。
 
 
 ## 4. `config/config.yaml` のポイント
 - `llm_model`, `default_character`, `device_index` を環境に合わせる
 - `speech_recognition.current_engine` で Whisper / Google / Parakeet / Gemini を切替
-- `tts_settings` に VOICEVOX/VOICEROID/A.I.VOICE/Irodori-TTS などの実行パスや参照音声フォルダを設定
+- `tts_settings` に VOICEVOX/VOICEROID/A.I.VOICE/Irodori-TTS/MioTTS などの実行パス、モデルID、参照音声フォルダを設定
 - `runtime_feature_permissions.allowed_discord_user_ids` などセキュリティ設定を見直す
+- `openai_compatible_local.context_window_tokens` は通常不要です。AoiTalk同梱launcherの起動引数には使われず、サーバーmetadataを読めない外部OpenAI互換サーバー向けのプロンプト予算overrideとしてだけ扱います。
 
 ## 5. PostgreSQL セットアップ
 AoiTalk のデータベースは PostgreSQL を使用します（ベクトル検索はQdrant RAGを使用）。以下はローカル DB 前提の統合手順です。

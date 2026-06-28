@@ -6,7 +6,7 @@ TRPGシナリオのゲームマスターとして場面をナレーションし�
 """
 
 from typing import Any, Optional
-from agents import Agent
+from ..llm.native_runtime import AgentDefinition as Agent
 
 from .base import BaseAgent
 

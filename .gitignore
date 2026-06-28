@@ -45,6 +45,8 @@ cache/
 # Audio files
 *.wav
 *.mp3
+config/miotts_refs/
+config/miotts_presets/
 
 # OS
 .DS_Store

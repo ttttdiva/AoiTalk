@@ -1,4 +1,4 @@
-import { and, eq, isNotNull } from "drizzle-orm";
+import { and, eq, isNotNull, isNull } from "drizzle-orm";
 import { db } from "@/db";
 import { projectMembers, projects, spaces } from "@/db/schema";
 
@@ -25,7 +25,11 @@ export async function listReadableSpaces(user: SessionUser) {
     .from(projectMembers)
     .innerJoin(projects, eq(projectMembers.projectId, projects.id))
     .where(
-      and(eq(projectMembers.userId, user.id), isNotNull(projects.spaceId)),
+      and(
+        eq(projectMembers.userId, user.id),
+        isNotNull(projects.spaceId),
+        isNull(projects.deletedAt),
+      ),
     );
   const memberSpaceIds = new Set(
     memberSpaceRows
@@ -67,7 +71,11 @@ export async function getReadableSpace(spaceId: string, user: SessionUser) {
     .from(projectMembers)
     .innerJoin(projects, eq(projectMembers.projectId, projects.id))
     .where(
-      and(eq(projectMembers.userId, user.id), eq(projects.spaceId, spaceId)),
+      and(
+        eq(projectMembers.userId, user.id),
+        eq(projects.spaceId, spaceId),
+        isNull(projects.deletedAt),
+      ),
     )
     .limit(1);
   return membership ? space : null;
@@ -97,7 +105,7 @@ export async function getReadableProjectIdsForSpace(
     const rows = await db
       .select({ id: projects.id })
       .from(projects)
-      .where(eq(projects.spaceId, spaceId));
+      .where(and(eq(projects.spaceId, spaceId), isNull(projects.deletedAt)));
     return rows.map((project) => project.id);
   }
 
@@ -106,7 +114,11 @@ export async function getReadableProjectIdsForSpace(
     .from(projectMembers)
     .innerJoin(projects, eq(projectMembers.projectId, projects.id))
     .where(
-      and(eq(projectMembers.userId, user.id), eq(projects.spaceId, spaceId)),
+      and(
+        eq(projectMembers.userId, user.id),
+        eq(projects.spaceId, spaceId),
+        isNull(projects.deletedAt),
+      ),
     );
   return rows.map((project) => project.id);
 }

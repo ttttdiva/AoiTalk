@@ -38,21 +38,23 @@ class WhisperSpeechRecognizer(SpeechRecognizerInterface):
         self.language = self.config.get('language', 'ja')
         self.chunk_length = self.config.get('chunk_length', 1.0)  # Reduced for faster response
         self.sample_rate = 16000  # Whisper expects 16kHz
-        
+        self.device = self._resolve_device(self.config.get('device', 'cpu'))
+        self.fp16 = self._resolve_fp16(self.config.get('fp16', False))
+
         # Initialize Whisper model
         self.model = None
         if WHISPER_AVAILABLE:
             try:
-                print(f"[WhisperRecognizer] Loading whisper model '{self.model_name}'...")
-                self.model = whisper.load_model(self.model_name)
+                print(f"[WhisperRecognizer] Loading whisper model '{self.model_name}' on {self.device}...")
+                self.model = whisper.load_model(self.model_name, device=self.device)
                 print(f"[WhisperRecognizer] Model '{self.model_name}' loaded successfully")
             except Exception as e:
                 print(f"[WhisperRecognizer] Failed to load model '{self.model_name}': {type(e).__name__}: {e}")
                 # Try to load a smaller model as fallback
                 if self.model_name != "base":
                     try:
-                        print("[WhisperRecognizer] Trying to load 'base' model as fallback...")
-                        self.model = whisper.load_model("base")
+                        print(f"[WhisperRecognizer] Trying to load 'base' model as fallback on {self.device}...")
+                        self.model = whisper.load_model("base", device=self.device)
                         self.model_name = "base"
                         print("[WhisperRecognizer] Fallback to 'base' model successful")
                     except Exception as e2:
@@ -76,15 +78,22 @@ class WhisperSpeechRecognizer(SpeechRecognizerInterface):
             config: Configuration dictionary
         """
         old_model = self.model_name
+        old_device = self.device
         self.config.update(config)
         new_model = self.config.get('model', self.model_name)
-        
+        new_device = self._resolve_device(self.config.get('device', self.device))
+        self.fp16 = self._resolve_fp16(self.config.get('fp16', self.fp16))
+
         # Reload model if changed
-        if new_model != old_model and WHISPER_AVAILABLE:
+        if (new_model != old_model or new_device != old_device) and WHISPER_AVAILABLE:
             try:
-                print(f"[WhisperRecognizer] Switching model from '{old_model}' to '{new_model}'")
-                self.model = whisper.load_model(new_model)
+                print(
+                    f"[WhisperRecognizer] Switching model from '{old_model}' on {old_device} "
+                    f"to '{new_model}' on {new_device}"
+                )
+                self.model = whisper.load_model(new_model, device=new_device)
                 self.model_name = new_model
+                self.device = new_device
                 print(f"[WhisperRecognizer] Successfully switched to model '{new_model}'")
             except Exception as e:
                 print(f"[WhisperRecognizer] Failed to switch model: {e}")
@@ -105,10 +114,31 @@ class WhisperSpeechRecognizer(SpeechRecognizerInterface):
             'model': self.model_name,
             'language': self.language,
             'chunk_length': self.chunk_length,
+            'device': self.device,
+            'fp16': self.fp16,
             'torch_available': TORCH_AVAILABLE,
             'cuda_available': TORCH_AVAILABLE and torch.cuda.is_available(),
             'model_loaded': self.model is not None
         }
+
+    def _resolve_device(self, requested: Any) -> str:
+        device = str(requested or 'cpu').strip().lower()
+        if device == 'auto':
+            return 'cuda' if TORCH_AVAILABLE and torch.cuda.is_available() else 'cpu'
+        if device.startswith('cuda') and not (TORCH_AVAILABLE and torch.cuda.is_available()):
+            print("[WhisperRecognizer] CUDA requested but not available; using CPU")
+            return 'cpu'
+        if device not in {'cpu', 'cuda'} and not device.startswith('cuda:'):
+            print(f"[WhisperRecognizer] Unsupported device '{device}', using CPU")
+            return 'cpu'
+        return device
+
+    def _resolve_fp16(self, requested: Any) -> bool:
+        if isinstance(requested, str):
+            enabled = requested.strip().lower() in {'1', 'true', 'yes', 'on'}
+        else:
+            enabled = bool(requested)
+        return enabled and self.device.startswith('cuda') and TORCH_AVAILABLE and torch.cuda.is_available()
         
     def start_stream(self):
         """Start a new streaming session"""
@@ -166,7 +196,7 @@ class WhisperSpeechRecognizer(SpeechRecognizerInterface):
                     no_speech_threshold=0.6,
                     logprob_threshold=-1.0,
                     compression_ratio_threshold=2.4,
-                    fp16=TORCH_AVAILABLE and torch.cuda.is_available()
+                    fp16=self.fp16
                 )
                 
                 text = result["text"].strip()
@@ -202,7 +232,7 @@ class WhisperSpeechRecognizer(SpeechRecognizerInterface):
                 language=self.language,
                 initial_prompt=prompt,
                 temperature=0.0,
-                fp16=TORCH_AVAILABLE and torch.cuda.is_available()
+                fp16=self.fp16
             )
             
             text = result["text"].strip()
@@ -255,7 +285,7 @@ class WhisperSpeechRecognizer(SpeechRecognizerInterface):
                 language=lang,
                 initial_prompt=prompt,
                 temperature=0.0,
-                fp16=TORCH_AVAILABLE and torch.cuda.is_available()
+                fp16=self.fp16
             )
             
             result = result_dict["text"].strip()

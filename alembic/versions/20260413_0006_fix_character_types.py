@@ -18,7 +18,7 @@ depends_on = None
 def upgrade() -> None:
     op.execute(
         "UPDATE characters SET character_type = 'roleplay' "
-        "WHERE slug != 'project_management_assistant' AND character_type = 'assistant'"
+        "WHERE slug != 'project_manager' AND character_type = 'assistant'"
     )
 
 

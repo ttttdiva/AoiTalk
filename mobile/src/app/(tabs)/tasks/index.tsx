@@ -135,6 +135,7 @@ function sameOrder(left: string[], right: string[]): boolean {
 type TaskCreateDialogProps = {
   visible: boolean;
   selectedProjectId: string | null;
+  selectedSpaceId: string | null;
   projects: Project[];
   onDismiss: () => void;
   onSubmit: (data: Record<string, unknown>) => Promise<void>;
@@ -153,6 +154,7 @@ type TaskCommandDialogProps = {
 function TaskCreateDialog({
   visible,
   selectedProjectId,
+  selectedSpaceId,
   projects,
   onDismiss,
   onSubmit,
@@ -181,6 +183,13 @@ function TaskCreateDialog({
   const [tagBusy, setTagBusy] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const descriptionInputRef = useRef<{ focus: () => void } | null>(null);
+  const scopedProjects = useMemo(
+    () =>
+      selectedSpaceId
+        ? projects.filter((project) => project.space_id === selectedSpaceId)
+        : projects,
+    [projects, selectedSpaceId],
+  );
 
   useEffect(() => {
     if (!visible) {
@@ -191,7 +200,7 @@ function TaskCreateDialog({
       setTagBusy(false);
       return;
     }
-    const initialProjectId = selectedProjectId ?? projects[0]?.id ?? null;
+    const initialProjectId = selectedProjectId ?? scopedProjects[0]?.id ?? null;
     setSessionKey((key) => key + 1);
     setProjectDraft(initialProjectId);
     setTitleDraft("");
@@ -207,7 +216,7 @@ function TaskCreateDialog({
     setSelectedTagIds([]);
     setNewTagDraft("");
     setFormError(null);
-  }, [projects, selectedProjectId, visible]);
+  }, [scopedProjects, selectedProjectId, visible]);
 
   useEffect(() => {
     if (!visible || !projectDraft) {
@@ -362,7 +371,7 @@ function TaskCreateDialog({
               }
               contentStyle={styles.menuContent}
             >
-              {projects.map((project) => (
+              {scopedProjects.map((project) => (
                 <Menu.Item
                   key={project.id}
                   title={project.name}
@@ -376,6 +385,9 @@ function TaskCreateDialog({
                   }}
                 />
               ))}
+              {scopedProjects.length === 0 ? (
+                <Menu.Item title="このスペースにプロジェクトがありません" disabled />
+              ) : null}
             </Menu>
           </View>
 
@@ -696,7 +708,9 @@ export default function TaskListScreen() {
     selectedProject,
     selectedSpaceId,
     selectedSpace,
+    spaces,
     projects,
+    setSelectedSpaceId,
     setSelectedProjectId,
     refreshProjects,
   } = useProject();
@@ -713,7 +727,7 @@ export default function TaskListScreen() {
   const [search, setSearch] = useState("");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
-  const [projectMenuVisible, setProjectMenuVisible] = useState(false);
+  const [scopeMenuVisible, setScopeMenuVisible] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   // 作成フォーム
@@ -810,6 +824,12 @@ export default function TaskListScreen() {
 
     return result;
   }, [filter, search, showFuture, tasks]);
+
+  const scopeLabel = selectedProject
+    ? `プロジェクト: ${selectedProject.name}`
+    : selectedSpace
+      ? `スペース: ${selectedSpace.name}`
+      : "すべてのスペース";
 
   useEffect(() => {
     tasksRef.current = tasks;
@@ -1353,10 +1373,10 @@ export default function TaskListScreen() {
                   />
                 ))}
               </Menu>
-              {item.end_at ? (
+              {item.start_at ? (
                 <Text style={styles.dueDate}>
-                  〆{" "}
-                  {formatTaskDateLabel(item.end_at, {
+                  開始{" "}
+                  {formatTaskDateLabel(item.start_at, {
                     allDay: item.all_day,
                     absoluteStyle: "short",
                   })}
@@ -1413,48 +1433,56 @@ export default function TaskListScreen() {
             <Text variant="titleLarge" style={styles.headerTitle}>
               タスク
             </Text>
-            <Text style={styles.headerSubtext}>
-              {selectedProject?.name || "すべてのプロジェクト"}
-              {selectedSpace && !selectedProject
-                ? ` / ${selectedSpace.name}`
-                : ""}
-            </Text>
+            <Text style={styles.headerSubtext}>{scopeLabel}</Text>
           </View>
           <Menu
-            visible={projectMenuVisible}
-            onDismiss={() => setProjectMenuVisible(false)}
+            visible={scopeMenuVisible}
+            onDismiss={() => setScopeMenuVisible(false)}
             anchor={
               <Chip
                 compact
                 onPress={() => {
-                  setProjectMenuVisible(true);
+                  setScopeMenuVisible(true);
                   void refreshProjects();
                 }}
                 style={styles.projectChip}
                 textStyle={styles.projectChipText}
               >
-                プロジェクト
+                表示範囲
               </Chip>
             }
             contentStyle={styles.menuContent}
           >
             <Menu.Item
-              title="すべてのプロジェクト"
-              leadingIcon={!selectedProjectId ? "check" : undefined}
+              title="すべてのスペース"
+              leadingIcon={
+                !selectedProjectId && !selectedSpaceId ? "check" : undefined
+              }
               onPress={() => {
-                setProjectMenuVisible(false);
+                setScopeMenuVisible(false);
                 setSelectedProjectId(null);
               }}
             />
+            {spaces.map((space) => (
+              <Menu.Item
+                key={space.id}
+                title={`スペース: ${space.name}`}
+                leadingIcon={space.id === selectedSpaceId ? "check" : undefined}
+                onPress={() => {
+                  setScopeMenuVisible(false);
+                  setSelectedSpaceId(space.id);
+                }}
+              />
+            ))}
             {projects.map((project) => (
               <Menu.Item
                 key={project.id}
-                title={project.name}
+                title={`プロジェクト: ${project.name}`}
                 leadingIcon={
                   project.id === selectedProjectId ? "check" : undefined
                 }
                 onPress={() => {
-                  setProjectMenuVisible(false);
+                  setScopeMenuVisible(false);
                   setSelectedProjectId(project.id);
                 }}
               />
@@ -1605,6 +1633,7 @@ export default function TaskListScreen() {
         <TaskCreateDialog
           visible={showCreate}
           selectedProjectId={selectedProjectId}
+          selectedSpaceId={selectedSpaceId}
           projects={projects}
           onDismiss={() => setShowCreate(false)}
           onSubmit={handleCreate}

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from agents import Agent, ModelSettings
+from ..llm.native_runtime import AgentDefinition as Agent, NativeModelSettings as ModelSettings
 
-from ..tools.adapters import OpenAIAgentAdapter
 from ..tools.basic import calculate, get_current_time, get_weather_info
+from ..tools.core import ensure_tool_definitions
 from .base import BaseAgent
 
 
@@ -13,7 +13,7 @@ class UtilityAgent(BaseAgent):
     """Specialized agent for utility operations."""
 
     def _create_agent(self) -> Agent:
-        tools = OpenAIAgentAdapter.convert_all(
+        tools = ensure_tool_definitions(
             [get_current_time, get_weather_info, calculate]
         )
 

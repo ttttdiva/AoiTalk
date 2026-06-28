@@ -2,7 +2,7 @@
 Time-related tools
 """
 import datetime
-from ..core import tool as function_tool
+from ..core import tool
 
 
 def get_current_time_impl() -> str:
@@ -15,7 +15,7 @@ def get_current_time_impl() -> str:
     return result
 
 
-@function_tool
+@tool
 def get_current_time() -> str:
     """ユーザーが現在の時刻や日付を尋ねた場合にのみ使用する関数"""
     return get_current_time_impl()

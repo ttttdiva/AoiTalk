@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import Any, Optional
+
+from .generation_policy import GenerationProfile, get_current_generation_policy
 
 
 _current_user_input: ContextVar[Optional[str]] = ContextVar(
@@ -12,11 +15,122 @@ _current_user_input: ContextVar[Optional[str]] = ContextVar(
     default=None,
 )
 
+VALID_COMMAND_CAPABILITIES: set[str] = {
+    "web_search",
+    "image_generation",
+    "project_db_update",
+    "project_progress_review",
+    "task_update",
+    "wbs_sync",
+}
+
+PROJECT_COMMAND_CAPABILITIES: set[str] = {
+    "project_db_update",
+    "project_progress_review",
+    "task_update",
+    "wbs_sync",
+}
+
+COMMAND_CAPABILITY_CONTEXT_HEADER = "## AoiTalk Command Context"
+COMMAND_CAPABILITY_LINE_PREFIX = "Command capabilities:"
+
 
 @dataclass(frozen=True)
 class ToolPolicyDecision:
     allowed: bool
     reason: str
+
+
+PROJECT_MANAGEMENT_MUTATION_TOOL_NAMES: set[str] = {
+    "organize_project_information_from_folder",
+    "configure_project_management_files",
+    "upsert_project_info_category",
+    "archive_project_info_category",
+    "register_project_document",
+    "delete_project_document",
+    "upsert_project_fact",
+    "delete_project_fact",
+    "set_project_information_sync_state",
+    "create_record_table",
+    "append_record_rows",
+    "update_record_row",
+    "delete_record_rows",
+    "delete_record_table",
+    "create_task",
+    "update_task",
+    "delete_task",
+    "assign_task",
+    "schedule_task",
+    "start_timer",
+    "stop_timer",
+    "log_time",
+    "sync_issue_table",
+    "sync_wbs_tasks",
+}
+
+PROJECT_MANAGEMENT_READ_TOOL_NAMES: set[str] = {
+    "get_project_context",
+    "list_projects",
+    "list_record_tables",
+    "list_project_information",
+    "render_project_diagram",
+    "list_project_tasks_changed_since",
+    "list_tasks",
+    "list_calendar",
+    "get_time_report",
+    "get_project_issues",
+    "get_project_progress",
+    "get_upcoming_wbs_tasks",
+    "summarize_project_requests",
+}
+
+PROJECT_MANAGEMENT_TOOL_NAMES: set[str] = (
+    PROJECT_MANAGEMENT_READ_TOOL_NAMES | PROJECT_MANAGEMENT_MUTATION_TOOL_NAMES
+)
+
+SEARCH_TOOL_NAMES: set[str] = {
+    "web_search",
+    "grok_x_search",
+    "knowledge_search",
+    "knowledge_read",
+    "knowledge_status",
+    "search_memory",
+}
+
+FILESYSTEM_READ_TOOL_NAMES: set[str] = {
+    "list_workspace_files",
+    "find_workspace_items",
+    "inspect_workspace_tree",
+    "read_workspace_file",
+    "get_workspace_file_info",
+    "download_user_file",
+    "list_user_files",
+    "get_user_file_info",
+    "execute_command",
+    "view_file",
+    "list_directory",
+    "search_files",
+    "get_repo_map",
+}
+
+FILESYSTEM_MUTATION_TOOL_NAMES: set[str] = {
+    "create_workspace_directory",
+    "upload_workspace_file",
+    "delete_workspace_item",
+    "move_workspace_item",
+    "upload_user_file",
+    "delete_user_file",
+    "create_file",
+    "delete_file",
+    "append_to_file",
+    "edit_file",
+    "insert_to_file",
+    "undo_edit",
+}
+
+FILESYSTEM_TOOL_NAMES: set[str] = (
+    FILESYSTEM_READ_TOOL_NAMES | FILESYSTEM_MUTATION_TOOL_NAMES
+)
 
 
 def set_current_user_input(user_input: Optional[str]) -> Token:
@@ -31,6 +145,113 @@ def get_current_user_input() -> Optional[str]:
     return _current_user_input.get()
 
 
+def sanitize_command_capabilities(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    raw_values: list[Any]
+    if isinstance(value, str):
+        raw_values = re.split(r"[, \t\r\n]+", value)
+    elif isinstance(value, (list, tuple, set)):
+        raw_values = list(value)
+    else:
+        return ()
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        item = str(raw or "").strip().lower()
+        if item not in VALID_COMMAND_CAPABILITIES or item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return tuple(result)
+
+
+def command_capabilities_from_text(text: str) -> set[str]:
+    raw = str(text or "")
+    if COMMAND_CAPABILITY_LINE_PREFIX not in raw:
+        return set()
+    capabilities: set[str] = set()
+    for line in raw.splitlines():
+        if not line.startswith(COMMAND_CAPABILITY_LINE_PREFIX):
+            continue
+        _, raw_caps = line.split(":", 1)
+        capabilities.update(sanitize_command_capabilities(raw_caps))
+    return capabilities
+
+
+def command_capability_active(text: str, capability: str) -> bool:
+    return capability in command_capabilities_from_text(text)
+
+
+def build_command_capability_context(
+    message: str,
+    capabilities: Any,
+) -> str:
+    sanitized = sanitize_command_capabilities(capabilities)
+    if not sanitized:
+        return message
+
+    guidance: list[str] = []
+    if "web_search" in sanitized:
+        guidance.append(
+            "- `web_search`: use direct public web search tools before answering."
+        )
+        guidance.append(
+            "- Choose the search query from the current user request and the "
+            "provided conversation history, then call `web_search`; do not use "
+            "the slash command text itself as the query."
+        )
+    if "image_generation" in sanitized:
+        guidance.append(
+            "- `image_generation`: use the media/image generation tool path; do not answer as plain text only."
+        )
+    if "project_db_update" in sanitized:
+        guidance.append(
+            "- `project_db_update`: use direct project information DB tools for durable project facts."
+        )
+    if "project_progress_review" in sanitized:
+        guidance.append(
+            "- `project_progress_review`: run an evidence-driven project progress review for the current project."
+        )
+        guidance.append(
+            "- Start from `get_project_progress`, then keep using project, record-table, task, file, and web-search tools as needed. Do not stop after the first tool result if evidence is insufficient, stale, or changed by a DB update."
+        )
+        guidance.append(
+            "- If project evidence is missing or stale, inspect/refresh the selected project filer root with `organize_project_information_from_folder` using `apply=true` when appropriate, then re-run `get_project_progress` before the final answer."
+        )
+    if "task_update" in sanitized:
+        guidance.append(
+            "- `task_update`: use direct task tools when creating, updating, or organizing tasks."
+        )
+    if "wbs_sync" in sanitized:
+        guidance.append(
+            "- `wbs_sync`: use direct WBS/project task synchronization tools."
+        )
+
+    return "\n".join(
+        [
+            COMMAND_CAPABILITY_CONTEXT_HEADER,
+            f"{COMMAND_CAPABILITY_LINE_PREFIX} {', '.join(sanitized)}",
+            *guidance,
+            "",
+            "Current user request:",
+            message,
+        ]
+    )
+
+
+def command_capabilities_for_current_turn_text(
+    text: str,
+    capabilities: Any = None,
+) -> tuple[str, ...]:
+    """Add command capabilities implied by the current user turn only."""
+    sanitized = sanitize_command_capabilities(capabilities)
+    if "web_search" not in sanitized and _looks_like_search_request(text):
+        return (*sanitized, "web_search")
+    return sanitized
+
+
 def looks_like_filesystem_request(text: str) -> bool:
     return _looks_like_filesystem_request(text)
 
@@ -39,12 +260,20 @@ def looks_like_project_management_request(text: str) -> bool:
     return _looks_like_project_management_request(text)
 
 
+def looks_like_project_progress_review_request(text: str) -> bool:
+    return _looks_like_project_progress_review_request(text)
+
+
+def project_progress_review_active(text: str) -> bool:
+    return _looks_like_project_progress_review_request(text)
+
+
 def looks_like_project_management_mutation_request(text: str) -> bool:
     return bool(project_management_required_mutation_tools(text))
 
 
 def looks_like_deferred_project_fact_request(text: str) -> bool:
-    policy_text = _extract_delegated_user_request(text)
+    policy_text = _extract_effective_user_request(text)
     normalized = policy_text.casefold()
     if not normalized.strip():
         return False
@@ -54,9 +283,8 @@ def looks_like_deferred_project_fact_request(text: str) -> bool:
         return False
 
     # Explicit project-information/fact update requests are handled synchronously
-    # by project_management_assistant. This path is for incidental durable facts
-    # that accompany another primary action, or a plain chat turn that introduced
-    # durable project information.
+    # by the root direct project tools. This helper only identifies incidental
+    # durable facts that accompany another primary action.
     return "upsert_project_fact" not in project_management_required_mutation_tools(
         policy_text
     )
@@ -66,7 +294,19 @@ def looks_like_utility_request(text: str) -> bool:
     return _looks_like_utility_request(text)
 
 
-def _extract_delegated_user_request(text: str) -> str:
+def looks_like_media_request(text: str) -> bool:
+    return _looks_like_media_request(text)
+
+
+def looks_like_search_request(text: str) -> bool:
+    return _looks_like_search_request(text)
+
+
+def looks_like_bare_search_followup_request(text: str) -> bool:
+    return _looks_like_bare_search_followup_request(text)
+
+
+def _extract_effective_user_request(text: str) -> str:
     raw = str(text or "")
     markers = (
         "\nUser request:\n",
@@ -83,43 +323,43 @@ def _extract_delegated_user_request(text: str) -> str:
 
 
 def project_management_required_mutation_tools(text: str) -> set[str]:
-    policy_text = _extract_delegated_user_request(text)
+    command_capabilities = command_capabilities_from_text(text)
+    command_tools: set[str] = set()
+    if "project_db_update" in command_capabilities:
+        command_tools.update(
+            {
+                "upsert_project_info_category",
+                "register_project_document",
+                "upsert_project_fact",
+                "set_project_information_sync_state",
+            }
+        )
+    if "task_update" in command_capabilities:
+        command_tools.update({"create_task", "update_task"})
+    if "wbs_sync" in command_capabilities:
+        command_tools.add("sync_wbs_tasks")
+    if command_tools:
+        return command_tools
+
+    policy_text = _extract_effective_user_request(text)
     normalized = policy_text.casefold()
     if not normalized.strip():
         return set()
 
     task_terms = (
-        "task",
-        "todo",
         "タスク",
-        "予定",
-        "予約",
-        "用事",
     )
     project_info_terms = (
-        "project information",
-        "project info",
         "案件情報",
         "プロジェクト情報",
         "案件情報db",
         "案件情報DB",
         "案件db",
         "案件DB",
-        "重要資料",
-        "資料フォルダ",
-        "管理資料",
-        "決定事項",
-        "要確認",
-        "カテゴリ",
-        "fact",
-        "facts",
+        "プロジェクトdb",
+        "プロジェクトDB",
     )
     record_table_terms = (
-        "record table",
-        "record-table",
-        "dbtable",
-        ".dbtable",
-        "database table",
         "レコードテーブル",
         "dbテーブル",
         "DBテーブル",
@@ -130,21 +370,31 @@ def project_management_required_mutation_tools(text: str) -> set[str]:
         "案件db",
         "案件DB",
     )
+    database_terms = (
+        "db",
+        "DB",
+        "データベース",
+        "台帳",
+        "一覧表",
+    )
+    project_database_phrases = (
+        "プロジェクト専用db",
+        "プロジェクトdb",
+        "専用db",
+        "案件専用db",
+        "案件db",
+        "案件情報db",
+        "プロジェクトDB",
+        "案件DB",
+        "案件情報DB",
+    )
     wbs_terms = (
-        "wbs",
         "WBS",
         "工程表",
-        "進捗管理",
     )
     issue_terms = (
-        "issue",
-        "issues",
-        "issue tracker",
-        "課題",
         "課題管理",
         "課題管理表",
-        "要確認",
-        "確認事項",
     )
     durable_fact_terms = (
         "決定",
@@ -162,49 +412,41 @@ def project_management_required_mutation_tools(text: str) -> set[str]:
         "延期",
         "前倒し",
         "変更になった",
-        "milestone",
-        "decided",
-        "confirmed",
-        "unconfirmed",
-        "probably",
-        "might",
-        "risk",
-        "delayed",
-        "postponed",
     )
     lookup_terms = (
+        "\u4eca\u65e5",
+        "\u672c\u65e5",
+        "\u671f\u9650",
+        "\u4f55",
+        "\u6559\u3048\u3066",
+        "\u4e00\u89a7",
+        "\u8868\u793a",
+        "\u78ba\u8a8d",
         "教えて",
         "見せて",
         "表示",
         "一覧",
         "知りたい",
         "確認したい",
-        "what",
-        "show",
-        "list",
         "?",
         "？",
     )
     folder_terms = (
-        "folder",
-        "directory",
-        "workspace",
         "フォルダ",
-        "ディレクトリ",
         "ワークスペース",
+        "ファイラー",
         "資料",
         "ファイル",
     )
     create_terms = (
-        "add",
-        "create",
-        "register",
-        "save",
-        "record",
+        "\u4f5c\u6210",
+        "\u4f5c\u6210\u3057\u3066",
+        "\u4f5c\u3063\u3066",
+        "\u8ffd\u52a0",
+        "\u767b\u9332",
         "追加",
         "作成",
         "登録",
-        "保存",
         "入れて",
         "残して",
         "まとめ",
@@ -219,11 +461,10 @@ def project_management_required_mutation_tools(text: str) -> set[str]:
         "データベース化",
     )
     update_terms = (
-        "update",
-        "edit",
-        "change",
-        "complete",
-        "done",
+        "\u66f4\u65b0",
+        "\u5909\u66f4",
+        "\u4fee\u6b63",
+        "\u5b8c\u4e86",
         "更新",
         "変更",
         "修正",
@@ -234,32 +475,36 @@ def project_management_required_mutation_tools(text: str) -> set[str]:
         "反映",
     )
     delete_terms = (
-        "delete",
-        "remove",
+        "\u524a\u9664",
+        "\u6d88\u3057",
         "消し",
         "削除",
     )
     schedule_terms = (
-        "schedule",
-        "calendar",
+        "\u671f\u9650",
+        "\u4e88\u5b9a",
+        "\u30b9\u30b1\u30b8\u30e5\u30fc\u30eb",
+        "\u30ab\u30ec\u30f3\u30c0\u30fc",
         "スケジュール",
         "カレンダー",
     )
     explicit_fact_persistence_terms = (
-        "save",
-        "record",
-        "remember",
-        "保存",
         "残して",
         "登録",
         "記録",
+        "保存",
         "覚えて",
         "メモ",
-        "fact",
-        "facts",
         "案件情報",
         "プロジェクト情報",
     )
+    fact_note_persistence_terms = (
+        "残して",
+        "記録",
+        "覚えて",
+        "メモ",
+    )
+    database_fact_persistence_terms = (*fact_note_persistence_terms, "保存")
 
     has_task = any(term.casefold() in normalized for term in task_terms)
     has_project_info = any(term.casefold() in normalized for term in project_info_terms)
@@ -267,20 +512,42 @@ def project_management_required_mutation_tools(text: str) -> set[str]:
     has_wbs = any(term.casefold() in normalized for term in wbs_terms)
     has_issue = any(term.casefold() in normalized for term in issue_terms)
     has_folder = any(term.casefold() in normalized for term in folder_terms)
+    has_database_reference = any(term.casefold() in normalized for term in database_terms)
+    has_fact_note_persistence = any(
+        term.casefold() in normalized for term in fact_note_persistence_terms
+    )
+    has_database_fact_persistence = any(
+        term.casefold() in normalized for term in database_fact_persistence_terms
+    )
     has_project_reference = _contains_any(
         normalized,
-        ("案件", "プロジェクト", "project"),
+        ("案件", "プロジェクト"),
     )
     has_durable_project_fact = (
         (has_project_reference or has_project_info or has_wbs or has_issue)
-        and any(term.casefold() in normalized for term in durable_fact_terms)
+        and (
+            any(term.casefold() in normalized for term in durable_fact_terms)
+            or has_fact_note_persistence
+        )
     )
-    has_project_database = has_project_info and any(
-        term in normalized
-        for term in ("db", "database", "データベース", "台帳", "一覧表")
+    has_project_info_database = has_project_info and any(
+        term.casefold() in normalized for term in database_terms
     )
     has_create_or_update = any(
         term.casefold() in normalized for term in create_terms + update_terms
+    )
+    is_short_database_update = (
+        has_database_reference
+        and has_create_or_update
+        and not has_task
+        and not has_database_fact_persistence
+        and len(normalized.strip()) <= 80
+    )
+    has_project_database = has_database_reference and (
+        has_project_info_database
+        or has_record_table
+        or is_short_database_update
+        or any(term.casefold() in normalized for term in project_database_phrases)
     )
     is_lookup_only = (
         any(term.casefold() in normalized for term in lookup_terms)
@@ -301,7 +568,9 @@ def project_management_required_mutation_tools(text: str) -> set[str]:
         tools.add("sync_wbs_tasks")
     if (has_issue or has_project_database) and has_create_or_update:
         tools.add("sync_issue_table")
-    if has_project_info and has_folder and has_create_or_update:
+    if (has_project_info and has_folder and has_create_or_update) or (
+        has_project_database and has_create_or_update
+    ):
         tools.add("organize_project_information_from_folder")
     if has_project_info and has_create_or_update:
         tools.update(
@@ -318,6 +587,13 @@ def project_management_required_mutation_tools(text: str) -> set[str]:
         and not (has_task or has_wbs or has_issue or has_record_table)
     ):
         tools.add("upsert_project_fact")
+    if (
+        has_database_reference
+        and has_database_fact_persistence
+        and not is_lookup_only
+        and not (has_task or has_wbs or has_issue or has_record_table)
+    ):
+        tools.add("upsert_project_fact")
     if (has_record_table or has_project_database) and has_create_or_update:
         tools.add("create_record_table")
     return tools
@@ -325,35 +601,22 @@ def project_management_required_mutation_tools(text: str) -> set[str]:
 
 def _project_management_fact_features(normalized: str) -> dict[str, bool]:
     project_info_terms = (
-        "project information",
-        "project info",
         "案件情報",
         "プロジェクト情報",
         "案件情報db",
         "案件情報DB",
         "案件db",
         "案件DB",
-        "重要資料",
-        "決定事項",
-        "要確認",
-        "fact",
-        "facts",
+        "プロジェクトdb",
+        "プロジェクトDB",
     )
     wbs_terms = (
-        "wbs",
         "WBS",
         "工程表",
-        "進捗管理",
     )
     issue_terms = (
-        "issue",
-        "issues",
-        "issue tracker",
-        "課題",
         "課題管理",
         "課題管理表",
-        "要確認",
-        "確認事項",
     )
     durable_fact_terms = (
         "決定",
@@ -371,15 +634,6 @@ def _project_management_fact_features(normalized: str) -> dict[str, bool]:
         "延期",
         "前倒し",
         "変更になった",
-        "milestone",
-        "decided",
-        "confirmed",
-        "unconfirmed",
-        "probably",
-        "might",
-        "risk",
-        "delayed",
-        "postponed",
     )
     lookup_terms = (
         "教えて",
@@ -388,22 +642,13 @@ def _project_management_fact_features(normalized: str) -> dict[str, bool]:
         "一覧",
         "知りたい",
         "確認したい",
-        "what",
-        "show",
-        "list",
         "?",
         "？",
     )
     create_terms = (
-        "add",
-        "create",
-        "register",
-        "save",
-        "record",
         "追加",
         "作成",
         "登録",
-        "保存",
         "入れて",
         "残して",
         "まとめ",
@@ -415,11 +660,6 @@ def _project_management_fact_features(normalized: str) -> dict[str, bool]:
         "DB化",
     )
     update_terms = (
-        "update",
-        "edit",
-        "change",
-        "complete",
-        "done",
         "更新",
         "変更",
         "修正",
@@ -435,7 +675,7 @@ def _project_management_fact_features(normalized: str) -> dict[str, bool]:
     has_issue = any(term.casefold() in normalized for term in issue_terms)
     has_project_reference = _contains_any(
         normalized,
-        ("案件", "プロジェクト", "project"),
+        ("案件", "プロジェクト"),
     )
     has_durable_project_fact = (
         (has_project_reference or has_project_info or has_wbs or has_issue)
@@ -471,6 +711,16 @@ def check_tool_call_allowed(
     config: Any = None,
 ) -> ToolPolicyDecision:
     text = _combined_text(user_input, tool_args)
+    policy = get_current_generation_policy()
+
+    if policy.profile == GenerationProfile.REVIEW and _looks_like_mutation_tool_call(
+        tool_name,
+        text,
+    ):
+        return ToolPolicyDecision(
+            False,
+            "review mode does not allow mutation-capable tool calls",
+        )
 
     if tool_name == "search_memory":
         if not is_memory_search_enabled(config):
@@ -484,22 +734,6 @@ def check_tool_call_allowed(
                 "the request does not depend on prior conversation history",
             )
         return ToolPolicyDecision(True, "request refers to prior conversation history")
-
-    if tool_name == "filesystem_assistant":
-        if _looks_like_filesystem_request(text):
-            return ToolPolicyDecision(True, "request explicitly refers to files or workspace content")
-        return ToolPolicyDecision(
-            False,
-            "the request does not ask to inspect or modify files, folders, repositories, or workspace documents",
-        )
-
-    if tool_name == "project_management_assistant":
-        if _looks_like_project_management_request(text):
-            return ToolPolicyDecision(True, "request explicitly refers to project information, task, WBS, schedule, timer, or reporting work")
-        return ToolPolicyDecision(
-            False,
-            "the request does not ask for project information, task, WBS, schedule, timer, or reporting work",
-        )
 
     if tool_name == "utility_assistant":
         if _looks_like_utility_request(text):
@@ -516,14 +750,17 @@ def format_blocked_tool_result(tool_name: str, decision: ToolPolicyDecision) -> 
     return (
         f"Tool policy blocked `{tool_name}`: {decision.reason}. "
         f"Do not call `{tool_name}` again for this user request. "
-        "Answer directly, or use `search_assistant` only when public, fresh, or time-sensitive information is required."
+        "Answer directly, or use direct search tools only when public, fresh, or time-sensitive information is required."
     )
 
 
 def _combined_text(user_input: Optional[str], tool_args: Optional[dict[str, Any]]) -> str:
     if user_input and str(user_input).strip():
         return str(user_input).strip()
+    return _tool_args_text(tool_args)
 
+
+def _tool_args_text(tool_args: Optional[dict[str, Any]]) -> str:
     parts: list[str] = []
     if tool_args:
         for value in tool_args.values():
@@ -535,6 +772,64 @@ def _combined_text(user_input: Optional[str], tool_args: Optional[dict[str, Any]
 def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
     lowered = text.casefold()
     return any(term.casefold() in lowered for term in terms)
+
+
+def _looks_like_mutation_tool_call(tool_name: str, text: str) -> bool:
+    normalized = str(text or "")
+    if tool_name in PROJECT_MANAGEMENT_MUTATION_TOOL_NAMES:
+        return True
+    if tool_name in FILESYSTEM_MUTATION_TOOL_NAMES:
+        return True
+    if tool_name == "execute_command":
+        return _contains_any(
+            normalized,
+            (
+                "create",
+                "delete",
+                "remove",
+                "move",
+                "edit",
+                "append",
+                "insert",
+                "save",
+                "write",
+                "upload",
+                "作成",
+                "削除",
+                "移動",
+                "編集",
+                "追記",
+                "保存",
+                "書き込",
+                "アップロード",
+            ),
+        )
+    return False
+
+
+def _looks_like_filesystem_followup_request(
+    user_input: str,
+    tool_args: Optional[dict[str, Any]],
+) -> bool:
+    args_text = _tool_args_text(tool_args)
+    if not user_input or not args_text or not _looks_like_filesystem_request(args_text):
+        return False
+    return _contains_any(
+        user_input,
+        (
+            "\u30bb\u30b0\u30e1\u30f3\u30c8",
+            "\u30bb\u30b0\u30e1\u30f3\u30c8\u8868",
+            "\u69cb\u6210",
+            "\u8a2d\u5b9a",
+            "\u8a2d\u8a08",
+            "\u30d1\u30e9\u30e1\u30fc\u30bf",
+            "\u30b3\u30f3\u30d5\u30a3\u30b0",
+            "\u8868\u51fa\u529b",
+            "\u8868\u306b",
+            "\u4e00\u89a7",
+            "\u62bd\u51fa",
+        ),
+    )
 
 
 def _looks_like_memory_request(text: str) -> bool:
@@ -550,93 +845,159 @@ def _looks_like_memory_request(text: str) -> bool:
             "記憶",
             "会話履歴",
             "話した",
-            "previous",
-            "earlier",
-            "last time",
-            "conversation history",
-            "remember",
         ),
     )
 
 
+def _looks_like_search_request(text: str) -> bool:
+    if command_capability_active(text, "web_search"):
+        return True
+
+    normalized = str(text or "").casefold()
+    if not normalized.strip():
+        return False
+
+    explicit_web_terms = (
+        "Web検索",
+        "web検索",
+        "ウェブ検索",
+        "ネット検索",
+        "インターネット検索",
+    )
+    if _contains_any(normalized, explicit_web_terms):
+        return True
+
+    if _looks_like_filesystem_request(normalized):
+        return False
+    if _looks_like_project_management_request(normalized):
+        return False
+    if _looks_like_memory_request(normalized):
+        return False
+
+    web_research_terms = (
+        "検索",
+        "調べて",
+        "調べる",
+        "調査して",
+        "調査する",
+    )
+    return _contains_any(normalized, web_research_terms)
+
+
+def _looks_like_media_request(text: str) -> bool:
+    if command_capability_active(text, "image_generation"):
+        return True
+
+    normalized = str(text or "").casefold()
+    if not normalized.strip():
+        return False
+    return _contains_any(
+        normalized,
+        (
+            "画像生成",
+            "画像を生成",
+            "絵を生成",
+            "イラスト生成",
+            "image generation",
+            "generate image",
+            "generate an image",
+            "comfyui",
+            "youtube",
+            "niconico",
+            "ニコニコ",
+            "bgm",
+        ),
+    )
+
+
+def _looks_like_bare_search_followup_request(text: str) -> bool:
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+
+    compact = re.sub(r"[\s\u3000。、．，,！!？?「」『』（）()\[\]【】\"'`]+", "", raw.casefold())
+    exact_japanese = {
+        "検索",
+        "検索して",
+        "検索してね",
+        "検索してください",
+        "検索しろ",
+        "検索してくれ",
+        "web検索して",
+        "web検索してね",
+        "ウェブ検索して",
+        "ウェブ検索してね",
+        "それ検索して",
+        "それを検索して",
+        "それを検索してね",
+        "これ検索して",
+        "これを検索して",
+        "調べて",
+        "調べてね",
+        "調べてください",
+        "それ調べて",
+        "それを調べて",
+        "これ調べて",
+        "これを調べて",
+        "ちゃんと検索して",
+        "ちゃんと検索してね",
+    }
+    if compact in exact_japanese:
+        return True
+
+    english = re.sub(r"[^a-z0-9]+", " ", raw.casefold()).strip()
+    exact_english = {
+        "search",
+        "search it",
+        "search that",
+        "search this",
+        "please search",
+        "web search",
+        "look it up",
+        "look that up",
+        "look this up",
+        "please look it up",
+    }
+    return english in exact_english
+
+
 def _looks_like_filesystem_request(text: str) -> bool:
+    normalized = str(text or "")
     if _contains_any(
         text,
         (
             "ファイル",
             "フォルダ",
-            "ディレクトリ",
-            "パス",
             "ワークスペース",
-            "リポジトリ",
-            "ソース",
-            "コード",
+            "ファイラー",
             "資料",
             "文書",
             "ドキュメント",
+            "設計書",
+            "仕様書",
+            "議事録",
+            "手順書",
             "添付",
             "アップロード",
             "案件資料",
             "案件フォルダ",
-            "workspace",
-            "repository",
-            "repo",
-            "file",
-            "folder",
-            "directory",
-            "path",
-            "document",
-            "attachment",
-            "ファイル",
-            "フォルダ",
-            "ディレクトリ",
-            "パス",
-            "ワークスペース",
-            "リポジトリ",
-            "ソース",
-            "コード",
-            "資料",
-            "文書",
-            "ドキュメント",
-            "添付",
-            "アップロード",
-            "案件資料",
-            "案件フォルダ",
-            "読める",
-            "読む",
-            "読んで",
-            "見つけて",
-            "探して",
-            "下層",
-            "配下",
-            "階層",
-            "構造",
-            "最初に読む",
         ),
     ):
         return True
 
-    return _contains_any(
-        text,
-        (
-            ".py",
-            ".ts",
-            ".tsx",
-            ".js",
-            ".json",
-            ".yaml",
-            ".yml",
-            ".md",
-            ".txt",
-            ".docx",
-            ".xlsx",
-            ".pdf",
-            "src/",
-            "docs/",
-            "memory-bank/",
-            "_projects/",
-        ),
-    )
+    if re.search(
+        r"(?i)(^|[\s:：])(?:[A-Za-z0-9_.-]+[\\/])+(?:[A-Za-z0-9_.-]+)?",
+        normalized,
+    ):
+        return True
+
+    if re.search(
+        r"(?i)\b[A-Za-z0-9_.-]+\.(?:txt|md|csv|json|docx|xlsx|pptx|pdf|py|ts|tsx|js|jsx|html|css|yaml|yml|toml|ini)\b",
+        normalized,
+    ):
+        return True
+
+    return False
 
 
 def _looks_like_utility_request(text: str) -> bool:
@@ -645,20 +1006,6 @@ def _looks_like_utility_request(text: str) -> bool:
         return False
 
     utility_terms = (
-        "current time",
-        "what time",
-        "time is it",
-        "current date",
-        "today's date",
-        "todays date",
-        "date today",
-        "weather",
-        "forecast",
-        "temperature",
-        "calculate",
-        "calculation",
-        "calculator",
-        "compute",
         "\u4eca\u306f\u4f55\u6642",
         "\u4eca\u4f55\u6642",
         "\u4f55\u6642",
@@ -671,6 +1018,14 @@ def _looks_like_utility_request(text: str) -> bool:
         "\u6c17\u6e29",
         "\u8a08\u7b97",
         "\u96fb\u5353",
+        "what time",
+        "current time",
+        "current date",
+        "current datetime",
+        "weather",
+        "temperature",
+        "calculate",
+        "calculator",
     )
     if _contains_any(normalized, utility_terms):
         return True
@@ -684,65 +1039,99 @@ def _looks_like_utility_request(text: str) -> bool:
 
 
 def _looks_like_project_management_request(text: str) -> bool:
-    if _contains_any(
+    if command_capabilities_from_text(text) & PROJECT_COMMAND_CAPABILITIES:
+        return True
+
+    if _contains_any(text, ("進捗", "進行状況")) and _contains_any(
         text,
         (
             "案件",
             "プロジェクト",
             "タスク",
-            "台帳",
-            "データベース",
-            "DB",
-            "todo",
-            "wbs",
-            "工数",
-            "タイマー",
-            "時間記録",
-            "作業ログ",
-            "time report",
-            "status report",
-            "project",
-            "record table",
-            "database",
-            "task",
-            "timer",
-            "案件",
-            "プロジェクト",
+            "予定",
+            "スケジュール",
+        ),
+    ):
+        return True
+
+    if _contains_any(
+        text,
+        (
+            "案件情報",
+            "案件情報DB",
+            "案件DB",
+            "プロジェクト情報",
+            "プロジェクトDB",
             "タスク",
+            "台帳",
             "WBS",
+            "工程表",
+            "課題管理",
+            "課題管理表",
+            "レコードテーブル",
+            "DBテーブル",
             "予定",
             "スケジュール",
-            "台帳",
-            "データベース",
-            "作業ログ",
-            "工数",
-        ),
-    ):
-        return True
-
-    if _contains_any(
-        text,
-        (
-            "スケジュール",
-            "予定",
             "カレンダー",
-            "schedule",
-            "calendar",
+            "期限",
         ),
     ):
         return True
+    if (
+        _contains_any(text, ("DB", "データベース"))
+        and _contains_any(
+            text,
+            (
+                "更新",
+                "整理",
+                "作成",
+                "登録",
+                "反映",
+                "保存",
+                "記録",
+                "メモ",
+                "覚えて",
+                "残して",
+                "DB化",
+                "データベース化",
+            ),
+        )
+        and len(str(text or "").strip()) <= 80
+    ):
+        return True
+    return False
 
-    return _contains_any(
-        text,
+
+def _looks_like_project_progress_review_request(text: str) -> bool:
+    if command_capability_active(text, "project_progress_review"):
+        return True
+
+    normalized = str(text or "")
+    if not normalized.strip():
+        return False
+    if _contains_any(normalized, ("進捗", "進行状況")) and _contains_any(
+        normalized,
         (
-            "進捗",
-            "ステータス",
-            "期限",
-            "締切",
-            "レポート",
-            "依頼",
-            "deadline",
-            "report",
-            "request",
+            "案件",
+            "プロジェクト",
+            "PJ",
+            "タスク",
+            "予定",
+            "スケジュール",
         ),
-    ) and _contains_any(text, ("案件", "プロジェクト", "タスク", "作業", "project", "task"))
+    ):
+        return True
+    if _contains_any(
+        normalized,
+        (
+            "案件進捗",
+            "プロジェクト進捗",
+            "進捗確認",
+            "状況確認",
+            "遅延確認",
+            "progress review",
+            "project progress",
+        ),
+    ):
+        return True
+    return False

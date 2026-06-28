@@ -14,7 +14,10 @@ import { ChatWebSocket } from "../../lib/websocket";
 import {
   generateMobileLlmReply,
   getConfiguredDirectMobileLlmSettings,
+  getConfiguredFallbackMobileLlmSettings,
   getMobileLlmSettings,
+  isDirectProvider,
+  type MobileLlmSettings,
 } from "../../lib/mobile-llm";
 import {
   conversationsRepo,
@@ -457,35 +460,92 @@ export function useConversationController(
       });
       setMessages((prev) => [...prev, localMessage]);
 
+      const appendDirectReply = async (
+        directSettings: MobileLlmSettings,
+        metadata: Record<string, unknown> = {},
+      ) => {
+        const reply = await generateMobileLlmReply(directSettings, messages, text);
+        const assistantMessage = await conversationsRepo.appendLocalMessage(
+          sessionId,
+          "assistant",
+          reply,
+          {
+            local_only: true,
+            direct_cloud: true,
+            provider: directSettings.provider,
+            model: directSettings.model,
+            ...metadata,
+          },
+        );
+        await conversationsRepo.mergeMessageMetadata(localMessage.id, {
+          pending: false,
+          message_state: "persisted",
+          direct_cloud: true,
+          ...metadata,
+        });
+        setMessages((prev) => [...prev, assistantMessage]);
+      };
+
       if (!isAuthenticated) {
         const settings = await getMobileLlmSettings();
-        const fallback = await getConfiguredDirectMobileLlmSettings(settings.provider);
-        if (fallback) {
+        const directMain = isDirectProvider(settings.provider)
+          ? settings
+          : await getConfiguredDirectMobileLlmSettings(settings.provider);
+        if (directMain) {
           setIsStreaming(true);
           try {
-            const reply = await generateMobileLlmReply(fallback, messages, text);
-            const assistantMessage = await conversationsRepo.appendLocalMessage(
-              sessionId,
-              "assistant",
-              reply,
-              {
-                local_only: true,
-                direct_cloud: true,
-                provider: fallback.provider,
-                model: fallback.model,
-              },
-            );
-            await conversationsRepo.mergeMessageMetadata(localMessage.id, {
-              pending: false,
-              message_state: "persisted",
-              direct_cloud: true,
+            await appendDirectReply(directMain);
+          } catch (directError) {
+            const fallback = isDirectProvider(settings.provider)
+              ? await getConfiguredFallbackMobileLlmSettings(settings.provider)
+              : null;
+            if (!fallback) {
+              setError(
+                directError instanceof Error
+                  ? directError.message
+                  : "メッセージ送信に失敗しました。",
+              );
+              return;
+            }
+            await appendDirectReply(fallback, {
+              fallback_from_direct: true,
+              main_error:
+                directError instanceof Error ? directError.message : "direct failed",
             });
-            setMessages((prev) => [...prev, assistantMessage]);
           } finally {
             setIsStreaming(false);
             setIsWaiting(false);
           }
         } else {
+          setIsWaiting(false);
+        }
+        return;
+      }
+
+      const settings = await getMobileLlmSettings();
+      if (isDirectProvider(settings.provider)) {
+        setIsStreaming(true);
+        try {
+          await appendDirectReply(settings);
+        } catch (directError) {
+          const fallback = await getConfiguredFallbackMobileLlmSettings(
+            settings.provider,
+          );
+          if (fallback) {
+            await appendDirectReply(fallback, {
+              fallback_from_direct: true,
+              main_error:
+                directError instanceof Error ? directError.message : "direct failed",
+            });
+            return;
+          }
+          setError(
+            directError instanceof Error
+              ? directError.message
+              : "メッセージ送信に失敗しました。",
+          );
+        } finally {
+          setIsStreaming(false);
           setIsWaiting(false);
         }
         return;
@@ -504,32 +564,17 @@ export function useConversationController(
         await conversationsRepo.markPendingMessageQueued(localMessage.id);
         scheduleRefresh();
       } catch (dispatchError) {
-        const settings = await getMobileLlmSettings();
-        const fallback = await getConfiguredDirectMobileLlmSettings(settings.provider);
+        const fallback = await getConfiguredFallbackMobileLlmSettings(
+          settings.provider,
+        );
         if (fallback) {
           setIsStreaming(true);
           try {
-            const reply = await generateMobileLlmReply(fallback, messages, text);
-            const assistantMessage = await conversationsRepo.appendLocalMessage(
-              sessionId,
-              "assistant",
-              reply,
-              {
-                local_only: true,
-                direct_cloud: true,
-                fallback_from_server: true,
-                provider: fallback.provider,
-                model: fallback.model,
-              },
-            );
-            await conversationsRepo.mergeMessageMetadata(localMessage.id, {
-              pending: false,
-              message_state: "persisted",
+            await appendDirectReply(fallback, {
               fallback_from_server: true,
               server_error:
                 dispatchError instanceof Error ? dispatchError.message : "dispatch failed",
             });
-            setMessages((prev) => [...prev, assistantMessage]);
             return;
           } finally {
             setIsStreaming(false);

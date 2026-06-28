@@ -34,11 +34,18 @@ from .generation_policy import (
     reset_current_generation_policy,
     set_current_generation_policy,
 )
+from .agentic_completion import (
+    render_messages_for_review,
+    run_agentic_completion_loop_sync,
+)
 from .agent_runtime import (
-    build_required_delegation_context_sync,
-    compose_required_delegation_user_message,
+    OpenAIToolCallRecord,
+    build_tool_hint_context_sync,
+    compose_tool_hint_user_message,
+    guard_tool_execution_claims,
 )
 from .tool_policy import reset_current_user_input, set_current_user_input
+from .unified_turn_runtime import RegistryToolRouter, UnifiedToolCall
 from ..services.user_settings_service import get_user_custom_instructions_sync
 
 
@@ -337,19 +344,23 @@ class GeminiLLMClient:
 
             # 統一レジストリからツール取得・実行
             registry = self._tool_registry
-            tool_def = registry.get(function_name)
-            if not tool_def:
+            if function_name not in registry:
                 return f"エラー: 未知の関数 '{function_name}'"
 
-            # ToolDefinition.execute() で実行（同期/非同期を自動処理）
             try:
-                if arguments:
-                    result = tool_def.execute(**arguments)
-                else:
-                    result = tool_def.execute()
+                result = RegistryToolRouter(
+                    registry,
+                    log_prefix="GeminiLLMClient",
+                    config=self.config,
+                ).execute(
+                    UnifiedToolCall(
+                        tool=function_name,
+                        arguments=dict(arguments or {}),
+                    )
+                )
 
-                print(f"[GeminiLLMClient] ツール結果: {result}")
-                return str(result)
+                print(f"[GeminiLLMClient] ツール結果: {result.model_output}")
+                return str(result.model_output)
                 
             except Exception as e:
                 error_msg = f"ツール実行エラー ({function_name}): {str(e)}"
@@ -502,16 +513,110 @@ class GeminiLLMClient:
                 )
             )
         except Exception as e:
-            print(f"[GeminiLLMClient] ContextBuilder failed; fallback to legacy context: {e}")
+            print(f"[GeminiLLMClient] ContextBuilder failed; fallback to basic context: {e}")
             return None
 
-    def _build_required_delegation_context(self, user_input: str) -> str:
-        return build_required_delegation_context_sync(
+    def _build_tool_hint_context(self, user_input: str) -> str:
+        return build_tool_hint_context_sync(
             user_input=user_input,
             registry=self._tool_registry,
             policy=get_client_generation_policy(self),
             log_prefix="GeminiLLMClient",
         )
+
+    def _render_gemini_context_for_review(
+        self,
+        context: List[Dict[str, Any]],
+        latest_user_message: Any,
+    ) -> str:
+        messages: list[dict[str, Any]] = []
+        for item in context[:-1]:
+            parts = item.get("parts", [])
+            if isinstance(parts, list):
+                content = "\n".join(str(part) for part in parts)
+            else:
+                content = str(parts)
+            messages.append({"role": item.get("role", "message"), "content": content})
+        messages.append({"role": "user", "content": latest_user_message})
+        return render_messages_for_review(messages)
+
+    def _run_agentic_review_once(
+        self,
+        prompt: str,
+        *,
+        generation_config: Any,
+        user_input: str,
+    ) -> str:
+        scenario_context = self._get_scenario_chat_context_sync()
+        effective_tools = self._get_effective_gemini_tools(scenario_context)
+        if scenario_context:
+            review_model = genai.GenerativeModel(
+                model_name=self.model_name,
+                safety_settings=(
+                    self.model._safety_settings
+                    if hasattr(self.model, "_safety_settings")
+                    else None
+                ),
+                tools=effective_tools if effective_tools else None,
+                system_instruction=(
+                    self.model._system_instruction
+                    if hasattr(self.model, "_system_instruction")
+                    else None
+                ),
+            )
+        else:
+            review_model = self.model
+        chat = review_model.start_chat(history=[])
+        latest_message: Any = prompt
+        tool_calls: list[OpenAIToolCallRecord] = []
+
+        for _ in range(5):
+            response = chat.send_message(
+                latest_message,
+                generation_config=generation_config,
+            )
+            candidates = getattr(response, "candidates", []) or []
+            if not candidates:
+                return ""
+            content = getattr(candidates[0], "content", None)
+            parts = getattr(content, "parts", []) if content else []
+            function_calls = []
+            text_parts = []
+            for part in parts:
+                if hasattr(part, "function_call") and part.function_call:
+                    function_calls.append(part.function_call)
+                elif hasattr(part, "text") and part.text:
+                    text_parts.append(part.text)
+
+            if text_parts:
+                return guard_tool_execution_claims("".join(text_parts), tool_calls)
+
+            if not function_calls:
+                return ""
+
+            function_response_parts = []
+            for func_call in function_calls:
+                function_name = func_call.name
+                arguments = dict(func_call.args) if func_call.args else {}
+                result = self._execute_tool(function_name, arguments)
+                tool_calls.append(
+                    OpenAIToolCallRecord(
+                        tool=function_name,
+                        arguments=arguments,
+                        result=result,
+                    )
+                )
+                function_response_parts.append(
+                    genai.protos.Part(
+                        function_response=genai.protos.FunctionResponse(
+                            name=function_name,
+                            response={"result": result},
+                        )
+                    )
+                )
+            latest_message = function_response_parts
+
+        return "ツール実行の上限に達したため、検証を完了できませんでした。"
 
     def generate_response(self,
                          user_input: str,
@@ -567,14 +672,14 @@ class GeminiLLMClient:
                 context = self._build_conversation_context(user_input)
 
             model_user_input = user_input
-            required_delegation_context = self._build_required_delegation_context(
+            tool_hint_context = self._build_tool_hint_context(
                 user_input
             )
-            model_user_input = compose_required_delegation_user_message(
+            model_user_input = compose_tool_hint_user_message(
                 user_input,
-                required_delegation_context,
+                tool_hint_context,
             )
-            if required_delegation_context:
+            if tool_hint_context:
                 if context:
                     context[-1]["parts"] = [model_user_input]
 
@@ -823,7 +928,7 @@ class GeminiLLMClient:
                     if tool_call_count >= max_tool_calls:
                         self._recent_tool_calls = []
                     
-                    # For queue operations, return immediately (keep legacy behavior)
+                    # For queue operations, return immediately.
                     if len(function_calls) == 1 and user_input and ("キューに" in user_input or "追加" in user_input):
                          # ... (existing queue logic)
                          self._recent_tool_calls = []
@@ -864,7 +969,22 @@ class GeminiLLMClient:
                     # Append any generated image tags to the final response
                     if 'generated_image_tags' in locals() and generated_image_tags:
                         response_text += "\n" + "\n".join(generated_image_tags)
-                    
+
+                    response_text = run_agentic_completion_loop_sync(
+                        client=self,
+                        run_once=lambda review_prompt: self._run_agentic_review_once(
+                            review_prompt,
+                            generation_config=generation_config,
+                            user_input=user_input,
+                        ),
+                        context=self._render_gemini_context_for_review(
+                            context,
+                            latest_message,
+                        ),
+                        user_input=user_input,
+                        initial_response=response_text,
+                    )
+
                     # Add to history (under lock to prevent interleaving with concurrent requests)
                     with self._history_lock:
                         self.conversation_history.append({"role": "user", "content": user_input})
@@ -911,6 +1031,20 @@ class GeminiLLMClient:
                         for part in final_response.candidates[0].content.parts:
                             if hasattr(part, 'text') and part.text:
                                 response_text = part.text
+                                response_text = run_agentic_completion_loop_sync(
+                                    client=self,
+                                    run_once=lambda review_prompt: self._run_agentic_review_once(
+                                        review_prompt,
+                                        generation_config=generation_config,
+                                        user_input=user_input,
+                                    ),
+                                    context=self._render_gemini_context_for_review(
+                                        context,
+                                        latest_message,
+                                    ),
+                                    user_input=user_input,
+                                    initial_response=response_text,
+                                )
                                 self.conversation_history.append({"role": "user", "content": user_input})
                                 self.conversation_history.append({"role": "assistant", "content": response_text})
                                 print(f"[GeminiLLMClient] 最終応答生成: {len(response_text)}文字")

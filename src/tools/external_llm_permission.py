@@ -60,8 +60,39 @@ COMMAND_TOOLS = {"execute_command"}
 
 EXTERNAL_SEARCH_TOOLS = {"web_search", "grok_x_search"}
 
+PROJECT_MANAGEMENT_MUTATION_TOOLS = {
+    "organize_project_information_from_folder",
+    "configure_project_management_files",
+    "upsert_project_info_category",
+    "archive_project_info_category",
+    "register_project_document",
+    "delete_project_document",
+    "upsert_project_fact",
+    "delete_project_fact",
+    "set_project_information_sync_state",
+    "create_record_table",
+    "append_record_rows",
+    "update_record_row",
+    "delete_record_rows",
+    "delete_record_table",
+    "create_task",
+    "update_task",
+    "delete_task",
+    "assign_task",
+    "schedule_task",
+    "start_timer",
+    "stop_timer",
+    "log_time",
+    "sync_issue_table",
+    "sync_wbs_tasks",
+}
+
 DEFAULT_PERMISSION_TOOLS = sorted(
-    EXTERNAL_SEARCH_TOOLS | FILE_WRITE_TOOLS | FILE_DELETE_TOOLS | COMMAND_TOOLS
+    EXTERNAL_SEARCH_TOOLS
+    | FILE_WRITE_TOOLS
+    | FILE_DELETE_TOOLS
+    | COMMAND_TOOLS
+    | PROJECT_MANAGEMENT_MUTATION_TOOLS
 )
 
 
@@ -141,7 +172,12 @@ class ExternalLLMPermissionManager:
         if permission_policy == PermissionPolicy.AUTO_APPROVE:
             return False
         if permission_policy == PermissionPolicy.CONFIRM_MUTATIONS:
-            return tool_name in (FILE_WRITE_TOOLS | FILE_DELETE_TOOLS | COMMAND_TOOLS)
+            return tool_name in (
+                FILE_WRITE_TOOLS
+                | FILE_DELETE_TOOLS
+                | COMMAND_TOOLS
+                | PROJECT_MANAGEMENT_MUTATION_TOOLS
+            )
         if permission_policy == PermissionPolicy.CONFIRM_ALL_TOOLS:
             return tool_name in self.enabled_tools
 

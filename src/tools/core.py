@@ -1,11 +1,11 @@
 """
 バックエンド非依存のツール定義
 
-OpenAI Agents SDK, Gemini API, CLI, SGLang 等のどのバックエンドでも
+OpenAI API, Gemini API, CLI, SGLang 等のどのバックエンドでも
 使える統一的なツール定義を提供する。
 """
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Union, get_type_hints
+from typing import Any, Callable, Dict, Iterable, List, Optional, Union, get_type_hints
 import asyncio
 import inspect
 
@@ -29,6 +29,13 @@ class ToolDefinition:
     function: Callable
     parameters: List[ToolParam] = field(default_factory=list)
     is_async: bool = False
+    risk: str = "low"
+    side_effect: str = "none"
+    requires_approval: bool = False
+    timeout_seconds: Optional[float] = None
+    supports_parallel: bool = True
+    owner: str = "core"
+    availability: Optional[Dict[str, Any]] = None
 
     def to_json_schema(self) -> Dict[str, Any]:
         """標準 JSON Schema フォーマットでパラメータ定義を返す"""
@@ -156,6 +163,11 @@ def tool(fn: Callable) -> "ToolDefinition":
             \"\"\"現在時刻を取得する\"\"\"
             ...
     """
+    if isinstance(fn, ToolDefinition):
+        return fn
+    if not callable(fn):
+        raise TypeError(f"@tool expects a callable, got {type(fn)}")
+
     sig = inspect.signature(fn)
     hints = get_type_hints(fn)
     raw_doc = inspect.getdoc(fn) or ""
@@ -188,3 +200,17 @@ def tool(fn: Callable) -> "ToolDefinition":
         parameters=params,
         is_async=inspect.iscoroutinefunction(fn),
     )
+
+
+def ensure_tool_definition(value: Any) -> ToolDefinition:
+    """関数または ToolDefinition を ToolDefinition に正規化する。"""
+    if isinstance(value, ToolDefinition):
+        return value
+    if callable(value):
+        return tool(value)
+    raise TypeError(f"Expected ToolDefinition or callable, got {type(value)}")
+
+
+def ensure_tool_definitions(values: Iterable[Any]) -> List[ToolDefinition]:
+    """複数ツールを ToolDefinition リストへ正規化する。"""
+    return [ensure_tool_definition(value) for value in values]

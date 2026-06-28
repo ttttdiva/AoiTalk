@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
-from agents import function_tool
+from ...tools.core import tool
 from sqlalchemy import select
 
 from .common import (
@@ -59,10 +59,107 @@ def _normalize_management_file_path(
     return text
 
 
+def _clip_project_info_text(value: object, max_chars: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 1)].rstrip() + "..."
+
+
+def _bounded_project_info_limit(value: object, default: int) -> int:
+    try:
+        parsed = int(value or default)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, min(parsed, 50))
+
+
+def _compact_project_information_payload(
+    payload: dict,
+    *,
+    fact_limit: int,
+    document_limit: int,
+    record_table_limit: int,
+) -> dict:
+    project = payload.get("project") if isinstance(payload.get("project"), dict) else {}
+    categories = payload.get("categories") if isinstance(payload.get("categories"), list) else []
+    documents = payload.get("documents") if isinstance(payload.get("documents"), list) else []
+    facts = payload.get("facts") if isinstance(payload.get("facts"), list) else []
+    record_tables = (
+        payload.get("record_tables")
+        if isinstance(payload.get("record_tables"), list)
+        else []
+    )
+
+    return {
+        "project": {
+            "id": project.get("id"),
+            "name": project.get("name"),
+            "slug": project.get("slug"),
+            "description": _clip_project_info_text(project.get("description"), 240),
+        },
+        "counts": {
+            "categories": len(categories),
+            "documents": len(documents),
+            "management_documents": len(payload.get("management_documents") or []),
+            "facts": len(facts),
+            "record_tables": len(record_tables),
+            "sync_states": len(payload.get("sync_states") or []),
+        },
+        "categories": [
+            {
+                "id": item.get("id"),
+                "key": item.get("key"),
+                "label": item.get("label"),
+                "status": item.get("status"),
+            }
+            for item in categories
+        ],
+        "documents": [
+            {
+                "id": item.get("id"),
+                "title": item.get("title"),
+                "document_type": item.get("document_type"),
+                "target_kind": item.get("target_kind"),
+                "file_path": item.get("file_path"),
+                "record_table_id": item.get("record_table_id"),
+                "external_url": item.get("external_url"),
+                "role": item.get("role"),
+                "is_primary": item.get("is_primary"),
+                "ai_access_level": item.get("ai_access_level"),
+                "description": _clip_project_info_text(item.get("description"), 180),
+            }
+            for item in documents[:document_limit]
+            if isinstance(item, dict)
+        ],
+        "management_documents": payload.get("management_documents") or [],
+        "facts": [
+            {
+                "id": item.get("id"),
+                "title": item.get("title"),
+                "content": _clip_project_info_text(item.get("content"), 240),
+                "fact_type": item.get("fact_type"),
+                "importance": item.get("importance"),
+                "confidence": item.get("confidence"),
+                "status": item.get("status"),
+                "source_ref": item.get("source_ref"),
+            }
+            for item in facts[:fact_limit]
+            if isinstance(item, dict)
+        ],
+        "record_tables": record_tables[:record_table_limit],
+        "sync_states": payload.get("sync_states") or [],
+        "output_note": (
+            "This is a compact project information summary. "
+            "Call list_project_information(detail_level='full') only when exact full records are required."
+        ),
+    }
+
+
 def build_project_info_tools() -> list:
     """プロジェクト情報DB（カテゴリ・文書リンク・ファクト・同期状態）関連ツールのツール群を生成して返す。"""
 
-    @function_tool
+    @tool
     def get_project_context(project_id: str = "") -> str:
         """Get the active project context or a specific project context/name."""
         from ...memory.database import get_database_manager
@@ -98,7 +195,7 @@ def build_project_info_tools() -> list:
             return f"Project not found: {project_id}"
         return format_project_context_for_prompt(context)
 
-    @function_tool
+    @tool
     def list_projects(project: str = "") -> str:
         """List accessible projects and optionally filter by UUID, slug, or project name."""
         from ...memory.database import get_database_manager
@@ -139,13 +236,17 @@ def build_project_info_tools() -> list:
 
         return _json(_run_async(_list()))
 
-    @function_tool
+    @tool
     def list_project_information(
         project: str = "",
         project_id: str = "",
         include_archived: bool = False,
+        detail_level: str = "summary",
+        limit_facts: int = 12,
+        limit_documents: int = 8,
+        limit_record_tables: int = 8,
     ) -> str:
-        """List project information categories, document links, durable facts, record tables, and sync state."""
+        """List project information categories, document links, durable facts, record tables, and sync state. Defaults to compact summary; set detail_level='full' for exact full records."""
         from ...memory.database import get_database_manager
         from ...memory.models import (
             Project,
@@ -228,7 +329,7 @@ def build_project_info_tools() -> list:
                     )
                 )
                 await session.commit()
-                return {
+                payload = {
                     "project": project_obj.to_dict() if project_obj else None,
                     "categories": [
                         category.to_dict()
@@ -263,6 +364,22 @@ def build_project_info_tools() -> list:
                         for state in sync_states_result.scalars().all()
                     ],
                 }
+                if str(detail_level or "summary").strip().casefold() in {
+                    "full",
+                    "all",
+                    "detail",
+                    "detailed",
+                }:
+                    return payload
+                return _compact_project_information_payload(
+                    payload,
+                    fact_limit=_bounded_project_info_limit(limit_facts, 12),
+                    document_limit=_bounded_project_info_limit(limit_documents, 8),
+                    record_table_limit=_bounded_project_info_limit(
+                        limit_record_tables,
+                        8,
+                    ),
+                )
             except Exception:
                 await session.rollback()
                 raise
@@ -274,7 +391,7 @@ def build_project_info_tools() -> list:
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
 
-    @function_tool
+    @tool
     def organize_project_information_from_folder(
         folder_path: str = "",
         project: str = "",
@@ -345,7 +462,7 @@ def build_project_info_tools() -> list:
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
 
-    @function_tool
+    @tool
     def configure_project_management_files(
         project: str = "",
         project_id: str = "",
@@ -430,7 +547,7 @@ def build_project_info_tools() -> list:
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
 
-    @function_tool
+    @tool
     def upsert_project_info_category(
         label: str,
         project: str = "",
@@ -507,7 +624,7 @@ def build_project_info_tools() -> list:
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
 
-    @function_tool
+    @tool
     def register_project_document(
         title: str,
         project: str = "",
@@ -649,7 +766,7 @@ def build_project_info_tools() -> list:
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
 
-    @function_tool
+    @tool
     def archive_project_info_category(
         category: str = "",
         category_id: str = "",
@@ -695,7 +812,7 @@ def build_project_info_tools() -> list:
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
 
-    @function_tool
+    @tool
     def delete_project_document(document_id: str) -> str:
         """Soft-delete a registered project document/link by id."""
         from ...memory.database import get_database_manager
@@ -728,7 +845,7 @@ def build_project_info_tools() -> list:
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
 
-    @function_tool
+    @tool
     def upsert_project_fact(
         title: str,
         content: str,
@@ -828,7 +945,7 @@ def build_project_info_tools() -> list:
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
 
-    @function_tool
+    @tool
     def delete_project_fact(fact_id: str) -> str:
         """Soft-delete a durable project fact by id."""
         from ...memory.database import get_database_manager
@@ -861,7 +978,7 @@ def build_project_info_tools() -> list:
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
 
-    @function_tool
+    @tool
     def list_project_tasks_changed_since(
         project: str = "",
         project_id: str = "",
@@ -964,7 +1081,7 @@ def build_project_info_tools() -> list:
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
 
-    @function_tool
+    @tool
     def set_project_information_sync_state(
         project: str = "",
         project_id: str = "",

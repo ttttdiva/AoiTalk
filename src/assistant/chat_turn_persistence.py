@@ -23,6 +23,67 @@ class PersistedTurnMessages:
     assistant_message: Optional[ConversationMessage] = None
 
 
+@dataclass
+class ClientUserContextSnapshot:
+    had_session_user_id: bool
+    session_user_id: Any = None
+    had_session_metadata: bool = False
+    session_metadata: Any = None
+    had_system_prompt: bool = False
+    system_prompt: Any = None
+
+
+def apply_turn_user_context_to_client(
+    llm_client: Any,
+    *,
+    sender_user_id: Optional[str] = None,
+    sender_display_name: Optional[str] = None,
+) -> Optional[ClientUserContextSnapshot]:
+    """Apply the Web turn sender as the LLM memory user for one generation."""
+
+    user_id = str(sender_user_id or "").strip()
+    if not user_id or not hasattr(llm_client, "set_session_context"):
+        return None
+
+    snapshot = ClientUserContextSnapshot(
+        had_session_user_id=hasattr(llm_client, "session_user_id"),
+        session_user_id=getattr(llm_client, "session_user_id", None),
+        had_session_metadata=hasattr(llm_client, "session_metadata"),
+        session_metadata=dict(getattr(llm_client, "session_metadata", {}) or {}),
+        had_system_prompt=hasattr(llm_client, "system_prompt"),
+        system_prompt=getattr(llm_client, "system_prompt", None),
+    )
+    metadata = {"platform": "web"}
+    display_name = str(sender_display_name or "").strip()
+    if display_name:
+        metadata["username"] = display_name
+    llm_client.set_session_context(user_id=user_id, metadata=metadata)
+    return snapshot
+
+
+def restore_turn_user_context_on_client(
+    llm_client: Any,
+    snapshot: Optional[ClientUserContextSnapshot],
+) -> None:
+    if snapshot is None:
+        return
+
+    if snapshot.had_session_user_id:
+        llm_client.session_user_id = snapshot.session_user_id
+    elif hasattr(llm_client, "session_user_id"):
+        delattr(llm_client, "session_user_id")
+
+    if snapshot.had_session_metadata:
+        llm_client.session_metadata = snapshot.session_metadata
+    elif hasattr(llm_client, "session_metadata"):
+        delattr(llm_client, "session_metadata")
+
+    if snapshot.had_system_prompt:
+        llm_client.system_prompt = snapshot.system_prompt
+    elif hasattr(llm_client, "system_prompt"):
+        delattr(llm_client, "system_prompt")
+
+
 class ChatTurnPersistence:
     """Centralizes DB-backed save/restore for web chat turns."""
 
@@ -106,7 +167,7 @@ class ChatTurnPersistence:
         prompt_messages: list[PromptMessage] = []
         for msg in messages:
             if excluded and str(msg.id) == excluded:
-                continue
+                break
             if msg.role not in {"system", "user", "assistant"}:
                 continue
             prompt_messages.append({"role": msg.role, "content": msg.content})
@@ -140,3 +201,7 @@ class ChatTurnPersistence:
             llm_client._loaded_history_session_id = session_id
         if hasattr(llm_client, "_loaded_session_id"):
             llm_client._loaded_session_id = session_id
+        if hasattr(llm_client, "_history_session_id"):
+            llm_client._history_session_id = session_id
+        if hasattr(llm_client, "_context_window_override_tokens"):
+            llm_client._context_window_override_tokens = None

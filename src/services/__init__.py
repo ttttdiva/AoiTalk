@@ -15,6 +15,7 @@ from .git_service import (
 from .project_context import (
     ProjectContextResolver,
     build_project_context,
+    format_minimal_project_context_for_chat_prompt,
     format_project_context_for_chat_prompt,
     format_project_context_for_prompt,
     get_runtime_project_context,
@@ -34,6 +35,7 @@ __all__ = [
     "get_project_directory",
     "ProjectContextResolver",
     "build_project_context",
+    "format_minimal_project_context_for_chat_prompt",
     "format_project_context_for_chat_prompt",
     "format_project_context_for_prompt",
     "get_runtime_project_context",

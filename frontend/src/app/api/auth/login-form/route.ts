@@ -7,6 +7,7 @@ import {
   createSessionToken,
   verifyPassword,
 } from "@/lib/auth";
+import { recordWebUILoginLog } from "@/lib/server/login-log";
 
 export async function POST(request: NextRequest) {
   const formData = await request.formData();
@@ -18,8 +19,15 @@ export async function POST(request: NextRequest) {
   const loginUrl = new URL("/login", baseUrl);
 
   if (!username || !password) {
+    await recordWebUILoginLog({
+      username,
+      action: "login",
+      request,
+      success: false,
+      failureReason: "missing_credentials",
+    });
     loginUrl.searchParams.set("error", "missing");
-    return NextResponse.redirect(loginUrl);
+    return NextResponse.redirect(loginUrl, { status: 303 });
   }
 
   const [user] = await db
@@ -29,19 +37,40 @@ export async function POST(request: NextRequest) {
     .limit(1);
 
   if (!user || !user.passwordHash) {
+    await recordWebUILoginLog({
+      username,
+      action: "login",
+      request,
+      success: false,
+      failureReason: "invalid_credentials",
+    });
     loginUrl.searchParams.set("error", "auth_failed");
-    return NextResponse.redirect(loginUrl);
+    return NextResponse.redirect(loginUrl, { status: 303 });
   }
 
   const valid = await verifyPassword(password, user.passwordHash);
   if (!valid) {
+    await recordWebUILoginLog({
+      username,
+      action: "login",
+      request,
+      success: false,
+      failureReason: "invalid_credentials",
+    });
     loginUrl.searchParams.set("error", "auth_failed");
-    return NextResponse.redirect(loginUrl);
+    return NextResponse.redirect(loginUrl, { status: 303 });
   }
 
   if (!user.isActive) {
+    await recordWebUILoginLog({
+      username,
+      action: "login",
+      request,
+      success: false,
+      failureReason: "account_disabled",
+    });
     loginUrl.searchParams.set("error", "inactive");
-    return NextResponse.redirect(loginUrl);
+    return NextResponse.redirect(loginUrl, { status: 303 });
   }
 
   // Set-Cookie を確実にリダイレクトレスポンスに乗せるため、
@@ -54,10 +83,19 @@ export async function POST(request: NextRequest) {
     .set({ lastLogin: new Date() })
     .where(eq(users.id, user.id));
 
+  await recordWebUILoginLog({
+    username: user.username,
+    action: "login",
+    request,
+    success: true,
+  });
+
   const destination = user.isPasswordResetRequired
     ? "/settings?password=required"
     : "/chat";
-  const response = NextResponse.redirect(new URL(destination, baseUrl));
+  const response = NextResponse.redirect(new URL(destination, baseUrl), {
+    status: 303,
+  });
   attachSessionCookie(response, token, protocol === "https");
   return response;
 }

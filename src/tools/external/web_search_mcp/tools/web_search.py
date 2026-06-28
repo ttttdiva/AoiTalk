@@ -1,4 +1,4 @@
-"""Web検索ツール（OpenAI Agents SDK WebSearchTool使用）"""
+"""Web検索ツール（OpenAI Responses API Web Search使用）"""
 
 from __future__ import annotations
 
@@ -24,20 +24,22 @@ def register(mcp: FastMCP):
             return "Web検索を使用するにはOPENAI_API_KEYが必要です。"
 
         try:
-            from agents import Agent, WebSearchTool, Runner
+            from openai import AsyncOpenAI
 
-            agent = Agent(
-                name="web-search-agent",
-                model="gpt-4o",
-                tools=[WebSearchTool()],
-                instructions="あなたはWeb検索アシスタントです。与えられたクエリについて最新の情報を検索し、簡潔で正確な回答を日本語で提供してください。"
+            client = AsyncOpenAI(api_key=api_key)
+            response = await client.responses.create(
+                model="gpt-4o-mini",
+                tools=[{"type": "web_search_preview"}],
+                input=(
+                    "あなたはWeb検索アシスタントです。"
+                    "与えられたクエリについて最新の情報を検索し、"
+                    "簡潔で正確な回答を日本語で提供してください。\n\n"
+                    f"検索クエリ: {query}"
+                ),
             )
 
-            runner = Runner()
-            response = await runner.run(agent, f"以下について検索して教えてください：{query}")
-
-            if response and hasattr(response, 'text'):
-                return response.text
+            if response and hasattr(response, 'output_text'):
+                return response.output_text
             elif response:
                 return str(response)
             else:

@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel
 
+from ...llm.tool_policy import looks_like_project_management_request
+
 
 class ChatMessage(BaseModel):
     type: str  # 'user', 'assistant', 'system'
@@ -39,10 +41,20 @@ class ConversationDispatchRequest(BaseModel):
     edit_message_id: Optional[str] = None
     response_model: Optional[ResponseModelSelection] = None
     client_message_id: Optional[str] = None
+    command_capabilities: Optional[List[str]] = None
     skip_user_persistence: bool = False
     persisted_user_message_id: Optional[str] = None
     attachments: Optional[List[Dict[str, Any]]] = None
     attachment_context: Optional[str] = None
+
+
+def effective_include_project_context(
+    *,
+    message: str,
+    requested: bool,
+) -> bool:
+    """Force project context for requests that explicitly need project evidence."""
+    return bool(requested or looks_like_project_management_request(message or ""))
 
 
 def sanitize_response_model_selection(value: Any) -> Optional[Dict[str, str]]:

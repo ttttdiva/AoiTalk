@@ -639,17 +639,14 @@ def create_task_router(
                     status_code=400, detail="Inboxスペースは削除できません"
                 )
 
-            # スペース内プロジェクトは所属解除（Web BFF と同じ挙動）
-            from sqlalchemy import update as sa_update
-
-            await session.execute(
-                sa_update(Project)
-                .where(Project.space_id == space.id)
-                .values(space_id=None)
+            deleted_project_count = await ProjectRepository.delete_projects_in_space(
+                session,
+                space.id,
+                delete_workspaces=True,
             )
             await session.delete(space)
             await session.commit()
-            return {"success": True}
+            return {"success": True, "deleted_project_count": deleted_project_count}
         finally:
             await session.close()
 

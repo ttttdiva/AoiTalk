@@ -57,6 +57,11 @@ import {
   explorerSave,
 } from "@/lib/explorer-api";
 import {
+  buildFallbackMigemoTerms,
+  findIncrementalSearchMatch,
+  type FilerSearchItem,
+} from "@/lib/migemo-lite";
+import {
   createProjectRecordTable,
   deleteProjectRecordTable,
   isRecordTableFile,
@@ -669,6 +674,19 @@ function NewRecordTableDialog({
 
 function ExplorerContent() {
   const explorerRootRef = useRef<HTMLDivElement>(null);
+  const explorerScrollRef = useRef<HTMLDivElement>(null);
+  const incrementalSearchRef = useRef<{
+    query: string;
+    lastInputAt: number;
+    timeoutId: number | null;
+    requestId: number;
+  }>({
+    query: "",
+    lastInputAt: 0,
+    timeoutId: null,
+    requestId: 0,
+  });
+  const activePathRef = useRef<string | null>(null);
   const searchParams = useSearchParams();
   const {
     currentPath,
@@ -741,7 +759,9 @@ function ExplorerContent() {
           path: f.path,
           type: f.type || "audio",
           rootPath: isAbsoluteFilerPath ? currentPath : contextRootPath || "",
-          sourceKind: isAbsoluteFilerPath ? "filer" as const : "explorer" as const,
+          sourceKind: isAbsoluteFilerPath
+            ? ("filer" as const)
+            : ("explorer" as const),
         })),
     [browseData, contextRootPath, currentPath, isAbsoluteFilerPath],
   );
@@ -780,8 +800,8 @@ function ExplorerContent() {
   const activePath =
     focusedItemPath && itemByPath.has(focusedItemPath)
       ? focusedItemPath
-      : selectedPaths[0] ?? null;
-  const activeItem = activePath ? itemByPath.get(activePath) ?? null : null;
+      : (selectedPaths[0] ?? null);
+  const activeItem = activePath ? (itemByPath.get(activePath) ?? null) : null;
   const canUseFileShortcuts =
     !isAbsoluteFilerPath && !isHfMode && filerTab !== "hydrus";
   const isExplorerInteractionBlocked =
@@ -995,19 +1015,6 @@ function ExplorerContent() {
     await refresh();
   }, [canUseFileShortcuts, clearSelection, itemByPath, refresh, selectedPaths]);
 
-  const getGridColumnCount = useCallback(() => {
-    if (viewMode !== "grid") return 1;
-    const grid = explorerRootRef.current?.querySelector(
-      '[data-explorer-grid="true"]',
-    );
-    if (!(grid instanceof HTMLElement)) return 1;
-    const columns = window
-      .getComputedStyle(grid)
-      .gridTemplateColumns.split(" ")
-      .filter(Boolean).length;
-    return Math.max(1, columns);
-  }, [viewMode]);
-
   const getRenderedItemPaths = useCallback(() => {
     const renderedPaths = Array.from(
       explorerRootRef.current?.querySelectorAll<HTMLElement>(
@@ -1020,6 +1027,33 @@ function ExplorerContent() {
       ? renderedPaths
       : visibleItems.map((item) => item.path);
   }, [itemByPath, visibleItems]);
+
+  const focusRenderedItemPath = useCallback(
+    (path: string) => {
+      activePathRef.current = path;
+      selectItem(path);
+      window.requestAnimationFrame(() => {
+        const element = Array.from(
+          explorerRootRef.current?.querySelectorAll<HTMLElement>(
+            "[data-explorer-item-path]",
+          ) ?? [],
+        ).find((item) => item.dataset.explorerItemPath === path);
+        element?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      });
+    },
+    [selectItem],
+  );
+
+  const focusItemByIndex = useCallback(
+    (index: number) => {
+      const itemPaths = getRenderedItemPaths();
+      if (itemPaths.length === 0) return;
+      const nextIndex = Math.max(0, Math.min(itemPaths.length - 1, index));
+      const nextPath = itemPaths[nextIndex];
+      if (nextPath) focusRenderedItemPath(nextPath);
+    },
+    [focusRenderedItemPath, getRenderedItemPaths],
+  );
 
   const focusItemByOffset = useCallback(
     (offset: number) => {
@@ -1035,10 +1069,25 @@ function ExplorerContent() {
             : 0
           : Math.max(0, Math.min(itemPaths.length - 1, currentIndex + offset));
       const nextPath = itemPaths[nextIndex];
-      if (nextPath) selectItem(nextPath);
+      if (nextPath) focusRenderedItemPath(nextPath);
     },
-    [activePath, getRenderedItemPaths, selectItem],
+    [activePath, focusRenderedItemPath, getRenderedItemPaths],
   );
+
+  const getVisibleItemPageSize = useCallback(() => {
+    const scrollRoot = explorerScrollRef.current ?? explorerRootRef.current;
+    if (!scrollRoot) return 10;
+    const scrollRect = scrollRoot.getBoundingClientRect();
+    const visibleCount = Array.from(
+      explorerRootRef.current?.querySelectorAll<HTMLElement>(
+        "[data-explorer-item-path]",
+      ) ?? [],
+    ).filter((item) => {
+      const rect = item.getBoundingClientRect();
+      return rect.bottom > scrollRect.top && rect.top < scrollRect.bottom;
+    }).length;
+    return Math.max(1, visibleCount || 10);
+  }, []);
 
   const openExplorerItem = useCallback(
     (item: ExplorerItem) => {
@@ -1050,6 +1099,111 @@ function ExplorerContent() {
     },
     [handleFileClick, navigate],
   );
+
+  const getRenderedSearchItems = useCallback((): FilerSearchItem[] => {
+    return getRenderedItemPaths()
+      .map((path) => itemByPath.get(path))
+      .filter((item): item is ExplorerItem => !!item)
+      .map((item) => ({ path: item.path, name: item.name }));
+  }, [getRenderedItemPaths, itemByPath]);
+
+  const focusSearchMatch = useCallback(
+    (
+      terms: string[],
+      baseActivePath: string | null = activePathRef.current,
+    ) => {
+      const match = findIncrementalSearchMatch(
+        getRenderedSearchItems(),
+        baseActivePath,
+        terms,
+      );
+      if (!match) return null;
+      focusRenderedItemPath(match.path);
+      return match.path;
+    },
+    [focusRenderedItemPath, getRenderedSearchItems],
+  );
+
+  const handleIncrementalSearchCharacter = useCallback(
+    (input: string) => {
+      const state = incrementalSearchRef.current;
+      const now = Date.now();
+      if (state.timeoutId !== null) {
+        window.clearTimeout(state.timeoutId);
+      }
+
+      state.query =
+        now - state.lastInputAt <= 1000 ? state.query + input : input;
+      state.lastInputAt = now;
+      state.timeoutId = window.setTimeout(() => {
+        state.query = "";
+        state.timeoutId = null;
+      }, 1000);
+
+      const query = state.query;
+      const requestId = state.requestId + 1;
+      state.requestId = requestId;
+      const baseActivePath = activePathRef.current;
+      const fallbackTerms = buildFallbackMigemoTerms(query);
+      const fallbackFocusedPath =
+        focusSearchMatch(fallbackTerms, baseActivePath) ?? baseActivePath;
+
+      void (async () => {
+        try {
+          const params = new URLSearchParams({ q: query, limit: "240" });
+          const response = await fetch(`/api/migemo?${params.toString()}`, {
+            credentials: "include",
+            cache: "no-store",
+          });
+          if (!response.ok) return;
+          const data = (await response.json()) as {
+            terms?: string[];
+          };
+          if (
+            incrementalSearchRef.current.requestId !== requestId ||
+            incrementalSearchRef.current.query !== query
+          ) {
+            return;
+          }
+          const terms =
+            data.terms && data.terms.length > 0 ? data.terms : fallbackTerms;
+          focusSearchMatch(terms, fallbackFocusedPath);
+        } catch {
+          // Fallback terms already ran synchronously.
+        }
+      })();
+    },
+    [focusSearchMatch],
+  );
+
+  useEffect(() => {
+    activePathRef.current = activePath;
+  }, [activePath]);
+
+  useEffect(() => {
+    if (loading || isExplorerInteractionBlocked || activePath) return;
+    if (!browseData || visibleItems.length === 0) return;
+    const frame = window.requestAnimationFrame(() => {
+      const firstPath = getRenderedItemPaths()[0] ?? visibleItems[0]?.path;
+      if (firstPath) focusRenderedItemPath(firstPath);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [
+    activePath,
+    browseData,
+    focusRenderedItemPath,
+    getRenderedItemPaths,
+    isExplorerInteractionBlocked,
+    loading,
+    visibleItems,
+  ]);
+
+  useEffect(() => {
+    return () => {
+      const timeoutId = incrementalSearchRef.current.timeoutId;
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+    };
+  }, []);
 
   useEffect(() => {
     const isTextInput = (target: EventTarget | null) => {
@@ -1072,6 +1226,14 @@ function ExplorerContent() {
       if (isExplorerInteractionBlocked || isTextInput(e.target)) return;
       const key = e.key.toLowerCase();
       const primaryModifier = e.ctrlKey || e.metaKey;
+      const activePathForEvent =
+        activePathRef.current ??
+        activePath ??
+        getRenderedItemPaths()[0] ??
+        null;
+      const activeItemForEvent = activePathForEvent
+        ? (itemByPath.get(activePathForEvent) ?? null)
+        : null;
 
       if (!primaryModifier && e.altKey && !e.shiftKey) {
         if (e.key === "ArrowLeft" || e.key === "Backspace") {
@@ -1125,25 +1287,37 @@ function ExplorerContent() {
         let offset = 0;
         if (e.key === "ArrowLeft") offset = -1;
         if (e.key === "ArrowRight") offset = 1;
-        if (e.key === "ArrowUp") offset = -getGridColumnCount();
-        if (e.key === "ArrowDown") offset = getGridColumnCount();
+        if (e.key === "ArrowUp") offset = -1;
+        if (e.key === "ArrowDown") offset = 1;
+        if (e.key === "PageUp") offset = -getVisibleItemPageSize();
+        if (e.key === "PageDown") offset = getVisibleItemPageSize();
         if (offset !== 0) {
           e.preventDefault();
           focusItemByOffset(offset);
           return;
         }
+        if (e.key === "Home") {
+          e.preventDefault();
+          focusItemByIndex(0);
+          return;
+        }
+        if (e.key === "End") {
+          e.preventDefault();
+          focusItemByIndex(Number.MAX_SAFE_INTEGER);
+          return;
+        }
       }
       if (!primaryModifier && !e.altKey && !e.shiftKey && e.key === "Enter") {
-        if (activeItem) {
+        if (activeItemForEvent) {
           e.preventDefault();
-          openExplorerItem(activeItem);
+          openExplorerItem(activeItemForEvent);
         }
         return;
       }
       if (!primaryModifier && !e.altKey && !e.shiftKey && e.key === "F2") {
-        if (canUseFileShortcuts && activeItem) {
+        if (canUseFileShortcuts && activeItemForEvent) {
           e.preventDefault();
-          setRenameTarget(activeItem);
+          setRenameTarget(activeItemForEvent);
         }
         return;
       }
@@ -1157,6 +1331,16 @@ function ExplorerContent() {
       ) {
         e.preventDefault();
         void deleteSelectedItems();
+        return;
+      }
+      if (
+        !primaryModifier &&
+        !e.altKey &&
+        e.key.length === 1 &&
+        !e.isComposing
+      ) {
+        e.preventDefault();
+        handleIncrementalSearchCharacter(e.key);
       }
     };
     window.addEventListener("keydown", handleKeyDown);
@@ -1167,13 +1351,17 @@ function ExplorerContent() {
     copySelectedItems,
     deleteSelectedItems,
     extractSelectedItems,
-    activeItem,
+    activePath,
+    focusItemByIndex,
     focusItemByOffset,
-    getGridColumnCount,
+    getVisibleItemPageSize,
+    getRenderedItemPaths,
     goBack,
     goForward,
     goUp,
+    handleIncrementalSearchCharacter,
     isExplorerInteractionBlocked,
+    itemByPath,
     openExplorerItem,
     pasteClipboardItems,
     selectAll,
@@ -1273,7 +1461,10 @@ function ExplorerContent() {
         />
       ) : (
         <UploadZone onContextMenu={handleBackgroundContextMenu}>
-          <div className="flex h-full flex-col overflow-auto p-4 space-y-3">
+          <div
+            ref={explorerScrollRef}
+            className="flex h-full flex-col overflow-auto p-4 space-y-3"
+          >
             {/* ヘッダー: タイトル + Git */}
             <div className="flex items-center justify-between">
               <h1 className="text-lg font-bold">ファイラー</h1>

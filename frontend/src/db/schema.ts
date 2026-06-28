@@ -71,6 +71,7 @@ export const projects = pgTable("projects", {
   isCompleted: boolean("is_completed").default(false),
   createdAt: timestamp("created_at"),
   updatedAt: timestamp("updated_at"),
+  deletedAt: timestamp("deleted_at"),
   projectMetadata: json("project_metadata"),
 });
 
@@ -525,6 +526,36 @@ export const conversationMessages = pgTable("conversation_messages", {
   parentMessageId: uuid("parent_message_id"),
   branchIndex: integer("branch_index").default(0),
   isActiveBranch: boolean("is_active_branch").default(true),
+});
+
+export const conversationArchives = pgTable("conversation_archives", {
+  id: uuid("id")
+    .primaryKey()
+    .$defaultFn(() => crypto.randomUUID()),
+  userId: varchar("user_id").notNull(),
+  characterName: varchar("character_name").notNull(),
+  originalSessionId: varchar("original_session_id"),
+  summary: text("summary").notNull(),
+  messageCount: integer("message_count"),
+  startTime: timestamp("start_time"),
+  endTime: timestamp("end_time"),
+  messageMetadata: json("message_metadata"),
+  archivedAt: timestamp("archived_at"),
+});
+
+export const conversationHistory = pgTable("conversation_history", {
+  id: uuid("id")
+    .primaryKey()
+    .$defaultFn(() => crypto.randomUUID()),
+  userId: varchar("user_id").notNull(),
+  sessionId: uuid("session_id"),
+  characterName: varchar("character_name").notNull(),
+  role: varchar("role").notNull(),
+  content: text("content").notNull(),
+  messageMetadata: json("message_metadata"),
+  createdAt: timestamp("created_at"),
+  tokenCount: integer("token_count"),
+  functionCallData: json("function_call_data"),
 });
 
 // ─── タスク活動ログ ───

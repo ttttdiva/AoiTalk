@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from agents import function_tool
+from ...tools.core import tool
 
 from .common import (
     _run_async,
@@ -17,7 +17,7 @@ from .common import (
 def build_time_tools() -> list:
     """タイマー・時間記録・カレンダー・レポート関連ツールのツール群を生成して返す。"""
 
-    @function_tool
+    @tool
     def start_timer(task_id: str, occurrence_id: str = "") -> str:
         """Start a timer for a task and auto-stop any existing active timer."""
         from ...memory.database import get_database_manager
@@ -49,7 +49,7 @@ def build_time_tools() -> list:
 
         return _json(_run_async(_start()))
 
-    @function_tool
+    @tool
     def stop_timer(time_entry_id: str = "") -> str:
         """Stop the active timer or a specific active time entry."""
         from ...memory.database import get_database_manager
@@ -83,7 +83,7 @@ def build_time_tools() -> list:
 
         return _json(_run_async(_stop()))
 
-    @function_tool
+    @tool
     def log_time(
         task_id: str,
         started_at: str,
@@ -124,7 +124,7 @@ def build_time_tools() -> list:
 
         return _json(_run_async(_log()))
 
-    @function_tool
+    @tool
     def list_calendar(
         project: str = "",
         project_id: str = "",
@@ -157,7 +157,7 @@ def build_time_tools() -> list:
 
         return _json(_run_async(_list()))
 
-    @function_tool
+    @tool
     def get_time_report(
         project: str = "",
         project_id: str = "",

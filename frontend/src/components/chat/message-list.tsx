@@ -17,6 +17,10 @@ import {
   Download,
   ExternalLink,
   Package,
+  Search,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -34,15 +38,17 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { AgentRunTimeline } from "@/components/chat/agent-run-timeline";
 import type {
   ChatAttachmentMetadata,
+  ChatGenerationMetrics,
+  ChatToolResultMetadata,
   ChatResponseModelOption,
   ChatResponseModelSelection,
   ConversationMessage,
 } from "@/lib/chat-api";
 import { getFileServeUrl, getImageThumbnailUrl } from "@/lib/explorer-serve-url";
 import { cn } from "@/lib/utils";
-import { ChevronLeft, ChevronRight } from "lucide-react";
 import Link from "next/link";
 
 function generatedImageSrc(imagePath: string): string {
@@ -149,8 +155,9 @@ type MessageListProps = {
   isStreaming: boolean;
   isWaitingResponse?: boolean;
   streamingContent?: string;
+  liveToolResults?: ChatToolResultMetadata[];
   activeTool?: string | null;
-  activityMessage?: string | null;
+  activeAgentRunId?: string | null;
   onEditMessage?: (messageId: string, newContent: string) => void;
   onRerunMessage?: (
     message: ConversationMessage,
@@ -217,6 +224,150 @@ function getMessageAttachments(
       attachment != null &&
       typeof attachment === "object" &&
       typeof (attachment as ChatAttachmentMetadata).name === "string",
+  );
+}
+
+function getMessageToolResults(
+  message: ConversationMessage,
+): ChatToolResultMetadata[] {
+  const results = message.metadata?.tool_results;
+  if (!Array.isArray(results)) return [];
+  return results.filter(
+    (result): result is ChatToolResultMetadata =>
+      result != null &&
+      typeof result === "object" &&
+      (typeof (result as ChatToolResultMetadata).output === "string" ||
+        Array.isArray((result as ChatToolResultMetadata).urls)),
+  );
+}
+
+function getMessageGenerationMetrics(
+  message: ConversationMessage,
+): ChatGenerationMetrics | null {
+  if (message.role !== "assistant") return null;
+  const metrics = message.metadata?.generation_metrics;
+  if (!metrics || typeof metrics !== "object" || Array.isArray(metrics)) {
+    return null;
+  }
+  return metrics as ChatGenerationMetrics;
+}
+
+function getMessageResponseElapsedMs(message: ConversationMessage): number | null {
+  if (message.role !== "assistant") return null;
+  const value = message.metadata?.response_elapsed_ms;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return null;
+  }
+  return value;
+}
+
+function formatResponseDuration(milliseconds: number): string {
+  if (milliseconds < 1000) return `${Math.round(milliseconds)}ms`;
+  const seconds = milliseconds / 1000;
+  if (seconds < 10) return `${seconds.toFixed(1)}秒`;
+  if (seconds < 60) return `${Math.round(seconds)}秒`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = Math.round(seconds % 60);
+  return `${minutes}分${remainingSeconds.toString().padStart(2, "0")}秒`;
+}
+
+function formatTokensPerSecond(metrics: ChatGenerationMetrics | null): string | null {
+  const value = metrics?.tokens_per_second;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return null;
+  }
+  const precision = value >= 10 ? 1 : 2;
+  return `${value.toFixed(precision)} token/s`;
+}
+
+function GenerationMetricsLine({
+  metrics,
+  responseElapsedMs,
+}: {
+  metrics: ChatGenerationMetrics | null;
+  responseElapsedMs: number | null;
+}) {
+  const durationMs = responseElapsedMs ?? metrics?.generation_ms ?? null;
+  const labels = [
+    typeof durationMs === "number" &&
+    Number.isFinite(durationMs) &&
+    durationMs >= 0
+      ? `回答 ${formatResponseDuration(durationMs)}`
+      : null,
+    formatTokensPerSecond(metrics),
+  ].filter(Boolean);
+
+  if (labels.length === 0) return null;
+
+  return (
+    <div className="pl-1 text-[11px] leading-none text-muted-foreground/70">
+      {labels.join(" / ")}
+    </div>
+  );
+}
+
+function ToolResultDetails({
+  results,
+}: {
+  results?: ChatToolResultMetadata[];
+}) {
+  const visibleResults = (results ?? []).filter(
+    (result) =>
+      typeof result.output === "string" ||
+      (Array.isArray(result.urls) && result.urls.length > 0),
+  );
+  if (visibleResults.length === 0) return null;
+
+  return (
+    <div className="mt-2 space-y-2">
+      {visibleResults.map((result, index) => {
+        const toolLabel = result.tool ? getToolLabel(result.tool) : "検索";
+        const urls = Array.isArray(result.urls) ? result.urls : [];
+        return (
+          <details
+            key={`${result.tool ?? "tool"}-${index}`}
+            className="max-w-full rounded-md border border-border/70 bg-muted/45 text-xs"
+          >
+            <summary className="flex min-h-9 cursor-pointer list-none items-center gap-2 px-3 py-2 text-muted-foreground [&::-webkit-details-marker]:hidden">
+              <Search className="size-3.5 shrink-0" />
+              <span className="min-w-0 flex-1 truncate">
+                {toolLabel}
+                {result.query ? `: ${result.query}` : ""}
+              </span>
+              {urls.length > 0 && (
+                <span className="shrink-0 rounded bg-background/70 px-1.5 py-0.5 text-[11px]">
+                  URL {urls.length}
+                </span>
+              )}
+              <ChevronDown className="size-3.5 shrink-0" />
+            </summary>
+            <div className="space-y-2 border-t border-border/60 px-3 py-2">
+              {urls.length > 0 && (
+                <div className="space-y-1">
+                  {urls.map((url) => (
+                    <a
+                      key={url}
+                      href={url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex min-w-0 items-center gap-1.5 text-primary hover:underline"
+                    >
+                      <ExternalLink className="size-3 shrink-0" />
+                      <span className="truncate">{url}</span>
+                    </a>
+                  ))}
+                </div>
+              )}
+              {result.output && (
+                <pre className="max-h-72 max-w-full overflow-auto whitespace-pre-wrap rounded bg-background/80 p-2 text-[11px] leading-relaxed text-foreground">
+                  {result.output}
+                </pre>
+              )}
+            </div>
+          </details>
+        );
+      })}
+    </div>
   );
 }
 
@@ -337,15 +488,6 @@ function ToolIndicator({ toolName }: { toolName: string }) {
     <div className="flex items-center gap-2 text-xs text-muted-foreground">
       <Wrench className="size-3 animate-pulse" />
       <span>{getToolLabel(toolName)} を実行中...</span>
-    </div>
-  );
-}
-
-function WaitingIndicator({ message = "考え中..." }: { message?: string }) {
-  return (
-    <div className="flex items-center gap-2 text-xs text-muted-foreground">
-      <Loader2 className="size-3 animate-spin" />
-      <span>{message}</span>
     </div>
   );
 }
@@ -597,8 +739,9 @@ export function MessageList({
   isStreaming,
   isWaitingResponse,
   streamingContent,
+  liveToolResults,
   activeTool,
-  activityMessage,
+  activeAgentRunId,
   onEditMessage,
   onRerunMessage,
   responseModelOptions = [],
@@ -835,16 +978,23 @@ export function MessageList({
   const showEmptyState =
     visibleMessages.length === 0 && !isStreaming && !isWaitingResponse;
 
+  const scrollToBottom = useCallback(() => {
+    requestAnimationFrame(() => {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    });
+  }, []);
+
   // 自動スクロール
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    scrollToBottom();
   }, [
     visibleMessages.length,
     isStreaming,
     isWaitingResponse,
     streamingContent,
     activeTool,
-    activityMessage,
+    activeAgentRunId,
+    scrollToBottom,
   ]);
 
   return (
@@ -977,6 +1127,13 @@ export function MessageList({
             .reverse()
             .find((item) => item.role === "user")?.content || "";
           const attachments = getMessageAttachments(msg);
+          const toolResults = getMessageToolResults(msg);
+          const generationMetrics = getMessageGenerationMetrics(msg);
+          const responseElapsedMs = getMessageResponseElapsedMs(msg);
+          const agentRunId =
+            typeof msg.metadata?.agent_run_id === "string"
+              ? msg.metadata.agent_run_id
+              : null;
           const assistantSender =
             msg.sender_display_name ||
             (typeof msg.metadata?.character_name === "string"
@@ -999,12 +1156,21 @@ export function MessageList({
                     {assistantSender}
                   </span>
                 )}
+                <GenerationMetricsLine
+                  metrics={generationMetrics}
+                  responseElapsedMs={responseElapsedMs}
+                />
                 {msg.content.trim() && (
                   <div className="min-w-0 max-w-full overflow-hidden rounded-2xl rounded-bl-md border border-white/60 bg-white/62 px-4 py-2.5 text-sm text-card-foreground shadow-[inset_0_1px_rgba(255,255,255,0.72),0_16px_34px_-30px_rgba(6,81,110,0.7)] [overflow-wrap:anywhere] backdrop-blur-xl prose-sm dark:border-white/12 dark:bg-card/75 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12),0_16px_34px_-30px_rgba(0,0,0,0.85)]">
                     <MessageContent content={msg.content} />
                   </div>
                 )}
                 <MessageAttachments attachments={attachments} />
+                <ToolResultDetails results={toolResults} />
+                <AgentRunTimeline
+                  runId={agentRunId}
+                  onContentChange={scrollToBottom}
+                />
                 {renderActions(msg, previousUserInput)}
                 {hasBranch && (
                   <BranchNav
@@ -1043,12 +1209,15 @@ export function MessageList({
             <div className="flex min-w-0 max-w-full flex-col gap-1">
               <div className="min-w-0 max-w-full overflow-hidden rounded-2xl rounded-bl-md border border-white/60 bg-white/62 px-4 py-2.5 text-sm text-card-foreground shadow-[inset_0_1px_rgba(255,255,255,0.72),0_16px_34px_-30px_rgba(6,81,110,0.7)] [overflow-wrap:anywhere] backdrop-blur-xl prose-sm dark:border-white/12 dark:bg-card/75 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12),0_16px_34px_-30px_rgba(0,0,0,0.85)]">
                 <MessageContent content={streamingContent} />
+                <ToolResultDetails results={liveToolResults} />
                 {!activeTool && <TypingIndicator />}
               </div>
               {activeTool && <ToolIndicator toolName={activeTool} />}
-              {!activeTool && activityMessage && (
-                <WaitingIndicator message={activityMessage} />
-              )}
+              <AgentRunTimeline
+                runId={activeAgentRunId}
+                live
+                onContentChange={scrollToBottom}
+              />
             </div>
           </div>
         )}
@@ -1060,25 +1229,33 @@ export function MessageList({
               <div className="min-w-0 max-w-full overflow-hidden rounded-2xl rounded-bl-md border border-white/60 bg-white/62 px-4 py-2.5 text-sm text-card-foreground shadow-[inset_0_1px_rgba(255,255,255,0.72),0_16px_34px_-30px_rgba(6,81,110,0.7)] [overflow-wrap:anywhere] backdrop-blur-xl prose-sm dark:border-white/12 dark:bg-card/75 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12),0_16px_34px_-30px_rgba(0,0,0,0.85)]">
                 {activeTool ? (
                   <ToolIndicator toolName={activeTool} />
-                ) : activityMessage ? (
-                  <WaitingIndicator message={activityMessage} />
                 ) : (
                   <TypingIndicator />
                 )}
               </div>
+              <AgentRunTimeline
+                runId={activeAgentRunId}
+                live
+                onContentChange={scrollToBottom}
+              />
             </div>
           </div>
         )}
 
         {/* 応答待ち（送信済み〜stream_start受信前） */}
-        {isWaitingResponse && !isStreaming && (
+        {isWaitingResponse && !isStreaming && (activeTool || activeAgentRunId) && (
           <div className="flex justify-start">
-            <div className="min-w-0 max-w-full overflow-hidden rounded-2xl rounded-bl-md border border-white/60 bg-white/62 px-4 py-2.5 text-sm text-card-foreground shadow-[inset_0_1px_rgba(255,255,255,0.72),0_16px_34px_-30px_rgba(6,81,110,0.7)] [overflow-wrap:anywhere] backdrop-blur-xl prose-sm dark:border-white/12 dark:bg-card/75 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12),0_16px_34px_-30px_rgba(0,0,0,0.85)]">
-              {activeTool ? (
-                <ToolIndicator toolName={activeTool} />
-              ) : (
-                <WaitingIndicator message={activityMessage ?? "考え中..."} />
+            <div className="flex min-w-0 max-w-full flex-col gap-1">
+              {activeTool && (
+                <div className="min-w-0 max-w-full overflow-hidden rounded-2xl rounded-bl-md border border-white/60 bg-white/62 px-4 py-2.5 text-sm text-card-foreground shadow-[inset_0_1px_rgba(255,255,255,0.72),0_16px_34px_-30px_rgba(6,81,110,0.7)] [overflow-wrap:anywhere] backdrop-blur-xl prose-sm dark:border-white/12 dark:bg-card/75 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12),0_16px_34px_-30px_rgba(0,0,0,0.85)]">
+                  <ToolIndicator toolName={activeTool} />
+                </div>
               )}
+              <AgentRunTimeline
+                runId={activeAgentRunId}
+                live
+                onContentChange={scrollToBottom}
+              />
             </div>
           </div>
         )}

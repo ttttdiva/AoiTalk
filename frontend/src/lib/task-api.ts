@@ -236,7 +236,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     signal: init?.signal ?? AbortSignal.timeout(5000),
   });
   if (res.status === 401) {
-    if (typeof window !== "undefined") {
+    const shouldRedirectToLogin = ![
+      "/api/time-entries/active",
+      "/api/spaces",
+      "/api/projects",
+    ].includes(path);
+    if (shouldRedirectToLogin && typeof window !== "undefined") {
       window.location.href = "/login";
     }
     throw new Error("認証が必要です");

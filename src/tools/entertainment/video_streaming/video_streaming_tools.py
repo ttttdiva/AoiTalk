@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from typing import Optional
-from ...core import tool as function_tool
+from ...core import tool
 from .stream_manager import get_stream_manager
 import yt_dlp
 
@@ -62,7 +62,7 @@ def _extract_video_id(url: str, platform: str) -> Optional[str]:
     return None
 
 
-@function_tool
+@tool
 def search_and_play_youtube(query: str) -> str:
     """
     YouTubeで動画を検索して音声を再生する
@@ -104,7 +104,7 @@ def search_and_play_youtube(query: str) -> str:
             print(f"[search_and_play_youtube] Found video: {title} ({url})")
             
             # Play the video using existing play_youtube_audio function
-            # Since play_youtube_audio is a FunctionTool, we need to call its inner function
+            # Since play_youtube_audio is a ToolDefinition, we need to call its inner function
             return _play_youtube_audio_impl(url)
             
     except Exception as e:
@@ -176,7 +176,7 @@ def _play_youtube_audio_impl(url: str) -> str:
     return "⏳ YouTube動画の音声を抽出中です。しばらくお待ちください..."
 
 
-@function_tool
+@tool
 def play_youtube_audio(url: str) -> str:
     """
     YouTubeの動画から音声を抽出して再生する
@@ -190,7 +190,7 @@ def play_youtube_audio(url: str) -> str:
     return _play_youtube_audio_impl(url)
 
 
-@function_tool
+@tool
 def search_and_play_niconico(query: str) -> str:
     """
     ニコニコ動画で動画を検索して音声を再生する
@@ -300,7 +300,7 @@ def _play_niconico_audio_impl(url: str) -> str:
     return "⏳ ニコニコ動画の音声を抽出中です。しばらくお待ちください..."
 
 
-@function_tool
+@tool
 def play_niconico_audio(url: str) -> str:
     """
     ニコニコ動画から音声を抽出して再生する
@@ -314,7 +314,7 @@ def play_niconico_audio(url: str) -> str:
     return _play_niconico_audio_impl(url)
 
 
-@function_tool
+@tool
 def stop_video_audio() -> str:
     """
     動画音声の再生を停止する
@@ -334,7 +334,7 @@ def stop_video_audio() -> str:
         return "現在再生中の動画音声はありません。"
 
 
-@function_tool  
+@tool
 def get_video_playback_status() -> str:
     """
     動画音声の再生状態を確認する

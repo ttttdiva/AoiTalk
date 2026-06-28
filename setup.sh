@@ -105,17 +105,42 @@ fi
 echo
 echo "[4/6] Python 仮想環境とパッケージをインストール中..."
 
+PYTHON_CMD=""
+for candidate in "${PYTHON:-}" python3.12 python3; do
+    [ -n "$candidate" ] || continue
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' >/dev/null 2>&1; then
+        PYTHON_CMD="$candidate"
+        break
+    fi
+done
+
+if [ -z "$PYTHON_CMD" ]; then
+    echo "  [エラー] Python 3.12以上が必要です。python3.12 をインストールしてから再実行してください。"
+    exit 1
+fi
+echo "  - Python: $($PYTHON_CMD --version)"
+
 # python3-venv が無いと venv 作成に失敗するので、可能なら入れておく
-if ! dpkg -s python3-venv >/dev/null 2>&1; then
-    echo "  - python3-venv をインストールします..."
-    sudo apt-get install -y python3-venv python3-pip || true
+if ! "$PYTHON_CMD" -m venv --help >/dev/null 2>&1; then
+    echo "  - Python venv パッケージをインストールします..."
+    sudo apt-get install -y python3.12-venv python3-pip || sudo apt-get install -y python3-venv python3-pip || true
+fi
+
+if [ -d "venv" ]; then
+    if [ -x "venv/bin/python" ] && venv/bin/python -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' >/dev/null 2>&1; then
+        echo "  - venv は既にPython 3.12以上です。スキップ。"
+    else
+        echo "  - 既存venvがPython 3.12未満のため再作成します..."
+        rm -rf venv
+    fi
 fi
 
 if [ ! -d "venv" ]; then
-    python3 -m venv venv
+    "$PYTHON_CMD" -m venv venv || {
+        echo "  [エラー] venv 作成に失敗しました。python3.12-venv をインストールしてから再実行してください。"
+        exit 1
+    }
     echo "  - venv を作成しました。"
-else
-    echo "  - venv は既に存在します。スキップ。"
 fi
 
 # shellcheck disable=SC1091

@@ -25,6 +25,7 @@ class SpeechRecognitionEngineConfig(BaseModel):
     language: Optional[str] = "ja"
     temperature: Optional[float] = Field(0.0, ge=0.0, le=1.0)
     fp16: Optional[bool] = True
+    device: Optional[str] = Field("cpu", pattern=r"^(auto|cpu|cuda|cuda:\d+)$")
     chunk_length: Optional[float] = Field(1.0, gt=0.0)
 
 
@@ -60,7 +61,7 @@ class Config(BaseModel):
     default_character: str
     llm_model: str
     llm_provider: str = Field(
-        pattern="^(openai|openrouter|gemini|gemini-cli|claude-cli|codex-cli|ollama|sglang|openai_compatible_local)$"
+        pattern="^(openai|openrouter|gemini|antigravity-cli|claude-cli|codex-cli|ollama|sglang|openai_compatible_local)$"
     )
     device_index: int = Field(0, ge=0)
 

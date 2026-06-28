@@ -835,7 +835,11 @@ async def _apply_project_operation(
             session, project_id=project_id, user_id=user_id, permission="delete"
         )
         _ensure_not_stale(existing.updated_at, operation.base_updated_at)
-        await ProjectRepository.delete_project(session, project_id)
+        await ProjectRepository.delete_project(
+            session,
+            project_id,
+            delete_workspace=True,
+        )
         return {"id": str(project_id), "deleted_at": datetime.utcnow().isoformat()}
 
     if operation.action == "create":

@@ -36,7 +36,7 @@ export async function getDashboardData(scope: DashboardScope) {
             estimatedHours: projects.estimatedHours,
           })
           .from(projects)
-          .where(eq(projects.id, scope.id))
+          .where(and(eq(projects.id, scope.id), isNull(projects.deletedAt)))
           .limit(1)
       : scope.projectIds
         ? scope.projectIds.length === 0
@@ -47,14 +47,19 @@ export async function getDashboardData(scope: DashboardScope) {
                 estimatedHours: projects.estimatedHours,
               })
               .from(projects)
-              .where(inArray(projects.id, scope.projectIds))
+              .where(
+                and(
+                  inArray(projects.id, scope.projectIds),
+                  isNull(projects.deletedAt),
+                ),
+              )
         : await db
             .select({
               id: projects.id,
               estimatedHours: projects.estimatedHours,
             })
             .from(projects)
-            .where(eq(projects.spaceId, scope.id));
+            .where(and(eq(projects.spaceId, scope.id), isNull(projects.deletedAt)));
 
   const projectIds = projectRows.map((project) => project.id);
   const condition = scopeCondition(scope, projectIds);

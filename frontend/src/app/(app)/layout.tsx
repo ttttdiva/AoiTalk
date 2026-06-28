@@ -9,6 +9,7 @@ import { AudioPlayerBar } from "@/components/layout/audio-player-bar";
 import { ShortcutsHelpDialog } from "@/components/layout/shortcuts-help-dialog";
 import { GlobalAdminRestart } from "@/components/layout/global-admin-restart";
 import { GlobalMemoPad } from "@/components/layout/global-memo-pad";
+import { HomeTodayOverlay } from "@/components/layout/home-today-overlay";
 import { TaskCompletionUndoProvider } from "@/components/tasks/task-completion-undo-provider";
 import { ProjectProvider } from "@/contexts/project-context";
 import { ChatSessionProvider } from "@/contexts/chat-session-context";
@@ -38,6 +39,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
                   <ShortcutsHelpDialog />
                   <GlobalAdminRestart />
                   <GlobalMemoPad />
+                  <HomeTodayOverlay />
                   <AudioPlayerBar />
                   <TaskCompletionUndoProvider />
                 </SidebarProvider>

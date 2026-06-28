@@ -30,6 +30,7 @@ from .router_helpers import cookie_auth_dependency
 from .connection_manager import ConnectionManager
 from .routes.api_token_routes import register_api_token_routes
 from .routes.auth_routes import register_auth_routes
+from .routes.agent_run_routes import register_agent_run_routes
 from .routes.capabilities_routes import register_capabilities_routes
 from .routes.config_routes import register_config_routes
 from .routes.conversation_dispatch_routes import register_conversation_dispatch_routes
@@ -42,7 +43,10 @@ from .routes.file_explorer_routes import register_file_explorer_routes
 from .routes.llm_routes import register_llm_routes
 from .routes.mobile_command_routes import register_mobile_command_routes
 from .routes.ogp_routes import register_ogp_routes
-from .routes.payloads import sanitize_response_model_selection
+from .routes.payloads import (
+    effective_include_project_context,
+    sanitize_response_model_selection,
+)
 from .routes.system_routes import register_system_routes
 from .routes.user_admin_routes import register_user_admin_routes
 from .routes.websocket_routes import register_websocket_routes
@@ -128,6 +132,11 @@ except ImportError:
     set_permission_manager = None
 
 from ..llm.generation_policy import resolve_generation_profile
+from ..llm.tool_policy import (
+    build_command_capability_context,
+    command_capabilities_for_current_turn_text,
+    sanitize_command_capabilities,
+)
 
 # Import os_operations user context functions
 try:
@@ -348,6 +357,7 @@ class WebChatServer:
         self._shutdown_background_tasks: list[Any] = []
         self._conversation_dispatch_tasks: set[Any] = set()
         self._conversation_generation_tasks: Dict[str, Set[Any]] = {}
+        self._conversation_generation_status: Dict[str, Dict[str, Any]] = {}
         self._conversation_steering_queues: Dict[str, List[str]] = {}
 
         # Create lifespan context manager
@@ -625,6 +635,7 @@ class WebChatServer:
         register_crawler_routes(self.app, self)
         register_mobile_command_routes(self.app, self)
         register_conversation_dispatch_routes(self.app, self)
+        register_agent_run_routes(self.app, self)
         register_file_explorer_routes(self.app, self)
         register_ogp_routes(self.app, self)
         register_document_storage_routes(self.app, self)
@@ -922,6 +933,168 @@ class WebChatServer:
         session_key = str(session_id or "").strip()
         return session_key or "__default__"
 
+    def _generation_status_key(self, session_id: Optional[str]) -> str:
+        return self._conversation_control_key(session_id)
+
+    def _ensure_generation_status_store(self) -> Dict[str, Dict[str, Any]]:
+        if not hasattr(self, "_conversation_generation_status"):
+            self._conversation_generation_status = {}
+        return self._conversation_generation_status
+
+    def _now_iso(self) -> str:
+        return f"{datetime.utcnow().isoformat(timespec='milliseconds')}Z"
+
+    def _extract_generation_status_message(self, data: Dict[str, Any]) -> Optional[str]:
+        nested = data.get("data")
+        nested_data = nested if isinstance(nested, dict) else {}
+        for key in ("message", "content", "status"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            nested_value = nested_data.get(key)
+            if isinstance(nested_value, str) and nested_value.strip():
+                return nested_value.strip()
+        return None
+
+    def _set_conversation_generation_status(
+        self,
+        session_id: Optional[str],
+        *,
+        running: bool,
+        status: str,
+        message: Optional[str] = None,
+        active_tool: Optional[str] = None,
+        agent_run_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        key = self._generation_status_key(session_id)
+        store = self._ensure_generation_status_store()
+        previous = store.get(key, {})
+        now = self._now_iso()
+        payload = {
+            "session_id": session_id,
+            "running": running,
+            "status": status,
+            "message": message,
+            "active_tool": active_tool,
+            "agent_run_id": agent_run_id or previous.get("agent_run_id"),
+            "started_at": previous.get("started_at") if previous else now,
+            "updated_at": now,
+        }
+        store[key] = payload
+        return payload
+
+    def get_conversation_generation_status(
+        self, session_id: Optional[str]
+    ) -> Dict[str, Any]:
+        key = self._generation_status_key(session_id)
+        status = self._ensure_generation_status_store().get(key)
+        tasks = self._conversation_generation_tasks.get(key, set())
+        running = any(not task.done() for task in tasks if hasattr(task, "done"))
+        if status:
+            return dict(status)
+        return {
+            "session_id": session_id,
+            "running": running,
+            "status": "running" if running else "idle",
+            "message": "応答を生成しています" if running else None,
+            "active_tool": None,
+            "started_at": None,
+            "updated_at": None,
+        }
+
+    def _update_generation_status_from_stream_event(
+        self, event_type: str, data: Dict[str, Any]
+    ) -> None:
+        nested = data.get("data")
+        nested_data = nested if isinstance(nested, dict) else {}
+        session_id = data.get("session_id", nested_data.get("session_id"))
+        if not session_id:
+            return
+
+        message = self._extract_generation_status_message(data)
+        tool = data.get("tool", nested_data.get("tool"))
+        active_tool = str(tool) if isinstance(tool, str) and tool else None
+        raw_agent_run_id = data.get("agent_run_id", nested_data.get("agent_run_id"))
+        agent_run_id = str(raw_agent_run_id) if raw_agent_run_id else None
+
+        if event_type == "stream_start":
+            self._set_conversation_generation_status(
+                session_id,
+                running=True,
+                status=str(data.get("status") or "running"),
+                message=message or "応答を生成しています",
+                active_tool=None,
+                agent_run_id=agent_run_id,
+            )
+        elif event_type == "tool_start":
+            tool_message = message or (
+                f"{active_tool} を実行しています"
+                if active_tool
+                else "ツールを実行しています"
+            )
+            self._set_conversation_generation_status(
+                session_id,
+                running=True,
+                status="tool",
+                message=tool_message,
+                active_tool=active_tool,
+                agent_run_id=agent_run_id,
+            )
+        elif event_type == "tool_end":
+            self._set_conversation_generation_status(
+                session_id,
+                running=True,
+                status="running",
+                message=message or "ツール実行が完了しました",
+                active_tool=None,
+                agent_run_id=agent_run_id,
+            )
+        elif event_type in {"status_update", "reasoning_progress", "steering_update"}:
+            previous = self._ensure_generation_status_store().get(
+                self._generation_status_key(session_id), {}
+            )
+            self._set_conversation_generation_status(
+                session_id,
+                running=True,
+                status=str(data.get("status") or event_type),
+                message=message or previous.get("message") or "応答を生成しています",
+                active_tool=previous.get("active_tool"),
+                agent_run_id=agent_run_id,
+            )
+        elif event_type in {"stream_end", "response"}:
+            failed = str(data.get("status") or nested_data.get("status") or "").lower() == "failed"
+            self._set_conversation_generation_status(
+                session_id,
+                running=False,
+                status="failed" if failed else "completed",
+                message=message
+                or (
+                    "応答生成に失敗しました"
+                    if failed
+                    else "応答生成が完了しました"
+                ),
+                active_tool=None,
+                agent_run_id=agent_run_id,
+            )
+        elif event_type == "stream_cancelled":
+            self._set_conversation_generation_status(
+                session_id,
+                running=False,
+                status="cancelled",
+                message=message or "応答生成を停止しました",
+                active_tool=None,
+                agent_run_id=agent_run_id,
+            )
+        elif event_type == "conversation_persisted" and data.get("role") == "assistant":
+            self._set_conversation_generation_status(
+                session_id,
+                running=False,
+                status="completed",
+                message="応答を保存しました",
+                active_tool=None,
+                agent_run_id=agent_run_id,
+            )
+
     def _register_conversation_generation_task(
         self, session_id: Optional[str], task: Any
     ) -> None:
@@ -931,16 +1104,45 @@ class WebChatServer:
 
         def _discard(done_task: Any) -> None:
             current_tasks = self._conversation_generation_tasks.get(key)
+            no_current_tasks = False
             if current_tasks is not None:
                 current_tasks.discard(done_task)
                 if not current_tasks:
                     self._conversation_generation_tasks.pop(key, None)
+                    no_current_tasks = True
             try:
                 done_task.result()
             except (asyncio.CancelledError, FutureCancelledError):
                 logger.info("Conversation generation cancelled: %s", key)
+                if no_current_tasks:
+                    self._set_conversation_generation_status(
+                        session_id,
+                        running=False,
+                        status="cancelled",
+                        message="応答生成を停止しました",
+                        active_tool=None,
+                    )
             except Exception:
                 logger.exception("Conversation generation failed: %s", key)
+                if no_current_tasks:
+                    self._set_conversation_generation_status(
+                        session_id,
+                        running=False,
+                        status="failed",
+                        message="応答生成中にエラーが発生しました",
+                        active_tool=None,
+                    )
+            else:
+                if no_current_tasks:
+                    current_status = self.get_conversation_generation_status(session_id)
+                    if current_status.get("running"):
+                        self._set_conversation_generation_status(
+                            session_id,
+                            running=False,
+                            status="completed",
+                            message="応答生成が完了しました",
+                            active_tool=None,
+                        )
 
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(_discard)
@@ -961,10 +1163,24 @@ class WebChatServer:
         attachment_context: Optional[str],
         skip_user_persistence: bool = False,
         persisted_user_message_id: Optional[str] = None,
+        agent_run_id: Optional[str] = None,
         assistant_sender_type: Optional[str] = None,
         assistant_sender_id: Optional[str] = None,
         assistant_sender_display_name: Optional[str] = None,
+        sender_user_id: Optional[str] = None,
+        sender_display_name: Optional[str] = None,
+        response_started_at_monotonic: Optional[float] = None,
+        command_capabilities: Optional[List[str]] = None,
     ) -> None:
+        if session_id:
+            self._set_conversation_generation_status(
+                session_id,
+                running=True,
+                status="queued",
+                message="応答生成を開始しています",
+                active_tool=None,
+                agent_run_id=agent_run_id,
+            )
         callback_coro = self.on_user_input(
             message,
             image_data=image_data,
@@ -979,9 +1195,14 @@ class WebChatServer:
             attachment_context=attachment_context,
             skip_user_persistence=skip_user_persistence,
             persisted_user_message_id=persisted_user_message_id,
+            agent_run_id=agent_run_id,
             assistant_sender_type=assistant_sender_type,
             assistant_sender_id=assistant_sender_id,
             assistant_sender_display_name=assistant_sender_display_name,
+            sender_user_id=sender_user_id,
+            sender_display_name=sender_display_name,
+            response_started_at_monotonic=response_started_at_monotonic,
+            command_capabilities=command_capabilities,
         )
         if self.main_event_loop:
             future = asyncio.run_coroutine_threadsafe(
@@ -1006,8 +1227,18 @@ class WebChatServer:
                 cancelled += 1
 
         self._conversation_steering_queues.pop(key, None)
+        current_status = self.get_conversation_generation_status(session_id)
+        agent_run_id = current_status.get("agent_run_id")
+        if agent_run_id:
+            try:
+                from ..services.agent_run_service import AgentRunService
+
+                await AgentRunService().cancel_run(str(agent_run_id))
+            except Exception:
+                logger.exception("Failed to cancel agent run: %s", agent_run_id)
         event_data = {
             "session_id": session_id,
+            "agent_run_id": agent_run_id,
             "status": "cancelled",
             "message": "応答生成を停止しました",
             "cancelled": cancelled,
@@ -1041,9 +1272,55 @@ class WebChatServer:
         key = self._conversation_control_key(session_id)
         return self._conversation_steering_queues.pop(key, [])
 
+    def get_voice_input_session_id(self) -> Optional[str]:
+        context = self.get_voice_input_session_context()
+        return context.get("session_id") if context else None
+
+    def get_voice_input_session_context(self) -> Optional[Dict[str, Optional[str]]]:
+        context_resolver = getattr(self.manager, "get_latest_session_context", None)
+        if callable(context_resolver):
+            return context_resolver()
+
+        resolver = getattr(self.manager, "get_latest_session_id", None)
+        if callable(resolver):
+            session_id = resolver()
+            if session_id:
+                return {"session_id": session_id, "user_id": None}
+        return None
+
+    async def dispatch_voice_message(self, message: str) -> bool:
+        """Route a local voice transcription into the active WebUI chat session."""
+        text = str(message or "").strip()
+        if not text:
+            return False
+
+        context = self.get_voice_input_session_context()
+        session_id = context.get("session_id") if context else None
+        if not session_id:
+            logger.warning("Voice input skipped WebUI dispatch: no active session")
+            return False
+        sender_user_id = str((context or {}).get("user_id") or "default_user")
+
+        await self._handle_user_message(
+            {
+                "message": text,
+                "session_id": session_id,
+                "_sender_user_id": sender_user_id,
+                "_sender_display_name": sender_user_id,
+            }
+        )
+        return True
+
     async def _handle_user_message(self, data: dict):
         """Handle user message with optional image, session_id, and project_id"""
         message = data.get("message", "").strip()
+        raw_user_message = message
+        raw_response_started_at = data.get("_response_started_at_monotonic")
+        response_started_at_monotonic = (
+            raw_response_started_at
+            if isinstance(raw_response_started_at, (int, float))
+            else time.monotonic()
+        )
         raw_image_data = data.get("image")  # {data: base64, mimeType: str, name: str}
         image_data = None
         if isinstance(raw_image_data, str) and raw_image_data:
@@ -1057,8 +1334,15 @@ class WebChatServer:
                     "name": raw_image_data.get("name"),
                 }
         session_id = data.get("session_id")  # Extract session_id from message data
+        agent_run_id = data.get("agent_run_id")
+        if not isinstance(agent_run_id, str) or not agent_run_id:
+            agent_run_id = None
         project_id = data.get("project_id")  # Extract project_id from message data
-        include_project_context = data.get("include_project_context") is True
+        requested_include_project_context = data.get("include_project_context") is True
+        include_project_context = effective_include_project_context(
+            message=message,
+            requested=requested_include_project_context,
+        )
         await self._attach_project_to_conversation_if_missing(session_id, project_id)
         edit_message_id = data.get("edit_message_id")
         response_model = sanitize_response_model_selection(data.get("response_model"))
@@ -1074,9 +1358,19 @@ class WebChatServer:
         if not isinstance(attachment_context, str):
             attachment_context = None
         mentions = data.get("mentions", [])  # @mentions: [{type, id, name}]
+        sender_user_id = str(data.get("_sender_user_id") or "default_user")
+        sender_display_name = str(
+            data.get("_sender_display_name")
+            or data.get("_sender_user_id")
+            or "default_user"
+        )
         generation_profile = resolve_generation_profile(
             data.get("generation_profile")
         ).value
+        command_capabilities = command_capabilities_for_current_turn_text(
+            raw_user_message,
+            sanitize_command_capabilities(data.get("command_capabilities")),
+        )
 
         # 生成プロファイルをセッションデータに保存（同一プロセス内の参照用）
         if generation_profile:
@@ -1087,6 +1381,35 @@ class WebChatServer:
 
         if not message and not image_data and not attachments and not attachment_context:
             return
+
+        if session_id and not agent_run_id:
+            try:
+                from ..services.agent_run_service import AgentRunService
+
+                agent_run = await AgentRunService().create_run(
+                    session_id=session_id,
+                    user_id=sender_user_id,
+                    project_id=project_id,
+                    trigger_message_id=persisted_user_message_id,
+                    objective=message,
+                    run_type="chat_turn",
+                    generation_profile=generation_profile,
+                    metadata={
+                        "client_message_id": client_message_id,
+                        "include_project_context": include_project_context,
+                        "requested_include_project_context": (
+                            requested_include_project_context
+                        ),
+                        "command_capabilities": list(command_capabilities),
+                        "edit_message_id": edit_message_id,
+                        "response_model": response_model,
+                        "attachment_count": len(attachments),
+                        "dispatch_source": "server_fallback",
+                    },
+                )
+                agent_run_id = str(agent_run["id"])
+            except Exception:
+                logger.exception("Failed to create fallback agent run")
 
         # @メンション処理: ファイル参照の内容をメッセージに追加
         if mentions and FILE_EXPLORER_AVAILABLE:
@@ -1121,19 +1444,26 @@ class WebChatServer:
         # スラッシュコマンドによるスキル明示呼び出し
         # 先頭が /skill名 のとき、LLM自動判断を待たずスキルを強制発火する。
         # 表示・永続化は生の入力のまま、LLM へ渡すメッセージのみ展開する。
+        llm_message = message
         if message:
             from ..skills.slash import resolve_skill_slash_command
 
             skill_prompt = resolve_skill_slash_command(message)
             if skill_prompt is not None:
-                message = skill_prompt
+                llm_message = skill_prompt
+
+        if command_capabilities:
+            llm_message = build_command_capability_context(
+                llm_message,
+                command_capabilities,
+            )
 
         # Set Knowledge Workspace project context for this message
         if KNOWLEDGE_PROJECT_CONTEXT_AVAILABLE and set_knowledge_project_context:
             set_knowledge_project_context(project_id)
 
         # Log session ID and project ID for debugging
-        log_parts = [f"User message: {message}"]
+        log_parts = [f"User message: {raw_user_message}"]
         if image_data:
             log_parts.append("(with image)")
         if session_id:
@@ -1144,20 +1474,18 @@ class WebChatServer:
             log_parts.append("[project_context:on]")
         if attachments:
             log_parts.append(f"[attachments:{len(attachments)}]")
+        if command_capabilities:
+            log_parts.append(f"[commands:{','.join(command_capabilities)}]")
         if not session_id:
             log_parts.append("[new conversation]")
         logger.info(" ".join(log_parts))
 
         if session_id and await self._handle_shared_group_message(
             session_id=session_id,
-            message=message,
+            message=llm_message,
             project_id=project_id,
-            sender_user_id=str(data.get("_sender_user_id") or "default_user"),
-            sender_display_name=str(
-                data.get("_sender_display_name")
-                or data.get("_sender_user_id")
-                or "default_user"
-            ),
+            sender_user_id=sender_user_id,
+            sender_display_name=sender_display_name,
             generation_profile=generation_profile,
             client_message_id=client_message_id,
             attachments=attachments,
@@ -1169,13 +1497,14 @@ class WebChatServer:
         # Create message entry with image info for display
         user_entry = {
             "type": "user",
-            "message": message,
+            "message": raw_user_message,
             "timestamp": datetime.now().strftime("%H:%M:%S"),
             "session_id": session_id,
             "has_image": bool(image_data),
             "image_preview": image_data.get("data") if image_data else None,
             "client_message_id": client_message_id,
             "attachments": attachments,
+            "command_capabilities": list(command_capabilities),
         }
 
         # Broadcast to clients
@@ -1195,7 +1524,7 @@ class WebChatServer:
         if self.on_user_input:
             try:
                 self._schedule_user_input_callback(
-                    message=message,
+                    message=llm_message,
                     image_data=image_data,
                     session_id=session_id,
                     project_id=project_id,
@@ -1208,6 +1537,11 @@ class WebChatServer:
                     attachment_context=attachment_context,
                     skip_user_persistence=skip_user_persistence,
                     persisted_user_message_id=persisted_user_message_id,
+                    agent_run_id=agent_run_id,
+                    sender_user_id=sender_user_id,
+                    sender_display_name=sender_display_name,
+                    response_started_at_monotonic=response_started_at_monotonic,
+                    command_capabilities=list(command_capabilities),
                 )
             except Exception as e:
                 logger.error(f"Callback error: {e}")
@@ -1342,6 +1676,9 @@ class WebChatServer:
                     assistant_sender_type="agent",
                     assistant_sender_id=agent_ids[0],
                     assistant_sender_display_name=agent_ids[0],
+                    sender_user_id=sender_user_id,
+                    sender_display_name=sender_display_name,
+                    response_started_at_monotonic=time.monotonic(),
                 )
 
             return True
@@ -1499,6 +1836,7 @@ class WebChatServer:
 
     async def broadcast_stream_event(self, event_type: str, data: dict):
         """Broadcast streaming events (stream_start, stream_token, tool_start, etc.)"""
+        self._update_generation_status_from_stream_event(event_type, data)
         await self.manager.broadcast({"type": event_type, **data})
 
     async def add_assistant_message(
@@ -2324,6 +2662,12 @@ class WebChatServer:
             return None
 
     def _get_next_user_id_from_request(self, request: Request) -> Optional[str]:
+        internal_key = request.headers.get("x-internal-auth")
+        if internal_key and internal_key == os.environ.get("INTERNAL_API_KEY", ""):
+            forwarded_user_id = request.headers.get("x-forwarded-user-id")
+            if forwarded_user_id:
+                return str(forwarded_user_id)
+
         payload = self._decode_next_session_cookie(
             request.cookies.get(self.next_cookie_name)
         )
@@ -2374,10 +2718,8 @@ class WebChatServer:
             if bearer.startswith(LONG_LIVED_TOKEN_PREFIX):
                 return await self._get_user_info_from_long_lived_token(bearer)
 
-        username = self._get_username_from_request(request)
-        next_user_id = None
-        if not username:
-            next_user_id = self._get_next_user_id_from_request(request)
+        next_user_id = self._get_next_user_id_from_request(request)
+        username = None if next_user_id else self._get_username_from_request(request)
         if not username and not next_user_id:
             return None
 

@@ -5,7 +5,7 @@ Spotify内部キューシステム管理モジュール
 import logging
 import asyncio
 from typing import List, Dict, Optional, Any
-from ...core import tool as function_tool
+from ...core import tool
 
 # Import logging functionality
 from ..spotify_logger import get_spotify_logger

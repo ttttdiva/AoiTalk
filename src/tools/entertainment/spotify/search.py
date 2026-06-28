@@ -4,7 +4,7 @@ Spotify検索機能モジュール
 
 import spotipy
 import logging
-from ...core import tool as function_tool
+from ...core import tool
 
 logger = logging.getLogger(__name__)
 

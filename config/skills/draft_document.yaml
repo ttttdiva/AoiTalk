@@ -9,7 +9,7 @@ prompt_template: |
   ## 手順
 
   ### 1. 対象資料の特定
-  filesystem_assistant で workspace_root を特定し、以下を確認:
+  get_project_context と direct filesystem tools で workspace_root を特定し、以下を確認:
   - CLAUDE.md（資料更新ワークフローの確認）
   - knowledge/projectInfo.md（成果物一覧と格納先の確認）
   - ユーザーの入力から対象となる資料を特定
@@ -94,7 +94,12 @@ aliases:
   - draft
   - 資料更新
 bound_tools:
-  - filesystem_assistant
+  - get_project_context
+  - find_workspace_items
+  - inspect_workspace_tree
+  - read_workspace_file
+  - view_file
+  - execute_command
 examples:
   - "/draft_document 詳細設計書を最新のヒアリングシートの内容で更新したい"
   - "/draft_document 完成図書の目次を作成してほしい"

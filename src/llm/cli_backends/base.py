@@ -1,24 +1,27 @@
 """
 Abstract base class for CLI-based LLM backends
 
-Provides common interface for Gemini CLI, Claude Code, Codex CLI, etc.
+Provides common interface for Antigravity CLI, Claude Code, Codex CLI, etc.
 """
 
 import logging
 import locale
 import os
+import queue
 import shutil
 import subprocess
+import threading
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Callable
 
 logger = logging.getLogger(__name__)
 
 # コマンドライン引数の長さ上限（安全マージン込み）
 # Windows: 約32,767文字だが余裕を持たせる
 _MAX_ARG_LENGTH = 8000
+CLIEventCallback = Callable[[str, Dict[str, Any]], Any]
 
 
 def _decode_cli_output(data: bytes | str | None) -> str:
@@ -62,6 +65,9 @@ class CLIBackendBase(ABC):
     - parse_output(raw_output): Filter/transform CLI output
     """
 
+    prompt_stdin_supported = True
+    direct_prompt_max_length = _MAX_ARG_LENGTH
+
     def __init__(self):
         """Initialize CLI backend"""
         self.provider_name = self.get_provider_name()
@@ -76,7 +82,7 @@ class CLIBackendBase(ABC):
             prompt: The prompt text to send to the CLI
 
         Returns:
-            List of command parts (e.g., ["gemini", "--yolo", "-p", prompt])
+            List of command parts (e.g., ["agy", "-p", prompt])
         """
         pass
 
@@ -86,7 +92,7 @@ class CLIBackendBase(ABC):
         Get provider name for logging
 
         Returns:
-            Provider name (e.g., "Gemini CLI")
+            Provider name (e.g., "Antigravity CLI")
         """
         pass
 
@@ -114,6 +120,23 @@ class CLIBackendBase(ABC):
         """
         return None
 
+    def get_subprocess_env(self) -> Optional[Dict[str, str]]:
+        """Return environment overrides for CLI subprocesses."""
+        return None
+
+    def handle_stream_output_line(
+        self,
+        line: str,
+        event_callback: CLIEventCallback,
+    ) -> None:
+        """Translate a streamed stdout line into UI progress events.
+
+        Provider backends can override this for structured output such as JSONL.
+        The raw line is still retained for final parsing regardless of whether
+        an event is emitted.
+        """
+        return None
+
     def parse_tool_calls(self, cli_output: str) -> List[Dict[str, Any]]:
         """
         Parse tool calls from CLI output
@@ -138,6 +161,7 @@ class CLIBackendBase(ABC):
         timeout: int = 300,
         extra_args: Optional[List[str]] = None,
         system_context: Optional[str] = None,
+        event_callback: Optional[CLIEventCallback] = None,
     ) -> Tuple[bool, str]:
         """
         Execute prompt via CLI
@@ -148,16 +172,29 @@ class CLIBackendBase(ABC):
             timeout: Timeout in seconds
             extra_args: Additional CLI arguments (e.g., MCP config)
             system_context: System context to pass via stdin (instructions, history, tools).
-                           When provided, prompt is passed via -p and system_context via stdin.
-                           Gemini CLI appends -p to stdin, so the user message comes last.
+                           When provided, prompt is passed via CLI argument and
+                           system_context via stdin for backends that support it.
 
         Returns:
             (success: bool, output: str)
         """
+        direct_prompt_max_length = getattr(
+            self,
+            "direct_prompt_max_length",
+            _MAX_ARG_LENGTH,
+        )
+        prompt_stdin_supported = getattr(self, "prompt_stdin_supported", True)
+
         if system_context:
             # system_context → stdin, prompt → -p
-            # Gemini CLI: "-p is appended to input on stdin"
-            if len(prompt) > _MAX_ARG_LENGTH:
+            if not prompt_stdin_supported:
+                combined_prompt = f"{system_context}\n\n{prompt}" if prompt else system_context
+                cmd = self.get_cli_command(combined_prompt)
+                stdin_input = None
+                logger.info(
+                    f"[{self.provider_name}] Using direct argument for system_context + prompt"
+                )
+            elif len(prompt) > direct_prompt_max_length:
                 # User message too long for -p, concatenate into stdin
                 cmd = self.get_cli_command("")
                 stdin_input = f"{system_context}\n\n{prompt}"
@@ -166,7 +203,7 @@ class CLIBackendBase(ABC):
                 cmd = self.get_cli_command(prompt)
                 stdin_input = system_context
                 logger.info(f"[{self.provider_name}] Using stdin for system_context, -p for user prompt")
-        elif len(prompt) > _MAX_ARG_LENGTH:
+        elif len(prompt) > direct_prompt_max_length and prompt_stdin_supported:
             # プロンプトが長すぎる場合、stdinにフォールバック
             cmd = self.get_cli_command("")
             stdin_input = prompt
@@ -187,6 +224,7 @@ class CLIBackendBase(ABC):
 
         logger.info(f"[{self.provider_name}] Executing: {cmd[0]}")
         logger.debug(f"[{self.provider_name}] Prompt length: {len(prompt)} chars")
+        subprocess_env = self.get_subprocess_env()
 
         max_retries = 3
         retry_delay = 1.0
@@ -196,19 +234,30 @@ class CLIBackendBase(ABC):
                 stdin_input_bytes = (
                     stdin_input.encode("utf-8") if stdin_input is not None else None
                 )
-                result = subprocess.run(
-                    cmd,
-                    input=stdin_input_bytes,
-                    cwd=str(cwd) if cwd else None,
-                    capture_output=True,
-                    check=False,
-                    timeout=timeout,
-                )
+                if event_callback:
+                    returncode, stdout_text, stderr_text = self._run_streaming_process(
+                        cmd,
+                        stdin_input_bytes=stdin_input_bytes,
+                        cwd=cwd,
+                        env=subprocess_env,
+                        timeout=timeout,
+                        event_callback=event_callback,
+                    )
+                else:
+                    result = subprocess.run(
+                        cmd,
+                        input=stdin_input_bytes,
+                        cwd=str(cwd) if cwd else None,
+                        capture_output=True,
+                        check=False,
+                        env=subprocess_env,
+                        timeout=timeout,
+                    )
+                    returncode = result.returncode
+                    stdout_text = _decode_cli_output(result.stdout)
+                    stderr_text = _decode_cli_output(result.stderr)
 
-                stdout_text = _decode_cli_output(result.stdout)
-                stderr_text = _decode_cli_output(result.stderr)
-
-                if result.returncode == 0:
+                if returncode == 0:
                     output = self.parse_output(stdout_text)
                     logger.info(f"[{self.provider_name}] Execution successful: {len(output)} chars")
                     return True, output
@@ -217,7 +266,7 @@ class CLIBackendBase(ABC):
                 stdout = stdout_text.strip()
                 logger.warning(
                     f"[{self.provider_name}] Attempt {attempt+1}/{max_retries} "
-                    f"failed (exit code {result.returncode})"
+                    f"failed (exit code {returncode})"
                 )
                 if stderr:
                     logger.warning(f"[{self.provider_name}] STDERR: {stderr[:500]}")
@@ -239,12 +288,12 @@ class CLIBackendBase(ABC):
                     retry_delay *= 2
                     continue
 
-                parsed_error = self.parse_error_output(stdout, stderr, result.returncode)
+                parsed_error = self.parse_error_output(stdout, stderr, returncode)
                 if parsed_error:
                     error_msg = parsed_error
                     logger.error(f"[{self.provider_name}] {parsed_error}")
                 else:
-                    error_msg = f"CLI failed (exit code {result.returncode})"
+                    error_msg = f"CLI failed (exit code {returncode})"
                     if stderr:
                         error_msg += f"\nSTDERR: {stderr}"
                         logger.error(f"[{self.provider_name}] {stderr}")
@@ -268,6 +317,79 @@ class CLIBackendBase(ABC):
                 return False, error_msg
 
         return False, "Max retries exceeded"
+
+    def _run_streaming_process(
+        self,
+        cmd: List[str],
+        *,
+        stdin_input_bytes: Optional[bytes],
+        cwd: Optional[Path],
+        env: Optional[Dict[str, str]],
+        timeout: int,
+        event_callback: CLIEventCallback,
+    ) -> tuple[int, str, str]:
+        """Run a CLI process while forwarding stdout lines as progress events."""
+        stdout_queue: queue.Queue[bytes | None] = queue.Queue()
+        stdout_chunks: list[bytes] = []
+
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE if stdin_input_bytes is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=str(cwd) if cwd else None,
+            env=env,
+        )
+
+        def _reader() -> None:
+            try:
+                if process.stdout is None:
+                    return
+                for chunk in iter(process.stdout.readline, b""):
+                    stdout_queue.put(chunk)
+            finally:
+                stdout_queue.put(None)
+
+        reader = threading.Thread(target=_reader, daemon=True)
+        reader.start()
+
+        if stdin_input_bytes is not None and process.stdin is not None:
+            try:
+                process.stdin.write(stdin_input_bytes)
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
+
+        deadline = time.monotonic() + timeout
+        reader_done = False
+        while not reader_done:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                reader.join(timeout=1.0)
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            try:
+                chunk = stdout_queue.get(timeout=min(0.1, max(remaining, 0.01)))
+            except queue.Empty:
+                continue
+            if chunk is None:
+                reader_done = True
+                continue
+            stdout_chunks.append(chunk)
+            line = _decode_cli_output(chunk).rstrip("\r\n")
+            if not line:
+                continue
+            try:
+                self.handle_stream_output_line(line, event_callback)
+            except Exception:
+                logger.debug(
+                    "[%s] Stream output event handling failed",
+                    self.provider_name,
+                    exc_info=True,
+                )
+
+        return_code = process.wait(timeout=1)
+        return return_code, _decode_cli_output(b"".join(stdout_chunks)), ""
 
     def prepare_image_attachment(
         self, image_data: Dict[str, Any], cwd: Optional[Path] = None
@@ -296,7 +418,7 @@ class CLIBackendBase(ABC):
 
         Each CLI tool has its own way to configure MCP servers:
         - Claude Code: --mcp-config JSON (command-line option)
-        - Gemini CLI: ~/.gemini/settings.json (settings file, no CLI option)
+        - Antigravity CLI: native plugin/settings files, no runtime CLI option
         - Codex CLI: ~/.codex/config.toml (settings file, no CLI option)
 
         Subclasses override this to provide CLI-specific MCP arguments.
@@ -330,6 +452,7 @@ class CLIBackendBase(ABC):
             result = subprocess.run(
                 [bin_path, "--version"],
                 capture_output=True,
+                env=self.get_subprocess_env(),
                 timeout=5,
             )
             return result.returncode == 0

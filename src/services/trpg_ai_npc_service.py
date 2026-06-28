@@ -698,9 +698,9 @@ def _build_prompt(
 
 async def _run_npc_agent(prompt: str, model: str = "gpt-4o-mini") -> Dict[str, Any]:
     try:
-        from agents import Agent, Runner
+        from ..llm.native_runtime import AgentDefinition, run_native_agent_once
 
-        agent = Agent(
+        agent = AgentDefinition(
             name="trpg_ai_npc_private_thinker",
             model=model or "gpt-4o-mini",
             instructions=(
@@ -708,7 +708,7 @@ async def _run_npc_agent(prompt: str, model: str = "gpt-4o-mini") -> Dict[str, A
                 "Return exactly one JSON object and never expose hidden reasoning in public_content."
             ),
         )
-        result = await Runner.run(agent, prompt)
+        result = await run_native_agent_once(agent, prompt)
         return _safe_json_object(result.final_output or "")
     except Exception as exc:  # noqa: BLE001
         logger.exception("AI NPC thinking failed: %s", exc)

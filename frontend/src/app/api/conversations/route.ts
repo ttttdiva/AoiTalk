@@ -9,6 +9,7 @@ import { eq, and, isNull, desc, sql, or, isNotNull } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
 import { decryptTextIfNeeded, encryptText } from "@/lib/server/field-crypto";
 import { messageToSnake } from "@/lib/server/conversation-route-utils";
+import { cleanupExpiredDeletedConversationsIfDue } from "@/lib/server/conversation-retention-cleanup";
 
 function sessionToSnake(row: Record<string, unknown>): Record<string, unknown> {
   const map: Record<string, string> = {
@@ -55,6 +56,8 @@ export async function GET(request: NextRequest) {
   if (!user) {
     return NextResponse.json({ detail: "認証が必要です" }, { status: 401 });
   }
+
+  await cleanupExpiredDeletedConversationsIfDue();
 
   const { searchParams } = new URL(request.url);
   const projectId = searchParams.get("project_id");

@@ -7,6 +7,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { CHAT_SHORTCUT_HELP_ITEMS } from "@/lib/chat-keyboard-shortcuts";
 
 type ShortcutItem = {
   keys: string[];
@@ -21,10 +22,7 @@ type ShortcutSection = {
 const SHORTCUT_SECTIONS: ShortcutSection[] = [
   {
     title: "チャット",
-    items: [
-      { keys: ["Ctrl", "Shift", "O"], description: "新規チャットを開始" },
-      { keys: ["Ctrl", "J"], description: "チャット入力欄にフォーカス" },
-    ],
+    items: CHAT_SHORTCUT_HELP_ITEMS,
   },
   {
     title: "ページ移動",
@@ -51,6 +49,7 @@ const SHORTCUT_SECTIONS: ShortcutSection[] = [
   {
     title: "タスク",
     items: [
+      { keys: ["Ctrl", "Shift", "H"], description: "Todayを開く" },
       { keys: ["Alt", "T"], description: "タスク作成ダイアログを開く" },
       { keys: ["Ctrl", "J"], description: "先頭タスクにフォーカス" },
       { keys: ["Ctrl", "F"], description: "タスク検索にフォーカス" },

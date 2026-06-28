@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type DragEvent } from "react";
 import {
   Bot,
   ChevronDown,
@@ -28,6 +28,9 @@ interface LlmModelOption {
   installed?: boolean;
   source?: string;
   source_label?: string;
+  base_url?: string;
+  server?: string;
+  server_label?: string;
   size?: number;
   details?: {
     parameter_size?: string;
@@ -35,6 +38,7 @@ interface LlmModelOption {
     family?: string;
   };
   context_length?: number;
+  reasoning_effort_options?: string[];
   custom_current?: boolean;
 }
 
@@ -82,14 +86,32 @@ interface LlmEngineResponse {
 
 interface SettingsPayload {
   settings?: {
-    model_sharing?: {
+    agent_team?: {
       enabled?: boolean;
       confirm_prompt?: boolean;
       notify?: boolean;
-      provider?: string;
-      model?: string;
+      redaction_terms?: string[];
+      strategy?: string;
+      members?: Record<string, ModelRouteSettings>;
+      roster?: ModelRouteSettings[];
     };
   };
+}
+
+interface ModelRouteSettings {
+  enabled?: boolean;
+  provider?: string;
+  model?: string;
+  mode?: string;
+  reasoning_effort?: string;
+  external?: boolean;
+  label?: string;
+  role?: string;
+  runner?: string;
+  scalable?: boolean;
+  default_instances?: number;
+  max_instances?: number;
+  tools?: string[];
 }
 
 interface OllamaPullTask {
@@ -119,6 +141,135 @@ type ProviderSettingsDraft = {
   api_key?: string;
   reasoning_effort?: string;
 };
+
+type ModelRouteKey =
+  | "advanced_reasoning"
+  | "architect"
+  | "explorer"
+  | "implementer"
+  | "reviewer"
+  | "utility"
+  | "media"
+  | "spotify"
+  | "scenario"
+  | "writing"
+  | "import"
+  | "agent_harness";
+
+type ModelRouteDefinition = {
+  key: ModelRouteKey;
+  label: string;
+  defaultProvider: string;
+  defaultModel: string;
+  allowedProviders?: string[];
+  scalable?: boolean;
+  defaultMaxInstances?: number;
+};
+
+type ModelRouteDraft = {
+  enabled: boolean;
+  provider: string;
+  model: string;
+  customModel: string;
+  mode: string;
+  scalable: boolean;
+  defaultInstances: number;
+  maxInstances: number;
+  runner: string;
+};
+
+const MODEL_ROUTE_DEFINITIONS: ModelRouteDefinition[] = [
+  {
+    key: "advanced_reasoning",
+    label: "高度推論",
+    defaultProvider: "openai",
+    defaultModel: "gpt-4o",
+  },
+  {
+    key: "architect",
+    label: "設計",
+    defaultProvider: "openai",
+    defaultModel: "gpt-4o-mini",
+    scalable: true,
+    defaultMaxInstances: 2,
+  },
+  {
+    key: "explorer",
+    label: "調査",
+    defaultProvider: "openai",
+    defaultModel: "gpt-4o-mini",
+    scalable: true,
+    defaultMaxInstances: 6,
+  },
+  {
+    key: "implementer",
+    label: "実装",
+    defaultProvider: "openai",
+    defaultModel: "gpt-4o-mini",
+    scalable: true,
+    defaultMaxInstances: 4,
+  },
+  {
+    key: "reviewer",
+    label: "レビュー",
+    defaultProvider: "openai",
+    defaultModel: "gpt-4o-mini",
+    scalable: true,
+    defaultMaxInstances: 4,
+  },
+  {
+    key: "utility",
+    label: "ユーティリティ",
+    defaultProvider: "openai",
+    defaultModel: "gpt-4o-mini",
+  },
+  {
+    key: "media",
+    label: "メディア",
+    defaultProvider: "openai",
+    defaultModel: "gpt-4o-mini",
+  },
+  {
+    key: "spotify",
+    label: "Spotify",
+    defaultProvider: "openai",
+    defaultModel: "gpt-4o-mini",
+  },
+  {
+    key: "scenario",
+    label: "TRPG_GM",
+    defaultProvider: "openai",
+    defaultModel: "gpt-4o-mini",
+  },
+  {
+    key: "writing",
+    label: "執筆",
+    defaultProvider: "openai",
+    defaultModel: "gpt-4o-mini",
+  },
+  {
+    key: "import",
+    label: "シナリオ素材取り込み",
+    defaultProvider: "openai",
+    defaultModel: "gpt-4o-mini",
+  },
+  {
+    key: "agent_harness",
+    label: "作業エージェント",
+    defaultProvider: "codex-cli",
+    defaultModel: "gpt-5-codex",
+    allowedProviders: ["codex-cli", "claude-cli"],
+  },
+];
+
+const EXTERNAL_AGENT_PROVIDERS = new Set([
+  "openai",
+  "openrouter",
+  "gemini",
+  "antigravity-cli",
+  "claude-cli",
+  "codex-cli",
+]);
 
 const MODEL_PAGE_SIZE = 24;
 
@@ -153,12 +304,12 @@ function providerHint(providerId: string): string {
       return "Codex CLI は --model を受け付けます。候補はCLIから取得した一覧ではなく、未掲載モデルは直接入力してください。";
     case "claude-cli":
       return "Claude Code は alias とフルモデル名を受け付けます。候補はCLIから取得した一覧ではありません。";
-    case "gemini-cli":
-      return "Gemini CLI は -m でモデルを指定します。候補はCLIから取得した一覧ではありません。";
+    case "antigravity-cli":
+      return "Antigravity CLI は --model でモデルを指定します。候補は agy models から取得した一覧ではありません。";
     case "sglang":
       return "SGLang は Hugging Face の model path または /v1/models のIDを使います。";
     case "openai_compatible_local":
-      return "llama-server などの /v1/chat/completions 互換APIを指定します。DFlash対応モデルはここで接続します。";
+      return "llama-server、exo、MLX LM などの /v1/chat/completions 互換APIを指定します。候補にBase URLがある場合は自動で反映します。";
     case "openrouter":
       return "OpenRouter は公開 Models API から候補を取得します。";
     case "ollama":
@@ -175,6 +326,16 @@ function modelSourceLabel(item: LlmModelOption): string | null {
   return null;
 }
 
+function modelSummary(item: LlmModelOption): string {
+  if (item.description) return item.description;
+  if (item.server_label && item.base_url) return `${item.server_label} ${item.base_url}`;
+  if (item.context_length) return `context ${item.context_length}`;
+  if (item.details) {
+    return `${item.details.parameter_size || "-"} / ${item.details.quantization_level || "-"} / ${formatBytes(item.size)}`;
+  }
+  return item.id;
+}
+
 function providerSourceLabel(source: string): string {
   switch (source) {
     case "remote":
@@ -185,6 +346,8 @@ function providerSourceLabel(source: string): string {
       return "インストール確認済み";
     case "cli-suggested":
       return "CLI候補";
+    case "platform-suggested":
+      return "OS候補";
     case "static-suggested":
       return "静的候補";
     case "static":
@@ -206,6 +369,57 @@ function providerSelection(provider: LlmProviderCatalog | null | undefined): Pro
   return { model: firstModel, customModel: configuredModel };
 }
 
+function modelOptionSettings(option: LlmModelOption | null | undefined): ProviderSettingsDraft | undefined {
+  if (!option?.base_url) return undefined;
+  return { base_url: option.base_url };
+}
+
+function defaultModeForOptions(options: string[] | undefined, preferred = "medium"): string {
+  const values = options ?? [];
+  if (!values.length) return preferred;
+  if (values.includes(preferred)) return preferred;
+  if (values.includes("fast")) return "fast";
+  if (values.includes("medium")) return "medium";
+  return values[0];
+}
+
+function routeSelection(
+  provider: LlmProviderCatalog | null | undefined,
+  modelId: string,
+): ProviderDraft {
+  if (!provider) return { model: modelId, customModel: "" };
+  return providerSelection({ ...provider, configured_model: modelId });
+}
+
+function buildRouteDrafts(
+  routes: Record<string, ModelRouteSettings> | undefined,
+  providers: LlmProviderCatalog[] | undefined,
+): Record<ModelRouteKey, ModelRouteDraft> {
+  return Object.fromEntries(
+    MODEL_ROUTE_DEFINITIONS.map((definition) => {
+      const route = routes?.[definition.key] ?? {};
+      const routeProvider = route.provider || definition.defaultProvider;
+      const routeModel = route.model || definition.defaultModel;
+      const providerCatalog = providers?.find((item) => item.id === routeProvider);
+      const selection = routeSelection(providerCatalog, routeModel);
+      return [
+        definition.key,
+        {
+          enabled: route.enabled === true,
+          provider: routeProvider,
+          model: selection.model,
+          customModel: selection.customModel,
+          mode: route.mode || route.reasoning_effort || "medium",
+          scalable: route.scalable ?? definition.scalable ?? false,
+          defaultInstances: route.default_instances ?? 1,
+          maxInstances: route.max_instances ?? definition.defaultMaxInstances ?? 1,
+          runner: route.runner ?? "",
+        },
+      ];
+    }),
+  ) as Record<ModelRouteKey, ModelRouteDraft>;
+}
+
 export function LlmModelSection() {
   const [expanded, setExpanded] = useState(false);
   const [catalog, setCatalog] = useState<LlmModelCatalogResponse | null>(null);
@@ -225,13 +439,14 @@ export function LlmModelSection() {
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [reasoningEffort, setReasoningEffort] = useState("medium");
-  const [delegationEnabled, setDelegationEnabled] = useState(false);
-  const [delegationConfirmPrompt, setDelegationConfirmPrompt] = useState(true);
-  const [delegationNotify, setDelegationNotify] = useState(true);
-  const [delegationProvider, setDelegationProvider] = useState("openai");
-  const [delegationModel, setDelegationModel] = useState("gpt-4o");
-  const [delegationCustomModel, setDelegationCustomModel] = useState("");
-  const [savingDelegation, setSavingDelegation] = useState(false);
+  const [routingEnabled, setRoutingEnabled] = useState(false);
+  const [routingConfirmPrompt, setRoutingConfirmPrompt] = useState(true);
+  const [routingNotify, setRoutingNotify] = useState(true);
+  const [agentTeamRedactionText, setAgentTeamRedactionText] = useState("");
+  const [routingDrafts, setRoutingDrafts] = useState<Record<ModelRouteKey, ModelRouteDraft>>(() =>
+    buildRouteDrafts(undefined, undefined),
+  );
+  const [savingRouting, setSavingRouting] = useState(false);
 
   const selectedProvider = useMemo(
     () => catalog?.providers.find((item) => item.id === provider) ?? null,
@@ -260,6 +475,8 @@ export function LlmModelSection() {
         item.description,
         item.source,
         item.source_label,
+        item.base_url,
+        item.server_label,
         item.details?.family,
         item.details?.parameter_size,
         item.details?.quantization_level,
@@ -324,6 +541,12 @@ export function LlmModelSection() {
     setApiKey("");
     setReasoningEffort(settings?.reasoning_effort ?? "medium");
   }, [selectedProvider]);
+
+  useEffect(() => {
+    if (provider === "openai_compatible_local" && selectedModel?.base_url) {
+      setBaseUrl(selectedModel.base_url);
+    }
+  }, [provider, selectedModel?.base_url]);
 
   useEffect(() => {
     if (!selectedProvider || selectedProvider.models.some((item) => item.id === model)) {
@@ -442,9 +665,14 @@ export function LlmModelSection() {
       const next = catalog?.providers.find((item) => item.id === nextProvider);
       const selection = providerDrafts[nextProvider] ?? providerSelection(next);
       const nextModel = selection.customModel.trim() || selection.model;
+      const nextOption = selection.customModel.trim()
+        ? null
+        : next?.models.find((item) => item.id === selection.model);
+      const nextSettings = modelOptionSettings(nextOption);
+      if (nextSettings?.base_url) setBaseUrl(nextSettings.base_url);
       setModel(selection.model);
       setCustomModel(selection.customModel);
-      void saveModelSelection(nextProvider, nextModel);
+      void saveModelSelection(nextProvider, nextModel, nextSettings);
     },
     [catalog, providerDrafts, saveModelSelection],
   );
@@ -457,9 +685,12 @@ export function LlmModelSection() {
         ...current,
         [provider]: { model: nextModel, customModel: "" },
       }));
-      void saveModelSelection(provider, nextModel);
+      const nextOption = selectedProvider?.models.find((item) => item.id === nextModel);
+      const nextSettings = modelOptionSettings(nextOption);
+      if (nextSettings?.base_url) setBaseUrl(nextSettings.base_url);
+      void saveModelSelection(provider, nextModel, nextSettings);
     },
-    [provider, saveModelSelection],
+    [provider, saveModelSelection, selectedProvider],
   );
 
   const handleCustomModelChange = useCallback(
@@ -518,43 +749,114 @@ export function LlmModelSection() {
     provider === "openrouter" ||
     provider === "sglang";
   const showReasoningEffort = provider === "codex-cli" || provider === "claude-cli";
-  const selectedDelegationProvider = useMemo(
-    () => catalog?.providers.find((item) => item.id === delegationProvider) ?? null,
-    [catalog, delegationProvider],
-  );
-  const delegationSelectedModelId = delegationCustomModel.trim() || delegationModel;
 
-  const loadDelegationSettings = useCallback(async () => {
+  const updateRoutingDraft = useCallback(
+    (key: ModelRouteKey, patch: Partial<ModelRouteDraft>) => {
+      setRoutingDrafts((current) => ({
+        ...current,
+        [key]: { ...current[key], ...patch },
+      }));
+    },
+    [],
+  );
+
+  const handleModelDragStart = useCallback(
+    (event: DragEvent<HTMLElement>, modelId: string) => {
+      event.dataTransfer.setData(
+        "application/json",
+        JSON.stringify({ provider, model: modelId }),
+      );
+      event.dataTransfer.effectAllowed = "copy";
+    },
+    [provider],
+  );
+
+  const routeProviderOptions = useCallback(
+    (definition: ModelRouteDefinition) => {
+      const providers = catalog?.providers ?? [];
+      if (!definition.allowedProviders) return providers;
+      return providers.filter((item) => definition.allowedProviders?.includes(item.id));
+    },
+    [catalog],
+  );
+
+  const handleMemberDrop = useCallback(
+    (event: DragEvent<HTMLElement>, definition: ModelRouteDefinition) => {
+      event.preventDefault();
+      const raw = event.dataTransfer.getData("application/json");
+      if (!raw) return;
+      let payload: { provider?: string; model?: string };
+      try {
+        payload = JSON.parse(raw) as { provider?: string; model?: string };
+      } catch {
+        return;
+      }
+      const droppedProvider = String(payload.provider || "");
+      const droppedModel = String(payload.model || "");
+      if (!droppedProvider || !droppedModel) return;
+      if (
+        definition.allowedProviders?.length &&
+        !definition.allowedProviders.includes(droppedProvider)
+      ) {
+        toast.error(`${definition.label} にはこの provider を割り当てられません`);
+        return;
+      }
+      const providerCatalog = catalog?.providers.find((item) => item.id === droppedProvider);
+      const droppedOption = providerCatalog?.models.find((item) => item.id === droppedModel);
+      updateRoutingDraft(definition.key, {
+        enabled: true,
+        provider: droppedProvider,
+        model: droppedModel,
+        customModel: "",
+        mode: defaultModeForOptions(
+          droppedOption?.reasoning_effort_options,
+          routingDrafts[definition.key]?.mode ?? "medium",
+        ),
+      });
+    },
+    [catalog, routingDrafts, updateRoutingDraft],
+  );
+
+  const loadAgentTeamSettings = useCallback(async () => {
     try {
       const data = await pyFetch<SettingsPayload>("/settings");
-      const settings = data.settings?.model_sharing ?? {};
-      const nextProvider = settings.provider || "openai";
-      const nextModel = settings.model || "gpt-4o";
-      setDelegationEnabled(settings.enabled ?? false);
-      setDelegationConfirmPrompt(settings.confirm_prompt ?? true);
-      setDelegationNotify(settings.notify ?? true);
-      setDelegationProvider(nextProvider);
-      setDelegationModel(nextModel);
-      setDelegationCustomModel("");
+      const team = data.settings?.agent_team;
+      setRoutingEnabled(team?.enabled ?? false);
+      setRoutingConfirmPrompt(team?.confirm_prompt ?? true);
+      setRoutingNotify(team?.notify ?? true);
+      setAgentTeamRedactionText((team?.redaction_terms ?? []).join(", "));
+      setRoutingDrafts(buildRouteDrafts(team?.members, catalog?.providers));
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "モデル分担設定を取得できませんでした");
+      toast.error(error instanceof Error ? error.message : "Agent Team 設定を取得できませんでした");
     }
-  }, []);
+  }, [catalog]);
 
   useEffect(() => {
-    if (expanded) void loadDelegationSettings();
-  }, [expanded, loadDelegationSettings]);
+    if (expanded) void loadAgentTeamSettings();
+  }, [expanded, loadAgentTeamSettings]);
 
   useEffect(() => {
-    if (!selectedDelegationProvider) return;
-    if (delegationCustomModel.trim()) return;
-    const selection = providerSelection({
-      ...selectedDelegationProvider,
-      configured_model: delegationModel,
+    if (!catalog) return;
+    setRoutingDrafts((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const definition of MODEL_ROUTE_DEFINITIONS) {
+        const draft = current[definition.key];
+        if (!draft || draft.customModel.trim()) continue;
+        const providerCatalog = catalog.providers.find((item) => item.id === draft.provider);
+        if (!providerCatalog) continue;
+        if (providerCatalog.models.some((item) => item.id === draft.model)) continue;
+        const selection = routeSelection(providerCatalog, draft.model || definition.defaultModel);
+        next[definition.key] = {
+          ...draft,
+          model: selection.model,
+          customModel: selection.customModel,
+        };
+        changed = true;
+      }
+      return changed ? next : current;
     });
-    setDelegationModel(selection.model);
-    setDelegationCustomModel(selection.customModel);
-  }, [delegationCustomModel, delegationModel, selectedDelegationProvider]);
+  }, [catalog]);
 
   const deleteOllamaModel = useCallback(async (modelId: string) => {
     if (!modelId || deletingModel) return;
@@ -580,46 +882,126 @@ export function LlmModelSection() {
     }
   }, [current, deletingModel, loadCatalog, model]);
 
-  const saveDelegationSettings = useCallback(async () => {
-    const targetModel = (delegationCustomModel.trim() || delegationModel).trim();
-    if (delegationEnabled && (!delegationProvider || !targetModel)) return;
-
-    setSavingDelegation(true);
+  const saveRoutingSettings = useCallback(async () => {
+    setSavingRouting(true);
     try {
       await pyFetch("/settings", {
         method: "PATCH",
-        body: JSON.stringify({ key: "model_sharing.enabled", value: delegationEnabled }),
+        body: JSON.stringify({ key: "agent_team.enabled", value: routingEnabled }),
       });
       await pyFetch("/settings", {
         method: "PATCH",
-        body: JSON.stringify({ key: "model_sharing.confirm_prompt", value: delegationConfirmPrompt }),
+        body: JSON.stringify({ key: "agent_team.confirm_prompt", value: routingConfirmPrompt }),
       });
       await pyFetch("/settings", {
         method: "PATCH",
-        body: JSON.stringify({ key: "model_sharing.notify", value: delegationNotify }),
+        body: JSON.stringify({ key: "agent_team.notify", value: routingNotify }),
       });
       await pyFetch("/settings", {
         method: "PATCH",
-        body: JSON.stringify({ key: "model_sharing.provider", value: delegationProvider }),
+        body: JSON.stringify({
+          key: "agent_team.redaction_terms",
+          value: agentTeamRedactionText
+            .split(",")
+            .map((item) => item.trim())
+            .filter(Boolean),
+        }),
       });
-      await pyFetch("/settings", {
-        method: "PATCH",
-        body: JSON.stringify({ key: "model_sharing.model", value: targetModel }),
-      });
-      toast.success("モデル分担設定を保存しました");
+
+      for (const definition of MODEL_ROUTE_DEFINITIONS) {
+        const draft = routingDrafts[definition.key];
+        const targetModel = (draft.customModel.trim() || draft.model).trim();
+        const providerCatalog = catalog?.providers.find((item) => item.id === draft.provider);
+        const selectedRouteModel = providerCatalog?.models.find((item) => item.id === targetModel);
+        const routeMode = defaultModeForOptions(
+          selectedRouteModel?.reasoning_effort_options,
+          draft.mode,
+        );
+        if (draft.enabled && (!draft.provider || !targetModel)) {
+          throw new Error(`${definition.label} の provider/model を指定してください`);
+        }
+        await pyFetch("/settings", {
+          method: "PATCH",
+          body: JSON.stringify({
+            key: `agent_team.members.${definition.key}.enabled`,
+            value: draft.enabled,
+          }),
+        });
+        await pyFetch("/settings", {
+          method: "PATCH",
+          body: JSON.stringify({
+            key: `agent_team.members.${definition.key}.provider`,
+            value: draft.provider,
+          }),
+        });
+        await pyFetch("/settings", {
+          method: "PATCH",
+          body: JSON.stringify({
+            key: `agent_team.members.${definition.key}.model`,
+            value: targetModel || definition.defaultModel,
+          }),
+        });
+        if (routeMode) {
+          await pyFetch("/settings", {
+            method: "PATCH",
+            body: JSON.stringify({
+              key: `agent_team.members.${definition.key}.mode`,
+              value: routeMode,
+            }),
+          });
+          await pyFetch("/settings", {
+            method: "PATCH",
+            body: JSON.stringify({
+              key: `agent_team.members.${definition.key}.reasoning_effort`,
+              value: routeMode,
+            }),
+          });
+        }
+        await pyFetch("/settings", {
+          method: "PATCH",
+          body: JSON.stringify({
+            key: `agent_team.members.${definition.key}.label`,
+            value: definition.label,
+          }),
+        });
+        await pyFetch("/settings", {
+          method: "PATCH",
+          body: JSON.stringify({
+            key: `agent_team.members.${definition.key}.scalable`,
+            value: draft.scalable,
+          }),
+        });
+        await pyFetch("/settings", {
+          method: "PATCH",
+          body: JSON.stringify({
+            key: `agent_team.members.${definition.key}.default_instances`,
+            value: draft.defaultInstances,
+          }),
+        });
+        await pyFetch("/settings", {
+          method: "PATCH",
+          body: JSON.stringify({
+            key: `agent_team.members.${definition.key}.max_instances`,
+            value: draft.maxInstances,
+          }),
+        });
+        if (definition.key === "agent_harness" || draft.runner) {
+          await pyFetch("/settings", {
+            method: "PATCH",
+            body: JSON.stringify({
+              key: `agent_team.members.${definition.key}.runner`,
+              value: draft.runner || "codex_exec",
+            }),
+          });
+        }
+      }
+      toast.success("Agent Team 設定を保存しました");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "モデル分担設定を保存できませんでした");
+      toast.error(error instanceof Error ? error.message : "Agent Team 設定を保存できませんでした");
     } finally {
-      setSavingDelegation(false);
+      setSavingRouting(false);
     }
-  }, [
-    delegationConfirmPrompt,
-    delegationCustomModel,
-    delegationEnabled,
-    delegationModel,
-    delegationNotify,
-    delegationProvider,
-  ]);
+  }, [agentTeamRedactionText, catalog, routingConfirmPrompt, routingDrafts, routingEnabled, routingNotify]);
 
   return (
     <Card size="sm">
@@ -922,6 +1304,8 @@ export function LlmModelSection() {
                     return (
                       <div
                         key={item.id}
+                        draggable
+                        onDragStart={(event) => handleModelDragStart(event, item.id)}
                         className={`flex min-h-14 items-center gap-2 rounded border px-3 py-2 transition-colors hover:bg-accent/50 ${
                           selectedModelId === item.id ? "border-primary bg-accent/30" : ""
                         }`}
@@ -944,10 +1328,7 @@ export function LlmModelSection() {
                             )}
                           </div>
                           <p className="mt-1 truncate text-[10px] text-muted-foreground">
-                            {item.description ||
-                              item.context_length && `context ${item.context_length}` ||
-                              item.details && `${item.details.parameter_size || "-"} / ${item.details.quantization_level || "-"} / ${formatBytes(item.size)}` ||
-                              item.id}
+                            {modelSummary(item)}
                           </p>
                         </button>
                         {canDelete && (
@@ -980,20 +1361,20 @@ export function LlmModelSection() {
                 <div className="flex items-center justify-between gap-3">
                   <label className="flex items-center gap-2 text-xs">
                     <Checkbox
-                      checked={delegationEnabled}
-                      onCheckedChange={(checked) => setDelegationEnabled(checked === true)}
-                      disabled={savingDelegation}
+                      checked={routingEnabled}
+                      onCheckedChange={(checked) => setRoutingEnabled(checked === true)}
+                      disabled={savingRouting}
                     />
-                    外部モデル分担を使う
+                    Agent Team を使う
                   </label>
-                  {!delegationEnabled && (
+                  {!routingEnabled && (
                     <Button
                       size="sm"
                       variant="outline"
-                      onClick={saveDelegationSettings}
-                      disabled={savingDelegation}
+                      onClick={saveRoutingSettings}
+                      disabled={savingRouting}
                     >
-                      {savingDelegation ? (
+                      {savingRouting ? (
                         <Loader2 className="mr-1 size-3 animate-spin" />
                       ) : (
                         <Save className="mr-1 size-3" />
@@ -1003,95 +1384,245 @@ export function LlmModelSection() {
                   )}
                 </div>
 
-                {delegationEnabled && (
+                {routingEnabled && (
                   <div className="space-y-3 rounded-md border p-3">
-                    <div className="grid gap-3 md:grid-cols-[220px_1fr]">
-                      <div className="space-y-1">
-                        <Label className="text-xs">外部モデルプロバイダー</Label>
-                        <select
-                          value={delegationProvider}
-                          onChange={(event) => {
-                            const nextProvider = event.target.value;
-                            const next = catalog.providers.find((item) => item.id === nextProvider);
-                            const selection = providerSelection(next);
-                            setDelegationProvider(nextProvider);
-                            setDelegationModel(selection.model);
-                            setDelegationCustomModel(selection.customModel);
-                          }}
-                          disabled={savingDelegation}
-                          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
-                        >
-                          {catalog.providers.map((item) => (
-                            <option key={item.id} value={item.id}>
-                              {item.label}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                      <div className="space-y-1">
-                        <Label className="text-xs">外部モデル</Label>
-                        <select
-                          value={delegationModel}
-                          onChange={(event) => {
-                            setDelegationModel(event.target.value);
-                            setDelegationCustomModel("");
-                          }}
-                          disabled={savingDelegation}
-                          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
-                        >
-                          {(selectedDelegationProvider?.models ?? []).map((item) => (
-                            <option key={item.id} value={item.id}>
-                              {item.label}{modelSourceLabel(item) ? ` (${modelSourceLabel(item)})` : ""}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                    </div>
-
-                    <div className="space-y-1">
-                      <Label className="text-xs">外部カスタムモデルID</Label>
-                      <Input
-                        value={delegationCustomModel}
-                        onChange={(event) => setDelegationCustomModel(event.target.value)}
-                        placeholder="候補にないモデルIDを直接入力"
-                        disabled={savingDelegation}
-                        className="h-8"
-                      />
-                      <p className="text-[10px] text-muted-foreground">
-                        {providerHint(delegationProvider)}
-                      </p>
-                    </div>
-
                     <div className="flex flex-wrap items-center gap-4">
                       <label className="flex items-center gap-2 text-xs">
                         <Checkbox
-                          checked={delegationConfirmPrompt}
-                          onCheckedChange={(checked) => setDelegationConfirmPrompt(checked === true)}
-                          disabled={savingDelegation}
+                          checked={routingConfirmPrompt}
+                          onCheckedChange={(checked) => setRoutingConfirmPrompt(checked === true)}
+                          disabled={savingRouting}
                         />
-                        送信前に確認する
+                        外部送信前に確認する
                       </label>
                       <label className="flex items-center gap-2 text-xs">
                         <Checkbox
-                          checked={delegationNotify}
-                          onCheckedChange={(checked) => setDelegationNotify(checked === true)}
-                          disabled={savingDelegation}
+                          checked={routingNotify}
+                          onCheckedChange={(checked) => setRoutingNotify(checked === true)}
+                          disabled={savingRouting}
                         />
                         確認時に通知する
                       </label>
                       <Button
                         size="sm"
                         variant="outline"
-                        onClick={saveDelegationSettings}
-                        disabled={savingDelegation || !delegationSelectedModelId.trim()}
+                        onClick={saveRoutingSettings}
+                        disabled={savingRouting}
                       >
-                        {savingDelegation ? (
+                        {savingRouting ? (
                           <Loader2 className="mr-1 size-3 animate-spin" />
                         ) : (
                           <Save className="mr-1 size-3" />
                         )}
                         保存
                       </Button>
+                    </div>
+
+                    <div className="space-y-1">
+                      <Label className="text-xs">外部モデル送信時に追加でマスクする語句</Label>
+                      <Input
+                        value={agentTeamRedactionText}
+                        onChange={(event) => setAgentTeamRedactionText(event.target.value)}
+                        placeholder="顧客名, 案件名, 社内コード"
+                        disabled={savingRouting}
+                        className="h-8"
+                      />
+                    </div>
+
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between gap-3 rounded border p-2">
+                        <span className="text-xs font-medium">メインエージェント</span>
+                        <Badge variant="secondary" className="max-w-[360px] truncate">
+                          {current?.provider ?? "-"} / {current?.model ?? "-"}
+                        </Badge>
+                      </div>
+                      {MODEL_ROUTE_DEFINITIONS.map((definition) => {
+                        const draft = routingDrafts[definition.key];
+                        const providers = routeProviderOptions(definition);
+                        const providerCatalog = catalog.providers.find((item) => item.id === draft.provider);
+                        const selectedRouteModelId = draft.customModel.trim() || draft.model;
+                        const selectedRouteModel = providerCatalog?.models.find(
+                          (item) => item.id === selectedRouteModelId,
+                        );
+                        const modeOptions = selectedRouteModel?.reasoning_effort_options ?? [];
+                        const routeMode = modeOptions.includes(draft.mode)
+                          ? draft.mode
+                          : defaultModeForOptions(modeOptions, draft.mode);
+                        return (
+                          <div
+                            key={definition.key}
+                            onDragOver={(event) => event.preventDefault()}
+                            onDrop={(event) => handleMemberDrop(event, definition)}
+                            className="grid gap-2 rounded border p-2 transition-colors hover:bg-accent/40 md:grid-cols-[170px_170px_1fr_110px_150px]"
+                          >
+                            <label className="flex items-center gap-2 text-xs font-medium">
+                              <Checkbox
+                                checked={draft.enabled}
+                                onCheckedChange={(checked) =>
+                                  updateRoutingDraft(definition.key, { enabled: checked === true })
+                                }
+                                disabled={savingRouting}
+                              />
+                              <span className="min-w-0 truncate">{definition.label}</span>
+                              {draft.enabled && EXTERNAL_AGENT_PROVIDERS.has(draft.provider) && (
+                                <Badge variant="secondary" className="shrink-0 text-[10px]">
+                                  外部送信
+                                </Badge>
+                              )}
+                            </label>
+                            <select
+                              value={draft.provider}
+                              onChange={(event) => {
+                                const nextProvider = event.target.value;
+                                const next = providers.find((item) => item.id === nextProvider);
+                                const selection = providerSelection(next);
+                                const nextModelId = selection.customModel.trim() || selection.model;
+                                const nextModel = next?.models.find((item) => item.id === nextModelId);
+                                updateRoutingDraft(definition.key, {
+                                  provider: nextProvider,
+                                  model: selection.model,
+                                  customModel: selection.customModel,
+                                  mode: defaultModeForOptions(
+                                    nextModel?.reasoning_effort_options,
+                                    next?.settings?.reasoning_effort ?? draft.mode,
+                                  ),
+                                  runner: definition.key === "agent_harness" && nextProvider === "claude-cli"
+                                    ? "claude_code"
+                                    : definition.key === "agent_harness" && nextProvider === "codex-cli"
+                                      ? "codex_exec"
+                                      : draft.runner,
+                                });
+                              }}
+                              disabled={savingRouting || Boolean(definition.allowedProviders?.length === 1)}
+                              className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
+                            >
+                              {providers.map((item) => (
+                                <option key={item.id} value={item.id}>
+                                  {item.label}
+                                </option>
+                              ))}
+                            </select>
+                            <div className="grid gap-2 md:grid-cols-2">
+                              <select
+                                value={draft.model}
+                                onChange={(event) => {
+                                  const nextModel = event.target.value;
+                                  const nextOption = providerCatalog?.models.find((item) => item.id === nextModel);
+                                  updateRoutingDraft(definition.key, {
+                                    model: nextModel,
+                                    customModel: "",
+                                    mode: defaultModeForOptions(
+                                      nextOption?.reasoning_effort_options,
+                                      draft.mode,
+                                    ),
+                                  });
+                                }}
+                                disabled={savingRouting}
+                                className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
+                              >
+                                {(providerCatalog?.models ?? []).map((item) => (
+                                  <option key={item.id} value={item.id}>
+                                    {item.label}
+                                  </option>
+                                ))}
+                              </select>
+                              <Input
+                                value={draft.customModel}
+                                onChange={(event) =>
+                                  updateRoutingDraft(definition.key, { customModel: event.target.value })
+                                }
+                                placeholder="カスタムID"
+                                disabled={savingRouting}
+                                className="h-8"
+                              />
+                            </div>
+                            {modeOptions.length > 0 ? (
+                              <select
+                                value={routeMode}
+                                onChange={(event) =>
+                                  updateRoutingDraft(definition.key, { mode: event.target.value })
+                                }
+                                disabled={savingRouting}
+                                className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
+                              >
+                                {modeOptions.map((item) => (
+                                  <option key={item} value={item}>
+                                    {item}
+                                  </option>
+                                ))}
+                              </select>
+                            ) : (
+                              <span className="flex h-8 items-center text-xs text-muted-foreground">
+                                モードなし
+                              </span>
+                            )}
+                            <div className="grid gap-2">
+                              {definition.scalable ? (
+                                <div className="grid grid-cols-[1fr_64px] items-center gap-2">
+                                  <span className="text-xs text-muted-foreground">自動増員</span>
+                                  <Input
+                                    type="number"
+                                    min={1}
+                                    max={32}
+                                    value={draft.maxInstances}
+                                    onChange={(event) => {
+                                      const next = Math.max(1, Math.min(32, Number(event.target.value) || 1));
+                                      updateRoutingDraft(definition.key, {
+                                        scalable: true,
+                                        maxInstances: next,
+                                        defaultInstances: Math.min(draft.defaultInstances || 1, next),
+                                      });
+                                    }}
+                                    disabled={savingRouting}
+                                    className="h-8"
+                                  />
+                                </div>
+                              ) : (
+                                <span className="flex h-8 items-center text-xs text-muted-foreground">
+                                  単体
+                                </span>
+                              )}
+                              {definition.key === "agent_harness" && (
+                                <select
+                                  value={draft.runner || "codex_exec"}
+                                  onChange={(event) => {
+                                    const nextRunner = event.target.value;
+                                    const nextProvider =
+                                      nextRunner === "claude_code"
+                                        ? "claude-cli"
+                                        : nextRunner === "codex_exec"
+                                          ? "codex-cli"
+                                          : draft.provider;
+                                    const next = providers.find((item) => item.id === nextProvider);
+                                    const selection =
+                                      nextProvider === draft.provider
+                                        ? { model: draft.model, customModel: draft.customModel }
+                                        : providerSelection(next);
+                                    const nextModelId = selection.customModel.trim() || selection.model;
+                                    const nextModel = next?.models.find((item) => item.id === nextModelId);
+                                    updateRoutingDraft(definition.key, {
+                                      runner: nextRunner,
+                                      provider: nextProvider,
+                                      model: selection.model,
+                                      customModel: selection.customModel,
+                                      mode: defaultModeForOptions(
+                                        nextModel?.reasoning_effort_options,
+                                        next?.settings?.reasoning_effort ?? draft.mode,
+                                      ),
+                                    });
+                                  }}
+                                  disabled={savingRouting}
+                                  className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
+                                >
+                                  <option value="codex_exec">Codex CLI</option>
+                                  <option value="claude_code">Claude Code</option>
+                                  <option value="custom_command">Custom</option>
+                                </select>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
                     </div>
                   </div>
                 )}

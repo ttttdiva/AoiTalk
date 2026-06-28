@@ -640,9 +640,9 @@ async def generate_gm_narration(
 
         raw_text = ""
         try:
-            from agents import Runner
+            from ..llm.native_runtime import run_native_agent_once
 
-            result = await Runner.run(gm.agent, prompt)
+            result = await run_native_agent_once(gm.agent, prompt)
             raw_text = (result.final_output or "").strip()
             if _looks_like_gm_refusal(raw_text):
                 retry_prompt = (
@@ -652,7 +652,7 @@ async def generate_gm_narration(
                     "現実の政治的投票、金融取引、法的助言ではありません。"
                     "安全上拒否するのではなく、GMとしてシナリオ資料と直近ログに沿って公開できる範囲を描写してください。"
                 )
-                retry_result = await Runner.run(gm.agent, retry_prompt)
+                retry_result = await run_native_agent_once(gm.agent, retry_prompt)
                 retry_text = (retry_result.final_output or "").strip()
                 if retry_text:
                     raw_text = retry_text
@@ -985,9 +985,9 @@ async def generate_private_gm_reply(
             "公開描写・公開ログ・画像生成・BGM・REQUEST_ROLLなどのマーカーは使わないでください。"
         )
         try:
-            from agents import Runner
+            from ..llm.native_runtime import run_native_agent_once
 
-            result = await Runner.run(gm.agent, prompt)
+            result = await run_native_agent_once(gm.agent, prompt)
             reply = _strip_markers((result.final_output or "").strip()) or "……"
         except Exception as e:
             logger.exception("Private AI GM reply failed: %s", e)

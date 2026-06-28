@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from agents import function_tool
+from ...tools.core import tool
 from sqlalchemy import func, select, update
 
 from .common import (
@@ -28,7 +28,7 @@ from .common import (
 def build_record_table_tools() -> list:
     """プロジェクトスコープのレコードテーブル（DB風テーブル）関連ツールのツール群を生成して返す。"""
 
-    @function_tool
+    @tool
     def list_record_tables(project: str = "", project_id: str = "") -> str:
         """List DB-style record tables in a project. Use this before updating an existing table."""
         from ...memory.database import get_database_manager
@@ -75,7 +75,7 @@ def build_record_table_tools() -> list:
 
         return _json(_run_async(_list()))
 
-    @function_tool
+    @tool
     def create_record_table(
         table_name: str,
         columns_json: str = "",
@@ -191,7 +191,7 @@ def build_record_table_tools() -> list:
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
 
-    @function_tool
+    @tool
     def append_record_rows(
         record_table: str,
         rows_json: str,
@@ -298,7 +298,7 @@ def build_record_table_tools() -> list:
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
 
-    @function_tool
+    @tool
     def update_record_row(
         row_id: str,
         values_json: str = "",
@@ -377,7 +377,7 @@ def build_record_table_tools() -> list:
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
 
-    @function_tool
+    @tool
     def delete_record_rows(row_ids: str) -> str:
         """Soft-delete one or more project DB table rows. `row_ids` is a comma-separated list of UUIDs."""
         from ...memory.database import get_database_manager
@@ -425,7 +425,7 @@ def build_record_table_tools() -> list:
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
 
-    @function_tool
+    @tool
     def delete_record_table(
         record_table: str,
         project: str = "",

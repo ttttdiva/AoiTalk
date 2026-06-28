@@ -19,7 +19,12 @@ SCENARIO_WORKFLOW_ALLOWED_TOOLS = {
 }
 
 DISABLED_SCENARIO_WORKFLOW_TOOLS = {
-    "project_management_assistant",
+    "get_project_context",
+    "list_project_information",
+    "create_task",
+    "update_task",
+    "sync_wbs_tasks",
+    "upsert_project_fact",
 }
 
 

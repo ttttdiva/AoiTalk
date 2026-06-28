@@ -18,7 +18,7 @@ prompt_template: |
     - 重要資料リンク、台帳、構成図、パラメーターシート
 
   ## 手順
-  1. project_management_assistant の get_project_context で対象案件を確認する。
+  1. get_project_context で対象案件を確認する。
   2. list_project_information で現在のカテゴリ、重要資料、既存ファクト、同期状態を読む。
   3. 入力で明示されたタスクや資料がある場合はそれを優先する。指定がない場合は list_project_tasks_changed_since を使い、前回同期カーソル以降に更新されたタスクだけ読む。
   4. タスク説明から案件情報として残すべき内容を抽出する。単なる進捗や「完了/未着手」だけの情報は反映しない。
@@ -41,7 +41,13 @@ aliases:
   - project_info_update
   - task_to_project_info
 bound_tools:
-  - project_management_assistant
+  - get_project_context
+  - list_project_information
+  - list_project_tasks_changed_since
+  - upsert_project_info_category
+  - register_project_document
+  - upsert_project_fact
+  - set_project_information_sync_state
 examples:
   - "/project_information_update"
   - "このタスクの説明から案件情報を更新して"

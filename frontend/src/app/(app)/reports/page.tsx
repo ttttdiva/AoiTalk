@@ -758,20 +758,6 @@ export default function ReportsPage() {
         scheduledTasksPromise,
       ]);
 
-      if (scope !== "all" && entries.length === 0) {
-        const [allReport, allEntries] = await Promise.all([
-          taskApi.getTimeReport({}, dateFrom, dateTo),
-          taskApi.listTimeEntries({}, dateFrom, dateTo),
-        ]);
-        if (allEntries.length > 0) {
-          setScope("all");
-          setReport(allReport);
-          setTimeEntries(allEntries);
-          setScheduledTasks([]);
-          return;
-        }
-      }
-
       setReport(r);
       setTimeEntries(entries);
       setScheduledTasks(

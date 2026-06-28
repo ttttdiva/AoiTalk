@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from agents import Agent, ModelSettings
+from ..llm.native_runtime import AgentDefinition as Agent, NativeModelSettings as ModelSettings
 
 from .base import BaseAgent
 from .project_management import (
@@ -34,6 +34,7 @@ _TOOL_ORDER = (
     "upsert_project_fact",
     "delete_project_fact",
     "list_project_tasks_changed_since",
+    "get_project_progress",
     "set_project_information_sync_state",
     "create_record_table",
     "append_record_rows",
@@ -78,9 +79,10 @@ Use your tools to:
 - create and update project-scoped DB-style record tables from text, files, or image-derived facts
 - update or delete project-scoped DB-style record table rows and tables
 - create, update, and delete project-scoped tasks
-- read WBS Excel files configured on the project and sync rows into tasks plus the WBS.dbtable record table
+- manage the internal WBS.dbtable as the canonical project WBS
+- optionally import external WBS Excel files into WBS.dbtable when such files are configured or provided
 - read issue-tracker Excel files configured on the project and sync rows into the 課題管理表.dbtable record table
-- summarize customer/internal confirmation items from WBS data
+- summarize customer/internal confirmation items from internal WBS data
 - schedule tasks with start/end times and recurrence
 - assign tasks to project members
 - start, stop, and log timers
@@ -88,6 +90,11 @@ Use your tools to:
 - report tracked time by project/day/user/task
 - keep record tables visible as .dbtable items in the project workspace filer
 - render Mermaid diagrams (system overview, WBS tree, record-table relations) from stored project data
+
+Response format rules:
+- For project progress, status, issues, tasks, WBS, record-table summaries, comparisons, or next actions, use Markdown headings, bullet lists, and compact tables when they make the answer easier to scan.
+- Keep short task confirmations, simple status acknowledgements, and casual non-project replies plain and concise. Do not force Markdown decoration into every answer.
+- Use Markdown tables only for compact comparable data, not for single short facts or conversational replies.
 
 Behavior rules:
 - Default to the runtime project context when a project is not explicitly provided.
@@ -99,8 +106,17 @@ Behavior rules:
 - Put appointment dates/times in start_at/end_at and description. Put reservation numbers, prices, coupon/point details, phone numbers, cancellation notes, and full extracted email facts in description, not in title.
 - For task creation without explicit priority, use priority="medium". For task creation without explicit project, use the runtime project; if no runtime project is available, create it in Inbox.
 - When the user asks to make a DB/table/台帳 from provided content, infer useful columns and rows, then create_record_table or append_record_rows.
-- When the user asks to complete a project DB from WBS, call sync_wbs_tasks with project/project_id when available; by default it syncs WBS.dbtable only and must not create normal task-list items.
-- When the user asks to complete a project information DB, first inspect existing project information, organize project filer documents when a folder/path is available, and include WBS.dbtable sync when a WBS file is configured or WBS/工程表/進捗管理 is mentioned.
+- Treat WBS as an internal DB-managed work breakdown/status table. The canonical WBS is WBS.dbtable. A user-provided Excel WBS is only an optional import source that may or may not exist.
+- When the user asks to create or update WBS items from text, conversation, documents, or your own decomposition, use create_record_table/append_record_rows/update_record_row against WBS.dbtable. Do not ask for Excel first.
+- When the user asks to import or sync an external WBS Excel, call sync_wbs_tasks with project/project_id when available; by default it imports into WBS.dbtable only and must not create normal task-list items.
+- When the user asks to complete or update a project information DB, first inspect existing project information, organize project filer documents, and include external WBS Excel import only when a WBS file is configured or explicitly provided. Do not require WBS Excel.
+- 案件進捗、状況確認、遅延確認、進捗確認では最初に get_project_progress を呼ぶ。これは目標、facts、現在状況、内部 WBS.dbtable、組み込みタスクをまとめる。WBS.dbtable が空でもそこで止めず、結果内の他の根拠から確認を続ける。進捗は日付範囲内の活動量ではなく、案件目標に対してどこまで進んだかを意味する。
+- For project progress, status, or delay checks, call get_project_progress first. Progress means how far the project has advanced toward its goals, not just activity volume within a date range. If WBS.dbtable is empty, continue from the other evidence; never stop at "WBS is empty".
+- Use list_calendar only when scheduled upcoming work matters, and get_time_report only when the user asks about actual work time, productivity, today/this week, or another period.
+- WBS Excel, issue-table Excel, and risk-table Excel files are optional imported evidence, not mandatory prerequisites for project progress checks. Do not answer that progress cannot be checked solely because WBS/課題管理表/リスク管理表 is unset. If those files are unavailable, continue from project goals, internal WBS.dbtable, tasks, schedules, time records, project facts, and issue rows, and mention missing external sources briefly only as a limitation.
+- If no project goals, built-in tasks, schedules, time records, WBS rows, issue rows, or project facts exist, say that AoiTalk has no stored progress evidence for this project yet, then suggest defining goals/milestones and creating WBS/tasks internally. Do not make Excel upload the first or only path.
+- When a runtime project is selected and the user says the project DB is old/wrong or asks to update/refresh it without a folder/path, do not ask for a path first. Call organize_project_information_from_folder with folder_path="" and apply=true to scan the project filer root.
+- For explicit update/completion requests, use mutation mode: organize_project_information_from_folder apply=true, sync_wbs_tasks dry_run=false, and sync_issue_table dry_run=false. A preview/dry-run is not a completed update.
 - After organizing project documents, call configure_project_management_files when WBS, issue, risk, or request files were identified but are not yet configured on the project.
 - Include issue-tracker sync when a project has an issue_file, when a newer 課題管理表 exists in the project filer, or when 課題管理表/issue/要確認 is mentioned.
 - Treat project information as durable knowledge about the project itself: overview, assumptions, scope, requirements, decisions, open questions, risks, issues, design details, and verification notes belong in project information; task status and progress belong in tasks.
@@ -133,7 +149,7 @@ Behavior rules:
         }
 
         return Agent(
-            name="ProjectManagementAssistant",
+            name="ProjectManagementToolBundle",
             model=self.model,
             instructions=instructions,
             model_settings=ModelSettings(tool_choice="required"),
@@ -141,11 +157,12 @@ Behavior rules:
         )
 
     def get_tool_name(self) -> str:
-        return "project_management_assistant"
+        return "project_management_tool_bundle"
 
     def get_tool_description(self) -> str:
         return (
-            "Project management assistant for the built-in task, calendar, timer, "
-            "reporting system, project information DB, record tables, WBS Excel sync, "
-            "issue tracker Excel sync, and project request summaries."
+            "Project management tool bundle for the built-in task, calendar, timer, "
+            "reporting system, project information DB, record tables, internal "
+            "WBS.dbtable management, optional external WBS Excel import, issue "
+            "tracker Excel sync, and project request summaries."
         )

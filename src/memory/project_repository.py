@@ -15,7 +15,9 @@ from .models import (
     ConversationSession, LocalTask, Task, TaskAssignee, TaskComment, TaskActivity,
     TaskDependency, TaskRecurrenceRule, TaskOccurrence, TimeEntry,
     ProjectNotificationSetting, NotificationDelivery, KnowledgeSourcePermission,
-    RecordField, RecordRow, RecordTable,
+    KnowledgeSource, ProjectContextPack, ContextMemory, ProjectInfoCategory,
+    ProjectDocument, ProjectFact, ProjectInfoSyncState, RecordAttachment,
+    RecordEvent, RecordField, RecordRow, RecordTable, RecordView,
 )
 
 
@@ -436,13 +438,16 @@ class ProjectRepository:
     @staticmethod
     async def delete_project(
         session: AsyncSession,
-        project_id: UUID
+        project_id: UUID,
+        *,
+        delete_workspace: bool = False,
     ) -> bool:
-        """Soft-delete a project and tombstone syncable descendants.
+        """Delete a project from the active app surface.
 
         Sync 対象の `projects` / `tasks` / `task_occurrences` / `time_entries`
-        は `deleted_at` tombstone を付与する。非同期対象の補助テーブルは
-        既存どおり物理削除し、会話セッションは project_id を NULL にして保持する。
+        は `deleted_at` tombstone を付与する。案件情報、台帳補助データ、
+        メンバー、ナレッジ、コンテキストなどの非sync補助データは物理削除し、
+        会話セッションは project_id を NULL にして保持する。
         """
         project = await ProjectRepository.get_by_id(session, project_id)
         if project is None:
@@ -495,11 +500,41 @@ class ProjectRepository:
             await session.execute(delete(TaskComment).where(TaskComment.task_id.in_(task_ids)))
             await session.execute(delete(TaskAssignee).where(TaskAssignee.task_id.in_(task_ids)))
 
+        record_table_ids_result = await session.execute(
+            select(RecordTable.id).where(RecordTable.project_id == project_id)
+        )
+        record_table_ids = [row[0] for row in record_table_ids_result.all()]
+        record_row_ids_result = await session.execute(
+            select(RecordRow.id).where(RecordRow.project_id == project_id)
+        )
+        record_row_ids = [row[0] for row in record_row_ids_result.all()]
+        if record_row_ids:
+            await session.execute(delete(RecordAttachment).where(RecordAttachment.row_id.in_(record_row_ids)))
+        if record_table_ids:
+            await session.execute(delete(RecordView).where(RecordView.table_id.in_(record_table_ids)))
+        await session.execute(delete(RecordEvent).where(RecordEvent.project_id == project_id))
+
+        await session.execute(delete(ProjectFact).where(ProjectFact.project_id == project_id))
+        await session.execute(delete(ProjectDocument).where(ProjectDocument.project_id == project_id))
+        await session.execute(delete(ProjectInfoSyncState).where(ProjectInfoSyncState.project_id == project_id))
+        await session.execute(delete(ProjectInfoCategory).where(ProjectInfoCategory.project_id == project_id))
+        await session.execute(delete(ProjectContextPack).where(ProjectContextPack.project_id == project_id))
+        await session.execute(delete(ContextMemory).where(ContextMemory.project_id == project_id))
         await session.execute(delete(NotificationDelivery).where(NotificationDelivery.project_id == project_id))
         await session.execute(delete(LocalTask).where(LocalTask.project_id == project_id))
         await session.execute(delete(ProjectNotificationSetting).where(ProjectNotificationSetting.project_id == project_id))
         await session.execute(delete(KnowledgeSourcePermission).where(KnowledgeSourcePermission.project_id == project_id))
         await session.execute(delete(ProjectJoinRequest).where(ProjectJoinRequest.project_id == project_id))
+        await session.execute(delete(ProjectMember).where(ProjectMember.project_id == project_id))
+
+        project_workspace_sources = await session.execute(
+            select(KnowledgeSource).where(KnowledgeSource.source_type == "project_workspace")
+        )
+        for source in project_workspace_sources.scalars().all():
+            access_policy = source.access_policy or {}
+            if str(access_policy.get("project_id") or "") == str(project_id):
+                await session.delete(source)
+
         await session.execute(
             update(RecordRow)
             .where(RecordRow.project_id == project_id, RecordRow.deleted_at.is_(None))
@@ -525,13 +560,54 @@ class ProjectRepository:
         await session.execute(
             update(ConversationSession)
             .where(ConversationSession.project_id == project_id)
-            .values(project_id=None, updated_at=now)
+            .values(project_id=None)
         )
 
         project.deleted_at = now
         project.updated_at = now
+        if delete_workspace:
+            from ..services.project_workspace_cleanup import remove_project_workspace
+
+            remove_project_workspace(project_id)
         await session.commit()
         return True
+
+    @staticmethod
+    async def delete_projects_in_space(
+        session: AsyncSession,
+        space_id: UUID,
+        *,
+        delete_workspaces: bool = False,
+    ) -> int:
+        """Soft-delete active projects in a space, then detach all project refs.
+
+        Space deletion must not leave active projects with ``space_id = NULL``.
+        Deleted project rows are detached afterward so the space row can be
+        removed without violating the ``projects.space_id`` foreign key.
+        """
+        result = await session.execute(
+            select(Project.id).where(
+                Project.space_id == space_id,
+                Project.deleted_at.is_(None),
+            )
+        )
+        project_ids = list(result.scalars().all())
+
+        deleted_count = 0
+        for project_id in project_ids:
+            if await ProjectRepository.delete_project(
+                session,
+                project_id,
+                delete_workspace=delete_workspaces,
+            ):
+                deleted_count += 1
+
+        await session.execute(
+            update(Project)
+            .where(Project.space_id == space_id)
+            .values(space_id=None, updated_at=datetime.utcnow())
+        )
+        return deleted_count
     
     # ─── Member Management ──────────────────────────────────────────────
     

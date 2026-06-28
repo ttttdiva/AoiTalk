@@ -7,10 +7,10 @@
 """
 
 from typing import Any, Optional
-from agents import Agent, ModelSettings
+from ..llm.native_runtime import AgentDefinition as Agent, NativeModelSettings as ModelSettings
 
 from .base import BaseAgent
-from ..tools.adapters import OpenAIAgentAdapter
+from ..tools.core import ensure_tool_definitions
 from ..tools.scenario_tools import get_coc_creation_reference_context
 
 
@@ -89,7 +89,7 @@ class StoryCreatorAgent(BaseAgent):
 
     def _create_agent(self) -> Agent:
         """ストーリークリエイターエージェントインスタンスを作成する。"""
-        tools = OpenAIAgentAdapter.convert_all([get_coc_creation_reference_context])
+        tools = ensure_tool_definitions([get_coc_creation_reference_context])
         return Agent(
             name="story_creator",
             instructions=(

@@ -47,6 +47,7 @@ export function SubtaskRow({
   fetchData,
   handleTaskDateChange,
   applyTaskPatchLocally,
+  requestRecurringDelete,
 }: {
   sub: Task;
   parentTask: Task;
@@ -69,6 +70,7 @@ export function SubtaskRow({
     changes: { start_at?: string | null; end_at?: string | null },
   ) => Promise<void>;
   applyTaskPatchLocally: (taskId: string, patch: Partial<Task>) => void;
+  requestRecurringDelete?: (task: Task) => boolean;
 }) {
   return (
     <tr
@@ -191,6 +193,7 @@ export function SubtaskRow({
           size="icon-xs"
           onClick={(e) => {
             e.stopPropagation();
+            if (requestRecurringDelete?.(sub)) return;
             pushUndo({
               type: "recreate",
               tasks: [sub],

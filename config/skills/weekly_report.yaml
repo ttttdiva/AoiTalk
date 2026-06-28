@@ -8,7 +8,7 @@ prompt_template: |
   ## 手順
 
   ### 1. 設定の確認
-  filesystem_assistant で workspace_root を特定し、knowledge/weekly_report_config.json を読み込む。
+  get_project_context と direct filesystem tools で workspace_root を特定し、knowledge/weekly_report_config.json を読み込む。
 
   存在しない場合 → 初回セットアップを実行:
   1. ユーザーに以下を確認:
@@ -102,7 +102,11 @@ aliases:
   - 週報
   - weekly
 bound_tools:
-  - filesystem_assistant
+  - get_project_context
+  - find_workspace_items
+  - read_workspace_file
+  - view_file
+  - execute_command
 examples:
   - "/weekly_report"
   - "/weekly_report 今週はNW切替作業があったことを強調"

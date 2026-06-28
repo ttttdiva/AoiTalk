@@ -26,7 +26,7 @@ class PermissionPolicy(str, Enum):
 class GenerationPolicy:
     profile: GenerationProfile
     agentic_completion_enabled: bool
-    required_delegation_enabled: bool
+    tool_hints_enabled: bool
     discretionary_tool_loop_enabled: bool
     permission_policy: PermissionPolicy
 
@@ -35,28 +35,28 @@ POLICIES: dict[GenerationProfile, GenerationPolicy] = {
     GenerationProfile.CHAT: GenerationPolicy(
         profile=GenerationProfile.CHAT,
         agentic_completion_enabled=False,
-        required_delegation_enabled=True,
+        tool_hints_enabled=True,
         discretionary_tool_loop_enabled=True,
         permission_policy=PermissionPolicy.CONFIRM_MUTATIONS,
     ),
     GenerationProfile.ASSISTED_WORK: GenerationPolicy(
         profile=GenerationProfile.ASSISTED_WORK,
         agentic_completion_enabled=True,
-        required_delegation_enabled=True,
+        tool_hints_enabled=True,
         discretionary_tool_loop_enabled=True,
         permission_policy=PermissionPolicy.CONFIRM_ALL_TOOLS,
     ),
     GenerationProfile.AUTONOMOUS_WORK: GenerationPolicy(
         profile=GenerationProfile.AUTONOMOUS_WORK,
         agentic_completion_enabled=True,
-        required_delegation_enabled=True,
+        tool_hints_enabled=True,
         discretionary_tool_loop_enabled=True,
         permission_policy=PermissionPolicy.AUTO_APPROVE,
     ),
     GenerationProfile.REVIEW: GenerationPolicy(
         profile=GenerationProfile.REVIEW,
         agentic_completion_enabled=True,
-        required_delegation_enabled=True,
+        tool_hints_enabled=True,
         discretionary_tool_loop_enabled=True,
         permission_policy=PermissionPolicy.CONFIRM_ALL_TOOLS,
     ),

@@ -18,6 +18,12 @@ from .security.field_crypto import (
 
 logger = logging.getLogger(__name__)
 GLOBAL_CONFIG_KEY = "global"
+OBSOLETE_AGENT_TEAM_MEMBER_KEYS = {
+    "search",
+    "filesystem",
+    "project_management",
+    "skills",
+}
 
 
 def _load_legacy_yaml(path: Path) -> Optional[Dict[str, Any]]:
@@ -46,6 +52,42 @@ def _fill_missing_defaults(value: Any, defaults: Any) -> Any:
     return merged
 
 
+def _prune_obsolete_app_config(value: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop stale config branches that no longer have a runtime owner."""
+    cleaned = copy.deepcopy(value)
+    cleaned.pop("model_sharing", None)
+    cleaned.pop("model_routing", None)
+
+    agent_team = cleaned.get("agent_team")
+    if isinstance(agent_team, dict):
+        members = agent_team.get("members")
+        if isinstance(members, dict):
+            for member_key in OBSOLETE_AGENT_TEAM_MEMBER_KEYS:
+                members.pop(member_key, None)
+        roster = agent_team.get("roster")
+        if isinstance(roster, list):
+            agent_team["roster"] = [
+                item
+                for item in roster
+                if not (
+                    isinstance(item, dict)
+                    and str(
+                        item.get("member_key")
+                        or item.get("key")
+                        or item.get("id")
+                        or ""
+                    )
+                    in OBSOLETE_AGENT_TEAM_MEMBER_KEYS
+                )
+            ]
+
+    agents = cleaned.get("agents")
+    if isinstance(agents, dict):
+        agents.pop("skills", None)
+
+    return cleaned
+
+
 def _db_deps():
     from sqlalchemy.exc import SQLAlchemyError
 
@@ -69,6 +111,7 @@ def load_app_config_sync(legacy_config_path: Optional[Path] = None) -> Dict[str,
         if legacy_config_path is not None
         else None
     ) or load_default_config()
+    seed = _prune_obsolete_app_config(seed)
 
     try:
         SQLAlchemyError, get_database_manager, AppConfigSetting = _db_deps()
@@ -98,12 +141,13 @@ def load_app_config_sync(legacy_config_path: Optional[Path] = None) -> Dict[str,
                 session.commit()
                 stored_value = encrypted_value
 
-            value = decrypt_json_secret_leaves(
+            stored_decrypted = decrypt_json_secret_leaves(
                 stored_value,
                 aad_prefix="app_config_settings.value",
             )
+            value = _prune_obsolete_app_config(stored_decrypted)
             merged = _fill_missing_defaults(value, seed)
-            if merged != value:
+            if merged != stored_decrypted:
                 row.value = encrypt_json_secret_leaves(
                     copy.deepcopy(merged),
                     aad_prefix="app_config_settings.value",
@@ -119,6 +163,7 @@ def save_app_config_sync(config: Dict[str, Any]) -> bool:
     """Replace the global app config JSON in DB."""
 
     try:
+        config = _prune_obsolete_app_config(config)
         SQLAlchemyError, get_database_manager, AppConfigSetting = _db_deps()
         _ensure_table()
         db_manager = get_database_manager()

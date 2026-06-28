@@ -26,10 +26,16 @@ from .generation_policy import (
     reset_current_generation_policy,
     set_current_generation_policy,
 )
+from .agentic_completion import (
+    agentic_max_rounds,
+    render_messages_for_review,
+    run_agentic_completion_loop_sync,
+)
 from .json_tool_loop import build_json_tool_loop_system_prompt, run_json_tool_loop
 from .agent_runtime import (
-    build_required_delegation_context_sync,
-    compose_required_delegation_user_message,
+    build_tool_hint_context_sync,
+    compose_tool_hint_user_message,
+    guard_tool_execution_claims,
     run_openai_tool_call_loop,
 )
 from .prompts import build_unified_instructions
@@ -39,7 +45,11 @@ from .provider_mode_adapters import (
     ollama_reasoning_effort_for_mode,
 )
 from .runtime_tool_registry import build_runtime_tool_registry
-from .tool_policy import reset_current_user_input, set_current_user_input
+from .tool_policy import (
+    project_progress_review_active,
+    reset_current_user_input,
+    set_current_user_input,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -220,8 +230,8 @@ class OllamaClient:
                 "",
                 "Decide whether a tool is needed.",
                 (
-                    "If the request asks to search, look up, verify, check current information, "
-                    "or uses Japanese terms such as 検索, 調べて, 確認, 最新, use a relevant search tool first."
+                    "If the request explicitly asks for web search or uses Japanese terms such "
+                    "as 調べて or 調査して, use a relevant search tool first."
                 ),
                 (
                     "When calling a tool with a `request` parameter, copy the user's request exactly "
@@ -361,8 +371,8 @@ class OllamaClient:
             logger.warning("[OllamaClient] Failed to resolve project context: %s", exc)
             return None
 
-    def _build_required_delegation_context(self, user_input: str) -> str:
-        return build_required_delegation_context_sync(
+    def _build_tool_hint_context(self, user_input: str) -> str:
+        return build_tool_hint_context_sync(
             user_input=user_input,
             registry=self._tool_registry,
             policy=get_client_generation_policy(self),
@@ -389,12 +399,12 @@ class OllamaClient:
             project_context = self._resolve_project_context_sync()
             project_token = set_runtime_project_context(project_context)
             model_user_input = user_input
-            required_delegation_context = self._build_required_delegation_context(
+            tool_hint_context = self._build_tool_hint_context(
                 user_input
             )
-            model_user_input = compose_required_delegation_user_message(
+            model_user_input = compose_tool_hint_user_message(
                 user_input,
-                required_delegation_context,
+                tool_hint_context,
             )
 
             if (
@@ -408,6 +418,20 @@ class OllamaClient:
                     temperature=temperature,
                     max_tokens=max_tokens,
                     original_request=user_input,
+                )
+                response_text = run_agentic_completion_loop_sync(
+                    client=self,
+                    run_once=lambda prompt: self._run_agentic_review_once(
+                        prompt,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        original_request=user_input,
+                    ),
+                    context=render_messages_for_review(
+                        [{"role": "user", "content": model_user_input}]
+                    ),
+                    user_input=user_input,
+                    initial_response=response_text,
                 )
                 self.history_manager.add_message("user", user_input)
                 self.history_manager.add_message("assistant", response_text)
@@ -432,10 +456,34 @@ class OllamaClient:
                     assistant_message=choice.message,
                     api_kwargs=api_kwargs,
                     registry=self._tool_registry,
+                    user_input=user_input,
+                )
+            elif project_progress_review_active(user_input):
+                response_text = self._handle_tool_calls(
+                    messages=messages,
+                    assistant_message=choice.message,
+                    api_kwargs=api_kwargs,
+                    registry=self._tool_registry,
+                    user_input=user_input,
                 )
             else:
-                response_text = choice.message.content or ""
+                response_text = guard_tool_execution_claims(
+                    choice.message.content or "",
+                    [],
+                )
 
+            response_text = run_agentic_completion_loop_sync(
+                client=self,
+                run_once=lambda prompt: self._run_agentic_review_once(
+                    prompt,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    original_request=user_input,
+                ),
+                context=render_messages_for_review(messages),
+                user_input=user_input,
+                initial_response=response_text,
+            )
             self.history_manager.add_message("user", user_input)
             self.history_manager.add_message("assistant", response_text)
             return response_text
@@ -480,12 +528,54 @@ class OllamaClient:
             response = self.client.chat.completions.create(**api_kwargs)
             return response.choices[0].message.content or ""
 
-        return run_json_tool_loop(
+        result = run_json_tool_loop(
             create_completion=_create,
             initial_messages=messages,
             registry=self._tool_registry,
+            max_rounds=agentic_max_rounds(self, original_request or user_input),
             original_request=original_request or user_input,
+            return_result=True,
         )
+        return guard_tool_execution_claims(result.final_output, result.tool_calls)
+
+    def _run_agentic_review_once(
+        self,
+        prompt: str,
+        *,
+        temperature: float,
+        max_tokens: Optional[int],
+        original_request: str,
+    ) -> str:
+        if (
+            get_client_generation_policy(self).discretionary_tool_loop_enabled
+            and len(self._tool_registry) > 0
+            and not self._native_tool_calling_enabled
+        ):
+            return self._generate_with_json_tool_loop(
+                prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                original_request=original_request,
+            )
+
+        messages = self._build_messages(prompt)
+        api_kwargs = self._build_api_kwargs(
+            messages,
+            temperature,
+            max_tokens,
+            tools_enabled=self._native_tool_calling_enabled,
+        )
+        response = self._create_completion_with_tool_fallback(api_kwargs)
+        choice = response.choices[0]
+        if getattr(choice.message, "tool_calls", None):
+            return self._handle_tool_calls(
+                messages=messages,
+                assistant_message=choice.message,
+                api_kwargs=api_kwargs,
+                registry=self._tool_registry,
+                user_input=original_request,
+            )
+        return guard_tool_execution_claims(choice.message.content or "", [])
 
     def _create_completion_with_tool_fallback(self, api_kwargs: Dict[str, Any]) -> Any:
         try:
@@ -514,16 +604,22 @@ class OllamaClient:
         api_kwargs: Dict[str, Any],
         registry: ToolRegistry,
         max_rounds: int = 5,
+        user_input: Optional[str] = None,
     ) -> str:
-        return run_openai_tool_call_loop(
+        effective_max_rounds = max(max_rounds, agentic_max_rounds(self, user_input))
+        result = run_openai_tool_call_loop(
             initial_messages=messages,
             assistant_message=assistant_message,
             api_kwargs=api_kwargs,
             registry=registry,
             create_completion=self._create_completion_with_tool_fallback,
             log_prefix="OllamaClient",
-            max_rounds=max_rounds,
+            max_rounds=effective_max_rounds,
+            return_result=True,
+            config=self.config,
+            user_input=user_input,
         )
+        return guard_tool_execution_claims(result.final_output, result.tool_calls)
 
     def _stream_response(
         self,

@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 from .engines.voicevox_engine import VoicevoxEngine
 from .engines.aivisspeech_engine import AivisSpeechEngine
 from .engines.nijivoice_engine import NijivoiceEngine
+from .engines.miotts_engine import MioTTSEngine
 IrodoriTTSEngine = None
 
 # Windows-only TTS engines (require pythonnet, pywin32, etc.)
@@ -221,7 +222,7 @@ class TTSManager:
         if not await engine.initialize():
             engine.stop_engine()
             return None
-            
+
         return engine
         
     async def create_voiceroid_engine(self, character_config: Optional[dict] = None) -> Optional["VoiceroidEngine"]:
@@ -284,7 +285,7 @@ class TTSManager:
         # Initialize engine
         if not await engine.initialize():
             return None
-            
+
         return engine
         
     async def create_cevio_engine(self) -> Optional["CevioEngine"]:
@@ -361,13 +362,55 @@ class TTSManager:
             Initialized NijivoiceEngine or None
         """
         engine = NijivoiceEngine(api_key=api_key)
-        
+
         # Initialize engine
         if not await engine.initialize():
             return None
-            
+
         return engine
-        
+
+    async def create_miotts_engine(
+        self,
+        model_id: Optional[str] = None,
+        codec_model_id: Optional[str] = None,
+        default_preset_id: Optional[str] = None,
+        device: Optional[str] = None,
+    ) -> Optional[MioTTSEngine]:
+        """Create and initialize embedded MioTTS engine."""
+        miotts_settings = self.config.get('tts_settings', {}).get('miotts', {})
+
+        engine = MioTTSEngine(
+            model_id=model_id or miotts_settings.get('model_id'),
+            codec_model_id=codec_model_id or miotts_settings.get('codec_model_id'),
+            refs_dir=miotts_settings.get('refs_dir'),
+            presets_dir=miotts_settings.get('presets_dir'),
+            cache_dir=miotts_settings.get('cache_dir'),
+            device=device or miotts_settings.get('device', 'auto'),
+            dtype=miotts_settings.get('dtype', 'auto'),
+            default_preset_id=(
+                default_preset_id
+                or miotts_settings.get('default_preset_id')
+                or miotts_settings.get('preset_id')
+            ),
+            trust_remote_code=miotts_settings.get('trust_remote_code', False),
+            max_text_length=miotts_settings.get('max_text_length', 300),
+            max_reference_mb=miotts_settings.get('max_reference_mb', 20),
+            max_reference_seconds=miotts_settings.get('max_reference_seconds', 20.0),
+            temperature=miotts_settings.get('temperature', 0.8),
+            top_p=miotts_settings.get('top_p', 1.0),
+            max_tokens=miotts_settings.get('max_tokens', 700),
+            repetition_penalty=miotts_settings.get('repetition_penalty', 1.0),
+            presence_penalty=miotts_settings.get('presence_penalty', 0.0),
+            frequency_penalty=miotts_settings.get('frequency_penalty', 0.0),
+            best_of_n_enabled=miotts_settings.get('best_of_n_enabled', False),
+            best_of_n_n=miotts_settings.get('best_of_n_n', 1),
+        )
+
+        if not await engine.initialize():
+            return None
+
+        return engine
+
     async def create_irodori_tts_engine(
         self,
         hf_checkpoint: Optional[str] = None,
@@ -667,7 +710,44 @@ class TTSManager:
                     'soundDuration': params.get('soundDuration', kwargs.get('soundDuration', 0.1)),
                     'format': params.get('format', kwargs.get('format', 'mp3'))
                 })
-                
+
+            elif self.current_engine == "miotts" and isinstance(engine, MioTTSEngine):
+                voice_config = char_config.get('voice', {})
+                params = voice_config.get('parameters', {})
+
+                miotts_keys = (
+                    'temperature',
+                    'top_p',
+                    'max_tokens',
+                    'max_new_tokens',
+                    'repetition_penalty',
+                    'presence_penalty',
+                    'frequency_penalty',
+                    'best_of_n_enabled',
+                    'best_of_n_n',
+                    'reference_data',
+                    'reference_base64',
+                    'reference_audio_base64',
+                    'reference_audio_path',
+                    'ref_wav',
+                )
+                miotts_kwargs = {
+                    'voice_id': voice_config.get('voice_id', kwargs.get('voice_id')),
+                    'voice_name': voice_config.get('voice_name', kwargs.get('voice_name')),
+                    'preset_id': params.get('preset_id', kwargs.get('preset_id')),
+                    'character_name': character_name,
+                    'ref_wav': voice_config.get('ref_wav', kwargs.get('ref_wav')),
+                    'reference_audio_path': voice_config.get(
+                        'reference_audio_path',
+                        kwargs.get('reference_audio_path'),
+                    ),
+                }
+                for key in miotts_keys:
+                    value = params.get(key, kwargs.get(key))
+                    if value is not None:
+                        miotts_kwargs[key] = value
+                kwargs.update({key: value for key, value in miotts_kwargs.items() if value is not None})
+
             elif IrodoriTTSEngine is not None and self.current_engine == "irodori_tts" and isinstance(engine, IrodoriTTSEngine):
                 voice_config = char_config.get('voice', {})
                 params = voice_config.get('parameters', {})

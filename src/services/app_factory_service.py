@@ -200,44 +200,6 @@ def load_artifact_manifest(artifact_id: str, config: Any | None = None) -> dict[
     )
 
 
-def list_app_factory_artifacts(
-    *,
-    config: Any | None = None,
-    limit: int = 50,
-) -> list[dict[str, Any]]:
-    root = get_app_factory_root(config)
-    if not root.exists():
-        return []
-
-    manifests: list[dict[str, Any]] = []
-    for artifact_dir in root.iterdir():
-        if not artifact_dir.is_dir():
-            continue
-        manifest_path = artifact_dir / "manifest.json"
-        if not manifest_path.exists():
-            continue
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifests.append(_manifest_with_runtime_status(manifest, artifact_dir))
-        except Exception:
-            continue
-
-    manifests.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
-    return manifests[: max(0, min(int(limit), 200))]
-
-
-def delete_app_factory_artifact(
-    artifact_id: str,
-    config: Any | None = None,
-) -> dict[str, Any]:
-    artifact_dir = _artifact_dir(artifact_id, config)
-    manifest = load_artifact_manifest(artifact_id, config)
-    if not artifact_dir.exists():
-        raise FileNotFoundError(f"Artifact not found: {artifact_id}")
-    shutil.rmtree(artifact_dir)
-    return manifest
-
-
 def resolve_artifact_download(
     artifact_id: str,
     config: Any | None = None,

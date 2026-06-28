@@ -8,7 +8,7 @@ import logging
 import uuid
 from typing import Optional
 
-from ..core import tool as function_tool
+from ..core import tool
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +137,7 @@ async def _read_async(document_id: str) -> str:
         await session.close()
 
 
-@function_tool
+@tool
 def knowledge_search(query: str, top_n: int = 5) -> str:
     """Knowledge Workspaceから関連文書を検索する。
 
@@ -151,7 +151,7 @@ def knowledge_search(query: str, top_n: int = 5) -> str:
         return f"Knowledge検索でエラーが発生しました: {exc}"
 
 
-@function_tool
+@tool
 def knowledge_read(document_id: str) -> str:
     """Knowledge Document IDを指定して正本ファイルの現在内容を読む。"""
     try:
@@ -161,7 +161,7 @@ def knowledge_read(document_id: str) -> str:
         return f"Knowledge文書の読み取りでエラーが発生しました: {exc}"
 
 
-@function_tool
+@tool
 def knowledge_status() -> str:
     """登録済みKnowledge Sourceと同期状態を確認する。"""
     try:

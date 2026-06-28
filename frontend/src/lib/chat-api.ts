@@ -3,6 +3,9 @@
  * /api/ 経由（Next.js Route Handler）
  */
 
+import type { ChatCommandCapability } from "@/lib/chat-commands";
+export type { ChatCommandCapability } from "@/lib/chat-commands";
+
 // ─── 型定義 ───
 
 export type ConversationSession = {
@@ -54,10 +57,34 @@ export type ChatAttachmentMetadata = {
 
 export type ConversationMessageMetadata = Record<string, unknown> & {
   client_message_id?: string;
+  agent_run_id?: string;
   attachments?: ChatAttachmentMetadata[];
+  command_capabilities?: ChatCommandCapability[];
+  generation_metrics?: ChatGenerationMetrics;
+  response_elapsed_ms?: number;
   has_image?: boolean;
   image_mime_type?: string | null;
   image_name?: string | null;
+  tool_results?: ChatToolResultMetadata[];
+};
+
+export type ChatGenerationMetrics = {
+  provider?: string;
+  model?: string;
+  tokens_per_second?: number;
+  output_tokens?: number;
+  prompt_tokens?: number;
+  total_tokens?: number;
+  generation_ms?: number;
+  prompt_ms?: number;
+};
+
+export type ChatToolResultMetadata = {
+  tool?: string;
+  query?: string | null;
+  urls?: string[];
+  output?: string;
+  truncated?: boolean;
 };
 
 export type ConversationMessage = {
@@ -125,6 +152,82 @@ export type ConversationSearchResult = {
   created_at?: string | null;
   last_activity?: string | null;
   project_id?: string | null;
+};
+
+export type ConversationGenerationStatus = {
+  success?: boolean;
+  session_id: string | null;
+  running: boolean;
+  status: string;
+  message?: string | null;
+  active_tool?: string | null;
+  agent_run_id?: string | null;
+  started_at?: string | null;
+  updated_at?: string | null;
+};
+
+export type AgentRunTimelineItem = {
+  id: string;
+  source: "event" | "tool_call" | string;
+  run_id: string;
+  event_id?: string | null;
+  sequence?: number | null;
+  event_type?: string | null;
+  status?: string | null;
+  display_status?: string | null;
+  actor_type?: string | null;
+  actor_key?: string | null;
+  actor_label?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  mode?: string | null;
+  action: string;
+  message?: string | null;
+  tool_name?: string | null;
+  tool_call_id?: string | null;
+  arguments?: Record<string, unknown>;
+  result_preview?: string | null;
+  success?: boolean;
+  mutation_confirmed?: boolean;
+  duration_ms?: number | null;
+  payload?: Record<string, unknown>;
+  created_at?: string | null;
+  started_at?: string | null;
+  ended_at?: string | null;
+};
+
+export type AgentRunTimelineColumn = {
+  key: string;
+  label: string;
+  actor_type?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  items: AgentRunTimelineItem[];
+};
+
+export type AgentRun = {
+  id: string;
+  root_run_id?: string | null;
+  parent_run_id?: string | null;
+  session_id?: string | null;
+  project_id?: string | null;
+  user_id?: string | null;
+  run_type: string;
+  status: string;
+  title?: string;
+  objective?: string;
+  generation_profile?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  error?: string | null;
+  metadata?: Record<string, unknown>;
+  created_at?: string | null;
+  updated_at?: string | null;
+  started_at?: string | null;
+  ended_at?: string | null;
+  last_event_at?: string | null;
+  timeline?: AgentRunTimelineItem[];
+  timeline_columns?: AgentRunTimelineColumn[];
 };
 
 export type ScenarioLogType = "writing" | "roleplay" | "trpg";
@@ -208,7 +311,8 @@ async function requestOnce<T>(
   });
 
   if (res.status === 401) {
-    if (typeof window !== "undefined") {
+    const shouldRedirectToLogin = !path.startsWith("/api/python-proxy/");
+    if (shouldRedirectToLogin && typeof window !== "undefined") {
       window.location.href = "/login";
     }
     throw new Error("認証が必要です");
@@ -382,6 +486,7 @@ export const chatApi = {
       edit_message_id?: string;
       response_model?: ChatResponseModelSelection;
       client_message_id?: string;
+      command_capabilities?: ChatCommandCapability[];
       skip_user_persistence?: boolean;
       persisted_user_message_id?: string;
     },
@@ -391,17 +496,41 @@ export const chatApi = {
       queued: boolean;
       session_id: string;
       user_message_id?: string | null;
+      agent_run_id?: string | null;
     }>(`/api/python-proxy/conversations/${sessionId}/dispatch`, {
       method: "POST",
       keepalive: true,
       body: JSON.stringify(data),
     }),
 
+  getAgentRun: (runId: string) =>
+    request<{ success: boolean; agent_run: AgentRun }>(
+      `/api/python-proxy/agent-runs/${runId}?include_events=false&include_tool_calls=false&include_timeline=true`,
+      {
+        cache: "no-store",
+        headers: { "Cache-Control": "no-cache" },
+        retries: 1,
+        retryDelayMs: 300,
+        timeoutMs: 10000,
+      },
+    ),
+
   stopGeneration: (sessionId: string) =>
     request<{ success: boolean; cancelled: number; session_id: string }>(
       `/api/python-proxy/conversations/${sessionId}/generation/stop`,
       {
         method: "POST",
+      },
+    ),
+
+  getGenerationStatus: (sessionId: string) =>
+    request<ConversationGenerationStatus>(
+      `/api/python-proxy/conversations/${sessionId}/generation/status`,
+      {
+        cache: "no-store",
+        headers: { "Cache-Control": "no-cache" },
+        retries: 1,
+        retryDelayMs: 300,
       },
     ),
 

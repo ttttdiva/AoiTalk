@@ -1,4 +1,4 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "@/db";
 import { projectMembers, projects, tags } from "@/db/schema";
 import {
@@ -158,7 +158,7 @@ export async function getProjectSpaceId(
   const [project] = await db
     .select({ spaceId: projects.spaceId })
     .from(projects)
-    .where(eq(projects.id, projectId))
+    .where(and(eq(projects.id, projectId), isNull(projects.deletedAt)))
     .limit(1);
   return project?.spaceId ?? null;
 }

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { projects, projectMembers } from "@/db/schema";
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
 import { ensureUserInboxSetup } from "@/lib/server/inbox-project";
 import { canWriteSpace } from "@/lib/server/space-access";
@@ -56,6 +56,7 @@ function toSnake(row: Record<string, unknown>): Record<string, unknown> {
     spaceId: "space_id",
     createdAt: "created_at",
     updatedAt: "updated_at",
+    deletedAt: "deleted_at",
     projectMetadata: "metadata",
   };
   const out: Record<string, unknown> = {};
@@ -122,7 +123,7 @@ export async function GET() {
   const rows = await db
     .select()
     .from(projects)
-    .where(inArray(projects.id, projectIds));
+    .where(and(inArray(projects.id, projectIds), isNull(projects.deletedAt)));
 
   const result = rows.map((r) =>
     serializeProject(r as unknown as Record<string, unknown>),

@@ -951,7 +951,7 @@ export default function ProjectsPage() {
     async (id: string) => {
       if (
         !window.confirm(
-          "このスペースを削除しますか？（プロジェクトは残ります）",
+          "このスペースと配下のプロジェクトを削除しますか？",
         )
       )
         return;

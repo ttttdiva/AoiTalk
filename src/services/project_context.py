@@ -317,6 +317,23 @@ def format_project_context_for_chat_prompt(project_context: Optional[dict[str, A
     return "\n".join(lines)
 
 
+def format_minimal_project_context_for_chat_prompt(
+    project_context: Optional[dict[str, Any]],
+) -> str:
+    """Render only selected project identity for lightweight CLI prompts."""
+    if not project_context:
+        return ""
+
+    lines = ["選択中プロジェクト:"]
+    if project_context.get("id"):
+        lines.append(f"- project_id: {project_context['id']}")
+    if project_context.get("name"):
+        lines.append(f"- project_name: {project_context['name']}")
+    if project_context.get("slug"):
+        lines.append(f"- project_slug: {project_context['slug']}")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 class ProjectContextResolver:
     """Resolve project context from project, session, or workspace inputs."""
 

@@ -127,13 +127,13 @@ interface AuthStatus {
 }
 
 const AGENT_LABELS: Record<string, string> = {
-  filesystem: "ファイルシステム",
-  project_management: "プロジェクト管理",
+  filesystem: "ファイル直接ツール",
+  project_management: "プロジェクトDB直接ツール",
 };
 
 const AGENT_DESCRIPTIONS: Record<string, string> = {
-  filesystem: "ローカルファイルを読み書きするツール権限です。",
-  project_management: "プロジェクトやタスクを操作するツール権限です。",
+  filesystem: "メインassistantがワークスペースの検索・読取・編集ツールを直接使う権限です。",
+  project_management: "メインassistantが案件情報DB・WBS・タスク系の直接ツールを使う権限です。",
 };
 
 type QuickSettingId =

@@ -23,7 +23,7 @@ https://nk-h01.f5.si:6002 {
 
 	# ── FastAPI (モバイルアプリ専用の Bearer 認証エンドポイント) ──
 	# モバイル専用パスのみ FastAPI に流す。それ以外の /api/* は Next.js 行き。
-	# 詳細は memory-bank/systemPatterns.md「Caddy リバースプロキシ規約」参照。
+	# 詳細は CLAUDE.md と docs/ のリバースプロキシ関連メモを参照。
 	# NOTE: Windows では `localhost` が IPv6 ([::1]) に解決されることがあり、
 	# Next.js/FastAPI が IPv4 のみ Listen している場合に 502 になる。
 	# 明示的に 127.0.0.1 を指定して回避する。

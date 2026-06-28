@@ -86,7 +86,7 @@ def seed_default_character(engine) -> None:
         session.add(
             Character(
                 name="案件管理アシスタント",
-                slug="project_management_assistant",
+                slug="project_manager",
                 character_type="assistant",
                 system_prompt=(
                     "通常チャットに答えつつ、ユーザーが案件・タスク・WBS・進捗・予定・台帳などの"
@@ -108,7 +108,7 @@ def seed_default_character(engine) -> None:
             )
         )
         session.commit()
-        print("[db-schema] seeded default character: project_management_assistant")
+        print("[db-schema] seeded default character: project_manager")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ import os
 import random
 import datetime
 import requests
-from ..core import tool as function_tool
+from ..core import tool
 
 
 def get_weather_info_impl(location: str = "東京", when: str = "今") -> str:
@@ -177,7 +177,7 @@ def get_weather_info_impl(location: str = "東京", when: str = "今") -> str:
         return error_msg
 
 
-@function_tool
+@tool
 def get_weather_info(location: str = "東京", when: str = "今") -> str:
     """指定された場所の天気情報を取得する
     

@@ -6,7 +6,7 @@ prompt_template: |
   {input}
 
   ## 手順
-  1. project_management_assistant の get_project_context で対象案件を確認する。
+  1. get_project_context で対象案件を確認する。
   2. list_project_information でカテゴリ、重要資料、ファクト、台帳、同期状態を読む。
   3. list_tasks と get_upcoming_wbs_tasks を使い、タスク/WBS側の直近状況を読む。
   4. 案件情報DBを正本として、以下を整理する。
@@ -30,7 +30,10 @@ aliases:
   - サマリ
   - summary
 bound_tools:
-  - project_management_assistant
+  - get_project_context
+  - list_project_information
+  - list_tasks
+  - get_upcoming_wbs_tasks
 examples:
   - "/project_summary"
   - "/project_summary 技術面を重点的に"

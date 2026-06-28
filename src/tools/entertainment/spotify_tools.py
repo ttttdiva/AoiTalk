@@ -21,9 +21,9 @@ if os.getenv('SPOTIFY_CLIENT_ID') and os.getenv('SPOTIFY_CLIENT_SECRET'):
     except Exception as e:
         print(f"[Spotify] 自動初期化警告: {e}")
 
-from ..core import tool as function_tool
+from ..core import tool
 
-# 自動キュー開始はキーワード検知でのみ処理（function_toolから削除）
+# 自動キュー開始はキーワード検知でのみ処理（toolから削除）
 def start_auto_queue(search_query: str) -> str:
     """
     指定されたアーティストや曲の楽曲を自動的にキューに追加し続ける
@@ -51,7 +51,7 @@ def start_auto_queue(search_query: str) -> str:
     else:
         return f"自動キュー機能の開始に失敗しました: {result}"
 
-# 自動キュー停止はキーワード検知でのみ処理（function_toolから削除）
+# 自動キュー停止はキーワード検知でのみ処理（toolから削除）
 def stop_auto_queue() -> str:
     """
     自動キュー追加機能を停止する
@@ -71,7 +71,7 @@ def stop_auto_queue() -> str:
     else:
         return f"自動キュー機能の停止に失敗しました: {result}"
 
-@function_tool
+@tool
 def check_queue_sync_status() -> str:
     """
     キューの同期状態を確認し、失敗した同期があれば報告する
@@ -107,7 +107,7 @@ def check_queue_sync_status() -> str:
     
     return report
 
-@function_tool
+@tool
 def retry_queue_sync() -> str:
     """
     失敗したキュー同期を再試行する
@@ -139,7 +139,7 @@ def retry_queue_sync() -> str:
     
     return report
 
-@function_tool
+@tool
 def spotify_system_health_check() -> str:
     """
     Spotifyシステム全体の健全性をチェックする
@@ -209,7 +209,7 @@ def spotify_system_health_check() -> str:
     
     return report
 
-@function_tool
+@tool
 def reset_spotify_monitoring() -> str:
     """
     Spotify監視システムをリセットする

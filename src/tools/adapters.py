@@ -48,20 +48,6 @@ def _clean_schema_for_gemini(schema: Dict[str, Any]) -> Dict[str, Any]:
     return cleaned
 
 
-class OpenAIAgentAdapter:
-    """Convert ToolDefinition objects into OpenAI Agents SDK tools."""
-
-    @staticmethod
-    def convert(tool_def: ToolDefinition):
-        from agents import function_tool
-
-        return function_tool(tool_def.function)
-
-    @staticmethod
-    def convert_all(tools: List[ToolDefinition]) -> list:
-        return [OpenAIAgentAdapter.convert(t) for t in tools]
-
-
 class GeminiAdapter:
     """Convert ToolDefinition objects into Gemini declarations."""
 
@@ -112,12 +98,12 @@ class CLIAdapter:
 
     @staticmethod
     def to_prompt_text(tools: List[ToolDefinition]) -> str:
-        lines = ["Available tools:"]
+        lines = ["利用可能なツール:"]
         for tool_def in tools:
             params_desc = ", ".join(
                 f"{param.name}: {param.type}"
                 + (
-                    f" (optional, default: {param.default})"
+                    f" (任意, 既定値: {param.default})"
                     if not param.required
                     else ""
                 )
@@ -126,8 +112,8 @@ class CLIAdapter:
             lines.append(f"  - {tool_def.name}({params_desc}): {tool_def.description}")
         lines.append("")
         lines.append(
-            "When you need a tool, emit "
-            "[TOOL_CALL: tool_name(key=value, key2=value2)]."
+            "ツールが必要な場合は "
+            "[TOOL_CALL: tool_name(key=value, key2=value2)] 形式で出力してください。"
         )
         return "\n".join(lines)
 

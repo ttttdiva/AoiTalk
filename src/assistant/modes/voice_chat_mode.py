@@ -11,7 +11,11 @@ from typing import Any, Dict, Optional
 from ..base import BaseAssistant
 from ..voice_handler import VoiceHandler
 from ..response_handler import ResponseHandler
-from ..chat_turn_persistence import ChatTurnPersistence
+from ..chat_turn_persistence import (
+    ChatTurnPersistence,
+    apply_turn_user_context_to_client,
+    restore_turn_user_context_on_client,
+)
 from ..chat_attachment_utils import (
     build_message_with_attachment_context,
     sanitize_chat_attachments,
@@ -66,7 +70,7 @@ class VoiceChatMode(BaseAssistant):
         return {
             "codex-cli": ("codex_cli.model",),
             "claude-cli": ("claude_cli.model",),
-            "gemini-cli": ("gemini_cli.model",),
+            "antigravity-cli": ("antigravity_cli.model",),
             "ollama": ("ollama_model", "ollama.model"),
             "sglang": ("sglang_model", "sglang.model"),
             "openai_compatible_local": ("openai_compatible_local.model",),
@@ -149,11 +153,21 @@ class VoiceChatMode(BaseAssistant):
         image_data=None,
         attachments=None,
         client_message_id=None,
+        include_generation_metrics: bool = False,
     ) -> dict:
         metadata = {}
         if llm_client and hasattr(llm_client, "_get_memory_metadata"):
             try:
                 metadata.update(llm_client._get_memory_metadata() or {})
+            except Exception:
+                pass
+        if (
+            include_generation_metrics
+            and llm_client
+            and hasattr(llm_client, "get_generation_metadata")
+        ):
+            try:
+                metadata.update(llm_client.get_generation_metadata() or {})
             except Exception:
                 pass
         sanitized_attachments = sanitize_chat_attachments(attachments)
@@ -273,7 +287,7 @@ class VoiceChatMode(BaseAssistant):
         self.recognizer = SpeechRecognitionManager(engine_name, speech_config)
         
         self.player = AudioPlayer()
-        self.tts_manager = TTSManager()
+        self.tts_manager = TTSManager(getattr(self.config, "config", None))
         
         # Initialize handlers
         self.voice_handler = VoiceHandler(self.config, self.recognizer, self.player)
@@ -438,7 +452,19 @@ class VoiceChatMode(BaseAssistant):
             else:
                 print("Irodori-TTSエンジンの初期化に失敗しました")
                 return False
-        
+
+        elif preferred_engine == 'miotts':
+            print("MioTTSエンジンを初期化中...")
+            miotts_engine = await self.tts_manager.create_miotts_engine()
+            if miotts_engine:
+                self.tts_manager.register_engine("miotts", miotts_engine)
+                self.tts_manager.set_engine("miotts")
+                engine_initialized = True
+                print("MioTTSエンジンの初期化完了")
+            else:
+                print("MioTTSエンジンの初期化に失敗しました")
+                return False
+
         if not engine_initialized:
             import traceback
             print(f"指定されたTTSエンジン '{preferred_engine}' の初期化に失敗しました")
@@ -506,9 +532,8 @@ class VoiceChatMode(BaseAssistant):
         
         # Set transcription callback for immediate UI updates
         async def transcription_callback(text: str):
-            """Callback to immediately display transcribed text in UI"""
-            if self.web_interface:
-                self.web_interface.add_user_message(text)
+            """Callback hook kept for voice handler compatibility."""
+            return
                 
         self.voice_handler.set_transcription_callback(transcription_callback)
         
@@ -672,6 +697,15 @@ class VoiceChatMode(BaseAssistant):
             return
         
         # 通常の音声入力処理
+        if isinstance(text, str) and text and self.web_interface:
+            dispatch_voice_message = getattr(
+                self.web_interface,
+                "dispatch_voice_message",
+                None,
+            )
+            if callable(dispatch_voice_message) and dispatch_voice_message(text):
+                return
+
         # Voice input should be displayed in UI even if transcription_callback was not called
         # This ensures voice input is always logged properly
         if isinstance(text, str) and text and self.web_interface:
@@ -701,9 +735,14 @@ class VoiceChatMode(BaseAssistant):
         attachment_context=None,
         skip_user_persistence=False,
         persisted_user_message_id=None,
+        agent_run_id=None,
         assistant_sender_type=None,
         assistant_sender_id=None,
         assistant_sender_display_name=None,
+        sender_user_id=None,
+        sender_display_name=None,
+        response_started_at_monotonic=None,
+        command_capabilities=None,
     ):
         """Process user message from web interface
         
@@ -724,6 +763,7 @@ class VoiceChatMode(BaseAssistant):
             )
             chat_persistence = self._get_chat_turn_persistence(llm_client)
             user_message = None
+            search_tool_results: list[dict[str, Any]] = []
             if session_id and not skip_user_persistence:
                 try:
                     user_message = await chat_persistence.save_user_message(
@@ -736,6 +776,9 @@ class VoiceChatMode(BaseAssistant):
                             client_message_id,
                         ),
                         branch_from_message_id=edit_message_id,
+                        sender_type="user" if sender_user_id else None,
+                        sender_id=sender_user_id,
+                        sender_display_name=sender_display_name,
                     )
                     await self._broadcast_conversation_persisted(
                         session_id=session_id,
@@ -749,10 +792,32 @@ class VoiceChatMode(BaseAssistant):
                 if not reply or not session_id:
                     return
                 try:
+                    metadata = self._get_chat_turn_metadata(
+                        llm_client,
+                        include_generation_metrics=True,
+                    )
+                    if isinstance(response_started_at_monotonic, (int, float)):
+                        elapsed_ms = int(
+                            max(
+                                0,
+                                round(
+                                    (
+                                        time.monotonic()
+                                        - response_started_at_monotonic
+                                    )
+                                    * 1000
+                                ),
+                            )
+                        )
+                        metadata["response_elapsed_ms"] = elapsed_ms
+                    if agent_run_id:
+                        metadata["agent_run_id"] = agent_run_id
+                    if search_tool_results:
+                        metadata["tool_results"] = list(search_tool_results)
                     assistant_message = await chat_persistence.save_assistant_message(
                         session_id=session_id,
                         content=reply,
-                        metadata=self._get_chat_turn_metadata(llm_client),
+                        metadata=metadata,
                         sender_type=assistant_sender_type,
                         sender_id=assistant_sender_id,
                         sender_display_name=assistant_sender_display_name,
@@ -903,6 +968,7 @@ class VoiceChatMode(BaseAssistant):
                 )
                 if self.response_handler:
                     self.response_handler.llm_client = llm_client
+                turn_user_context_snapshot = None
                 if llm_client and session_id:
                     exclude_message_id = (
                         str(user_message.id)
@@ -921,6 +987,11 @@ class VoiceChatMode(BaseAssistant):
 
                 # Set session ID and project ID in LLM client
                 if llm_client:
+                    turn_user_context_snapshot = apply_turn_user_context_to_client(
+                        llm_client,
+                        sender_user_id=sender_user_id,
+                        sender_display_name=sender_display_name,
+                    )
                     if session_id:
                         llm_client.current_session_id = session_id
                     if project_id:
@@ -961,6 +1032,14 @@ class VoiceChatMode(BaseAssistant):
                             event_data = dict(data)
                             if session_id:
                                 event_data["session_id"] = session_id
+                            if agent_run_id:
+                                event_data["agent_run_id"] = agent_run_id
+                            tool_result = event_data.get("tool_result")
+                            if (
+                                event_type == "tool_end"
+                                and isinstance(tool_result, dict)
+                            ):
+                                search_tool_results.append(tool_result)
                             result = web_iface.broadcast_stream_event(event_type, event_data)
                             if inspect.isawaitable(result):
                                 await result
@@ -1000,6 +1079,10 @@ class VoiceChatMode(BaseAssistant):
                         llm_client.current_edit_message_id = None
                         llm_client.current_response_model = None
                         llm_client.external_persistence_enabled = False
+                        restore_turn_user_context_on_client(
+                            llm_client,
+                            turn_user_context_snapshot,
+                        )
 
                 if response:
                     await persist_assistant_reply(response)

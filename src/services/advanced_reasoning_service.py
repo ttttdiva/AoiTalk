@@ -1,4 +1,4 @@
-"""Advanced reasoning delegation guarded by editable external-model approval."""
+"""Advanced reasoning delegation for the Agent Team."""
 
 from __future__ import annotations
 
@@ -9,19 +9,20 @@ import re
 from typing import Any
 
 from ..config import Config
+from .agent_team_service import (
+    AGENT_TEAM_PROVIDERS,
+    agent_team_confirm_prompt,
+    agent_team_member_for,
+    agent_team_member_mode,
+    agent_team_member_requires_external_approval,
+    agent_team_member_settings,
+    agent_team_notify,
+    config_get,
+    config_set,
+)
 logger = logging.getLogger(__name__)
 
-ADVANCED_REASONING_PROVIDERS = {
-    "openai",
-    "openrouter",
-    "gemini",
-    "ollama",
-    "openai_compatible_local",
-    "sglang",
-    "gemini-cli",
-    "claude-cli",
-    "codex-cli",
-}
+ADVANCED_REASONING_MEMBER_KEY = "advanced_reasoning"
 
 _SECRET_VALUE_PATTERN = re.compile(
     r"(?P<prefix>\b[A-Z][A-Z0-9_]*(?:API_KEY|ACCESS_TOKEN|TOKEN|SECRET|PASSWORD|PASS|KEY)\b\s*[:=]\s*)"
@@ -57,49 +58,80 @@ _WINDOWS_PATH_PATTERN = re.compile(r"(?<!\w)(?:[A-Za-z]:[\\/]|\\\\)[^\s<>\":|?*]
 _UNIX_USER_PATH_PATTERN = re.compile(r"(?<!\w)/(?:Users|home|mnt|srv|var)/(?:[^\s<>\"']+)")
 
 
-def config_get(config: Any, key: str, default: Any = None) -> Any:
-    if isinstance(config, dict):
-        value: Any = config
-        for part in key.split("."):
-            if not isinstance(value, dict) or part not in value:
-                return default
-            value = value[part]
-        return value
-    if hasattr(config, "get"):
-        return config.get(key, default)
-    return default
+def advanced_reasoning_enabled(config: Any) -> bool:
+    return agent_team_member_for(config, ADVANCED_REASONING_MEMBER_KEY) is not None
 
 
-def config_set(config: Any, key: str, value: Any) -> None:
-    if hasattr(config, "set"):
-        config.set(key, value)
-        return
-    if isinstance(config, dict):
-        parts = key.split(".")
-        target = config
-        for part in parts[:-1]:
-            target = target.setdefault(part, {})
-        target[parts[-1]] = value
+def advanced_reasoning_provider(config: Any) -> str:
+    member = agent_team_member_settings(config, ADVANCED_REASONING_MEMBER_KEY)
+    return str(member.get("provider") or "openai").strip().lower()
 
 
-def model_sharing_enabled(config: Any) -> bool:
-    return bool(config_get(config, "model_sharing.enabled", False))
+def advanced_reasoning_model(config: Any) -> str:
+    member = agent_team_member_settings(config, ADVANCED_REASONING_MEMBER_KEY)
+    return str(member.get("model") or "gpt-4o").strip()
 
 
-def model_sharing_provider(config: Any) -> str:
-    return str(config_get(config, "model_sharing.provider", "openai")).strip().lower()
+def advanced_reasoning_confirm_prompt(config: Any) -> bool:
+    return agent_team_confirm_prompt(config)
 
 
-def model_sharing_model(config: Any) -> str:
-    return str(config_get(config, "model_sharing.model", "gpt-4o")).strip()
+def advanced_reasoning_confirmation_enabled(config: Any) -> bool:
+    if _current_generation_policy_auto_approves():
+        return False
+    return advanced_reasoning_confirm_prompt(config)
 
 
-def model_sharing_confirm_prompt(config: Any) -> bool:
-    return bool(config_get(config, "model_sharing.confirm_prompt", True))
+def _current_generation_policy_auto_approves() -> bool:
+    try:
+        from ..llm.generation_policy import (
+            PermissionPolicy,
+            get_current_generation_policy,
+        )
+
+        return (
+            get_current_generation_policy().permission_policy
+            == PermissionPolicy.AUTO_APPROVE
+        )
+    except Exception:
+        return False
 
 
-def model_sharing_notify(config: Any) -> bool:
-    return bool(config_get(config, "model_sharing.notify", True))
+def advanced_reasoning_notify(config: Any) -> bool:
+    return agent_team_notify(config)
+
+
+def advanced_reasoning_effort(config: Any) -> str:
+    return agent_team_member_mode(config, ADVANCED_REASONING_MEMBER_KEY, "medium")
+
+
+def apply_advanced_reasoning_mode(
+    config: Any,
+    *,
+    provider: str,
+    model: str,
+    client: Any = None,
+) -> str:
+    from .llm_model_catalog import default_llm_mode_for_options, reasoning_effort_options_for_model
+
+    options = reasoning_effort_options_for_model(provider, model)
+    if not options:
+        return ""
+
+    effort = advanced_reasoning_effort(config)
+    if effort not in options:
+        effort = default_llm_mode_for_options(options)
+
+    provider_id = str(provider or "").strip().lower()
+    if provider_id == "openai":
+        config_set(config, "openai.reasoning_effort", effort)
+    elif provider_id == "codex-cli":
+        config_set(config, "codex_cli.reasoning_effort", effort)
+    elif provider_id == "claude-cli":
+        config_set(config, "claude_cli.reasoning_effort", effort)
+    elif client is not None and hasattr(client, "set_llm_mode"):
+        client.set_llm_mode(effort)
+    return effort
 
 
 def _redaction_placeholder(category: str, counters: dict[str, int], findings: list[dict[str, str]]) -> str:
@@ -136,7 +168,7 @@ def _apply_plain_pattern(
 
 
 def _configured_redaction_terms(config: Any) -> list[str]:
-    raw_terms = config_get(config, "model_sharing.redaction_terms", [])
+    raw_terms = config_get(config, "agent_team.redaction_terms", [])
     if not isinstance(raw_terms, list):
         return []
     terms = []
@@ -195,13 +227,13 @@ class AdvancedReasoningService:
         self.config = config
 
     def is_enabled(self) -> bool:
-        return model_sharing_enabled(self.config)
+        return advanced_reasoning_enabled(self.config)
 
     def _provider(self) -> str:
-        return model_sharing_provider(self.config)
+        return advanced_reasoning_provider(self.config)
 
     def _model(self) -> str:
-        return model_sharing_model(self.config)
+        return advanced_reasoning_model(self.config)
 
     async def run(self, prompt: str, *, redacted_prompt: str = "") -> str:
         if not self.is_enabled():
@@ -213,10 +245,14 @@ class AdvancedReasoningService:
 
         provider = self._provider()
         model = self._model()
-        if provider not in ADVANCED_REASONING_PROVIDERS:
+        if provider not in AGENT_TEAM_PROVIDERS:
             return f"Unsupported advanced reasoning provider: {provider}"
         if not model:
             return "Advanced reasoning model is not configured."
+
+        member = agent_team_member_for(self.config, ADVANCED_REASONING_MEMBER_KEY)
+        if not agent_team_member_requires_external_approval(member):
+            return await self._run_target_model(clean_prompt, provider=provider, model=model)
 
         default_prompt, redaction_findings = build_redacted_prompt(
             clean_prompt,
@@ -232,8 +268,8 @@ class AdvancedReasoningService:
             provider=provider,
             model=model,
             description=f"Review the prompt before sending it to {provider}/{model}.",
-            confirm=model_sharing_confirm_prompt(self.config),
-            notify=model_sharing_notify(self.config),
+            confirm=advanced_reasoning_confirmation_enabled(self.config),
+            notify=advanced_reasoning_notify(self.config),
             request_kind="advanced_reasoning_assistant",
         )
         if approved_prompt is None:
@@ -254,6 +290,13 @@ class AdvancedReasoningService:
             return future.result(timeout=420)
 
     async def _run_target_model(self, prompt: str, *, provider: str, model: str) -> str:
+        if provider == "openai":
+            return await asyncio.to_thread(
+                self._run_openai_responses_model,
+                prompt,
+                model=model,
+            )
+
         from ..llm.manager import create_llm_client
 
         temp_config = clone_config(self.config)
@@ -263,8 +306,10 @@ class AdvancedReasoningService:
         config_set(temp_config, "skills.enabled", False)
         config_set(temp_config, "memory.enabled", False)
         config_set(temp_config, f"{provider}.model", model)
+        apply_advanced_reasoning_mode(temp_config, provider=provider, model=model)
 
         client = create_llm_client(temp_config)
+        apply_advanced_reasoning_mode(temp_config, provider=provider, model=model, client=client)
         if hasattr(client, "clear_history"):
             client.clear_history()
 
@@ -276,4 +321,32 @@ class AdvancedReasoningService:
             return str(result or "").strip()
         except Exception as exc:
             logger.exception("[AdvancedReasoningService] delegation failed")
+            return f"Advanced reasoning error: {exc}"
+
+    def _run_openai_responses_model(self, prompt: str, *, model: str) -> str:
+        try:
+            from openai import OpenAI
+
+            client = OpenAI(api_key=config_get(self.config, "openai_api_key"))
+            kwargs: dict[str, Any] = {
+                "model": model,
+                "input": prompt,
+            }
+            effort = advanced_reasoning_effort(self.config)
+            if effort:
+                kwargs["reasoning"] = {"effort": effort}
+            response = client.responses.create(**kwargs)
+            output_text = str(getattr(response, "output_text", "") or "").strip()
+            if output_text:
+                return output_text
+
+            parts: list[str] = []
+            for item in getattr(response, "output", []) or []:
+                for content in getattr(item, "content", []) or []:
+                    text = getattr(content, "text", None)
+                    if text:
+                        parts.append(str(text))
+            return "\n".join(parts).strip()
+        except Exception as exc:
+            logger.exception("[AdvancedReasoningService] OpenAI delegation failed")
             return f"Advanced reasoning error: {exc}"

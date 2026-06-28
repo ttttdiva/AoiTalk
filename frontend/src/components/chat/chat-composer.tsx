@@ -13,6 +13,7 @@ import {
   Brain,
   Send,
   Square,
+  Plus,
   Paperclip,
   X,
   FolderOpen,
@@ -28,14 +29,16 @@ import {
 import { MentionMenu, type MentionItem } from "@/components/chat/mention-menu";
 import {
   GenerationProfileSelector,
-  type GenerationProfile,
 } from "@/components/chat/generation-profile-selector";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -52,7 +55,27 @@ import { useSnippetAutocomplete } from "@/hooks/use-snippet-autocomplete";
 import { SnippetPopup } from "@/components/ui/snippet-popup";
 import { useSnippets } from "@/contexts/snippets-context";
 import { useUserSettings } from "@/contexts/user-settings-context";
+import { getChatComposerShortcutAction } from "@/lib/chat-keyboard-shortcuts";
 import type { LlmMode } from "@/lib/chat-api";
+import {
+  getSettingsGenerationProfile,
+  loadStoredGenerationProfile,
+  saveStoredGenerationProfile,
+  type GenerationProfile,
+} from "@/lib/generation-profile";
+import {
+  HIDDEN_CHAT_SKILL_NAMES,
+  completeChatCommandPrefix,
+  commandCapabilitiesForActiveCommand,
+  filterChatCommands,
+  firstMatchingChatCommand,
+  findChatCommand,
+  isSlashCommandToken,
+  type ActiveChatCommand,
+  type ChatCommandDefinition,
+  type ChatCommandCapability,
+} from "@/lib/chat-commands";
+import { toast } from "sonner";
 
 type ChatComposerProps = {
   onSend: (
@@ -60,6 +83,7 @@ type ChatComposerProps = {
     files?: File[],
     mentions?: MentionItem[],
     generationProfile?: GenerationProfile,
+    commandCapabilities?: ChatCommandCapability[],
   ) => void;
   onSteer?: (content: string) => void;
   onStop?: () => void;
@@ -75,7 +99,6 @@ type ChatComposerProps = {
   llmModeOptions?: LlmMode[];
   llmModeLabels?: Record<string, string>;
   onLlmModeChange?: (mode: LlmMode) => void;
-  onLlmModeCycle?: () => void;
   steeringInstructions?: SubmittedSteeringInstruction[];
   onClearSteeringInstructions?: () => void;
 };
@@ -87,34 +110,21 @@ export type SubmittedSteeringInstruction = {
   status: "sending" | "queued" | "failed";
 };
 
-const SLASH_COMMANDS = [
-  {
-    command: "/start",
-    description: "タイマー開始",
-    usage: "/start [タスク名]",
-  },
-  {
-    command: "/due",
-    description: "期限設定",
-    usage: "/due [日付]",
-  },
-  {
-    command: "/status",
-    description: "現在の状態表示",
-    usage: "/status",
-  },
-  {
-    command: "/roll",
-    description: "ダイスロール",
-    usage: "/roll [ダイス表記]",
-  },
-];
-
 type SkillSlashCommand = {
   command: string;
   description: string;
   usage: string;
 };
+
+type SlashMenuItem =
+  | {
+      kind: "chat";
+      command: ChatCommandDefinition;
+    }
+  | {
+      kind: "skill";
+      command: SkillSlashCommand;
+    };
 
 type SkillApiItem = {
   name: string;
@@ -128,55 +138,16 @@ async function fetchSkillSlashCommands(): Promise<SkillSlashCommand[]> {
   });
   if (!res.ok) throw new Error(`API Error: ${res.status}`);
   const data: { skills?: SkillApiItem[] } = await res.json();
-  return (data.skills ?? [])
-    // AUTO は LLM 自動判断専用なのでスラッシュ候補から除外する
-    .filter((skill) => skill.trigger_mode !== "auto")
-    .map((skill) => ({
-      command: `/${skill.name}`,
-      description: skill.description || "スキル",
-      usage: `/${skill.name} [入力]`,
-    }));
-}
-
-const GENERATION_PROFILE_STORAGE_KEY = "aoitalk-generation-profile";
-const DEFAULT_GENERATION_PROFILE: GenerationProfile = "chat";
-const VALID_GENERATION_PROFILES = new Set<GenerationProfile>([
-  "chat",
-  "assisted_work",
-  "autonomous_work",
-  "review",
-]);
-
-function normalizeGenerationProfile(value: unknown): GenerationProfile | null {
-  if (typeof value !== "string") return null;
-  return VALID_GENERATION_PROFILES.has(value as GenerationProfile)
-    ? (value as GenerationProfile)
-    : null;
-}
-
-function loadStoredGenerationProfile(): GenerationProfile {
-  if (typeof window === "undefined") return DEFAULT_GENERATION_PROFILE;
   return (
-    normalizeGenerationProfile(
-      window.localStorage.getItem(GENERATION_PROFILE_STORAGE_KEY),
-    ) ?? DEFAULT_GENERATION_PROFILE
-  );
-}
-
-function saveStoredGenerationProfile(profile: GenerationProfile) {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(GENERATION_PROFILE_STORAGE_KEY, profile);
-}
-
-function getSettingsGenerationProfile(
-  settings: Record<string, unknown>,
-): GenerationProfile | null {
-  const chat = settings.chat;
-  if (typeof chat !== "object" || chat === null || Array.isArray(chat)) {
-    return null;
-  }
-  return normalizeGenerationProfile(
-    (chat as Record<string, unknown>).generation_profile,
+    (data.skills ?? [])
+      // AUTO は LLM 自動判断専用なのでスラッシュ候補から除外する
+      .filter((skill) => skill.trigger_mode !== "auto")
+      .filter((skill) => !HIDDEN_CHAT_SKILL_NAMES.has(skill.name))
+      .map((skill) => ({
+        command: `/${skill.name}`,
+        description: skill.description || "スキル",
+        usage: `/${skill.name} [入力]`,
+      }))
   );
 }
 
@@ -248,7 +219,9 @@ function formatInstructionTime(value: string) {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-function getInstructionStatusLabel(status: SubmittedSteeringInstruction["status"]) {
+function getInstructionStatusLabel(
+  status: SubmittedSteeringInstruction["status"],
+) {
   if (status === "failed") return "送信失敗";
   if (status === "sending") return "送信中";
   return "送信済み";
@@ -303,18 +276,43 @@ function LlmModeSelector({
   options,
   labels,
   onChange,
+  open,
+  onOpenChange,
+  onComposerFocusRequest,
 }: {
   value: LlmMode;
   options: LlmMode[];
   labels: Record<string, string>;
   onChange?: (mode: LlmMode) => void;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onComposerFocusRequest?: () => void;
 }) {
   const currentLabel = formatLlmModeLabel(value, labels);
   const disabled = !onChange || options.length <= 1;
   const lightweight = isLightweightLlmMode(value);
+  const selectedItemRef = useRef<HTMLElement | null>(null);
+
+  const focusComposer = useCallback(() => {
+    requestAnimationFrame(() => onComposerFocusRequest?.());
+  }, [onComposerFocusRequest]);
+
+  useEffect(() => {
+    if (!open || disabled) return;
+    const timeoutId = window.setTimeout(() => {
+      selectedItemRef.current?.focus();
+    }, 0);
+    return () => window.clearTimeout(timeoutId);
+  }, [disabled, open, options, value]);
 
   return (
-    <DropdownMenu>
+    <DropdownMenu
+      open={open}
+      onOpenChange={(nextOpen) => {
+        onOpenChange(nextOpen);
+        if (!nextOpen) focusComposer();
+      }}
+    >
       <DropdownMenuTrigger
         render={
           <Button
@@ -325,7 +323,7 @@ function LlmModeSelector({
               !lightweight && "border-primary/40 text-primary shadow-sm",
             )}
             disabled={disabled}
-            title={`LLM mode: ${currentLabel} (Ctrl+M)`}
+            title={`LLM mode: ${currentLabel} (Ctrl+Shift+M)`}
             aria-label="LLM mode"
           />
         }
@@ -347,6 +345,8 @@ function LlmModeSelector({
           value={value}
           onValueChange={(nextMode) => {
             if (nextMode !== value) onChange?.(nextMode);
+            onOpenChange(false);
+            focusComposer();
           }}
         >
           {options.map((mode) => {
@@ -354,7 +354,12 @@ function LlmModeSelector({
             return (
               <DropdownMenuRadioItem
                 key={mode}
+                ref={(node) => {
+                  if (mode === value) selectedItemRef.current = node;
+                }}
                 value={mode}
+                closeOnClick
+                onClick={focusComposer}
                 className="items-start gap-2 py-1.5"
               >
                 <LlmModeIcon
@@ -470,26 +475,35 @@ export function ChatComposer({
   llmModeOptions = [],
   llmModeLabels = {},
   onLlmModeChange,
-  onLlmModeCycle,
   steeringInstructions = [],
   onClearSteeringInstructions,
 }: ChatComposerProps) {
   const [value, setValue] = useState("");
   const [showSlashMenu, setShowSlashMenu] = useState(false);
+  const [slashSelectionIndex, setSlashSelectionIndex] = useState(0);
   const [skillCommands, setSkillCommands] = useState<SkillSlashCommand[]>([]);
+  const [activeCommand, setActiveCommand] = useState<ActiveChatCommand | null>(
+    null,
+  );
   const skillsFetchedRef = useRef(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const [showMentionMenu, setShowMentionMenu] = useState(false);
   const [mentionQuery, setMentionQuery] = useState("");
   const [mentions, setMentions] = useState<MentionItem[]>([]);
   const [localGenerationProfile, setLocalGenerationProfile] =
-    useState<GenerationProfile>(loadStoredGenerationProfile);
-  const [
-    generationProfileChangedByUser,
-    setGenerationProfileChangedByUser,
-  ] = useState(false);
+    useState<GenerationProfile>(() =>
+      loadStoredGenerationProfile(
+        typeof window === "undefined" ? null : window.localStorage,
+      ),
+    );
+  const [generationProfileChangedByUser, setGenerationProfileChangedByUser] =
+    useState(false);
+  const [generationProfileMenuOpen, setGenerationProfileMenuOpen] =
+    useState(false);
+  const [llmModeMenuOpen, setLlmModeMenuOpen] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const slashMenuRef = useRef<HTMLDivElement>(null);
   useMarkdownShortcuts(textareaRef);
   const { snippets } = useSnippets();
   const { settings: userSettings, patch: patchUserSettings } =
@@ -506,18 +520,55 @@ export function ChatComposer({
 
   const isSteeringMode = busy;
   const isEmpty =
-    value.trim().length === 0 &&
-    (!isSteeringMode && attachedFiles.length === 0);
+    value.trim().length === 0 && !isSteeringMode && attachedFiles.length === 0;
   const effectiveLlmModeOptions =
-    llmModeOptions.length > 0
-      ? llmModeOptions
-      : llmMode
-        ? [llmMode]
-        : [];
+    llmModeOptions.length > 0 ? llmModeOptions : llmMode ? [llmMode] : [];
   const effectiveLlmMode =
     llmMode && effectiveLlmModeOptions.includes(llmMode)
       ? llmMode
       : (effectiveLlmModeOptions[0] ?? "");
+  const isEditingSlashCommand = value.startsWith("/") && !/\s/.test(value);
+  const slashQuery = isEditingSlashCommand ? value.trim() : "";
+  const filteredChatCommands = useMemo(
+    () => filterChatCommands(slashQuery),
+    [slashQuery],
+  );
+  const filteredSkillCommands = useMemo(() => {
+    const normalized = slashQuery.trim().toLowerCase();
+    if (!normalized || normalized === "/") return skillCommands;
+    return skillCommands.filter((item) =>
+      item.command.toLowerCase().startsWith(normalized),
+    );
+  }, [skillCommands, slashQuery]);
+  const slashMenuItems = useMemo<SlashMenuItem[]>(
+    () => [
+      ...filteredChatCommands.map((command) => ({
+        kind: "chat" as const,
+        command,
+      })),
+      ...filteredSkillCommands.map((command) => ({
+        kind: "skill" as const,
+        command,
+      })),
+    ],
+    [filteredChatCommands, filteredSkillCommands],
+  );
+  const selectedSlashMenuIndex =
+    slashMenuItems.length > 0
+      ? Math.min(slashSelectionIndex, slashMenuItems.length - 1)
+      : -1;
+  const composerPlaceholder = activeCommand
+    ? `${activeCommand.label}で実行する内容を入力...`
+    : deepResearchEnabled
+      ? "Deep Researchする質問を入力..."
+      : "メッセージを入力... (/ でコマンド、@ でメンション)";
+  const searchCommand = useMemo(() => {
+    const command = findChatCommand("/search");
+    return command?.kind === "capability" ? command : null;
+  }, []);
+  const webSearchActive = activeCommand?.capability === "web_search";
+  const toolsMenuActive =
+    projectContextEnabled || deepResearchEnabled || webSearchActive;
 
   useEffect(() => {
     textareaRef.current?.focus();
@@ -525,16 +576,18 @@ export function ChatComposer({
 
   useEffect(() => {
     if (!settingsGenerationProfile) return;
-    saveStoredGenerationProfile(settingsGenerationProfile);
+    saveStoredGenerationProfile(window.localStorage, settingsGenerationProfile);
   }, [settingsGenerationProfile]);
 
   const handleGenerationProfileChange = useCallback(
     (nextProfile: GenerationProfile) => {
       setGenerationProfileChangedByUser(true);
       setLocalGenerationProfile(nextProfile);
-      saveStoredGenerationProfile(nextProfile);
+      saveStoredGenerationProfile(window.localStorage, nextProfile);
       void patchUserSettings({
-        chat: { generation_profile: nextProfile },
+        chat: {
+          generation_profile: nextProfile,
+        },
       }).catch((err) => {
         console.warn("生成プロファイルの保存に失敗:", err);
       });
@@ -544,38 +597,40 @@ export function ChatComposer({
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
-      if (event.altKey && !event.shiftKey && event.key.toLowerCase() === "p") {
-        event.preventDefault();
+      const action = getChatComposerShortcutAction(event);
+      if (!action) return;
+
+      event.preventDefault();
+      if (action === "project_context") {
         onProjectContextToggle?.(!projectContextEnabled);
-      }
-      if (
-        event.ctrlKey &&
-        !event.shiftKey &&
-        !event.altKey &&
-        !event.metaKey &&
-        event.key.toLowerCase() === "m"
-      ) {
-        event.preventDefault();
-        onLlmModeCycle?.();
         return;
       }
-      if (
-        event.ctrlKey &&
-        event.shiftKey &&
-        event.key.toLowerCase() === "f"
-      ) {
-        event.preventDefault();
-        onDeepResearchToggle?.(!deepResearchEnabled);
+      if (action === "generation_profile_menu") {
+        setGenerationProfileMenuOpen(true);
+        return;
+      }
+      if (action === "llm_mode_menu") {
+        setLlmModeMenuOpen(true);
+        return;
+      }
+
+      if (webSearchActive) {
+        setActiveCommand(null);
+        toast.success("Web検索を解除しました");
+      } else if (searchCommand) {
+        setActiveCommand(searchCommand);
+        toast.success("Web検索を次の送信に適用します");
+      } else {
+        toast.error("Web検索コマンドが見つかりません");
       }
     };
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
   }, [
-    deepResearchEnabled,
-    onDeepResearchToggle,
-    onLlmModeCycle,
     onProjectContextToggle,
     projectContextEnabled,
+    searchCommand,
+    webSearchActive,
   ]);
 
   // テキストエリアの高さ自動調整
@@ -591,6 +646,14 @@ export function ChatComposer({
   useEffect(() => {
     adjustHeight();
   }, [value, adjustHeight]);
+
+  useEffect(() => {
+    if (!showSlashMenu || selectedSlashMenuIndex < 0) return;
+    const el = slashMenuRef.current?.querySelector<HTMLElement>(
+      `[data-slash-command-index="${selectedSlashMenuIndex}"]`,
+    );
+    el?.scrollIntoView({ block: "nearest" });
+  }, [selectedSlashMenuIndex, showSlashMenu]);
 
   const handleSend = useCallback(() => {
     if (isSteeringMode) {
@@ -612,8 +675,10 @@ export function ChatComposer({
       attachedFiles.length > 0 ? attachedFiles : undefined,
       mentions.length > 0 ? mentions : undefined,
       generationProfile,
+      commandCapabilitiesForActiveCommand(activeCommand),
     );
     setValue("");
+    setActiveCommand(null);
     onAttachedFilesChange([]);
     setMentions([]);
     requestAnimationFrame(() => {
@@ -632,18 +697,235 @@ export function ChatComposer({
     attachedFiles,
     mentions,
     generationProfile,
+    activeCommand,
     onAttachedFilesChange,
   ]);
 
+  const applyChatCommand = useCallback(
+    (command: ChatCommandDefinition) => {
+      setShowSlashMenu(false);
+      setSlashSelectionIndex(0);
+      setValue("");
+
+      if (command.kind === "toggle") {
+        if (command.target === "project_context") {
+          const nextValue = !projectContextEnabled;
+          onProjectContextToggle?.(nextValue);
+          toast.success(`Project context: ${nextValue ? "on" : "off"}`);
+        } else {
+          const nextValue = !deepResearchEnabled;
+          onDeepResearchToggle?.(nextValue);
+          toast.success(`Deep Research: ${nextValue ? "on" : "off"}`);
+        }
+        requestAnimationFrame(() => textareaRef.current?.focus());
+        return;
+      }
+
+      setActiveCommand(command);
+      toast.success(`${command.label} を次の送信に適用します`);
+      requestAnimationFrame(() => textareaRef.current?.focus());
+    },
+    [
+      deepResearchEnabled,
+      onDeepResearchToggle,
+      onProjectContextToggle,
+      projectContextEnabled,
+    ],
+  );
+
+  const applySkillCommand = useCallback((command: SkillSlashCommand) => {
+    setValue(`${command.command} `);
+    setShowSlashMenu(false);
+    setSlashSelectionIndex(0);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }, []);
+
+  const handleProjectContextMenuToggle = useCallback(
+    (checked: boolean) => {
+      onProjectContextToggle?.(checked);
+      requestAnimationFrame(() => textareaRef.current?.focus());
+    },
+    [onProjectContextToggle],
+  );
+
+  const handleDeepResearchMenuToggle = useCallback(
+    (checked: boolean) => {
+      onDeepResearchToggle?.(checked);
+      requestAnimationFrame(() => textareaRef.current?.focus());
+    },
+    [onDeepResearchToggle],
+  );
+
+  const handleWebSearchMenuToggle = useCallback(
+    (checked: boolean) => {
+      if (checked) {
+        if (!searchCommand) {
+          toast.error("Web検索コマンドが見つかりません");
+          return;
+        }
+        setActiveCommand(searchCommand);
+        toast.success("Web検索を次の送信に適用します");
+      } else if (webSearchActive) {
+        setActiveCommand(null);
+        toast.success("Web検索を解除しました");
+      }
+      requestAnimationFrame(() => textareaRef.current?.focus());
+    },
+    [searchCommand, webSearchActive],
+  );
+
+  const applySlashMenuItem = useCallback(
+    (item: SlashMenuItem) => {
+      if (item.kind === "chat") {
+        applyChatCommand(item.command);
+        return;
+      }
+      applySkillCommand(item.command);
+    },
+    [applyChatCommand, applySkillCommand],
+  );
+
+  const firstMatchingSkillCommand = useCallback(
+    (token: string): SkillSlashCommand | null => {
+      const normalized = token.trim().toLowerCase();
+      if (!normalized || normalized === "/") return null;
+      return (
+        skillCommands.find((item) =>
+          item.command.toLowerCase().startsWith(normalized),
+        ) ?? null
+      );
+    },
+    [skillCommands],
+  );
+
+  const completeSlashCommandPrefix = useCallback(() => {
+    const token = value.trim();
+    if (!showSlashMenu || !isSlashCommandToken(token)) return false;
+    if (findChatCommand(token)) return false;
+    if (
+      skillCommands.some(
+        (item) => item.command.toLowerCase() === token.toLowerCase(),
+      )
+    ) {
+      return false;
+    }
+
+    const completion =
+      completeChatCommandPrefix(token) ??
+      firstMatchingSkillCommand(token)?.command ??
+      null;
+    if (!completion || completion.toLowerCase() === token.toLowerCase()) {
+      return false;
+    }
+
+    setValue(completion);
+    setShowSlashMenu(true);
+    requestAnimationFrame(() => {
+      const textarea = textareaRef.current;
+      if (!textarea) return;
+      textarea.focus();
+      textarea.setSelectionRange(completion.length, completion.length);
+    });
+    return true;
+  }, [firstMatchingSkillCommand, showSlashMenu, skillCommands, value]);
+
+  const confirmSlashCommand = useCallback(() => {
+    if (showSlashMenu && selectedSlashMenuIndex >= 0) {
+      const selectedItem = slashMenuItems[selectedSlashMenuIndex];
+      if (selectedItem) {
+        applySlashMenuItem(selectedItem);
+        return true;
+      }
+    }
+
+    const token = value.trim();
+    if (!isSlashCommandToken(token)) return false;
+
+    const exactChatCommand = findChatCommand(token);
+    if (exactChatCommand) {
+      applyChatCommand(exactChatCommand);
+      return true;
+    }
+
+    const exactSkillCommand = skillCommands.find(
+      (item) => item.command.toLowerCase() === token.toLowerCase(),
+    );
+    if (exactSkillCommand) {
+      applySkillCommand(exactSkillCommand);
+      return true;
+    }
+
+    const firstChatCommand = firstMatchingChatCommand(token);
+    if (firstChatCommand) {
+      applyChatCommand(firstChatCommand);
+      return true;
+    }
+
+    const firstSkillCommand = firstMatchingSkillCommand(token);
+    if (firstSkillCommand) {
+      applySkillCommand(firstSkillCommand);
+      return true;
+    }
+
+    return false;
+  }, [
+    applyChatCommand,
+    applySkillCommand,
+    applySlashMenuItem,
+    firstMatchingSkillCommand,
+    selectedSlashMenuIndex,
+    showSlashMenu,
+    skillCommands,
+    slashMenuItems,
+    value,
+  ]);
+
+  const moveSlashSelection = useCallback(
+    (direction: 1 | -1) => {
+      if (slashMenuItems.length === 0) return;
+      setSlashSelectionIndex((prev) => {
+        const current = Math.min(prev, slashMenuItems.length - 1);
+        return (
+          (current + direction + slashMenuItems.length) % slashMenuItems.length
+        );
+      });
+    },
+    [slashMenuItems.length],
+  );
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (showSlashMenu && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+      if (slashMenuItems.length > 0) {
+        e.preventDefault();
+        e.stopPropagation();
+        moveSlashSelection(e.key === "ArrowDown" ? 1 : -1);
+      }
+      return;
+    }
+
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
+      if (confirmSlashCommand()) return;
       if (!showSlashMenu && !showMentionMenu) {
         handleSend();
       }
     }
+    if (
+      e.key === "Tab" ||
+      (e.key === "ArrowRight" &&
+        e.currentTarget.selectionStart === value.length &&
+        e.currentTarget.selectionEnd === value.length)
+    ) {
+      if (completeSlashCommandPrefix()) {
+        e.preventDefault();
+        return;
+      }
+    }
     if (e.key === "Escape") {
-      if (showSlashMenu) setShowSlashMenu(false);
+      if (showSlashMenu) {
+        setShowSlashMenu(false);
+        setSlashSelectionIndex(0);
+      }
       if (showMentionMenu) setShowMentionMenu(false);
     }
   };
@@ -659,16 +941,30 @@ export function ChatComposer({
       });
   }, []);
 
+  const handleSlashSearchChange = useCallback(
+    (nextValue: string) => {
+      const compact = nextValue.replace(/\s+/g, "");
+      const commandToken = compact.startsWith("/") ? compact : `/${compact}`;
+      setValue(commandToken || "/");
+      setShowSlashMenu(true);
+      setSlashSelectionIndex(0);
+      loadSkillCommands();
+    },
+    [loadSkillCommands],
+  );
+
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const newValue = e.target.value;
     setValue(newValue);
 
     // スラッシュコマンド検出
-    if (newValue === "/") {
+    if (newValue.startsWith("/") && !/\s/.test(newValue)) {
       setShowSlashMenu(true);
+      setSlashSelectionIndex(0);
       loadSkillCommands();
     } else if (!newValue.startsWith("/") || newValue.includes(" ")) {
       setShowSlashMenu(false);
+      setSlashSelectionIndex(0);
     }
 
     // @メンション検出
@@ -703,22 +999,22 @@ export function ChatComposer({
     [value],
   );
 
-  const handleSlashCommand = (command: string) => {
-    setValue(command + " ");
-    setShowSlashMenu(false);
-    textareaRef.current?.focus();
-  };
-
   // ファイル追加
-  const addFiles = useCallback((files: FileList | File[]) => {
-    const newFiles = Array.from(files);
-    onAttachedFilesChange((prev) => [...prev, ...newFiles]);
-  }, [onAttachedFilesChange]);
+  const addFiles = useCallback(
+    (files: FileList | File[]) => {
+      const newFiles = Array.from(files);
+      onAttachedFilesChange((prev) => [...prev, ...newFiles]);
+    },
+    [onAttachedFilesChange],
+  );
 
   // ファイル削除
-  const removeFile = useCallback((index: number) => {
-    onAttachedFilesChange((prev) => prev.filter((_, i) => i !== index));
-  }, [onAttachedFilesChange]);
+  const removeFile = useCallback(
+    (index: number) => {
+      onAttachedFilesChange((prev) => prev.filter((_, i) => i !== index));
+    },
+    [onAttachedFilesChange],
+  );
 
   // ドラッグ&ドロップハンドラ
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -784,6 +1080,9 @@ export function ChatComposer({
           <GenerationProfileSelector
             value={generationProfile}
             onChange={handleGenerationProfileChange}
+            open={generationProfileMenuOpen}
+            onOpenChange={setGenerationProfileMenuOpen}
+            onComposerFocusRequest={() => textareaRef.current?.focus()}
           />
 
           {effectiveLlmModeOptions.length > 0 && (
@@ -792,58 +1091,79 @@ export function ChatComposer({
               options={effectiveLlmModeOptions}
               labels={llmModeLabels}
               onChange={onLlmModeChange}
+              open={llmModeMenuOpen}
+              onOpenChange={setLlmModeMenuOpen}
+              onComposerFocusRequest={() => textareaRef.current?.focus()}
             />
           )}
 
-          <Button
-            type="button"
-            variant={projectContextEnabled ? "secondary" : "ghost"}
-            size="icon"
-            className="shrink-0"
-            onClick={() => onProjectContextToggle?.(!projectContextEnabled)}
-            disabled={disabled || isSteeringMode}
-            title={
-              projectContextEnabled
-                ? "Project context: on (Alt+P)"
-                : "Project context: off (Alt+P)"
-            }
-          >
-            <FolderOpen className="size-4" />
-          </Button>
-
-          <Button
-            type="button"
-            variant={deepResearchEnabled ? "secondary" : "ghost"}
-            size="icon"
-            className={cn(
-              "shrink-0",
-              deepResearchEnabled &&
-                "border border-primary/40 text-primary shadow-sm",
-            )}
-            onClick={() => onDeepResearchToggle?.(!deepResearchEnabled)}
-            disabled={disabled || isSteeringMode}
-            title={
-              deepResearchEnabled
-                ? "Deep Research: on (Ctrl+Shift+F)"
-                : "Deep Research: off (Ctrl+Shift+F)"
-            }
-            aria-label="Deep Research"
-            aria-pressed={deepResearchEnabled}
-          >
-            <Search className="size-4" />
-          </Button>
-
-          {/* ファイル添付ボタン */}
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="shrink-0"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={disabled || isSteeringMode}
-          >
-            <Paperclip className="size-4" />
-          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={
+                <Button
+                  type="button"
+                  variant={toolsMenuActive ? "secondary" : "ghost"}
+                  size="icon"
+                  className={cn(
+                    "shrink-0",
+                    toolsMenuActive &&
+                      "border border-primary/40 text-primary shadow-sm",
+                  )}
+                  disabled={disabled || isSteeringMode}
+                  title="ツール"
+                  aria-label="ツール"
+                  aria-pressed={toolsMenuActive}
+                />
+              }
+            >
+              <Plus className="size-4" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              side="top"
+              sideOffset={8}
+              align="start"
+              className="w-56"
+            >
+              <DropdownMenuCheckboxItem
+                checked={projectContextEnabled}
+                onCheckedChange={(checked) =>
+                  handleProjectContextMenuToggle(checked === true)
+                }
+                className="gap-2 py-1.5"
+              >
+                <FolderOpen className="size-4" />
+                <span>Project context</span>
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                checked={deepResearchEnabled}
+                onCheckedChange={(checked) =>
+                  handleDeepResearchMenuToggle(checked === true)
+                }
+                className="gap-2 py-1.5"
+              >
+                <Brain className="size-4" />
+                <span>Deep Research</span>
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                checked={webSearchActive}
+                onCheckedChange={(checked) =>
+                  handleWebSearchMenuToggle(checked === true)
+                }
+                className="gap-2 py-1.5"
+              >
+                <Search className="size-4" />
+                <span>Web検索</span>
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onClick={() => fileInputRef.current?.click()}
+                className="gap-2 py-1.5"
+              >
+                <Paperclip className="size-4" />
+                <span>ファイル添付</span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
           <input
             ref={fileInputRef}
             type="file"
@@ -853,42 +1173,60 @@ export function ChatComposer({
           />
 
           <div className="relative flex-1">
+            {activeCommand && !isSteeringMode && (
+              <div className="mb-1 flex items-center gap-1.5">
+                <span className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-primary/35 bg-primary/10 px-2 py-1 text-xs font-medium text-primary">
+                  <span className="truncate">{activeCommand.label}</span>
+                  <button
+                    type="button"
+                    className="rounded-sm text-primary/70 hover:text-primary"
+                    onClick={() => setActiveCommand(null)}
+                    aria-label={`${activeCommand.label} commandを解除`}
+                    title={`${activeCommand.label} commandを解除`}
+                  >
+                    <X className="size-3" />
+                  </button>
+                </span>
+              </div>
+            )}
+
             {/* スラッシュコマンドメニュー */}
             {showSlashMenu && (
-              <div className="absolute bottom-full left-0 z-50 mb-2 w-64 rounded-lg border bg-popover shadow-md">
-                <Command>
-                  <CommandInput placeholder="コマンド検索..." className="h-8" />
+              <div
+                ref={slashMenuRef}
+                className="absolute bottom-full left-0 z-50 mb-2 w-64 rounded-lg border bg-popover shadow-md"
+              >
+                <Command shouldFilter={false}>
+                  <CommandInput
+                    value={slashQuery}
+                    onValueChange={handleSlashSearchChange}
+                    placeholder="コマンド検索..."
+                    className="h-8"
+                  />
                   <CommandList>
                     <CommandEmpty>コマンドが見つかりません</CommandEmpty>
-                    <CommandGroup heading="コマンド">
-                      {SLASH_COMMANDS.map((cmd) => (
-                        <CommandItem
-                          key={cmd.command}
-                          value={cmd.command}
-                          onSelect={() => handleSlashCommand(cmd.command)}
-                        >
-                          <div className="flex flex-col">
-                            <span className="font-mono text-sm">
-                              {cmd.usage}
-                            </span>
-                            <span className="text-xs text-muted-foreground">
-                              {cmd.description}
-                            </span>
-                          </div>
-                        </CommandItem>
-                      ))}
-                    </CommandGroup>
-                    {skillCommands.length > 0 && (
-                      <CommandGroup heading="スキル">
-                        {skillCommands.map((cmd) => (
+                    {filteredChatCommands.length > 0 && (
+                      <CommandGroup heading="コマンド">
+                        {filteredChatCommands.map((cmd, index) => (
                           <CommandItem
                             key={cmd.command}
-                            value={cmd.command}
-                            onSelect={() => handleSlashCommand(cmd.command)}
+                            value={`${cmd.command} ${cmd.label}`}
+                            data-slash-command-index={index}
+                            className={cn(
+                              index === selectedSlashMenuIndex &&
+                                "bg-muted text-foreground",
+                            )}
+                            onMouseEnter={() => setSlashSelectionIndex(index)}
+                            onSelect={() =>
+                              applySlashMenuItem({
+                                kind: "chat",
+                                command: cmd,
+                              })
+                            }
                           >
                             <div className="flex flex-col">
                               <span className="font-mono text-sm">
-                                {cmd.usage}
+                                {cmd.command}
                               </span>
                               <span className="text-xs text-muted-foreground">
                                 {cmd.description}
@@ -896,6 +1234,42 @@ export function ChatComposer({
                             </div>
                           </CommandItem>
                         ))}
+                      </CommandGroup>
+                    )}
+                    {filteredSkillCommands.length > 0 && (
+                      <CommandGroup heading="スキル（プロンプト）">
+                        {filteredSkillCommands.map((cmd, index) => {
+                          const menuIndex = filteredChatCommands.length + index;
+                          return (
+                            <CommandItem
+                              key={cmd.command}
+                              value={cmd.command}
+                              data-slash-command-index={menuIndex}
+                              className={cn(
+                                menuIndex === selectedSlashMenuIndex &&
+                                  "bg-muted text-foreground",
+                              )}
+                              onMouseEnter={() =>
+                                setSlashSelectionIndex(menuIndex)
+                              }
+                              onSelect={() =>
+                                applySlashMenuItem({
+                                  kind: "skill",
+                                  command: cmd,
+                                })
+                              }
+                            >
+                              <div className="flex flex-col">
+                                <span className="font-mono text-sm">
+                                  {cmd.usage}
+                                </span>
+                                <span className="text-xs text-muted-foreground">
+                                  {cmd.description}
+                                </span>
+                              </div>
+                            </CommandItem>
+                          );
+                        })}
                       </CommandGroup>
                     )}
                   </CommandList>
@@ -925,9 +1299,7 @@ export function ChatComposer({
               placeholder={
                 isSteeringMode
                   ? "生成中に追加する指示を入力..."
-                  : deepResearchEnabled
-                  ? "Deep Researchする質問を入力..."
-                  : "メッセージを入力... (/ でコマンド、@ でメンション)"
+                  : composerPlaceholder
               }
               rows={1}
               className={cn(
@@ -940,7 +1312,7 @@ export function ChatComposer({
             />
           </div>
 
-          {isSteeringMode && onStop && (
+          {isSteeringMode && onStop ? (
             <Button
               type="button"
               variant="destructive"
@@ -951,22 +1323,18 @@ export function ChatComposer({
             >
               <Square className="size-4" />
             </Button>
+          ) : (
+            <Button
+              size="icon"
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={handleSend}
+              disabled={isEmpty || disabled}
+              className="shrink-0"
+              title="送信"
+            >
+              <Send className="size-4" />
+            </Button>
           )}
-
-          <Button
-            size="icon"
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={handleSend}
-            disabled={
-              isSteeringMode
-                ? value.trim().length === 0 || !onSteer
-                : isEmpty || disabled
-            }
-            className="shrink-0"
-            title={isSteeringMode ? "追加指示を送信" : "送信"}
-          >
-            <Send className="size-4" />
-          </Button>
         </div>
       </div>
       <SnippetPopup state={snippetState} />

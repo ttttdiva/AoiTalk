@@ -8,11 +8,6 @@ import os
 import logging
 import re
 from typing import Optional, List, Dict, Any, Union, Generator, Callable, Awaitable
-from agents import Agent, ModelSettings, OpenAIProvider, RunConfig, Runner
-from agents.model_settings import Reasoning
-from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
-from agents.items import ToolCallItem, ToolCallOutputItem
-from openai import AsyncOpenAI
 
 from ..config import Config
 from ..services.project_context import (
@@ -29,9 +24,15 @@ from ..services.scenario_chat_context import (
     is_scenario_workflow_tool_allowed,
 )
 from .gemini_engine import GeminiLLMClient
+from .native_runtime import (
+    AgentDefinition as Agent,
+    AgentTurnRunner,
+    NativeModelSettings as ModelSettings,
+    Reasoning,
+    create_async_openai_client,
+)
 from .provider_capabilities import ProviderCapabilities
 from ..tools import init_spotify_manager
-from ..tools.adapters import OpenAIAgentAdapter
 from ..memory.manager import ConversationMemoryManager
 from ..memory.config import MemoryConfig
 from .prompts import build_unified_instructions
@@ -43,62 +44,77 @@ from .generation_policy import (
     reset_current_generation_policy,
     set_current_generation_policy,
 )
-from .agent_runtime import build_required_delegation_context_async
-from .tool_policy import reset_current_user_input, set_current_user_input
+from .agentic_completion import (
+    agentic_completion_enabled,
+    agentic_max_rounds,
+    build_agentic_continuation_context,
+    build_agentic_review_prompt,
+    parse_agentic_review_decision,
+    run_agentic_completion_loop_async,
+)
+from .agent_runtime import build_tool_hint_context_async
+from .specialist_delegate import (
+    reset_runtime_specialist_provider,
+    set_runtime_specialist_provider,
+)
+from .tool_policy import (
+    command_capability_active,
+    looks_like_bare_search_followup_request,
+    project_progress_review_active,
+    reset_current_user_input,
+    set_current_user_input,
+)
 from ..services.user_settings_service import get_user_custom_instructions_sync
 
 logger = logging.getLogger(__name__)
 
+
+def _config_get(config: Any, key: str, default: Any = None) -> Any:
+    if config is None:
+        return default
+    if hasattr(config, "get"):
+        try:
+            value = config.get(key, None)
+        except TypeError:
+            value = config.get(key)
+        if value is not None:
+            return value
+    if isinstance(config, dict):
+        current: Any = config
+        for part in key.split("."):
+            if not isinstance(current, dict) or part not in current:
+                return default
+            current = current[part]
+        return current
+    return default
+
+
+def _config_bool(config: Any, key: str, default: bool) -> bool:
+    raw_value = _config_get(config, key, None)
+    if raw_value is None:
+        return default
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, (int, float)):
+        return bool(raw_value)
+    normalized = str(raw_value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 StreamCallback = Callable[[str, Dict[str, Any]], Awaitable[None]]
+
+_SEARCH_TOOL_URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"'、。]+")
+_SEARCH_OUTPUT_LIMIT = 12000
+_SEARCH_URL_LIMIT = 20
 SteeringCallback = Callable[[], Awaitable[List[str]]]
 
 
-def _ensure_openai_agents_chat_stream_compat() -> None:
-    """古い OpenAI Agents SDK と openai-python 2.x のストリーミング差分を吸収する。"""
-    try:
-        from openai.types.responses import ResponseTextDeltaEvent
-        import agents.models.chatcmpl_stream_handler as stream_handler
-    except Exception:
-        logger.debug(
-            "[AgentLLMClient] OpenAI Agents chat stream compatibility check skipped",
-            exc_info=True,
-        )
-        return
-
-    logprobs_field = getattr(ResponseTextDeltaEvent, "model_fields", {}).get("logprobs")
-    is_required = getattr(logprobs_field, "is_required", None)
-    logprobs_required = bool(is_required()) if callable(is_required) else False
-    if not logprobs_required:
-        return
-
-    current_factory = getattr(stream_handler, "ResponseTextDeltaEvent", None)
-    if getattr(current_factory, "_aoitalk_logprobs_compat", False):
-        return
-
-    sample_kwargs = {
-        "content_index": 0,
-        "delta": "",
-        "item_id": "compat-check",
-        "output_index": 0,
-        "type": "response.output_text.delta",
-        "sequence_number": 0,
-    }
-    try:
-        current_factory(**sample_kwargs)
-        return
-    except Exception:
-        pass
-
-    def response_text_delta_event_with_logprobs(*args: Any, **kwargs: Any) -> Any:
-        kwargs.setdefault("logprobs", [])
-        return ResponseTextDeltaEvent(*args, **kwargs)
-
-    setattr(response_text_delta_event_with_logprobs, "_aoitalk_logprobs_compat", True)
-    stream_handler.ResponseTextDeltaEvent = response_text_delta_event_with_logprobs
-
-
 class AgentLLMClient:
-    """Character-based LLM client using OpenAI Agents SDK with tools"""
+    """Character-based LLM client using the AoiTalk-native agent runtime."""
 
     def __init__(
         self,
@@ -110,6 +126,7 @@ class AgentLLMClient:
         base_url: Optional[str] = None,
         default_headers: Optional[Dict[str, str]] = None,
         force_chat_completions: bool = False,
+        supports_tools: bool = True,
     ):
         """Initialize tool-based LLM client
 
@@ -121,28 +138,25 @@ class AgentLLMClient:
         self.config = config
         self.model_name = model
         self.provider_label = provider_label
+        self._native_tools_enabled = bool(supports_tools)
         self.capabilities = ProviderCapabilities(
             supports_stream=True,
-            supports_tools=True,
+            supports_tools=self._native_tools_enabled,
             supports_response_format=provider_label == "openai",
             supports_model_pull=False,
             supports_model_delete=False,
             supports_extra_body=False,
         )
-        if force_chat_completions:
-            _ensure_openai_agents_chat_stream_compat()
-        self._run_config: Optional[RunConfig] = None
-        if base_url:
-            self._run_config = RunConfig(
-                model_provider=OpenAIProvider(
-                    openai_client=AsyncOpenAI(
-                        api_key=api_key,
-                        base_url=base_url,
-                        default_headers=default_headers,
-                    ),
-                    use_responses=not force_chat_completions,
-                )
-            )
+        self._openai_client = create_async_openai_client(
+            api_key=api_key,
+            base_url=base_url,
+            default_headers=default_headers,
+        )
+        self._turn_runner = AgentTurnRunner(
+            client=self._openai_client,
+            provider_label=provider_label,
+            config=config,
+        )
         # Handle both Config object and dict
         if hasattr(config, "default_character"):
             self.character_name = config.default_character
@@ -271,9 +285,12 @@ class AgentLLMClient:
         return self._build_instructions()
 
     def _create_character_agent(self) -> Agent:
-        """Create character agent with tools from unified registry + MCP"""
-        # Convert runtime tools into OpenAI Agents SDK function tools.
-        base_tools = OpenAIAgentAdapter.convert_all(self._tool_registry.get_all())
+        """Create character agent with tools from the unified runtime registry."""
+        base_tools = (
+            self._tool_registry.get_all()
+            if getattr(self, "_native_tools_enabled", True)
+            else []
+        )
 
         # キャラクター名を決定
         if self.config:
@@ -309,10 +326,6 @@ class AgentLLMClient:
             return None
         return effort
 
-    def _runner_kwargs(self) -> Dict[str, Any]:
-        """Return Runner kwargs for providers that need a custom model provider."""
-        return {"run_config": self._run_config} if self._run_config else {}
-
     def chat(
         self,
         messages: List[Dict[str, Any]],
@@ -343,6 +356,8 @@ class AgentLLMClient:
         return {"ok": True, "provider": self.provider_label, "model": self.model_name}
 
     def _get_effective_tools_for_current_session(self, scenario_chat_context=None):
+        if not getattr(self, "_native_tools_enabled", True):
+            return []
         scenario_chat_context = (
             scenario_chat_context or self._get_scenario_chat_context_sync()
         )
@@ -567,16 +582,17 @@ class AgentLLMClient:
     ) -> Optional[ContextBundle]:
         if self._get_scenario_chat_context_sync():
             return None
+        include_project_context = bool(
+            getattr(self, "current_include_project_context", True)
+        ) and not looks_like_bare_search_followup_request(user_input)
         try:
             return await ContextBuilder().build_context(
                 user_id=self._get_session_user_id(),
                 message=user_input,
-                project_id=self.current_project_id,
+                project_id=self.current_project_id if include_project_context else None,
                 session_id=self.current_session_id,
-                project_context=project_context,
-                include_project_context=bool(
-                    getattr(self, "current_include_project_context", True)
-                ),
+                project_context=project_context if include_project_context else None,
+                include_project_context=include_project_context,
             )
         except Exception as e:
             print(f"[AgentLLMClient] ContextBuilder failed; no memory context injected: {e}")
@@ -668,14 +684,14 @@ class AgentLLMClient:
         image_data: dict = None,
         stream_callback: Optional[StreamCallback] = None,
     ) -> Union[str, Generator[str, None, None]]:
-        """Generate response using OpenAI Agents SDK
+        """Generate response using the AoiTalk-native agent runtime
 
         Args:
             user_input: User's input text
-            temperature: Sampling temperature (kept for compatibility)
-            max_tokens: Maximum tokens (kept for compatibility)
-            stream: Whether to stream (kept for compatibility)
-            image_data: Optional image data (kept for compatibility)
+            temperature: Sampling temperature.
+            max_tokens: Maximum tokens.
+            stream: Whether to stream.
+            image_data: Optional image data.
             stream_callback: Async callback for streaming events
 
         Returns:
@@ -799,40 +815,16 @@ class AgentLLMClient:
         instruction_block = "\n".join(f"- {instruction}" for instruction in instructions)
         return f"{context}\n\n追加指示:\n{instruction_block}"
 
-    def _agentic_completion_enabled(self) -> bool:
-        return get_client_generation_policy(self).agentic_completion_enabled
+    def _agentic_completion_enabled(self, user_input: str | None = None) -> bool:
+        if not getattr(self, "_native_tools_enabled", True):
+            return False
+        return agentic_completion_enabled(self, user_input)
 
-    def _agentic_max_rounds(self) -> int:
-        raw_value = None
-        if self.config is not None and hasattr(self.config, "get"):
-            raw_value = self.config.get("agentic_completion.max_rounds", None)
-        elif isinstance(self.config, dict):
-            raw_value = self.config.get("agentic_completion.max_rounds")
-        try:
-            value = int(raw_value) if raw_value is not None else 2
-        except (TypeError, ValueError):
-            value = 2
-        return max(0, min(value, 5))
+    def _agentic_max_rounds(self, user_input: str | None = None) -> int:
+        return agentic_max_rounds(self, user_input)
 
     def _parse_agentic_review_decision(self, content: str) -> dict[str, str]:
-        text = str(content or "").strip()
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
-            return {"status": "done", "reason": "review did not return JSON"}
-        try:
-            payload = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            return {"status": "done", "reason": "review JSON parse failed"}
-        if not isinstance(payload, dict):
-            return {"status": "done", "reason": "review payload was not an object"}
-        status = str(payload.get("status") or "done").strip().lower()
-        if status not in {"done", "continue"}:
-            status = "done"
-        return {
-            "status": status,
-            "reason": str(payload.get("reason") or "").strip(),
-            "next_request": str(payload.get("next_request") or "").strip(),
-        }
+        return parse_agentic_review_decision(content)
 
     def _build_agentic_review_prompt(
         self,
@@ -840,27 +832,13 @@ class AgentLLMClient:
         original_context: str,
         latest_response: str,
         round_index: int,
+        user_input: str | None = None,
     ) -> str:
-        return "\n".join(
-            [
-                "You are the completion verifier for this AoiTalk agent run.",
-                "Review whether the user's request has actually been completed.",
-                "If the request produced or changed files, artifacts, tasks, records, or other external state, inspect the result with the available specialist tools before deciding.",
-                "Examples: for an Excel file, verify that the file exists and that its workbook content matches the requested sheets, columns, rows, and dates; for code changes, inspect diffs or run narrow checks if available.",
-                "If verification fails or important work remains, request one more focused continuation step.",
-                "Do not ask the user to do verification that the agent can do with tools.",
-                "Return exactly one JSON object and no markdown:",
-                '{"status":"done","reason":"..."}',
-                '{"status":"continue","reason":"...","next_request":"..."}',
-                "",
-                f"Review round: {round_index}",
-                "",
-                "Original conversation context:",
-                original_context,
-                "",
-                "Latest assistant response:",
-                latest_response,
-            ]
+        return build_agentic_review_prompt(
+            original_context=original_context,
+            latest_response=latest_response,
+            round_index=round_index,
+            user_input=user_input,
         )
 
     def _build_agentic_continuation_context(
@@ -870,26 +848,10 @@ class AgentLLMClient:
         latest_response: str,
         decision: dict[str, str],
     ) -> str:
-        next_request = decision.get("next_request") or (
-            "Continue the work needed to satisfy the original request."
-        )
-        return "\n".join(
-            [
-                "Continue this AoiTalk agent run because verification found unfinished or invalid work.",
-                "Use specialist tools as needed, then produce a corrected final response.",
-                "",
-                "Original conversation context:",
-                original_context,
-                "",
-                "Previous assistant response:",
-                latest_response,
-                "",
-                "Verification result:",
-                decision.get("reason", ""),
-                "",
-                "Required continuation:",
-                next_request,
-            ]
+        return build_agentic_continuation_context(
+            original_context=original_context,
+            latest_response=latest_response,
+            decision=decision,
         )
 
     async def _run_once_with_agent(
@@ -897,23 +859,69 @@ class AgentLLMClient:
         agent: Agent,
         context: str,
         stream_callback: Optional[StreamCallback] = None,
+        required_tool_name: Optional[str] = None,
     ) -> str:
-        if stream_callback:
-            return await self._run_streamed_with_callback(
-                agent, context, stream_callback
+        previous_max_tool_rounds = getattr(self._turn_runner, "max_tool_rounds", None)
+        if previous_max_tool_rounds is not None:
+            self._turn_runner.max_tool_rounds = max(
+                previous_max_tool_rounds,
+                self._agentic_max_rounds(context),
             )
-        result = await Runner.run(agent, context, **self._runner_kwargs())
-        if hasattr(result, "messages"):
-            tool_calls = [
-                msg
-                for msg in result.messages
-                if hasattr(msg, "role") and msg.role == "tool"
-            ]
-            print(f"[AgentLLMClient] Tool messages found: {len(tool_calls)}")
+        try:
+            result = await self._turn_runner.run(
+                agent,
+                context,
+                stream_callback=stream_callback,
+            )
+        finally:
+            if previous_max_tool_rounds is not None:
+                self._turn_runner.max_tool_rounds = previous_max_tool_rounds
+        if result.tool_calls:
+            print(f"[AgentLLMClient] Tool messages found: {len(result.tool_calls)}")
+        if required_tool_name and not any(
+            record.tool == required_tool_name and record.successful
+            for record in result.tool_calls
+        ):
+            logger.warning(
+                "[AgentLLMClient] required tool %s was not called",
+                required_tool_name,
+            )
+            return (
+                "ツール実行の検証に失敗しました: "
+                f"必須ツール `{required_tool_name}` が実行されませんでした。"
+            )
         return str(result.final_output or "")
 
-    async def _build_required_delegation_context(self, user_input: str) -> str:
-        return await build_required_delegation_context_async(
+    def _required_command_tool_name(self, user_input: str) -> Optional[str]:
+        if "web_search" in set(
+            getattr(self, "current_command_capabilities", ()) or ()
+        ):
+            return "web_search"
+        if command_capability_active(user_input, "web_search"):
+            return "web_search"
+        return None
+
+    def _agent_requiring_tool(self, agent: Agent, required_tool_name: str) -> Agent:
+        required_tools = [
+            tool
+            for tool in agent.tools
+            if str(getattr(tool, "name", "")) == required_tool_name
+        ]
+        return Agent(
+            name=agent.name,
+            instructions=agent.instructions,
+            tools=required_tools,
+            model=agent.model,
+            model_settings=ModelSettings(
+                tool_choice="required",
+                reasoning=agent.model_settings.reasoning,
+            ),
+        )
+
+    async def _build_tool_hint_context(self, user_input: str) -> str:
+        if not getattr(self, "_native_tools_enabled", True):
+            return ""
+        return await build_tool_hint_context_async(
             user_input=user_input,
             registry=self._tool_registry,
             policy=get_client_generation_policy(self),
@@ -925,59 +933,21 @@ class AgentLLMClient:
         agent: Agent,
         context: str,
         stream_callback: Optional[StreamCallback] = None,
+        user_input: str | None = None,
     ) -> str:
-        if not self._agentic_completion_enabled():
+        if not self._agentic_completion_enabled(user_input):
             return await self._run_once_with_agent(agent, context, stream_callback)
 
-        if stream_callback:
-            await stream_callback(
-                "stream_start",
-                {"status": "agentic", "message": "作業を実行しています"},
-            )
+        async def _run_once(prompt: str) -> str:
+            return await self._run_once_with_agent(agent, prompt, None)
 
-        response = await self._run_once_with_agent(agent, context, None)
-        for round_index in range(1, self._agentic_max_rounds() + 1):
-            if stream_callback:
-                await stream_callback(
-                    "status_update",
-                    {
-                        "status": "agentic_review",
-                        "message": "結果を検証しています",
-                    },
-                )
-
-            review_prompt = self._build_agentic_review_prompt(
-                original_context=context,
-                latest_response=response,
-                round_index=round_index,
-            )
-            review_result = await Runner.run(agent, review_prompt, **self._runner_kwargs())
-            decision = self._parse_agentic_review_decision(
-                str(review_result.final_output or "")
-            )
-            if decision["status"] != "continue":
-                break
-
-            if stream_callback:
-                await stream_callback(
-                    "status_update",
-                    {
-                        "status": "agentic_continue",
-                        "message": "不足分を再実行しています",
-                    },
-                )
-
-            continuation_context = self._build_agentic_continuation_context(
-                original_context=context,
-                latest_response=response,
-                decision=decision,
-            )
-            response = await self._run_once_with_agent(agent, continuation_context, None)
-
-        if stream_callback:
-            await stream_callback("stream_end", {"content": response})
-
-        return response
+        return await run_agentic_completion_loop_async(
+            client=self,
+            run_once=_run_once,
+            context=context,
+            stream_callback=stream_callback,
+            user_input=user_input,
+        )
 
     async def _generate_async(
         self,
@@ -987,6 +957,9 @@ class AgentLLMClient:
     ) -> str:
         """Generate response asynchronously using character agent with tools"""
         project_token = None
+        specialist_provider_token = set_runtime_specialist_provider(
+            self.provider_label
+        )
         tool_policy_token = set_current_user_input(user_input)
         generation_policy_token = set_current_generation_policy(
             get_client_generation_policy(self)
@@ -1028,19 +1001,25 @@ class AgentLLMClient:
             self.history_manager.add_message("user", user_input)
 
             context = self._build_conversation_context()
-            required_delegation_context = await self._build_required_delegation_context(
+            tool_hint_context = await self._build_tool_hint_context(
                 user_input
             )
-            if required_delegation_context:
+            if tool_hint_context:
                 context = (
-                    f"{required_delegation_context}\n\n{context}"
+                    f"{tool_hint_context}\n\n{context}"
                     if context
-                    else required_delegation_context
+                    else tool_hint_context
                 )
             response: Optional[str] = None
+            required_tool_name = self._required_command_tool_name(user_input)
 
-            if self.reasoning_manager and self.reasoning_manager.is_reasoning_required(
-                user_input, self._get_available_tools()
+            if (
+                not required_tool_name
+                and self.reasoning_manager
+                and self.reasoning_manager.is_reasoning_required(
+                    user_input,
+                    self._get_available_tools(),
+                )
             ):
                 print("[AgentLLMClient] Entering reasoning mode")
 
@@ -1067,7 +1046,7 @@ class AgentLLMClient:
                             "\n\n".join(
                                 part
                                 for part in [
-                                    required_delegation_context,
+                                    tool_hint_context,
                                     (
                                         self._current_context_bundle.render_for_prompt()
                                         if self._current_context_bundle
@@ -1118,15 +1097,32 @@ class AgentLLMClient:
                         scenario_chat_context
                     ),
                     model=self.model_name,
+                    model_settings=self.agent.model_settings,
                 )
+                if required_tool_name:
+                    effective_agent = self._agent_requiring_tool(
+                        effective_agent,
+                        required_tool_name,
+                    )
                 context = await self._append_pending_steering_to_context(
                     context, steering_callback, stream_callback
                 )
-                response = await self._run_agentic_completion_loop(
-                    effective_agent, context, stream_callback
-                )
+                if required_tool_name:
+                    response = await self._run_once_with_agent(
+                        effective_agent,
+                        context,
+                        stream_callback,
+                        required_tool_name=required_tool_name,
+                    )
+                else:
+                    response = await self._run_agentic_completion_loop(
+                        effective_agent,
+                        context,
+                        stream_callback,
+                        user_input=user_input,
+                    )
             except Exception as e:
-                print(f"[AgentLLMClient] Runner実行エラー: {e}")
+                print(f"[AgentLLMClient] native runtime実行エラー: {e}")
                 import traceback
 
                 traceback.print_exc()
@@ -1165,6 +1161,7 @@ class AgentLLMClient:
         finally:
             reset_current_generation_policy(generation_policy_token)
             reset_current_user_input(tool_policy_token)
+            reset_runtime_specialist_provider(specialist_provider_token)
             if project_token is not None:
                 reset_runtime_project_context(project_token)
             self._current_context_bundle = None
@@ -1172,58 +1169,35 @@ class AgentLLMClient:
     async def _run_streamed_with_callback(
         self, agent: Agent, context: str, callback: StreamCallback
     ) -> str:
-        """Runner.run_streamed()でストリーミング実行し、コールバックでイベントを通知する"""
-        from openai.types.responses import ResponseTextDeltaEvent
-
-        await callback("stream_start", {"message": "応答を生成しています"})
-
-        streamed_result = Runner.run_streamed(agent, context, **self._runner_kwargs())
-        full_text = ""
-
-        async for event in streamed_result.stream_events():
-            if isinstance(event, RawResponsesStreamEvent):
-                if isinstance(event.data, ResponseTextDeltaEvent):
-                    delta = event.data.delta
-                    if delta:
-                        full_text += delta
-                        await callback("stream_token", {"content": delta})
-
-            elif isinstance(event, RunItemStreamEvent):
-                if event.name == "tool_called" and isinstance(event.item, ToolCallItem):
-                    tool_name = self._extract_stream_tool_name(event.item)
-                    print(f"[AgentLLMClient] ツール呼び出し: {tool_name}")
-                    await callback(
-                        "tool_start",
-                        {
-                            "tool": tool_name,
-                            "message": f"{tool_name} を実行しています",
-                        },
-                    )
-                elif event.name == "tool_output" and isinstance(
-                    event.item, ToolCallOutputItem
-                ):
-                    print(f"[AgentLLMClient] ツール完了")
-                    await callback("tool_end", {"message": "ツール実行が完了しました"})
-                elif event.name in {
-                    "handoff_requested",
-                    "handoff_occured",
-                    "handoff_occurred",
-                }:
-                    await callback(
-                        "status_update",
-                        {
-                            "status": "handoff",
-                            "message": "専門エージェントに処理を渡しています",
-                        },
-                    )
-
-        await callback(
-            "stream_end", {"content": streamed_result.final_output or full_text}
+        """Native runtime streaming callback bridge."""
+        result = await self._turn_runner.run(
+            agent,
+            context,
+            stream_callback=callback,
         )
+        return result.final_output
 
-        return streamed_result.final_output or full_text
+    def _extract_stream_tool_call_id(self, item: Any) -> str | None:
+        raw_item = getattr(item, "raw_item", None)
+        call_id = getattr(raw_item, "call_id", None)
+        if call_id:
+            return str(call_id)
+        if isinstance(raw_item, dict) and raw_item.get("call_id"):
+            return str(raw_item["call_id"])
+        return None
 
-    def _extract_stream_tool_name(self, item: ToolCallItem) -> str:
+    def _extract_stream_tool_output_call_id(
+        self, item: Any
+    ) -> str | None:
+        raw_item = getattr(item, "raw_item", None)
+        call_id = getattr(raw_item, "call_id", None)
+        if call_id:
+            return str(call_id)
+        if isinstance(raw_item, dict) and raw_item.get("call_id"):
+            return str(raw_item["call_id"])
+        return None
+
+    def _extract_stream_tool_name(self, item: Any) -> str:
         raw_item = getattr(item, "raw_item", None)
         for attr in ("name", "tool_name"):
             value = getattr(raw_item, attr, None)
@@ -1242,6 +1216,71 @@ class AgentLLMClient:
             if isinstance(function_data, dict) and function_data.get("name"):
                 return str(function_data["name"])
         return "tool"
+
+    def _extract_stream_tool_arguments(
+        self, item: Any
+    ) -> dict[str, Any] | None:
+        raw_item = getattr(item, "raw_item", None)
+        arguments = getattr(raw_item, "arguments", None)
+        if arguments is None and isinstance(raw_item, dict):
+            arguments = raw_item.get("arguments")
+        if isinstance(arguments, str) and arguments.strip():
+            try:
+                parsed = json.loads(arguments)
+                return parsed if isinstance(parsed, dict) else None
+            except Exception:
+                return {"raw": arguments}
+        if isinstance(arguments, dict):
+            return arguments
+        return None
+
+    def _stringify_tool_output(self, output: Any) -> str:
+        if output is None:
+            return ""
+        if isinstance(output, str):
+            return output
+        try:
+            return json.dumps(output, ensure_ascii=False, default=str)
+        except Exception:
+            return str(output)
+
+    def _build_search_tool_result(
+        self,
+        tool_name: str,
+        tool_args: dict[str, Any] | None,
+        output_text: str,
+    ) -> dict[str, Any] | None:
+        if "search" not in tool_name.lower() or not output_text.strip():
+            return None
+
+        urls: list[str] = []
+        for match in _SEARCH_TOOL_URL_RE.finditer(output_text):
+            url = match.group(0).rstrip(".,;:!?")
+            if url not in urls:
+                urls.append(url)
+            if len(urls) >= _SEARCH_URL_LIMIT:
+                break
+
+        query = None
+        if tool_args:
+            for key in ("query", "q", "search_query", "keyword", "keywords"):
+                value = tool_args.get(key)
+                if isinstance(value, str) and value.strip():
+                    query = value.strip()
+                    break
+
+        clipped_output = output_text.strip()
+        truncated = len(clipped_output) > _SEARCH_OUTPUT_LIMIT
+        if truncated:
+            clipped_output = clipped_output[:_SEARCH_OUTPUT_LIMIT].rstrip() + "\n...(省略)"
+
+        return {
+            "tool": tool_name,
+            "query": query,
+            "urls": urls,
+            "output": clipped_output,
+            "truncated": truncated,
+        }
 
     def _extract_scene_description(self, response: str) -> Optional[str]:
         """応答から画像生成用のシーン描写を抽出する。"""
@@ -1437,8 +1476,14 @@ New conversation:
 Updated summary:
 """
         try:
-            # Use Runner directly to bypass tools and history
-            result = await Runner.run(self.agent, prompt, **self._runner_kwargs())
+            summary_agent = Agent(
+                name=f"{self.agent.name}Summary",
+                instructions=self.agent.instructions,
+                model=self.agent.model,
+                tools=[],
+                model_settings=self.agent.model_settings,
+            )
+            result = await self._turn_runner.run(summary_agent, prompt)
             return result.final_output
 
         except Exception as e:
@@ -1479,6 +1524,8 @@ Updated summary:
         Returns:
             List of tool names
         """
+        if not getattr(self, "_native_tools_enabled", True):
+            return []
         scenario_chat_context = self._get_scenario_chat_context_sync()
         if not scenario_chat_context:
             return self._tool_registry.get_names()
@@ -1596,13 +1643,13 @@ def create_llm_client(
 
         return create_openai_compatible_local_client(config)
 
-    elif llm_provider in ["gemini-cli", "claude-cli", "codex-cli"]:
+    elif llm_provider in ["antigravity-cli", "claude-cli", "codex-cli"]:
         # CLI-based providers
         print(f"[LLM Factory] {llm_provider.upper()} Backendを作成")
 
         # Select appropriate CLI backend
-        if llm_provider == "gemini-cli":
-            from .cli_backends.gemini import GeminiCLIBackend as CLIImpl
+        if llm_provider == "antigravity-cli":
+            from .cli_backends.antigravity import AntigravityCLIBackend as CLIImpl
 
             cli_backend = CLIImpl(model=config.get("llm_model"))
         elif llm_provider == "claude-cli":
@@ -1667,6 +1714,7 @@ def create_llm_client(
             base_url=base_url,
             default_headers=headers,
             force_chat_completions=True,
+            supports_tools=_config_bool(config, "openrouter.enable_tools", False),
         )
 
     else:  # openai or default

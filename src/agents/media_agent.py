@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from agents import Agent, ModelSettings
+from ..llm.native_runtime import AgentDefinition as Agent, NativeModelSettings as ModelSettings
 
-from ..tools.adapters import OpenAIAgentAdapter
+from ..tools.core import ensure_tool_definitions
 from ..tools.entertainment.video_streaming.video_streaming_tools import (
     get_video_playback_status,
     play_niconico_audio,
@@ -23,7 +23,7 @@ class MediaAgent(BaseAgent):
     """Specialized agent for image and streaming media tasks."""
 
     def _create_agent(self) -> Agent:
-        tools = OpenAIAgentAdapter.convert_all(
+        tools = ensure_tool_definitions(
             [
                 generate_image,
                 generate_comfyui_image,
@@ -51,7 +51,7 @@ Use the available media tools directly to carry out the user's request.
 
 2. **Image Generation**: You have two tools:
    - generate_image: Uses Gemini's built-in image generation. Good for general requests.
-   - generate_comfyui_image: Uses a local ComfyUI server. Better for high-quality, character-specific, or stylized images. 
+   - generate_comfyui_image: Uses a local ComfyUI server. Better for high-quality, character-specific, or stylized images.
      - Use `list_comfyui_workflows` to see available workflows.
      - You can specify `workflow_name` and override parameters like `width`, `height`, `steps`, `cfg`, `sampler`, `scheduler`, `lora_strength`, and `seed`.
      - If the user mentions a specific character, try to use their slug in `character_slug` to apply their appearance tags.

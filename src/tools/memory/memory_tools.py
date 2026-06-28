@@ -3,7 +3,7 @@ Memory search tools for function calling
 """
 
 from typing import Dict, Any, List, Optional
-from ..core import tool as function_tool
+from ..core import tool
 from src.memory.manager import ConversationMemoryManager
 from src.memory.config import MemoryConfig
 
@@ -23,7 +23,7 @@ def get_memory_manager() -> ConversationMemoryManager:
     return _memory_manager
 
 
-@function_tool
+@tool
 async def search_memory(query: str, time_range: str = "all", max_results: int = 10) -> Dict[str, Any]:
     """過去の会話履歴や記憶から関連する内容を検索する
     
@@ -100,4 +100,4 @@ async def search_memory(query: str, time_range: str = "all", max_results: int = 
         }
 
 
-# FunctionTool created by @function_tool decorator
+# ToolDefinition created by @tool decorator

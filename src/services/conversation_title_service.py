@@ -16,6 +16,14 @@ TITLE_MAX_LENGTH = 50
 TITLE_FALLBACK_LENGTH = 40
 TITLE_CONTENT_LIMIT = 500
 TITLE_GENERATION_CONTEXT_KEY = "title_generation"
+REJECTED_GENERATED_TITLE_FRAGMENTS = (
+    "利用可能な案件情報DBと直近の確認結果だけを根拠に回答します",
+    "選択中の案件情報DBから利用できる短い根拠を取得できませんでした",
+    "ローカルLLMはモデルを読み込み中です",
+    "ローカルLLMから本文のない応答が返りました",
+    "ローカルLLMの呼び出しでエラーが発生しました",
+    "ツール実行の検証に失敗しました",
+)
 
 TitleGenerator = Callable[[str], Awaitable[Optional[str]] | Optional[str]]
 
@@ -43,6 +51,16 @@ def clean_generated_title(value: str) -> str:
     title = re.sub(r"^(タイトル|題名)\s*[:：]\s*", "", title)
     title = title.strip(" \t\r\n\"'`「」『』【】[]")
     return _compact_text(title)
+
+
+def is_acceptable_generated_title(title: str) -> bool:
+    if not 0 < len(title) <= TITLE_MAX_LENGTH:
+        return False
+    return not is_rejected_generated_title(title)
+
+
+def is_rejected_generated_title(title: str) -> bool:
+    return any(fragment in title for fragment in REJECTED_GENERATED_TITLE_FRAGMENTS)
 
 
 def _first_user_message(messages: Sequence[ConversationMessage]) -> Optional[str]:
@@ -164,7 +182,7 @@ async def generate_conversation_title(
                 generated = await generated
             if generated:
                 title = clean_generated_title(str(generated))
-                if 0 < len(title) <= TITLE_MAX_LENGTH:
+                if is_acceptable_generated_title(title):
                     return GeneratedConversationTitle(title=title, source="llm")
         except Exception as exc:
             logger.warning("LLM conversation title generation failed: %s", exc)
@@ -192,9 +210,11 @@ async def ensure_conversation_title(
 
     current_title = _compact_text(session.title or "")
     current_source = _title_generation_source(session)
+    current_title_is_rejected = is_rejected_generated_title(current_title)
     can_replace_current = (
         not current_title
         or current_source == "fallback"
+        or current_title_is_rejected
         or _is_replaceable_fallback_title(current_title, messages)
     )
     if not can_replace_current:
@@ -205,7 +225,7 @@ async def ensure_conversation_title(
         return None
     if current_title == generated.title and current_source == generated.source:
         return None
-    if current_title and generated.source != "llm":
+    if current_title and generated.source != "llm" and not current_title_is_rejected:
         return None
 
     updated = await _update_generated_title(repo, session_id, generated)

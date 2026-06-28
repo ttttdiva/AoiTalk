@@ -34,13 +34,23 @@ from .generation_policy import (
     reset_current_generation_policy,
     set_current_generation_policy,
 )
+from .agentic_completion import (
+    agentic_max_rounds,
+    render_messages_for_review,
+    run_agentic_completion_loop_sync,
+)
 from .agent_runtime import (
-    build_required_delegation_context_sync,
-    compose_required_delegation_user_message,
+    build_tool_hint_context_sync,
+    compose_tool_hint_user_message,
+    guard_tool_execution_claims,
     run_openai_tool_call_loop,
 )
 from .runtime_tool_registry import build_runtime_tool_registry
-from .tool_policy import reset_current_user_input, set_current_user_input
+from .tool_policy import (
+    project_progress_review_active,
+    reset_current_user_input,
+    set_current_user_input,
+)
 from .provider_capabilities import ProviderCapabilities
 
 logger = logging.getLogger(__name__)
@@ -575,8 +585,8 @@ class SGLangClient:
             logger.warning("[SGLangClient] Failed to resolve project context: %s", exc)
             return None
 
-    def _build_required_delegation_context(self, user_input: str) -> str:
-        return build_required_delegation_context_sync(
+    def _build_tool_hint_context(self, user_input: str) -> str:
+        return build_tool_hint_context_sync(
             user_input=user_input,
             registry=self._tool_registry,
             policy=get_client_generation_policy(self),
@@ -665,12 +675,12 @@ class SGLangClient:
         try:
             project_context = self._resolve_project_context_sync()
             project_token = set_runtime_project_context(project_context)
-            required_delegation_context = self._build_required_delegation_context(
+            tool_hint_context = self._build_tool_hint_context(
                 user_input
             )
-            model_user_input = compose_required_delegation_user_message(
+            model_user_input = compose_tool_hint_user_message(
                 user_input,
-                required_delegation_context,
+                tool_hint_context,
             )
 
             # Build messages
@@ -726,7 +736,19 @@ class SGLangClient:
                 # Handle tool calls if present
                 if choice.message.tool_calls:
                     response_text = self._handle_tool_calls(
-                        messages, choice.message, api_kwargs, registry
+                        messages,
+                        choice.message,
+                        api_kwargs,
+                        registry,
+                        user_input=user_input,
+                    )
+                elif project_progress_review_active(user_input):
+                    response_text = self._handle_tool_calls(
+                        messages,
+                        choice.message,
+                        api_kwargs,
+                        registry,
+                        user_input=user_input,
                     )
                 else:
                     raw_response_text = choice.message.content or ""
@@ -734,7 +756,20 @@ class SGLangClient:
                         response_text, _ = self._process_thinking_response(raw_response_text)
                     else:
                         response_text = raw_response_text
+                    response_text = guard_tool_execution_claims(response_text, [])
 
+                response_text = run_agentic_completion_loop_sync(
+                    client=self,
+                    run_once=lambda prompt: self._run_agentic_review_once(
+                        prompt,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        user_input=user_input,
+                    ),
+                    context=render_messages_for_review(messages),
+                    user_input=user_input,
+                    initial_response=response_text,
+                )
                 # Add to history
                 self.history_manager.add_message("user", user_input)
                 self.history_manager.add_message("assistant", response_text)
@@ -768,17 +803,78 @@ class SGLangClient:
         assistant_message: Any,
         api_kwargs: Dict[str, Any],
         registry: "ToolRegistry",
-        max_rounds: int = 5
+        max_rounds: int = 5,
+        user_input: Optional[str] = None,
     ) -> str:
-        return run_openai_tool_call_loop(
+        effective_max_rounds = max(max_rounds, agentic_max_rounds(self, user_input))
+        result = run_openai_tool_call_loop(
             initial_messages=messages,
             assistant_message=assistant_message,
             api_kwargs=api_kwargs,
             registry=registry,
             create_completion=lambda kwargs: self.client.chat.completions.create(**kwargs),
             log_prefix="SGLangClient",
-            max_rounds=max_rounds,
+            max_rounds=effective_max_rounds,
+            return_result=True,
+            config=self.config,
+            user_input=user_input,
         )
+        return guard_tool_execution_claims(result.final_output, result.tool_calls)
+
+    def _run_agentic_review_once(
+        self,
+        prompt: str,
+        *,
+        temperature: float,
+        max_tokens: Optional[int],
+        user_input: str,
+    ) -> str:
+        messages = self._build_messages(prompt)
+        if self._thinking_mode:
+            effective_temperature = 0.6
+            effective_top_p = 0.95
+            extra_body = {"chat_template_kwargs": {"enable_thinking": True}}
+        else:
+            effective_temperature = temperature
+            effective_top_p = 0.8
+            extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+
+        registry = self._tool_registry
+        api_tools = OpenAIAPIAdapter.convert_all(registry.get_all()) if len(registry) > 0 else None
+        api_kwargs: Dict[str, Any] = {
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": effective_temperature,
+            "top_p": effective_top_p,
+            "max_tokens": max_tokens or 1024,
+        }
+        if api_tools:
+            api_kwargs["tools"] = api_tools
+            api_kwargs["tool_choice"] = "auto"
+        try:
+            response = self.client.chat.completions.create(
+                **api_kwargs, extra_body=extra_body
+            )
+        except Exception as api_err:
+            if "chat_template" in str(api_err).lower() or "extra_body" in str(api_err).lower():
+                logger.warning(f"[SGLangClient] Retrying agentic review without extra_body: {api_err}")
+                response = self.client.chat.completions.create(**api_kwargs)
+            else:
+                raise
+
+        choice = response.choices[0]
+        if choice.message.tool_calls:
+            return self._handle_tool_calls(
+                messages,
+                choice.message,
+                api_kwargs,
+                registry,
+                user_input=user_input,
+            )
+        response_text = choice.message.content or ""
+        if self._thinking_mode:
+            response_text, _ = self._process_thinking_response(response_text)
+        return guard_tool_execution_claims(response_text, [])
 
     def _stream_response(
         self,

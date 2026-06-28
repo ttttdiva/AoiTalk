@@ -23,6 +23,7 @@ export function useTaskContextMenu({
   upsertTaskLocally,
   removeTaskLocally,
   setSelectedIds,
+  requestRecurringDelete,
 }: {
   fetchData: (options?: FetchDataOptions) => Promise<void>;
   pushUndo: (entry: UndoEntry) => void;
@@ -31,6 +32,7 @@ export function useTaskContextMenu({
   upsertTaskLocally: (task: Task) => void;
   removeTaskLocally: (taskId: string) => void;
   setSelectedIds: React.Dispatch<React.SetStateAction<Set<string>>>;
+  requestRecurringDelete?: (task: Task) => boolean;
 }) {
   const [contextMenu, setContextMenu] = useState<{
     x: number;
@@ -210,6 +212,7 @@ export function useTaskContextMenu({
     if (!contextMenu) return;
     const task = contextMenu.task;
     closeContextMenu();
+    if (requestRecurringDelete?.(task)) return;
     try {
       pushUndo({ type: "recreate", tasks: [task] });
       await taskApi.deleteTask(task.id);
@@ -230,6 +233,7 @@ export function useTaskContextMenu({
     fetchData,
     pushUndo,
     removeTaskLocally,
+    requestRecurringDelete,
     setSelectedIds,
   ]);
 

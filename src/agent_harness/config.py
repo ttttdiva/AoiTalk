@@ -97,6 +97,19 @@ class HarnessCodexSettings:
 
 
 @dataclass(frozen=True)
+class HarnessClaudeSettings:
+    bin_path: str = "claude"
+    model: str | None = None
+    reasoning_effort: str | None = None
+
+
+@dataclass(frozen=True)
+class HarnessCustomCommandSettings:
+    command: str | None = None
+    args: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class AgentHarnessSettings:
     enabled: bool = False
     auto_start: bool = False
@@ -113,6 +126,8 @@ class AgentHarnessSettings:
     tracker: HarnessTrackerSettings = field(default_factory=HarnessTrackerSettings)
     hooks: HarnessHookSettings = field(default_factory=HarnessHookSettings)
     codex: HarnessCodexSettings = field(default_factory=HarnessCodexSettings)
+    claude: HarnessClaudeSettings = field(default_factory=HarnessClaudeSettings)
+    custom_command: HarnessCustomCommandSettings = field(default_factory=HarnessCustomCommandSettings)
 
     @classmethod
     def from_config(
@@ -124,7 +139,45 @@ class AgentHarnessSettings:
         tracker_raw = raw.get("tracker", {}) or {}
         hooks_raw = raw.get("hooks", {}) or {}
         codex_raw = raw.get("codex", {}) or {}
+        claude_raw = raw.get("claude", {}) or {}
+        custom_command_raw = raw.get("custom_command", {}) or {}
         codex_cli_raw = _config_get(config, "codex_cli", {}) or {}
+        claude_cli_raw = _config_get(config, "claude_cli", {}) or {}
+        try:
+            from ..services.agent_team_service import (
+                agent_team_member_for,
+                agent_team_member_mode,
+            )
+
+            agent_route = agent_team_member_for(config, "agent_harness")
+        except Exception:
+            agent_route = None
+        route_codex_model = None
+        route_codex_effort = None
+        route_claude_model = None
+        route_claude_effort = None
+        route_runner = None
+        if agent_route:
+            route_runner = agent_route.get("runner")
+        normalized_route_runner = _normalize_runner(str(route_runner)) if route_runner else ""
+        if agent_route and (
+            normalized_route_runner in {"codex_exec", "codex_cli"}
+            or (
+                not normalized_route_runner
+                and agent_route.get("provider") == "codex-cli"
+            )
+        ):
+            route_codex_model = agent_route.get("model")
+            route_codex_effort = agent_team_member_mode(config, "agent_harness")
+            route_runner = route_runner or "codex_exec"
+        elif agent_route and (
+            normalized_route_runner in {"claude_code", "claude_cli"}
+            or agent_route.get("provider") == "claude-cli"
+        ):
+            route_claude_model = agent_route.get("model")
+            route_claude_effort = agent_team_member_mode(config, "agent_harness")
+            if not route_runner or _normalize_runner(str(route_runner)) == "codex_exec":
+                route_runner = "claude_code"
         by_state_raw = raw.get("max_concurrent_agents_by_state", {}) or {}
         by_state = {
             _normalize_state(str(state)): int(limit)
@@ -175,15 +228,29 @@ class AgentHarnessSettings:
             ),
             codex=HarnessCodexSettings(
                 bin_path=str(codex_raw.get("bin_path") or os.getenv("CODEX_BIN") or "codex"),
-                model=codex_raw.get("model") or codex_cli_raw.get("model"),
+                model=route_codex_model or codex_raw.get("model") or codex_cli_raw.get("model"),
                 reasoning_effort=(
-                    codex_raw.get("reasoning_effort")
+                    route_codex_effort
+                    or codex_raw.get("reasoning_effort")
                     or codex_cli_raw.get("reasoning_effort")
                 ),
                 approval_policy=codex_raw.get("approval_policy", "never"),
                 exec_sandbox=str(codex_raw.get("exec_sandbox") or "workspace-write"),
                 stall_timeout_ms=_as_int(codex_raw.get("stall_timeout_ms"), 300_000, minimum=0),
-                runner=_normalize_runner(str(codex_raw.get("runner") or "codex_exec")),
+                runner=_normalize_runner(str(route_runner or codex_raw.get("runner") or "codex_exec")),
+            ),
+            claude=HarnessClaudeSettings(
+                bin_path=str(claude_raw.get("bin_path") or os.getenv("CLAUDE_BIN") or "claude"),
+                model=route_claude_model or claude_raw.get("model") or claude_cli_raw.get("model"),
+                reasoning_effort=(
+                    route_claude_effort
+                    or claude_raw.get("reasoning_effort")
+                    or claude_cli_raw.get("reasoning_effort")
+                ),
+            ),
+            custom_command=HarnessCustomCommandSettings(
+                command=custom_command_raw.get("command"),
+                args=_as_str_list(custom_command_raw.get("args"), []),
             ),
         )
 

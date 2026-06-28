@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agents import function_tool
+from ...tools.core import tool
 from sqlalchemy import select
 
 from .common import (
@@ -17,7 +17,7 @@ from .common import (
 def build_diagram_tools() -> list:
     """構成図生成ツール群を生成して返す。"""
 
-    @function_tool
+    @tool
     def render_project_diagram(
         project: str = "",
         project_id: str = "",

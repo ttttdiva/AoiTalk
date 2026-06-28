@@ -8,7 +8,7 @@ import requests
 
 from ..external_llm_permission import check_permission_sync
 
-from ..core import tool as function_tool
+from ..core import tool
 
 XAI_API_BASE = os.getenv('XAI_API_BASE', 'https://api.x.ai/v1')
 XAI_DEFAULT_MODEL = os.getenv('XAI_GROK_MODEL', 'grok-4-0709')
@@ -123,7 +123,7 @@ def _build_tool_config(
     return tool_config
 
 
-@function_tool
+@tool
 def grok_x_search(
     query: str,
     max_results: int = 8,

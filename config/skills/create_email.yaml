@@ -9,7 +9,7 @@ prompt_template: |
   ## 手順
 
   ### 1. テンプレート一覧の取得
-  filesystem_assistant で workspace_root の knowledge/email-templates/ 配下の全 .md ファイルを読み込み、一覧を把握する。
+  direct filesystem tools で workspace_root の knowledge/email-templates/ 配下の全 .md ファイルを読み込み、一覧を把握する。
   （README.md はテンプレートではないので除外する）
 
   ### 2. テンプレート選択
@@ -59,7 +59,10 @@ aliases:
   - メール
   - email
 bound_tools:
-  - filesystem_assistant
+  - find_workspace_items
+  - inspect_workspace_tree
+  - read_workspace_file
+  - view_file
 examples:
   - "/create_email 来週火曜に打ち合わせを設定したい"
   - "/create_email 移行資料をBoxにアップしたので連絡メール"

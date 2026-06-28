@@ -262,7 +262,15 @@ class ResponseHandler:
             if hasattr(self.llm_client, 'recognizer') and self.llm_client.recognizer:
                 self.llm_client.recognizer.add_assistant_output(response)
 
-            asyncio.create_task(self._process_dreaming_memory(text, response))
+            dreaming_context = self._capture_dreaming_memory_context()
+            asyncio.create_task(
+                self._process_dreaming_memory(
+                    text,
+                    response,
+                    user_id=dreaming_context["user_id"],
+                    session_id=dreaming_context["session_id"],
+                )
+            )
             self._schedule_deferred_project_fact_reflection(text, response)
 
             return response
@@ -281,30 +289,26 @@ class ResponseHandler:
         user_input: str,
         assistant_response: str,
     ) -> None:
-        """Schedule incidental project fact reflection after the main response."""
-        try:
-            from ..llm.tool_policy import looks_like_deferred_project_fact_request
+        """No-op: project facts are updated in-turn through root direct tools."""
+        return
 
-            if not looks_like_deferred_project_fact_request(user_input):
-                return
+    def _capture_dreaming_memory_context(self) -> Dict[str, Optional[str]]:
+        """Capture mutable LLM session context before background tasks run."""
+        user_id = "default_user"
+        getter = getattr(self.llm_client, "_get_session_user_id", None)
+        if callable(getter):
+            try:
+                resolved_user_id = getter()
+                if resolved_user_id:
+                    user_id = str(resolved_user_id)
+            except Exception as e:
+                print(f"[DreamingMemory] user_id取得エラー（default_userで継続）: {e}")
 
-            config = getattr(self.llm_client, "config", None)
-            if config is None:
-                print("[ProjectFactReflection] config がないため反映をスキップしました")
-                return
-
-            project_context = self._capture_project_context_for_background()
-            task = asyncio.create_task(
-                self._process_deferred_project_fact_reflection(
-                    user_input,
-                    assistant_response,
-                    config,
-                    project_context,
-                )
-            )
-            task.add_done_callback(self._log_background_task_error)
-        except Exception as e:
-            print(f"[ProjectFactReflection] スケジュールエラー（無視）: {e}")
+        session_id = getattr(self.llm_client, "current_session_id", None)
+        return {
+            "user_id": user_id,
+            "session_id": str(session_id) if session_id else None,
+        }
 
     def _capture_project_context_for_background(self) -> Optional[Dict[str, Any]]:
         resolver = getattr(self.llm_client, "_resolve_project_context_sync", None)
@@ -337,35 +341,7 @@ class ResponseHandler:
         config: Any,
         project_context: Optional[Dict[str, Any]],
     ) -> None:
-        try:
-            from ..llm.specialist_delegate import ProjectManagementDelegationRunner
-
-            request = "\n".join(
-                [
-                    "Deferred project fact reflection after the user-facing response.",
-                    "The primary requested action has already been handled; do not create, update, delete, or schedule tasks.",
-                    "Do not sync WBS rows, issue tables, or record tables in this deferred pass.",
-                    "Reflect only durable project information introduced by the original user message.",
-                    "First call list_project_information for the target project unless the relevant existing facts are already present in this request context.",
-                    "Compare new information with existing facts by meaning. If it duplicates, corrects, supersedes, or refines an existing fact, update that fact with upsert_project_fact using fact_id when available.",
-                    "Create a new fact only when it is genuinely new. Use source_type=\"conversation\" and preserve uncertainty with confidence below 1.0 when the user's wording is uncertain.",
-                    "",
-                    "Original user message:",
-                    user_input,
-                    "",
-                    "Assistant response already sent:",
-                    assistant_response,
-                ]
-            )
-            result = await ProjectManagementDelegationRunner(config).run_async(
-                request,
-                project_context=project_context,
-            )
-            summary = str(result or "").strip().splitlines()
-            if summary:
-                print(f"[ProjectFactReflection] 完了: {summary[0][:200]}")
-        except Exception as e:
-            print(f"[ProjectFactReflection] 反映エラー（無視）: {e}")
+        return
     
     async def _speak_response_background(self, task_id: str, response: str):
         """Handle TTS and playback in background"""
@@ -500,7 +476,7 @@ class ResponseHandler:
                     )
                 
                 # Wait for synthesis with timeout and cancellation checking
-                synthesis_timeout = 30.0  # 30 second timeout for TTS
+                synthesis_timeout = self._get_synthesis_timeout()
                 start_time = time.time()
                 
                 while not synthesis_task.done():
@@ -532,7 +508,27 @@ class ResponseHandler:
         else:
             if not audio_data:
                 print(f"[{task_id}] 音声合成結果が空です - TTSエンジンに問題がある可能性があります")
-    
+
+    def _get_synthesis_timeout(self) -> float:
+        default_timeout = 30.0
+        config = getattr(self.voice_chat_mode, "config", None)
+        tts_manager = getattr(self.voice_chat_mode, "tts_manager", None)
+        engine_name = getattr(tts_manager, "current_engine", None)
+
+        if config is not None and hasattr(config, "get"):
+            default_timeout = float(config.get("tts.synthesis_timeout", default_timeout) or default_timeout)
+            if engine_name:
+                engine_settings = config.get(f"tts_settings.{engine_name}", {}) or {}
+                if isinstance(engine_settings, dict):
+                    engine_timeout = (
+                        engine_settings.get("synthesis_timeout")
+                        or engine_settings.get("timeout")
+                    )
+                    if engine_timeout:
+                        return float(engine_timeout)
+
+        return default_timeout
+
     async def _play_audio(self, task_id: str, audio_data: bytes, current_task: Optional[asyncio.Task]):
         """Play synthesized audio"""
         # Use playback resource lock to ensure only one audio plays at a time
@@ -676,12 +672,21 @@ class ResponseHandler:
         
         print("[タスク管理] 全タスクのキャンセル完了")
     
-    async def _process_dreaming_memory(self, user_input: str, assistant_response: str):
+    async def _process_dreaming_memory(
+        self,
+        user_input: str,
+        assistant_response: str,
+        *,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ):
         """会話からDreamingメモリを自動抽出して保存する（バックグラウンドタスク）。
 
         Args:
             user_input: ユーザーの入力テキスト
             assistant_response: アシスタントの応答テキスト
+            user_id: 応答生成時点で確定したユーザーID
+            session_id: 応答生成時点で確定した会話セッションID
         """
         try:
             from ..memory.dreaming_extractor import DreamingMemoryExtractor
@@ -690,9 +695,8 @@ class ResponseHandler:
                 bulk_create_memories,
             )
 
-            user_id = "default_user"
-            if hasattr(self.llm_client, '_get_session_user_id'):
-                user_id = self.llm_client._get_session_user_id()
+            if not user_id:
+                user_id = self._capture_dreaming_memory_context()["user_id"]
 
             # 既存メモリを取得（重複排除用）
             existing = await list_memories(user_id, active_only=True)
@@ -705,7 +709,8 @@ class ResponseHandler:
             )
 
             if new_memories:
-                session_id = getattr(self.llm_client, 'current_session_id', None)
+                if session_id is None:
+                    session_id = self._capture_dreaming_memory_context()["session_id"]
                 metadata = {"session_id": session_id} if session_id else {}
                 created = await bulk_create_memories(user_id, new_memories, metadata=metadata)
                 if created:

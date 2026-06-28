@@ -142,6 +142,10 @@ interface TaskDetailModalProps {
   occurrenceContext?: RecurringOccurrenceContext | null;
 }
 
+type FetchTaskOptions = {
+  showLoading?: boolean;
+};
+
 export function TaskDetailModal({
   taskId,
   draftTask,
@@ -563,9 +567,10 @@ export function TaskDetailModal({
   );
 
   // タスク取得
-  const fetchTask = useCallback(async () => {
+  const fetchTask = useCallback(async (options: FetchTaskOptions = {}) => {
     if (!effectiveTaskId) return;
-    setLoading(true);
+    const shouldShowLoading = options.showLoading ?? true;
+    if (shouldShowLoading) setLoading(true);
     try {
       const t = await taskApi.getTask(effectiveTaskId);
       let occurrenceForView = activeOccurrenceContext;
@@ -598,7 +603,7 @@ export function TaskDetailModal({
     } catch (err) {
       console.error("タスク取得失敗:", err);
     } finally {
-      setLoading(false);
+      if (shouldShowLoading) setLoading(false);
     }
   }, [activeOccurrenceContext, effectiveTaskId, occurrenceStatusOverride]);
 
@@ -676,7 +681,7 @@ export function TaskDetailModal({
       setRecEndDate(null);
       setRecSkipWeekend(false);
       setRecSkipHoliday(false);
-      fetchTask();
+      fetchTask({ showLoading: true });
       fetchRecurrence();
     }
   }, [open, effectiveTaskId, fetchTask, fetchRecurrence]);
@@ -2485,10 +2490,37 @@ export function TaskDetailModal({
                       };
                     });
                     setSubtaskInputOpenSignal((value) => value + 1);
+                    void fetchTask({ showLoading: false });
                     onTaskUpdated();
                   }}
+                  onSubtaskUpdated={(updatedSubtask) => {
+                    setTask((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            subtasks: (prev.subtasks || []).map((subtask) =>
+                              subtask.id === updatedSubtask.id
+                                ? { ...subtask, ...updatedSubtask }
+                                : subtask,
+                            ),
+                          }
+                        : prev,
+                    );
+                  }}
+                  onSubtaskDeleted={(subtaskId) => {
+                    setTask((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            subtasks: (prev.subtasks || []).filter(
+                              (subtask) => subtask.id !== subtaskId,
+                            ),
+                          }
+                        : prev,
+                    );
+                  }}
                   onUpdated={() => {
-                    fetchTask();
+                    void fetchTask({ showLoading: false });
                     onTaskUpdated();
                   }}
                 />

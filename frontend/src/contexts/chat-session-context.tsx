@@ -10,6 +10,8 @@ import {
 } from "react";
 import { chatApi, type ConversationSession } from "@/lib/chat-api";
 
+export const CHAT_SESSION_TITLE_UPDATED_EVENT = "aoitalk-chat-session-title-updated";
+
 type ChatSessionContextValue = {
   sessions: ConversationSession[];
   sessionsError: string | null;
@@ -77,6 +79,13 @@ export function ChatSessionProvider({ children }: { children: ReactNode }) {
     setSessions((prev) =>
       prev.map((s) => (s.id === id ? { ...s, title } : s))
     );
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(
+        new CustomEvent(CHAT_SESSION_TITLE_UPDATED_EVENT, {
+          detail: { sessionId: id, title },
+        }),
+      );
+    }
   }, []);
 
   const bumpSession = useCallback((id: string) => {

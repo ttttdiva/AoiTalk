@@ -6,7 +6,7 @@ import spotipy
 import logging
 import time
 import asyncio
-from ...core import tool as function_tool
+from ...core import tool
 
 logger = logging.getLogger(__name__)
 

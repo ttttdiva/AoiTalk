@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from agents import Agent, ModelSettings, function_tool
+from ..llm.native_runtime import AgentDefinition as Agent, NativeModelSettings as ModelSettings
 
-from ..tools.adapters import OpenAIAgentAdapter
+from ..tools.core import ensure_tool_definitions, tool
 from ..tools.entertainment.spotify import (
     add_playlist_to_queue,
     add_queue_to_playlist,
@@ -42,7 +42,7 @@ class SpotifyAgent(BaseAgent):
 
     def _create_agent(self) -> Agent:
         tools = [
-            *OpenAIAgentAdapter.convert_all(
+            *ensure_tool_definitions(
                 [
                     setup_spotify_auth,
                     set_spotify_auth_code,
@@ -52,25 +52,25 @@ class SpotifyAgent(BaseAgent):
                     get_spotify_listening_patterns,
                 ]
             ),
-            function_tool(search_spotify_music),
-            function_tool(play_spotify_track),
-            function_tool(play_song_now),
-            function_tool(queue_song),
-            function_tool(pause_spotify),
-            function_tool(skip_spotify_track),
-            function_tool(previous_track),
-            function_tool(get_spotify_status),
-            function_tool(show_queue),
-            function_tool(clear_spotify_queue),
-            function_tool(remove_from_queue),
-            function_tool(get_spotify_user_playlists),
-            function_tool(create_playlist),
-            function_tool(create_playlist_from_queue),
-            function_tool(add_tracks_to_playlist),
-            function_tool(add_queue_to_playlist),
-            function_tool(add_playlist_to_queue),
-            function_tool(remove_tracks_from_playlist),
-            function_tool(play_playlist),
+            tool(search_spotify_music),
+            tool(play_spotify_track),
+            tool(play_song_now),
+            tool(queue_song),
+            tool(pause_spotify),
+            tool(skip_spotify_track),
+            tool(previous_track),
+            tool(get_spotify_status),
+            tool(show_queue),
+            tool(clear_spotify_queue),
+            tool(remove_from_queue),
+            tool(get_spotify_user_playlists),
+            tool(create_playlist),
+            tool(create_playlist_from_queue),
+            tool(add_tracks_to_playlist),
+            tool(add_queue_to_playlist),
+            tool(add_playlist_to_queue),
+            tool(remove_tracks_from_playlist),
+            tool(play_playlist),
         ]
 
         instructions = """

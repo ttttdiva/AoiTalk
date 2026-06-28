@@ -7,6 +7,7 @@ export const NO_STORE_HEADERS = {
 };
 
 export type InternalPythonUser = {
+  id?: string | null;
   username?: string | null;
 };
 
@@ -33,6 +34,9 @@ export function buildInternalPythonHeaders(
 ): Headers {
   const nextHeaders = new Headers(headers);
   nextHeaders.set("x-internal-auth", getInternalApiKey());
+  if (user.id) {
+    nextHeaders.set("x-forwarded-user-id", user.id);
+  }
   if (user.username) {
     nextHeaders.set("x-forwarded-user", user.username);
   }

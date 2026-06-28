@@ -842,6 +842,8 @@ class VoiceHandler:
                 engine = await self.tts_manager.create_aivisspeech_engine(engine_path)
             elif engine_name == 'irodori_tts':
                 engine = await self.tts_manager.create_irodori_tts_engine()
+            elif engine_name == 'miotts':
+                engine = await self.tts_manager.create_miotts_engine()
             elif engine_name == 'voiceroid':
                 character_config = self.config.get_character_config(self.config.get('default_character'))
                 engine = await self.tts_manager.create_voiceroid_engine(character_config)

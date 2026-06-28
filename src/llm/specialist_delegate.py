@@ -8,51 +8,167 @@ import contextvars
 import json
 import logging
 import os
+import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional, Sequence, Type
 
-from agents import Runner
 from openai import OpenAI
 
 from ..config import Config
 from ..services.project_context import (
     format_project_context_for_prompt,
+    get_runtime_project_context,
     reset_runtime_project_context,
     set_runtime_project_context,
 )
-from ..services.model_sharing_service import (
+from ..services.advanced_reasoning_service import (
     build_redacted_prompt,
+)
+from ..services.agent_team_service import (
+    agent_team_confirm_prompt,
+    agent_team_member_for,
+    agent_team_member_mode,
+    agent_team_member_requires_external_approval,
+    agent_team_notify,
+    apply_agent_team_member_mode,
     config_get,
-    model_sharing_confirm_prompt,
-    model_sharing_enabled,
-    model_sharing_model,
-    model_sharing_notify,
-    model_sharing_provider,
 )
 from ..tools.adapters import CLIAdapter, OpenAIAPIAdapter
-from ..tools.core import ToolDefinition, ToolParam
+from ..tools.core import ToolDefinition, ToolParam, ensure_tool_definitions
 from ..tools.external import MCPPlugin, set_mcp_plugin
 from ..tools.external_llm_permission import request_external_model_prompt
 from ..tools.registry import ToolRegistry
-from .agent_runtime import OpenAIToolCallLoopResult, run_openai_tool_call_loop
+from .agent_runtime import (
+    OpenAIToolCallLoopResult,
+    OpenAIToolCallRecord,
+    run_openai_tool_call_loop,
+)
+from .context_budget import (
+    clip_text_preserve_tail,
+    resolve_context_budget,
+)
 from .json_tool_loop import (
     JsonToolCallRecord,
     JsonToolLoopResult,
     build_json_tool_loop_system_prompt,
     run_json_tool_loop,
 )
-from .tool_policy import project_management_required_mutation_tools
+from .generation_policy import PermissionPolicy, get_current_generation_policy
+from .native_runtime import (
+    AgentDefinition as NativeAgentDefinition,
+    NativeModelSettings,
+    Reasoning,
+    run_native_agent_once,
+)
+from .provider_mode_adapters import ollama_reasoning_effort_for_mode
+from .unified_turn_runtime import run_cli_tool_call_loop
 
 logger = logging.getLogger(__name__)
 
-CLI_PROVIDER_NAMES = {"gemini-cli", "claude-cli", "codex-cli"}
-AGENTS_SDK_MODEL_PREFIXES = ("openai/", "litellm/", "gpt-", "o1", "o3", "o4")
+_runtime_specialist_provider: contextvars.ContextVar[Optional[str]] = (
+    contextvars.ContextVar("runtime_specialist_provider", default=None)
+)
+
+
+def set_runtime_specialist_provider(provider: Optional[str]) -> contextvars.Token:
+    value = str(provider or "").strip().lower() or None
+    return _runtime_specialist_provider.set(value)
+
+
+def reset_runtime_specialist_provider(token: contextvars.Token) -> None:
+    _runtime_specialist_provider.reset(token)
+
+CLI_PROVIDER_NAMES = {"antigravity-cli", "claude-cli", "codex-cli"}
+NATIVE_OPENAI_MODEL_PREFIXES = ("openai/", "litellm/", "gpt-", "o1", "o3", "o4")
 OLLAMA_PROVIDER_NAME = "ollama"
 OPENAI_COMPATIBLE_PROVIDER_NAMES = {
     "openai_compatible_local",
     "sglang",
     "openrouter",
 }
+CONSTRAINED_OPENAI_COMPATIBLE_CONTEXT_TOKENS = 16384
+
+TEAM_ROLE_INSTRUCTIONS = {
+    "architect": """
+You are the Agent Team architect.
+
+Analyze the existing context and produce a concrete implementation blueprint.
+Make decisions, assign ownership boundaries, identify affected files/modules,
+and call out risks that implementers and reviewers must handle.
+Do not write marketing copy. Be specific and operational.
+""".strip(),
+    "explorer": """
+You are an Agent Team explorer.
+
+Investigate the requested topic with the available read-only tools. Trace entry
+points, data flow, configuration, tests, and nearby conventions. Return concise
+findings with file references and the minimum context needed for implementation.
+Avoid duplicating other explorers' work when the request gives you a narrower
+question.
+""".strip(),
+    "implementer": """
+You are an Agent Team implementer.
+
+Turn the assigned implementation scope into concrete steps and code-level
+guidance. Respect file ownership from the coordinator, avoid unrelated
+refactors, and explicitly note conflicts or missing prerequisites. When no
+write-capable runner is attached, return an implementation patch plan with exact
+files and functions rather than pretending to edit files.
+""".strip(),
+    "reviewer": """
+You are an Agent Team reviewer.
+
+Review the assigned scope for correctness, regressions, missing tests, security
+or privacy risks, and maintainability. Report only issues that are actionable and
+grounded in evidence. Start with findings, ordered by severity, with file
+references whenever available.
+""".strip(),
+}
+
+_COMPACT_TOOL_DESCRIPTIONS = {
+    "find_workspace_items": "Find files or folders by name in the workspace.",
+    "inspect_workspace_tree": "List a bounded workspace folder tree.",
+    "read_workspace_file": "Read a workspace file preview.",
+    "get_workspace_file_info": "Get workspace file metadata.",
+    "list_workspace_files": "List direct workspace folder contents.",
+    "get_project_context": "Get the active project context.",
+    "list_project_information": "List saved project facts, documents, and tables.",
+    "list_record_tables": "List project record tables.",
+    "list_tasks": "List project tasks.",
+    "create_task": "Create a project task.",
+    "update_task": "Update a project task.",
+    "delete_task": "Delete a project task.",
+    "schedule_task": "Schedule a project task.",
+    "get_project_progress": "Summarize project progress from goals, internal WBS, and tasks.",
+    "get_upcoming_wbs_tasks": "List upcoming internal WBS.dbtable rows.",
+    "get_project_issues": "List project issues.",
+}
+
+
+def _is_context_overflow_error(exc: Exception) -> bool:
+    body = getattr(exc, "body", None)
+    text = f"{exc} {body}".casefold()
+    return any(
+        term in text
+        for term in (
+            "context size",
+            "context length",
+            "context window",
+            "maximum context",
+            "max context",
+            "n_ctx",
+            "too many tokens",
+            "prompt is too long",
+            "requested tokens",
+            "exceeds context",
+            "exceeded context",
+            "exceeds the context",
+            "exceeded the context",
+            "exceeds maximum context",
+            "コンテキスト",
+        )
+    )
 
 
 def _config_get(config: Any, key: str, default: Any = None) -> Any:
@@ -61,6 +177,55 @@ def _config_get(config: Any, key: str, default: Any = None) -> Any:
     if hasattr(config, "get"):
         return config.get(key, default)
     return default
+
+
+def _compact_tool_definition(tool_def: ToolDefinition) -> ToolDefinition:
+    return ToolDefinition(
+        name=tool_def.name,
+        description=_COMPACT_TOOL_DESCRIPTIONS.get(tool_def.name, tool_def.name),
+        function=tool_def.function,
+        parameters=[
+            ToolParam(
+                name=param.name,
+                type=param.type,
+                description="",
+                required=param.required,
+                default=param.default,
+                enum=param.enum,
+            )
+            for param in tool_def.parameters
+        ],
+        is_async=tool_def.is_async,
+    )
+
+
+def _clone_registry_with_tools(
+    registry: ToolRegistry,
+    tool_names: Sequence[str],
+    *,
+    compact: bool = False,
+) -> ToolRegistry:
+    selected = ToolRegistry()
+    seen: set[str] = set()
+    for name in tool_names:
+        if name in seen:
+            continue
+        seen.add(name)
+        tool_def = registry.get(name)
+        if tool_def is None:
+            continue
+        selected.register(_compact_tool_definition(tool_def) if compact else tool_def)
+    return selected
+
+
+def _is_constrained_openai_compatible_context(
+    provider: str,
+    context_window_tokens: int,
+) -> bool:
+    return (
+        provider in {"openai_compatible_local", "sglang"}
+        and context_window_tokens <= CONSTRAINED_OPENAI_COMPATIBLE_CONTEXT_TOKENS
+    )
 
 
 class SpecialistDelegationRunner:
@@ -81,9 +246,18 @@ class SpecialistDelegationRunner:
         self.display_name = display_name
         self.agent_class = agent_class
         self.mcp_server_names = tuple(mcp_server_names or ())
+        self._agent_team_member_config = agent_team_member_for(config, domain_key)
 
         self.provider = self._select_provider()
         self.model = model or self._select_model()
+        self._mode_preset = ""
+        if self._uses_agent_team_member_target():
+            self._mode_preset = apply_agent_team_member_mode(
+                self.config,
+                member_key=self.domain_key,
+                provider=self.provider,
+                model=self.model or "",
+            )
         self.cli_backend = (
             self._create_cli_backend() if self.provider in CLI_PROVIDER_NAMES else None
         )
@@ -102,21 +276,15 @@ class SpecialistDelegationRunner:
 
         return agents_config, domain_config
 
-    def _uses_model_sharing_target(self) -> bool:
-        if not model_sharing_enabled(self.config):
-            return False
-        if self.domain_key == "search":
-            from ..services.quick_search_service import (
-                SEARCH_PROVIDER_LOCAL,
-                get_search_provider,
-            )
-
-            return get_search_provider(self.config) != SEARCH_PROVIDER_LOCAL
-        return False
+    def _uses_agent_team_member_target(self) -> bool:
+        return self._agent_team_member_config is not None
 
     def _main_provider(self) -> str:
         provider = str(_config_get(self.config, "llm_provider", "openai")).strip().lower()
         return provider or "openai"
+
+    def _active_provider(self) -> str:
+        return _runtime_specialist_provider.get() or self.provider
 
     def _main_model_for_provider(self, provider: str) -> Optional[str]:
         selected = str(_config_get(self.config, "llm_model", "") or "").strip()
@@ -135,7 +303,7 @@ class SpecialistDelegationRunner:
             "ollama": ("ollama.model", "ollama_model"),
             "codex-cli": ("codex_cli.model",),
             "claude-cli": ("claude_cli.model",),
-            "gemini-cli": ("gemini_cli.model",),
+            "antigravity-cli": ("antigravity_cli.model",),
         }
         for key in provider_model_keys.get(provider, ()):
             value = str(_config_get(self.config, key, "") or "").strip()
@@ -144,14 +312,14 @@ class SpecialistDelegationRunner:
         return None
 
     def _select_provider(self) -> str:
-        if self._uses_model_sharing_target():
-            return model_sharing_provider(self.config)
+        if self._agent_team_member_config:
+            return self._agent_team_member_config["provider"]
         return self._main_provider()
 
-    def _select_agents_sdk_model(self) -> str:
+    def _select_native_openai_model(self) -> str:
         configured_model = self.model or self._main_model_for_provider(self.provider)
         if configured_model and str(configured_model).strip().startswith(
-            AGENTS_SDK_MODEL_PREFIXES
+            NATIVE_OPENAI_MODEL_PREFIXES
         ):
             return str(configured_model).strip()
 
@@ -159,19 +327,19 @@ class SpecialistDelegationRunner:
             return "gpt-4o-mini"
 
         llm_model = str(_config_get(self.config, "llm_model", "")).strip()
-        if llm_model.startswith(AGENTS_SDK_MODEL_PREFIXES):
+        if llm_model.startswith(NATIVE_OPENAI_MODEL_PREFIXES):
             return llm_model
 
         logger.warning(
-            "[%sDelegationRunner] No Agents SDK compatible model configured; "
+            "[%sDelegationRunner] No native OpenAI-compatible model configured; "
             "falling back to gpt-4o-mini",
             self.display_name,
         )
         return "gpt-4o-mini"
 
     def _select_model(self) -> Optional[str]:
-        if self._uses_model_sharing_target():
-            return model_sharing_model(self.config)
+        if self._agent_team_member_config:
+            return self._agent_team_member_config["model"]
 
         configured_model = self._main_model_for_provider(self.provider)
 
@@ -207,25 +375,70 @@ class SpecialistDelegationRunner:
         if self.provider == "gemini":
             return configured_model or "gemini-3-flash-preview"
 
-        return self._select_agents_sdk_model()
+        return self._select_native_openai_model()
 
     def _create_cli_backend(self):
-        if self.provider == "gemini-cli":
-            from .cli_backends.gemini import GeminiCLIBackend
+        if self.provider == "antigravity-cli":
+            from .cli_backends.antigravity import AntigravityCLIBackend
 
-            return GeminiCLIBackend()
+            return AntigravityCLIBackend(model=self.model)
 
         if self.provider == "claude-cli":
             from .cli_backends.claude import ClaudeCLIBackend
 
-            return ClaudeCLIBackend(model=self.model)
+            return ClaudeCLIBackend(
+                model=self.model,
+                reasoning_effort=(
+                    agent_team_member_mode(self.config, self.domain_key)
+                    if self._uses_agent_team_member_target()
+                    else _config_get(self.config, "claude_cli.reasoning_effort")
+                ),
+            )
 
         if self.provider == "codex-cli":
             from .cli_backends.codex import CodexCLIBackend
 
-            return CodexCLIBackend(model=self.model)
+            return CodexCLIBackend(
+                model=self.model,
+                reasoning_effort=(
+                    agent_team_member_mode(self.config, self.domain_key)
+                    if self._uses_agent_team_member_target()
+                    else _config_get(self.config, "codex_cli.reasoning_effort")
+                ),
+            )
 
         raise ValueError(f"Unsupported specialist CLI provider: {self.provider}")
+
+    def _mode_extra_body(self) -> dict[str, Any]:
+        if self.provider not in {"openai_compatible_local", "sglang"}:
+            return {}
+        mode = str(self._mode_preset or "").strip().lower()
+        if mode not in {"fast", "thinking"}:
+            return {}
+        return {
+            "chat_template_kwargs": {
+                "enable_thinking": mode == "thinking",
+            }
+        }
+
+    def _with_native_mode_preset(self, agent: Any) -> Any:
+        mode = str(self._mode_preset or "").strip()
+        if self.provider != "openai" or not mode:
+            return agent
+
+        from ..services.llm_model_catalog import reasoning_effort_options_for_model
+
+        if mode not in reasoning_effort_options_for_model("openai", getattr(agent, "model", "")):
+            return agent
+
+        current_settings = getattr(agent, "model_settings", None) or NativeModelSettings()
+        return replace(
+            agent,
+            model_settings=replace(
+                current_settings,
+                reasoning=Reasoning(effort=mode),
+            ),
+        )
 
     def _configure_model_environment(self) -> None:
         openai_api_key = _config_get(self.config, "openai_api_key")
@@ -274,7 +487,7 @@ class SpecialistDelegationRunner:
     def _get_agent_definition(self):
         if self._agent_definition is None:
             self._agent_definition = self._create_agent_instance(
-                model=self.model or self._select_agents_sdk_model()
+                model=self.model or self._select_native_openai_model()
             ).agent
         return self._agent_definition
 
@@ -296,38 +509,12 @@ class SpecialistDelegationRunner:
         return registry
 
     def _convert_agent_tool(self, agent_tool: Any) -> ToolDefinition:
-        schema = getattr(agent_tool, "params_json_schema", {}) or {}
-        properties = schema.get("properties", {}) or {}
-        required = set(schema.get("required", []) or [])
+        if isinstance(agent_tool, ToolDefinition):
+            return agent_tool
 
-        params = []
-        for name, spec in properties.items():
-            param_type = spec.get("type", "string")
-            if isinstance(param_type, list):
-                non_null_types = [value for value in param_type if value != "null"]
-                param_type = non_null_types[0] if non_null_types else "string"
-
-            params.append(
-                ToolParam(
-                    name=name,
-                    type=param_type,
-                    description=spec.get("description", ""),
-                    required=name in required,
-                    default=spec.get("default"),
-                    enum=spec.get("enum"),
-                )
-            )
-
-        def _invoke(**kwargs):
-            payload = json.dumps(kwargs, ensure_ascii=False)
-            return agent_tool.on_invoke_tool(None, payload)
-
-        return ToolDefinition(
-            name=getattr(agent_tool, "name", "tool"),
-            description=getattr(agent_tool, "description", "")
-            or getattr(agent_tool, "name", "tool"),
-            function=_invoke,
-            parameters=params,
+        raise TypeError(
+            "Specialist agent tools must be native ToolDefinition instances; "
+            f"got {type(agent_tool)!r}"
         )
 
     def _build_cli_system_context(self) -> str:
@@ -347,10 +534,10 @@ class SpecialistDelegationRunner:
         parts.extend(
             [
                 "",
-                "You are running as a specialist sub-agent.",
-                "Use the available tools when they are needed to complete the request.",
-                "If a tool is needed, emit the exact [TOOL_CALL: tool_name(key=value)] format.",
-                "After tool results are provided, continue and answer naturally.",
+                "あなたは専門アシスタントツールとして実行されています。",
+                "依頼を完了するために必要な場合は、利用可能なツールを使ってください。",
+                "ツールが必要な場合は [TOOL_CALL: tool_name(key=value)] 形式で出力してください。",
+                "ツール結果が返された後は、その結果を根拠に自然に回答してください。",
             ]
         )
 
@@ -364,18 +551,18 @@ class SpecialistDelegationRunner:
     ) -> str:
         return "\n".join(
             [
-                "# Tool Execution Results",
-                f"Original specialist request: {original_input}",
+                "# ツール実行結果",
+                f"元の専門依頼: {original_input}",
                 "",
-                "Initial response:",
+                "直前の出力:",
                 initial_response,
                 "",
                 tool_results_text,
                 "",
-                "# Your Task",
-                "Use the tool results above to finish the user's request.",
-                "Do not emit another tool call unless it is still required.",
-                "Return the final user-facing answer.",
+                "# 最終回答",
+                "上記のツール結果に基づいて、ユーザーの依頼を完了してください。",
+                "追加ツールがまだ必要な場合だけ、次のツール呼び出しを出力してください。",
+                "最終的にユーザーへ返す回答だけを出力してください。",
             ]
         )
 
@@ -385,6 +572,9 @@ class SpecialistDelegationRunner:
 
         registry = self._build_tool_registry()
         system_context = self._build_cli_system_context()
+        required_tools = self._required_native_openai_tool_names(request)
+        if not required_tools:
+            required_tools = self._required_ollama_tool_names(request)
 
         success, cli_output = self.cli_backend.execute_prompt(
             prompt=request,
@@ -399,32 +589,39 @@ class SpecialistDelegationRunner:
             )
             return f"{self.display_name} delegation error: {cli_output}"
 
-        tool_calls = self.cli_backend.parse_tool_calls(cli_output)
-        if not tool_calls:
-            return cli_output
-
-        logger.info(
-            "[%sDelegationRunner] Executing %s CLI tool call(s)",
-            self.display_name,
-            len(tool_calls),
+        turn_result = run_cli_tool_call_loop(
+            original_input=request,
+            initial_output=cli_output,
+            registry=registry,
+            parse_tool_calls=self.cli_backend.parse_tool_calls,
+            execute_follow_up=lambda follow_up: self.cli_backend.execute_prompt(
+                follow_up,
+                cwd=Path.cwd(),
+            ),
+            build_follow_up_prompt=self._build_cli_follow_up_prompt,
+            log_prefix=f"{self.display_name}DelegationRunner",
+            config=self.config,
+            user_input=request,
         )
-        tool_results = CLIAdapter.execute_tool_calls(tool_calls, registry)
-        results_text = CLIAdapter.format_tool_results(tool_results)
-
-        follow_up = self._build_cli_follow_up_prompt(request, cli_output, results_text)
-        success2, final_output = self.cli_backend.execute_prompt(
-            follow_up,
-            cwd=Path.cwd(),
-        )
-        if not success2:
-            logger.error(
-                "[%sDelegationRunner] CLI follow-up failed: %s",
-                self.display_name,
-                final_output,
+        tool_call_records = [
+            OpenAIToolCallRecord(
+                tool=tool_result.call.tool,
+                arguments=dict(tool_result.call.arguments),
+                result=tool_result.model_output,
             )
-            return cli_output
+            for tool_result in turn_result.tool_results
+        ]
 
-        return final_output
+        if required_tools:
+            return self._validate_openai_tool_loop_result(
+                request,
+                OpenAIToolCallLoopResult(
+                    final_output=turn_result.final_output,
+                    tool_calls=tool_call_records,
+                ),
+                required_tools,
+            )
+        return turn_result.final_output
 
     def _run_via_ollama_json_tool_loop(self, request: str) -> str:
         registry = self._build_tool_registry()
@@ -463,8 +660,8 @@ class SpecialistDelegationRunner:
                         "",
                         "Decide whether a tool is needed.",
                         (
-                            "If the request asks to search, look up, verify, check current information, "
-                            "or uses Japanese terms such as 検索, 調べて, 確認, 最新, use a relevant search tool first."
+                            "If the request explicitly asks for web search or uses Japanese terms such "
+                            "as 調べて or 調査して, use a relevant search tool first."
                         ),
                         (
                             "When calling a tool with a `request` parameter, copy the user's request exactly "
@@ -476,13 +673,20 @@ class SpecialistDelegationRunner:
         ]
 
         def _create(messages_payload: list[dict[str, Any]]) -> str:
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages_payload,
-                temperature=0,
-                max_tokens=1024,
-                response_format={"type": "json_object"},
+            api_kwargs: dict[str, Any] = {
+                "model": model,
+                "messages": messages_payload,
+                "temperature": 0,
+                "max_tokens": 1024,
+                "response_format": {"type": "json_object"},
+            }
+            reasoning_effort = ollama_reasoning_effort_for_mode(
+                model,
+                self._mode_preset,
             )
+            if reasoning_effort:
+                api_kwargs["reasoning_effort"] = reasoning_effort
+            response = client.chat.completions.create(**api_kwargs)
             return response.choices[0].message.content or ""
 
         required_tools = self._required_ollama_tool_names(request)
@@ -547,6 +751,8 @@ class SpecialistDelegationRunner:
         try:
             return client.chat.completions.create(**api_kwargs)
         except Exception as exc:
+            if _is_context_overflow_error(exc):
+                raise
             retry_kwargs = dict(api_kwargs)
             removed = []
             for key in ("tools", "tool_choice", "response_format", "extra_body"):
@@ -569,20 +775,42 @@ class SpecialistDelegationRunner:
         instructions = str(getattr(agent_definition, "instructions", "")).strip()
         base_url, api_key = self._openai_compatible_connection()
         client = OpenAI(base_url=base_url, api_key=api_key)
+        context_budget = resolve_context_budget(
+            config=self.config,
+            provider_key=self.provider,
+            base_url=base_url,
+            model_name=self.model,
+            api_key=api_key,
+        )
+        required_tools = self._required_openai_compatible_tool_names(request)
+        registry = self._openai_compatible_registry_for_budget(
+            registry,
+            request=request,
+            context_window_tokens=context_budget.context_window_tokens,
+            required_tools=required_tools,
+        )
 
         messages = [
             {"role": "system", "content": instructions},
-            {"role": "user", "content": request},
+            {
+                "role": "user",
+                "content": clip_text_preserve_tail(
+                    request,
+                    context_budget.message_budget_chars,
+                ),
+            },
         ]
         api_kwargs: dict[str, Any] = {
             "model": self.model or "local-model",
             "messages": messages,
             "temperature": 0,
-            "max_tokens": 1024,
+            "max_tokens": context_budget.response_tokens,
         }
+        extra_body = self._mode_extra_body()
+        if extra_body:
+            api_kwargs["extra_body"] = extra_body
         if len(registry) > 0:
             api_kwargs["tools"] = OpenAIAPIAdapter.convert_all(registry.get_all())
-            required_tools = self._required_openai_compatible_tool_names(request)
             api_kwargs["tool_choice"] = "required" if required_tools else "auto"
         else:
             required_tools = set()
@@ -599,6 +827,9 @@ class SpecialistDelegationRunner:
                 log_prefix=f"{self.display_name}DelegationRunner",
                 max_rounds=5,
                 return_result=bool(required_tools),
+                max_tool_result_chars=context_budget.tool_result_chars,
+                config=self.config,
+                user_input=request,
             )
             if isinstance(result, OpenAIToolCallLoopResult):
                 return self._validate_openai_tool_loop_result(
@@ -618,8 +849,46 @@ class SpecialistDelegationRunner:
             )
         return getattr(message, "content", None) or ""
 
+    def _openai_compatible_registry_for_budget(
+        self,
+        registry: ToolRegistry,
+        *,
+        request: str,
+        context_window_tokens: int,
+        required_tools: set[str],
+    ) -> ToolRegistry:
+        if not _is_constrained_openai_compatible_context(
+            self.provider,
+            context_window_tokens,
+        ):
+            return registry
+
+        compact_names = self._compact_openai_compatible_tool_names(
+            request,
+            required_tools=required_tools,
+        )
+        if not compact_names:
+            return registry
+
+        compact_registry = _clone_registry_with_tools(
+            registry,
+            compact_names,
+            compact=True,
+        )
+        return compact_registry if len(compact_registry) > 0 else registry
+
+    def _compact_openai_compatible_tool_names(
+        self,
+        request: str,
+        *,
+        required_tools: set[str],
+    ) -> list[str]:
+        return sorted(required_tools)
+
     async def _approve_external_model_request(self, delegated_request: str) -> Optional[str]:
-        if not self._uses_model_sharing_target():
+        if not self._uses_agent_team_member_target():
+            return delegated_request
+        if not agent_team_member_requires_external_approval(self._agent_team_member_config):
             return delegated_request
 
         redacted_prompt, redaction_findings = build_redacted_prompt(
@@ -632,11 +901,24 @@ class SpecialistDelegationRunner:
             redaction_findings=redaction_findings,
             provider=self.provider,
             model=self.model or "",
-            description=f"Review the {self.display_name} assistant prompt before sending it to {self.provider}/{self.model}.",
-            confirm=model_sharing_confirm_prompt(self.config),
-            notify=model_sharing_notify(self.config),
+            description=(
+                f"Review the {self.display_name} assistant prompt before "
+                f"sending it to {self.provider}/{self.model}."
+            ),
+            confirm=self._external_route_prompt_confirmation_enabled(
+                agent_team_confirm_prompt(self.config)
+            ),
+            notify=agent_team_notify(self.config),
             request_kind=f"{self.domain_key}_assistant",
         )
+
+    def _external_route_prompt_confirmation_enabled(self, configured: bool) -> bool:
+        if (
+            get_current_generation_policy().permission_policy
+            == PermissionPolicy.AUTO_APPROVE
+        ):
+            return False
+        return bool(configured)
 
     def _required_ollama_tool_names(self, request: str) -> set[str]:
         return set()
@@ -673,6 +955,59 @@ class SpecialistDelegationRunner:
         required_tools: set[str],
     ) -> str:
         return result.final_output
+
+    def _required_native_openai_tool_names(self, request: str) -> set[str]:
+        return set()
+
+    def _tool_loop_result_from_native_run_result(
+        self,
+        result: Any,
+    ) -> OpenAIToolCallLoopResult:
+        records: list[OpenAIToolCallRecord] = []
+        pending_calls: list[tuple[str, dict[str, Any]]] = []
+
+        for item in getattr(result, "new_items", []) or []:
+            item_type = getattr(item, "type", "")
+            raw_item = getattr(item, "raw_item", None)
+            if item_type == "tool_call_item":
+                name = str(getattr(raw_item, "name", "") or "")
+                args_text = getattr(raw_item, "arguments", "{}") or "{}"
+                try:
+                    arguments = json.loads(args_text)
+                except Exception:
+                    arguments = {}
+                if name:
+                    pending_calls.append(
+                        (name, arguments if isinstance(arguments, dict) else {})
+                    )
+                continue
+
+            if item_type != "tool_call_output_item":
+                continue
+
+            output = getattr(item, "output", "")
+            if pending_calls:
+                name, arguments = pending_calls.pop(0)
+            else:
+                name = str(
+                    getattr(raw_item, "name", "")
+                    or getattr(raw_item, "tool_name", "")
+                    or ""
+                )
+                arguments = {}
+            if name:
+                records.append(
+                    OpenAIToolCallRecord(
+                        tool=name,
+                        arguments=arguments,
+                        result=str(output or ""),
+                    )
+                )
+
+        return OpenAIToolCallLoopResult(
+            final_output=str(getattr(result, "final_output", "") or ""),
+            tool_calls=records,
+        )
 
     async def _run_async(
         self,
@@ -726,9 +1061,31 @@ class SpecialistDelegationRunner:
                 )
 
             agent = self._create_agent_instance(
-                model=self.model or self._select_agents_sdk_model()
+                model=self.model or self._select_native_openai_model()
+            ).agent
+            agent = self._with_native_mode_preset(agent)
+            result = await run_native_agent_once(
+                agent,
+                delegated_request,
+                config=self.config,
             )
-            result = await Runner.run(agent.agent, delegated_request)
+            required_tools = self._required_native_openai_tool_names(delegated_request)
+            if required_tools:
+                return self._validate_openai_tool_loop_result(
+                    delegated_request,
+                    OpenAIToolCallLoopResult(
+                        final_output=result.final_output,
+                        tool_calls=[
+                            OpenAIToolCallRecord(
+                                tool=record.tool,
+                                arguments=record.arguments,
+                                result=record.result,
+                            )
+                            for record in result.tool_calls
+                        ],
+                    ),
+                    required_tools,
+                )
             return result.final_output
         except Exception as exc:
             logger.exception(
@@ -781,6 +1138,86 @@ class SpecialistDelegationRunner:
         return await self._run_async(request, project_context=project_context)
 
 
+class _AgentTeamRoleAgent:
+    def __init__(
+        self,
+        *,
+        model: str,
+        role_key: str,
+        label: str,
+        tools: Sequence[ToolDefinition],
+    ) -> None:
+        self.model = model
+        self.role_key = role_key
+        self.label = label
+        self.tools = list(tools)
+        self._agent: NativeAgentDefinition | None = None
+
+    @property
+    def agent(self) -> NativeAgentDefinition:
+        if self._agent is None:
+            instructions = TEAM_ROLE_INSTRUCTIONS.get(
+                self.role_key,
+                f"You are the Agent Team {self.label} teammate.",
+            )
+            self._agent = NativeAgentDefinition(
+                name=f"AgentTeam_{self.role_key}",
+                model=self.model,
+                instructions=instructions,
+                model_settings=NativeModelSettings(tool_choice="auto"),
+                tools=list(self.tools),
+            )
+        return self._agent
+
+
+def _agent_team_read_tools() -> list[ToolDefinition]:
+    from ..tools.file_explorer.file_explorer_tools import (
+        find_workspace_items,
+        get_workspace_file_info,
+        inspect_workspace_tree,
+        list_workspace_files,
+        read_workspace_file,
+    )
+    from ..tools.repo_map.tools import get_repo_map
+
+    return ensure_tool_definitions(
+        [
+            list_workspace_files,
+            find_workspace_items,
+            inspect_workspace_tree,
+            read_workspace_file,
+            get_workspace_file_info,
+            get_repo_map,
+        ]
+    )
+
+
+class AgentTeamRoleDelegationRunner(SpecialistDelegationRunner):
+    def __init__(
+        self,
+        config: Config,
+        *,
+        member_key: str,
+        display_name: str,
+        model: Optional[str] = None,
+    ):
+        super().__init__(
+            config,
+            domain_key=member_key,
+            display_name=display_name,
+            agent_class=object,
+            model=model,
+        )
+
+    def _create_agent_instance(self, model: Optional[str] = None):
+        return _AgentTeamRoleAgent(
+            model=model or self.model or self._select_native_openai_model(),
+            role_key=self.domain_key,
+            label=self.display_name,
+            tools=_agent_team_read_tools(),
+        )
+
+
 class SpotifyDelegationRunner(SpecialistDelegationRunner):
     def __init__(self, config: Config, model: Optional[str] = None):
         from ..agents.spotify_agent import SpotifyAgent
@@ -807,94 +1244,6 @@ class UtilityDelegationRunner(SpecialistDelegationRunner):
         )
 
 
-class SearchDelegationRunner(SpecialistDelegationRunner):
-    def __init__(self, config: Config, model: Optional[str] = None):
-        from ..agents.search_agent import SearchAgent
-
-        effective_model = model
-        if effective_model is None and self._config_uses_direct_local_search(config):
-            # Direct local search does not invoke a specialist LLM, but the base
-            # runner still stores a model field. Provide a placeholder to avoid
-            # misleading fallback warnings.
-            effective_model = "gpt-4o-mini"
-
-        super().__init__(
-            config,
-            domain_key="search",
-            display_name="Search",
-            agent_class=SearchAgent,
-            model=effective_model,
-        )
-
-    @staticmethod
-    def _config_uses_direct_local_search(config: Any) -> bool:
-        from ..agents.search_agent import _knowledge_search_enabled, _x_search_enabled
-        from ..services.quick_search_service import (
-            SEARCH_PROVIDER_LOCAL,
-            get_search_provider,
-        )
-        from .tool_policy import is_memory_search_enabled
-
-        return (
-            get_search_provider(config) == SEARCH_PROVIDER_LOCAL
-            and not _x_search_enabled(config)
-            and not _knowledge_search_enabled(config)
-            and not is_memory_search_enabled(config)
-        )
-
-    def _should_use_direct_local_search(self) -> bool:
-        return self._config_uses_direct_local_search(self.config)
-
-    def run(
-        self,
-        request: str,
-        project_context: Optional[dict[str, Any]] = None,
-    ) -> str:
-        if self._should_use_direct_local_search():
-            from ..tools.basic.web_search import web_search_with_config
-            from ..services.quick_search_service import normalize_local_search_query
-
-            return web_search_with_config(
-                normalize_local_search_query(request),
-                config=self.config,
-            )
-
-        return super().run(request, project_context=project_context)
-
-    async def run_async(
-        self,
-        request: str,
-        project_context: Optional[dict[str, Any]] = None,
-    ) -> str:
-        if self._should_use_direct_local_search():
-            from ..services.quick_search_service import normalize_local_search_query
-            from ..tools.basic.web_search import web_search_with_config
-
-            return await asyncio.to_thread(
-                web_search_with_config,
-                normalize_local_search_query(request),
-                config=self.config,
-            )
-
-        return await super().run_async(
-            request,
-            project_context=project_context,
-        )
-
-
-class FilesystemDelegationRunner(SpecialistDelegationRunner):
-    def __init__(self, config: Config, model: Optional[str] = None):
-        from ..agents.filesystem_agent import FilesystemAgent
-
-        super().__init__(
-            config,
-            domain_key="filesystem",
-            display_name="Filesystem",
-            agent_class=FilesystemAgent,
-            model=model,
-        )
-
-
 class MediaDelegationRunner(SpecialistDelegationRunner):
     def __init__(self, config: Config, model: Optional[str] = None):
         from ..agents.media_agent import MediaAgent
@@ -905,222 +1254,6 @@ class MediaDelegationRunner(SpecialistDelegationRunner):
             display_name="Media",
             agent_class=MediaAgent,
             model=model,
-        )
-
-
-class SkillsDelegationRunner(SpecialistDelegationRunner):
-    def __init__(self, config: Config, model: Optional[str] = None):
-        from ..agents.skills_agent import SkillsAgent
-
-        super().__init__(
-            config,
-            domain_key="skills",
-            display_name="Skills",
-            agent_class=SkillsAgent,
-            model=model,
-        )
-
-
-class ProjectManagementDelegationRunner(SpecialistDelegationRunner):
-    _DEFERRED_FACT_MARKER = "Deferred project fact reflection"
-
-    def __init__(self, config: Config, model: Optional[str] = None):
-        from ..agents.project_management_agent import ProjectManagementAgent
-
-        super().__init__(
-            config,
-            domain_key="project_management",
-            display_name="ProjectManagement",
-            agent_class=ProjectManagementAgent,
-            model=model,
-        )
-
-    def _required_ollama_tool_names(self, request: str) -> set[str]:
-        if self._is_deferred_project_fact_reflection(request):
-            return {"list_project_information", "upsert_project_fact"}
-        return project_management_required_mutation_tools(request)
-
-    def _require_all_required_tools(
-        self,
-        request: str,
-        required_tools: set[str],
-    ) -> bool:
-        return bool(required_tools) and self._is_deferred_project_fact_reflection(request)
-
-    def _is_deferred_project_fact_reflection(self, request: str) -> bool:
-        return self._DEFERRED_FACT_MARKER in str(request or "")
-
-    def _required_ollama_tool_reason(
-        self,
-        request: str,
-        required_tools: set[str],
-    ) -> str | None:
-        if not required_tools:
-            return None
-        return (
-            "The user requested a project/task mutation. The mutation must be "
-            "performed by the project management tool before the assistant can "
-            "claim it is complete."
-        )
-
-    def _validate_ollama_tool_loop_result(
-        self,
-        request: str,
-        result: JsonToolLoopResult,
-        required_tools: set[str],
-    ) -> str:
-        if not required_tools:
-            return result.final_output
-
-        if self._require_all_required_tools(request, required_tools):
-            successful_names = {
-                call.tool
-                for call in result.tool_calls
-                if call.tool in required_tools and call.successful
-            }
-            missing = sorted(required_tools - successful_names)
-            if missing:
-                return self._format_missing_required_tools(required_tools, result.tool_calls, missing)
-
-        successful_calls = [
-            call
-            for call in result.tool_calls
-            if call.tool in required_tools and call.successful
-        ]
-        if successful_calls:
-            return self._format_mutation_tool_result(successful_calls[-1])
-
-        tools = ", ".join(f"`{name}`" for name in sorted(required_tools))
-        attempted = ", ".join(
-            f"{call.tool}: {call.result[:200]}"
-            for call in result.tool_calls
-        ) or "none"
-        return "\n".join(
-            [
-                "ProjectManagement delegation error: requested mutation was not completed.",
-                f"Required tool confirmation was missing. Expected one of: {tools}.",
-                f"Executed tool calls: {attempted}",
-                "Do not tell the user the task or schedule was added.",
-            ]
-        )
-
-    def _validate_openai_tool_loop_result(
-        self,
-        request: str,
-        result: OpenAIToolCallLoopResult,
-        required_tools: set[str],
-    ) -> str:
-        if not required_tools:
-            return result.final_output
-
-        if self._require_all_required_tools(request, required_tools):
-            successful_names = {
-                call.tool
-                for call in result.tool_calls
-                if call.tool in required_tools and call.successful
-            }
-            missing = sorted(required_tools - successful_names)
-            if missing:
-                return self._format_missing_required_tools(required_tools, result.tool_calls, missing)
-
-        successful_calls = [
-            call
-            for call in result.tool_calls
-            if call.tool in required_tools and call.successful
-        ]
-        if successful_calls:
-            return self._format_mutation_tool_result(successful_calls[-1])
-
-        return self._format_missing_required_tools(
-            required_tools,
-            result.tool_calls,
-            sorted(required_tools),
-        )
-
-    def _format_missing_required_tools(
-        self,
-        required_tools: set[str],
-        tool_calls: Sequence[Any],
-        missing: Sequence[str],
-    ) -> str:
-        tools = ", ".join(f"`{name}`" for name in sorted(required_tools))
-        attempted = ", ".join(
-            f"{call.tool}: {str(call.result)[:200]}"
-            for call in tool_calls
-        ) or "none"
-        return "\n".join(
-            [
-                "ProjectManagement delegation error: requested mutation was not completed.",
-                f"Required tool confirmation was missing. Expected: {tools}.",
-                f"Missing required tools: {', '.join(missing)}.",
-                f"Executed tool calls: {attempted}",
-                "Do not tell the user the task, schedule, or project information was updated.",
-            ]
-        )
-
-    def _format_mutation_tool_result(self, call: Any) -> str:
-        try:
-            payload = json.loads(call.result)
-        except Exception:
-            payload = None
-
-        if call.tool == "upsert_project_fact":
-            fact = payload.get("fact") if isinstance(payload, dict) else None
-            if isinstance(fact, dict):
-                lines = ["案件情報を更新しました。", f"- tool: {call.tool}"]
-                field_labels = {
-                    "id": "fact_id",
-                    "title": "title",
-                    "project_id": "project_id",
-                    "fact_type": "fact_type",
-                    "confidence": "confidence",
-                    "status": "status",
-                }
-                for field, label in field_labels.items():
-                    value = fact.get(field)
-                    if value is not None and str(value).strip():
-                        lines.append(f"- {label}: {value}")
-                return "\n".join(lines)
-
-        task_tools = {
-            "create_task",
-            "update_task",
-            "delete_task",
-            "assign_task",
-            "schedule_task",
-        }
-        task = payload
-        if call.tool in task_tools and isinstance(payload, dict):
-            for key in ("task", "created_task", "updated_task", "result"):
-                if isinstance(payload.get(key), dict):
-                    task = payload[key]
-                    break
-
-        if call.tool in task_tools and isinstance(task, dict):
-            lines = ["タスク操作を完了しました。", f"- tool: {call.tool}"]
-            field_labels = {
-                "id": "task_id",
-                "title": "title",
-                "project_id": "project_id",
-                "status": "status",
-                "priority": "priority",
-                "start_at": "start_at",
-                "end_at": "end_at",
-                "due_at": "due_at",
-            }
-            for field, label in field_labels.items():
-                value = task.get(field)
-                if value is not None and str(value).strip():
-                    lines.append(f"- {label}: {value}")
-            if len(lines) > 2:
-                return "\n".join(lines)
-
-        return "\n".join(
-            [
-                "プロジェクト管理操作を完了しました。",
-                f"- tool: {call.tool}",
-                f"- tool_result: {call.result}",
-            ]
         )
 
 

@@ -35,6 +35,8 @@ class SpeechRecognitionConfig(BaseModel):
     engine: str = Field(default="whisper", description="Speech recognition engine")
     language: str = Field(default="ja", description="Language code")
     model: str = Field(default="small", description="Model size")
+    device: str = Field(default="cpu", description="Runtime device")
+    fp16: bool = Field(default=False, description="Use FP16 when running on CUDA")
     hallucination_detection: bool = Field(default=True, description="Enable hallucination detection")
     min_audio_duration: float = Field(default=0.2, ge=0.1, description="Minimum audio duration")
     energy_threshold: float = Field(default=0.000005, ge=0.0, description="Energy threshold")

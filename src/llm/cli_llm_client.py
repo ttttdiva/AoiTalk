@@ -1,12 +1,13 @@
 """
-CLI-based LLM Client (supports Gemini CLI, Claude Code, Codex CLI)
+CLI-based LLM Client (supports Antigravity CLI, Claude Code, Codex CLI)
 
-CLI（Gemini/Claude/Codex）をLLMバックエンドとして使用するクライアント実装。
+CLI（Antigravity/Claude/Codex）をLLMバックエンドとして使用するクライアント実装。
 AgentLLMClientと互換のインターフェースを提供する。
 """
 
 import asyncio
 import concurrent.futures
+import inspect
 import logging
 import os
 from pathlib import Path
@@ -15,7 +16,7 @@ from typing import Optional, List, Dict, Any, Union, Generator
 from ..config import Config
 from ..services.project_context import (
     ProjectContextResolver,
-    format_project_context_for_chat_prompt,
+    format_minimal_project_context_for_chat_prompt,
     get_runtime_project_context,
     reset_runtime_project_context,
     sanitize_project_context_for_chat,
@@ -28,6 +29,21 @@ from ..services.scenario_chat_context import (
 )
 from .cli_backends.base import CLIBackendBase
 from .prompts import build_unified_instructions
+from .agentic_completion import (
+    render_messages_for_review,
+    run_agentic_completion_loop_sync,
+)
+from .agent_runtime import (
+    OpenAIToolCallRecord,
+    build_tool_hint_context_sync,
+    compose_tool_hint_user_message,
+    guard_tool_execution_claims,
+    project_context_read_final_response_check,
+    project_context_required_read_tool_names,
+)
+from .cli_tool_context import build_cli_tool_context
+from .context_budget import clip_text
+from .unified_turn_runtime import run_cli_tool_call_loop
 
 # Memory management
 from ..memory.manager import ConversationMemoryManager
@@ -46,15 +62,22 @@ from .generation_policy import (
     set_current_generation_policy,
 )
 from .runtime_tool_registry import build_runtime_tool_registry
-from .tool_policy import reset_current_user_input, set_current_user_input
+from .tool_policy import (
+    looks_like_bare_search_followup_request,
+    looks_like_project_management_request,
+    reset_current_user_input,
+    set_current_user_input,
+)
 from ..services.user_settings_service import get_user_custom_instructions_sync
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CLI_TOOL_RESULT_MAX_CHARS = 8000
+
 
 class CLILLMClient:
     """
-    CLI-based LLM client (supports Gemini/Claude/Codex)
+    CLI-based LLM client (supports Antigravity/Claude/Codex)
 
     AgentLLMClientと互換性のあるインターフェースを提供し、
     外部CLIツールを通じて推論・応答生成を行う。
@@ -68,10 +91,10 @@ class CLILLMClient:
         self.character_name = config.default_character
         self.model_name = config.get('llm_model', 'cli')
 
-        # CLI backend (Gemini/Claude/Codex)
+        # CLI backend (Antigravity/Claude/Codex)
         if cli_backend is None:
-            from .cli_backends.gemini import GeminiCLIBackend
-            self.cli_backend = GeminiCLIBackend()
+            from .cli_backends.antigravity import AntigravityCLIBackend
+            self.cli_backend = AntigravityCLIBackend()
         else:
             self.cli_backend = cli_backend
 
@@ -132,7 +155,7 @@ class CLILLMClient:
 
         # MCP: CLIネイティブ委譲（MCPPluginは使用しない）
         # Claude Code: --mcp-config で実行時渡し
-        # Gemini CLI / Codex CLI: 各CLIの設定ファイルで事前設定が必要
+        # Antigravity CLI / Codex CLI: 各CLIの設定ファイルで事前設定が必要
         self._mcp_servers: dict = {}
         if config.get('mcp_enabled', False):
             self._mcp_servers = config.get('mcp', {}).get('servers', {})
@@ -247,13 +270,23 @@ class CLILLMClient:
         **kwargs,
     ) -> Union[str, Generator[str, None, None]]:
         logger.info(f"[CLILLMClient] Generating response for: {user_input[:50]}...")
+        stream_callback = kwargs.get("stream_callback")
 
         try:
-            response = self._generate_sync(user_input, image_data=image_data)
+            response = self._generate_sync(
+                user_input,
+                image_data=image_data,
+                stream_callback=stream_callback,
+            )
         except Exception as e:
             logger.error(f"[CLILLMClient] Error: {e}", exc_info=True)
             personality = self.character_config.get('personality', {}) if self.character_config else {}
             response = personality.get('fallbackReply', 'エラーが発生しました')
+            self._emit_stream_event_sync(
+                stream_callback,
+                "stream_end",
+                {"content": response},
+            )
 
         if stream:
             def response_generator():
@@ -261,13 +294,19 @@ class CLILLMClient:
             return response_generator()
         return response
 
-    def _generate_sync(self, user_input: str, image_data: Optional[Dict[str, Any]] = None) -> str:
+    def _generate_sync(
+        self,
+        user_input: str,
+        image_data: Optional[Dict[str, Any]] = None,
+        stream_callback: Any = None,
+    ) -> str:
         """Core synchronous generation logic"""
         project_token = None
         tool_policy_token = set_current_user_input(user_input)
         generation_policy_token = set_current_generation_policy(
             get_client_generation_policy(self)
         )
+        event_callback = self._make_stream_event_callback(stream_callback)
         image_cleanup = None
 
         try:
@@ -302,10 +341,40 @@ class CLILLMClient:
                     )
 
             # Build system context (instructions + history + tools) separately from user input
-            system_context = self._build_system_context()
+            system_context = self._build_system_context(user_input=user_input)
+            project_context_read_block = self._run_project_context_read_before_cli(
+                user_input,
+                event_callback=event_callback,
+            )
+            if project_context_read_block:
+                system_context = f"{system_context}\n\n{project_context_read_block}"
+            tool_hint_context = build_tool_hint_context_sync(
+                user_input=user_input,
+                registry=self._tool_registry,
+                policy=get_client_generation_policy(self),
+                log_prefix="CLILLMClient",
+            )
+            prompt = compose_tool_hint_user_message(
+                prompt,
+                tool_hint_context,
+            )
 
             # MCP args (CLI-native delegation)
             mcp_args = self.cli_backend.get_mcp_args(self._mcp_servers) if self._mcp_servers else None
+
+            self._emit_stream_event_sync(
+                stream_callback,
+                "stream_start",
+                {"message": "CLI generation started"},
+            )
+            self._emit_stream_event_sync(
+                stream_callback,
+                "status_update",
+                {
+                    "status": "cli_backend_started",
+                    "message": f"{self.cli_backend.get_provider_name()} is running",
+                },
+            )
 
             # Execute via CLI: system_context → stdin, prompt → -p
             success, cli_output = self.cli_backend.execute_prompt(
@@ -313,24 +382,78 @@ class CLILLMClient:
                 cwd=Path.cwd(),
                 extra_args=mcp_args,
                 system_context=system_context,
+                event_callback=event_callback,
             )
 
             if not success:
                 logger.error(f"[CLILLMClient] CLI execution failed: {cli_output}")
+                self._emit_stream_event_sync(
+                    stream_callback,
+                    "stream_end",
+                    {
+                        "content": f"CLI error: {cli_output}",
+                        "status": "failed",
+                        "message": "CLI execution failed",
+                        "error": str(cli_output or ""),
+                    },
+                )
                 return f"エラーが発生しました: {cli_output}"
 
-            # Parse and execute tool calls
-            tool_calls = self.cli_backend.parse_tool_calls(cli_output)
-            if tool_calls:
-                logger.info(f"[CLILLMClient] Executing {len(tool_calls)} tool call(s)")
-                tool_results = CLIAdapter.execute_tool_calls(tool_calls, self._tool_registry)
-                results_text = CLIAdapter.format_tool_results(tool_results)
-
-                follow_up = self._build_follow_up_prompt(user_input, cli_output, results_text)
-                success2, final_output = self.cli_backend.execute_prompt(follow_up, cwd=Path.cwd())
-                response = final_output if success2 else cli_output
-            else:
-                response = cli_output
+            turn_result = run_cli_tool_call_loop(
+                original_input=user_input,
+                initial_output=cli_output,
+                registry=self._tool_registry,
+                parse_tool_calls=self.cli_backend.parse_tool_calls,
+                execute_follow_up=lambda follow_up: self.cli_backend.execute_prompt(
+                    follow_up,
+                    cwd=Path.cwd(),
+                    event_callback=event_callback,
+                ),
+                build_follow_up_prompt=self._build_follow_up_prompt,
+                log_prefix="CLILLMClient",
+                max_tool_result_chars=self._cli_tool_result_max_chars(),
+                config=self.config,
+                user_input=user_input,
+                event_callback=event_callback,
+                final_response_check=project_context_read_final_response_check(
+                    required=(
+                        self._requires_cli_project_context_read(user_input)
+                        and not bool(project_context_read_block)
+                    ),
+                ),
+            )
+            tool_call_records: list[OpenAIToolCallRecord] = [
+                OpenAIToolCallRecord(
+                    tool=tool_result.call.tool,
+                    arguments=dict(tool_result.call.arguments),
+                    result=tool_result.model_output,
+                )
+                for tool_result in turn_result.tool_results
+            ]
+            response = turn_result.final_output
+            response = guard_tool_execution_claims(response, tool_call_records)
+            response = run_agentic_completion_loop_sync(
+                client=self,
+                run_once=lambda review_prompt: self._run_agentic_review_once(
+                    review_prompt,
+                    system_context=system_context,
+                    event_callback=event_callback,
+                    user_input=user_input,
+                ),
+                context=render_messages_for_review(
+                    [
+                        {"role": "system", "content": system_context},
+                        {"role": "user", "content": prompt},
+                    ]
+                ),
+                user_input=user_input,
+                initial_response=response,
+            )
+            self._emit_stream_event_sync(
+                stream_callback,
+                "stream_end",
+                {"content": response},
+            )
 
             # Update history
             self.history_manager.add_message("user", user_input)
@@ -351,6 +474,181 @@ class CLILLMClient:
             if image_cleanup is not None:
                 image_cleanup()
 
+    def _run_streamed_with_callback(self, *args, **kwargs):
+        """Capability marker: CLI clients emit progress through stream_callback."""
+        raise NotImplementedError(
+            "CLILLMClient uses generate_response(..., stream_callback=...)"
+        )
+
+    def _run_agentic_review_once(
+        self,
+        prompt: str,
+        *,
+        system_context: str,
+        event_callback: Any,
+        user_input: str,
+    ) -> str:
+        success, cli_output = self.cli_backend.execute_prompt(
+            prompt=prompt,
+            cwd=Path.cwd(),
+            system_context=system_context,
+            event_callback=event_callback,
+        )
+        if not success:
+            logger.error(f"[CLILLMClient] agentic review CLI execution failed: {cli_output}")
+            return f"エラーが発生しました: {cli_output}"
+
+        turn_result = run_cli_tool_call_loop(
+            original_input=user_input,
+            initial_output=cli_output,
+            registry=self._tool_registry,
+            parse_tool_calls=self.cli_backend.parse_tool_calls,
+            execute_follow_up=lambda follow_up: self.cli_backend.execute_prompt(
+                follow_up,
+                cwd=Path.cwd(),
+                event_callback=event_callback,
+            ),
+            build_follow_up_prompt=self._build_follow_up_prompt,
+            log_prefix="CLILLMClient",
+            max_tool_result_chars=self._cli_tool_result_max_chars(),
+            config=self.config,
+            user_input=user_input,
+            event_callback=event_callback,
+            final_response_check=project_context_read_final_response_check(
+                required=self._requires_cli_project_context_read(user_input),
+            ),
+        )
+        tool_call_records: list[OpenAIToolCallRecord] = [
+            OpenAIToolCallRecord(
+                tool=tool_result.call.tool,
+                arguments=dict(tool_result.call.arguments),
+                result=tool_result.model_output,
+            )
+            for tool_result in turn_result.tool_results
+        ]
+        return guard_tool_execution_claims(turn_result.final_output, tool_call_records)
+
+    def _cli_tool_result_max_chars(self) -> int:
+        configured = None
+        if hasattr(self.config, "get"):
+            configured = self.config.get("cli.tool_result_max_chars", None)
+            if configured is None:
+                configured = self.config.get("llm_cli.tool_result_max_chars", None)
+        try:
+            value = int(configured) if configured is not None else DEFAULT_CLI_TOOL_RESULT_MAX_CHARS
+        except (TypeError, ValueError):
+            value = DEFAULT_CLI_TOOL_RESULT_MAX_CHARS
+        return max(1000, value)
+
+    def _should_include_cli_project_context(self, user_input: str | None) -> bool:
+        if looks_like_bare_search_followup_request(user_input or ""):
+            return False
+        if getattr(self, "current_include_project_context", False) is True:
+            return True
+        return looks_like_project_management_request(user_input or "")
+
+    def _requires_cli_project_context_read(self, user_input: str | None) -> bool:
+        return (
+            getattr(self, "current_include_project_context", None) is True
+            and not looks_like_bare_search_followup_request(user_input or "")
+            and bool(self.current_project_id or self.current_session_id)
+        )
+
+    def _run_project_context_read_before_cli(
+        self,
+        user_input: str | None,
+        *,
+        event_callback: Any,
+    ) -> str:
+        if not self._requires_cli_project_context_read(user_input):
+            return ""
+
+        for tool_name in project_context_required_read_tool_names(self._tool_registry):
+            args: dict[str, Any] = {}
+            if tool_name == "list_project_information" and self.current_project_id:
+                args["project_id"] = str(self.current_project_id)
+
+            self._emit_cli_tool_event(
+                event_callback,
+                "tool_start",
+                tool_name=tool_name,
+                args=args,
+                message=f"Running {tool_name}",
+            )
+            try:
+                result = self._tool_registry.execute(tool_name, **args)
+            except Exception as exc:
+                self._emit_cli_tool_event(
+                    event_callback,
+                    "tool_end",
+                    tool_name=tool_name,
+                    args=args,
+                    message=f"Failed {tool_name}",
+                    output="",
+                    error=str(exc),
+                )
+                logger.warning(
+                    "[CLILLMClient] project context pre-read failed: %s: %s",
+                    tool_name,
+                    exc,
+                )
+                continue
+
+            output = str(result)
+            self._emit_cli_tool_event(
+                event_callback,
+                "tool_end",
+                tool_name=tool_name,
+                args=args,
+                message=f"Completed {tool_name}",
+                output=output,
+                error="",
+            )
+            clipped = clip_text(output, self._cli_tool_result_max_chars())
+            return (
+                "## Project Context DB Read Result\n"
+                f"- `{tool_name}` was executed before the model response because "
+                "Project context is enabled.\n"
+                "- Treat this tool result as grounding evidence. Decide normally "
+                "whether additional reads or project DB mutation tools are needed.\n\n"
+                f"```text\n{clipped}\n```"
+            )
+
+        return ""
+
+    def _emit_cli_tool_event(
+        self,
+        event_callback: Any,
+        event_type: str,
+        *,
+        tool_name: str,
+        args: dict[str, Any],
+        message: str,
+        output: str | None = None,
+        error: str = "",
+    ) -> None:
+        if not event_callback:
+            return
+        payload: dict[str, Any] = {
+            "tool": tool_name,
+            "tool_args": dict(args),
+            "message": message,
+        }
+        if event_type == "tool_end":
+            payload["tool_result"] = {
+                "tool": tool_name,
+                "arguments": dict(args),
+                "output": output or "",
+                "error": error,
+            }
+        try:
+            event_callback(event_type, payload)
+        except Exception:
+            logger.debug(
+                "[CLILLMClient] project context pre-read event callback failed",
+                exc_info=True,
+            )
+
     def _run_reasoning(self, user_input: str) -> str:
         """Run reasoning mode synchronously"""
         context = {
@@ -359,7 +657,7 @@ class CLILLMClient:
             'character_name': self.character_name,
             'project_context': sanitize_project_context_for_chat(
                 get_runtime_project_context()
-            ) if bool(getattr(self, "current_include_project_context", True)) else None,
+            ) if self._should_include_cli_project_context(user_input) else None,
             'runtime_context': (
                 self._current_context_bundle.render_for_prompt()
                 if self._current_context_bundle
@@ -383,6 +681,39 @@ class CLILLMClient:
         finally:
             loop.close()
             asyncio.set_event_loop(None)
+
+    def _make_stream_event_callback(self, stream_callback: Any):
+        if stream_callback is None:
+            return None
+
+        def _callback(event_type: str, data: dict[str, Any]) -> None:
+            self._emit_stream_event_sync(stream_callback, event_type, data)
+
+        return _callback
+
+    def _emit_stream_event_sync(
+        self,
+        stream_callback: Any,
+        event_type: str,
+        data: dict[str, Any],
+    ) -> None:
+        if stream_callback is None:
+            return
+        try:
+            result = stream_callback(event_type, data)
+            if inspect.isawaitable(result):
+                try:
+                    running_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    asyncio.run(result)
+                else:
+                    running_loop.create_task(result)
+        except Exception:
+            logger.debug(
+                "[CLILLMClient] Stream callback failed for %s",
+                event_type,
+                exc_info=True,
+            )
 
     def _save_to_memory(self, user_input: str, response: str):
         """Save conversation to memory manager (runs async in background)"""
@@ -448,11 +779,11 @@ class CLILLMClient:
         )
 
     def generate(self, prompt: str) -> str:
-        """Simple synchronous generate (reasoning mode compatibility)"""
+        """Generate a synchronous response for reasoning workflows."""
         return self.generate_response(prompt, stream=False)
 
     async def generate_async(self, prompt: str) -> str:
-        """Simple async generate (reasoning mode compatibility)"""
+        """Generate an async response for reasoning workflows."""
         return await self.generate_response_async(prompt)
 
     # ------------------------------------------------------------------
@@ -470,20 +801,6 @@ class CLILLMClient:
             bool(self.cli_backend.get_mcp_args(self._mcp_servers))
         )
 
-    async def add_mcp_server(
-        self, name: str, command: str, args: List[str] = None, env: Dict[str, str] = None
-    ) -> bool:
-        """Add MCP server (interface compatibility stub)
-
-        CLI backends manage MCP natively. This method is kept for interface
-        compatibility but only updates the internal config dict.
-        """
-        logger.info(
-            f"[CLILLMClient] add_mcp_server called for '{name}' — "
-            f"CLI backends manage MCP natively"
-        )
-        return False
-
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
@@ -500,11 +817,11 @@ class CLILLMClient:
     # Prompt building
     # ------------------------------------------------------------------
 
-    def _build_system_context(self) -> str:
+    def _build_system_context(self, user_input: str | None = None) -> str:
         """Build system context for stdin (instructions + history + tools)
 
         システムプロンプト・会話履歴・ツール情報をまとめて返す。
-        Gemini CLIではstdinで渡し、ユーザーメッセージは-pで別途渡す。
+        各CLI backendが対応する入力形式へ変換して渡す。
         """
         parts = []
         scenario_chat_context = self._get_scenario_chat_context_sync()
@@ -533,16 +850,16 @@ class CLILLMClient:
         if context_builder_block:
             parts.append(f"\n{context_builder_block}")
 
-        include_project_context = bool(
-            getattr(self, "current_include_project_context", True)
-        )
+        include_project_context = self._should_include_cli_project_context(user_input)
         project_context = (
             None
             if scenario_chat_context or not include_project_context
             else get_runtime_project_context()
         )
         if project_context and not context_builder_block:
-            parts.append(f"\n{format_project_context_for_chat_prompt(project_context)}")
+            parts.append(
+                f"\n{format_minimal_project_context_for_chat_prompt(project_context)}"
+            )
 
         # Conversation history
         context_text = self.history_manager.get_context_as_text()
@@ -568,69 +885,71 @@ class CLILLMClient:
             return "\n".join(parts)
 
         # Tool information
-        all_tools = self._tool_registry.get_all()
-        if all_tools:
-            tool_prompt = CLIAdapter.to_prompt_text(all_tools)
+        tool_prompt = build_cli_tool_context(
+            user_input=user_input,
+            registry=self._tool_registry,
+            force_project_tools=include_project_context,
+        )
+        if tool_prompt:
             parts.append(f"\n利用可能なツール:\n{tool_prompt}")
 
-        # 明示的な応答指示（設定確認の応答を防止）
+        # Final response instruction for the current user utterance.
         parts.append(
             "\n---\n"
-            "上記の設定に従い、以下のユーザーの発言にキャラクターとして直接応答してください。"
-            "設定の確認や読み込みの報告は不要です。"
+            "以下のユーザー発話に、キャラクターとして直接答えてください。"
         )
 
+        parts.append(self._build_tool_execution_contract_prompt())
         return "\n".join(parts)
+
+    def _build_tool_execution_contract_prompt(self) -> str:
+        return "\n".join(
+            [
+                "\nツール実行形式:",
+                "- ツールが必要な場合は通常回答ではなく `[TOOL_CALL: tool_name(key=value)]` 形式で出力してください。",
+                "- 引数が不要な場合は `[TOOL_CALL: tool_name()]` 形式で出力してください。",
+                "- 外部状態を確認・変更した事実は、ツール結果だけを根拠にしてください。",
+                "- 追加確認が必要な場合は、最終回答に進まず次のツール呼び出しを出力してください。",
+            ]
+        )
 
     def _build_prompt_with_tools(self, user_input: str) -> str:
         """Build combined prompt (fallback for non-stdin backends)"""
-        system_context = self._build_system_context()
+        system_context = self._build_system_context(user_input=user_input)
         return f"{system_context}\n\nUser: {user_input}\nAssistant:"
 
     def _build_follow_up_prompt(
         self, original_input: str, initial_response: str, tool_results_text: str
     ) -> str:
         parts = [
-            "# Tool Execution Results",
+            "# ツール実行結果",
         ]
         scenario_chat_context = self._get_scenario_chat_context_sync()
-        context_builder_block = (
-            self._current_context_bundle.render_for_prompt()
-            if not scenario_chat_context and self._current_context_bundle
-            else ""
-        )
-        include_project_context = bool(
-            getattr(self, "current_include_project_context", True)
-        )
-        project_context = (
-            None
-            if scenario_chat_context or not include_project_context
-            else get_runtime_project_context()
-        )
         if scenario_chat_context:
             parts.extend([scenario_chat_context.prompt, ""])
-        if context_builder_block:
-            parts.extend([context_builder_block, ""])
-        elif project_context:
-            parts.extend([
-                format_project_context_for_chat_prompt(project_context),
-                "",
-            ])
         task_instruction = (
-            "Based on the tool results above, continue the scenario workflow response."
+            "上記のツール結果に基づいて、シナリオ進行の応答を続けてください。"
             if scenario_chat_context
-            else "Based on the tool results above, provide a natural, helpful response to the user."
+            else "上記のツール結果に基づいて、ユーザーに自然に回答してください。"
         )
         final_reminder = (
-            "Follow the dedicated scenario workflow instructions."
+            "専用シナリオ進行指示に従ってください。"
             if scenario_chat_context
-            else f"Remember to stay in character as {self.character_name}."
+            else f"キャラクターとしての応答を維持してください: {self.character_name}"
         )
         parts.extend([
-            f"Original User Input: {original_input}",
-            f"\nYour Initial Response: {initial_response}",
-            f"\n{tool_results_text}",
-            "\n# Your Task",
+            "追加確認が必要な場合は `[TOOL_CALL: tool_name(key=value)]` 形式で続けてください。",
+            "",
+            "元のユーザー発話:",
+            original_input,
+            "",
+            "直前の出力:",
+            initial_response,
+            "",
+            "ツール結果:",
+            tool_results_text,
+            "",
+            "# 最終回答",
             task_instruction,
             final_reminder,
             "\nAssistant:",
@@ -642,22 +961,25 @@ class CLILLMClient:
     ) -> Optional[ContextBundle]:
         if self._get_scenario_chat_context_sync():
             return None
+        include_project_context = self._should_include_cli_project_context(user_input)
         try:
             return self._run_async_in_new_loop(
                 ContextBuilder().build_context(
                     user_id=self._get_session_user_id(),
                     message=user_input,
-                    project_id=self.current_project_id,
+                    project_id=self.current_project_id if include_project_context else None,
                     session_id=self.current_session_id,
-                    project_context=project_context,
-                    include_project_context=bool(
-                        getattr(self, "current_include_project_context", True)
-                    ),
+                    project_context=project_context if include_project_context else None,
+                    include_project_context=include_project_context,
+                    include_project_information=False,
+                    include_project_pack=False,
+                    include_task_context=False,
+                    project_context_mode="minimal",
                 )
             )
         except Exception as e:
             logger.warning(
-                f"[CLILLMClient] ContextBuilder failed; fallback to legacy context: {e}"
+                f"[CLILLMClient] ContextBuilder failed; fallback to basic context: {e}"
             )
             return None
 
@@ -700,6 +1022,3 @@ class CLILLMClient:
             for name in self._tool_registry.get_names()
             if is_scenario_workflow_tool_allowed(name, scenario_chat_context)
         ]
-
-# Backward compatibility alias
-GeminiCLIBackend = CLILLMClient

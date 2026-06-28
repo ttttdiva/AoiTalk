@@ -5,7 +5,7 @@ Spotifyプレイリスト管理モジュール
 import spotipy
 import logging
 import asyncio
-from ...core import tool as function_tool
+from ...core import tool
 from typing import List, Dict, Any
 
 # Import logging functionality

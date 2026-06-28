@@ -681,7 +681,10 @@ async def _sync_wbs_record_table(
         table = RecordTable(
             project_id=project_id,
             name="WBS",
-            description="Imported from project WBS Excel.",
+            description=(
+                "Internal project WBS. Rows may be managed by the agent "
+                "or imported from external WBS Excel."
+            ),
             sort_order=0,
             memory_policy="project_only",
             default_sensitivity="normal",

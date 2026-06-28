@@ -132,8 +132,12 @@ const TYPE_OPTIONS = [
 
 const TOOL_OPTIONS = [
   { value: "web_search", label: "Web検索" },
-  { value: "filesystem_assistant", label: "ファイル操作" },
-  { value: "project_management_assistant", label: "プロジェクト管理" },
+  { value: "read_workspace_file", label: "ファイル読込" },
+  { value: "search_files", label: "ファイル検索" },
+  { value: "execute_command", label: "コマンド実行" },
+  { value: "list_project_information", label: "案件情報参照" },
+  { value: "organize_project_information_from_folder", label: "案件DB更新" },
+  { value: "create_task", label: "タスク作成" },
   { value: "media_assistant", label: "メディア" },
   { value: "utility_assistant", label: "ユーティリティ" },
   { value: "spotify_assistant", label: "Spotify" },
@@ -147,7 +151,30 @@ const VOICE_ENGINE_OPTIONS = [
   { value: "aivoice", label: "A.I.VOICE" },
   { value: "aivisspeech", label: "AivisSpeech" },
   { value: "nijivoice", label: "NijiVoice" },
+  { value: "miotts", label: "MioTTS" },
 ];
+
+const DEFAULT_VOICE_PARAMETER_FIELDS = [
+  "volume",
+  "pitch",
+  "speed",
+  "intonation",
+] as const;
+
+const MIOTTS_VOICE_PARAMETER_FIELDS = [
+  "temperature",
+  "top_p",
+  "max_tokens",
+  "repetition_penalty",
+  "presence_penalty",
+  "frequency_penalty",
+  "best_of_n_n",
+] as const;
+
+const getVoiceParameterFields = (engine: string) =>
+  engine === "miotts"
+    ? MIOTTS_VOICE_PARAMETER_FIELDS
+    : DEFAULT_VOICE_PARAMETER_FIELDS;
 
 const IMAGE_GEN_OPTIONS = [
   { value: "", label: "なし" },
@@ -1019,11 +1046,15 @@ export function CharactersSection() {
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div className="space-y-1">
-                  <Label className="text-xs">ボイスID</Label>
+                  <Label className="text-xs">
+                    {form.voice_engine === "miotts" ? "プリセットID" : "ボイスID"}
+                  </Label>
                   <Input
                     value={form.voice_id}
                     onChange={(e) => updateForm("voice_id", e.target.value)}
-                    placeholder="aoi_emo_44"
+                    placeholder={
+                      form.voice_engine === "miotts" ? "jp_female" : "aoi_emo_44"
+                    }
                   />
                 </div>
                 <div className="space-y-1">
@@ -1044,7 +1075,7 @@ export function CharactersSection() {
               <div className="space-y-1">
                 <Label className="text-xs">音声パラメータ</Label>
                 <div className="grid grid-cols-2 gap-3">
-                  {(["volume", "pitch", "speed", "intonation"] as const).map(
+                  {getVoiceParameterFields(form.voice_engine).map(
                     (param) => (
                       <div key={param} className="space-y-1">
                         <Label className="text-[10px] text-muted-foreground">
@@ -1052,7 +1083,11 @@ export function CharactersSection() {
                         </Label>
                         <Input
                           type="number"
-                          step="0.1"
+                          step={
+                            param === "max_tokens" || param === "best_of_n_n"
+                              ? "1"
+                              : "0.1"
+                          }
                           value={form.voice_parameters[param] ?? ""}
                           onChange={(e) => {
                             const newParams = { ...form.voice_parameters };

@@ -6,7 +6,7 @@ prompt_template: |
   {input}
 
   ## 手順
-  1. project_management_assistant の get_project_context で対象案件を確認する。
+  1. get_project_context で対象案件を確認する。
   2. list_project_information で案件情報DBの要確認事項、決定事項、重要資料を読む。
   3. list_tasks で未完了タスクを読む。
   4. get_upcoming_wbs_tasks と summarize_project_requests を使い、WBS由来の期限・確認依頼を読む。
@@ -28,7 +28,12 @@ aliases:
   - next
   - todo整理
 bound_tools:
-  - project_management_assistant
+  - get_project_context
+  - list_project_information
+  - list_tasks
+  - get_upcoming_wbs_tasks
+  - summarize_project_requests
+  - upsert_project_fact
 examples:
   - "/next_actions"
   - "/next_actions 今週中に終わらせるべきものだけ"

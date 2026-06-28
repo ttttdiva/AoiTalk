@@ -4,12 +4,12 @@ Spotify activity memory and search tools for conversation memory
 
 import asyncio
 from typing import List, Dict, Any, Optional
-from ..core import tool as function_tool
+from ..core import tool
 
 from ..entertainment.spotify_logger import get_spotify_logger
 
 
-@function_tool
+@tool
 def search_spotify_activity(
     query: str,
     days: int = 7,
@@ -98,7 +98,7 @@ def search_spotify_activity(
         return f"Spotifyアクティビティ検索エラー: {e}"
 
 
-@function_tool
+@tool
 def get_spotify_activity_stats(
     days: int = 7,
     user_id: str = "default_user"
@@ -185,7 +185,7 @@ def get_spotify_activity_stats(
         return f"Spotifyアクティビティ統計取得エラー: {e}"
 
 
-@function_tool
+@tool
 def get_recent_spotify_activity(
     hours: int = 24,
     limit: int = 20,
@@ -265,7 +265,7 @@ def get_recent_spotify_activity(
         return f"最近のSpotifyアクティビティ取得エラー: {e}"
 
 
-@function_tool
+@tool
 def get_spotify_listening_patterns(
     days: int = 30,
     user_id: str = "default_user"

@@ -13,9 +13,9 @@ AoiTalkは、音声認識と複数TTSによる読み上げに対応した、Open
 
 ## 中核機能
 
-- **音声対応の会話操作**: Whisper、Parakeet、Google Speech、Gemini系の認識器と、VOICEVOX、VOICEROID、A.I.VOICE、CeVIO、AivisSpeech、Nijivoice、Azure TTS、gTTS、Irodori TTS などの読み上げエンジンを構成に応じて利用できます。
+- **音声対応の会話操作**: Whisper、Parakeet、Google Speech、Gemini系の認識器と、VOICEVOX、VOICEROID、A.I.VOICE、CeVIO、AivisSpeech、Nijivoice、Azure TTS、gTTS、Irodori TTS、MioTTS などの読み上げエンジンを構成に応じて利用できます。
 - **タスク・プロジェクト管理**: プロジェクト、スペース、タスク、ステータス、期日、繰り返し、発生日、通知、作業時間、レポートをPostgreSQL上で管理します。
-- **AI専門エージェント**: project management、filesystem、utility、media、Spotify、skills などの専門ランナーに処理を委譲し、会話だけで終わらない作業を実行します。
+- **AIツール実行**: 検索、ファイル操作、プロジェクトDB/タスク、スキル呼び出しはメインassistantの直接ツールとして扱い、utility、media、Spotify、writing、import、scenario などだけを高レベル専門委任として使います。
 - **資料と知識の活用**: ファイラー、Office/PDF読取、QdrantベースのRAG、知識ワークスペース、プロジェクト情報整理を使い、案件資料や作業メモを再利用しやすくします。
 - **外部連携**: Google Calendar、MCPサーバー、OpenAI互換LLM、OpenRouter、Gemini、Ollama、SGLangなどを構成に応じて使えます。
 
@@ -33,7 +33,7 @@ AoiTalkは、音声認識と複数TTSによる読み上げに対応した、Open
 ```powershell
 git clone https://github.com/ttttdiva/AoiTalk.git
 cd AoiTalk
-python -m venv venv
+py -3.12 -m venv venv
 venv\Scripts\activate
 pip install -e ".[audio,test]"
 cd frontend
@@ -58,7 +58,7 @@ chmod +x setup.sh run.sh
 ./run.sh
 ```
 
-`setup.sh` は PostgreSQL 16 + pgvector、Node.js、Python venv、Alembic migration をまとめて準備します。`sudo` が必要です。
+`setup.sh` は PostgreSQL 16 + pgvector、Node.js、Python 3.12 venv、Alembic migration をまとめて準備します。`sudo` が必要です。
 
 ## 重要な環境変数
 
@@ -86,7 +86,7 @@ WebUIのログインアカウントはPostgreSQLの `users` テーブルで管�
 
 ## タスク管理API
 
-タスク管理はAoiTalk本体に組み込まれています。`project_management_assistant` は別のMCPサーバーではなく、アプリのバックエンドとAPIを直接操作します。
+????????DB???AoiTalk????????????root runtime ????????????????????????API???????
 
 - `/api/tasks`
 - `/api/task-occurrences`
@@ -95,17 +95,14 @@ WebUIのログインアカウントはPostgreSQLの `users` テーブルで管�
 - `/api/notifications`
 - `/api/projects/{id}/notification-settings`
 
-## Specialist Tools
+## Runtime Tools
 
-Runtime specialist delegation は `src/llm/runtime_tool_registry.py` で管理しています。
+Root runtime は検索、ファイル操作、プロジェクトDB/タスク、スキル呼び出しを直接ツールとして公開します。高レベル専門委任は、直接ツールと同じ役割を持たない領域だけに残します。
 
-- `project_management_assistant`
-- `filesystem_assistant`
-- `utility_assistant`
-- `media_assistant`
-- `spotify_assistant`
-- `skills_assistant`
-
+- Search: `web_search`, `grok_x_search`, `knowledge_search`, `search_memory`
+- Filesystem: `find_workspace_items`, `read_workspace_file`, `search_files`, `list_directory`, `execute_command`
+- Project: `get_project_context`, `list_project_information`, `organize_project_information_from_folder`, `sync_wbs_tasks`, `create_task`
+- High-level specialists: `utility_assistant`, `media_assistant`, `spotify_assistant`, `writing_assistant`, `import_assistant`, `scenario_assistant`
 ## MCP Servers
 
 MCPサーバー設定は `config/config.yaml` の `mcp` セクションで管理します。

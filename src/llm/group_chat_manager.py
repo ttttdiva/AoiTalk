@@ -44,7 +44,7 @@ class GroupChatManager:
                 char_data, accumulated_context, user_message, responses
             )
 
-            # LLM呼び出し（OpenAI Agents SDKではなく直接API呼び出し）
+            # LLM呼び出し（native runtimeで直接API呼び出し）
             content = await self._call_llm(char_data, prompt)
 
             response = {
@@ -118,16 +118,15 @@ class GroupChatManager:
     async def _call_llm(self, char_data, prompt):
         """LLM APIを直接呼び出して応答を生成"""
         try:
-            from agents import Agent, Runner
-            from ..tools.adapters import OpenAIAgentAdapter
+            from .native_runtime import AgentDefinition, run_native_agent_once
 
             model = char_data.get("model") or "gpt-4o-mini"
-            agent = Agent(
+            agent = AgentDefinition(
                 name=char_data.get("name", "Character"),
                 instructions=prompt,
                 model=model,
             )
-            result = await Runner.run(agent, "")
+            result = await run_native_agent_once(agent, "")
             return result.final_output or ""
         except Exception as e:
             logger.error(f"グループチャットLLM呼び出し失敗: {e}")

@@ -1,7 +1,6 @@
 param(
     [string]$HostAddress = "127.0.0.1",
     [int]$Port = 8080,
-    [int]$MaxContext = 8192,
     [string]$ModelPath = $env:QWOPUS_MODEL_PATH,
     [string]$ModelAlias = "qwopus3.6-35b-a3b",
     [string]$LlamaServerExe = $env:LLAMA_SERVER_EXE,
@@ -71,7 +70,12 @@ if ($Stop) {
     exit 0
 }
 
-if (-not $ModelPath) { throw "Pass -ModelPath or set QWOPUS_MODEL_PATH." }
+$projectRoot = Split-Path -Parent $PSScriptRoot
+$defaultAiRoot = Join-Path ([System.IO.Path]::GetPathRoot($projectRoot)) "AI"
+
+if (-not $ModelPath) {
+    $ModelPath = Join-Path $defaultAiRoot "models\qwopus\models\Qwopus3.6-35B-A3B-v1-Q4_K_M.gguf"
+}
 if (-not $LlamaServerExe) { $LlamaServerExe = "llama-server" }
 if (-not $LogRoot) { $LogRoot = Join-Path $env:LOCALAPPDATA "AoiTalk\logs\qwopus" }
 
@@ -89,7 +93,6 @@ $args = @(
     "--port", [string]$Port,
     "--model", $ModelPath,
     "--alias", $ModelAlias,
-    "--ctx-size", [string]$MaxContext,
     "--n-gpu-layers", "999"
 )
 

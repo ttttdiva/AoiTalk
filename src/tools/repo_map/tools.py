@@ -7,14 +7,14 @@ Provides function tools for generating repository structure maps.
 import logging
 from typing import Any, Dict, List, Optional
 
-from ..core import tool as function_tool
+from ..core import tool
 
 from .repo_map import get_repo_map_instance
 
 logger = logging.getLogger(__name__)
 
 
-@function_tool
+@tool
 def get_repo_map(
     path: str,
     max_tokens: int = 4096,

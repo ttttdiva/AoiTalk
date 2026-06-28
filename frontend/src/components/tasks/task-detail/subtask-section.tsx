@@ -17,12 +17,16 @@ export function SubtaskSection({
   onEnsureTask,
   openInputSignal,
   onSubtaskAdded,
+  onSubtaskUpdated,
+  onSubtaskDeleted,
   onUpdated,
 }: {
   task: Task;
   onEnsureTask?: () => Promise<Task | null | undefined>;
   openInputSignal?: number;
   onSubtaskAdded?: (parentTask: Task, subtask: Task) => void;
+  onSubtaskUpdated?: (subtask: Task) => void;
+  onSubtaskDeleted?: (subtaskId: string) => void;
   onUpdated: () => void;
 }) {
   const [addTitle, setAddTitle] = useState("");
@@ -96,9 +100,10 @@ export function SubtaskSection({
                 checked={sub.status === "closed"}
                 onCheckedChange={async (checked) => {
                   try {
-                    await taskApi.updateTask(sub.id, {
+                    const updated = await taskApi.updateTask(sub.id, {
                       status: checked ? "closed" : "open",
                     });
+                    onSubtaskUpdated?.(updated);
                     onUpdated();
                   } catch (err) {
                     console.error("サブタスクステータス更新失敗:", err);
@@ -122,6 +127,7 @@ export function SubtaskSection({
                 onClick={async () => {
                   try {
                     await taskApi.deleteTask(sub.id);
+                    onSubtaskDeleted?.(sub.id);
                     onUpdated();
                   } catch (err) {
                     console.error("サブタスク削除失敗:", err);

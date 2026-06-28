@@ -20,7 +20,7 @@ RUN cd frontend && npm run build
 # =============================================================================
 # Stage 2: Python Builder - 依存関係のビルド
 # =============================================================================
-FROM python:3.11-slim-bookworm AS builder
+FROM python:3.12-slim-bookworm AS builder
 
 # ビルド用システム依存関係
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -45,7 +45,7 @@ RUN pip wheel --no-cache-dir --wheel-dir /wheels .
 # =============================================================================
 # Stage 3: Runtime - 実行環境
 # =============================================================================
-FROM python:3.11-slim-bookworm
+FROM python:3.12-slim-bookworm
 
 # Node.js インストール（Next.js実行用）
 RUN apt-get update && apt-get install -y --no-install-recommends \

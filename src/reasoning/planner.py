@@ -32,7 +32,7 @@ class ReasoningPlanner:
             },
             'create': {
                 'keywords': ['作成', '登録', '追加', '生成', '保存'],
-                'tools': ['project_management_assistant', 'spotify_assistant', 'filesystem_assistant', 'media_assistant', 'skills_assistant']
+                'tools': ['create_task', 'upsert_project_fact', 'create_record_table', 'spotify_assistant', 'create_file', 'media_assistant', 'invoke_skill']
             },
             'analyze': {
                 'keywords': ['分析', '解析', '評価', '判定', '比較'],
@@ -40,11 +40,11 @@ class ReasoningPlanner:
             },
             'fetch': {
                 'keywords': ['取得', '読み込み', 'ダウンロード', 'アクセス'],
-                'tools': ['filesystem_assistant', 'project_management_assistant', 'spotify_assistant']
+                'tools': ['find_workspace_items', 'read_workspace_file', 'view_file', 'list_project_information', 'spotify_assistant']
             },
             'transform': {
                 'keywords': ['変換', '整形', 'フォーマット', '加工', '抽出'],
-                'tools': ['filesystem_assistant', 'project_management_assistant', 'spotify_assistant', 'skills_assistant']
+                'tools': ['search_files', 'read_workspace_file', 'edit_file', 'organize_project_information_from_folder', 'spotify_assistant', 'invoke_skill']
             }
         }
     
@@ -201,12 +201,21 @@ class ReasoningPlanner:
             'WebSearch': 'インターネットから最新情報を検索',
             'web_search': 'General web search for fresh information',
             'grok_x_search': 'Fresh X/Twitter search via Grok',
-            'project_management_assistant': 'Task management, project/case information DB, WBS checks, and management action planning',
+            'list_project_information': 'Read project/case information DB facts and documents',
+            'create_task': 'Create a project task',
+            'upsert_project_fact': 'Create or update project DB facts',
+            'organize_project_information_from_folder': 'Read project files and organize project information DB entries',
+            'sync_wbs_tasks': 'Synchronize WBS tasks',
             'spotify_assistant': 'Spotify auth, playback, queue, playlist, and activity operations',
-            'filesystem_assistant': 'Local file browsing, editing, workspace management, and command execution',
+            'find_workspace_items': 'Find workspace files or folders by name',
+            'inspect_workspace_tree': 'Inspect a bounded workspace folder tree',
+            'read_workspace_file': 'Read a workspace file or document preview',
+            'view_file': 'Read a local file by path with optional line range',
+            'search_files': 'Search local files by name or content',
+            'edit_file': 'Edit a local file by string replacement',
             'utility_assistant': 'Time, weather, and calculation operations',
             'media_assistant': 'Image generation and YouTube/NicoNico playback',
-            'skills_assistant': 'Invoke installed skills for domain-specific tasks',
+            'invoke_skill': 'Invoke installed skills for domain-specific tasks',
             'execute_file_operation': 'ローカルファイルの編集・参照（OS操作ツール）',
             'get_weather': '天気予報と気象情報の取得',
         }

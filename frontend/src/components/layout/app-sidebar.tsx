@@ -10,6 +10,7 @@ import {
   useRef,
   useMemo,
   Suspense,
+  type FormEvent,
   type MouseEvent,
 } from "react";
 import {
@@ -32,9 +33,11 @@ import {
   Upload,
   Layers,
   Table2,
+  Pencil,
 } from "lucide-react";
 import {
   chatApi,
+  type ConversationSession,
   type ScenarioLogResponse,
 } from "@/lib/chat-api";
 import { taskApi, type Task } from "@/lib/task-api";
@@ -83,6 +86,20 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
 } from "@/components/ui/dropdown-menu";
+import { Button } from "@/components/ui/button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import {
   Sidebar,
   SidebarContent,
@@ -99,6 +116,10 @@ import {
   navigateChatSessionInPlace,
   readChatSessionIdFromLocation,
 } from "@/lib/chat-navigation";
+import {
+  ChatSessionContextMenu,
+  type ChatSessionContextMenuState,
+} from "@/components/chat/session-context-menu";
 
 /** 相対時間を返す */
 function formatRelativeTime(dateStr: string | null | undefined): string {
@@ -206,14 +227,26 @@ function ChatSidebar() {
   const searchParams = useSearchParams();
   const searchParamSessionId = searchParams.get("s") || null;
   const [activeSessionId, setActiveSessionId] = useState(searchParamSessionId);
-  const { selectedProjectId } = useProject();
-  const { sessions, sessionsError, fetchSessions, addSession, removeSession } =
-    useChatSessions();
+  const { selectedProjectId, allProjects } = useProject();
+  const {
+    sessions,
+    sessionsError,
+    fetchSessions,
+    addSession,
+    removeSession,
+    updateSessionTitle,
+  } = useChatSessions();
   const [isCreatingSession, setIsCreatingSession] = useState(false);
+  const [titleEditSession, setTitleEditSession] =
+    useState<ConversationSession | null>(null);
+  const [titleDraft, setTitleDraft] = useState("");
+  const [isUpdatingTitle, setIsUpdatingTitle] = useState(false);
   const [scenarioLogContextState, setScenarioLogContextState] = useState<{
     sessionId: string;
     data: ScenarioLogResponse | null;
   } | null>(null);
+  const [sessionContextMenu, setSessionContextMenu] =
+    useState<ChatSessionContextMenuState | null>(null);
 
   useEffect(() => {
     fetchSessions();
@@ -325,11 +358,92 @@ function ChatSidebar() {
     [activeSessionId, router, removeSession],
   );
 
+  const closeTitleEditDialog = useCallback(() => {
+    setTitleEditSession(null);
+    setTitleDraft("");
+  }, []);
+
+  const handleOpenTitleEdit = useCallback((session: ConversationSession) => {
+    setTitleEditSession(session);
+    setTitleDraft(session.title || "");
+  }, []);
+
+  const handleTitleEditOpenChange = useCallback(
+    (open: boolean) => {
+      if (!open && !isUpdatingTitle) {
+        closeTitleEditDialog();
+      }
+    },
+    [closeTitleEditDialog, isUpdatingTitle],
+  );
+
+  const handleUpdateSessionTitle = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      if (!titleEditSession) return;
+
+      const nextTitle = titleDraft.trim();
+      if (!nextTitle) {
+        toast.error("タイトルを入力してください");
+        return;
+      }
+      if (nextTitle.length > 200) {
+        toast.error("タイトルは200文字以内で入力してください");
+        return;
+      }
+      if (nextTitle === (titleEditSession.title || "")) {
+        closeTitleEditDialog();
+        return;
+      }
+
+      setIsUpdatingTitle(true);
+      try {
+        await chatApi.updateSessionTitle(titleEditSession.id, nextTitle);
+        updateSessionTitle(titleEditSession.id, nextTitle);
+        toast.success("タイトルを更新しました");
+        closeTitleEditDialog();
+      } catch (err) {
+        console.error("セッションタイトル更新エラー:", err);
+        toast.error("タイトルの更新に失敗しました");
+      } finally {
+        setIsUpdatingTitle(false);
+      }
+    },
+    [
+      closeTitleEditDialog,
+      titleDraft,
+      titleEditSession,
+      updateSessionTitle,
+    ],
+  );
+
+  const handleSessionContextMenu = useCallback(
+    (event: MouseEvent, session: ConversationSession) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setSessionContextMenu({
+        x: event.clientX,
+        y: event.clientY,
+        session,
+      });
+    },
+    [],
+  );
+
+  const closeSessionContextMenu = useCallback(() => {
+    setSessionContextMenu(null);
+  }, []);
+
   const sortedSessions = [...sessions].sort((a, b) => {
     const dateA = new Date(a.last_activity ?? a.session_start ?? 0).getTime();
     const dateB = new Date(b.last_activity ?? b.session_start ?? 0).getTime();
     return dateB - dateA;
   });
+
+  const projectNameById = useMemo(
+    () => new Map(allProjects.map((project) => [project.id, project.name])),
+    [allProjects],
+  );
 
   const scenarioLogContext =
     activeSessionId && scenarioLogContextState?.sessionId === activeSessionId
@@ -441,8 +555,16 @@ function ChatSidebar() {
             {!sessionsError &&
               sortedSessions.map((s) => {
                 const href = `/chat?s=${encodeURIComponent(s.id)}`;
+                const projectName = s.project_id
+                  ? (projectNameById.get(s.project_id) ?? "不明なプロジェクト")
+                  : null;
                 return (
-                  <SidebarMenuItem key={s.id}>
+                  <SidebarMenuItem
+                    key={s.id}
+                    onContextMenu={(event) =>
+                      handleSessionContextMenu(event, s)
+                    }
+                  >
                     <SidebarMenuButton
                       isActive={activeSessionId === s.id}
                       render={
@@ -460,7 +582,10 @@ function ChatSidebar() {
                         <span className="truncate text-sm">
                           {s.title || "無題の会話"}
                         </span>
-                        <span className="text-xs text-muted-foreground">
+                        <span className="truncate text-xs text-muted-foreground">
+                          {projectName && (
+                            <>プロジェクト: {projectName} &middot; </>
+                          )}
                           {s.character_name}
                           {s.last_activity && (
                             <> &middot; {formatRelativeTime(s.last_activity)}</>
@@ -476,6 +601,15 @@ function ChatSidebar() {
                         <MoreHorizontal className="size-4" />
                       </DropdownMenuTrigger>
                       <DropdownMenuContent side="right" align="start">
+                        <DropdownMenuItem
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleOpenTitleEdit(s);
+                          }}
+                        >
+                          <Pencil className="mr-2 size-4" />
+                          タイトルを編集
+                        </DropdownMenuItem>
                         <DropdownMenuItem
                           className="text-destructive focus:text-destructive"
                           onClick={(e) => {
@@ -494,6 +628,47 @@ function ChatSidebar() {
           </SidebarMenu>
         </SidebarGroupContent>
       </SidebarGroup>
+      <ChatSessionContextMenu
+        menu={sessionContextMenu}
+        onClose={closeSessionContextMenu}
+        onRename={handleOpenTitleEdit}
+        onDelete={handleDeleteSession}
+      />
+      <Dialog
+        open={titleEditSession != null}
+        onOpenChange={handleTitleEditOpenChange}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>タイトルを編集</DialogTitle>
+          </DialogHeader>
+          <form className="space-y-4" onSubmit={handleUpdateSessionTitle}>
+            <Input
+              autoFocus
+              value={titleDraft}
+              maxLength={200}
+              placeholder="会話タイトル"
+              onChange={(event) => setTitleDraft(event.target.value)}
+            />
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={closeTitleEditDialog}
+                disabled={isUpdatingTitle}
+              >
+                キャンセル
+              </Button>
+              <Button
+                type="submit"
+                disabled={isUpdatingTitle || !titleDraft.trim()}
+              >
+                保存
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
     </>
   );
 }
@@ -1975,29 +2150,54 @@ function AppSidebarInner() {
     }
   }, []);
 
+  const handleHomeClick = useCallback(() => {
+    window.dispatchEvent(new Event("global-open-home"));
+  }, []);
+
   return (
     <Sidebar>
       <SidebarHeader className="ao-sidebar-hero justify-center">
-        <button
-          type="button"
-          onClick={handleBrandClick}
-          className="flex min-w-0 items-center gap-2 rounded-md px-2 py-2 text-left transition-colors hover:bg-white/48 focus-visible:ring-2 focus-visible:ring-sidebar-ring focus-visible:outline-none dark:hover:bg-white/8"
-          title="新規チャットを開く"
-        >
-          <img
-            src="/images/ui/brand-orb.png"
-            alt=""
-            className="size-9 shrink-0 rounded-xl object-cover shadow-[0_14px_30px_-22px_rgba(5,90,115,0.9)] ring-1 ring-white/80"
-          />
-          <div className="min-w-0">
-            <span className="block text-lg font-semibold leading-5 tracking-tight">
-              AoiTalk
-            </span>
-            <span className="block truncate text-[11px] font-semibold leading-4 text-sidebar-foreground/58">
-              Crystal workspace
-            </span>
-          </div>
-        </button>
+        <div className="flex min-w-0 items-center gap-1.5">
+          <button
+            type="button"
+            onClick={handleBrandClick}
+            className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-2 text-left transition-colors hover:bg-white/48 focus-visible:ring-2 focus-visible:ring-sidebar-ring focus-visible:outline-none dark:hover:bg-white/8"
+            title="新規チャットを開く"
+          >
+            <img
+              src="/images/ui/brand-orb.png"
+              alt=""
+              className="size-9 shrink-0 rounded-xl object-cover shadow-[0_14px_30px_-22px_rgba(5,90,115,0.9)] ring-1 ring-white/80"
+            />
+            <div className="min-w-0">
+              <span className="block text-lg font-semibold leading-5 tracking-tight">
+                AoiTalk
+              </span>
+              <span className="block truncate text-[11px] font-semibold leading-4 text-sidebar-foreground/58">
+                Crystal workspace
+              </span>
+            </div>
+          </button>
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  className="shrink-0"
+                  onClick={handleHomeClick}
+                >
+                  <Home className="size-4" />
+                  <span className="sr-only">Todayを開く</span>
+                </Button>
+              }
+            />
+            <TooltipContent side="right">
+              Todayを開く (Ctrl+Shift+H)
+            </TooltipContent>
+          </Tooltip>
+        </div>
         <MobileContextSwitcher />
       </SidebarHeader>
       <SidebarContent>

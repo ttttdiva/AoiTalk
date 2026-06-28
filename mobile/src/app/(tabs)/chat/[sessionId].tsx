@@ -313,7 +313,7 @@ export default function ChatScreen() {
   return (
     <KeyboardAvoidingView
       style={styles.container}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
+      behavior={Platform.OS === "ios" ? "padding" : "height"}
       keyboardVerticalOffset={Platform.OS === "ios" ? 90 : 0}
     >
       <Surface style={styles.header} elevation={1}>
@@ -369,6 +369,7 @@ export default function ChatScreen() {
         data={controller.timeline}
         keyExtractor={(item) => item.id}
         renderItem={({ item }) => renderEvent(item)}
+        keyboardShouldPersistTaps="handled"
         contentContainerStyle={styles.messageList}
         ListEmptyComponent={
           <View style={styles.empty}>

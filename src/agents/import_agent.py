@@ -5,9 +5,9 @@
 ディレクトリ分析、キャラクター/世界設定/シーンの柔軟な取り込みを行う。
 """
 
-from agents import Agent
+from ..llm.native_runtime import AgentDefinition as Agent
 
-from ..tools.adapters import OpenAIAgentAdapter
+from ..tools.core import ensure_tool_definitions
 from ..tools.import_tools import (
     analyze_import_files,
     import_file_as_character,
@@ -54,7 +54,7 @@ class ImportAgent(BaseAgent):
 
     def _create_agent(self) -> Agent:
         """ImportAgentインスタンスを作成する。"""
-        tools = OpenAIAgentAdapter.convert_all(
+        tools = ensure_tool_definitions(
             [
                 analyze_import_files,
                 import_file_as_character,

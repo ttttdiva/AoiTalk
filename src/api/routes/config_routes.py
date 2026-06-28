@@ -8,6 +8,18 @@ from fastapi.responses import JSONResponse
 
 from ..router_helpers import cookie_auth_dependency
 from .payloads import SettingsPayload
+from ...services.agent_team_service import (
+    AGENT_TEAM_MEMBER_KEYS,
+    AGENT_TEAM_PROVIDERS,
+    agent_team_confirm_prompt,
+    agent_team_enabled,
+    agent_team_member_for,
+    agent_team_member_mode,
+    agent_team_member_requires_external_approval,
+    agent_team_member_settings,
+    agent_team_notify,
+    agent_team_roster,
+)
 
 # Import CharacterSwitchManager (server.py と同じフォールバック付き)
 try:
@@ -46,8 +58,8 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             speech_config = server.config.get("speech_recognition", {})
 
         # エージェントツール系の場合はプロバイダー名のみを表示
-        # (gemini-cli, codex, claude codeなどはモデル名ではなくツール名を表示)
-        agent_tool_providers = ["gemini-cli", "codex-cli", "claude-cli"]
+        # (antigravity-cli, codex, claude codeなどはモデル名ではなくツール名を表示)
+        agent_tool_providers = ["antigravity-cli", "codex-cli", "claude-cli"]
         if llm_provider in agent_tool_providers:
             # エージェントツール系の場合はモデル名をプロバイダー名に置き換え
             llm_model = llm_provider
@@ -111,24 +123,14 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
     # Allowed settings that can be modified via WebUI
     ALLOWED_SETTINGS = {
         "external_llm.auto_approve": {"type": "bool"},
-        "model_sharing.enabled": {"type": "bool"},
-        "model_sharing.confirm_prompt": {"type": "bool"},
-        "model_sharing.notify": {"type": "bool"},
-        "model_sharing.provider": {
+        "agent_team.enabled": {"type": "bool"},
+        "agent_team.confirm_prompt": {"type": "bool"},
+        "agent_team.notify": {"type": "bool"},
+        "agent_team.redaction_terms": {"type": "str_list"},
+        "agent_team.strategy": {
             "type": "enum",
-            "values": [
-                "openai",
-                "openrouter",
-                "gemini",
-                "ollama",
-                "openai_compatible_local",
-                "sglang",
-                "gemini-cli",
-                "claude-cli",
-                "codex-cli",
-            ],
+            "values": ["adaptive", "fanout", "judge"],
         },
-        "model_sharing.model": {"type": "str"},
         "search.knowledge_enabled": {"type": "bool"},
         "reasoning.enabled": {"type": "bool"},
         "reasoning.display_mode": {
@@ -146,31 +148,103 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         "agents.spotify.enabled": {"type": "bool"},
         "spotify.enabled": {"type": "bool"},
     }
+    for member_key in sorted(AGENT_TEAM_MEMBER_KEYS):
+        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.enabled"] = {
+            "type": "bool"
+        }
+        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.provider"] = {
+            "type": "enum",
+            "values": sorted(AGENT_TEAM_PROVIDERS),
+        }
+        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.model"] = {
+            "type": "str"
+        }
+        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.mode"] = {
+            "type": "str"
+        }
+        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.reasoning_effort"] = {
+            "type": "str"
+        }
+        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.label"] = {
+            "type": "str"
+        }
+        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.role"] = {
+            "type": "str"
+        }
+        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.runner"] = {
+            "type": "str"
+        }
+        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.scalable"] = {
+            "type": "bool"
+        }
+        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.default_instances"] = {
+            "type": "int",
+            "min": 0,
+            "max": 32,
+        }
+        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.max_instances"] = {
+            "type": "int",
+            "min": 1,
+            "max": 32,
+        }
 
     @app.get("/api/settings")
     async def get_settings(_: None = Depends(require_auth)):
         """Get configurable settings"""
         try:
+            def _member_payload(member_key: str) -> dict:
+                member = agent_team_member_settings(server.config, member_key)
+                target = agent_team_member_for(server.config, member_key)
+                return {
+                    "enabled": bool(member.get("enabled", False)),
+                    "provider": str(member.get("provider") or ""),
+                    "model": str(member.get("model") or ""),
+                    "mode": agent_team_member_mode(
+                        server.config,
+                        member_key,
+                        "medium",
+                    ),
+                    "reasoning_effort": agent_team_member_mode(
+                        server.config,
+                        member_key,
+                        "medium",
+                    ),
+                    "external": agent_team_member_requires_external_approval(
+                        target or {
+                            "provider": str(member.get("provider") or ""),
+                            "model": str(member.get("model") or ""),
+                        }
+                    ),
+                    "label": str(member.get("label") or ""),
+                    "role": str(member.get("role") or member_key),
+                    "runner": str(member.get("runner") or ""),
+                    "scalable": bool(member.get("scalable", False)),
+                    "default_instances": int(member.get("default_instances") or 0),
+                    "max_instances": int(member.get("max_instances") or 1),
+                    "tools": list(member.get("tools") or []),
+                }
+
             settings = {
                 "external_llm": {
                     "auto_approve": server.config.get(
                         "external_llm.auto_approve", True
                     )
                 },
-                "model_sharing": {
-                    "enabled": server.config.get(
-                        "model_sharing.enabled", False
+                "agent_team": {
+                    "enabled": agent_team_enabled(server.config),
+                    "confirm_prompt": agent_team_confirm_prompt(server.config),
+                    "notify": agent_team_notify(server.config),
+                    "redaction_terms": server.config.get(
+                        "agent_team.redaction_terms", []
                     ),
-                    "confirm_prompt": server.config.get(
-                        "model_sharing.confirm_prompt", True
+                    "strategy": server.config.get(
+                        "agent_team.strategy", "adaptive"
                     ),
-                    "notify": server.config.get("model_sharing.notify", True),
-                    "provider": server.config.get(
-                        "model_sharing.provider", "openai"
-                    ),
-                    "model": server.config.get(
-                        "model_sharing.model", "gpt-4o"
-                    ),
+                    "members": {
+                        member_key: _member_payload(member_key)
+                        for member_key in sorted(AGENT_TEAM_MEMBER_KEYS)
+                    },
+                    "roster": agent_team_roster(server.config),
                 },
                 "knowledge": {
                     "enabled": server.config.get("search.knowledge_enabled", False)
@@ -245,6 +319,27 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                     )
             elif setting_schema["type"] == "str":
                 value = str(value).strip()
+            elif setting_schema["type"] == "int":
+                value = int(value)
+                if "min" in setting_schema and value < setting_schema["min"]:
+                    raise ValueError(f"Value must be >= {setting_schema['min']}")
+                if "max" in setting_schema and value > setting_schema["max"]:
+                    raise ValueError(f"Value must be <= {setting_schema['max']}")
+            elif setting_schema["type"] == "str_list":
+                if isinstance(value, str):
+                    value = [
+                        item.strip()
+                        for item in value.split(",")
+                        if item.strip()
+                    ]
+                elif isinstance(value, list):
+                    value = [
+                        str(item or "").strip()
+                        for item in value
+                        if str(item or "").strip()
+                    ]
+                else:
+                    raise ValueError("Value must be a list of strings")
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 

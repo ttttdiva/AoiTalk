@@ -30,12 +30,14 @@ import {
   Clock,
   Repeat,
 } from "lucide-react";
+import { toast } from "sonner";
 import {
   taskApi,
   type RecurringOccurrenceContext,
   type Task,
 } from "@/lib/task-api";
 import { TaskDetailModal } from "@/components/tasks/task-detail-modal";
+import { RecurringDeleteDialog } from "@/components/tasks/task-detail/recurring-delete-dialog";
 import { TagPill } from "@/components/tasks/tag-pill";
 import {
   applyTaskFilter,
@@ -189,7 +191,44 @@ export default function TasksPage() {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [selectedOccurrenceContext, setSelectedOccurrenceContext] =
     useState<RecurringOccurrenceContext | null>(null);
+  const [pendingRecurringDelete, setPendingRecurringDelete] = useState<{
+    task: Task;
+    occurrenceContext: RecurringOccurrenceContext;
+  } | null>(null);
   const [draftTask, setDraftTask] = useState<Partial<Task> | null>(null);
+  const requestRecurringDelete = useCallback((task: Task): boolean => {
+    if (!task.has_recurrence) return false;
+    const occurrenceContext = getTaskOccurrenceContext(task);
+    if (!occurrenceContext?.start_at) {
+      toast.error("繰り返しタスクの発生日を取得できません", {
+        description: "タスク詳細を開き直してから削除してください。",
+      });
+      return true;
+    }
+    setPendingRecurringDelete({ task, occurrenceContext });
+    return true;
+  }, []);
+  const handleRecurringDelete = useCallback(
+    async (mode: "single" | "future") => {
+      if (!pendingRecurringDelete) return;
+      const { task, occurrenceContext } = pendingRecurringDelete;
+      try {
+        await taskApi.deleteOccurrence(task.id, {
+          mode,
+          occurrence_id: occurrenceContext.occurrence_id ?? null,
+          occurrence_start_at: occurrenceContext.start_at,
+          occurrence_end_at: occurrenceContext.end_at ?? null,
+          original_start_at: occurrenceContext.original_start_at ?? null,
+        });
+        setPendingRecurringDelete(null);
+        clearSelection();
+        await fetchData();
+      } catch (err) {
+        console.error("繰り返しタスク削除失敗:", err);
+      }
+    },
+    [clearSelection, fetchData, pendingRecurringDelete],
+  );
   const openTaskById = useCallback(
     (
       taskId: string,
@@ -482,6 +521,7 @@ export default function TasksPage() {
     upsertTaskLocally,
     removeTaskLocally,
     setSelectedIds,
+    requestRecurringDelete,
   });
 
   // プロジェクト名マップ
@@ -739,6 +779,7 @@ export default function TasksPage() {
     focusedTaskId,
     focusTaskById,
     filteredTasksRef,
+    requestRecurringDelete,
   });
 
   // ステータスメニュー表示中のショートカットキー
@@ -1311,6 +1352,7 @@ export default function TasksPage() {
                           fetchData={fetchData}
                           handleTaskDateChange={handleTaskDateChange}
                           applyTaskPatchLocally={applyTaskPatchLocally}
+                          requestRecurringDelete={requestRecurringDelete}
                         />
                       ))}
 
@@ -1373,8 +1415,16 @@ export default function TasksPage() {
           setSelectedOccurrenceContext(null);
           setDraftTask(null);
         }}
-        onTaskUpdated={fetchData}
+        onTaskUpdated={() => fetchData({ forceLoading: false })}
         occurrenceContext={selectedOccurrenceContext}
+      />
+      <RecurringDeleteDialog
+        open={!!pendingRecurringDelete}
+        onOpenChange={(open) => {
+          if (!open) setPendingRecurringDelete(null);
+        }}
+        onDeleteSingle={() => void handleRecurringDelete("single")}
+        onDeleteFuture={() => void handleRecurringDelete("future")}
       />
 
       {/* 右クリックコンテキストメニュー */}

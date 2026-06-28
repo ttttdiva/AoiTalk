@@ -81,7 +81,8 @@ speech_recognition:
   engines:
     whisper:
       chunk_length: 1.0
-      fp16: true
+      device: cpu
+      fp16: false
       language: ja
       model: large-v3
       temperature: 0.0
@@ -105,6 +106,25 @@ tts_settings:
     host: aivisspeech  # docker-composeサービス名
     port: 10101
     use_gpu: false
+  miotts:
+    model_id: Aratako/MioTTS-0.6B
+    codec_model_id: Aratako/MioCodec-25Hz-44.1kHz-v2
+    refs_dir: config/miotts_refs
+    presets_dir: config/miotts_presets
+    cache_dir: cache/miotts
+    device: auto
+    dtype: auto
+    synthesis_timeout: 180.0
+    max_text_length: 300
+    max_reference_mb: 20
+    max_reference_seconds: 20.0
+    default_preset_id: ""
+    temperature: 0.8
+    top_p: 1.0
+    max_tokens: 700
+    repetition_penalty: 1.0
+    presence_penalty: 0.0
+    frequency_penalty: 0.0
 
 # MCPは無効化 (Docker内でのプロセス起動は複雑)
 mcp_enabled: false

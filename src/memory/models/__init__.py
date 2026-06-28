@@ -14,6 +14,12 @@ from .conversations import (
     ConversationArchive,
     ConversationHistory,
 )
+from .agent_runs import (
+    AgentRun,
+    AgentRunEdge,
+    AgentRunEvent,
+    AgentRunToolCall,
+)
 from .users import (
     User,
     LongLivedApiToken,
@@ -83,6 +89,10 @@ from .remote import (
 configure_mappers()
 
 __all__ = [
+    "AgentRun",
+    "AgentRunEdge",
+    "AgentRunEvent",
+    "AgentRunToolCall",
     "AppConfigSetting",
     "Base",
     "ContextMemory",

@@ -9,6 +9,7 @@ from typing import Any, Callable, Optional
 
 from ..tools.core import ToolDefinition
 from ..tools.registry import ToolRegistry
+from .unified_turn_runtime import RegistryToolRouter, UnifiedToolCall
 
 
 @dataclass(frozen=True)
@@ -50,13 +51,13 @@ def build_json_tool_loop_system_prompt(base_instructions: str, registry: ToolReg
         part
         for part in [
             base_instructions.strip(),
-            "Tool protocol:",
-            "You can use the available tools by returning exactly one JSON object and no markdown.",
-            'To call a tool: {"type":"tool_call","tool":"tool_name","arguments":{...}}',
-            'To answer the user: {"type":"final","content":"..."}',
-            "After a tool result is provided, use it to continue or return a final answer.",
-            "Do not invent tool results. If a needed tool is unavailable, return a final answer explaining that.",
-            "Available tools:",
+            "ツール実行プロトコル:",
+            "利用可能なツールは、MarkdownなしのJSONオブジェクト1個だけを返して使ってください。",
+            'ツールを呼ぶ場合: {"type":"tool_call","tool":"tool_name","arguments":{...}}',
+            '最終回答する場合: {"type":"final","content":"..."}',
+            "ツール結果が返された後は、その結果を根拠に続行するか最終回答してください。",
+            "ツール結果を捏造しないでください。必要なツールがない場合は、その旨を最終回答してください。",
+            "利用可能なツール:",
             json.dumps(tool_specs, ensure_ascii=False, indent=2),
         ]
         if part
@@ -241,10 +242,18 @@ def execute_json_tool_call(
         arguments,
         fallback_request=fallback_request,
     )
-    try:
-        return str(tool.execute(**normalized_args))
-    except Exception as exc:
-        return f"Tool execution error: {exc}"
+    result = RegistryToolRouter(
+        registry,
+        log_prefix="JsonToolLoop",
+    ).execute(
+        UnifiedToolCall(
+            tool=tool_name,
+            arguments=normalized_args,
+        )
+    )
+    if result.success:
+        return result.output
+    return f"Tool execution error: {result.error or result.output}"
 
 
 def _tool_spec(tool: ToolDefinition) -> dict[str, Any]:
@@ -306,8 +315,8 @@ def _build_repair_prompt(original_request: str) -> str:
             "",
             "Return one JSON object only.",
             (
-                "If a relevant tool is available and the request asks for search, lookup, verification, "
-                "current information, or uses Japanese terms such as 検索, 調べて, 確認, 最新, call that tool."
+                "If a relevant tool is available and the request explicitly asks for web search "
+                "or uses Japanese terms such as 調べて or 調査して, call that tool."
             ),
             (
                 "If you cannot translate the request, call the relevant `*_assistant` tool with the exact "

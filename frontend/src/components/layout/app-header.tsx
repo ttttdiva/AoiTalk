@@ -57,8 +57,6 @@ const viewTabs = [
   { title: "設定", href: "/settings" },
 ];
 
-viewTabs.splice(5, 0, { title: "App Factory", href: "/app-factory" });
-
 type LlmEngine = { provider: string; model: string; label: string };
 
 type VoiceStatus = {

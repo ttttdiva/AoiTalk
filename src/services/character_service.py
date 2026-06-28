@@ -438,16 +438,12 @@ def _make_dynamic_agent_class(
     system_prompt: str,
     model: Optional[str] = None,
 ) -> type:
-    try:
-        from agents import Agent
-    except ImportError:
-        logger.error("agents パッケージがインストールされていません")
-        raise
+    from ..llm.native_runtime import AgentDefinition
 
     class DynamicCharacterAgent:
         def __init__(self, model: Optional[str] = None):
             effective_model = model or "gpt-4o-mini"
-            self.agent = Agent(
+            self.agent = AgentDefinition(
                 name=agent_name,
                 instructions=system_prompt,
                 model=effective_model,

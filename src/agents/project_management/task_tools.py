@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import UUID
 
-from agents import function_tool
+from ...tools.core import tool
 
 from ...task_time import DEFAULT_TASK_TIMEZONE
 from .common import (
@@ -20,7 +20,7 @@ from .common import (
 def build_task_tools() -> list:
     """タスクのCRUD・割り当て・スケジュール関連ツールのツール群を生成して返す。"""
 
-    @function_tool
+    @tool
     def list_tasks(
         project: str = "", project_id: str = "", status: str = "", search: str = ""
     ) -> str:
@@ -51,7 +51,7 @@ def build_task_tools() -> list:
 
         return _json(_run_async(_list()))
 
-    @function_tool
+    @tool
     def create_task(
         title: str,
         description: str = "",
@@ -124,7 +124,7 @@ def build_task_tools() -> list:
 
         return _json(_run_async(_create()))
 
-    @function_tool
+    @tool
     def update_task(
         task_id: str,
         title: str = "",
@@ -198,7 +198,7 @@ def build_task_tools() -> list:
 
         return _json(_run_async(_update()))
 
-    @function_tool
+    @tool
     def delete_task(task_id: str) -> str:
         """Soft-delete a task by id."""
         from ...memory.database import get_database_manager
@@ -231,7 +231,7 @@ def build_task_tools() -> list:
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
 
-    @function_tool
+    @tool
     def assign_task(
         task_id: str, assignee_ids: str, project: str = "", project_id: str = ""
     ) -> str:
@@ -263,7 +263,7 @@ def build_task_tools() -> list:
 
         return _json(_run_async(_assign()))
 
-    @function_tool
+    @tool
     def schedule_task(
         task_id: str,
         due_date: str = "",

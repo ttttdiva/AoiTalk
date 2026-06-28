@@ -1,5 +1,6 @@
 "use client";
 
+import { useCallback } from "react";
 import {
   MessageSquare,
   ShieldCheck,
@@ -15,12 +16,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Button } from "@/components/ui/button";
-
-export type GenerationProfile =
-  | "chat"
-  | "assisted_work"
-  | "autonomous_work"
-  | "review";
+import type { GenerationProfile } from "@/lib/generation-profile";
 
 const GENERATION_PROFILES = [
   {
@@ -52,19 +48,43 @@ const GENERATION_PROFILES = [
 type Props = {
   value: GenerationProfile;
   onChange: (mode: GenerationProfile) => void;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onComposerFocusRequest?: () => void;
 };
 
-export function GenerationProfileSelector({ value, onChange }: Props) {
+export function GenerationProfileSelector({
+  value,
+  onChange,
+  open,
+  onOpenChange,
+  onComposerFocusRequest,
+}: Props) {
   const current =
     GENERATION_PROFILES.find((m) => m.value === value) ??
     GENERATION_PROFILES[0];
   const CurrentIcon = current.icon;
+  const focusComposer = useCallback(() => {
+    requestAnimationFrame(() => onComposerFocusRequest?.());
+  }, [onComposerFocusRequest]);
 
   return (
-    <DropdownMenu>
+    <DropdownMenu
+      open={open}
+      onOpenChange={(nextOpen) => {
+        onOpenChange(nextOpen);
+        if (!nextOpen) focusComposer();
+      }}
+    >
       <DropdownMenuTrigger
         render={
-          <Button variant="ghost" size="icon" className="shrink-0" title={current.label} />
+          <Button
+            variant="ghost"
+            size="icon"
+            className="shrink-0"
+            title={`${current.label} (Ctrl+M)`}
+            aria-label="動作モード"
+          />
         }
       >
         <CurrentIcon className="size-4" />
@@ -74,7 +94,11 @@ export function GenerationProfileSelector({ value, onChange }: Props) {
       <DropdownMenuContent side="top" sideOffset={8} align="start" className="w-64">
         <DropdownMenuRadioGroup
           value={value}
-          onValueChange={(v) => onChange(v as GenerationProfile)}
+          onValueChange={(v) => {
+            onChange(v as GenerationProfile);
+            onOpenChange(false);
+            focusComposer();
+          }}
         >
           {GENERATION_PROFILES.map((mode) => {
             const Icon = mode.icon;

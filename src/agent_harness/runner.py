@@ -6,8 +6,10 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import shutil
 from pathlib import Path
+from typing import Any
 
 from .config import AgentHarnessSettings
 from .models import HarnessEventCallback, RunResult, WorkItem
@@ -165,10 +167,115 @@ class CodexExecRunner(AgentRunner):
         return cmd
 
 
+class ClaudeCodeRunner(AgentRunner):
+    """Run Claude Code CLI as a repository agent in the task worktree."""
+
+    def __init__(self, settings: AgentHarnessSettings):
+        self.settings = settings
+
+    async def run(
+        self,
+        *,
+        work_item: WorkItem,
+        workspace: Path,
+        prompt: str,
+        attempt: int | None,
+        on_event: HarnessEventCallback | None = None,
+    ) -> RunResult:
+        cmd = self._command(prompt)
+        if on_event:
+            await _emit(
+                on_event,
+                {
+                    "event": "claude_code_started",
+                    "message": {
+                        "work_item": work_item.identifier,
+                        "attempt": attempt,
+                        "workspace": str(workspace),
+                    },
+                },
+            )
+        return await _run_plain_process(
+            cmd,
+            cwd=workspace,
+            event_name="claude_output",
+            failure_event="claude_code_failed",
+            on_event=on_event,
+        )
+
+    def _command(self, prompt: str) -> list[str]:
+        bin_path = shutil.which(self.settings.claude.bin_path) or self.settings.claude.bin_path
+        cmd = [bin_path, "-p"]
+        if self.settings.claude.model:
+            cmd.extend(["--model", self.settings.claude.model])
+        if self.settings.claude.reasoning_effort:
+            cmd.extend(["--effort", self.settings.claude.reasoning_effort])
+        cmd.append(prompt)
+        return cmd
+
+
+class CustomCommandRunner(AgentRunner):
+    """Run a configured command as an Agent Team work runner."""
+
+    def __init__(self, settings: AgentHarnessSettings):
+        self.settings = settings
+
+    async def run(
+        self,
+        *,
+        work_item: WorkItem,
+        workspace: Path,
+        prompt: str,
+        attempt: int | None,
+        on_event: HarnessEventCallback | None = None,
+    ) -> RunResult:
+        cmd = self._command(work_item=work_item, workspace=workspace, prompt=prompt)
+        if not cmd:
+            return RunResult(success=False, message="custom_command runner is not configured")
+        if on_event:
+            await _emit(
+                on_event,
+                {
+                    "event": "custom_agent_started",
+                    "message": {
+                        "work_item": work_item.identifier,
+                        "attempt": attempt,
+                        "workspace": str(workspace),
+                    },
+                },
+            )
+        return await _run_plain_process(
+            cmd,
+            cwd=workspace,
+            event_name="custom_agent_output",
+            failure_event="custom_agent_failed",
+            on_event=on_event,
+        )
+
+    def _command(self, *, work_item: WorkItem, workspace: Path, prompt: str) -> list[str]:
+        command = str(self.settings.custom_command.command or "").strip()
+        if not command:
+            return []
+        values = {
+            "prompt": prompt,
+            "workspace": str(workspace),
+            "work_item": work_item.identifier,
+        }
+        parts = shlex.split(command, posix=os.name != "nt")
+        args = [str(arg).format(**values) for arg in self.settings.custom_command.args]
+        if "{prompt}" not in command and not any("{prompt}" in arg for arg in args):
+            args.append(prompt)
+        return [part.format(**values) for part in parts] + args
+
+
 def build_runner(settings: AgentHarnessSettings) -> AgentRunner:
     runner_name = settings.codex.runner.strip().lower()
-    if runner_name == "codex_exec":
+    if runner_name in {"codex_exec", "codex_cli"}:
         return CodexExecRunner(settings)
+    if runner_name in {"claude_code", "claude_cli"}:
+        return ClaudeCodeRunner(settings)
+    if runner_name == "custom_command":
+        return CustomCommandRunner(settings)
     raise ValueError(f"Unsupported agent harness runner: {settings.codex.runner}")
 
 
@@ -176,6 +283,51 @@ async def _emit(on_event: HarnessEventCallback, event: dict[str, Any]) -> None:
     maybe = on_event(event)
     if asyncio.iscoroutine(maybe):
         await maybe
+
+
+async def _run_plain_process(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    event_name: str,
+    failure_event: str,
+    on_event: HarnessEventCallback | None = None,
+) -> RunResult:
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=str(cwd),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env={**os.environ, "NO_COLOR": "1"},
+    )
+    assert process.stdout is not None
+    output_lines: list[str] = []
+    while True:
+        line = await process.stdout.readline()
+        if not line:
+            break
+        text = line.decode("utf-8", errors="replace").rstrip()
+        if not text:
+            continue
+        output_lines.append(text)
+        output_lines = output_lines[-200:]
+        if on_event:
+            await _emit(on_event, {"event": event_name, "message": text})
+
+    return_code = await process.wait()
+    message = "\n".join(output_lines).strip()
+    if return_code == 0:
+        return RunResult(success=True, message=message)
+    if on_event:
+        await _emit(
+            on_event,
+            {
+                "event": failure_event,
+                "message": {"exit_code": return_code, "error": message},
+            },
+        )
+    return RunResult(success=False, message=message or f"runner failed: {return_code}")
 
 
 def _extract_agent_message(payload: dict[str, Any]) -> str:

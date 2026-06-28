@@ -13,18 +13,26 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .base import CLIBackendBase
+from ..generation_policy import (
+    GenerationProfile,
+    PermissionPolicy,
+    get_current_generation_policy,
+)
+from .base import CLIBackendBase, CLIEventCallback
 
 logger = logging.getLogger(__name__)
 
 _USAGE_LIMIT_PREFIX = "You've hit your usage limit for "
 
-_CODEX_CHAT_ADAPTER_PREAMBLE = """\
-You are being used as a plain text-generation backend inside the AoiTalk chat app.
-Do not act as a coding agent unless the user explicitly asks for code or repository work.
-Do not inspect files, edit files, create branches, mention AGENTS.md/CLAUDE.md, or describe Codex operating policy.
-Treat the following content as chat instructions and conversation context for the assistant response.
-Return only the final assistant message for the current user request.
+_CODEX_ADAPTER_PREAMBLE = """\
+You are the model backend inside the AoiTalk app.
+Use the AoiTalk tools listed in the system context through the documented
+[TOOL_CALL: name(args...)] format whenever the task requires file access, web
+search, project DB updates, or other external actions that AoiTalk exposes.
+Treat tool results as the only proof that external work happened, and continue
+requesting the next needed tool call when a result reveals required follow-up
+work. Return the final user-facing assistant message when the available tool
+results are enough to answer accurately.
 """
 
 
@@ -42,6 +50,7 @@ class CodexCLIBackend(CLIBackendBase):
 
     def get_cli_command(self, prompt: str) -> List[str]:
         """Build a Codex CLI command."""
+        policy = get_current_generation_policy()
         bin_path = os.getenv("CODEX_BIN", "codex")
         cmd = [
             bin_path,
@@ -50,8 +59,9 @@ class CodexCLIBackend(CLIBackendBase):
             "--color",
             "never",
             "--ephemeral",
-            "--ignore-rules",
         ]
+        if policy.profile == GenerationProfile.CHAT:
+            cmd.append("--ignore-rules")
 
         model = self._model or os.getenv("CODEX_MODEL")
         if model:
@@ -61,7 +71,23 @@ class CodexCLIBackend(CLIBackendBase):
         if reasoning_effort:
             cmd.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
 
-        sandbox = os.getenv("CODEX_SANDBOX", "read-only").strip()
+        approval_policy = os.getenv("CODEX_APPROVAL_POLICY")
+        if (
+            approval_policy is None
+            and policy.permission_policy == PermissionPolicy.AUTO_APPROVE
+        ):
+            approval_policy = "never"
+        if approval_policy:
+            cmd.extend(["-c", f'approval_policy="{approval_policy.strip()}"'])
+
+        sandbox = os.getenv("CODEX_SANDBOX")
+        if sandbox is None:
+            sandbox = (
+                "workspace-write"
+                if policy.permission_policy == PermissionPolicy.AUTO_APPROVE
+                else "read-only"
+            )
+        sandbox = sandbox.strip()
         if sandbox:
             cmd.extend(["--sandbox", sandbox])
 
@@ -97,6 +123,122 @@ class CodexCLIBackend(CLIBackendBase):
             return agent_messages[-1]
 
         return super().parse_output(raw_output)
+
+    def handle_stream_output_line(
+        self,
+        line: str,
+        event_callback: CLIEventCallback,
+    ) -> None:
+        """Convert Codex JSONL events into AoiTalk stream progress events."""
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            return
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            return
+
+        event_type = str(event.get("type") or event.get("method") or "")
+        if event_type == "turn.started":
+            event_callback(
+                "status_update",
+                {
+                    "status": "codex_turn_started",
+                    "message": "Codex CLI turn started",
+                },
+            )
+            return
+        if event_type == "turn.completed":
+            event_callback(
+                "status_update",
+                {
+                    "status": "codex_turn_completed",
+                    "message": "Codex CLI turn completed",
+                },
+            )
+            return
+        if event_type == "error":
+            message = event.get("message")
+            event_callback(
+                "status_update",
+                {
+                    "status": "codex_error",
+                    "message": str(message or "Codex CLI error"),
+                },
+            )
+            return
+
+        item = event.get("item")
+        if not isinstance(item, dict):
+            return
+        item_type = str(item.get("type") or "")
+        label = self._stream_item_label(item)
+        if event_type == "item.started":
+            if self._is_tool_like_item(item):
+                event_callback(
+                    "tool_start",
+                    {
+                        "tool": label,
+                        "tool_args": {},
+                        "message": f"Codex CLI started {label}",
+                    },
+                )
+            elif item_type:
+                event_callback(
+                    "status_update",
+                    {
+                        "status": f"codex_{item_type}_started",
+                        "message": f"Codex CLI started {label}",
+                    },
+                )
+            return
+        if event_type == "item.completed":
+            if self._is_tool_like_item(item):
+                event_callback(
+                    "tool_end",
+                    {
+                        "tool": label,
+                        "tool_args": {},
+                        "message": f"Codex CLI completed {label}",
+                        "tool_result": {
+                            "tool": label,
+                            "arguments": {},
+                            "output": self._stream_item_output(item),
+                        },
+                    },
+                )
+            elif item_type and item_type != "agent_message":
+                event_callback(
+                    "status_update",
+                    {
+                        "status": f"codex_{item_type}_completed",
+                        "message": f"Codex CLI completed {label}",
+                    },
+                )
+
+    def _stream_item_label(self, item: dict[str, Any]) -> str:
+        for key in ("name", "command", "tool", "title", "type"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return "item"
+
+    def _stream_item_output(self, item: dict[str, Any]) -> str:
+        for key in ("output", "text", "result"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _is_tool_like_item(self, item: dict[str, Any]) -> bool:
+        item_type = str(item.get("type") or "").lower()
+        return item_type in {
+            "command",
+            "command_execution",
+            "function_call",
+            "tool_call",
+            "shell",
+        }
 
     def parse_error_output(self, stdout: str, stderr: str, exit_code: int) -> Optional[str]:
         """Extract Codex JSONL failure messages into a concise chat error."""
@@ -150,14 +292,16 @@ class CodexCLIBackend(CLIBackendBase):
         timeout: int = 300,
         extra_args: Optional[List[str]] = None,
         system_context: Optional[str] = None,
+        event_callback: Optional[CLIEventCallback] = None,
     ):
         """Codex accepts one initial instruction stream, so pass it via stdin."""
+        policy = get_current_generation_policy()
         combined_prompt = prompt
         if system_context:
             combined_prompt = (
                 f"{system_context}\n\nUser request:\n{prompt}" if prompt else system_context
             )
-        combined_prompt = f"{_CODEX_CHAT_ADAPTER_PREAMBLE}\n\n{combined_prompt}"
+        combined_prompt = f"{_CODEX_ADAPTER_PREAMBLE}\n\n{combined_prompt}"
 
         return super().execute_prompt(
             "",
@@ -165,6 +309,7 @@ class CodexCLIBackend(CLIBackendBase):
             timeout=timeout,
             extra_args=extra_args,
             system_context=combined_prompt,
+            event_callback=event_callback,
         )
 
     def get_mcp_args(self, mcp_servers: Dict[str, Any]) -> List[str]:

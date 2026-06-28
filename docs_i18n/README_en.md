@@ -15,7 +15,7 @@ Task and project management are the center of the product. WebUI chat, speech in
 
 - **Voice-capable interaction**: Depending on configuration, AoiTalk can use recognition engines such as Whisper, Parakeet, Google Speech, and Gemini, plus TTS engines such as VOICEVOX, VOICEROID, A.I.VOICE, CeVIO, AivisSpeech, Nijivoice, Azure TTS, gTTS, and Irodori TTS.
 - **Task and project management**: Projects, spaces, tasks, statuses, due dates, recurrence rules, task occurrences, notifications, time entries, and reports are stored in PostgreSQL.
-- **Specialist AI agents**: Runtime delegation covers project management, filesystem work, utility tasks, media, Spotify, and skills so the assistant can perform work instead of only discussing it.
+- **AI tool execution**: Search, filesystem work, project DB/task operations, and skill invocation are direct root tools. Only domains without equivalent direct tools, such as utility, media, Spotify, writing, import, and scenario work, remain as high-level specialist delegation.
 - **Documents and knowledge**: The filer, Office/PDF reading, Qdrant-backed RAG, knowledge workspaces, and project information organizers help reuse project material and working notes.
 - **Integrations**: Google Calendar, MCP servers, OpenAI-compatible LLMs, OpenRouter, Gemini, Ollama, and SGLang can be enabled as needed.
 
@@ -86,7 +86,7 @@ See `.env.sample` and `docs/setup_guide.md` for details.
 
 ## Task Management APIs
 
-Task management is built into AoiTalk. `project_management_assistant` works directly through the app backend and APIs rather than through a separate MCP server.
+Task management and project DB updates are built into AoiTalk. The root runtime uses direct project tools against the app backend and APIs.
 
 - `/api/tasks`
 - `/api/task-occurrences`
@@ -95,17 +95,14 @@ Task management is built into AoiTalk. `project_management_assistant` works dire
 - `/api/notifications`
 - `/api/projects/{id}/notification-settings`
 
-## Specialist Tools
+## Runtime Tools
 
-Runtime specialist delegation is managed in `src/llm/runtime_tool_registry.py`.
+The root runtime exposes search, filesystem, project DB/task, and skill invocation as direct tools. High-level specialist delegation remains only for domains that do not duplicate those direct tools.
 
-- `project_management_assistant`
-- `filesystem_assistant`
-- `utility_assistant`
-- `media_assistant`
-- `spotify_assistant`
-- `skills_assistant`
-
+- Search: `web_search`, `grok_x_search`, `knowledge_search`, `search_memory`
+- Filesystem: `find_workspace_items`, `read_workspace_file`, `search_files`, `list_directory`, `execute_command`
+- Project: `get_project_context`, `list_project_information`, `organize_project_information_from_folder`, `sync_wbs_tasks`, `create_task`
+- High-level specialists: `utility_assistant`, `media_assistant`, `spotify_assistant`, `writing_assistant`, `import_assistant`, `scenario_assistant`
 ## MCP Servers
 
 Configured MCP servers live under the `mcp` section of `config/config.yaml`.

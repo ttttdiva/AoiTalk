@@ -3,7 +3,7 @@ Calculation tools for mathematical operations
 """
 import math
 import re
-from ..core import tool as function_tool
+from ..core import tool
 
 
 def calculate_impl(expression: str) -> str:
@@ -122,7 +122,7 @@ def calculate_impl(expression: str) -> str:
         return error_msg
 
 
-@function_tool
+@tool
 def calculate(expression: str) -> str:
     """数式を計算します。基本的な四則演算、数学関数、定数が使用できます。
     

@@ -20,10 +20,16 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Optional
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 import xml.etree.ElementTree as ET
 
 import httpx
+
+from ..llm.agent_runtime import (
+    OpenAIToolCallRecord,
+    reset_verified_tool_execution_claims,
+    set_verified_tool_execution_claims,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +79,21 @@ def _source_key(source: "DeepResearchSource") -> str:
     if source.url:
         return source.url.rstrip("/").lower()
     return f"{source.engine}:{source.title.lower()}"
+
+
+def _normalize_duckduckgo_url(url: str) -> str:
+    value = html.unescape(str(url or "")).strip()
+    parsed = urlparse(value)
+    if (
+        (not parsed.netloc or "duckduckgo.com" in parsed.netloc)
+        and parsed.path.startswith("/l/")
+    ):
+        target = parse_qs(parsed.query).get("uddg", [""])[0]
+        if target:
+            return unquote(target)
+    if value.startswith("//"):
+        return f"https:{value}"
+    return value
 
 
 def _safe_filename(job_id: str) -> str:
@@ -379,7 +400,12 @@ class DeepResearchSearchClient:
         selected = [engine.lower() for engine in engines]
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
             if "searxng" in selected:
-                tasks.append(self._search_searxng(client, query, max_results_per_engine))
+                if self._searxng_url():
+                    tasks.append(self._search_searxng(client, query, max_results_per_engine))
+                elif "duckduckgo" not in selected:
+                    tasks.append(self._search_duckduckgo(client, query, max_results_per_engine))
+            if "duckduckgo" in selected:
+                tasks.append(self._search_duckduckgo(client, query, max_results_per_engine))
             if "wikipedia" in selected:
                 tasks.append(self._search_wikipedia(client, query, max_results_per_engine))
             if "arxiv" in selected:
@@ -413,6 +439,7 @@ class DeepResearchSearchClient:
         searxng_url = self._searxng_url()
         return [
             {"id": "searxng", "label": "SearXNG", "available": bool(searxng_url)},
+            {"id": "duckduckgo", "label": "DuckDuckGo HTML", "available": True},
             {"id": "wikipedia", "label": "Wikipedia", "available": True},
             {"id": "arxiv", "label": "arXiv", "available": True},
             {"id": "openalex", "label": "OpenAlex", "available": True},
@@ -426,6 +453,53 @@ class DeepResearchSearchClient:
             or _config_get(self.config, "search.searxng_url", "")
         )
         return str(configured).rstrip("/") if configured else ""
+
+    async def _search_duckduckgo(
+        self, client: httpx.AsyncClient, query: str, limit: int
+    ) -> list[DeepResearchSource]:
+        response = await client.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query, "kl": "jp-jp"},
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (compatible; AoiTalkLocalSearch/0.1; "
+                    "+https://github.com/ttttdiva/41_AoiTalk)"
+                )
+            },
+        )
+        response.raise_for_status()
+        text = response.text
+        sources: list[DeepResearchSource] = []
+        matches = list(
+            re.finditer(
+                r'<a[^>]+class="[^"]*\bresult__a\b[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+                text,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        )
+        for index, match in enumerate(matches[:limit]):
+            href = _normalize_duckduckgo_url(html.unescape(match.group(1)))
+            title = _strip_html(match.group(2))
+            if not title:
+                continue
+            block_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            block = text[match.end() : block_end]
+            snippet_match = re.search(
+                r'class="[^"]*\bresult__snippet\b[^"]*"[^>]*>(.*?)</(?:a|div)>',
+                block,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            sources.append(
+                DeepResearchSource(
+                    id=0,
+                    title=title,
+                    url=href,
+                    snippet=_strip_html(snippet_match.group(1) if snippet_match else ""),
+                    engine="duckduckgo",
+                    query=query,
+                )
+            )
+        return sources
 
     async def _search_searxng(
         self, client: httpx.AsyncClient, query: str, limit: int
@@ -925,13 +999,62 @@ class DeepResearchRunner:
 - 根拠が弱い点は「未確認」または「追加調査が必要」と明記する
 - 最後に「次に調べるべきこと」を3項目以内で出す
 """
+        token = set_verified_tool_execution_claims(
+            [
+                self._deep_research_search_record(
+                    request,
+                    sources,
+                    questions_by_iteration,
+                )
+            ]
+        )
         try:
             report = await llm.generate(prompt, max_tokens=4096)
         except Exception as exc:
             logger.warning("Report synthesis failed: %s", exc)
             report = self._fallback_report(request.query, sources)
+        finally:
+            reset_verified_tool_execution_claims(token)
 
         return self._append_bibliography(report.strip(), sources)
+
+    def _deep_research_search_record(
+        self,
+        request: DeepResearchRequest,
+        sources: list[DeepResearchSource],
+        questions_by_iteration: dict[str, list[str]],
+    ) -> OpenAIToolCallRecord:
+        source_lines = []
+        for source in sources[:20]:
+            source_lines.append(
+                (
+                    f"[{source.id}] {source.title} "
+                    f"({source.engine}) {source.url or '(local)'}"
+                ).strip()
+            )
+
+        questions = [
+            question
+            for items in questions_by_iteration.values()
+            for question in items
+        ]
+        result = "\n".join(
+            [
+                "Deep Research search completed successfully.",
+                f"Topic: {request.query}",
+                f"Search queries: {len(questions)}",
+                f"Sources collected: {len(sources)}",
+                *source_lines,
+            ]
+        )
+        return OpenAIToolCallRecord(
+            tool="web_search",
+            arguments={
+                "request": request.query,
+                "source": "deep_research",
+            },
+            result=result,
+        )
 
     def _fallback_report(self, query: str, sources: list[DeepResearchSource]) -> str:
         lines = [f"# Deep Research: {query}", "", "## 収集ソースの要約"]

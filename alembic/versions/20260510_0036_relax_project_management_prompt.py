@@ -30,7 +30,7 @@ def upgrade() -> None:
             """
             UPDATE characters
             SET system_prompt = :prompt
-            WHERE slug = 'project_management_assistant'
+            WHERE slug = 'project_manager'
             """
         ),
         {"prompt": PROJECT_MANAGEMENT_PROMPT},

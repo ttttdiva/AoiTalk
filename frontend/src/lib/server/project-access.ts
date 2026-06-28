@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { db } from "@/db";
 import { projectMembers, projects } from "@/db/schema";
 
@@ -6,7 +6,7 @@ export async function getAccessibleProject(projectId: string, userId: string) {
   const [project] = await db
     .select()
     .from(projects)
-    .where(eq(projects.id, projectId))
+    .where(and(eq(projects.id, projectId), isNull(projects.deletedAt)))
     .limit(1);
   if (!project) return null;
 

@@ -9,8 +9,12 @@ import socket
 import psutil
 from typing import Optional, Dict, Any
 import requests
-from voicevox import Client
 import aiohttp
+
+try:
+    from voicevox import Client as VoicevoxClient
+except ImportError:
+    from vvclient import Client as VoicevoxClient
 
 
 class VoicevoxEngine:
@@ -31,6 +35,38 @@ class VoicevoxEngine:
         self.process = None
         self.client = None
         self.session = None  # aiohttp session for connection pooling
+
+    def _create_client(self):
+        try:
+            return VoicevoxClient(base_url=self.base_url)
+        except TypeError:
+            return VoicevoxClient(base_uri=self.base_url)
+
+    async def _attach_session(self):
+        if not self.client or not self.session:
+            return
+
+        if hasattr(self.client, '_session'):
+            if self.client._session and not self.client._session.closed:
+                await self.client._session.close()
+            self.client._session = self.session
+            return
+
+        http_client = getattr(self.client, 'http', None)
+        if http_client and hasattr(http_client, '_session'):
+            if http_client._session and not http_client._session.closed:
+                await http_client._session.close()
+            http_client._session = self.session
+
+    @staticmethod
+    def _set_audio_query_value(audio_query: Any, attr_name: str, api_key: str, value: float):
+        if hasattr(audio_query, attr_name):
+            setattr(audio_query, attr_name, value)
+            return
+
+        data = getattr(audio_query, 'data', None)
+        if isinstance(data, dict):
+            data[api_key] = value
         
     def _is_port_in_use(self, port: int) -> bool:
         """Check if port is in use
@@ -197,14 +233,8 @@ class VoicevoxEngine:
             )
             
             # Initialize client with custom session
-            self.client = Client(base_url=self.base_url)
-            
-            # Override client's session if possible
-            if hasattr(self.client, '_session'):
-                # Close default session if exists
-                if self.client._session and not self.client._session.closed:
-                    await self.client._session.close()
-                self.client._session = self.session
+            self.client = self._create_client()
+            await self._attach_session()
             
             return True
         except Exception as e:
@@ -264,10 +294,10 @@ class VoicevoxEngine:
                 audio_query = await self.client.create_audio_query(text, speaker=speaker_id)
                 
                 # Apply voice parameters
-                audio_query.speed_scale = speed
-                audio_query.pitch_scale = pitch
-                audio_query.intonation_scale = intonation
-                audio_query.volume_scale = volume
+                self._set_audio_query_value(audio_query, 'speed_scale', 'speedScale', speed)
+                self._set_audio_query_value(audio_query, 'pitch_scale', 'pitchScale', pitch)
+                self._set_audio_query_value(audio_query, 'intonation_scale', 'intonationScale', intonation)
+                self._set_audio_query_value(audio_query, 'volume_scale', 'volumeScale', volume)
                 
                 # Synthesize audio
                 audio_data = await audio_query.synthesis(speaker=speaker_id)
@@ -310,13 +340,8 @@ class VoicevoxEngine:
                             )
                             
                             # Create new client
-                            self.client = Client(base_url=self.base_url)
-                            
-                            # Override client's session if possible
-                            if hasattr(self.client, '_session'):
-                                if self.client._session and not self.client._session.closed:
-                                    await self.client._session.close()
-                                self.client._session = self.session
+                            self.client = self._create_client()
+                            await self._attach_session()
                                 
                             print("[VOICEVOX] Client reinitialized")
                         except Exception as reinit_error:
@@ -338,10 +363,24 @@ class VoicevoxEngine:
         """
         if not self.client:
             return None
-            
+
         try:
-            speakers = await self.client.fetch_speakers()
-            return speakers
+            if hasattr(self.client, 'fetch_speakers'):
+                return await self.client.fetch_speakers()
+
+            session = self.session
+            owns_session = False
+            if not session or session.closed:
+                session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30, connect=5))
+                owns_session = True
+
+            try:
+                async with session.get(f"{self.base_url}/speakers") as response:
+                    response.raise_for_status()
+                    return await response.json()
+            finally:
+                if owns_session:
+                    await session.close()
         except Exception as e:
             print(f"Failed to fetch speakers: {e}")
             return None
@@ -378,4 +417,4 @@ class VoicevoxEngine:
         
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit"""
-        await self.cleanup() 
+        await self.cleanup()

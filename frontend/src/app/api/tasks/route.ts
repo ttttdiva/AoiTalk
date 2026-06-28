@@ -20,10 +20,9 @@ import {
   min,
   sql,
   lte,
-  gte,
 } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
-import { normalizeTaskStatus } from "@/lib/task-status";
+import { isClosedTaskStatus, normalizeTaskStatus } from "@/lib/task-status";
 import { enqueueAutoSyncGoogleCalendarForTask } from "@/lib/server/google-calendar-auto-sync";
 import { computeOccurrencesInRange } from "@/lib/recurrence-preview";
 import {
@@ -56,6 +55,11 @@ import {
   isRecurrenceSkipSourceKind,
   resolveOccurrenceOriginalStartAt,
 } from "@/lib/recurrence-exceptions";
+import {
+  chooseEarliestOpenOccurrence,
+  occurrenceOverlapsRange,
+  shouldIncludeTaskScheduleOccurrence,
+} from "@/lib/task-list-effective-occurrence";
 
 const TASK_LIST_OCCURRENCE_LOOKAHEAD_DAYS = 366;
 
@@ -76,17 +80,6 @@ function addDays(date: Date, days: number): Date {
   const next = new Date(date);
   next.setDate(next.getDate() + days);
   return next;
-}
-
-function overlapsRange(
-  start: Date | null,
-  end: Date | null,
-  rangeStart: Date,
-  rangeEnd: Date,
-): boolean {
-  if (!start) return false;
-  const effectiveEnd = end ?? start;
-  return start <= rangeEnd && effectiveEnd >= rangeStart;
 }
 
 function toLocalTimestampKey(value: DbTimestampValue): string {
@@ -132,7 +125,6 @@ async function resolveTaskListEffectiveOccurrences(
             and(
               inArray(taskOccurrences.taskId, recurrenceTaskIds),
               lte(taskOccurrences.startAt, toDbLocalTimestamp(rangeEnd)),
-              gte(taskOccurrences.endAt, toDbLocalTimestamp(rangeStart)),
             ),
           );
 
@@ -170,8 +162,12 @@ async function resolveTaskListEffectiveOccurrences(
       hiddenOccurrences.add(originalKey);
       continue;
     }
+    if (originalKey && isClosedTaskStatus(row.status)) {
+      hiddenOccurrences.add(originalKey);
+    }
 
-    if (!overlapsRange(rowStartAt, rowEndAt, rangeStart, rangeEnd)) continue;
+    if (!occurrenceOverlapsRange(rowStartAt, rowEndAt, rangeStart, rangeEnd))
+      continue;
 
     setOccurrence(row.taskId, occurrenceKey(row.taskId, row.startAt), {
       id: row.id,
@@ -198,7 +194,16 @@ async function resolveTaskListEffectiveOccurrences(
     const baseEndLocal = dbTimestampToLocalDate(baseEnd);
     if (!baseStartLocal) continue;
 
-    if (overlapsRange(baseStartLocal, baseEndLocal, rangeStart, rangeEnd)) {
+    if (
+      shouldIncludeTaskScheduleOccurrence({
+        start: baseStartLocal,
+        end: baseEndLocal,
+        status: task.status,
+        rangeStart,
+        rangeEnd,
+        blocked: hiddenOccurrences.has(occurrenceKey(task.id, baseStart)),
+      })
+    ) {
       const key = occurrenceKey(task.id, baseStart);
       if (!hiddenOccurrences.has(key)) {
         setOccurrence(task.id, key, {
@@ -245,7 +250,8 @@ async function resolveTaskListEffectiveOccurrences(
 
     for (const nextStart of upcomingStarts) {
       const nextEnd = applyOccurrenceDuration(nextStart, durationMs);
-      if (!overlapsRange(nextStart, nextEnd, rangeStart, rangeEnd)) continue;
+      if (!occurrenceOverlapsRange(nextStart, nextEnd, rangeStart, rangeEnd))
+        continue;
 
       const nextStartDb = localDateToDbTimestampDate(nextStart) ?? nextStart;
       const nextEndDb = nextEnd
@@ -268,11 +274,10 @@ async function resolveTaskListEffectiveOccurrences(
 
   const effectiveByTask = new Map<string, EffectiveOccurrence>();
   for (const [taskId, occurrences] of occurrenceMaps) {
-    const effective = [...occurrences.values()].sort((a, b) => {
-      const aTime = dbTimestampToLocalDate(a.startAt)?.getTime() ?? 0;
-      const bTime = dbTimestampToLocalDate(b.startAt)?.getTime() ?? 0;
-      return aTime - bTime;
-    })[0];
+    const effective = chooseEarliestOpenOccurrence([...occurrences.values()], {
+      getStart: (occurrence) => dbTimestampToLocalDate(occurrence.startAt),
+      getStatus: (occurrence) => occurrence.status,
+    });
     if (effective) effectiveByTask.set(taskId, effective);
   }
 

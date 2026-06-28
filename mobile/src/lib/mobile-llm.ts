@@ -223,6 +223,23 @@ export async function getConfiguredDirectMobileLlmSettings(
   return null;
 }
 
+export async function getConfiguredFallbackMobileLlmSettings(
+  mainProvider?: MobileLlmProvider,
+): Promise<MobileLlmSettings | null> {
+  const provider = await getMobileLlmFallbackProvider();
+  if (!provider || provider === "off" || provider === mainProvider) {
+    return null;
+  }
+
+  await migrateLegacyProfileIfNeeded(provider);
+  const profile = await getStoredProfile(provider);
+  const settings = { provider, ...profile };
+  if (isMobileLlmConfigured(settings)) {
+    return settings;
+  }
+  return null;
+}
+
 export async function saveMobileLlmSettings(
   settings: MobileLlmSettings,
 ): Promise<void> {

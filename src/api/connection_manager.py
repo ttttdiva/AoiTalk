@@ -14,6 +14,7 @@ class ConnectionManager:
     def __init__(self) -> None:
         self.active_connections: Set[WebSocket] = set()
         self.connection_contexts: Dict[WebSocket, Dict[str, Optional[str]]] = {}
+        self._latest_session_id: Optional[str] = None
         # Legacy shared chat history (for backward compatibility when auth disabled)
         self.chat_history: List[dict] = []
         self.max_history = 100
@@ -36,6 +37,8 @@ class ConnectionManager:
             "user_id": user_id,
             "session_id": session_id,
         }
+        if session_id:
+            self._latest_session_id = session_id
         logger.info(
             f"Client connected. Total connections: {len(self.active_connections)}"
         )
@@ -45,11 +48,42 @@ class ConnectionManager:
 
     def disconnect(self, websocket: WebSocket) -> None:
         """Remove WebSocket connection"""
+        context = self.connection_contexts.get(websocket, {})
         self.active_connections.discard(websocket)
         self.connection_contexts.pop(websocket, None)
+        if context.get("session_id") == self._latest_session_id:
+            self._latest_session_id = self._resolve_any_active_session_id()
         logger.info(
             f"Client disconnected. Total connections: {len(self.active_connections)}"
         )
+
+    def _resolve_any_active_session_context(self) -> Optional[Dict[str, Optional[str]]]:
+        for context in self.connection_contexts.values():
+            session_id = context.get("session_id")
+            if session_id:
+                return dict(context)
+        return None
+
+    def _resolve_any_active_session_id(self) -> Optional[str]:
+        context = self._resolve_any_active_session_context()
+        return context.get("session_id") if context else None
+
+    def get_latest_session_context(self) -> Optional[Dict[str, Optional[str]]]:
+        """Return context for the most recent connected chat session."""
+        if self._latest_session_id:
+            for context in self.connection_contexts.values():
+                if context.get("session_id") == self._latest_session_id:
+                    return dict(context)
+            self._latest_session_id = None
+
+        context = self._resolve_any_active_session_context()
+        self._latest_session_id = context.get("session_id") if context else None
+        return context
+
+    def get_latest_session_id(self) -> Optional[str]:
+        """Return the most recent connected chat session, if it is still active."""
+        context = self.get_latest_session_context()
+        return context.get("session_id") if context else None
 
     async def broadcast(
         self,

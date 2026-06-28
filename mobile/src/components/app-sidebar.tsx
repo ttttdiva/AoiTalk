@@ -127,6 +127,16 @@ function ContextSwitcher() {
             </Button>
           }
         >
+          <Menu.Item
+            leadingIcon={
+              !selectedSpaceId && !selectedProjectId ? "check" : undefined
+            }
+            onPress={() => {
+              setSelectedProjectId(null);
+              setSpaceMenuVisible(false);
+            }}
+            title="すべてのスペース"
+          />
           {spaces.map((space) => (
             <Menu.Item
               key={space.id}
@@ -159,12 +169,14 @@ function ContextSwitcher() {
           }
         >
           <Menu.Item
-            leadingIcon={!selectedProjectId ? "check" : undefined}
+            leadingIcon={
+              !selectedProjectId && !selectedSpaceId ? "check" : undefined
+            }
             onPress={() => {
               setSelectedProjectId(null);
               setProjectMenuVisible(false);
             }}
-            title="すべてのプロジェクト"
+            title="すべてのスペース"
           />
           {projects.map((project) => (
             <Menu.Item
@@ -271,7 +283,7 @@ function ChatSidebar({ close }: { close: () => void }) {
 
 function TaskSidebar({ close }: { close: () => void }) {
   const router = useRouter();
-  const { projects, selectedProjectId } = useProject();
+  const { projects, selectedProjectId, selectedSpaceId } = useProject();
   const { isAuthenticated, isAnonymous, user } = useAuth();
   const [tasks, setTasks] = useState<Task[]>([]);
   const [loading, setLoading] = useState(false);
@@ -284,6 +296,17 @@ function TaskSidebar({ close }: { close: () => void }) {
   const projectMap = useMemo(
     () => new Map(projects.map((project) => [project.id, project.name])),
     [projects],
+  );
+  const selectedSpaceProjectIds = useMemo(
+    () =>
+      selectedSpaceId
+        ? new Set(
+            projects
+              .filter((project) => project.space_id === selectedSpaceId)
+              .map((project) => project.id),
+          )
+        : null,
+    [projects, selectedSpaceId],
   );
 
   const loadTasks = useCallback(async () => {
@@ -305,11 +328,17 @@ function TaskSidebar({ close }: { close: () => void }) {
     () =>
       tasks
         .filter((task) => !task.parent_task_id)
-        .filter((task) => (selectedProjectId ? task.project_id === selectedProjectId : true))
+        .filter((task) => {
+          if (selectedProjectId) return task.project_id === selectedProjectId;
+          if (selectedSpaceProjectIds) {
+            return selectedSpaceProjectIds.has(task.project_id);
+          }
+          return true;
+        })
         .filter((task) => !COMPLETED_TASK_STATUSES.has(task.status))
         .filter((task) => !isFutureTask(task))
         .slice(0, 40),
-    [selectedProjectId, tasks],
+    [selectedProjectId, selectedSpaceProjectIds, tasks],
   );
 
   return (

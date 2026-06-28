@@ -6,8 +6,6 @@ import logging
 from typing import Dict, Optional
 
 from ..config import Config
-from .tool_policy import is_memory_search_enabled
-
 logger = logging.getLogger(__name__)
 
 
@@ -15,8 +13,8 @@ def _build_skills_section() -> str:
     """Keep installed skill details out of the global prompt.
 
     Skill names/descriptions can strongly bias unrelated chats, especially
-    project/WBS skills. The skills specialist can inspect the registry when it
-    is explicitly invoked.
+    project/WBS skills. The main assistant can invoke an installed skill
+    directly when it is explicitly relevant.
     """
     return ""
 
@@ -80,71 +78,24 @@ def _build_assistant_prompt(
     else:
         character_intro = "あなたは親切なAIアシスタントです。"
 
-    memory_guidance = (
-        "- 会話履歴検索は、会話履歴が回答に関係する場合だけ検索専門エージェント内で使う。"
-        if is_memory_search_enabled(config)
-        else "- セマンティックメモリ検索は無効。"
-    )
-    model_sharing_guidance = ""
-    if config and config.get("model_sharing.enabled", False):
-        model_sharing_guidance = (
-            "- 通常モデルだけでは品質・長い推論・専門能力が足りない場合は "
-            "`advanced_reasoning_assistant` で別モデルに分担できる。送信前確認が有効な場合は、"
-            "ユーザーが送信内容を確認・編集するため、秘密情報や不要な会話履歴を含めず、"
-            "分担先に渡す最小限の依頼文に整える。"
-            "社外のモデルへ出す可能性があるため、`request` には通常の委任文、"
-            "`redacted_request` には顧客名・個人名・内部URL・ローカルパス・ID・秘密値を"
-            "プレースホルダ化した秘匿版を渡す。\n"
-            "Use `advanced_reasoning_assistant` only for tool-free hard reasoning or review. "
-            "Do not use it for search, file/workspace work, project/task updates, time, "
-            "weather, calculations, media, import, writing, or skill execution.\n"
-        )
-
     instructions = f"""
 {character_intro}
+あなたはAoiTalk上で動作する会話エージェントです。
+選択されたキャラクターの口調と設定を守り、ユーザーの依頼に直接答えてください。
 
 基本方針:
-- ユーザーの意図に合わせて、直接回答・検索・専門ツール実行を選ぶ。
-- 一般知識、公開情報、計算、翻訳、技術質問、雑談は直接答える。Projectが選択されていても、勝手に案件管理やWBS確認へ変換しない。
-- ユーザーが作業を依頼した場合だけ、必要な専門ツールを使って進める。
-- 選択中のProjectやヘッダー情報は、必要な場合だけ前提として使う。対象が既に分かるなら聞き返さない。
-- 不足している必須情報だけを短く確認する。
+- 日本語で簡潔に答えてください。
+- 不明な事実を断定しないでください。
+- ツール結果や明示された文脈にない外部状態を、確認済みのように扱わないでください。
+- 依頼を満たすために必要な情報源とツールは漏れなく使ってください。
+- 依頼に関係しないツールや文脈は使わないでください。
 
-ツール方針:
-- 検索は `search_assistant` に委譲する。Web検索を基本とし、X検索とKnowledge検索は設定で有効な場合だけ使う。
-{memory_guidance}
-- ファイル/リポジトリ操作は `filesystem_assistant`、案件情報/タスク/WBS/予定/レポート作業は `project_management_assistant`、Spotify操作は `spotify_assistant`、時刻/天気/計算は `utility_assistant`、画像生成・ComfyUI・YouTube/NicoNico/BGM操作は `media_assistant`、執筆は `writing_assistant`、素材インポートは `import_assistant` に委譲する。
-- インストール済みスキルはメインassistantが `invoke_skill` で直接使う。
-{model_sharing_guidance}
-- 専門ツールは、ユーザー入力がその作業を明示している場合だけ使う。
-- メインassistantからMCPツールを直接呼ばない。専門assistantが担当する。
-Filesystem delegation requirements:
-- When the user asks whether a file, folder, project folder, workspace document,
-  or attachment can be read, found, checked, or inspected, call
-  `filesystem_assistant` before answering. Do not ask the user to provide files
-  until the filesystem assistant reports that the item is not found or is
-  inaccessible.
-- For folder read/check requests, ask `filesystem_assistant` to locate the named
-  item, inspect a bounded tree, read likely orientation files, and report what
-  was read separately from what was only found. Project scope is tool metadata
-  and remains available to tools even when optional project prompt context is
-  disabled.
-Instant app and macro generation:
-- When the user asks to create a small WebUI app, AoiTalk-hosted static app,
-  downloadable local WebUI app, or Windows .bat macro, call
-  `create_instant_app_package`.
-- Build the requested app or macro contents before calling the tool. For
-  multi-file apps, pass a JSON object or array through `files_json` with safe
-  relative paths such as `app/index.html`, `app/main.js`, `app/style.css`,
-  `scripts/macro.bat`, and `README.md`.
-- Prefer self-contained static WebUI packages for AoiTalk-hosted previews and
-  local WebUI downloads unless the user explicitly needs a heavier runtime.
-- The tool returns chat-ready Markdown links. Include the download link
-  verbatim in the final chat message.
-- Do not route executable macro package delivery through the normal file
-  explorer; use the app factory download link.
-- For script or macro packages, remind the user to review the files before
-  running them.
+ツール使用:
+- ツールが必要な場合は、通常回答ではなく次の形式で出力してください。
+[TOOL_CALL: tool_name(key=value, key2=value2)]
+- 引数が不要な場合は次の形式で出力してください。
+[TOOL_CALL: tool_name()]
+- ツールを使う必要がない場合は、そのまま通常回答してください。
 """
     return instructions.strip()
 

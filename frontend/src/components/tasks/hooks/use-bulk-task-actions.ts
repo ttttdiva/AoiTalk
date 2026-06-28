@@ -3,6 +3,8 @@
 import { useCallback } from "react";
 import type React from "react";
 
+import { toast } from "sonner";
+
 import { taskApi, type Task } from "@/lib/task-api";
 import { isTaskCompletionTransition } from "@/lib/task-completion-undo";
 import type { FetchDataOptions } from "@/components/tasks/hooks/use-tasks-data";
@@ -27,6 +29,7 @@ export function useBulkTaskActions({
   focusedTaskId,
   focusTaskById,
   filteredTasksRef,
+  requestRecurringDelete,
 }: {
   tasks: Task[];
   setTasks: React.Dispatch<React.SetStateAction<Task[]>>;
@@ -43,6 +46,7 @@ export function useBulkTaskActions({
   focusedTaskId: string | null;
   focusTaskById: (taskId: string | null) => void;
   filteredTasksRef: React.RefObject<Task[]>;
+  requestRecurringDelete?: (task: Task) => boolean;
 }) {
   const handleRowStatusChange = useCallback(
     async (task: Task, status: string) => {
@@ -139,9 +143,26 @@ export function useBulkTaskActions({
 
   const handleBulkDelete = useCallback(async () => {
     if (selectedIds.size === 0) return;
+    const targets = tasks.filter((t) => selectedIds.has(t.id));
+    const recurringTargets = targets.filter((task) => task.has_recurrence);
+    if (
+      recurringTargets.length > 1 ||
+      (recurringTargets.length === 1 && targets.length > 1)
+    ) {
+      toast.error("繰り返しタスクは個別に削除してください", {
+        description:
+          "今回だけ削除するか、今回以降を削除するかを選ぶ必要があります。",
+      });
+      return;
+    }
+    if (
+      recurringTargets.length === 1 &&
+      requestRecurringDelete?.(recurringTargets[0])
+    ) {
+      return;
+    }
     setBulkLoading(true);
     try {
-      const targets = tasks.filter((t) => selectedIds.has(t.id));
       pushUndo({ type: "recreate", tasks: targets });
       await Promise.all([...selectedIds].map((id) => taskApi.deleteTask(id)));
       setTasks((prev) => prev.filter((task) => !selectedIds.has(task.id)));
@@ -158,6 +179,7 @@ export function useBulkTaskActions({
     clearSelection,
     fetchData,
     pushUndo,
+    requestRecurringDelete,
     setBulkLoading,
     setTasks,
   ]);
@@ -237,6 +259,23 @@ export function useBulkTaskActions({
   const handleDeleteTasks = useCallback(
     async (taskList: Task[]) => {
       if (taskList.length === 0) return;
+      const recurringTasks = taskList.filter((task) => task.has_recurrence);
+      if (
+        recurringTasks.length > 1 ||
+        (recurringTasks.length === 1 && taskList.length > 1)
+      ) {
+        toast.error("繰り返しタスクは個別に削除してください", {
+          description:
+            "今回だけ削除するか、今回以降を削除するかを選ぶ必要があります。",
+        });
+        return;
+      }
+      if (
+        recurringTasks.length === 1 &&
+        requestRecurringDelete?.(recurringTasks[0])
+      ) {
+        return;
+      }
       setBulkLoading(true);
       try {
         pushUndo({ type: "recreate", tasks: taskList });
@@ -271,6 +310,7 @@ export function useBulkTaskActions({
       focusTaskById,
       focusedTaskId,
       pushUndo,
+      requestRecurringDelete,
       setBulkLoading,
       setCutTaskIds,
       setSelectedIds,

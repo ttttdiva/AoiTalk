@@ -23,6 +23,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _should_stop_previous_openai_compatible_local_server(
+    previous_provider: str,
+    previous_model: str,
+    next_provider: str,
+    next_model: str,
+) -> bool:
+    previous_provider_id = str(previous_provider or "").strip().lower()
+    next_provider_id = str(next_provider or "").strip().lower()
+    if previous_provider_id != "openai_compatible_local":
+        return False
+    if next_provider_id != "openai_compatible_local":
+        return True
+    return str(previous_model or "").strip() != str(next_model or "").strip()
+
+
 def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
     """LLM mode / models / engine / Ollama 管理ルートを登録する"""
     require_auth = cookie_auth_dependency(server._enforce_cookie_auth)
@@ -184,10 +199,38 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
             body = await request.json()
             provider = str(body.get("provider", "")).strip()
             model = str(body.get("model", "")).strip()
+            base_url = body.get("base_url")
             if not provider or not model:
                 raise HTTPException(
                     status_code=400, detail="provider と model は必須です"
                 )
+
+            previous_provider = str(server.config.get("llm_provider", "") or "")
+            previous_model = str(server.config.get("llm_model", "") or "")
+            should_stop_previous_local_server = (
+                _should_stop_previous_openai_compatible_local_server(
+                    previous_provider,
+                    previous_model,
+                    provider,
+                    model,
+                )
+            )
+            stopped_local_servers = 0
+
+            if provider == "openai_compatible_local":
+                from src.service_manager import (
+                    validate_openai_compatible_local_launch_selection,
+                )
+
+                try:
+                    validate_openai_compatible_local_launch_selection(
+                        server.config,
+                        provider=provider,
+                        model=model,
+                        base_url=base_url if isinstance(base_url, str) else None,
+                    )
+                except Exception as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
 
             def _apply_config(key: str, next_value: Any) -> None:
                 if hasattr(server.config, "save_to_file"):
@@ -211,14 +254,13 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 _apply_config("codex_cli.model", model)
             elif provider == "claude-cli":
                 _apply_config("claude_cli.model", model)
-            elif provider == "gemini-cli":
-                _apply_config("gemini_cli.model", model)
+            elif provider == "antigravity-cli":
+                _apply_config("antigravity_cli.model", model)
             elif provider == "gemini":
                 _apply_config("gemini.model", model)
             elif provider == "openai":
                 _apply_config("openai.model", model)
 
-            base_url = body.get("base_url")
             if isinstance(base_url, str) and base_url.strip():
                 if provider in {
                     "ollama",
@@ -228,6 +270,17 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                     _apply_config(f"{provider}.base_url", base_url.strip())
                 elif provider == "sglang":
                     _apply_config("sglang_base_url", base_url.strip())
+            elif provider == "openai_compatible_local":
+                from src.llm.openai_compatible_local_profiles import (
+                    local_server_profile_for_model,
+                )
+
+                profile = local_server_profile_for_model(model)
+                if profile:
+                    _apply_config(
+                        "openai_compatible_local.base_url",
+                        profile["base_url"],
+                    )
 
             api_key = body.get("api_key")
             if isinstance(api_key, str) and api_key.strip():
@@ -273,14 +326,46 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                     _apply_config("claude_cli.reasoning_effort", effort)
 
             if provider == "openai_compatible_local":
-                from src.service_manager import ensure_openai_compatible_local_server
+                from src.service_manager import (
+                    ensure_openai_compatible_local_server,
+                    stop_openai_compatible_local_servers,
+                )
 
-                ensure_openai_compatible_local_server(server.config)
+                if should_stop_previous_local_server:
+                    stopped_local_servers = stop_openai_compatible_local_servers()
+                    if stopped_local_servers:
+                        logger.info(
+                            "Stopped %s managed OpenAI-compatible local server "
+                            "process(es) before local model switch",
+                            stopped_local_servers,
+                        )
+
+                try:
+                    ensure_openai_compatible_local_server(
+                        server.config,
+                        raise_on_launch_error=True,
+                    )
+                except Exception as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
 
             # 新しいLLMクライアントを生成して差し替え
             from ...llm.manager import create_llm_client
 
             new_client = create_llm_client(server.config)
+
+            if (
+                should_stop_previous_local_server
+                and provider != "openai_compatible_local"
+            ):
+                from src.service_manager import stop_openai_compatible_local_servers
+
+                stopped_local_servers = stop_openai_compatible_local_servers()
+                if stopped_local_servers:
+                    logger.info(
+                        "Stopped %s managed OpenAI-compatible local server "
+                        "process(es) after switching away",
+                        stopped_local_servers,
+                    )
 
             next_mode_state = build_llm_mode_state(server.config, client=new_client)
             server._current_llm_mode = str(next_mode_state.get("mode") or "fast")

@@ -403,10 +403,17 @@ def create_project_router(
                 if not project:
                     raise HTTPException(status_code=404, detail="Project not found")
                 
-                if str(project.owner_id) != user_info["id"]:
+                if (
+                    str(project.owner_id) != user_info["id"]
+                    and user_info.get("role") != "admin"
+                ):
                     raise HTTPException(status_code=403, detail="Only owner can delete project")
                 
-                deleted = await ProjectRepository.delete_project(session, UUID(project_id))
+                deleted = await ProjectRepository.delete_project(
+                    session,
+                    UUID(project_id),
+                    delete_workspace=True,
+                )
                 
                 return JSONResponse({
                     "success": deleted,

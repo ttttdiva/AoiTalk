@@ -5,9 +5,9 @@
 コンテキスト取得、本文生成、保存、Canon更新を行う。
 """
 
-from agents import Agent
+from ..llm.native_runtime import AgentDefinition as Agent
 
-from ..tools.adapters import OpenAIAgentAdapter
+from ..tools.core import ensure_tool_definitions
 from ..tools.writing_tools import (
     get_writing_context,
     save_scene_draft,
@@ -92,7 +92,7 @@ class WritingAgent(BaseAgent):
 
     def _create_agent(self) -> Agent:
         """WritingAgentインスタンスを作成する。"""
-        tools = OpenAIAgentAdapter.convert_all(
+        tools = ensure_tool_definitions(
             [
                 get_writing_context,
                 save_scene_draft,

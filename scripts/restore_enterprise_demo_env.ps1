@@ -5,6 +5,7 @@ param(
     [string]$DatabaseUser = "aoitalk_demo",
     [string]$DemoAssetsRoot = "D:\Publish\AoiTalk_Demo_Assets",
     [string]$DemoProjectId = "e28e143b-73d6-49cf-bdce-ea2064c3940e",
+    [switch]$RestoreDemoAssetsToProject,
     [switch]$SkipDemoAssets,
     [switch]$ConfigureOnly
 )
@@ -89,11 +90,6 @@ if (-not (Test-Path -LiteralPath $setupScript -PathType Leaf)) {
 
 Assert-Identifier "DatabaseName" $DatabaseName
 Assert-Identifier "DatabaseUser" $DatabaseUser
-$parsedDemoProjectId = [Guid]::Empty
-if (-not [Guid]::TryParse($DemoProjectId, [ref]$parsedDemoProjectId)) {
-    throw "DemoProjectId must be a UUID."
-}
-$DemoProjectId = $parsedDemoProjectId.ToString()
 
 $sourceValues = Read-DotEnv $sourceEnvFull
 $content = [System.IO.File]::ReadAllText($sourceEnvFull, [System.Text.Encoding]::UTF8)
@@ -123,7 +119,13 @@ foreach ($key in @("NEXTAUTH_SECRET", "AOITALK_WEB_AUTH_SECRET", "AOITALK_JWT_SE
 Write-Host "[env] Regenerated the Enterprise demo .env: $destinationEnv"
 Write-Host "[env] DB=${DatabaseName} / USER=${DatabaseUser} / HOST=${hostName}:${port}"
 
-if (-not $SkipDemoAssets) {
+if ($RestoreDemoAssetsToProject -and -not $SkipDemoAssets) {
+    $parsedDemoProjectId = [Guid]::Empty
+    if (-not [Guid]::TryParse($DemoProjectId, [ref]$parsedDemoProjectId)) {
+        throw "DemoProjectId must be a UUID."
+    }
+    $DemoProjectId = $parsedDemoProjectId.ToString()
+
     $demoAssetsRootFull = [System.IO.Path]::GetFullPath($DemoAssetsRoot)
     if (Test-Path -LiteralPath $demoAssetsRootFull -PathType Container) {
         $sourceCandidates = Get-ChildItem -LiteralPath $demoAssetsRootFull -Directory -Recurse |
@@ -164,6 +166,8 @@ if (-not $SkipDemoAssets) {
     } else {
         Write-Warning "Demo assets directory was not found; workspace restore was skipped: $demoAssetsRootFull"
     }
+} elseif (-not $SkipDemoAssets) {
+    Write-Host "[files] Demo project files were not preloaded. Upload files from $DemoAssetsRoot in the filer during the demo."
 }
 
 if ($ConfigureOnly) {

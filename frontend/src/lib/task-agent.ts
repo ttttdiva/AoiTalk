@@ -9,10 +9,11 @@ function pushLine(lines: string[], label: string, value: unknown) {
 export function buildTaskAgentPrompt(task: Task): string {
   const lines: string[] = [
     "Take over the following task.",
-    "Start by asking the user the key clarifying questions in one batch.",
-    "After the initial questions, continue autonomously as much as possible.",
-    "Keep progress updates, decisions, blockers, and the final result in this conversation.",
-    "Do not wait for unnecessary confirmation if you can already proceed.",
+    "First inspect the task context and any relevant project/repository context available to you.",
+    "Do not make code, data, schedule, or project state changes yet.",
+    "Produce a concise execution proposal with scope, likely files/systems, risks, verification, and any blocking questions.",
+    "Ask for a single approval before starting implementation or state-changing work.",
+    "After approval, continue autonomously as much as possible and keep progress updates, decisions, blockers, and the final result in this conversation.",
     "",
     "Task details:",
   ];

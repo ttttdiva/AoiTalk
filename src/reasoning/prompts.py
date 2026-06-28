@@ -5,7 +5,7 @@ Evaluate the complexity of the following user request.
 
 User input: {user_input}
 
-Available tools:
+利用可能なツール:
 {available_tools}
 
 Return JSON with these fields:
@@ -31,7 +31,7 @@ Break the following user request into concrete execution steps.
 
 User input: {user_input}
 
-Available tools:
+利用可能なツール:
 {available_tools}
 
 Conversation context:
@@ -58,17 +58,23 @@ Select the most appropriate tools for the task below.
 Task description: {task_description}
 Task type: {task_type}
 
-Available tools:
+利用可能なツール:
 {available_tools_with_descriptions}
 
 Selection rules:
-- Use `search_memory`, `knowledge_search`, or web search for information lookup.
-- Use `project_management_assistant` for task/TODO work, project/case information, project DB facts/documents, WBS checks, and follow-up planning.
-- Use `spotify_assistant` for Spotify work.
-- Use `filesystem_assistant` for local file work.
-- Use `utility_assistant` for time, weather, or calculation requests.
-- Use `media_assistant` for image generation or YouTube/NicoNico playback.
-- Use `skills_assistant` when an installed skill should handle the task.
+- 情報検索には `search_memory`、`knowledge_search`、またはWeb検索を使う。
+- タスク/TODO、案件情報、案件DB facts/documents、内部 WBS.dbtable、
+  follow-up planning には `list_project_information`、`list_record_tables`、
+  `get_upcoming_wbs_tasks`、`create_record_table`、`append_record_rows`、
+  `create_task`、`upsert_project_fact` などの直toolを使う。
+  外部WBS Excelを内部 WBS.dbtable に取り込む時だけ `sync_wbs_tasks` を使う。
+- Spotify操作には `spotify_assistant` を使う。
+- ローカルファイル作業には `find_workspace_items`、
+  `inspect_workspace_tree`、`read_workspace_file`、`view_file`、
+  `search_files` などの直filesystem toolを使う。
+- 時刻、天気、計算には `utility_assistant` を使う。
+- 画像生成やYouTube/NicoNico再生には `media_assistant` を使う。
+- インストール済みskillが適切な場合だけ `invoke_skill` を使う。
 
 Return JSON:
 {{
@@ -116,7 +122,7 @@ One execution step failed. Propose a recovery plan.
 
 Failed step: {failed_step}
 Error: {error_message}
-Available tools: {available_tools}
+利用可能なツール: {available_tools}
 
 Return JSON:
 {{

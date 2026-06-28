@@ -19,7 +19,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ..core import tool as function_tool
+from ..core import tool
 from ..external_llm_permission import check_permission_sync
 
 from .command_executor import get_command_executor
@@ -469,7 +469,7 @@ def _check_command_protection(command: str, working_directory: Optional[str]) ->
     return None
 
 
-@function_tool
+@tool
 def execute_command(
     command: str,
     working_directory: Optional[str] = None
@@ -524,7 +524,7 @@ def execute_command(
 
 
 
-@function_tool
+@tool
 def view_file(
     path: str,
     start_line: Optional[int] = None,
@@ -578,7 +578,7 @@ def view_file(
         }
 
 
-@function_tool
+@tool
 def create_file(
     path: str,
     content: str
@@ -639,7 +639,7 @@ def create_file(
         }
 
 
-@function_tool
+@tool
 def delete_file(path: str) -> Dict[str, Any]:
     """ファイルまたはディレクトリを削除する
     
@@ -716,7 +716,7 @@ def delete_file(path: str) -> Dict[str, Any]:
         }
 
 
-@function_tool
+@tool
 def append_to_file(path: str, content: str) -> Dict[str, Any]:
     """ファイルの末尾に内容を追記する
     
@@ -782,7 +782,7 @@ def append_to_file(path: str, content: str) -> Dict[str, Any]:
         }
 
 
-@function_tool
+@tool
 def edit_file(
     path: str,
     old_str: str,
@@ -848,7 +848,7 @@ def edit_file(
         }
 
 
-@function_tool
+@tool
 def insert_to_file(
     path: str,
     line_number: int,
@@ -911,7 +911,7 @@ def insert_to_file(
         }
 
 
-@function_tool
+@tool
 def undo_edit(path: str) -> Dict[str, Any]:
     """ファイルの直前の編集を取り消す
     
@@ -959,7 +959,7 @@ def undo_edit(path: str) -> Dict[str, Any]:
         }
 
 
-@function_tool
+@tool
 def list_directory(
     path: str,
     max_depth: int = 2,
@@ -1005,7 +1005,7 @@ def list_directory(
         }
 
 
-@function_tool
+@tool
 def search_files(
     query: str,
     path: str,

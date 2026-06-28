@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { projects, projectMembers } from "@/db/schema";
-import { eq, and } from "drizzle-orm";
+import { eq, and, isNull } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
 import { getAccessibleProject } from "@/lib/server/project-access";
+import { proxyRequestToPythonApi } from "@/lib/server/python-api-proxy";
 import { canWriteSpace } from "@/lib/server/space-access";
 
 function toSnake(row: Record<string, unknown>): Record<string, unknown> {
@@ -21,6 +22,7 @@ function toSnake(row: Record<string, unknown>): Record<string, unknown> {
     spaceId: "space_id",
     createdAt: "created_at",
     updatedAt: "updated_at",
+    deletedAt: "deleted_at",
     projectMetadata: "metadata",
   };
   const out: Record<string, unknown> = {};
@@ -156,7 +158,7 @@ export async function PATCH(
     const [current] = await db
       .select({ projectMetadata: projects.projectMetadata })
       .from(projects)
-      .where(eq(projects.id, id))
+      .where(and(eq(projects.id, id), isNull(projects.deletedAt)))
       .limit(1);
     const mergedMetadata = {
       ...parseProjectMetadata(current?.projectMetadata),
@@ -175,8 +177,15 @@ export async function PATCH(
   const [updated] = await db
     .update(projects)
     .set(updates)
-    .where(eq(projects.id, id))
+    .where(and(eq(projects.id, id), isNull(projects.deletedAt)))
     .returning();
+
+  if (!updated) {
+    return NextResponse.json(
+      { detail: "プロジェクトが見つかりません" },
+      { status: 404 },
+    );
+  }
 
   return NextResponse.json(
     serializeProject(updated as unknown as Record<string, unknown>)
@@ -184,7 +193,7 @@ export async function PATCH(
 }
 
 export async function DELETE(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const user = await getSession();
@@ -198,7 +207,7 @@ export async function DELETE(
   const [project] = await db
     .select()
     .from(projects)
-    .where(eq(projects.id, id))
+    .where(and(eq(projects.id, id), isNull(projects.deletedAt)))
     .limit(1);
 
   if (!project) {
@@ -222,9 +231,8 @@ export async function DELETE(
     );
   }
 
-  // メンバーを先に削除
-  await db.delete(projectMembers).where(eq(projectMembers.projectId, id));
-  await db.delete(projects).where(eq(projects.id, id));
-
-  return NextResponse.json({ success: true });
+  return proxyRequestToPythonApi(request, {
+    path: ["projects", id],
+    user,
+  });
 }

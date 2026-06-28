@@ -4,13 +4,16 @@ import { useEffect, useRef, useCallback, useState } from "react";
 import type {
   ChatAttachmentKind,
   ChatAttachmentMetadata,
+  ChatCommandCapability,
   ChatResponseModelSelection,
 } from "@/lib/chat-api";
+import { isWebSocketMessageForSession } from "@/lib/chat-websocket-events";
 
 type WSMessage = {
   type: string;
   content?: string;
   session_id?: string;
+  agent_run_id?: string;
   tool?: string;
   message?: string;
   status?: string;
@@ -125,6 +128,20 @@ function extractActivityMessage(data: WSMessage): string | null {
   return message && message.trim().length > 0 ? message : null;
 }
 
+function extractAgentRunId(data: WSMessage): string | null {
+  const nestedData =
+    data.data && typeof data.data === "object"
+      ? (data.data as Record<string, unknown>)
+      : null;
+  const value =
+    typeof data.agent_run_id === "string"
+      ? data.agent_run_id
+      : typeof nestedData?.agent_run_id === "string"
+        ? nestedData.agent_run_id
+        : null;
+  return value && value.trim().length > 0 ? value : null;
+}
+
 function createBaseAttachment(file: File): ChatAttachmentMetadata {
   return {
     name: file.name,
@@ -177,11 +194,31 @@ export function useWebSocket(sessionId: string | null) {
   const [isStreaming, setIsStreaming] = useState(false);
   const [activeTool, setActiveTool] = useState<string | null>(null);
   const [activityMessage, setActivityMessage] = useState<string | null>(null);
+  const [activeAgentRunId, setActiveAgentRunId] = useState<string | null>(null);
   const streamBufferRef = useRef("");
 
   useEffect(() => {
-    sessionIdRef.current = sessionId;
-    if (!sessionId) return;
+    const currentSessionId = sessionId;
+    let resetCancelled = false;
+
+    sessionIdRef.current = currentSessionId;
+    streamBufferRef.current = "";
+
+    queueMicrotask(() => {
+      if (resetCancelled || sessionIdRef.current !== currentSessionId) return;
+      setLastMessage(null);
+      setIsConnected(false);
+      setIsStreaming(false);
+      setActiveTool(null);
+      setActivityMessage(null);
+      setActiveAgentRunId(null);
+    });
+
+    if (!sessionId) {
+      return () => {
+        resetCancelled = true;
+      };
+    }
 
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${protocol}//${window.location.hostname}:3000/ws?session_id=${sessionId}`;
@@ -202,14 +239,17 @@ export function useWebSocket(sessionId: string | null) {
       wsRef.current = ws;
 
       ws.onopen = () => {
+        if (cancelled || wsRef.current !== ws) return;
         reconnectAttempt = 0;
         setIsConnected(true);
       };
       ws.onclose = () => {
+        if (cancelled || wsRef.current !== ws) return;
         setIsConnected(false);
         setIsStreaming(false);
         setActiveTool(null);
         setActivityMessage(null);
+        setActiveAgentRunId(null);
         if (!cancelled) {
           const delay = Math.min(1000 * 2 ** reconnectAttempt, 5000);
           reconnectAttempt += 1;
@@ -219,26 +259,17 @@ export function useWebSocket(sessionId: string | null) {
       };
       ws.onmessage = (event) => {
         try {
+          if (cancelled || wsRef.current !== ws) return;
           const data = JSON.parse(event.data) as WSMessage;
-          const nestedData =
-            data.data && typeof data.data === "object"
-              ? (data.data as Record<string, unknown>)
-              : null;
-          const eventSessionId =
-            typeof data.session_id === "string"
-              ? data.session_id
-              : typeof nestedData?.session_id === "string"
-                ? nestedData.session_id
-                : null;
-          if (
-            eventSessionId &&
-            sessionIdRef.current &&
-            eventSessionId !== sessionIdRef.current
-          ) {
+          if (!isWebSocketMessageForSession(data, sessionIdRef.current)) {
             return;
           }
 
           setLastMessage(data);
+          const nextAgentRunId = extractAgentRunId(data);
+          if (nextAgentRunId) {
+            setActiveAgentRunId(nextAgentRunId);
+          }
           if (data.type === "stream_start") {
             setIsStreaming(true);
             setActiveTool(null);
@@ -274,7 +305,10 @@ export function useWebSocket(sessionId: string | null) {
             data.type === "reasoning_progress" ||
             data.type === "status_update"
           ) {
-            setActivityMessage(extractActivityMessage(data));
+            const message = extractActivityMessage(data);
+            if (message) {
+              setActivityMessage(message);
+            }
           }
           if (
             data.type === "stream_end" ||
@@ -284,17 +318,23 @@ export function useWebSocket(sessionId: string | null) {
             setIsStreaming(false);
             setActiveTool(null);
             setActivityMessage(null);
+            setActiveAgentRunId(null);
           }
         } catch {
           /* JSON以外のメッセージは無視 */
         }
       };
-      ws.onerror = () => setIsConnected(false);
+      ws.onerror = () => {
+        if (!cancelled && wsRef.current === ws) {
+          setIsConnected(false);
+        }
+      };
     };
 
     connect();
 
     return () => {
+      resetCancelled = true;
       cancelled = true;
       clearReconnectTimer();
       wsRef.current?.close();
@@ -314,12 +354,17 @@ export function useWebSocket(sessionId: string | null) {
       responseModel?: ChatResponseModelSelection,
       targetSessionId?: string | null,
       clientMessageId?: string,
+      commandCapabilities?: ChatCommandCapability[],
     ) => {
       if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+      setActiveAgentRunId(null);
 
       const buildPayload = async () => {
         const data: Record<string, unknown> = { message: content };
         if (clientMessageId) data.client_message_id = clientMessageId;
+        if (commandCapabilities && commandCapabilities.length > 0) {
+          data.command_capabilities = commandCapabilities;
+        }
         if (projectId) data.project_id = projectId;
         data.include_project_context = includeProjectContext === true;
         const payloadSessionId = targetSessionId ?? sessionIdRef.current;
@@ -462,6 +507,7 @@ export function useWebSocket(sessionId: string | null) {
     isStreaming,
     activeTool,
     activityMessage,
+    activeAgentRunId,
     streamBuffer: streamBufferRef,
     sendMessage,
     sendPermissionResponse,

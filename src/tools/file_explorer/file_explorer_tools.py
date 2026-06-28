@@ -7,7 +7,7 @@ Provides CRUD operations for managing files through LLM function calling.
 import base64
 from typing import Any, Dict
 
-from ..core import tool as function_tool
+from ..core import tool
 
 from .file_explorer_service import (
     list_directory,
@@ -29,7 +29,7 @@ def _check_permission_sync(tool_name: str, args: Dict[str, Any]) -> bool:
     return check_permission_sync(tool_name, args)
 
 
-@function_tool
+@tool
 def list_workspace_files(path: str = "") -> Dict[str, Any]:
     """ワークスペース内のファイルとフォルダを一覧表示する
     
@@ -43,7 +43,7 @@ def list_workspace_files(path: str = "") -> Dict[str, Any]:
     return list_directory(path)
 
 
-@function_tool
+@tool
 def find_workspace_items(
     query: str,
     path: str = "",
@@ -66,7 +66,7 @@ def find_workspace_items(
     )
 
 
-@function_tool
+@tool
 def inspect_workspace_tree(
     path: str = "",
     max_depth: int = 3,
@@ -87,7 +87,7 @@ def inspect_workspace_tree(
     )
 
 
-@function_tool
+@tool
 def create_workspace_directory(path: str, name: str) -> Dict[str, Any]:
     """ワークスペースに新しいフォルダを作成する
     
@@ -107,7 +107,7 @@ def create_workspace_directory(path: str, name: str) -> Dict[str, Any]:
     return create_directory(path, name)
 
 
-@function_tool
+@tool
 def upload_workspace_file(path: str, filename: str, content_base64: str) -> Dict[str, Any]:
     """ワークスペースにファイルをアップロードする
     
@@ -135,7 +135,7 @@ def upload_workspace_file(path: str, filename: str, content_base64: str) -> Dict
     return upload_file(path, filename, content)
 
 
-@function_tool
+@tool
 def read_workspace_file(path: str) -> Dict[str, Any]:
     """ワークスペースのファイル内容を読み取る
     
@@ -152,7 +152,7 @@ def read_workspace_file(path: str) -> Dict[str, Any]:
     return get_preview(path)
 
 
-@function_tool
+@tool
 def delete_workspace_item(path: str) -> Dict[str, Any]:
     """ワークスペースのファイルまたはフォルダを削除する
     
@@ -168,7 +168,7 @@ def delete_workspace_item(path: str) -> Dict[str, Any]:
     return delete_item(path)
 
 
-@function_tool
+@tool
 def move_workspace_item(src: str, dest: str) -> Dict[str, Any]:
     """ワークスペース内でファイルまたはフォルダを移動する
     
@@ -185,7 +185,7 @@ def move_workspace_item(src: str, dest: str) -> Dict[str, Any]:
     return move_item(src, dest)
 
 
-@function_tool
+@tool
 def get_workspace_file_info(path: str) -> Dict[str, Any]:
     """ワークスペースのファイル情報を取得する
     

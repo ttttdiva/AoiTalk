@@ -24,6 +24,20 @@ async def generate_title_with_llm_client(
         return None
 
     async def _generate() -> Optional[str]:
+        async_title_generate = getattr(llm_client, "generate_title_async", None)
+        if callable(async_title_generate):
+            response = await async_title_generate(prompt)
+            return str(response) if response else None
+
+        sync_title_generate = getattr(llm_client, "generate_title", None)
+        if callable(sync_title_generate):
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: sync_title_generate(prompt),
+            )
+            return str(response) if response else None
+
         if hasattr(llm_client, "generate_async"):
             response = await llm_client.generate_async(prompt)
             return str(response) if response else None

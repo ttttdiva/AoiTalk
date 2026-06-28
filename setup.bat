@@ -24,24 +24,40 @@ if errorlevel 1 (
 )
 
 echo.
-echo [2/8] Python 3.10以上の確認...
-set "PYTHON_CMD=python"
-python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
-if errorlevel 1 (
-    echo Pythonをインストール中...
+echo [2/8] Python 3.12以上の確認...
+set "PYTHON_CMD="
+for /f "usebackq delims=" %%P in (`py -3.12 scripts\python_312_gate.py --print-executable 2^>nul`) do set "PYTHON_CMD=%%P"
+if not defined PYTHON_CMD (
+    python scripts\python_312_gate.py >nul 2>&1
+    if not errorlevel 1 (
+        for /f "usebackq delims=" %%P in (`python scripts\python_312_gate.py --print-executable 2^>nul`) do set "PYTHON_CMD=%%P"
+    )
+)
+if not defined PYTHON_CMD (
+    echo Python 3.12をインストール中...
     winget install Python.Python.3.12 --exact --accept-package-agreements --accept-source-agreements --disable-interactivity
     if errorlevel 1 (
         echo [エラー] Pythonのインストールに失敗しました。
         pause
         exit /b 1
     )
-    set "PYTHON_CMD=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
-    if not exist "%PYTHON_CMD%" (
-        echo [エラー] Pythonのインストール先が見つかりません。新しいコンソールで setup.bat を再実行してください。
-        pause
-        exit /b 1
-    )
+    for /f "usebackq delims=" %%P in (`py -3.12 scripts\python_312_gate.py --print-executable 2^>nul`) do set "PYTHON_CMD=%%P"
 )
+if not defined PYTHON_CMD (
+    set "PYTHON_CMD=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+)
+if not exist "%PYTHON_CMD%" (
+    echo [エラー] Python 3.12のインストール先が見つかりません。新しいコンソールで setup.bat を再実行してください。
+    pause
+    exit /b 1
+)
+"%PYTHON_CMD%" scripts\python_312_gate.py >nul 2>&1
+if errorlevel 1 (
+    echo [エラー] Python 3.12以上を確認できません: %PYTHON_CMD%
+    pause
+    exit /b 1
+)
+echo Python 3.12以上を確認しました。
 
 echo.
 echo [3/8] Node.jsの確認...
@@ -86,6 +102,18 @@ if errorlevel 1 (
 
 echo.
 echo [5/8] Python仮想環境とパッケージをインストール中...
+if exist "venv\Scripts\python.exe" (
+    venv\Scripts\python.exe scripts\python_312_gate.py >nul 2>&1
+    if errorlevel 1 (
+        echo 既存venvがPython 3.12未満のため再作成します...
+        rmdir /s /q venv
+        if exist "venv" (
+            echo [エラー] 既存venvの削除に失敗しました。起動中のPythonプロセスを停止してから再実行してください。
+            pause
+            exit /b 1
+        )
+    )
+)
 if not exist "venv\Scripts\python.exe" "%PYTHON_CMD%" -m venv venv
 if not exist "venv\Scripts\python.exe" (
     echo [エラー] Python仮想環境の作成に失敗しました。

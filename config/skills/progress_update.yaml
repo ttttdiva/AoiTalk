@@ -7,7 +7,7 @@ prompt_template: |
   {input}
 
   ## 手順
-  1. project_management_assistant の get_project_context で対象案件を確認する。
+  1. get_project_context で対象案件を確認する。
   2. list_project_information で既存の案件情報、重要資料、カテゴリを読む。
   3. list_tasks で関連しそうなタスクを探す。既存タスクがあれば update_task、なければ create_task を使う。
   4. 報告から以下を分離する。
@@ -26,7 +26,14 @@ aliases:
   - 進捗報告
   - update_progress
 bound_tools:
-  - project_management_assistant
+  - get_project_context
+  - list_project_information
+  - list_tasks
+  - create_task
+  - update_task
+  - upsert_project_info_category
+  - register_project_document
+  - upsert_project_fact
 examples:
   - "/progress_update 設計レビュー完了、明日から構築開始"
   - "/progress_update NW機器の設定投入が完了。課題：ファイアウォールのルール確認待ち"

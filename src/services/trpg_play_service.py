@@ -692,9 +692,9 @@ async def suggest_quick_npc_name(
         f"既存名: {', '.join(sorted(existing_names))[:900]}\n"
     )
     try:
-        from agents import Agent, Runner
+        from ..llm.native_runtime import AgentDefinition, run_native_agent_once
 
-        agent = Agent(
+        agent = AgentDefinition(
             name="trpg_quick_npc_profile_generator",
             instructions=(
                 "あなたはTRPG卓の即席NPCを作る補助AIです。"
@@ -702,7 +702,7 @@ async def suggest_quick_npc_name(
             ),
             model="gpt-4o-mini",
         )
-        result = await Runner.run(agent, prompt)
+        result = await run_native_agent_once(agent, prompt)
         profile = _extract_json_object(result.final_output or "")
         generated_name = _clean_suggested_npc_name(str(profile.get("name") or ""))
         if preferred_name:

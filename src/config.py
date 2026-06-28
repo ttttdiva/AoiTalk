@@ -96,7 +96,7 @@ class Config:
     }
     
     # TTSエンジン設定
-    TTS_ENGINES = ['voicevox', 'voiceroid', 'cevio', 'aivoice', 'aivisspeech', 'irodori_tts']
+    TTS_ENGINES = ['voicevox', 'voiceroid', 'cevio', 'aivoice', 'aivisspeech', 'irodori_tts', 'miotts']
     
     # グローバル必須環境変数は持たない。
     # LLM APIキーは llm_provider ごとに validate_config() で確認する。
@@ -234,7 +234,40 @@ class Config:
             aivisspeech_config['host'] = os.getenv('AIVISSPEECH_HOST', '127.0.0.1')
         if 'port' not in aivisspeech_config:
             aivisspeech_config['port'] = int(os.getenv('AIVISSPEECH_PORT', '10101'))
-        
+
+        # MioTTS embedded runtime settings. Use AOITALK_* names to avoid
+        # conflicting with upstream MioTTS-Inference variables.
+        miotts_config = config['tts_settings']['miotts']
+        miotts_env_map = {
+            'model_id': 'AOITALK_MIOTTS_MODEL_ID',
+            'codec_model_id': 'AOITALK_MIOTTS_CODEC_MODEL_ID',
+            'refs_dir': 'AOITALK_MIOTTS_REFS_DIR',
+            'presets_dir': 'AOITALK_MIOTTS_PRESETS_DIR',
+            'cache_dir': 'AOITALK_MIOTTS_CACHE_DIR',
+            'device': 'AOITALK_MIOTTS_DEVICE',
+            'dtype': 'AOITALK_MIOTTS_DTYPE',
+        }
+        for key, env_name in miotts_env_map.items():
+            value = os.getenv(env_name)
+            if value:
+                miotts_config[key] = value
+        if os.getenv('AOITALK_MIOTTS_DEFAULT_PRESET_ID'):
+            miotts_config['default_preset_id'] = os.getenv('AOITALK_MIOTTS_DEFAULT_PRESET_ID')
+        if os.getenv('AOITALK_MIOTTS_MAX_TEXT_LENGTH'):
+            miotts_config['max_text_length'] = int(os.getenv('AOITALK_MIOTTS_MAX_TEXT_LENGTH', '300'))
+        if os.getenv('AOITALK_MIOTTS_MAX_REFERENCE_MB'):
+            miotts_config['max_reference_mb'] = int(os.getenv('AOITALK_MIOTTS_MAX_REFERENCE_MB', '20'))
+        if os.getenv('AOITALK_MIOTTS_MAX_REFERENCE_SECONDS'):
+            miotts_config['max_reference_seconds'] = float(
+                os.getenv('AOITALK_MIOTTS_MAX_REFERENCE_SECONDS', '20.0')
+            )
+        if os.getenv('AOITALK_MIOTTS_TEMPERATURE'):
+            miotts_config['temperature'] = float(os.getenv('AOITALK_MIOTTS_TEMPERATURE', '0.8'))
+        if os.getenv('AOITALK_MIOTTS_TOP_P'):
+            miotts_config['top_p'] = float(os.getenv('AOITALK_MIOTTS_TOP_P', '1.0'))
+        if os.getenv('AOITALK_MIOTTS_MAX_TOKENS'):
+            miotts_config['max_tokens'] = int(os.getenv('AOITALK_MIOTTS_MAX_TOKENS', '700'))
+
         # Azure TTS設定
         azure_region = os.getenv('AZURE_TTS_REGION')
         if azure_region:

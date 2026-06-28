@@ -16,6 +16,17 @@ from src.llm.provider_mode_adapters import (
     ollama_mode_options_for_model,
 )
 from src.llm.provider_capabilities import ProviderCapabilities
+from src.llm.openai_compatible_local_profiles import (
+    macos_openai_compatible_local_model_options,
+    local_server_profile_for_model,
+    openai_compatible_local_base_url,
+    openai_compatible_local_discovery_base_urls,
+)
+from src.services.agent_team_service import (
+    AGENT_TEAM_MEMBER_KEYS,
+    AGENT_TEAM_MEMBER_LABELS,
+    agent_team_members_by_provider,
+)
 
 LLM_PROVIDER_LABELS = {
     "gemini": "Gemini API",
@@ -26,7 +37,7 @@ LLM_PROVIDER_LABELS = {
     "openai_compatible_local": "ローカルOpenAI互換サーバー",
     "codex-cli": "Codex CLI",
     "claude-cli": "Claude Code",
-    "gemini-cli": "Gemini CLI",
+    "antigravity-cli": "Antigravity CLI",
 }
 
 LLM_ENGINE_OPTIONS = [
@@ -62,7 +73,7 @@ PROVIDER_MODEL_CONFIG_KEYS = {
     ),
     "codex-cli": ("codex_cli.model", "codex_model"),
     "claude-cli": ("claude_cli.model", "claude_model"),
-    "gemini-cli": ("gemini_cli.model", "gemini_cli_model"),
+    "antigravity-cli": ("antigravity_cli.model", "antigravity_cli_model"),
 }
 
 PROVIDER_ORDER = [
@@ -74,7 +85,7 @@ PROVIDER_ORDER = [
     "openai_compatible_local",
     "codex-cli",
     "claude-cli",
-    "gemini-cli",
+    "antigravity-cli",
 ]
 
 STATIC_MODEL_CATALOG = {
@@ -194,20 +205,33 @@ STATIC_MODEL_CATALOG = {
         {"id": "opus", "label": "opus", "description": "Claude Code alias"},
         {"id": "haiku", "label": "haiku", "description": "Claude Code alias"},
     ],
-    "gemini-cli": [
+    "antigravity-cli": [
         {
-            "id": "gemini-3.1-pro-preview",
-            "label": "Gemini 3.1 Pro Preview",
-            "description": "Gemini CLI 用の候補。CLIからの一覧取得ではありません。",
+            "id": "default",
+            "label": "default",
+            "description": "Antigravity CLI の既定モデルを使用します。",
         },
         {
-            "id": "gemini-3-flash-preview",
-            "label": "Gemini 3 Flash Preview",
-            "description": "Gemini CLI 用の候補。CLIからの一覧取得ではありません。",
+            "id": "Gemini 3.5 Flash (High)",
+            "label": "Gemini 3.5 Flash (High)",
+            "description": "Antigravity CLI 用の候補。agy models から取得できない環境向けの静的候補です。",
         },
-        {"id": "gemini-2.5-pro", "label": "Gemini 2.5 Pro"},
-        {"id": "gemini-2.5-flash", "label": "Gemini 2.5 Flash"},
-        {"id": "gemini-2.5-flash-lite", "label": "Gemini 2.5 Flash-Lite"},
+        {
+            "id": "Gemini 3.5 Flash (Medium)",
+            "label": "Gemini 3.5 Flash (Medium)",
+            "description": "Antigravity CLI 用の候補。agy models から取得できない環境向けの静的候補です。",
+        },
+        {"id": "Gemini 3.5 Flash (Low)", "label": "Gemini 3.5 Flash (Low)"},
+        {"id": "Gemini 3.1 Pro (High)", "label": "Gemini 3.1 Pro (High)"},
+        {"id": "Gemini 3.1 Pro (Low)", "label": "Gemini 3.1 Pro (Low)"},
+        {
+            "id": "Claude Sonnet 4.6 (Thinking)",
+            "label": "Claude Sonnet 4.6 (Thinking)",
+        },
+        {
+            "id": "Claude Opus 4.6 (Thinking)",
+            "label": "Claude Opus 4.6 (Thinking)",
+        },
     ],
 }
 
@@ -247,13 +271,13 @@ PROVIDER_CAPABILITIES = {
     ),
     "codex-cli": ProviderCapabilities(),
     "claude-cli": ProviderCapabilities(),
-    "gemini-cli": ProviderCapabilities(),
+    "antigravity-cli": ProviderCapabilities(),
 }
 
 STATIC_SOURCE_BY_PROVIDER = {
     "codex-cli": ("cli-suggested", "CLI候補"),
     "claude-cli": ("cli-suggested", "CLI候補"),
-    "gemini-cli": ("cli-suggested", "CLI候補"),
+    "antigravity-cli": ("cli-suggested", "CLI候補"),
     "ollama": ("pull-suggested", "Pull候補"),
 }
 
@@ -302,6 +326,8 @@ LOCAL_MODEL_LABELS = {
     "qwen3.6-27b-dflash": "Qwen3.6-27B (DFlash)",
 }
 
+AGENT_TEAM_MEMBER_LABEL_BY_KEY = AGENT_TEAM_MEMBER_LABELS
+
 
 def model_option(model_id: str, label: Optional[str] = None, **extra: Any) -> Dict[str, Any]:
     model_id_text = str(model_id)
@@ -326,6 +352,23 @@ def dedupe_models(models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         next_model.setdefault("label", model_id)
         next_model.setdefault("source", "static-suggested")
         next_model.setdefault("source_label", "候補")
+        result.append(next_model)
+    return result
+
+
+def enrich_model_reasoning_options(
+    provider: str,
+    models: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    result = []
+    for model in models:
+        next_model = dict(model)
+        options = reasoning_effort_options_for_model(
+            provider,
+            str(next_model.get("id") or ""),
+        )
+        if options:
+            next_model["reasoning_effort_options"] = options
         result.append(next_model)
     return result
 
@@ -459,20 +502,29 @@ def _static_models(provider: str) -> List[Dict[str, Any]]:
         provider,
         ("static-suggested", "候補"),
     )
-    return [
-        model_option(
-            item.get("id") or item.get("model"),
-            item.get("label"),
-            **{
-                key: value
-                for key, value in item.items()
-                if key not in {"id", "model", "label"}
-            },
-            source=source,
-            source_label=source_label,
+    catalog_items = list(STATIC_MODEL_CATALOG.get(provider, []))
+    if provider == "openai_compatible_local":
+        catalog_items = macos_openai_compatible_local_model_options() + catalog_items
+
+    models = []
+    for item in catalog_items:
+        extra = {
+            key: value
+            for key, value in item.items()
+            if key not in {"id", "model", "label"}
+        }
+        item_source = extra.pop("source", source)
+        item_source_label = extra.pop("source_label", source_label)
+        models.append(
+            model_option(
+                item.get("id") or item.get("model"),
+                item.get("label"),
+                **extra,
+                source=item_source,
+                source_label=item_source_label,
+            )
         )
-        for item in STATIC_MODEL_CATALOG.get(provider, [])
-    ]
+    return models
 
 
 def _is_ollama_incompatible_model(model_id: Optional[str]) -> bool:
@@ -582,31 +634,42 @@ def _openai_compatible_local_models(
     cfg: Any,
     fetch_json: Callable[..., Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    base_url = (
-        _config_get(cfg, "openai_compatible_local.base_url")
-        or _config_get(cfg, "openai_compatible_local_base_url")
-        or os.environ.get("OPENAI_COMPATIBLE_LOCAL_BASE_URL")
-        or "http://127.0.0.1:8080/v1"
-    ).rstrip("/")
     api_key = (
         _config_get(cfg, "openai_compatible_local.api_key")
         or _config_get(cfg, "openai_compatible_local_api_key")
         or os.environ.get("OPENAI_COMPATIBLE_LOCAL_API_KEY")
         or "dummy"
     )
-    try:
-        data = fetch_json(
-            f"{base_url}/models",
-            headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
-            timeout=1.5,
-        )
-    except Exception:
-        return []
-    return [
-        model_option(item.get("id"), source="service-api", source_label="API取得")
-        for item in data.get("data", [])
-        if isinstance(item, dict) and item.get("id")
-    ]
+    models: List[Dict[str, Any]] = []
+    for base_url in openai_compatible_local_discovery_base_urls(cfg):
+        try:
+            data = fetch_json(
+                f"{base_url.rstrip('/')}/models",
+                headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+                timeout=1.5,
+            )
+        except Exception:
+            continue
+        for item in data.get("data", []):
+            if not isinstance(item, dict) or not item.get("id"):
+                continue
+            model_id = item.get("id")
+            profile = local_server_profile_for_model(str(model_id)) or {}
+            server_meta = {
+                key: value
+                for key, value in profile.items()
+                if key in {"server", "server_label"}
+            }
+            models.append(
+                model_option(
+                    model_id,
+                    source="service-api",
+                    source_label="API取得",
+                    base_url=base_url,
+                    **server_meta,
+                )
+            )
+    return models
 
 
 def provider_models(
@@ -677,9 +740,7 @@ def provider_settings(provider: str, cfg: Any) -> Dict[str, Any]:
             or ""
         )
         return {
-            "base_url": _config_get(
-                cfg, "openai_compatible_local.base_url", "http://127.0.0.1:8080/v1"
-            ),
+            "base_url": openai_compatible_local_base_url(cfg),
             "api_key_configured": bool(api_key),
             "api_key_placeholder": "dummy" if not api_key else "設定済み",
             "enable_tools": bool(
@@ -857,6 +918,8 @@ def _provider_source(models: List[Dict[str, Any]], refreshed: bool) -> str:
         return "installed"
     if "cli-suggested" in sources:
         return "cli-suggested"
+    if "platform-suggested" in sources:
+        return "platform-suggested"
     return "static" if not refreshed else "static-suggested"
 
 
@@ -874,6 +937,22 @@ def provider_saved_model(provider: str, cfg: Any) -> Optional[str]:
     return None
 
 
+def agent_team_models_by_provider(cfg: Any) -> Dict[str, List[Dict[str, str]]]:
+    result: Dict[str, List[Dict[str, str]]] = {}
+    for provider, members in agent_team_members_by_provider(cfg).items():
+        for member in members:
+            member_key = str(member.get("member_key") or "").strip()
+            if member_key not in AGENT_TEAM_MEMBER_KEYS:
+                continue
+            result.setdefault(provider, []).append(
+                {
+                    "member_key": member_key,
+                    "model": str(member.get("model") or "").strip(),
+                }
+            )
+    return result
+
+
 def build_model_catalog(
     cfg: Any,
     *,
@@ -885,6 +964,7 @@ def build_model_catalog(
 ) -> Dict[str, Any]:
     current_p = _config_get(cfg, "llm_provider", "openai")
     current_m = _config_get(cfg, "llm_model", "gpt-4o")
+    team_models = agent_team_models_by_provider(cfg)
     providers = []
     refresh_target = (refresh_provider or "").strip() or None
 
@@ -902,26 +982,49 @@ def build_model_catalog(
         if provider == "ollama" and _is_ollama_incompatible_model(saved_model):
             saved_model = None
         if saved_model and not any(m["id"] == saved_model for m in models):
+            server_profile = (
+                local_server_profile_for_model(saved_model)
+                if provider == "openai_compatible_local"
+                else None
+            ) or {}
             models.insert(
                 0,
                 model_option(
                     saved_model,
                     saved_model,
+                    **server_profile,
                     custom_current=provider == current_p,
                     provider_configured=True,
                     source="provider-configured",
                     source_label="現在の設定" if provider == current_p else "保存済み設定",
                 ),
             )
-        configured_model = saved_model
-        if not configured_model and models:
-            configured_model = str(models[0]["id"])
+        for configured_member in reversed(team_models.get(provider, [])):
+            configured_model = configured_member["model"]
+            if any(m["id"] == configured_model for m in models):
+                continue
+            member_key = configured_member["member_key"]
+            member_label = AGENT_TEAM_MEMBER_LABEL_BY_KEY.get(member_key, member_key)
+            models.insert(
+                0,
+                model_option(
+                    configured_model,
+                    configured_model,
+                    custom_current=True,
+                    source="agent-team-configured",
+                    source_label=f"Agent Team: {member_label}",
+                ),
+            )
+        configured_provider_model = saved_model
+        if not configured_provider_model and models:
+            configured_provider_model = str(models[0]["id"])
+        models = enrich_model_reasoning_options(provider, models)
         providers.append(
             {
                 "id": provider,
                 "label": LLM_PROVIDER_LABELS.get(provider, provider),
                 "models": models,
-                "configured_model": configured_model or "",
+                "configured_model": configured_provider_model or "",
                 "supports_custom_model": True,
                 "capabilities": PROVIDER_CAPABILITIES.get(
                     provider, ProviderCapabilities()

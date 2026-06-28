@@ -6,7 +6,9 @@ import {
   useEffect,
   useCallback,
   useRef,
+  useReducer,
   type CSSProperties,
+  type DragEvent as ReactDragEvent,
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
@@ -18,8 +20,11 @@ import {
 } from "@/lib/chat-api";
 import type {
   ChatAttachmentMetadata,
+  ChatCommandCapability,
   ChatResponseModelOption,
   ChatResponseModelSelection,
+  ChatToolResultMetadata,
+  ConversationGenerationStatus,
   ConversationMessage,
   ConversationSearchResult,
   ConversationSession,
@@ -28,6 +33,7 @@ import type {
   LlmModelCatalogResponse,
   LlmMode,
 } from "@/lib/chat-api";
+import { commandCapabilitiesFromMessageMetadata } from "@/lib/chat-commands";
 import { deepResearchApi, type DeepResearchJob } from "@/lib/deep-research-api";
 import { useWebSocket } from "@/hooks/use-websocket";
 import { explorerBookmarks, explorerSearch } from "@/lib/explorer-api";
@@ -39,7 +45,10 @@ import {
 } from "@/components/chat/chat-composer";
 import { ConversationSearchDialog } from "@/components/chat/conversation-search-dialog";
 import { useProject } from "@/contexts/project-context";
-import { useChatSessions } from "@/contexts/chat-session-context";
+import {
+  CHAT_SESSION_TITLE_UPDATED_EVENT,
+  useChatSessions,
+} from "@/contexts/chat-session-context";
 import { ScenarioPanel } from "@/components/chat/scenario-panel";
 import { GroupChatDialog } from "@/components/chat/group-chat-dialog";
 import { SteeringPanel } from "@/components/chat/steering-panel";
@@ -49,7 +58,18 @@ import {
   navigateChatSessionInPlace,
   readChatSessionIdFromLocation,
 } from "@/lib/chat-navigation";
-import { AlertCircle, RefreshCcw, Users, Sliders } from "lucide-react";
+import { getDroppedExplorerFiles } from "@/lib/file-drop";
+import {
+  chatTimelineReducer,
+  initialChatTimelineState,
+} from "@/lib/chat-state";
+import {
+  AlertCircle,
+  FolderOpen,
+  RefreshCcw,
+  Users,
+  Sliders,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import {
@@ -76,6 +96,7 @@ type PendingMessage = {
   mentions?: { type: string; id: string; name: string }[];
   generationProfile?: string;
   includeProjectContext?: boolean;
+  commandCapabilities?: ChatCommandCapability[];
 };
 
 type ToolPermissionRequest = {
@@ -122,6 +143,18 @@ function createClientMessageId(): string {
   return `client-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
+function isChatToolResultMetadata(
+  value: unknown,
+): value is ChatToolResultMetadata {
+  if (!value || typeof value !== "object") return false;
+  const result = value as ChatToolResultMetadata;
+  return (
+    typeof result.output === "string" ||
+    (Array.isArray(result.urls) &&
+      result.urls.every((url) => typeof url === "string"))
+  );
+}
+
 function createLocalAttachmentMetadata(
   files?: File[],
 ): ChatAttachmentMetadata[] | undefined {
@@ -133,9 +166,12 @@ function createLocalAttachmentMetadata(
   }));
 }
 
-function getClientMessageId(message: ConversationMessage): string | null {
-  const value = message.metadata?.client_message_id;
-  return typeof value === "string" && value.length > 0 ? value : null;
+function hasDraggedFiles(
+  dataTransfer: DataTransfer | null,
+): dataTransfer is DataTransfer {
+  return Boolean(
+    dataTransfer && Array.from(dataTransfer.types).includes("Files"),
+  );
 }
 
 function isScenarioWorkflowSession(session: ConversationSession) {
@@ -198,10 +234,14 @@ function createLocalUserMessage(
   content: string,
   clientMessageId: string,
   files?: File[],
+  commandCapabilities?: ChatCommandCapability[],
 ): ConversationMessage {
   const metadata: ConversationMessage["metadata"] = {
     client_message_id: clientMessageId,
   };
+  if (commandCapabilities?.length) {
+    metadata.command_capabilities = commandCapabilities;
+  }
   const attachments = createLocalAttachmentMetadata(files);
   if (attachments) {
     metadata.attachments = attachments;
@@ -288,65 +328,6 @@ function buildResponseModelOptions(
   }
 
   return result;
-}
-
-function isTransientLocalMessage(message: ConversationMessage): boolean {
-  return message.id.startsWith("temp-") || message.id.startsWith("msg-");
-}
-
-function mergePersistedConversationMessages(
-  localMessages: ConversationMessage[],
-  persistedMessages: ConversationMessage[],
-  sessionId: string,
-): ConversationMessage[] {
-  const unusedPersistedIndexes = new Set(
-    persistedMessages.map((_, index) => index),
-  );
-
-  for (const local of localMessages) {
-    const persistedIndex = persistedMessages.findIndex(
-      (persisted) => persisted.id === local.id,
-    );
-    if (persistedIndex >= 0) {
-      unusedPersistedIndexes.delete(persistedIndex);
-    }
-  }
-
-  const unmatchedLocalMessages: ConversationMessage[] = [];
-  for (const local of localMessages) {
-    if (local.session_id !== sessionId) continue;
-
-    const persistedById = persistedMessages.some(
-      (persisted) => persisted.id === local.id,
-    );
-    if (persistedById) continue;
-    if (!isTransientLocalMessage(local)) continue;
-
-    const persistedIndex = persistedMessages.findIndex(
-      (persisted, index) => {
-        if (!unusedPersistedIndexes.has(index)) return false;
-        if (persisted.session_id !== local.session_id) return false;
-        if (persisted.role !== local.role) return false;
-
-        const localClientId = getClientMessageId(local);
-        const persistedClientId = getClientMessageId(persisted);
-        if (localClientId && persistedClientId) {
-          return localClientId === persistedClientId;
-        }
-
-        return persisted.content === local.content;
-      },
-    );
-
-    if (persistedIndex >= 0) {
-      unusedPersistedIndexes.delete(persistedIndex);
-      continue;
-    }
-
-    unmatchedLocalMessages.push(local);
-  }
-
-  return [...persistedMessages, ...unmatchedLocalMessages];
 }
 
 function formatDeepResearchProgress(job: DeepResearchJob): string {
@@ -496,14 +477,6 @@ function ChatPageInner() {
     }
   }, []);
 
-  const handleLlmModeCycle = useCallback(async () => {
-    if (!llmModeOptions.length) return;
-    const options = llmModeOptions;
-    const currentIndex = options.indexOf(llmMode);
-    const nextMode = options[(currentIndex + 1) % options.length] ?? options[0];
-    await handleLlmModeChange(nextMode);
-  }, [handleLlmModeChange, llmMode, llmModeOptions]);
-
   // 最後の通常チャットセッションIDを復元（シナリオ系は専用導線からのみ復元）
   useEffect(() => {
     if (activeSessionId) return;
@@ -537,12 +510,22 @@ function ChatPageInner() {
   }, [activeSessionId, router]);
 
   // ─── 状態 ───
-  const [messages, setMessages] = useState<ConversationMessage[]>([]);
+  const [chatTimeline, dispatchChatTimeline] = useReducer(
+    chatTimelineReducer,
+    initialChatTimelineState,
+  );
+  const messages = chatTimeline.messages;
+  const messagesRef = useRef<ConversationMessage[]>(messages);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
   const [sessionLoadError, setSessionLoadError] = useState<string | null>(null);
   const [sessionLoadAttempt, setSessionLoadAttempt] = useState(0);
   const [isSending, setIsSending] = useState(false);
-  const [isWaitingResponse, setIsWaitingResponse] = useState(false);
+  const [waitingResponseSessionIds, setWaitingResponseSessionIds] = useState<
+    string[]
+  >([]);
+  const [restoredGenerationStatus, setRestoredGenerationStatus] =
+    useState<ConversationGenerationStatus | null>(null);
+  const [pendingAgentRunId, setPendingAgentRunId] = useState<string | null>(null);
   const [responseModelOptions, setResponseModelOptions] = useState<
     ChatResponseModelOption[]
   >([]);
@@ -569,11 +552,41 @@ function ChatPageInner() {
     };
   } | null>(null);
 
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
   // グループチャット
   const [groupDialogOpen, setGroupDialogOpen] = useState(false);
   const [conversationSearchOpen, setConversationSearchOpen] = useState(false);
   const [currentSession, setCurrentSession] =
     useState<ConversationSession | null>(null);
+
+  useEffect(() => {
+    const handleTitleUpdated = (event: Event) => {
+      const detail = (
+        event as CustomEvent<{ sessionId?: unknown; title?: unknown }>
+      ).detail;
+      const sessionId = typeof detail?.sessionId === "string" ? detail.sessionId : "";
+      const title = typeof detail?.title === "string" ? detail.title : "";
+      if (!sessionId) return;
+      setCurrentSession((prev) =>
+        prev && prev.id === sessionId ? { ...prev, title } : prev,
+      );
+    };
+
+    window.addEventListener(
+      CHAT_SESSION_TITLE_UPDATED_EVENT,
+      handleTitleUpdated,
+    );
+    return () => {
+      window.removeEventListener(
+        CHAT_SESSION_TITLE_UPDATED_EVENT,
+        handleTitleUpdated,
+      );
+    };
+  }, []);
+
   const maybeGenerateLoadedSessionTitle = useCallback(
     async (
       session: ConversationSession,
@@ -636,9 +649,22 @@ function ChatPageInner() {
   const isScenarioChatSession =
     (currentSession ? isScenarioWorkflowSession(currentSession) : false) ||
     Boolean(scenarioSession || writingSession || roleplaySession);
+  const isWaitingResponse = Boolean(
+    activeSessionId && waitingResponseSessionIds.includes(activeSessionId),
+  );
   const effectiveProjectId = isScenarioChatSession
     ? undefined
     : (currentSession?.project_id ?? selectedProjectId ?? undefined);
+  const displayedProjectId =
+    currentSession?.project_id ?? (!activeSessionId ? selectedProjectId : null);
+  const displayedProjectName = displayedProjectId
+    ? allProjects.find((project) => project.id === displayedProjectId)?.name
+    : null;
+  const projectAssociationLabel = currentSession
+    ? currentSession.project_id
+      ? (displayedProjectName ?? "不明なプロジェクト")
+      : "プロジェクトなし"
+    : displayedProjectName;
   const temporaryFileSessionKey =
     activeSessionId ?? TEMPORARY_FILE_DRAFT_SESSION_KEY;
   const attachedFiles = temporaryFilesBySession[temporaryFileSessionKey] ?? [];
@@ -656,7 +682,7 @@ function ChatPageInner() {
     lastMessage,
     isStreaming,
     activeTool,
-    activityMessage,
+    activeAgentRunId,
     streamBuffer,
     sendMessage,
     sendPermissionResponse,
@@ -664,7 +690,23 @@ function ChatPageInner() {
     stopGeneration,
     sendSteering,
   } = useWebSocket(activeSessionId);
-  const chatBusy = isStreaming || isSending || isWaitingResponse;
+  const restoredGenerationRunning =
+    restoredGenerationStatus?.running === true && !isStreaming;
+  const displayIsWaitingResponse =
+    isWaitingResponse || restoredGenerationRunning;
+  const displayActiveTool =
+    activeTool ??
+    (restoredGenerationRunning
+      ? (restoredGenerationStatus?.active_tool ?? null)
+      : null);
+  const displayAgentRunId = isStreaming
+    ? activeAgentRunId
+    : restoredGenerationRunning
+      ? (restoredGenerationStatus?.agent_run_id ?? null)
+      : displayIsWaitingResponse
+        ? pendingAgentRunId
+        : null;
+  const chatBusy = isStreaming || isSending || displayIsWaitingResponse;
   const [toolPermissionRequest, setToolPermissionRequest] =
     useState<ToolPermissionRequest | null>(null);
   const [externalModelPromptRequest, setExternalModelPromptRequest] =
@@ -673,6 +715,10 @@ function ChatPageInner() {
 
   // ストリーミング内容を反映するための状態
   const [streamingContent, setStreamingContent] = useState("");
+  const [liveToolResults, setLiveToolResults] = useState<
+    ChatToolResultMetadata[]
+  >([]);
+  const liveToolResultsRef = useRef<ChatToolResultMetadata[]>([]);
   const [steeringInstructions, setSteeringInstructions] = useState<
     SubmittedSteeringInstruction[]
   >([]);
@@ -681,6 +727,35 @@ function ChatPageInner() {
   );
   const responsePollGenerationRef = useRef(0);
   const pendingSearchMessageIdRef = useRef<string | null>(null);
+
+  const markWaitingResponse = useCallback((sessionId: string | null) => {
+    if (!sessionId) return;
+    setWaitingResponseSessionIds((prev) =>
+      prev.includes(sessionId) ? prev : [...prev, sessionId],
+    );
+  }, []);
+
+  const clearWaitingResponse = useCallback((sessionId: string | null) => {
+    if (!sessionId) {
+      return;
+    }
+    setWaitingResponseSessionIds((prev) =>
+      prev.includes(sessionId) ? prev.filter((id) => id !== sessionId) : prev,
+    );
+  }, []);
+
+  const resetDisplayedGenerationState = useCallback(() => {
+    responsePollGenerationRef.current += 1;
+    if (streamingIntervalRef.current) {
+      clearInterval(streamingIntervalRef.current);
+      streamingIntervalRef.current = null;
+    }
+    setStreamingContent("");
+    liveToolResultsRef.current = [];
+    setLiveToolResults([]);
+    setRestoredGenerationStatus(null);
+    setPendingAgentRunId(null);
+  }, []);
 
   // 処理済みメッセージのタイムスタンプを追跡（重複処理防止）
   const processedMsgRef = useRef<string | null>(null);
@@ -739,9 +814,11 @@ function ChatPageInner() {
       const data = await chatApi.getMessages(sessionId);
       const currentSessionId = activeSessionIdRef.current;
       if (currentSessionId && currentSessionId !== sessionId) return null;
-      setMessages((prev) =>
-        mergePersistedConversationMessages(prev, data.messages, sessionId),
-      );
+      dispatchChatTimeline({
+        type: "hydrate_persisted",
+        sessionId,
+        messages: data.messages,
+      });
       return data.messages;
     } catch (err) {
       console.warn("保存済みメッセージの再取得に失敗:", err);
@@ -758,7 +835,9 @@ function ChatPageInner() {
       const generation = ++responsePollGenerationRef.current;
       const timeoutAt = Date.now() + 300_000;
 
-      const hasNewAssistantMessage = (persistedMessages: ConversationMessage[]) =>
+      const hasNewAssistantMessage = (
+        persistedMessages: ConversationMessage[],
+      ) =>
         persistedMessages.some(
           (message) =>
             message.role === "assistant" && !knownAssistantIds.has(message.id),
@@ -774,7 +853,8 @@ function ChatPageInner() {
         if (!persistedMessages) continue;
 
         if (hasNewAssistantMessage(persistedMessages)) {
-          setIsWaitingResponse(false);
+          clearWaitingResponse(sessionId);
+          setRestoredGenerationStatus(null);
           if (titleSession) {
             void maybeGenerateLoadedSessionTitle(
               titleSession,
@@ -791,9 +871,60 @@ function ChatPageInner() {
           void maybeGenerateLoadedSessionTitle(titleSession, finalMessages);
         }
       }
-      setIsWaitingResponse(false);
+      clearWaitingResponse(sessionId);
+      setRestoredGenerationStatus(null);
     },
-    [maybeGenerateLoadedSessionTitle, refreshPersistedMessages],
+    [
+      clearWaitingResponse,
+      maybeGenerateLoadedSessionTitle,
+      refreshPersistedMessages,
+    ],
+  );
+
+  const refreshGenerationStatus = useCallback(
+    async (
+      sessionId: string,
+      knownMessages: ConversationMessage[],
+      titleSession?: ConversationSession | null,
+    ) => {
+      try {
+        const status = await chatApi.getGenerationStatus(sessionId);
+        if (
+          activeSessionIdRef.current &&
+          activeSessionIdRef.current !== sessionId
+        ) {
+          return;
+        }
+        if (status.running) {
+          setRestoredGenerationStatus(status);
+          markWaitingResponse(sessionId);
+          setPendingAgentRunId(status.agent_run_id ?? null);
+          const knownAssistantIds = new Set(
+            knownMessages
+              .filter((message) => message.role === "assistant")
+              .map((message) => message.id),
+          );
+          void waitForPersistedAssistantResponse(
+            sessionId,
+            knownAssistantIds,
+            titleSession,
+          );
+        } else {
+          setRestoredGenerationStatus(null);
+          if (status.status !== "idle") {
+            clearWaitingResponse(sessionId);
+            setPendingAgentRunId(null);
+          }
+        }
+      } catch (err) {
+        console.warn("生成状態の復元に失敗しました", err);
+      }
+    },
+    [
+      clearWaitingResponse,
+      markWaitingResponse,
+      waitForPersistedAssistantResponse,
+    ],
   );
 
   const setAttachedFiles = useCallback(
@@ -815,6 +946,68 @@ function ChatPageInner() {
     [temporaryFileSessionKey],
   );
 
+  const appendDroppedFiles = useCallback(
+    async (dataTransfer: DataTransfer) => {
+      const droppedItems = await getDroppedExplorerFiles(dataTransfer);
+      const files = droppedItems.map((item) => item.file);
+      if (files.length === 0) return;
+
+      setAttachedFiles((prev) => [...prev, ...files]);
+    },
+    [setAttachedFiles],
+  );
+
+  const handleChatFileDragOver = useCallback(
+    (event: ReactDragEvent<HTMLDivElement>) => {
+      if (!hasDraggedFiles(event.dataTransfer)) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      event.dataTransfer.dropEffect = chatBusy ? "none" : "copy";
+    },
+    [chatBusy],
+  );
+
+  const handleChatFileDrop = useCallback(
+    async (event: ReactDragEvent<HTMLDivElement>) => {
+      if (!hasDraggedFiles(event.dataTransfer)) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      if (chatBusy) return;
+
+      await appendDroppedFiles(event.dataTransfer);
+    },
+    [appendDroppedFiles, chatBusy],
+  );
+
+  useEffect(() => {
+    const handleWindowFileDragOver = (event: DragEvent) => {
+      if (!hasDraggedFiles(event.dataTransfer)) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      event.dataTransfer.dropEffect = chatBusy ? "none" : "copy";
+    };
+
+    const handleWindowFileDrop = (event: DragEvent) => {
+      if (!hasDraggedFiles(event.dataTransfer)) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      if (chatBusy) return;
+
+      void appendDroppedFiles(event.dataTransfer);
+    };
+
+    window.addEventListener("dragover", handleWindowFileDragOver);
+    window.addEventListener("drop", handleWindowFileDrop);
+    return () => {
+      window.removeEventListener("dragover", handleWindowFileDragOver);
+      window.removeEventListener("drop", handleWindowFileDrop);
+    };
+  }, [appendDroppedFiles, chatBusy]);
+
   const dispatchMessageWithoutWebSocket = useCallback(
     async (
       sessionId: string,
@@ -823,22 +1016,36 @@ function ChatPageInner() {
       generationProfile?: string,
       responseModel?: ChatResponseModelSelection,
       clientMessageId?: string,
+      commandCapabilities?: ChatCommandCapability[],
       persistence?: {
         skipUserPersistence?: boolean;
         persistedUserMessageId?: string;
       },
     ) => {
-      await chatApi.dispatchMessage(sessionId, {
+      const result = await chatApi.dispatchMessage(sessionId, {
         message: content,
         project_id: projectId,
         generation_profile: generationProfile,
         include_project_context: includeProjectContext,
         response_model: responseModel,
         client_message_id: clientMessageId,
+        command_capabilities: commandCapabilities,
         skip_user_persistence: persistence?.skipUserPersistence,
         persisted_user_message_id: persistence?.persistedUserMessageId,
       });
+      if (clientMessageId && result.user_message_id) {
+        dispatchChatTimeline({
+          type: "promote_client_message",
+          sessionId,
+          clientMessageId,
+          serverMessageId: result.user_message_id,
+        });
+      }
+      if (result.agent_run_id) {
+        setPendingAgentRunId(result.agent_run_id);
+      }
       bumpSession(sessionId);
+      return result;
     },
     [bumpSession, includeProjectContext],
   );
@@ -894,7 +1101,8 @@ function ChatPageInner() {
   const handleStopGeneration = useCallback(async () => {
     if (!activeSessionId) return;
     responsePollGenerationRef.current += 1;
-    setIsWaitingResponse(false);
+    clearWaitingResponse(activeSessionId);
+    setRestoredGenerationStatus(null);
     setSteeringInstructions([]);
     if (streamingIntervalRef.current) {
       clearInterval(streamingIntervalRef.current);
@@ -910,7 +1118,7 @@ function ChatPageInner() {
         toast.error("応答停止に失敗しました");
       }
     }
-  }, [activeSessionId, stopGeneration]);
+  }, [activeSessionId, clearWaitingResponse, stopGeneration]);
 
   const handleSteerGeneration = useCallback(
     async (content: string) => {
@@ -954,8 +1162,8 @@ function ChatPageInner() {
   // ─── セッション選択時にメッセージを取得 ───
   useEffect(() => {
     if (!activeSessionId) {
-      setMessages([]);
-      setStreamingContent("");
+      dispatchChatTimeline({ type: "clear" });
+      resetDisplayedGenerationState();
       setIsLoadingMessages(false);
       setSessionLoadError(null);
       setScenarioSession(null);
@@ -967,15 +1175,14 @@ function ChatPageInner() {
     }
 
     let cancelled = false;
+    resetDisplayedGenerationState();
     setIsLoadingMessages(true);
     setSessionLoadError(null);
     // 現在のセッションのtempメッセージのみ保持（別セッションのものはクリア）
-    setMessages((prev) =>
-      prev.filter(
-        (m) => m.id.startsWith("temp-") && m.session_id === activeSessionId,
-      ),
-    );
-    setStreamingContent("");
+    dispatchChatTimeline({
+      type: "keep_transient_for_session",
+      sessionId: activeSessionId,
+    });
     setSteeringInstructions([]);
     setScenarioSession(null);
     setWritingSession(null);
@@ -1038,12 +1245,15 @@ function ChatPageInner() {
             localStorage.setItem(LAST_SESSION_KEY, activeSessionId);
           }
           // API結果で置き換え。temp-メッセージはAPIに未反映のもののみ残す
-          setMessages((prev) =>
-            mergePersistedConversationMessages(
-              prev.filter((m) => m.id.startsWith("temp-")),
-              data.messages,
-              activeSessionId,
-            ),
+          dispatchChatTimeline({
+            type: "hydrate_persisted",
+            sessionId: activeSessionId,
+            messages: data.messages,
+          });
+          void refreshGenerationStatus(
+            activeSessionId,
+            data.messages,
+            data.session,
           );
           void maybeGenerateLoadedSessionTitle(data.session, data.messages);
           await loadScenarioContext(data.session);
@@ -1054,7 +1264,7 @@ function ChatPageInner() {
           if (localStorage.getItem(LAST_SESSION_KEY) === activeSessionId) {
             localStorage.removeItem(LAST_SESSION_KEY);
           }
-          setMessages([]);
+          dispatchChatTimeline({ type: "clear" });
           setCurrentSession(null);
           setScenarioSession(null);
           setWritingSession(null);
@@ -1076,9 +1286,20 @@ function ChatPageInner() {
   }, [
     activeSessionId,
     maybeGenerateLoadedSessionTitle,
+    refreshGenerationStatus,
+    resetDisplayedGenerationState,
     router,
     sessionLoadAttempt,
   ]);
+
+  useEffect(() => {
+    if (!activeSessionId || !isConnected) return;
+    void refreshGenerationStatus(
+      activeSessionId,
+      messagesRef.current,
+      currentSession,
+    );
+  }, [activeSessionId, currentSession, isConnected, refreshGenerationStatus]);
 
   // ─── WebSocket接続時に保留メッセージを送信 ───
   useEffect(() => {
@@ -1096,9 +1317,17 @@ function ChatPageInner() {
         undefined,
         activeSessionId,
         pending.clientMessageId,
+        pending.commandCapabilities,
       );
+      markWaitingResponse(activeSessionId);
     }
-  }, [activeSessionId, effectiveProjectId, isConnected, sendMessage]);
+  }, [
+    activeSessionId,
+    effectiveProjectId,
+    isConnected,
+    markWaitingResponse,
+    sendMessage,
+  ]);
 
   const handleDeepResearchMessage = useCallback(
     async (content: string, projectId?: string) => {
@@ -1123,10 +1352,11 @@ function ChatPageInner() {
           content,
         });
 
-        setMessages((prev) => {
-          const next = isNewSession ? [] : prev;
-          return [...next, userMessage.message];
-        });
+        if (isNewSession) {
+          dispatchChatTimeline({ type: "replace", messages: [userMessage.message] });
+        } else {
+          dispatchChatTimeline({ type: "append", message: userMessage.message });
+        }
 
         const assistantTemp = createLocalMessage(
           sessionId,
@@ -1134,8 +1364,8 @@ function ChatPageInner() {
           "Deep Researchを開始しています。",
           { deep_research: true, status: "queued" },
         );
-        setMessages((prev) => [...prev, assistantTemp]);
-        setIsWaitingResponse(true);
+        dispatchChatTimeline({ type: "append", message: assistantTemp });
+        markWaitingResponse(sessionId);
         bumpSession(sessionId);
 
         const started = await deepResearchApi.startJob({
@@ -1151,27 +1381,26 @@ function ChatPageInner() {
 
         let current = started;
         const updateAssistantTemp = (job: DeepResearchJob) => {
-          setMessages((prev) => {
-            const content =
-              job.status === "completed" || job.status === "failed"
-                ? formatDeepResearchFinal(job)
-                : formatDeepResearchProgress(job);
-            const replacement = {
-              ...assistantTemp,
-              content,
-              metadata: {
-                ...assistantTemp.metadata,
-                deep_research: true,
-                job_id: job.id,
-                status: job.status,
-                progress: job.progress,
-              },
-            };
-            const index = prev.findIndex((msg) => msg.id === assistantTemp.id);
-            if (index === -1) return [...prev, replacement];
-            const next = [...prev];
-            next[index] = replacement;
-            return next;
+          const content =
+            job.status === "completed" || job.status === "failed"
+              ? formatDeepResearchFinal(job)
+              : formatDeepResearchProgress(job);
+          const replacement = {
+            ...assistantTemp,
+            content,
+            metadata: {
+              ...assistantTemp.metadata,
+              deep_research: true,
+              job_id: job.id,
+              status: job.status,
+              progress: job.progress,
+            },
+          };
+          dispatchChatTimeline({
+            type: "replace_by_id",
+            messageId: assistantTemp.id,
+            message: replacement,
+            appendIfMissing: true,
           });
         };
 
@@ -1188,11 +1417,10 @@ function ChatPageInner() {
           role: "assistant",
           content: finalContent,
         });
-        setMessages((prev) => {
-          const index = prev.findIndex((msg) => msg.id === assistantTemp.id);
-          if (index === -1) return [...prev, savedAssistant.message];
-          const next = [...prev];
-          next[index] = {
+        dispatchChatTimeline({
+          type: "replace_by_id",
+          messageId: assistantTemp.id,
+          message: {
             ...savedAssistant.message,
             metadata: {
               ...savedAssistant.message.metadata,
@@ -1201,8 +1429,8 @@ function ChatPageInner() {
               status: current.status,
               progress: current.progress,
             },
-          };
-          return next;
+          },
+          appendIfMissing: true,
         });
         try {
           const titleResult = await chatApi.generateSessionTitle(sessionId);
@@ -1222,9 +1450,9 @@ function ChatPageInner() {
         console.error("Deep Research送信失敗:", err);
         if (sessionId) {
           const failedSessionId = sessionId;
-          setMessages((prev) => [
-            ...prev,
-            createLocalMessage(
+          dispatchChatTimeline({
+            type: "append",
+            message: createLocalMessage(
               failedSessionId,
               "assistant",
               `Deep Researchに失敗しました。\n\n${
@@ -1232,10 +1460,10 @@ function ChatPageInner() {
               }`,
               { deep_research: true, status: "failed" },
             ),
-          ]);
+          });
         }
       } finally {
-        setIsWaitingResponse(false);
+        clearWaitingResponse(sessionId);
         setIsSending(false);
       }
     },
@@ -1244,7 +1472,9 @@ function ChatPageInner() {
       addSession,
       activateSession,
       bumpSession,
+      clearWaitingResponse,
       includeProjectContext,
+      markWaitingResponse,
       router,
       updateSidebarTitle,
     ],
@@ -1287,9 +1517,9 @@ function ChatPageInner() {
               is_active_branch: true,
             }),
           );
-          setMessages(initialMsgs);
+          dispatchChatTimeline({ type: "replace", messages: initialMsgs });
         } else {
-          setMessages([]);
+          dispatchChatTimeline({ type: "clear" });
         }
 
         activateSession(session.id);
@@ -1311,28 +1541,32 @@ function ChatPageInner() {
       files?: File[],
       mentions?: { type: string; id: string; name: string }[],
       generationProfile?: string,
+      commandCapabilities?: ChatCommandCapability[],
     ) => {
       // 連打防止
       if (isSending) return;
       setIsSending(true);
+      setRestoredGenerationStatus(null);
+      setPendingAgentRunId(null);
       const clientMessageId = createClientMessageId();
       const messageProjectId =
         isScenarioChatSession
           ? undefined
           : (resolveProjectIdFromMessage(content, allProjects) ??
             effectiveProjectId);
+      const hasCommandCapabilities = Boolean(commandCapabilities?.length);
 
-      if (deepResearchEnabled) {
+      if (deepResearchEnabled && !hasCommandCapabilities) {
         if (files?.length) {
           if (activeSessionId) {
-            setMessages((prev) => [
-              ...prev,
-              createLocalMessage(
+            dispatchChatTimeline({
+              type: "append",
+              message: createLocalMessage(
                 activeSessionId,
                 "assistant",
                 "Deep Researchではファイル添付をまだ送信できません。通常チャットに切り替えて送信してください。",
               ),
-            ]);
+            });
           }
           setIsSending(false);
           return;
@@ -1345,7 +1579,8 @@ function ChatPageInner() {
       let sessionId = activeSessionId;
       if (!sessionId) {
         try {
-          const canPersistInitialMessage = !files?.length && !mentions?.length;
+          const canPersistInitialMessage =
+            !files?.length && !mentions?.length && !hasCommandCapabilities;
           const data = await chatApi.createSession(
             "aoi",
             messageProjectId,
@@ -1361,9 +1596,14 @@ function ChatPageInner() {
           // 新規セッションなのでメッセージをクリアしてからユーザーメッセージを追加
           const userMsg =
             data.initial_message ??
-            createLocalUserMessage(sessionId, content, clientMessageId, files);
-          setMessages([userMsg]);
-          setIsWaitingResponse(true);
+            createLocalUserMessage(
+              sessionId,
+              content,
+              clientMessageId,
+              files,
+              commandCapabilities,
+            );
+          dispatchChatTimeline({ type: "replace", messages: [userMsg] });
           const href = `/chat?s=${encodeURIComponent(sessionId)}`;
           if (!navigateChatSessionInPlace(href)) {
             router.push(href);
@@ -1379,6 +1619,7 @@ function ChatPageInner() {
               mentions,
               generationProfile,
               includeProjectContext,
+              commandCapabilities,
             };
           } else {
             try {
@@ -1389,6 +1630,7 @@ function ChatPageInner() {
                 generationProfile,
                 undefined,
                 clientMessageId,
+                commandCapabilities,
                 data.initial_message
                   ? {
                       skipUserPersistence: true,
@@ -1396,11 +1638,12 @@ function ChatPageInner() {
                     }
                   : undefined,
               );
+              markWaitingResponse(sessionId);
             } catch (err) {
               console.error("新規セッションのREST送信失敗:", err);
               const failureMessage = createDispatchFailureMessage(sessionId);
-              setMessages((prev) => [...prev, failureMessage]);
-              setIsWaitingResponse(false);
+              dispatchChatTimeline({ type: "append", message: failureMessage });
+              clearWaitingResponse(sessionId);
               setTimeout(() => setIsSending(false), 500);
               return;
             }
@@ -1415,7 +1658,7 @@ function ChatPageInner() {
           return;
         } catch (err) {
           console.error("セッション自動作成失敗:", err);
-          setIsWaitingResponse(false);
+          clearWaitingResponse(sessionId ?? null);
           setIsSending(false);
           return;
         }
@@ -1436,9 +1679,9 @@ function ChatPageInner() {
           content,
           clientMessageId,
           files,
+          commandCapabilities,
         );
-        setMessages((prev) => [...prev, userMsg]);
-        setIsWaitingResponse(true);
+        dispatchChatTimeline({ type: "append", message: userMsg });
         if (files?.length || mentions?.length) {
           pendingMessageRef.current = {
             content,
@@ -1448,6 +1691,7 @@ function ChatPageInner() {
             mentions,
             generationProfile,
             includeProjectContext,
+            commandCapabilities,
           };
           bumpSession(sessionId);
         } else {
@@ -1459,7 +1703,9 @@ function ChatPageInner() {
               generationProfile,
               undefined,
               clientMessageId,
+              commandCapabilities,
             );
+            markWaitingResponse(sessionId);
             void waitForPersistedAssistantResponse(
               sessionId,
               knownAssistantIds,
@@ -1468,8 +1714,8 @@ function ChatPageInner() {
           } catch (err) {
             console.error("WebSocket未接続時のREST送信失敗:", err);
             const failureMessage = createDispatchFailureMessage(sessionId);
-            setMessages((prev) => [...prev, failureMessage]);
-            setIsWaitingResponse(false);
+            dispatchChatTimeline({ type: "append", message: failureMessage });
+            clearWaitingResponse(sessionId);
           }
         }
         setTimeout(() => setIsSending(false), 500);
@@ -1482,8 +1728,9 @@ function ChatPageInner() {
         content,
         clientMessageId,
         files,
+        commandCapabilities,
       );
-      setMessages((prev) => [...prev, userMsg]);
+      dispatchChatTimeline({ type: "append", message: userMsg });
 
       // グループチャットは共有セッション用WebSocketで送信する。
       if (isGroupChat && sessionId) {
@@ -1499,9 +1746,10 @@ function ChatPageInner() {
           undefined,
           sessionId,
           clientMessageId,
+          commandCapabilities,
         );
         setIsSending(false);
-        setIsWaitingResponse(false);
+        clearWaitingResponse(sessionId);
         return;
       }
 
@@ -1519,9 +1767,10 @@ function ChatPageInner() {
           undefined,
           sessionId,
           clientMessageId,
+          commandCapabilities,
         );
         bumpSession(sessionId);
-        setIsWaitingResponse(true);
+        markWaitingResponse(sessionId);
         void waitForPersistedAssistantResponse(
           sessionId,
           knownAssistantIds,
@@ -1536,8 +1785,9 @@ function ChatPageInner() {
             generationProfile,
             undefined,
             clientMessageId,
+            commandCapabilities,
           );
-          setIsWaitingResponse(true);
+          markWaitingResponse(sessionId);
           void waitForPersistedAssistantResponse(
             sessionId,
             knownAssistantIds,
@@ -1546,8 +1796,8 @@ function ChatPageInner() {
         } catch (err) {
           console.error("メッセージ送信失敗:", err);
           const failureMessage = createDispatchFailureMessage(sessionId);
-          setMessages((prev) => [...prev, failureMessage]);
-          setIsWaitingResponse(false);
+          dispatchChatTimeline({ type: "append", message: failureMessage });
+          clearWaitingResponse(sessionId);
         }
       }
       setTimeout(() => setIsSending(false), 500);
@@ -1564,6 +1814,7 @@ function ChatPageInner() {
       activateSession,
       addSession,
       bumpSession,
+      clearWaitingResponse,
       isSending,
       deepResearchEnabled,
       handleDeepResearchMessage,
@@ -1572,6 +1823,7 @@ function ChatPageInner() {
       createDispatchFailureMessage,
       currentSession,
       isScenarioChatSession,
+      markWaitingResponse,
       waitForPersistedAssistantResponse,
     ],
   );
@@ -1582,7 +1834,12 @@ function ChatPageInner() {
       content: string,
       responseModel?: ChatResponseModelSelection,
     ) => {
-      if (!activeSessionId || isSending || isWaitingResponse || isStreaming) {
+      if (
+        !activeSessionId ||
+        isSending ||
+        displayIsWaitingResponse ||
+        isStreaming
+      ) {
         return;
       }
       const knownAssistantIds = new Set(
@@ -1590,17 +1847,25 @@ function ChatPageInner() {
           .filter((message) => message.role === "assistant")
           .map((message) => message.id),
       );
+      const commandCapabilities =
+        commandCapabilitiesFromMessageMetadata(sourceMessage.metadata);
       setIsSending(true);
-      setIsWaitingResponse(true);
+      setPendingAgentRunId(null);
       try {
-        await chatApi.dispatchMessage(activeSessionId, {
+        const result = await chatApi.dispatchMessage(activeSessionId, {
           message: content,
           project_id: effectiveProjectId,
           generation_profile: "autonomous_work",
           include_project_context: includeProjectContext,
           edit_message_id: sourceMessage.id,
           response_model: responseModel,
+          command_capabilities:
+            commandCapabilities.length > 0 ? commandCapabilities : undefined,
         });
+        if (result.agent_run_id) {
+          setPendingAgentRunId(result.agent_run_id);
+        }
+        markWaitingResponse(activeSessionId);
         bumpSession(activeSessionId);
         void waitForPersistedAssistantResponse(
           activeSessionId,
@@ -1609,7 +1874,7 @@ function ChatPageInner() {
         );
       } catch (err) {
         console.error("分岐メッセージ送信失敗:", err);
-        setIsWaitingResponse(false);
+        clearWaitingResponse(activeSessionId);
       } finally {
         setTimeout(() => setIsSending(false), 500);
       }
@@ -1617,11 +1882,13 @@ function ChatPageInner() {
     [
       activeSessionId,
       bumpSession,
+      clearWaitingResponse,
       effectiveProjectId,
       includeProjectContext,
       isSending,
       isStreaming,
-      isWaitingResponse,
+      displayIsWaitingResponse,
+      markWaitingResponse,
       messages,
       currentSession,
       waitForPersistedAssistantResponse,
@@ -1802,33 +2069,26 @@ function ChatPageInner() {
       const data = lastMessage.data as Record<string, unknown> | undefined;
       if (isForeignSessionEvent(data?.session_id)) return;
       if (data && data.type === "assistant") {
-        setIsWaitingResponse(false);
+        clearWaitingResponse(activeSessionId);
+        setRestoredGenerationStatus(null);
         setSteeringInstructions([]);
         const content = (data.message as string) || "";
-        if (content) {
-          const assistantMsg: ConversationMessage = {
-            id: `msg-${Date.now()}`,
-            session_id: activeSessionId || "",
-            role: "assistant",
-            content,
-            metadata: { character: data.character },
-            created_at: new Date().toISOString(),
-            parent_message_id: null,
-            branch_index: 0,
-            is_active_branch: true,
-          };
-          // 同じ内容のassistantメッセージが既にある場合は重複追加しない
-          setMessages((prev) => {
-            if (
-              prev.some((m) => m.role === "assistant" && m.content === content)
-            ) {
-              return prev;
-            }
-            return [...prev, assistantMsg];
+        if (content && activeSessionId) {
+          dispatchChatTimeline({
+            type: "append",
+            message: createLocalMessage(
+              activeSessionId,
+              "assistant",
+              content,
+              {
+                character: data.character,
+                ...(typeof data.session_id === "string" && data.session_id
+                  ? {}
+                  : { transient_source: "unscoped_ws_new_message" }),
+              },
+            ),
           });
-          if (activeSessionId) {
-            void refreshPersistedMessages(activeSessionId);
-          }
+          void refreshPersistedMessages(activeSessionId);
         }
       }
       // user型のnew_messageは保存済みIDを含まないため、応答側で履歴を再取得してtemp表示を置き換える
@@ -1840,7 +2100,8 @@ function ChatPageInner() {
       if (activeSessionId && sessionId === activeSessionId) {
         if (lastMessage.role === "assistant") {
           responsePollGenerationRef.current += 1;
-          setIsWaitingResponse(false);
+          clearWaitingResponse(sessionId);
+          setRestoredGenerationStatus(null);
           setSteeringInstructions([]);
         }
         void (async () => {
@@ -1877,32 +2138,45 @@ function ChatPageInner() {
     if (lastMessage.type === "generated_image") {
       if (isForeignSessionEvent(lastMessage.session_id)) return;
       const content = (lastMessage.content as string) || "";
-      if (content) {
-        setMessages((prev) => {
-          const lastAssistantIndex = [...prev]
-            .reverse()
-            .findIndex((m) => m.role === "assistant");
-          if (lastAssistantIndex === -1) return prev;
-
-          const idx = prev.length - 1 - lastAssistantIndex;
-          const target = prev[idx];
-          if (target.content.includes(content)) return prev;
-
-          const next = [...prev];
-          next[idx] = {
-            ...target,
-            content: `${target.content}\n\n${content}`.trim(),
-          };
-          return next;
+      if (content && activeSessionId) {
+        dispatchChatTimeline({
+          type: "append_to_last_assistant",
+          sessionId: activeSessionId,
+          content,
         });
       }
       return;
     }
 
+    if (
+      lastMessage.type === "tool_start" ||
+      lastMessage.type === "tool_end" ||
+      lastMessage.type === "status_update" ||
+      lastMessage.type === "reasoning_progress" ||
+      lastMessage.type === "steering_update"
+    ) {
+      if (isForeignSessionEvent(lastMessage.session_id)) return;
+      setRestoredGenerationStatus(null);
+      if (
+        lastMessage.type === "tool_end" &&
+        isChatToolResultMetadata(lastMessage.tool_result)
+      ) {
+        const nextResults = [
+          ...liveToolResultsRef.current,
+          lastMessage.tool_result,
+        ];
+        liveToolResultsRef.current = nextResults;
+        setLiveToolResults(nextResults);
+      }
+    }
+
     if (lastMessage.type === "stream_start") {
       if (isForeignSessionEvent(lastMessage.session_id)) return;
-      setIsWaitingResponse(false);
+      setRestoredGenerationStatus(null);
+      clearWaitingResponse(activeSessionId);
       setStreamingContent("");
+      liveToolResultsRef.current = [];
+      setLiveToolResults([]);
       // ストリーミングバッファを定期的に反映
       streamingIntervalRef.current = setInterval(() => {
         setStreamingContent(streamBuffer.current);
@@ -1912,12 +2186,15 @@ function ChatPageInner() {
     if (lastMessage.type === "stream_cancelled") {
       if (isForeignSessionEvent(lastMessage.session_id)) return;
       responsePollGenerationRef.current += 1;
-      setIsWaitingResponse(false);
+      clearWaitingResponse(activeSessionId);
+      setRestoredGenerationStatus(null);
       if (streamingIntervalRef.current) {
         clearInterval(streamingIntervalRef.current);
         streamingIntervalRef.current = null;
       }
       setStreamingContent("");
+      liveToolResultsRef.current = [];
+      setLiveToolResults([]);
       setSteeringInstructions([]);
       toast.info(
         typeof lastMessage.message === "string"
@@ -1933,7 +2210,8 @@ function ChatPageInner() {
     if (lastMessage.type === "stream_end" || lastMessage.type === "response") {
       if (isForeignSessionEvent(lastMessage.session_id)) return;
       responsePollGenerationRef.current += 1;
-      setIsWaitingResponse(false);
+      clearWaitingResponse(activeSessionId);
+      setRestoredGenerationStatus(null);
       setSteeringInstructions([]);
       // インターバル停止
       if (streamingIntervalRef.current) {
@@ -1943,34 +2221,22 @@ function ChatPageInner() {
 
       const finalContent =
         (lastMessage.content as string) || streamBuffer.current;
-
-      if (finalContent) {
-        const msgId = (lastMessage.message_id as string) || `msg-${Date.now()}`;
-        setMessages((prev) => {
-          // 同一内容のassistantメッセージが既にあれば追加しない
-          if (
-            prev.some(
-              (m) => m.role === "assistant" && m.content === finalContent,
-            )
-          ) {
-            return prev;
-          }
-          const assistantMsg: ConversationMessage = {
-            id: msgId,
-            session_id: activeSessionId || "",
-            role: "assistant",
-            content: finalContent,
-            metadata: {},
-            created_at: new Date().toISOString(),
-            parent_message_id: null,
-            branch_index: 0,
-            is_active_branch: true,
-          };
-          return [...prev, assistantMsg];
+      if (finalContent && activeSessionId) {
+        const toolResults = liveToolResultsRef.current;
+        dispatchChatTimeline({
+          type: "append",
+          message: createLocalMessage(
+            activeSessionId,
+            "assistant",
+            finalContent,
+            toolResults.length > 0 ? { tool_results: toolResults } : {},
+          ),
         });
       }
 
       setStreamingContent("");
+      liveToolResultsRef.current = [];
+      setLiveToolResults([]);
       if (activeSessionId) {
         void refreshPersistedMessages(activeSessionId);
       }
@@ -1986,6 +2252,7 @@ function ChatPageInner() {
     updateSidebarTitle,
     currentSession,
     maybeGenerateLoadedSessionTitle,
+    clearWaitingResponse,
   ]);
 
   // クリーンアップ
@@ -2002,6 +2269,8 @@ function ChatPageInner() {
     <div
       className="relative flex h-full overflow-hidden"
       style={chatViewportStyle}
+      onDragOver={handleChatFileDragOver}
+      onDrop={handleChatFileDrop}
     >
       <div className="flex flex-1 flex-col overflow-hidden">
         {/* ヘッダーバー：グループチャット作成・ステアリングトグル */}
@@ -2015,6 +2284,14 @@ function ChatPageInner() {
             <Users className="size-3.5 mr-1" />
             グループ
           </Button>
+          {projectAssociationLabel && (
+            <span className="inline-flex min-w-0 max-w-[52%] items-center gap-1 rounded-md border border-border/60 bg-background/60 px-2 py-1 text-xs text-muted-foreground">
+              <FolderOpen className="size-3.5 shrink-0" />
+              <span className="truncate">
+                プロジェクト: {projectAssociationLabel}
+              </span>
+            </span>
+          )}
           {isRpSession && activeSessionId && (
             <Button
               variant={steeringVisible ? "secondary" : "ghost"}
@@ -2072,10 +2349,11 @@ function ChatPageInner() {
                 : "メッセージを送信して会話を開始しましょう。"
             }
             isStreaming={isStreaming}
-            isWaitingResponse={isWaitingResponse}
+            isWaitingResponse={displayIsWaitingResponse}
             streamingContent={streamingContent}
-            activeTool={activeTool}
-            activityMessage={activityMessage}
+            liveToolResults={liveToolResults}
+            activeTool={displayActiveTool}
+            activeAgentRunId={displayAgentRunId}
             onEditMessage={handleEditMessage}
             onRerunMessage={handleRerunMessage}
             responseModelOptions={responseModelOptions}
@@ -2107,7 +2385,6 @@ function ChatPageInner() {
           llmModeOptions={llmModeOptions}
           llmModeLabels={llmModeLabels}
           onLlmModeChange={handleLlmModeChange}
-          onLlmModeCycle={handleLlmModeCycle}
           steeringInstructions={steeringInstructions}
           onClearSteeringInstructions={() => setSteeringInstructions([])}
         />

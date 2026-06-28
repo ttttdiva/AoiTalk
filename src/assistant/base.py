@@ -302,7 +302,7 @@ class BaseAssistant(ABC):
         
         # Update LLM client with new character
         if self.llm_client:
-            # Use update_character/set_character if available (for GeminiCLIBackend etc.)
+            # Use update_character/set_character if available on the LLM client.
             if hasattr(self.llm_client, 'update_character'):
                 self.llm_client.update_character(yaml_filename)
                 print(f"[BaseAssistant] LLMキャラクターを更新しました (update_character)")

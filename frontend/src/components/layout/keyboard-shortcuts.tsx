@@ -37,6 +37,13 @@ export function KeyboardShortcuts() {
         return;
       }
 
+      // Ctrl+Shift+H: Today/Home オーバーレイ
+      if (e.ctrlKey && e.shiftKey && (e.key === "h" || e.key === "H")) {
+        e.preventDefault();
+        window.dispatchEvent(new Event("global-open-home"));
+        return;
+      }
+
       // Ctrl+J: チャット入力欄にフォーカス
       if (e.ctrlKey && (e.key === "j" || e.key === "J")) {
         e.preventDefault();
@@ -116,6 +123,7 @@ export function KeyboardShortcuts() {
           break;
         case "p":
         case "P":
+          if (pathname.startsWith("/filer")) return;
           e.preventDefault();
           window.dispatchEvent(new Event("global-open-memo"));
           break;

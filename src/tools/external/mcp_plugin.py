@@ -8,6 +8,8 @@ from contextlib import AsyncExitStack
 import json
 import os
 
+from ..core import ToolDefinition, ToolParam
+
 try:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
@@ -17,6 +19,53 @@ except ImportError:
     logging.warning("MCP SDK not available. Install with: pip install mcp[cli]")
 
 logger = logging.getLogger(__name__)
+
+
+def _mcp_tool_params(input_schema: Any) -> List[ToolParam]:
+    if not isinstance(input_schema, dict):
+        return []
+
+    properties = input_schema.get("properties", {})
+    if not isinstance(properties, dict):
+        return []
+
+    required = set(input_schema.get("required", []) or [])
+    params: List[ToolParam] = []
+    for name, spec in properties.items():
+        if not isinstance(spec, dict):
+            spec = {}
+        param_type = spec.get("type", "string")
+        if isinstance(param_type, list):
+            concrete_types = [value for value in param_type if value != "null"]
+            param_type = concrete_types[0] if concrete_types else "string"
+        if param_type not in {"string", "integer", "number", "boolean", "array", "object"}:
+            param_type = "string"
+
+        params.append(
+            ToolParam(
+                name=str(name),
+                type=str(param_type),
+                description=str(spec.get("description") or ""),
+                required=name in required,
+                default=spec.get("default"),
+                enum=spec.get("enum") if isinstance(spec.get("enum"), list) else None,
+            )
+        )
+    return params
+
+
+def _format_mcp_content(content: Any) -> str:
+    if isinstance(content, list):
+        texts = []
+        for item in content:
+            if hasattr(item, "text"):
+                texts.append(str(item.text))
+            elif isinstance(item, dict) and "text" in item:
+                texts.append(str(item["text"]))
+            else:
+                texts.append(str(item))
+        return "\n".join(texts)
+    return str(content)
 
 
 class MCPClient:
@@ -265,11 +314,10 @@ class MCPPlugin:
     """
     
     def __init__(self):
-        self.name = "MCP Plugin"  # Add name attribute for OpenAI Agents SDK compatibility
+        self.name = "MCP Plugin"
         self.client = MCPClient()
         self._initialized = False
         self._init_loop_id = None
-        self._tool_server_map: Dict[str, str] = {}  # tool_name -> server_name cache
     
     async def initialize(self, config: Dict[str, Any] = None):
         """Initialize the MCP plugin"""
@@ -305,7 +353,7 @@ class MCPPlugin:
                             continue
                     else:
                         actual_config = dict(server_config)
-                    
+
                     # Start with current process environment (PATH, etc.)
                     # then overlay config-specified env vars
                     env = {**shared_env, **actual_config.get('env', {})}
@@ -456,97 +504,49 @@ class MCPPlugin:
         return self.client.is_available()
     
     async def list_tools(self):
-        """List tools (required by OpenAI Agents SDK)"""
+        """List MCP tools as native AoiTalk ToolDefinition instances."""
         if not self._initialized:
             return []
 
-        # OpenAI Agents SDK expects a list of tool objects with .name attribute
         all_tools = await self.client.list_tools()
         tools_list = []
 
-        # Rebuild tool-to-server mapping cache
-        self._tool_server_map.clear()
-
         for server_name, tools in all_tools.items():
-            for tool in tools:
-                # Cache tool -> server mapping
-                self._tool_server_map[tool['name']] = server_name
-
-                # Create a simple object with name attribute
-                class ToolObject:
-                    def __init__(self, name, description, inputSchema):
-                        self.name = name
-                        self.description = description
-                        self.inputSchema = inputSchema
-
-                tool_obj = ToolObject(
-                    name=tool['name'],
-                    description=tool['description'],
-                    inputSchema=tool['inputSchema']
-                )
-                tools_list.append(tool_obj)
+            for mcp_tool in tools:
+                tools_list.append(self._to_tool_definition(server_name, mcp_tool))
 
         return tools_list
-    
+
+    def _to_tool_definition(
+        self,
+        server_name: str,
+        mcp_tool: Dict[str, Any],
+    ) -> ToolDefinition:
+        tool_name = str(mcp_tool.get("name") or "")
+        native_name = f"mcp_{server_name}_{tool_name}"
+        description = str(mcp_tool.get("description") or tool_name)
+
+        async def _invoke(**kwargs):
+            result = await self.client.call_tool(server_name, tool_name, kwargs)
+            if result is None:
+                return f"Failed to execute tool {tool_name}"
+            if result.get("isError", False):
+                return f'Tool execution error: {result.get("content", "Unknown error")}'
+            return _format_mcp_content(result.get("content", []))
+
+        return ToolDefinition(
+            name=native_name,
+            description=f"[MCP:{server_name}] {description}",
+            function=_invoke,
+            parameters=_mcp_tool_params(mcp_tool.get("inputSchema")),
+            is_async=True,
+            side_effect="external",
+            timeout_seconds=30.0,
+            owner=f"mcp:{server_name}",
+        )
+
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any]):
-        """Call tool (required by OpenAI Agents SDK)
-
-        The SDK calls list_tools() to discover tools, then call_tool(name, args)
-        to invoke them. Tool names come directly from the MCP server (e.g.,
-        'get_teams', 'create_task') so we need to find the correct server.
-        """
-        class TextContent:
-            def __init__(self, text):
-                self.text = text
-            def model_dump_json(self):
-                return json.dumps({"text": self.text})
-
-        def _make_result(text):
-            return type('MockResult', (), {'content': [TextContent(text)]})()
-
+        """Call an MCP tool by its native `mcp_<server>_<tool>` name."""
         if not self._initialized:
-            return _make_result('MCP plugin not initialized')
-
-        # Use cached tool-to-server mapping (built by list_tools)
-        server_name = self._tool_server_map.get(tool_name)
-
-        # Fallback: rebuild mapping if cache miss
-        if server_name is None:
-            for sname in self.client.sessions:
-                try:
-                    session = self.client.sessions[sname]
-                    response = await session.list_tools()
-                    for t in response.tools:
-                        self._tool_server_map[t.name] = sname
-                except Exception:
-                    continue
-            server_name = self._tool_server_map.get(tool_name)
-
-        if server_name is None:
-            return _make_result(f'Tool "{tool_name}" not found on any MCP server')
-
-        # Call the tool through MCP client
-        result = await self.client.call_tool(server_name, tool_name, arguments)
-
-        if result is None:
-            return _make_result(f'Failed to execute tool {tool_name}')
-
-        if result.get('isError', False):
-            return _make_result(f'Tool execution error: {result.get("content", "Unknown error")}')
-
-        # Format content for OpenAI Agents SDK
-        content = result.get('content', [])
-        if isinstance(content, list):
-            texts = []
-            for item in content:
-                if hasattr(item, 'text'):
-                    texts.append(str(item.text))
-                elif isinstance(item, dict) and 'text' in item:
-                    texts.append(str(item['text']))
-                else:
-                    texts.append(str(item))
-            content_text = '\n'.join(texts)
-        else:
-            content_text = str(content)
-
-        return _make_result(content_text) 
+            return "MCP plugin not initialized"
+        return await self.execute_tool({"name": tool_name, "arguments": arguments})

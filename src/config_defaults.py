@@ -39,15 +39,47 @@ openai_compatible_local:
   base_url: http://127.0.0.1:8080/v1
   model: local-model
   api_key: dummy
+  context_window_tokens: null
+  context_budget:
+    probe_server: true
+    response_reserve_tokens: 1024
+    chars_per_token: 1.15
   enable_tools: false
   enable_response_format: false
   enable_extra_body: false
   extra_body: {}
   qwopus:
     auto_start: true
+  exo:
+    auto_start: true
+    command: ''
+    root: ''
+  mlx_lm:
+    auto_start: true
+    command: ''
+context_compression:
+  enabled: false
+  mode: auto
+  min_chars: 3000
+  tool_result_max_chars: null
+  ccr_enabled: false
+  ccr_ttl_seconds: 1800
+  strip_data_urls: true
+  strategies:
+    json: true
+    log: true
+    search: true
+    file_preview: true
+    file_listing: true
+    text_head_tail: true
+  protect:
+    recent_tool_results: 2
+    error_outputs_under_chars: 8000
+    latest_project_progress: true
 openrouter:
   base_url: https://openrouter.ai/api/v1
   model: openai/gpt-4o-mini
+  enable_tools: false
   app_name: AoiTalk
   site_url: ''
 codex_cli:
@@ -56,8 +88,8 @@ codex_cli:
 claude_cli:
   model: default
   reasoning_effort: medium
-gemini_cli:
-  model: gemini-3-flash-preview
+antigravity_cli:
+  model: default
 runtime_feature_permissions:
   allowed_discord_user_ids:
   - '217450236879044609'
@@ -76,12 +108,322 @@ external_llm:
   auto_approve: true
   tools:
   - web_search
-model_sharing:
+agent_team:
   enabled: false
   confirm_prompt: true
   notify: true
-  provider: openai
-  model: gpt-4o
+  redaction_terms: []
+  strategy: adaptive
+  roster:
+  - id: architect
+    member_key: architect
+    label: 設計
+    enabled: true
+    provider: openai
+    model: gpt-4o-mini
+    mode: medium
+    reasoning_effort: medium
+    role: architect
+    tools:
+    - workspace_read
+    - repo_map
+    scalable: true
+    default_instances: 1
+    max_instances: 2
+    spawn_policy: adaptive
+  - id: explorer
+    member_key: explorer
+    label: 調査
+    enabled: true
+    provider: openai
+    model: gpt-4o-mini
+    mode: fast
+    reasoning_effort: fast
+    role: explorer
+    tools:
+    - workspace_read
+    - repo_map
+    scalable: true
+    default_instances: 1
+    max_instances: 6
+    spawn_policy: adaptive
+  - id: implementer
+    member_key: implementer
+    label: 実装
+    enabled: true
+    provider: openai
+    model: gpt-4o-mini
+    mode: medium
+    reasoning_effort: medium
+    role: worker
+    tools:
+    - workspace_read
+    - repo_map
+    scalable: true
+    default_instances: 1
+    max_instances: 4
+    spawn_policy: adaptive
+  - id: reviewer
+    member_key: reviewer
+    label: レビュー
+    enabled: true
+    provider: openai
+    model: gpt-4o-mini
+    mode: medium
+    reasoning_effort: medium
+    role: reviewer
+    tools:
+    - workspace_read
+    - repo_map
+    scalable: true
+    default_instances: 1
+    max_instances: 4
+    spawn_policy: adaptive
+  - id: utility
+    member_key: utility
+    label: ユーティリティ
+    enabled: true
+    provider: openai
+    model: gpt-4o-mini
+    mode: fast
+    reasoning_effort: fast
+    role: utility
+    tools:
+    - utility
+    scalable: false
+    default_instances: 1
+    max_instances: 1
+  - id: media
+    member_key: media
+    label: メディア
+    enabled: true
+    provider: openai
+    model: gpt-4o-mini
+    mode: fast
+    reasoning_effort: fast
+    role: media
+    tools:
+    - media
+    scalable: false
+    default_instances: 1
+    max_instances: 1
+  - id: spotify
+    member_key: spotify
+    label: Spotify
+    enabled: true
+    provider: openai
+    model: gpt-4o-mini
+    mode: fast
+    reasoning_effort: fast
+    role: spotify
+    tools:
+    - spotify
+    scalable: false
+    default_instances: 1
+    max_instances: 1
+  - id: scenario
+    member_key: scenario
+    label: TRPG_GM
+    enabled: true
+    provider: openai
+    model: gpt-4o-mini
+    mode: fast
+    reasoning_effort: fast
+    role: TRPG_GM
+    tools:
+    - scenario
+    scalable: false
+    default_instances: 1
+    max_instances: 1
+  - id: writing
+    member_key: writing
+    label: 執筆
+    enabled: true
+    provider: openai
+    model: gpt-4o-mini
+    mode: fast
+    reasoning_effort: fast
+    role: writing
+    tools:
+    - writing
+    scalable: false
+    default_instances: 1
+    max_instances: 1
+  - id: import
+    member_key: import
+    label: シナリオ素材取り込み
+    enabled: true
+    provider: openai
+    model: gpt-4o-mini
+    mode: fast
+    reasoning_effort: fast
+    role: scenario_import
+    tools:
+    - import
+    scalable: false
+    default_instances: 1
+    max_instances: 1
+  - id: advanced_reasoning
+    member_key: advanced_reasoning
+    label: 高度推論
+    enabled: false
+    provider: openai
+    model: gpt-4o
+    mode: medium
+    reasoning_effort: medium
+    role: judge
+    tools: []
+    scalable: false
+    default_instances: 0
+    max_instances: 1
+  - id: agent_harness
+    member_key: agent_harness
+    label: 作業エージェント
+    enabled: true
+    provider: codex-cli
+    model: gpt-5-codex
+    mode: medium
+    reasoning_effort: medium
+    role: work_agent
+    tools:
+    - codex_exec
+    - claude_code
+    - custom_command
+    runner: codex_exec
+    scalable: false
+    default_instances: 1
+    max_instances: 1
+    spawn_policy: adaptive
+  members:
+    advanced_reasoning:
+      enabled: false
+      provider: openai
+      model: gpt-4o
+      mode: medium
+      reasoning_effort: medium
+      role: judge
+      tools: []
+    architect:
+      enabled: true
+      provider: openai
+      model: gpt-4o-mini
+      mode: medium
+      reasoning_effort: medium
+      role: architect
+      tools:
+      - workspace_read
+      - repo_map
+      scalable: true
+      default_instances: 1
+      max_instances: 2
+    explorer:
+      enabled: true
+      provider: openai
+      model: gpt-4o-mini
+      mode: fast
+      reasoning_effort: fast
+      role: explorer
+      tools:
+      - workspace_read
+      - repo_map
+      scalable: true
+      default_instances: 1
+      max_instances: 6
+    implementer:
+      enabled: true
+      provider: openai
+      model: gpt-4o-mini
+      mode: medium
+      reasoning_effort: medium
+      role: worker
+      tools:
+      - workspace_read
+      - repo_map
+      scalable: true
+      default_instances: 1
+      max_instances: 4
+    reviewer:
+      enabled: true
+      provider: openai
+      model: gpt-4o-mini
+      mode: medium
+      reasoning_effort: medium
+      role: reviewer
+      tools:
+      - workspace_read
+      - repo_map
+      scalable: true
+      default_instances: 1
+      max_instances: 4
+    utility:
+      enabled: true
+      provider: openai
+      model: gpt-4o-mini
+      mode: fast
+      reasoning_effort: fast
+      role: utility
+      tools:
+      - utility
+    media:
+      enabled: true
+      provider: openai
+      model: gpt-4o-mini
+      mode: fast
+      reasoning_effort: fast
+      role: media
+      tools:
+      - media
+    spotify:
+      enabled: true
+      provider: openai
+      model: gpt-4o-mini
+      mode: fast
+      reasoning_effort: fast
+      role: spotify
+      tools:
+      - spotify
+    scenario:
+      enabled: true
+      provider: openai
+      model: gpt-4o-mini
+      mode: fast
+      reasoning_effort: fast
+      role: TRPG_GM
+      tools:
+      - scenario
+    writing:
+      enabled: true
+      provider: openai
+      model: gpt-4o-mini
+      mode: fast
+      reasoning_effort: fast
+      role: writing
+      tools:
+      - writing
+    import:
+      enabled: true
+      provider: openai
+      model: gpt-4o-mini
+      mode: fast
+      reasoning_effort: fast
+      role: scenario_import
+      tools:
+      - import
+    agent_harness:
+      enabled: true
+      provider: codex-cli
+      model: gpt-5-codex
+      mode: medium
+      reasoning_effort: medium
+      role: work_agent
+      tools:
+      - codex_exec
+      - claude_code
+      - custom_command
+      runner: codex_exec
+      scalable: false
+      default_instances: 1
+      max_instances: 1
 search:
   provider: openai
   x_enabled: false
@@ -189,6 +531,13 @@ agent_harness:
     exec_sandbox: workspace-write
     runner: codex_exec
     stall_timeout_ms: 300000
+  claude:
+    bin_path: claude
+    model: null
+    reasoning_effort: null
+  custom_command:
+    command: null
+    args: []
   hooks:
     timeout_ms: 60000
     after_create: null
@@ -198,6 +547,11 @@ agent_harness:
 
 agentic_completion:
   max_rounds: 2
+  work_max_rounds: 120
+  assisted_work_max_rounds: 120
+  autonomous_work_max_rounds: 120
+  review_max_rounds: 120
+  project_progress_max_rounds: 120
 mcp_enabled: false
 mcp:
   servers:
@@ -327,7 +681,8 @@ speech_recognition:
       stream_chunk_duration: 1.0
     whisper:
       chunk_length: 1.0
-      fp16: true
+      device: cpu
+      fp16: false
       language: ja
       model: large-v3
       temperature: 0.0
@@ -358,6 +713,7 @@ reasoning:
     data_transformation: 0.2
 tts:
   speed_adjustment: 1.0
+  synthesis_timeout: 30.0
 tts_settings:
   voicevox:
     host: 127.0.0.1
@@ -384,6 +740,28 @@ tts_settings:
     max_ref_seconds: 30.0
     ref_normalize_db: null
     ref_ensure_max: true
+  miotts:
+    model_id: Aratako/MioTTS-0.6B
+    codec_model_id: Aratako/MioCodec-25Hz-44.1kHz-v2
+    refs_dir: config/miotts_refs
+    presets_dir: config/miotts_presets
+    cache_dir: cache/miotts
+    device: auto
+    dtype: auto
+    trust_remote_code: false
+    synthesis_timeout: 180.0
+    max_text_length: 300
+    max_reference_mb: 20
+    max_reference_seconds: 20.0
+    default_preset_id: ""
+    temperature: 0.8
+    top_p: 1.0
+    max_tokens: 700
+    repetition_penalty: 1.0
+    presence_penalty: 0.0
+    frequency_penalty: 0.0
+    best_of_n_enabled: false
+    best_of_n_n: 1
 moderations: false
 use_tools: true
 rag:
@@ -445,8 +823,6 @@ agents:
   utility:
     enabled: true
   media:
-    enabled: true
-  skills:
     enabled: true
   spotify:
     enabled: false

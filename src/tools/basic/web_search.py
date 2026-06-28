@@ -1,12 +1,12 @@
 """
 Web search tool for normal chat agents.
 
-The backend can use either OpenAI's hosted WebSearchTool or the local
+The backend can use either OpenAI's hosted web search or the local
 lightweight search service, depending on `search.provider`.
 """
 import os
 import asyncio
-from ..core import tool as function_tool
+from ..core import tool
 
 from ..external_llm_permission import check_permission_sync
 from ...services.quick_search_service import (
@@ -39,7 +39,7 @@ def _run_async(coro_factory, timeout: int = 45):
 
 
 def openai_web_search_impl(query: str) -> str:
-    """OpenAI APIのHosted WebSearchToolで検索します。
+    """OpenAI APIのHosted Web Searchで検索します。
 
     Args:
         query: 検索クエリ
@@ -55,25 +55,27 @@ def openai_web_search_impl(query: str) -> str:
         if not api_key:
             return "Web検索を使用するにはOPENAI_API_KEYが必要です。"
 
-        # OpenAI Agents SDKを使って検索を実行
+        # OpenAI SDKのResponses APIでHosted Web Searchを実行
         try:
-            from agents import Agent, WebSearchTool, Runner
-
-            agent = Agent(
-                name="web-search-agent",
-                model="gpt-4o",
-                tools=[WebSearchTool()],
-                instructions="あなたはWeb検索アシスタントです。与えられたクエリについて最新の情報を検索し、簡潔で正確な回答を日本語で提供してください。"
-            )
+            from openai import OpenAI
 
             async def run_search():
-                runner = Runner()
-                return await runner.run(agent, f"以下について検索して教えてください：{query}")
+                client = OpenAI(api_key=api_key)
+                return client.responses.create(
+                    model="gpt-4o-mini",
+                    tools=[{"type": "web_search_preview"}],
+                    input=(
+                        "あなたはWeb検索アシスタントです。"
+                        "与えられたクエリについて最新の情報を検索し、"
+                        "簡潔で正確な回答を日本語で提供してください。\n\n"
+                        f"検索クエリ: {query}"
+                    ),
+                )
 
             response = _run_async(run_search, timeout=45)
 
-            if response and hasattr(response, 'text'):
-                result = response.text
+            if response and hasattr(response, 'output_text'):
+                result = response.output_text
                 print(f"[Tool] web_search 結果: {len(result)}文字")
                 return result
             elif response:
@@ -135,7 +137,7 @@ def web_search_with_permission(query: str) -> str:
     return web_search_with_config(query)
 
 
-@function_tool
+@tool
 def web_search(query: str) -> str:
     """Web検索を実行します。
 

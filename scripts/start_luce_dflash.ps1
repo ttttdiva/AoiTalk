@@ -1,7 +1,6 @@
 param(
     [string]$HostAddress = "127.0.0.1",
     [int]$Port = 8080,
-    [int]$MaxContext = 8192,
     [string]$RepoRoot = $env:LUCE_DFLASH_ROOT,
     [string]$TargetModel = $env:LUCE_DFLASH_TARGET_MODEL,
     [string]$DraftModel = $env:LUCE_DFLASH_DRAFT_MODEL,
@@ -60,6 +59,7 @@ function Stop-DFlash {
 }
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
+$defaultAiRoot = Join-Path ([System.IO.Path]::GetPathRoot($projectRoot)) "AI"
 $repoEnv = Join-Path $projectRoot ".env"
 $hfHome = Load-DotEnvValue -Path $repoEnv -Key "HF_HOME"
 $hfCache = Load-DotEnvValue -Path $repoEnv -Key "HF_HUB_CACHE"
@@ -74,9 +74,13 @@ if ($Stop) {
     exit 0
 }
 
-if (-not $RepoRoot) { throw "Pass -RepoRoot or set LUCE_DFLASH_ROOT." }
-if (-not $TargetModel) { throw "Pass -TargetModel or set LUCE_DFLASH_TARGET_MODEL." }
-if (-not $DraftModel) { throw "Pass -DraftModel or set LUCE_DFLASH_DRAFT_MODEL." }
+if (-not $RepoRoot) { $RepoRoot = Join-Path $defaultAiRoot "lucebox-hub\dflash" }
+if (-not $TargetModel) {
+    $TargetModel = Join-Path $defaultAiRoot "models\luce-dflash\models\Qwen3.6-27B-Q4_K_M.gguf"
+}
+if (-not $DraftModel) {
+    $DraftModel = Join-Path $defaultAiRoot "models\luce-dflash\models\draft\dflash-draft-3.6-q8_0.gguf"
+}
 if (-not $PythonExe) { $PythonExe = Join-Path $projectRoot "venv\Scripts\python.exe" }
 if (-not $CudaRoot) { throw "Pass -CudaRoot or set CUDA_PATH." }
 
@@ -115,7 +119,6 @@ $args = @(
     "--target", $TargetModel,
     "--draft", $DraftModel,
     "--bin", $dflashExe,
-    "--max-ctx", [string]$MaxContext,
     "--cache-type-k", "q4_0",
     "--cache-type-v", "q8_0",
     "--prefix-cache-slots", "0",

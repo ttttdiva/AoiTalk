@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from agents import Agent, ModelSettings
+from ..llm.native_runtime import AgentDefinition as Agent, NativeModelSettings as ModelSettings
 
-from ..tools.adapters import OpenAIAgentAdapter
+from ..tools.core import ensure_tool_definitions
 from ..tools.trpg_creation_tools import create_trpg_scenario
 from ..tools.scenario_tools import roll_dice, get_scenario_state, update_scenario_state
 from ..tools.entertainment.music_tools import play_bgm, stop_bgm
@@ -15,7 +15,7 @@ class ScenarioAgent(BaseAgent):
     """Specialized agent for TRPG scenario management and automation."""
 
     def _create_agent(self) -> Agent:
-        tools = OpenAIAgentAdapter.convert_all(
+        tools = ensure_tool_definitions(
             [
                 roll_dice,
                 create_trpg_scenario,
@@ -32,7 +32,7 @@ You are a TRPG scenario specialist (Game Master assistant).
 Your job is to manage the state of a TRPG scenario play session by observing the conversation and extracting key updates.
 Perform the following actions silently using the provided tools:
 
-1. **State Extraction**: 
+1. **State Extraction**:
    - Observe the player's dialogue and the narrator's descriptions.
    - If the player gains an item, use `update_scenario_state` with `add_items`.
    - If a significant event happens (e.g., meeting someone, discovering a secret), add a flag using `add_flags`.

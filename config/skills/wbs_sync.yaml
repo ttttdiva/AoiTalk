@@ -6,7 +6,7 @@ prompt_template: |
   {input}
 
   ## 手順
-  1. project_management_assistant の get_project_context で workspace_root と wbs_file を確認する。
+  1. get_project_context で workspace_root と wbs_file を確認する。
   2. sync_wbs_tasks を dry_run=true で実行し、作成候補件数を確認する。
   3. ユーザーが明示的に同期実行を求めている場合のみ dry_run=false で同期する。
   4. 同期後、list_tasks または get_upcoming_wbs_tasks で直近タスクを要約する。
@@ -17,7 +17,10 @@ aliases:
   - wbs
   - WBSタスク化
 bound_tools:
-  - project_management_assistant
+  - get_project_context
+  - sync_wbs_tasks
+  - list_tasks
+  - get_upcoming_wbs_tasks
 examples:
   - "/wbs_sync"
   - "この案件のWBSをタスク化して"

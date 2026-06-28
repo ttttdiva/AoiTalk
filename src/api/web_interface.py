@@ -34,6 +34,7 @@ class WebChatInterface:
         self.add_system_message = self._async_wrapper(self.server.add_system_message)
         self.add_user_message = self._async_wrapper(self.server.add_user_message)
         self.broadcast_stream_event = self._async_wrapper(self.server.broadcast_stream_event)
+        self.dispatch_voice_message = self._dispatch_voice_message
         self.set_voice_recognition_ready = self.server.set_voice_recognition_ready
         self.update_rms = self.server.update_rms
         self.set_recording_state = self.server.set_recording_state
@@ -60,6 +61,13 @@ class WebChatInterface:
             except RuntimeError:
                 asyncio.run(async_func(*args, **kwargs))
         return wrapper
+
+    def _dispatch_voice_message(self, message: str) -> bool:
+        """Queue local voice input into the latest active chat session."""
+        if not self.server.get_voice_input_session_id():
+            return False
+        self._async_wrapper(self.server.dispatch_voice_message)(message)
+        return True
         
     def set_user_input_callback(self, callback, event_loop=None):
         """Set user input callback"""
