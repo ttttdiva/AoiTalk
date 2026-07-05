@@ -2,17 +2,7 @@
 
 import { useEffect } from "react";
 import { usePathname } from "next/navigation";
-
-const shortcuts: Record<string, string> = {
-  "1": "/chat",
-  "2": "/tasks",
-  "3": "/calendar",
-  "4": "/reports",
-  "5": "/filer",
-  "6": "/projects",
-  "7": "/scenarios",
-  "8": "/settings",
-};
+import { APP_ALT_SHORTCUTS } from "@/lib/app-navigation";
 
 export function KeyboardShortcuts() {
   const pathname = usePathname();
@@ -84,10 +74,10 @@ export function KeyboardShortcuts() {
           return;
         }
 
-        // Alt+1~8: ページ遷移
-        if (shortcuts[e.key]) {
+        // Alt+1~9: ページ遷移
+        if (APP_ALT_SHORTCUTS[e.key]) {
           e.preventDefault();
-          window.location.href = shortcuts[e.key];
+          window.location.href = APP_ALT_SHORTCUTS[e.key];
         }
         return;
       }

@@ -51,10 +51,16 @@ from .routes.system_routes import register_system_routes
 from .routes.user_admin_routes import register_user_admin_routes
 from .routes.websocket_routes import register_websocket_routes
 from ..services.conversation_title_llm import generate_title_with_llm_client
-from ..services.llm_model_catalog import build_llm_mode_state
+from ..services.llm_model_catalog import build_llm_mode_state, model_supports_vision
+from ..services.media_recognition_service import MediaRecognitionService
 from ..services.ollama_model_service import OllamaModelManager
 from ..runtime_features import runtime_feature_manager
-from ..assistant.chat_attachment_utils import sanitize_chat_attachments
+from ..assistant.chat_attachment_utils import (
+    build_message_with_attachment_context,
+    inject_media_recognition_results,
+    sanitize_chat_attachments,
+)
+from ..llm.multimodal import normalize_image_payloads
 
 # Import CharacterSwitchManager
 try:
@@ -1161,6 +1167,7 @@ class WebChatServer:
         client_message_id: Optional[str],
         attachments: List[Dict[str, Any]],
         attachment_context: Optional[str],
+        media_recognition_metadata: Optional[List[Dict[str, Any]]] = None,
         skip_user_persistence: bool = False,
         persisted_user_message_id: Optional[str] = None,
         agent_run_id: Optional[str] = None,
@@ -1193,6 +1200,7 @@ class WebChatServer:
             client_message_id=client_message_id,
             attachments=attachments,
             attachment_context=attachment_context,
+            media_recognition_metadata=media_recognition_metadata,
             skip_user_persistence=skip_user_persistence,
             persisted_user_message_id=persisted_user_message_id,
             agent_run_id=agent_run_id,
@@ -1311,6 +1319,88 @@ class WebChatServer:
         )
         return True
 
+    def _normalize_websocket_images(self, raw_images: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw_images, list):
+            return []
+        return normalize_image_payloads(raw_images)
+
+    def _normalize_websocket_audio(self, raw_audio: Any) -> Optional[dict[str, Any]]:
+        if not isinstance(raw_audio, dict):
+            return None
+        payload = raw_audio.get("data") or raw_audio.get("dataUrl")
+        if not isinstance(payload, str) or not payload:
+            return None
+        return {
+            "data": payload,
+            "mimeType": raw_audio.get("mimeType") or raw_audio.get("mime_type"),
+            "name": raw_audio.get("name"),
+        }
+
+    def _main_model_supports_vision(self) -> bool | None:
+        provider = str(self.config.get("llm_provider", "") or "").strip()
+        model = str(self.config.get("llm_model", "") or "").strip()
+        return model_supports_vision(provider, model)
+
+    async def _prepare_media_recognition(
+        self,
+        *,
+        llm_message: str,
+        images: list[dict[str, Any]],
+        audio: Optional[dict[str, Any]],
+        attachment_context: Optional[str],
+        session_id: Optional[str],
+    ) -> tuple[Optional[dict], Optional[str], list[dict[str, Any]]]:
+        """Return (direct_image_data, augmented_attachment_context, metadata)."""
+        direct_image_data: Optional[dict] = {"images": images} if images else None
+        results: list[Any] = []
+        metadata: list[dict[str, Any]] = []
+        image_mode = str(
+            self.config.get("model_routing.media.image_mode", "auto") or "auto"
+        ).strip()
+        should_delegate_images = False
+        if images:
+            if image_mode == "off":
+                direct_image_data = None
+            elif image_mode == "always":
+                should_delegate_images = True
+                direct_image_data = None
+            elif self._main_model_supports_vision() is not True:
+                should_delegate_images = True
+                direct_image_data = None
+
+        service = MediaRecognitionService(self.config)
+        if should_delegate_images:
+            await self.broadcast_stream_event(
+                "status_update",
+                {
+                    "session_id": session_id,
+                    "stage": "media_recognition",
+                    "status": "image",
+                    "message": "画像を解析中…",
+                },
+            )
+            image_results = await service.recognize_images(llm_message, images)
+            results.extend(image_results)
+        if audio:
+            await self.broadcast_stream_event(
+                "status_update",
+                {
+                    "session_id": session_id,
+                    "stage": "media_recognition",
+                    "status": "audio",
+                    "message": "音声を解析中…",
+                },
+            )
+            results.append(await service.recognize_audio(llm_message, audio))
+
+        if results:
+            attachment_context = inject_media_recognition_results(
+                attachment_context,
+                results,
+            )
+            metadata = [result.to_metadata() for result in results if hasattr(result, "to_metadata")]
+        return direct_image_data, attachment_context, metadata
+
     async def _handle_user_message(self, data: dict):
         """Handle user message with optional image, session_id, and project_id"""
         message = data.get("message", "").strip()
@@ -1321,18 +1411,9 @@ class WebChatServer:
             if isinstance(raw_response_started_at, (int, float))
             else time.monotonic()
         )
-        raw_image_data = data.get("image")  # {data: base64, mimeType: str, name: str}
-        image_data = None
-        if isinstance(raw_image_data, str) and raw_image_data:
-            image_data = {"data": raw_image_data, "mimeType": None, "name": None}
-        elif isinstance(raw_image_data, dict):
-            payload = raw_image_data.get("data") or raw_image_data.get("dataUrl")
-            if payload:
-                image_data = {
-                    "data": payload,
-                    "mimeType": raw_image_data.get("mimeType"),
-                    "name": raw_image_data.get("name"),
-                }
+        images = self._normalize_websocket_images(data.get("images"))
+        audio_data = self._normalize_websocket_audio(data.get("audio"))
+        image_data = {"images": images} if images else None
         session_id = data.get("session_id")  # Extract session_id from message data
         agent_run_id = data.get("agent_run_id")
         if not isinstance(agent_run_id, str) or not agent_run_id:
@@ -1379,7 +1460,7 @@ class WebChatServer:
             if session_id:
                 self._session_generation_profiles[session_id] = generation_profile
 
-        if not message and not image_data and not attachments and not attachment_context:
+        if not message and not image_data and not audio_data and not attachments and not attachment_context:
             return
 
         if session_id and not agent_run_id:
@@ -1458,6 +1539,16 @@ class WebChatServer:
                 command_capabilities,
             )
 
+        image_data, attachment_context, media_recognition_metadata = (
+            await self._prepare_media_recognition(
+                llm_message=llm_message,
+                images=images,
+                audio=audio_data,
+                attachment_context=attachment_context,
+                session_id=session_id,
+            )
+        )
+
         # Set Knowledge Workspace project context for this message
         if KNOWLEDGE_PROJECT_CONTEXT_AVAILABLE and set_knowledge_project_context:
             set_knowledge_project_context(project_id)
@@ -1465,7 +1556,9 @@ class WebChatServer:
         # Log session ID and project ID for debugging
         log_parts = [f"User message: {raw_user_message}"]
         if image_data:
-            log_parts.append("(with image)")
+            log_parts.append(f"(with images:{len(images)})")
+        if audio_data:
+            log_parts.append("(with audio)")
         if session_id:
             log_parts.append(f"[session_id: {session_id}]")
         if project_id:
@@ -1491,6 +1584,8 @@ class WebChatServer:
             attachments=attachments,
             has_image=bool(image_data),
             image_data=image_data,
+            attachment_context=attachment_context,
+            media_recognition_metadata=media_recognition_metadata,
         ):
             return
 
@@ -1501,9 +1596,10 @@ class WebChatServer:
             "timestamp": datetime.now().strftime("%H:%M:%S"),
             "session_id": session_id,
             "has_image": bool(image_data),
-            "image_preview": image_data.get("data") if image_data else None,
+            "image_preview": images[0].get("data") if images else None,
             "client_message_id": client_message_id,
             "attachments": attachments,
+            "media_recognition": media_recognition_metadata,
             "command_capabilities": list(command_capabilities),
         }
 
@@ -1535,6 +1631,7 @@ class WebChatServer:
                     client_message_id=client_message_id,
                     attachments=attachments,
                     attachment_context=attachment_context,
+                    media_recognition_metadata=media_recognition_metadata,
                     skip_user_persistence=skip_user_persistence,
                     persisted_user_message_id=persisted_user_message_id,
                     agent_run_id=agent_run_id,
@@ -1562,6 +1659,8 @@ class WebChatServer:
         attachments: List[Dict[str, Any]],
         has_image: bool,
         image_data: Optional[dict],
+        attachment_context: Optional[str],
+        media_recognition_metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
         """Persist and fan out a shared group message if the session is shared."""
         try:
@@ -1581,8 +1680,13 @@ class WebChatServer:
                 "has_image": has_image,
             }
             if image_data:
-                metadata["image_mime_type"] = image_data.get("mimeType")
-                metadata["image_name"] = image_data.get("name")
+                images = normalize_image_payloads(image_data)
+                metadata["image_count"] = len(images)
+                if images:
+                    metadata["image_mime_type"] = images[0].get("mimeType")
+                    metadata["image_name"] = images[0].get("name")
+            if media_recognition_metadata:
+                metadata["media_recognition"] = media_recognition_metadata
             persisted = await repo.add_message(
                 session_id=session_id,
                 role="user",
@@ -1635,8 +1739,12 @@ class WebChatServer:
                     config=self.config,
                     character_slugs=character_slugs,
                 )
+                response_input = build_message_with_attachment_context(
+                    message,
+                    attachment_context,
+                )
                 responses = await manager.generate_responses(
-                    user_message=message,
+                    user_message=response_input,
                     history=history,
                     strategy="round_robin",
                 )
@@ -1671,7 +1779,8 @@ class WebChatServer:
                     response_model=None,
                     client_message_id=None,
                     attachments=attachments,
-                    attachment_context=None,
+                    attachment_context=attachment_context,
+                    media_recognition_metadata=media_recognition_metadata,
                     skip_user_persistence=True,
                     assistant_sender_type="agent",
                     assistant_sender_id=agent_ids[0],

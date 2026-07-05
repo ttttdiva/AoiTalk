@@ -147,9 +147,14 @@ class AgentHarnessSettings:
             from ..services.agent_team_service import (
                 agent_team_member_for,
                 agent_team_member_mode,
+                model_route_is_explicit,
             )
 
-            agent_route = agent_team_member_for(config, "agent_harness")
+            agent_route = (
+                agent_team_member_for(config, "agent_harness")
+                if model_route_is_explicit(config, "agent_harness")
+                else None
+            )
         except Exception:
             agent_route = None
         route_codex_model = None

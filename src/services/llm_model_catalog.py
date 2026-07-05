@@ -88,6 +88,40 @@ PROVIDER_ORDER = [
     "antigravity-cli",
 ]
 
+
+def model_supports_vision(provider: str, model: str) -> bool | None:
+    """Return known vision support for a provider/model pair.
+
+    True/False is reserved for known cloud model families. None means unknown,
+    which callers should treat as requiring the recognition route.
+    """
+    provider_id = str(provider or "").strip().lower()
+    model_id = str(model or "").strip().lower()
+    if not provider_id or not model_id:
+        return None
+    local_or_unknown = {"sglang", "openai_compatible_local", "ollama"}
+    if provider_id in local_or_unknown:
+        return None
+    if provider_id == "gemini":
+        return True
+    if provider_id == "openai":
+        if model_id.startswith(("gpt-4o", "gpt-4.1", "gpt-5", "o3", "o4")):
+            return True
+        return False
+    if provider_id == "openrouter":
+        if any(part in model_id for part in ("gpt-4o", "gpt-4.1", "gpt-5", "gemini", "claude-3", "claude-sonnet", "claude-opus")):
+            return True
+        return None
+    if provider_id == "claude":
+        if "claude-3" in model_id or "sonnet" in model_id or "opus" in model_id:
+            return True
+        return None
+    if provider_id == "grok":
+        if "vision" in model_id or "grok-2" in model_id or "grok-4" in model_id:
+            return True
+        return None
+    return None
+
 STATIC_MODEL_CATALOG = {
     "gemini": [
         {

@@ -184,6 +184,7 @@ export type AgentRunTimelineItem = {
   action: string;
   message?: string | null;
   tool_name?: string | null;
+  raw_tool_name?: string | null;
   tool_call_id?: string | null;
   arguments?: Record<string, unknown>;
   result_preview?: string | null;

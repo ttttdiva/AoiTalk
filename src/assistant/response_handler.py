@@ -290,7 +290,7 @@ class ResponseHandler:
         user_input: str,
         assistant_response: str,
     ) -> None:
-        """No-op: project facts are updated in-turn through root direct tools."""
+        """No-op: project information is updated in-turn through root direct tools."""
         return
 
     def _capture_dreaming_memory_context(self) -> Dict[str, Optional[str]]:
@@ -319,7 +319,7 @@ class ResponseHandler:
                 if isinstance(context, dict) and context.get("id"):
                     return dict(context)
             except Exception as e:
-                print(f"[ProjectFactReflection] project context 解決エラー（継続）: {e}")
+                print(f"[ProjectInformationReflection] project context 解決エラー（継続）: {e}")
 
         project_id = getattr(self.llm_client, "current_project_id", None)
         if project_id:
@@ -333,7 +333,7 @@ class ResponseHandler:
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            print(f"[ProjectFactReflection] バックグラウンドエラー（無視）: {e}")
+            print(f"[ProjectInformationReflection] バックグラウンドエラー（無視）: {e}")
 
     async def _process_deferred_project_fact_reflection(
         self,
@@ -343,7 +343,7 @@ class ResponseHandler:
         project_context: Optional[Dict[str, Any]],
     ) -> None:
         return
-    
+
     async def _speak_response_background(self, task_id: str, response: str):
         """Handle TTS and playback in background"""
         try:

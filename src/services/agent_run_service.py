@@ -39,6 +39,7 @@ AGENT_TEAM_TOOL_MEMBERS = {
 DIRECT_TOOL_LABELS = {
     "web_search": "Web検索",
     "search_web": "Web検索",
+    "shell_command": "シェルコマンド",
     "deep_research": "Deep Research",
     "get_weather": "天気",
     "get_current_time": "現在時刻",
@@ -46,6 +47,9 @@ DIRECT_TOOL_LABELS = {
     "create_task": "タスク作成",
     "update_task": "タスク更新",
     "list_tasks": "タスク取得",
+    "list_project_information": "案件情報参照",
+    "get_project_context": "案件コンテキスト参照",
+    "list_record_tables": "台帳参照",
     "read_file": "ファイル読み取り",
     "write_file": "ファイル書き込み",
     "execute_code": "コード実行",
@@ -102,6 +106,49 @@ def _clean_tool_name(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _looks_like_shell_command(value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return False
+    lower = text.lower()
+    shell_markers = (
+        "powershell.exe",
+        "\\pwsh.exe",
+        "/pwsh",
+        "cmd.exe",
+        " -command ",
+        " -command'",
+        " -command\"",
+        " /c ",
+        " -c ",
+    )
+    return any(marker in lower for marker in shell_markers)
+
+
+def _normalize_tool_name(value: Any) -> str:
+    clean_name = _clean_tool_name(value)
+    if _looks_like_shell_command(clean_name):
+        return "shell_command"
+    return clean_name
+
+
+def _payload_shell_command(payload: dict[str, Any]) -> str:
+    tool_args = payload.get("tool_args")
+    if isinstance(tool_args, dict):
+        command = tool_args.get("command")
+        if isinstance(command, str) and _looks_like_shell_command(command):
+            return command.strip()
+
+    tool_result = payload.get("tool_result")
+    if isinstance(tool_result, dict):
+        arguments = tool_result.get("arguments")
+        if isinstance(arguments, dict):
+            command = arguments.get("command")
+            if isinstance(command, str) and _looks_like_shell_command(command):
+                return command.strip()
+    return ""
+
+
 def _payload_text(payload: dict[str, Any], *keys: str) -> str:
     for key in keys:
         value = payload.get(key)
@@ -144,7 +191,7 @@ def _event_tool_name(event_type: str, payload: dict[str, Any]) -> str:
 
 
 def _actor_for_tool(tool_name: str) -> dict[str, str | None]:
-    clean_name = _clean_tool_name(tool_name)
+    clean_name = _normalize_tool_name(tool_name)
     member_key = AGENT_TEAM_TOOL_MEMBERS.get(clean_name)
     if member_key:
         return {
@@ -258,9 +305,31 @@ def _timeline_event_display_status(event: AgentRunEvent) -> str | None:
     return event.status
 
 
+def _timeline_event_message(
+    message: str | None,
+    *,
+    raw_tool_name: str,
+    tool_name: str,
+) -> str | None:
+    if (
+        message
+        and tool_name == "shell_command"
+        and raw_tool_name
+        and raw_tool_name in message
+    ):
+        return message.replace(raw_tool_name, tool_name)
+    return message
+
+
 def _timeline_event_item(run: AgentRun, event: AgentRunEvent) -> dict[str, Any]:
     payload = event.payload if isinstance(event.payload, dict) else {}
-    tool_name = _event_tool_name(event.event_type, payload)
+    raw_tool_name = _event_tool_name(event.event_type, payload)
+    tool_name = _normalize_tool_name(raw_tool_name)
+    raw_display_tool_name = (
+        raw_tool_name
+        if raw_tool_name and raw_tool_name != tool_name
+        else _payload_shell_command(payload)
+    )
     actor = _actor_for_event(run, event)
     provider = _payload_text(payload, "provider", "agent_provider", "model_provider")
     model = _model_text(payload, "model", "agent_model", "model_name")
@@ -289,8 +358,15 @@ def _timeline_event_item(run: AgentRun, event: AgentRunEvent) -> dict[str, Any]:
         "model": model or None,
         "mode": _payload_text(payload, "mode", "model_mode", "reasoning_effort") or None,
         "action": _event_action(event.event_type, tool_label),
-        "message": event.message,
+        "message": _timeline_event_message(
+            event.message,
+            raw_tool_name=raw_display_tool_name,
+            tool_name=tool_name,
+        ),
         "tool_name": tool_name or None,
+        "raw_tool_name": (
+            raw_display_tool_name if raw_display_tool_name else None
+        ),
         "payload": _jsonable(payload),
         "created_at": _dt(event.created_at),
     }
@@ -300,8 +376,19 @@ def _timeline_event_item(run: AgentRun, event: AgentRunEvent) -> dict[str, Any]:
 def _timeline_tool_call_item(
     tool_call: AgentRunToolCall,
 ) -> dict[str, Any]:
-    actor = _actor_for_tool(tool_call.tool_name)
+    raw_tool_name = _clean_tool_name(tool_call.tool_name)
+    tool_name = _normalize_tool_name(raw_tool_name)
+    actor = _actor_for_tool(tool_name)
     metadata = tool_call.result_metadata if isinstance(tool_call.result_metadata, dict) else {}
+    arguments = tool_call.arguments or {}
+    if tool_name == "shell_command" and raw_tool_name != tool_name:
+        arguments = dict(arguments)
+        arguments.setdefault("command", raw_tool_name)
+    action = (
+        f"{actor['actor_label'] or 'ツール'}の実行完了"
+        if tool_call.success
+        else f"{actor['actor_label'] or 'ツール'}の実行に失敗"
+    )
     return {
         "id": f"tool:{tool_call.id}",
         "source": "tool_call",
@@ -322,11 +409,12 @@ def _timeline_tool_call_item(
         or None,
         "model": _model_text(metadata, "model", "agent_model", "model_name") or None,
         "mode": _payload_text(metadata, "mode", "model_mode", "reasoning_effort") or None,
-        "action": "実行結果を記録",
-        "message": tool_call.tool_name,
-        "tool_name": tool_call.tool_name,
+        "action": action,
+        "message": tool_name,
+        "tool_name": tool_name,
+        "raw_tool_name": raw_tool_name if raw_tool_name != tool_name else None,
         "tool_call_id": tool_call.tool_call_id,
-        "arguments": tool_call.arguments or {},
+        "arguments": arguments,
         "result_preview": _clip(tool_call.result, max_chars=1200),
         "success": bool(tool_call.success),
         "mutation_confirmed": bool(tool_call.mutation_confirmed),
@@ -343,23 +431,42 @@ def build_agent_run_timeline(run: AgentRun) -> list[dict[str, Any]]:
 
     items: list[tuple[datetime, int, dict[str, Any]]] = []
     tool_calls = list(getattr(run, "tool_calls", []) or [])
-    recorded_tool_names = {
-        _clean_tool_name(tool_call.tool_name) for tool_call in tool_calls
-    }
+    recorded_tool_cutoffs: dict[str, datetime] = {}
+    for tool_call in tool_calls:
+        tool_name = _normalize_tool_name(_clean_tool_name(tool_call.tool_name))
+        if not tool_name:
+            continue
+        cutoff_candidates = [
+            value
+            for value in (tool_call.started_at, tool_call.ended_at, tool_call.created_at)
+            if value
+        ]
+        cutoff = max(cutoff_candidates) if cutoff_candidates else None
+        if cutoff and (
+            tool_name not in recorded_tool_cutoffs
+            or cutoff > recorded_tool_cutoffs[tool_name]
+        ):
+            recorded_tool_cutoffs[tool_name] = cutoff
     for event in getattr(run, "events", []) or []:
         payload = event.payload if isinstance(event.payload, dict) else {}
-        tool_name = _event_tool_name(event.event_type, payload)
+        tool_name = _normalize_tool_name(_event_tool_name(event.event_type, payload))
+        event_created_at = event.created_at or datetime.min
         if (
-            event.event_type == "stream.tool_end"
-            and payload.get("tool_result_already_recorded")
+            event.event_type in {"stream.tool_start", "stream.tool_end"}
             and tool_name
-            and tool_name in recorded_tool_names
+            and tool_name in recorded_tool_cutoffs
+            and event_created_at <= recorded_tool_cutoffs[tool_name]
         ):
             continue
-        created_at = event.created_at or datetime.min
+        if (
+            event.event_type in {"tool.end", "tool.failed"}
+            and tool_name
+            and tool_name in recorded_tool_cutoffs
+        ):
+            continue
         items.append(
             (
-                created_at,
+                event_created_at,
                 int(event.sequence or 0),
                 _timeline_event_item(run, event),
             )

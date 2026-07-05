@@ -31,6 +31,7 @@ from .native_runtime import (
     Reasoning,
     create_async_openai_client,
 )
+from .multimodal import openai_content_parts
 from .provider_capabilities import ProviderCapabilities
 from ..tools import init_spotify_manager
 from ..memory.manager import ConversationMemoryManager
@@ -702,9 +703,13 @@ class AgentLLMClient:
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(
-                    self._run_async_safe, user_input, stream_callback
+                    self._run_async_safe,
+                    user_input,
+                    stream_callback,
+                    None,
+                    image_data,
                 )
-                response = future.result(timeout=300)
+                response = future.result()
 
             print(f"[AgentLLMClient] 応答: {response}")
 
@@ -762,6 +767,7 @@ class AgentLLMClient:
         user_input: str,
         stream_callback: Optional[StreamCallback] = None,
         steering_callback: Optional[SteeringCallback] = None,
+        image_data: dict | None = None,
     ) -> str:
         """Safely run async code in a new event loop"""
         loop = asyncio.new_event_loop()
@@ -773,6 +779,7 @@ class AgentLLMClient:
                     user_input,
                     stream_callback=stream_callback,
                     steering_callback=steering_callback,
+                    image_data=image_data,
                 )
             )
         finally:
@@ -933,11 +940,11 @@ class AgentLLMClient:
     async def _run_agentic_completion_loop(
         self,
         agent: Agent,
-        context: str,
+        context: Any,
         stream_callback: Optional[StreamCallback] = None,
         user_input: str | None = None,
     ) -> str:
-        if not self._agentic_completion_enabled(user_input):
+        if not isinstance(context, str) or not self._agentic_completion_enabled(user_input):
             return await self._run_once_with_agent(agent, context, stream_callback)
 
         async def _run_once(prompt: str) -> str:
@@ -956,6 +963,7 @@ class AgentLLMClient:
         user_input: str,
         stream_callback: Optional[StreamCallback] = None,
         steering_callback: Optional[SteeringCallback] = None,
+        image_data: dict | None = None,
     ) -> str:
         """Generate response asynchronously using character agent with tools"""
         project_token = None
@@ -1112,14 +1120,14 @@ class AgentLLMClient:
                 if required_tool_name:
                     response = await self._run_once_with_agent(
                         effective_agent,
-                        context,
+                        openai_content_parts(context, image_data),
                         stream_callback,
                         required_tool_name=required_tool_name,
                     )
                 else:
                     response = await self._run_agentic_completion_loop(
                         effective_agent,
-                        context,
+                        openai_content_parts(context, image_data),
                         stream_callback,
                         user_input=user_input,
                     )
@@ -1539,6 +1547,7 @@ Updated summary:
             user_input,
             stream_callback=stream_callback,
             steering_callback=steering_callback,
+            image_data=image_data,
         )
 
     def clear_history(self):

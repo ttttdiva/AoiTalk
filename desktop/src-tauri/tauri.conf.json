@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AoiTalk Desktop",
+  "version": "0.1.0",
+  "identifier": "jp.aoitalk.desktop",
+  "build": {
+    "devUrl": "http://127.0.0.1:3002",
+    "frontendDist": "http://127.0.0.1:3002"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null,
+      "capabilities": ["main-capability"]
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all"
+  }
+}

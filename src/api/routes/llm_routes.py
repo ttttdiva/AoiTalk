@@ -1,10 +1,15 @@
 """LLM モード/エンジン切替・モデルカタログ・Ollama モデル管理ルート (server.py から移設)"""
 
+import asyncio
+import json
 import logging
+import re
+import uuid
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy import select
 
 from ...services.llm_model_catalog import (
     build_engine_options as build_llm_engine_options,
@@ -16,11 +21,175 @@ from ...services.llm_model_catalog import (
 )
 from ..router_helpers import cookie_auth_dependency
 from .payloads import OllamaModelPayload, OllamaPullPayload
+from ...memory.database import get_database_manager
+from ...memory.models import (
+    KnowledgeField,
+    KnowledgeFieldValue,
+    KnowledgeNode,
+    KnowledgeNodeSupertag,
+    KnowledgeSupertag,
+)
 
 if TYPE_CHECKING:
     from ..server import WebChatServer
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    value = str(text or "").strip()
+    if not value:
+        raise ValueError("empty LLM response")
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        match = re.search(r"\{[\s\S]*\}", value)
+        if not match:
+            raise
+        parsed = json.loads(match.group(0))
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM response is not a JSON object")
+    return parsed
+
+
+def _normalize_docs_ai_result(command: str, parsed: dict[str, Any]) -> dict[str, Any]:
+    mode = str(parsed.get("mode") or "").strip()
+    if command == "rewrite":
+        replacement = str(parsed.get("replacement") or parsed.get("title") or "").strip()
+        return {
+            "mode": "replace_title",
+            "replacement": replacement[:500],
+            "summary": str(parsed.get("summary") or "AI rewrite proposal").strip()[:500],
+        }
+    if command == "fill_fields":
+        fields = parsed.get("fields")
+        normalized_fields = []
+        if isinstance(fields, list):
+            for item in fields[:20]:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or item.get("field") or "").strip()
+                value = str(item.get("value") or "").strip()
+                if name:
+                    normalized_fields.append({"name": name[:120], "value": value[:1000]})
+        return {
+            "mode": "field_suggestions",
+            "fields": normalized_fields,
+            "summary": str(parsed.get("summary") or "AI field suggestions").strip()[:500],
+        }
+    lines = parsed.get("lines")
+    if not isinstance(lines, list):
+        lines = parsed.get("children")
+    normalized_lines = [
+        str(item).strip()[:500]
+        for item in (lines if isinstance(lines, list) else [])
+        if str(item).strip()
+    ][:12]
+    if command == "extract_tasks":
+        normalized_lines = [
+            line if "#Task" in line or "#タスク" in line else f"{line} #Task"
+            for line in normalized_lines
+        ]
+    return {
+        "mode": mode if mode == "insert_children" else "insert_children",
+        "lines": normalized_lines,
+        "summary": str(parsed.get("summary") or "AI child node proposal").strip()[:500],
+    }
+
+
+async def _run_docs_ai_completion(llm_client: Any, prompt: str) -> str:
+    async_generate = getattr(llm_client, "generate_response_async", None)
+    if callable(async_generate):
+        return str(await async_generate(prompt))
+    async_generic = getattr(llm_client, "generate_async", None)
+    if callable(async_generic):
+        return str(await async_generic(prompt))
+    sync_generate = getattr(llm_client, "generate_response", None)
+    if callable(sync_generate):
+        return str(await asyncio.to_thread(lambda: sync_generate(prompt, stream=False)))
+    sync_generic = getattr(llm_client, "generate", None)
+    if callable(sync_generic):
+        return str(await asyncio.to_thread(lambda: sync_generic(prompt)))
+    raise RuntimeError("Configured LLM client does not support text generation")
+
+
+async def _build_docs_ai_context(node_id: str | None) -> str:
+    if not node_id:
+        return ""
+    try:
+        parsed_id = uuid.UUID(str(node_id))
+    except ValueError:
+        return ""
+    manager = get_database_manager()
+    session = await manager.get_session()
+    try:
+        node = await session.get(KnowledgeNode, parsed_id)
+        if node is None:
+            return ""
+        parent = await session.get(KnowledgeNode, node.parent_id) if node.parent_id else None
+        siblings_result = await session.execute(
+            select(KnowledgeNode)
+            .where(
+                KnowledgeNode.workspace_id == node.workspace_id,
+                KnowledgeNode.parent_id == node.parent_id,
+                KnowledgeNode.archived_at.is_(None),
+            )
+            .order_by(KnowledgeNode.sort_order, KnowledgeNode.created_at)
+            .limit(16)
+        )
+        siblings = list(siblings_result.scalars().all())
+        tags_result = await session.execute(
+            select(KnowledgeSupertag)
+            .join(KnowledgeNodeSupertag, KnowledgeNodeSupertag.supertag_id == KnowledgeSupertag.id)
+            .where(KnowledgeNodeSupertag.node_id == node.id)
+            .order_by(KnowledgeSupertag.name)
+        )
+        tags = list(tags_result.scalars().all())
+        fields_result = await session.execute(
+            select(KnowledgeField, KnowledgeFieldValue)
+            .join(KnowledgeNodeSupertag, KnowledgeNodeSupertag.supertag_id == KnowledgeField.supertag_id)
+            .outerjoin(
+                KnowledgeFieldValue,
+                (KnowledgeFieldValue.node_id == node.id)
+                & (KnowledgeFieldValue.field_id == KnowledgeField.id),
+            )
+            .where(KnowledgeNodeSupertag.node_id == node.id)
+            .order_by(KnowledgeField.sort_order, KnowledgeField.name)
+        )
+        field_lines = []
+        for field, value in fields_result.all():
+            raw_value = ""
+            if value is not None:
+                raw_value = (
+                    value.value_text
+                    or (str(value.value_number) if value.value_number is not None else "")
+                    or (value.value_datetime.isoformat() if value.value_datetime else "")
+                    or (str(value.target_node_id) if value.target_node_id else "")
+                    or (json.dumps(value.value_json, ensure_ascii=False) if value.value_json else "")
+                )
+            field_lines.append(f"- {field.name} ({field.system_key or field.field_type}): {raw_value or '(empty)'}")
+        instructions = "\n".join(
+            str(tag.ai_instructions or "").strip()
+            for tag in tags
+            if str(tag.ai_instructions or "").strip()
+        )
+        return "\n".join(
+            [
+                "Docs context:",
+                f"Current node: {node.title or ''}",
+                f"Body: {(node.body_text or '')[:1000]}",
+                f"Parent: {parent.title if parent else '(root)'}",
+                "Sibling outline:",
+                *[f"- {item.title or ''}" for item in siblings],
+                "Tags: " + ", ".join(f"#{tag.name}" for tag in tags),
+                "Fields:",
+                *field_lines,
+                "AI instructions:",
+                instructions or "(none)",
+            ]
+        )
+    finally:
+        await session.close()
 
 
 def _should_stop_previous_openai_compatible_local_server(
@@ -49,6 +218,51 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
         return JSONResponse(
             build_llm_mode_state(server.config, client=server._llm_client)
         )
+
+    @app.post("/api/ai/docs/command")
+    async def run_docs_ai_command(request: Request, _: None = Depends(require_auth)):
+        """Run Docs AI commands through the configured LLM client."""
+        body = await request.json()
+        command = str(body.get("command") or "continue").strip()[:80]
+        prompt = str(body.get("prompt") or "").strip()[:8000]
+        node_id = str(body.get("node_id") or "").strip()[:80] or None
+        llm_client = server._llm_client
+        if llm_client is None:
+            raise HTTPException(status_code=503, detail="LLM client is not configured")
+
+        mode_instruction = {
+            "continue": "Return child outline lines that naturally continue the selected Docs node.",
+            "extract_tasks": "Extract actionable task lines. Each line must be a task title.",
+            "rewrite": "Rewrite the selected node title. Return replacement only in JSON.",
+            "fill_fields": "Suggest field values for empty Docs fields.",
+        }.get(command, "Return child outline lines that naturally continue the selected Docs node.")
+        json_shape = (
+            '{"mode":"replace_title","replacement":"...","summary":"..."}'
+            if command == "rewrite"
+            else '{"mode":"field_suggestions","fields":[{"name":"...","value":"..."}],"summary":"..."}'
+            if command == "fill_fields"
+            else '{"mode":"insert_children","lines":["..."],"summary":"..."}'
+        )
+        docs_context = await _build_docs_ai_context(node_id)
+        llm_prompt = (
+            "You are AoiTalk Docs AI. Respond with strict JSON only, no markdown.\n"
+            f"Command: {command}\n"
+            f"Node ID: {node_id or ''}\n"
+            f"Instruction: {mode_instruction}\n"
+            f"Required JSON shape: {json_shape}\n"
+            "Write concise Japanese content unless the user prompt clearly uses another language.\n"
+            "User/selection context:\n"
+            f"{prompt or '(empty)'}\n\n"
+            f"{docs_context}"
+        )
+        try:
+            raw = await _run_docs_ai_completion(llm_client, llm_prompt)
+            parsed = _extract_json_object(raw)
+            result = _normalize_docs_ai_result(command, parsed)
+        except Exception as exc:
+            logger.exception("Docs AI command failed")
+            raise HTTPException(status_code=502, detail="Docs AI generation failed", headers={"x-error": str(exc)})
+        return JSONResponse({"result": result, "confidence": 0.78})
 
     @app.post("/api/llm/mode")
     async def set_llm_mode(request: Request, _: None = Depends(require_auth)):

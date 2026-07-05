@@ -127,6 +127,7 @@ MCPサーバー設定は `config/config.yaml` の `mcp` セクションで管理
 
 - `docs/setup_guide.md`
 - `docs/task_workspace_rebuild.md`
+- `docs/desktop_tauri.md`
 - `docs/public_publish.md`
 - `docs/enterprise_publish.md`
 - `docs/DISCORD_BOT_SETUP.md`

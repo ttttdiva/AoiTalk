@@ -56,7 +56,6 @@ def _prune_obsolete_app_config(value: Dict[str, Any]) -> Dict[str, Any]:
     """Drop stale config branches that no longer have a runtime owner."""
     cleaned = copy.deepcopy(value)
     cleaned.pop("model_sharing", None)
-    cleaned.pop("model_routing", None)
 
     agent_team = cleaned.get("agent_team")
     if isinstance(agent_team, dict):
@@ -88,6 +87,56 @@ def _prune_obsolete_app_config(value: Dict[str, Any]) -> Dict[str, Any]:
     return cleaned
 
 
+def _migrate_agent_team_to_model_routing(value: Dict[str, Any]) -> Dict[str, Any]:
+    """Move legacy agent_team model choices into model_routing.overrides."""
+    migrated = copy.deepcopy(value)
+    agent_team = migrated.get("agent_team")
+    if isinstance(migrated.get("model_routing"), dict):
+        if isinstance(agent_team, dict):
+            agent_team.pop("enabled", None)
+            agent_team.pop("members", None)
+            agent_team.pop("roster", None)
+        return migrated
+
+    overrides: Dict[str, Any] = {}
+    if isinstance(agent_team, dict):
+        members = agent_team.get("members")
+        if isinstance(members, dict):
+            for key, member in members.items():
+                if not isinstance(member, dict):
+                    continue
+                provider = str(member.get("provider") or "").strip()
+                model = str(member.get("model") or "").strip()
+                if not provider or not model:
+                    continue
+                route = {"provider": provider, "model": model}
+                for field in ("mode", "reasoning_effort", "max_instances", "runner"):
+                    if field in member and member.get(field) not in (None, ""):
+                        route[field] = member.get(field)
+                overrides[str(key)] = route
+        agent_team.pop("enabled", None)
+        agent_team.pop("members", None)
+        agent_team.pop("roster", None)
+
+    migrated["model_routing"] = {
+        "classes": {
+            "heavy": {},
+            "light": {},
+            "vision": {"provider": "", "model": "", "base_url": "", "api_key": ""},
+            "audio": {
+                "engine": "speech_recognition",
+                "provider": "",
+                "model": "",
+                "base_url": "",
+                "api_key": "",
+            },
+        },
+        "media": {"image_mode": "auto"},
+        "overrides": overrides,
+    }
+    return migrated
+
+
 def _db_deps():
     from sqlalchemy.exc import SQLAlchemyError
 
@@ -111,7 +160,7 @@ def load_app_config_sync(legacy_config_path: Optional[Path] = None) -> Dict[str,
         if legacy_config_path is not None
         else None
     ) or load_default_config()
-    seed = _prune_obsolete_app_config(seed)
+    seed = _migrate_agent_team_to_model_routing(_prune_obsolete_app_config(seed))
 
     try:
         SQLAlchemyError, get_database_manager, AppConfigSetting = _db_deps()
@@ -145,7 +194,9 @@ def load_app_config_sync(legacy_config_path: Optional[Path] = None) -> Dict[str,
                 stored_value,
                 aad_prefix="app_config_settings.value",
             )
-            value = _prune_obsolete_app_config(stored_decrypted)
+            value = _migrate_agent_team_to_model_routing(
+                _prune_obsolete_app_config(stored_decrypted)
+            )
             merged = _fill_missing_defaults(value, seed)
             if merged != stored_decrypted:
                 row.value = encrypt_json_secret_leaves(
@@ -163,7 +214,7 @@ def save_app_config_sync(config: Dict[str, Any]) -> bool:
     """Replace the global app config JSON in DB."""
 
     try:
-        config = _prune_obsolete_app_config(config)
+        config = _migrate_agent_team_to_model_routing(_prune_obsolete_app_config(config))
         SQLAlchemyError, get_database_manager, AppConfigSetting = _db_deps()
         _ensure_table()
         db_manager = get_database_manager()

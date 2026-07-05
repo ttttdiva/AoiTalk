@@ -517,6 +517,7 @@ export async function POST(request: NextRequest) {
   const body = await request.json();
   const {
     project_id,
+    knowledge_node_id,
     title,
     description,
     status,
@@ -604,6 +605,7 @@ export async function POST(request: NextRequest) {
       .insert(tasks)
       .values({
         projectId: project_id,
+        knowledgeNodeId: normalizeOptionalUuid(knowledge_node_id),
         title: normalizedTitle,
         description: description || null,
         status: normalizedStatus,

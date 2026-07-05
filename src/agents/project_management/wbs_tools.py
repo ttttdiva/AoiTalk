@@ -36,14 +36,6 @@ WBS_FIELD_ALIASES: dict[str, set[str]] = {
 
 CLOSED_WBS_STATUSES = {"closed", "done", "complete", "completed", "完了", "終了", "済"}
 CLOSED_TASK_STATUSES = {"closed", "done", "complete", "completed", "完了", "終了", "済"}
-GOAL_FACT_TYPES = {
-    "goal",
-    "milestone",
-    "requirement",
-    "scope",
-    "success_condition",
-    "decision",
-}
 GOAL_TEXT_MARKERS = (
     "目標",
     "ゴール",
@@ -262,24 +254,22 @@ def _sort_wbs_row_key(row: dict[str, Any]) -> tuple[Any, bool, str]:
     )
 
 
-def _compact_project_fact(fact: Any) -> dict[str, Any]:
-    content = str(getattr(fact, "content", "") or "").strip()
+def _compact_project_doc(node: Any) -> dict[str, Any]:
+    body = str(getattr(node, "body_text", "") or "").strip()
     return {
-        "id": str(fact.id),
-        "title": getattr(fact, "title", None),
-        "content": content[:300],
-        "fact_type": getattr(fact, "fact_type", None),
-        "importance": getattr(fact, "importance", None),
-        "confidence": getattr(fact, "confidence", None),
-        "source_ref": getattr(fact, "source_ref", None),
+        "id": str(node.id),
+        "title": getattr(node, "title", None),
+        "body_text": body[:500],
+        "updated_at": (
+            node.updated_at.isoformat()
+            if getattr(node, "updated_at", None)
+            else None
+        ),
     }
 
 
-def _fact_looks_goal_related(fact: Any) -> bool:
-    fact_type = str(getattr(fact, "fact_type", "") or "").casefold()
-    if fact_type in GOAL_FACT_TYPES:
-        return True
-    text = f"{getattr(fact, 'title', '')} {getattr(fact, 'content', '')}"
+def _doc_looks_goal_related(node: Any) -> bool:
+    text = f"{getattr(node, 'title', '')} {getattr(node, 'body_text', '')}"
     return any(marker in text for marker in GOAL_TEXT_MARKERS)
 
 
@@ -474,9 +464,9 @@ def build_wbs_tools() -> list:
         project: str = "",
         project_id: str = "",
     ) -> str:
-        """Summarize project progress toward goals using project facts, internal WBS.dbtable, and built-in tasks. Empty WBS.dbtable is not a blocker."""
+        """Summarize project progress toward goals using Docs, internal WBS.dbtable, and built-in tasks. Empty WBS.dbtable is not a blocker."""
         from ...memory.database import get_database_manager
-        from ...memory.models import ProjectContextPack, ProjectFact
+        from ...memory.models import KnowledgeNode, ProjectContextPack
         from ...services.task_management_service import TaskManagementService
 
         async def _summarize():
@@ -501,14 +491,13 @@ def build_wbs_tools() -> list:
                     user_id=user_id,
                     project_id=resolved_project_id,
                 )
-                facts_result = await session.execute(
-                    select(ProjectFact)
+                docs_result = await session.execute(
+                    select(KnowledgeNode)
                     .where(
-                        ProjectFact.project_id == resolved_project_id,
-                        ProjectFact.deleted_at.is_(None),
-                        ProjectFact.status != "archived",
+                        KnowledgeNode.project_id == resolved_project_id,
+                        KnowledgeNode.archived_at.is_(None),
                     )
-                    .order_by(ProjectFact.importance.desc(), ProjectFact.updated_at.desc())
+                    .order_by(KnowledgeNode.updated_at.desc())
                     .limit(50)
                 )
                 context_pack = await session.scalar(
@@ -516,13 +505,16 @@ def build_wbs_tools() -> list:
                         ProjectContextPack.project_id == resolved_project_id
                     )
                 )
-                facts = list(facts_result.scalars().all())
-                goal_facts = [
-                    _compact_project_fact(fact)
-                    for fact in facts
-                    if _fact_looks_goal_related(fact)
+                docs_nodes = list(docs_result.scalars().all())
+                goal_docs = [
+                    _compact_project_doc(node)
+                    for node in docs_nodes
+                    if _doc_looks_goal_related(node)
                 ][:limit]
-                all_facts = [_compact_project_fact(fact) for fact in facts[:limit]]
+                docs_evidence = [
+                    _compact_project_doc(node)
+                    for node in docs_nodes[:limit]
+                ]
                 context_goals = (
                     context_pack.goals
                     if context_pack is not None and isinstance(context_pack.goals, list)
@@ -538,8 +530,8 @@ def build_wbs_tools() -> list:
                 task_summary = _summarize_tasks_for_progress(tasks, limit)
                 evidence_sources = {
                     "project_context_goals": bool(context_goals),
-                    "project_goal_facts": bool(goal_facts),
-                    "project_facts": bool(all_facts),
+                    "project_goal_docs": bool(goal_docs),
+                    "project_docs": bool(docs_evidence),
                     "internal_wbs": bool(internal["rows"]),
                     "tasks": bool(tasks),
                     "current_status": bool(current_status),
@@ -562,8 +554,8 @@ def build_wbs_tools() -> list:
                     "evidence_sources": evidence_sources,
                     "goals": context_goals[:limit],
                     "current_status": current_status,
-                    "goal_facts": goal_facts,
-                    "facts": all_facts,
+                    "goal_docs": goal_docs,
+                    "docs": docs_evidence,
                     "wbs": {
                         "table_id": internal["table_id"],
                         **wbs_summary,

@@ -142,6 +142,13 @@ class Task(Base):
     legacy_local_task_id = Column(
         UUID(as_uuid=True), ForeignKey("local_tasks.id"), nullable=True, unique=True
     )
+    knowledge_node_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_nodes.id", ondelete="SET NULL"),
+        nullable=True,
+        unique=True,
+        index=True,
+    )
     title = Column(String(255), nullable=False)
     description = Column(Text)
     status = Column(String(32), nullable=False, default="todo", index=True)
@@ -215,6 +222,9 @@ class Task(Base):
             "project_id": str(self.project_id),
             "legacy_local_task_id": (
                 str(self.legacy_local_task_id) if self.legacy_local_task_id else None
+            ),
+            "knowledge_node_id": (
+                str(self.knowledge_node_id) if self.knowledge_node_id else None
             ),
             "title": self.title,
             "description": self.description,

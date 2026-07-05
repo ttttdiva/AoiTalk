@@ -43,14 +43,11 @@ class ToolPolicyDecision:
 
 PROJECT_MANAGEMENT_MUTATION_TOOL_NAMES: set[str] = {
     "organize_project_information_from_folder",
+    "patch_project_information_doc",
+    "attach_project_information_reference",
+    "upsert_project_qa_entry",
+    "archive_project_qa_entry",
     "configure_project_management_files",
-    "upsert_project_info_category",
-    "archive_project_info_category",
-    "register_project_document",
-    "delete_project_document",
-    "upsert_project_fact",
-    "delete_project_fact",
-    "set_project_information_sync_state",
     "create_record_table",
     "append_record_rows",
     "update_record_row",
@@ -87,6 +84,24 @@ PROJECT_MANAGEMENT_READ_TOOL_NAMES: set[str] = {
 PROJECT_MANAGEMENT_TOOL_NAMES: set[str] = (
     PROJECT_MANAGEMENT_READ_TOOL_NAMES | PROJECT_MANAGEMENT_MUTATION_TOOL_NAMES
 )
+
+DOCS_MUTATION_TOOL_NAMES: set[str] = {
+    "docs_create_nodes",
+    "docs_update_node",
+    "docs_set_fields",
+    "docs_add_tag",
+    "docs_remove_tag",
+    "docs_move_node",
+    "docs_archive_node",
+}
+
+DOCS_READ_TOOL_NAMES: set[str] = {
+    "docs_search",
+    "docs_outline",
+    "docs_query",
+}
+
+DOCS_TOOL_NAMES: set[str] = DOCS_READ_TOOL_NAMES | DOCS_MUTATION_TOOL_NAMES
 
 SEARCH_TOOL_NAMES: set[str] = {
     "web_search",
@@ -208,7 +223,13 @@ def build_command_capability_context(
         )
     if "project_db_update" in sanitized:
         guidance.append(
-            "- `project_db_update`: use direct project information DB tools for durable project facts."
+            "- `project_db_update`: use direct project information Docs tools for durable project knowledge."
+        )
+        guidance.append(
+            "- Before writing project information Docs, read `list_project_information`, preserve existing headings, patch the relevant section/block with `patch_project_information_doc`, and include `change_summary` plus `source_refs_json` when evidence exists."
+        )
+        guidance.append(
+            "- Do not write unsupported claims as settled body text; put them under 要確認 or create an unanswered candidate Q&A."
         )
     if "project_progress_review" in sanitized:
         guidance.append(
@@ -282,10 +303,10 @@ def looks_like_deferred_project_fact_request(text: str) -> bool:
     if not features["has_durable_project_fact"] or features["is_lookup_only"]:
         return False
 
-    # Explicit project-information/fact update requests are handled synchronously
+    # Explicit project-information update requests are handled synchronously
     # by the root direct project tools. This helper only identifies incidental
-    # durable facts that accompany another primary action.
-    return "upsert_project_fact" not in project_management_required_mutation_tools(
+    # durable notes that accompany another primary action.
+    return "patch_project_information_doc" not in project_management_required_mutation_tools(
         policy_text
     )
 
@@ -332,10 +353,9 @@ def project_management_required_mutation_tools(text: str) -> set[str]:
     if "project_db_update" in command_capabilities:
         command_tools.update(
             {
-                "upsert_project_info_category",
-                "register_project_document",
-                "upsert_project_fact",
-                "set_project_information_sync_state",
+                "organize_project_information_from_folder",
+                "patch_project_information_doc",
+                "attach_project_information_reference",
             }
         )
     if "task_update" in command_capabilities:
@@ -356,6 +376,8 @@ def project_management_required_mutation_tools(text: str) -> set[str]:
     project_info_terms = (
         "案件情報",
         "プロジェクト情報",
+        "案件情報docs",
+        "プロジェクト情報docs",
         "案件情報db",
         "案件情報DB",
         "案件db",
@@ -378,6 +400,7 @@ def project_management_required_mutation_tools(text: str) -> set[str]:
         "db",
         "DB",
         "データベース",
+        "docs",
         "台帳",
         "一覧表",
     )
@@ -388,6 +411,8 @@ def project_management_required_mutation_tools(text: str) -> set[str]:
         "案件専用db",
         "案件db",
         "案件情報db",
+        "案件情報docs",
+        "プロジェクト情報docs",
         "プロジェクトDB",
         "案件DB",
         "案件情報DB",
@@ -577,27 +602,21 @@ def project_management_required_mutation_tools(text: str) -> set[str]:
     ):
         tools.add("organize_project_information_from_folder")
     if has_project_info and has_create_or_update:
-        tools.update(
-            {
-                "upsert_project_info_category",
-                "register_project_document",
-                "upsert_project_fact",
-            }
-        )
+        tools.add("patch_project_information_doc")
     if (
         has_durable_project_fact
         and not is_lookup_only
         and any(term.casefold() in normalized for term in explicit_fact_persistence_terms)
         and not (has_task or has_wbs or has_issue or has_record_table)
     ):
-        tools.add("upsert_project_fact")
+        tools.add("patch_project_information_doc")
     if (
         has_database_reference
         and has_database_fact_persistence
         and not is_lookup_only
         and not (has_task or has_wbs or has_issue or has_record_table)
     ):
-        tools.add("upsert_project_fact")
+        tools.add("patch_project_information_doc")
     if (has_record_table or has_project_database) and has_create_or_update:
         tools.add("create_record_table")
     return tools
@@ -607,6 +626,8 @@ def _project_management_fact_features(normalized: str) -> dict[str, bool]:
     project_info_terms = (
         "案件情報",
         "プロジェクト情報",
+        "案件情報docs",
+        "プロジェクト情報docs",
         "案件情報db",
         "案件情報DB",
         "案件db",
@@ -781,6 +802,8 @@ def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
 def _looks_like_mutation_tool_call(tool_name: str, text: str) -> bool:
     normalized = str(text or "")
     if tool_name in PROJECT_MANAGEMENT_MUTATION_TOOL_NAMES:
+        return True
+    if tool_name in DOCS_MUTATION_TOOL_NAMES:
         return True
     if tool_name in FILESYSTEM_MUTATION_TOOL_NAMES:
         return True
@@ -1066,9 +1089,11 @@ def _looks_like_project_management_request(text: str) -> bool:
         text,
         (
             "案件情報",
+            "案件情報Docs",
             "案件情報DB",
             "案件DB",
             "プロジェクト情報",
+            "プロジェクト情報Docs",
             "プロジェクトDB",
             "タスク",
             "台帳",

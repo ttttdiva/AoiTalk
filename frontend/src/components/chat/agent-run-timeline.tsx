@@ -20,12 +20,18 @@ import {
   type AgentRunTimelineColumn,
   type AgentRunTimelineItem,
 } from "@/lib/chat-api";
+import {
+  isTerminalAgentRunStatus,
+  initialAgentRunTimelineExpanded,
+  nextAgentRunTimelineExpanded,
+  shouldPollAgentRunTimeline,
+} from "@/lib/agent-run-timeline-state";
 import { cn } from "@/lib/utils";
 
 type AgentRunTimelineProps = {
   runId?: string | null;
   live?: boolean;
-  onContentChange?: () => void;
+  onContentChange?: () => boolean | void;
 };
 
 const STATUS_LABELS: Record<string, string> = {
@@ -39,15 +45,11 @@ const STATUS_LABELS: Record<string, string> = {
   tool: "ツール",
 };
 
-const TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled"]);
+const HISTORICAL_PENDING_POLL_TIMEOUT_MS = 30_000;
 
 function statusLabel(status?: string | null) {
   if (!status) return "記録";
   return STATUS_LABELS[status] ?? status;
-}
-
-function isTerminalRunStatus(status?: string | null) {
-  return Boolean(status && TERMINAL_RUN_STATUSES.has(status));
 }
 
 function statusTone(status?: string | null) {
@@ -247,39 +249,47 @@ export function AgentRunTimeline({
   live = false,
   onContentChange,
 }: AgentRunTimelineProps) {
-  const [expanded, setExpanded] = useState(live ? Boolean(runId) : false);
+  const [expanded, setExpanded] = useState(
+    initialAgentRunTimelineExpanded(live, runId),
+  );
   const [run, setRun] = useState<AgentRun | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const scrollBottomRef = useRef<HTMLDivElement>(null);
-  const shouldPollLive = Boolean(
-    live && runId && !isTerminalRunStatus(run?.status),
-  );
+  const historicalPendingPollStartedAtRef = useRef<number | null>(null);
+  const shouldPollLive = shouldPollAgentRunTimeline(live, runId, run?.status);
   const hasRunError = Boolean(run?.error);
   const hasLoadedRun = run !== null;
+  const shouldPollHistoricalPending = Boolean(
+    !live &&
+      runId &&
+      hasLoadedRun &&
+      !hasRunError &&
+      !isTerminalAgentRunStatus(run?.status),
+  );
+  const shouldPollRun = shouldPollLive || shouldPollHistoricalPending;
 
   useEffect(() => {
     setRun(null);
     setError(null);
     setLoading(false);
-    setExpanded(Boolean(runId));
+    setExpanded(initialAgentRunTimelineExpanded(live, runId));
+    historicalPendingPollStartedAtRef.current = null;
   }, [live, runId]);
 
   useEffect(() => {
     if (!runId) return;
-    if (
-      shouldPollLive ||
-      run?.status === "failed" ||
-      run?.status === "cancelled" ||
-      hasRunError
-    ) {
-      setExpanded(true);
-      return;
-    }
-    if (run?.status === "succeeded" && !hasRunError) {
-      setExpanded(false);
-    }
-  }, [hasRunError, run?.status, runId, shouldPollLive]);
+    setExpanded((currentExpanded) =>
+      nextAgentRunTimelineExpanded({
+        runId,
+        live,
+        currentExpanded,
+        shouldPollLive,
+        status: run?.status,
+        hasRunError,
+      }),
+    );
+  }, [hasRunError, live, run?.status, runId, shouldPollLive]);
 
   const loadRun = useCallback(
     async (isCancelled: () => boolean) => {
@@ -318,14 +328,31 @@ export function AgentRunTimeline({
   }, [hasLoadedRun, live, loadRun, runId]);
 
   useEffect(() => {
-    if ((!expanded && !shouldPollLive) || !runId) return;
+    if ((!expanded && !shouldPollRun) || !runId) return;
     let cancelled = false;
     let intervalId: number | undefined;
+    if (
+      shouldPollHistoricalPending &&
+      historicalPendingPollStartedAtRef.current === null
+    ) {
+      historicalPendingPollStartedAtRef.current = Date.now();
+    }
+    const pollTimeoutAt =
+      shouldPollHistoricalPending && historicalPendingPollStartedAtRef.current
+        ? historicalPendingPollStartedAtRef.current +
+          HISTORICAL_PENDING_POLL_TIMEOUT_MS
+        : null;
 
     void loadRun(() => cancelled);
-    if (shouldPollLive) {
+    if (shouldPollRun) {
       intervalId = window.setInterval(
-        () => void loadRun(() => cancelled),
+        () => {
+          if (pollTimeoutAt !== null && Date.now() > pollTimeoutAt) {
+            if (intervalId) window.clearInterval(intervalId);
+            return;
+          }
+          void loadRun(() => cancelled);
+        },
         2500,
       );
     }
@@ -334,7 +361,13 @@ export function AgentRunTimeline({
       cancelled = true;
       if (intervalId) window.clearInterval(intervalId);
     };
-  }, [expanded, loadRun, runId, shouldPollLive]);
+  }, [
+    expanded,
+    loadRun,
+    runId,
+    shouldPollHistoricalPending,
+    shouldPollRun,
+  ]);
 
   const items = useMemo(() => run?.timeline ?? [], [run]);
   const columns = useMemo(() => run?.timeline_columns ?? [], [run]);
@@ -342,7 +375,7 @@ export function AgentRunTimeline({
 
   useEffect(() => {
     if (!expanded) return;
-    onContentChange?.();
+    if (onContentChange?.() === false) return;
     scrollBottomRef.current?.scrollIntoView({
       behavior: "smooth",
       block: "end",

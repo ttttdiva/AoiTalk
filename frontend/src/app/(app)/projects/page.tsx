@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import {
   useState,
   useEffect,
@@ -1815,6 +1816,15 @@ export default function ProjectsPage() {
                     <Tags className="size-3.5" />
                     タグ
                   </button>
+                )}
+                {selectedProject && (
+                  <Link
+                    href={`/docs?project_id=${encodeURIComponent(selectedProject.id)}`}
+                    className="ml-auto flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                  >
+                    <FileText className="size-3.5" />
+                    Docs
+                  </Link>
                 )}
               </div>
 

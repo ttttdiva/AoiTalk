@@ -26,7 +26,7 @@ Linux/macOSでは `AOITALK_FIELD_CRYPTO_KEY_COMMAND` に keyring/KMS から base
 - `conversation_archives.summary`
 - `conversation_sessions.current_summary`
 - `context_memories.content`
-- `project_facts.content`
+- `knowledge_nodes.body_text/body_json` の案件情報本文
 - `record_rows.values`
 - `record_rows.title`
 - `record_rows.search_text`

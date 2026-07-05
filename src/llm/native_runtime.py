@@ -94,7 +94,7 @@ class AgentTurnRunner:
     async def run(
         self,
         agent: AgentDefinition,
-        user_input: str,
+        user_input: str | list[dict[str, Any]],
         *,
         stream_callback: Optional[StreamCallback] = None,
     ) -> NativeRunResult:
@@ -104,6 +104,15 @@ class AgentTurnRunner:
             {"role": "system", "content": agent.instructions or ""},
             {"role": "user", "content": user_input or ""},
         ]
+        plain_user_input = (
+            user_input
+            if isinstance(user_input, str)
+            else "\n".join(
+                str(part.get("text") or "")
+                for part in user_input
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        )
         tool_records: list[ToolExecutionRecord] = []
         tool_registry = ToolRegistry()
         for tool in agent.tools:
@@ -175,7 +184,7 @@ class AgentTurnRunner:
                 model_payload = model_tool_result_payload(
                     tool_name=tool_name,
                     output=result_text,
-                    user_input=user_input,
+                    user_input=plain_user_input,
                     max_chars=self.max_tool_result_chars,
                     config=self.config,
                     legacy_clip=_clip_text,

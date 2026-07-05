@@ -13,6 +13,7 @@ function LoginForm() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const searchParams = useSearchParams();
+  const next = searchParams.get("next") ?? "";
 
   /*
   const searchError = useMemo(() => {
@@ -55,6 +56,14 @@ function LoginForm() {
     p.name = "password";
     p.value = password;
     form.appendChild(p);
+
+    if (next) {
+      const n = document.createElement("input");
+      n.type = "hidden";
+      n.name = "next";
+      n.value = next;
+      form.appendChild(n);
+    }
 
     document.body.appendChild(form);
     form.submit();

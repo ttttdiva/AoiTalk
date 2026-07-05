@@ -154,6 +154,7 @@ class VoiceChatMode(BaseAssistant):
         attachments=None,
         client_message_id=None,
         include_generation_metrics: bool = False,
+        media_recognition_metadata=None,
     ) -> dict:
         metadata = {}
         if llm_client and hasattr(llm_client, "_get_memory_metadata"):
@@ -175,12 +176,21 @@ class VoiceChatMode(BaseAssistant):
             metadata["client_message_id"] = client_message_id
         if sanitized_attachments:
             metadata["attachments"] = sanitized_attachments
+        if media_recognition_metadata:
+            metadata["media_recognition"] = list(media_recognition_metadata)
         if image_data:
+            image_items = []
+            if isinstance(image_data, dict) and isinstance(image_data.get("images"), list):
+                image_items = [item for item in image_data.get("images") if isinstance(item, dict)]
+            elif isinstance(image_data, dict):
+                image_items = [image_data]
+            first_image = image_items[0] if image_items else {}
             metadata.update(
                 {
                     "has_image": True,
-                    "image_mime_type": image_data.get("mimeType"),
-                    "image_name": image_data.get("name"),
+                    "image_count": len(image_items),
+                    "image_mime_type": first_image.get("mimeType"),
+                    "image_name": first_image.get("name"),
                 }
             )
         return metadata
@@ -743,6 +753,7 @@ class VoiceChatMode(BaseAssistant):
         sender_display_name=None,
         response_started_at_monotonic=None,
         command_capabilities=None,
+        media_recognition_metadata=None,
     ):
         """Process user message from web interface
         
@@ -774,6 +785,7 @@ class VoiceChatMode(BaseAssistant):
                             image_data,
                             attachments,
                             client_message_id,
+                            media_recognition_metadata=media_recognition_metadata,
                         ),
                         branch_from_message_id=edit_message_id,
                         sender_type="user" if sender_user_id else None,

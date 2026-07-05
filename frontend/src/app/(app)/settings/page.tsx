@@ -133,7 +133,7 @@ const AGENT_LABELS: Record<string, string> = {
 
 const AGENT_DESCRIPTIONS: Record<string, string> = {
   filesystem: "メインassistantがワークスペースの検索・読取・編集ツールを直接使う権限です。",
-  project_management: "メインassistantが案件情報DB・WBS・タスク系の直接ツールを使う権限です。",
+  project_management: "メインassistantが案件情報Docs・WBS・タスク系の直接ツールを使う権限です。",
 };
 
 type QuickSettingId =

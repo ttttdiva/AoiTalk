@@ -22,6 +22,24 @@ export function getWebSocketMessageSessionId(
     : null;
 }
 
+export function getWebSocketMessageAgentRunId(
+  message: WebSocketSessionMessage,
+): string | null {
+  if (typeof message.agent_run_id === "string" && message.agent_run_id.trim()) {
+    return message.agent_run_id;
+  }
+
+  const nested = message.data;
+  if (!nested || typeof nested !== "object" || Array.isArray(nested)) {
+    return null;
+  }
+
+  const nestedAgentRunId = (nested as { agent_run_id?: unknown }).agent_run_id;
+  return typeof nestedAgentRunId === "string" && nestedAgentRunId.trim()
+    ? nestedAgentRunId
+    : null;
+}
+
 export function isWebSocketMessageForSession(
   message: WebSocketSessionMessage,
   sessionId: string | null,

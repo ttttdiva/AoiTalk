@@ -77,6 +77,23 @@ _FRONTEND_BUILD_INPUT_SUFFIXES = {
     ".yaml",
     ".yml",
 }
+_FRONTEND_STATIC_ASSET_SUFFIXES = {
+    ".css",
+    ".gif",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".js",
+    ".json",
+    ".map",
+    ".png",
+    ".svg",
+    ".ttf",
+    ".txt",
+    ".webp",
+    ".woff",
+    ".woff2",
+}
 _FRONTEND_STATIC_REF_PATTERN = re.compile(
     r"(?:/_next/|_next/)?static/[^\s\"'`<>)\]}]+"
 )
@@ -322,6 +339,17 @@ def _config_bool(config: object | None, key: str, default: bool = False) -> bool
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _should_skip_caddy_for_desktop() -> bool:
+    return _env_bool("AOITALK_SKIP_CADDY") or _env_bool("AOITALK_DESKTOP")
 
 
 def _should_start_luce_dflash(config: object | None) -> bool:
@@ -1072,6 +1100,8 @@ def _normalize_next_static_asset_ref(value: object) -> str | None:
         return None
     if "." not in parts[-1]:
         return None
+    if Path(parts[-1]).suffix.lower() not in _FRONTEND_STATIC_ASSET_SUFFIXES:
+        return None
     return "/".join(parts)
 
 
@@ -1279,10 +1309,16 @@ def _build_frontend_env(project_root: Path) -> dict[str, str]:
 def start_services(config: object | None = None) -> None:
     """Start frontend, Caddy, and provider-specific local services."""
     project_root = Path(__file__).resolve().parent.parent
+    skip_caddy = _should_skip_caddy_for_desktop()
 
     _kill_existing_on_port(3000)
-    _kill_existing_on_port(6002)
-    _kill_existing_on_port(3002)
+    if not skip_caddy:
+        _kill_existing_on_port(6002)
+        _kill_existing_on_port(3002)
+
+    frontend_already_running = skip_caddy and _wait_for_port(
+        "127.0.0.1", 3002, timeout_seconds=0.5
+    )
 
     should_start_dflash = _should_start_luce_dflash(config)
     should_start_qwopus = _should_start_qwopus_llama_server(config)
@@ -1295,7 +1331,12 @@ def start_services(config: object | None = None) -> None:
     frontend_env = _build_frontend_env(project_root)
     _ensure_frontend_build(project_root, frontend_log_path, frontend_env)
 
-    if _IS_WINDOWS:
+    frontend_proc: subprocess.Popen | None = None
+    caddy_proc: subprocess.Popen | None = None
+
+    if frontend_already_running:
+        pass
+    elif _IS_WINDOWS:
         frontend_proc = subprocess.Popen(
             [
                 "powershell",
@@ -1321,12 +1362,13 @@ def start_services(config: object | None = None) -> None:
                 f"frontend.log tail:\n{_read_log_tail(frontend_log_path)}"
             )
 
-        caddy_proc = subprocess.Popen(
-            [_resolve_caddy_binary(project_root), "run", "--config", "Caddyfile"],
-            cwd=str(project_root / "caddy"),
-            creationflags=subprocess.CREATE_NEW_CONSOLE,
-        )
-        _track_child_process(caddy_proc)
+        if not skip_caddy:
+            caddy_proc = subprocess.Popen(
+                [_resolve_caddy_binary(project_root), "run", "--config", "Caddyfile"],
+                cwd=str(project_root / "caddy"),
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+            )
+            _track_child_process(caddy_proc)
     else:
         frontend_cmd = (
             f"npm run start -- -p 3002 -H 0.0.0.0 2>&1 | "
@@ -1346,35 +1388,47 @@ def start_services(config: object | None = None) -> None:
                 f"frontend.log tail:\n{_read_log_tail(frontend_log_path)}"
             )
 
-        caddy_proc = subprocess.Popen(
-            [_resolve_caddy_binary(project_root), "run", "--config", "Caddyfile"],
-            cwd=str(project_root / "caddy"),
-            start_new_session=True,
-        )
-        _track_child_process(caddy_proc)
+        if not skip_caddy:
+            caddy_proc = subprocess.Popen(
+                [_resolve_caddy_binary(project_root), "run", "--config", "Caddyfile"],
+                cwd=str(project_root / "caddy"),
+                start_new_session=True,
+            )
+            _track_child_process(caddy_proc)
+
+    caddy_status = (
+        "Caddy skipped for desktop"
+        if skip_caddy
+        else f"Caddy (PID {caddy_proc.pid})"
+    )
+    frontend_status = (
+        "Frontend (existing on 127.0.0.1:3002)"
+        if frontend_proc is None
+        else f"Frontend (PID {frontend_proc.pid})"
+    )
 
     if should_start_dflash and local_server_launch_started:
         print(
-            f"Started Frontend (PID {frontend_proc.pid}) / "
-            f"Caddy (PID {caddy_proc.pid}) / Luce DFlash starting"
+            f"Started {frontend_status} / "
+            f"{caddy_status} / Luce DFlash starting"
         )
     elif should_start_qwopus and local_server_launch_started:
         print(
-            f"Started Frontend (PID {frontend_proc.pid}) / "
-            f"Caddy (PID {caddy_proc.pid}) / Qwopus llama-server starting"
+            f"Started {frontend_status} / "
+            f"{caddy_status} / Qwopus llama-server starting"
         )
     elif should_start_exo and local_server_launch_started:
         print(
-            f"Started Frontend (PID {frontend_proc.pid}) / "
-            f"Caddy (PID {caddy_proc.pid}) / exo server starting"
+            f"Started {frontend_status} / "
+            f"{caddy_status} / exo server starting"
         )
     elif should_start_mlx_lm and local_server_launch_started:
         print(
-            f"Started Frontend (PID {frontend_proc.pid}) / "
-            f"Caddy (PID {caddy_proc.pid}) / MLX LM server starting"
+            f"Started {frontend_status} / "
+            f"{caddy_status} / MLX LM server starting"
         )
     else:
-        print(f"Started Frontend (PID {frontend_proc.pid}) / Caddy (PID {caddy_proc.pid})")
+        print(f"Started {frontend_status} / {caddy_status}")
 
 
 def kill_services() -> None:

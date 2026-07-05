@@ -251,6 +251,7 @@ export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
     focusedItemPath,
     selectItem,
     toggleSelect,
+    selectRange,
     refresh,
   } = useExplorer();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -292,6 +293,10 @@ export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
     e: React.MouseEvent,
     item: ExplorerDirectory | ExplorerFile,
   ) => {
+    if (e.shiftKey) {
+      selectRange(item.path, orderedPaths, e.ctrlKey || e.metaKey);
+      return;
+    }
     if (e.ctrlKey || e.metaKey) {
       toggleSelect(item.path);
       return;
@@ -369,6 +374,10 @@ export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
   const gridTemplate = `repeat(auto-fill, minmax(min(${cellWidth}px, calc((100% - ${(minColumns - 1) * 4}px) / ${minColumns})), 1fr))`;
 
   if (!browseData) return null;
+  const orderedPaths = [
+    ...browseData.directories.map((dir) => dir.path),
+    ...browseData.files.map((file) => file.path),
+  ];
 
   return (
     <div ref={containerRef}>

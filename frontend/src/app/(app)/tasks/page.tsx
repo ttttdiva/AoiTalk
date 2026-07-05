@@ -424,10 +424,31 @@ export default function TasksPage() {
       try {
         if (task.active_time_entry) {
           await taskApi.stopTimer(task.active_time_entry.id);
+          setTasks((prev) =>
+            prev.map((item) =>
+              item.id === task.id ? { ...item, active_time_entry: null } : item,
+            ),
+          );
+          window.dispatchEvent(
+            new CustomEvent("timer-changed", {
+              detail: { activeEntry: null },
+            }),
+          );
         } else {
-          await taskApi.startTimer(task.id);
+          const started = await taskApi.startTimer(task.id);
+          setTasks((prev) =>
+            prev.map((item) =>
+              item.id === task.id
+                ? { ...item, active_time_entry: started }
+                : item,
+            ),
+          );
+          window.dispatchEvent(
+            new CustomEvent("timer-changed", {
+              detail: { activeEntry: started },
+            }),
+          );
         }
-        window.dispatchEvent(new Event("timer-changed"));
         await fetchData();
       } catch (err) {
         console.error("タイマー操作失敗:", err);
@@ -435,7 +456,7 @@ export default function TasksPage() {
         setTimerLoading(null);
       }
     },
-    [fetchData],
+    [fetchData, setTasks],
   );
 
   // 他画面（ヘッダー/モーダル）でタイマーが変わったら一覧も再取得
@@ -455,15 +476,24 @@ export default function TasksPage() {
 
     setTimerLoading(task.id);
     try {
-      await taskApi.startTimer(task.id);
-      window.dispatchEvent(new Event("timer-changed"));
+      const started = await taskApi.startTimer(task.id);
+      setTasks((prev) =>
+        prev.map((item) =>
+          item.id === task.id ? { ...item, active_time_entry: started } : item,
+        ),
+      );
+      window.dispatchEvent(
+        new CustomEvent("timer-changed", {
+          detail: { activeEntry: started },
+        }),
+      );
       await fetchData();
     } catch (err) {
       console.error("Focused task timer start failed:", err);
     } finally {
       setTimerLoading(null);
     }
-  }, [fetchData, focusedTaskId, tasks]);
+  }, [fetchData, focusedTaskId, setTasks, tasks]);
 
   // 経過時間リアルタイム表示
   const [now, setNow] = useState(() => Date.now());

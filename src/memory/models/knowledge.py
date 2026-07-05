@@ -15,12 +15,14 @@ from sqlalchemy import (
     ForeignKey,
     UniqueConstraint,
     Index,
+    Boolean,
     text,
+    Date,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
-from .base import Base, _encrypted_text_property
+from .base import Base, _encrypted_json_property, _encrypted_text_property
 
 
 class KnowledgeSource(Base):
@@ -394,3 +396,457 @@ class KnowledgeEditEvent(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "applied_at": self.applied_at.isoformat() if self.applied_at else None,
         }
+
+
+class KnowledgeWorkspace(Base):
+    """AoiTalk DBを正本にするDocsワークスペース。"""
+
+    __tablename__ = "knowledge_workspaces"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(200), nullable=False)
+    description = Column(Text)
+    owner_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
+    settings_json = Column(JSON, default=dict, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("owner_user_id", name="uq_knowledge_workspaces_owner_user"),
+        Index("ix_knowledge_workspaces_owner_user", "owner_user_id"),
+    )
+
+
+class KnowledgeNode(Base):
+    """Docs内のTana型アウトライナーノード。"""
+
+    __tablename__ = "knowledge_nodes"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    parent_id = Column(UUID(as_uuid=True), ForeignKey("knowledge_nodes.id", ondelete="CASCADE"))
+    root_page_id = Column(UUID(as_uuid=True), ForeignKey("knowledge_nodes.id", ondelete="SET NULL"))
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL"))
+    title = Column(String(500), nullable=False)
+    description = Column(Text, default="", nullable=False)
+    _body_json = Column("body_json", JSON, default=dict, nullable=False)
+    body_json = _encrypted_json_property("_body_json", "knowledge_nodes.body_json")
+    _body_text = Column("body_text", Text, default="", nullable=False)
+    body_text = _encrypted_text_property("_body_text", "knowledge_nodes.body_text")
+    node_type = Column(String(40), default="node", nullable=False)
+    display_props = Column(JSON, default=dict, nullable=False)
+    query_json = Column(JSON)
+    view_json = Column(JSON, default=dict, nullable=False)
+    day_date = Column(Date)
+    sort_order = Column(Float, default=0, nullable=False)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    updated_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    archived_at = Column(DateTime)
+
+    __table_args__ = (
+        Index("ix_knowledge_nodes_workspace", "workspace_id"),
+        Index("ix_knowledge_nodes_workspace_parent_sort", "workspace_id", "parent_id", "sort_order"),
+        Index("ix_knowledge_nodes_workspace_project", "workspace_id", "project_id"),
+        Index("ix_knowledge_nodes_workspace_day", "workspace_id", "day_date"),
+        Index("ix_knowledge_nodes_root_page", "root_page_id"),
+        Index("ix_knowledge_nodes_archived_at", "archived_at"),
+    )
+
+
+class KnowledgeSupertag(Base):
+    """Tana Supertag相当の型定義。"""
+
+    __tablename__ = "knowledge_supertags"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    parent_supertag_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_supertags.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    system_key = Column(Text)
+    name = Column(String(120), nullable=False)
+    base_type = Column(String(40), default="note", nullable=False)
+    description = Column(Text)
+    icon = Column(String(64))
+    color = Column(String(32))
+    template_json = Column(JSON, default=dict, nullable=False)
+    pinned_field_ids = Column(JSON, default=list, nullable=False)
+    config_json = Column(JSON, default=dict, nullable=False)
+    title_template = Column(Text)
+    ai_instructions = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "name", name="uq_knowledge_supertag_name"),
+        UniqueConstraint(
+            "workspace_id",
+            "system_key",
+            name="uq_knowledge_supertags_workspace_system_key",
+        ),
+        Index("ix_knowledge_supertags_workspace", "workspace_id"),
+        Index("ix_knowledge_supertags_parent", "parent_supertag_id"),
+        Index("ix_knowledge_supertags_system_key", "system_key"),
+    )
+
+
+class KnowledgeNodeSupertag(Base):
+    """NodeとSupertagの多対多関連。"""
+
+    __tablename__ = "knowledge_node_supertags"
+
+    node_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_nodes.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    supertag_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_supertags.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    created_at = Column(DateTime, default=datetime.utcnow)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+
+    __table_args__ = (
+        Index("ix_knowledge_node_supertags_supertag", "supertag_id"),
+    )
+
+
+class KnowledgeField(Base):
+    """Supertagに紐づくフィールド定義。"""
+
+    __tablename__ = "knowledge_fields"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    supertag_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_supertags.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    system_key = Column(Text)
+    name = Column(String(120), nullable=False)
+    field_type = Column(String(40), default="text", nullable=False)
+    required = Column(Boolean, default=False, nullable=False)
+    options_json = Column(JSON, default=dict, nullable=False)
+    default_value_json = Column(JSON)
+    sort_order = Column(Float, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("supertag_id", "name", name="uq_knowledge_field_name"),
+        Index("ix_knowledge_fields_workspace", "workspace_id"),
+        Index("ix_knowledge_fields_supertag", "supertag_id"),
+        Index("ix_knowledge_fields_system_key", "system_key"),
+    )
+
+
+class KnowledgeSupertagField(Base):
+    """Supertagと共有フィールド定義の関連。"""
+
+    __tablename__ = "knowledge_supertag_fields"
+
+    supertag_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_supertags.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    field_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_fields.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    sort_order = Column(Float, default=0, nullable=False)
+    required = Column(Boolean, default=False, nullable=False)
+    show_in_template = Column(Boolean, default=True, nullable=False)
+    optional = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class KnowledgeNodePlacement(Base):
+    """同一ノードを別の親配下へ参照配置する関連。"""
+
+    __tablename__ = "knowledge_node_placements"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    node_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    parent_node_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sort_order = Column(Float, default=0, nullable=False)
+    collapsed = Column(Boolean, default=False, nullable=False)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("node_id", "parent_node_id", name="uq_knowledge_node_placement_parent"),
+        Index("ix_knowledge_node_placements_parent", "parent_node_id", "sort_order"),
+    )
+
+
+class KnowledgeFieldValue(Base):
+    """Nodeごとの型付きフィールド値。"""
+
+    __tablename__ = "knowledge_field_values"
+
+    node_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_nodes.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    field_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_fields.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    value_json = Column(JSON)
+    value_text = Column(Text)
+    value_number = Column(Float)
+    value_datetime = Column(DateTime)
+    target_node_id = Column(UUID(as_uuid=True), ForeignKey("knowledge_nodes.id", ondelete="SET NULL"))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+
+    __table_args__ = (
+        Index("ix_knowledge_field_values_field", "field_id"),
+        Index("ix_knowledge_field_values_target", "target_node_id"),
+        Index("ix_knowledge_field_values_text", "value_text"),
+        Index("ix_knowledge_field_values_number", "value_number"),
+        Index("ix_knowledge_field_values_datetime", "value_datetime"),
+    )
+
+
+class KnowledgeEdge(Base):
+    """Node間の明示的な関係。"""
+
+    __tablename__ = "knowledge_edges"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_node_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    target_node_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    relation_type = Column(String(80), default="related_to", nullable=False)
+    confidence = Column(Float, default=1, nullable=False)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_knowledge_edges_source", "source_node_id"),
+        Index("ix_knowledge_edges_target", "target_node_id"),
+        Index("ix_knowledge_edges_relation", "relation_type"),
+    )
+
+
+class KnowledgeSearchIndex(Base):
+    """暗号化済みDocs本文から再生成する検索用派生index。"""
+
+    __tablename__ = "knowledge_search_index"
+
+    node_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_nodes.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    workspace_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL"))
+    title_text = Column(Text, default="", nullable=False)
+    body_text_plain = Column(Text, default="", nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_knowledge_search_index_workspace", "workspace_id"),
+        Index("ix_knowledge_search_index_project", "project_id"),
+    )
+
+
+class KnowledgeSavedView(Base):
+    """タグ別・条件別に保存するDocsビュー定義。"""
+
+    __tablename__ = "knowledge_saved_views"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    supertag_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_supertags.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    name = Column(String(200), nullable=False)
+    layout = Column(String(40), default="table", nullable=False)
+    config_json = Column(JSON, default=dict, nullable=False)
+    sort_order = Column(Float, default=0, nullable=False)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_knowledge_saved_views_workspace", "workspace_id"),
+        Index("ix_knowledge_saved_views_supertag", "supertag_id"),
+    )
+
+
+class KnowledgeRevision(Base):
+    """Docs nodeの編集履歴。"""
+
+    __tablename__ = "knowledge_revisions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    node_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    title = Column(String(500), nullable=False)
+    _body_json = Column("body_json", JSON, default=dict, nullable=False)
+    body_json = _encrypted_json_property("_body_json", "knowledge_revisions.body_json")
+    _body_text = Column("body_text", Text, default="", nullable=False)
+    body_text = _encrypted_text_property("_body_text", "knowledge_revisions.body_text")
+    change_summary = Column(Text)
+    source_refs_json = Column(JSON, default=list, nullable=False)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (Index("ix_knowledge_revisions_node", "node_id"),)
+
+
+class KnowledgeAiSuggestion(Base):
+    """AI Organizerの未承認提案。"""
+
+    __tablename__ = "knowledge_ai_suggestions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    node_id = Column(UUID(as_uuid=True), ForeignKey("knowledge_nodes.id", ondelete="CASCADE"))
+    suggestion_type = Column(String(80), nullable=False)
+    payload_json = Column(JSON, default=dict, nullable=False)
+    status = Column(String(20), default="proposed", nullable=False)
+    confidence = Column(Float)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_knowledge_ai_suggestions_workspace", "workspace_id"),
+        Index("ix_knowledge_ai_suggestions_node", "node_id"),
+        Index("ix_knowledge_ai_suggestions_status", "status"),
+    )
+
+
+class KnowledgeAttachment(Base):
+    """Docs nodeに紐づく添付ファイルメタデータ。"""
+
+    __tablename__ = "knowledge_attachments"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    node_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    file_name = Column(String(255), nullable=False)
+    file_path = Column(Text, nullable=False)
+    mime_type = Column(String(120))
+    size_bytes = Column(Integer)
+    attachment_metadata = Column(JSON, default=dict, nullable=False)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (Index("ix_knowledge_attachments_node", "node_id"),)
+
+
+class KnowledgeImportJob(Base):
+    """汎用Docs Importのジョブ。"""
+
+    __tablename__ = "knowledge_import_jobs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL"))
+    source_type = Column(String(40), nullable=False)
+    source_name = Column(Text, nullable=False)
+    status = Column(String(20), default="proposed", nullable=False)
+    options_json = Column(JSON, default=dict, nullable=False)
+    summary_json = Column(JSON, default=dict, nullable=False)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_knowledge_import_jobs_workspace", "workspace_id"),
+        Index("ix_knowledge_import_jobs_project", "project_id"),
+        Index("ix_knowledge_import_jobs_status", "status"),
+    )
+
+
+class KnowledgeImportItem(Base):
+    """Importジョブ内の取り込み候補。"""
+
+    __tablename__ = "knowledge_import_items"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    job_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_import_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    node_id = Column(UUID(as_uuid=True), ForeignKey("knowledge_nodes.id", ondelete="SET NULL"))
+    source_ref = Column(Text, nullable=False)
+    title = Column(String(500), nullable=False)
+    item_type = Column(String(40), default="page", nullable=False)
+    status = Column(String(20), default="proposed", nullable=False)
+    preview_json = Column(JSON, default=dict, nullable=False)
+    error_message = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_knowledge_import_items_job", "job_id"),
+        Index("ix_knowledge_import_items_node", "node_id"),
+        Index("ix_knowledge_import_items_status", "status"),
+    )

@@ -1,15 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "@/db";
 import {
   notificationDeliveries,
-  taskAssignees,
-  taskComments,
   taskOccurrences,
   taskRecurrenceRules,
-  taskTags,
   tasks,
-  timeEntries,
 } from "@/db/schema";
 import { getSession } from "@/lib/auth";
 import { normalizeTaskStatus } from "@/lib/task-status";
@@ -26,6 +22,10 @@ import {
   serializeDbTimestamp,
   toDbLocalTimestamp,
 } from "@/lib/server/db-time";
+import {
+  collectTaskTreeIds,
+  deleteTaskTreeRows,
+} from "@/lib/server/task-delete";
 
 function parseDate(value: unknown, fieldName: string): Date {
   const parsed =
@@ -459,22 +459,7 @@ export async function DELETE(
     const taskStartAt = dbTimestampToLocalDate(task.startAt);
     if (taskStartAt && taskStartAt.getTime() >= originalStartAt.getTime()) {
       await deleteDueSoonNotifications(id);
-      await db
-        .delete(notificationDeliveries)
-        .where(eq(notificationDeliveries.taskId, id));
-      await db.delete(timeEntries).where(eq(timeEntries.taskId, id));
-      await db.delete(taskOccurrences).where(eq(taskOccurrences.taskId, id));
-      await db.execute(sql`DELETE FROM task_activities WHERE task_id = ${id}`);
-      await db.execute(
-        sql`DELETE FROM task_dependencies WHERE task_id = ${id} OR depends_on_task_id = ${id}`,
-      );
-      await db
-        .delete(taskRecurrenceRules)
-        .where(eq(taskRecurrenceRules.taskId, id));
-      await db.delete(taskComments).where(eq(taskComments.taskId, id));
-      await db.delete(taskTags).where(eq(taskTags.taskId, id));
-      await db.delete(taskAssignees).where(eq(taskAssignees.taskId, id));
-      await db.delete(tasks).where(eq(tasks.id, id));
+      await deleteTaskTreeRows(await collectTaskTreeIds(id));
       return NextResponse.json({ success: true, deleted_task: true });
     }
 

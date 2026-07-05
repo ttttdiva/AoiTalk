@@ -25,7 +25,6 @@ from src.memory.models import (
     ConversationSession,
     GoogleCalendarConnection,
     KnowledgeChunk,
-    ProjectFact,
     RecordRow,
     TaskComment,
 )
@@ -42,7 +41,6 @@ TEXT_FIELDS: tuple[tuple[type[Any], str, str], ...] = (
     (ConversationArchive, "_summary", "summary"),
     (ConversationHistory, "_content", "content"),
     (ContextMemory, "_content", "content"),
-    (ProjectFact, "_content", "content"),
     (TaskComment, "_content", "content"),
     (KnowledgeChunk, "_text", "text"),
     (RecordRow, "_title", "title"),

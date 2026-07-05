@@ -52,6 +52,7 @@ from .tool_policy import (
     set_current_user_input,
 )
 from .provider_capabilities import ProviderCapabilities
+from .multimodal import openai_content_parts
 
 logger = logging.getLogger(__name__)
 
@@ -665,8 +666,6 @@ class SGLangClient:
         Returns:
             Generated response text or generator
         """
-        if image_data:
-            logger.warning("[SGLangClient] 画像入力はこのプロバイダーでサポートされていません。画像は無視されます。")
         project_token = None
         tool_policy_token = set_current_user_input(user_input)
         generation_policy_token = set_current_generation_policy(
@@ -685,6 +684,11 @@ class SGLangClient:
 
             # Build messages
             messages = self._build_messages(model_user_input)
+            if image_data and messages:
+                messages[-1]["content"] = openai_content_parts(
+                    str(messages[-1].get("content") or ""),
+                    image_data,
+                )
 
             # Mode-specific parameters (Qwen3 thinking mode support)
             if self._thinking_mode:

@@ -177,14 +177,27 @@ export default function TaskDetailPage() {
     try {
       if (task?.active_time_entry) {
         await taskApi.stopTimer(task.active_time_entry.id);
+        setElapsedSeconds(0);
+        setTask((prev) =>
+          prev ? { ...prev, active_time_entry: null } : prev,
+        );
+        window.dispatchEvent(
+          new CustomEvent("timer-changed", {
+            detail: { activeEntry: null },
+          }),
+        );
       } else {
         const started = await taskApi.startTimer(taskId);
         setElapsedSeconds(0);
         setTask((prev) =>
           prev ? { ...prev, active_time_entry: started } : prev,
         );
+        window.dispatchEvent(
+          new CustomEvent("timer-changed", {
+            detail: { activeEntry: started },
+          }),
+        );
       }
-      window.dispatchEvent(new Event("timer-changed"));
       await fetchTask();
     } catch (err) {
       console.error("タイマー操作失敗:", err);

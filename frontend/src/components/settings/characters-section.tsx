@@ -136,7 +136,7 @@ const TOOL_OPTIONS = [
   { value: "search_files", label: "ファイル検索" },
   { value: "execute_command", label: "コマンド実行" },
   { value: "list_project_information", label: "案件情報参照" },
-  { value: "organize_project_information_from_folder", label: "案件DB更新" },
+  { value: "organize_project_information_from_folder", label: "案件情報Docs更新" },
   { value: "create_task", label: "タスク作成" },
   { value: "media_assistant", label: "メディア" },
   { value: "utility_assistant", label: "ユーティリティ" },

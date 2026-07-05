@@ -17,8 +17,8 @@ TITLE_FALLBACK_LENGTH = 40
 TITLE_CONTENT_LIMIT = 500
 TITLE_GENERATION_CONTEXT_KEY = "title_generation"
 REJECTED_GENERATED_TITLE_FRAGMENTS = (
-    "利用可能な案件情報DBと直近の確認結果だけを根拠に回答します",
-    "選択中の案件情報DBから利用できる短い根拠を取得できませんでした",
+    "利用可能な案件情報Docsと直近の確認結果だけを根拠に回答します",
+    "選択中の案件情報Docsから利用できる短い根拠を取得できませんでした",
     "ローカルLLMはモデルを読み込み中です",
     "ローカルLLMから本文のない応答が返りました",
     "ローカルLLMの呼び出しでエラーが発生しました",

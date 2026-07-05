@@ -40,6 +40,7 @@ from .agent_runtime import (
 )
 from .prompts import build_unified_instructions
 from .provider_capabilities import ProviderCapabilities
+from .multimodal import openai_content_parts
 from .provider_mode_adapters import (
     ollama_mode_options_for_model,
     ollama_reasoning_effort_for_mode,
@@ -388,9 +389,6 @@ class OllamaClient:
         image_data: Optional[Dict[str, Any]] = None,
         stream_callback: Any = None,
     ) -> Union[str, Generator[str, None, None]]:
-        if image_data:
-            logger.warning("[OllamaClient] image_data is ignored by this client")
-
         project_token = None
         tool_policy_token = set_current_user_input(user_input)
         policy = get_client_generation_policy(self)
@@ -438,6 +436,11 @@ class OllamaClient:
                 return response_text
 
             messages = self._build_messages(model_user_input)
+            if image_data and messages:
+                messages[-1]["content"] = openai_content_parts(
+                    str(messages[-1].get("content") or ""),
+                    image_data,
+                )
             api_kwargs = self._build_api_kwargs(
                 messages,
                 temperature,

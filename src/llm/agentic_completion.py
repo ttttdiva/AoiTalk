@@ -262,7 +262,7 @@ def build_agentic_review_prompt(
     if user_input and project_progress_review_active(user_input):
         lines.extend(
             [
-                "For project progress review, do not mark done unless the run checked current project evidence with project tools, and if DB/project facts/record tables were updated, progress was checked again after that update.",
+                "For project progress review, do not mark done unless the run checked current project evidence with project tools, and if project Docs/record tables were updated, progress was checked again after that update.",
                 "Continue when the answer is based only on a first shallow result, when stored evidence is insufficient and project files have not been inspected/refreshed, or when needed external current facts have not been searched.",
             ]
         )

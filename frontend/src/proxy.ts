@@ -21,6 +21,13 @@ function getRequiredJwtSecret(): Uint8Array {
 
 const SECRET = getRequiredJwtSecret();
 
+function redirectToLogin(request: NextRequest) {
+  const loginUrl = new URL("/login", request.url);
+  const nextPath = `${request.nextUrl.pathname}${request.nextUrl.search}`;
+  if (nextPath !== "/login") loginUrl.searchParams.set("next", nextPath);
+  return NextResponse.redirect(loginUrl);
+}
+
 export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
@@ -37,13 +44,13 @@ export async function proxy(request: NextRequest) {
   // セッションCookie確認。FastAPI の旧Cookieなど、Next.js JWTではない値は通さない。
   const session = request.cookies.get(COOKIE_NAME);
   if (!session) {
-    return NextResponse.redirect(new URL("/login", request.url));
+    return redirectToLogin(request);
   }
 
   try {
     await jwtVerify(session.value, SECRET);
   } catch {
-    const response = NextResponse.redirect(new URL("/login", request.url));
+    const response = redirectToLogin(request);
     response.cookies.set(COOKIE_NAME, "", {
       httpOnly: true,
       secure: request.nextUrl.protocol === "https:",

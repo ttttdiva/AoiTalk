@@ -204,20 +204,28 @@ export function textEditorTheme(options?: {
   fontSize?: number;
   fontFamily?: string;
   compact?: boolean;
+  surface?: "solid" | "glass";
 }) {
   const minHeight = options?.minHeight ?? 120;
   const maxHeight = options?.maxHeight;
   const fontSize = options?.fontSize ?? 13;
   const fontFamily = options?.fontFamily ?? "inherit";
   const padding = options?.compact ? "6px 10px" : "8px 12px";
+  const surface = options?.surface ?? "solid";
   const rootStyles: Record<string, string> = {
     minHeight: `${minHeight}px`,
     fontSize: `${fontSize}px`,
     border: "1px solid var(--input, var(--border, #333))",
     borderRadius: "0.5rem",
-    background: "rgb(255 255 255 / 0.45)",
-    boxShadow: "inset 0 1px rgba(255, 255, 255, 0.62)",
-    backdropFilter: "blur(24px)",
+    background:
+      surface === "glass"
+        ? "color-mix(in oklab, var(--background, #0f172a) 72%, transparent)"
+        : "var(--background, #0f172a)",
+    boxShadow:
+      surface === "glass"
+        ? "inset 0 1px color-mix(in oklab, var(--foreground, #e5e7eb) 16%, transparent)"
+        : "none",
+    backdropFilter: surface === "glass" ? "blur(18px)" : "none",
     overflow: "hidden",
   };
   const scrollerStyles: Record<string, string> = {

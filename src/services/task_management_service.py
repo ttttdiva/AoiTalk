@@ -25,12 +25,17 @@ from ..memory.models import (
     Task,
     TaskActivity,
     TaskAssignee,
+    TaskAttachment,
     TaskComment,
+    TaskDependency,
     TaskOccurrence,
     TaskRecurrenceRule,
     TaskTag,
     TimeEntry,
     User,
+    KnowledgeNode,
+    KnowledgeNodeSupertag,
+    KnowledgeSupertag,
 )
 from ..memory.project_repository import ProjectRepository
 from ..task_time import DEFAULT_TASK_TIMEZONE, normalize_task_timezone
@@ -529,6 +534,30 @@ class TaskManagementService:
             raise TaskManagementError("Task not found", status_code=404)
         return task
 
+    async def _collect_task_tree_ids(
+        self, session: AsyncSession, root_task_id: UUID
+    ) -> list[UUID]:
+        task_ids = [root_task_id]
+        seen = {root_task_id}
+        queue = [root_task_id]
+
+        while queue:
+            result = await session.execute(
+                select(Task.id).where(Task.parent_task_id.in_(queue))
+            )
+            child_ids = [
+                child_id
+                for child_id in result.scalars().all()
+                if child_id not in seen
+            ]
+            if not child_ids:
+                break
+            seen.update(child_ids)
+            task_ids.extend(child_ids)
+            queue = child_ids
+
+        return task_ids
+
     def _build_time_entry_payload(self, entry: TimeEntry) -> dict[str, Any]:
         """TimeEntry.to_dict() に Web BFF 互換のフィールドを追加して返す。
 
@@ -885,6 +914,7 @@ class TaskManagementService:
         title: str,
         description: Optional[str] = None,
         project_id: Optional[UUID] = None,
+        knowledge_node_id: Optional[UUID] = None,
         status: str = "todo",
         priority: Optional[str] = None,
         start_at: Optional[datetime] = None,
@@ -928,6 +958,7 @@ class TaskManagementService:
             id=task_id or uuid4(),
             project_id=target_project_id,
             legacy_local_task_id=legacy_local_task_id,
+            knowledge_node_id=knowledge_node_id,
             title=normalized_title,
             description=description,
             status=normalized_status,
@@ -1051,27 +1082,77 @@ class TaskManagementService:
         user_id: UUID,
         task_id: UUID,
     ) -> None:
-        task = await self._load_task(session, task_id)
+        result = await session.execute(select(Task).where(Task.id == task_id))
+        task = result.scalar_one_or_none()
+        if task is None:
+            raise TaskManagementError("Task not found", status_code=404)
         await self.require_project_permission(
             session, project_id=task.project_id, user_id=user_id, permission="write"
         )
-        now = datetime.utcnow()
-        task.deleted_at = now
-        task.updated_at = now
+
+        task_ids = await self._collect_task_tree_ids(session, task.id)
+        await self._remove_task_supertags_for_deleted_tasks(session, task_ids)
+
         await session.execute(
-            update(TaskOccurrence)
-            .where(
-                TaskOccurrence.task_id == task.id, TaskOccurrence.deleted_at.is_(None)
+            delete(NotificationDelivery).where(
+                NotificationDelivery.task_id.in_(task_ids)
             )
-            .values(deleted_at=now, updated_at=now)
+        )
+        await session.execute(delete(TimeEntry).where(TimeEntry.task_id.in_(task_ids)))
+        await session.execute(
+            delete(TaskOccurrence).where(TaskOccurrence.task_id.in_(task_ids))
         )
         await session.execute(
-            update(TimeEntry)
-            .where(TimeEntry.task_id == task.id, TimeEntry.deleted_at.is_(None))
-            .values(deleted_at=now, updated_at=now)
+            delete(TaskDependency).where(
+                or_(
+                    TaskDependency.task_id.in_(task_ids),
+                    TaskDependency.depends_on_task_id.in_(task_ids),
+                )
+            )
         )
+        await session.execute(
+            delete(TaskActivity).where(TaskActivity.task_id.in_(task_ids))
+        )
+        await session.execute(
+            delete(TaskRecurrenceRule).where(TaskRecurrenceRule.task_id.in_(task_ids))
+        )
+        await session.execute(
+            delete(TaskComment).where(TaskComment.task_id.in_(task_ids))
+        )
+        await session.execute(
+            delete(TaskAttachment).where(TaskAttachment.task_id.in_(task_ids))
+        )
+        await session.execute(delete(TaskTag).where(TaskTag.task_id.in_(task_ids)))
+        await session.execute(
+            delete(TaskAssignee).where(TaskAssignee.task_id.in_(task_ids))
+        )
+        await session.execute(delete(Task).where(Task.id.in_(task_ids)))
         await session.commit()
-        await self._broadcast("task_deleted", {"task_id": str(task_id)})
+        await self._broadcast(
+            "task_deleted",
+            {"task_id": str(task_id), "task_ids": [str(value) for value in task_ids]},
+        )
+
+    async def _remove_task_supertags_for_deleted_tasks(
+        self,
+        session: AsyncSession,
+        task_ids: list[UUID],
+    ) -> None:
+        if not task_ids:
+            return
+        linked_node_ids = select(Task.knowledge_node_id).where(
+            Task.id.in_(task_ids),
+            Task.knowledge_node_id.is_not(None),
+        )
+        task_tag_ids = select(KnowledgeSupertag.id).where(
+            KnowledgeSupertag.system_key == "task"
+        )
+        await session.execute(
+            delete(KnowledgeNodeSupertag).where(
+                KnowledgeNodeSupertag.node_id.in_(linked_node_ids),
+                KnowledgeNodeSupertag.supertag_id.in_(task_tag_ids),
+            )
+        )
 
     async def reorder_tasks(
         self,
@@ -1209,6 +1290,8 @@ class TaskManagementService:
             task.title = _normalize_task_title(str(updates["title"]))
         if "description" in updates:
             task.description = updates["description"]
+        if "knowledge_node_id" in updates:
+            task.knowledge_node_id = updates["knowledge_node_id"]
         if "status" in updates and updates["status"] is not None:
             task.status = normalize_task_status(updates["status"])
             if task.status == "closed":
@@ -1283,10 +1366,38 @@ class TaskManagementService:
                 key: str(value) for key, value in updates.items() if value is not None
             },
         )
+        if "title" in updates and task.knowledge_node_id is not None:
+            await self._sync_bound_docs_node_title(
+                session,
+                task=task,
+                user_id=user_id,
+            )
         await session.commit()
         task = await self._load_task(session, task.id)
         await self._broadcast("task_updated", task.to_dict())
         return task.to_dict()
+
+    async def _sync_bound_docs_node_title(
+        self,
+        session: AsyncSession,
+        *,
+        task: Task,
+        user_id: UUID,
+    ) -> None:
+        node = await session.get(KnowledgeNode, task.knowledge_node_id)
+        if node is None or node.archived_at is not None or node.title == task.title:
+            return
+        node.title = task.title
+        node.updated_by = user_id
+        node.updated_at = datetime.utcnow()
+
+        from .docs_graph_service import DocsGraphService
+
+        await DocsGraphService(session).record_node_change(
+            node,
+            user_id,
+            "タスクタイトルをDocs nodeへ同期",
+        )
 
     async def list_tags(
         self,

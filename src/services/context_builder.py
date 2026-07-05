@@ -7,7 +7,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from ..memory.database import get_db_session
 from ..memory.models import ConversationSession, Task
@@ -37,6 +37,43 @@ def _clip_text(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 1].rstrip() + "..."
+
+
+def _iso(value: Any) -> str:
+    return value.isoformat() if hasattr(value, "isoformat") else ""
+
+
+def _heading_outline(text: str, *, limit: int = 20) -> list[str]:
+    headings: list[str] = []
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("#"):
+            continue
+        title = stripped.lstrip("#").strip()
+        if title:
+            headings.append(title)
+        if len(headings) >= limit:
+            break
+    return headings
+
+
+def _field_value_text(value: Any) -> str:
+    if getattr(value, "target_node_id", None):
+        return f"@docs:{value.target_node_id}"
+    if getattr(value, "value_text", None):
+        return str(value.value_text)
+    if getattr(value, "value_number", None) is not None:
+        return str(value.value_number)
+    if getattr(value, "value_datetime", None) is not None:
+        return _iso(value.value_datetime)
+    raw = getattr(value, "value_json", None)
+    if raw is None:
+        return ""
+    if isinstance(raw, dict):
+        for key in ("value", "text", "label", "id"):
+            if raw.get(key) not in (None, ""):
+                return str(raw[key])
+    return str(raw)
 
 
 @dataclass
@@ -286,39 +323,30 @@ class ContextBuilder:
         self,
         *,
         project_id: str,
-        max_facts: int = 8,
-        max_documents: int = 6,
         max_record_tables: int = 6,
-        fact_content_chars: int = 220,
-        document_description_chars: int = 160,
+        max_related_nodes: int = 24,
+        max_qas: int = 10,
+        docs_node_chars: int = 8000,
     ) -> str:
         project_uuid = _coerce_uuid(project_id)
         if not project_uuid:
             return ""
 
-        from ..memory.models import ProjectDocument, ProjectFact, RecordTable
+        from ..memory.models import (
+            KnowledgeEdge,
+            KnowledgeField,
+            KnowledgeFieldValue,
+            KnowledgeNode,
+            KnowledgeNodeSupertag,
+            KnowledgeRevision,
+            KnowledgeSupertag,
+            Project,
+            ProjectQaEntry,
+            RecordTable,
+        )
 
         async with await get_db_session() as session:
-            facts_result = await session.execute(
-                select(ProjectFact)
-                .where(
-                    ProjectFact.project_id == project_uuid,
-                    ProjectFact.deleted_at.is_(None),
-                    ProjectFact.status != "archived",
-                )
-                .order_by(ProjectFact.importance.desc(), ProjectFact.updated_at.desc())
-                .limit(max(1, max_facts))
-            )
-            documents_result = await session.execute(
-                select(ProjectDocument)
-                .where(
-                    ProjectDocument.project_id == project_uuid,
-                    ProjectDocument.deleted_at.is_(None),
-                    ProjectDocument.status != "archived",
-                )
-                .order_by(ProjectDocument.is_primary.desc(), ProjectDocument.updated_at.desc())
-                .limit(max(1, max_documents))
-            )
+            project = await session.get(Project, project_uuid)
             tables_result = await session.execute(
                 select(RecordTable)
                 .where(
@@ -328,65 +356,288 @@ class ContextBuilder:
                 .order_by(RecordTable.sort_order, RecordTable.created_at)
                 .limit(max(1, max_record_tables))
             )
+            qa_result = await session.execute(
+                select(ProjectQaEntry)
+                .where(
+                    ProjectQaEntry.project_id == project_uuid,
+                    ProjectQaEntry.deleted_at.is_(None),
+                    ProjectQaEntry.status != "archived",
+                    ProjectQaEntry.review_state == "accepted",
+                )
+                .order_by(ProjectQaEntry.asked_count.desc(), ProjectQaEntry.updated_at.desc())
+                .limit(max(1, max_qas))
+            )
 
-            facts = list(facts_result.scalars().all())
-            documents = list(documents_result.scalars().all())
             tables = list(tables_result.scalars().all())
+            qa_entries = list(qa_result.scalars().all())
 
-        if not facts and not documents and not tables:
+            canonical_node: Any = None
+            if project and project.knowledge_node_id:
+                candidate = await session.get(KnowledgeNode, project.knowledge_node_id)
+                if candidate and candidate.project_id == project_uuid and not candidate.archived_at:
+                    canonical_node = candidate
+
+            if canonical_node is None:
+                canonical_result = await session.execute(
+                    select(KnowledgeNode)
+                    .join(
+                        KnowledgeNodeSupertag,
+                        KnowledgeNodeSupertag.node_id == KnowledgeNode.id,
+                    )
+                    .join(
+                        KnowledgeSupertag,
+                        KnowledgeNodeSupertag.supertag_id == KnowledgeSupertag.id,
+                    )
+                    .where(
+                        KnowledgeNode.project_id == project_uuid,
+                        KnowledgeNode.archived_at.is_(None),
+                        KnowledgeSupertag.base_type == "project_information",
+                    )
+                    .order_by(KnowledgeNode.updated_at.desc())
+                    .limit(1)
+                )
+                canonical_node = canonical_result.scalar_one_or_none()
+
+            related_result = await session.execute(
+                select(KnowledgeNode)
+                .where(
+                    KnowledgeNode.project_id == project_uuid,
+                    KnowledgeNode.archived_at.is_(None),
+                )
+                .order_by(KnowledgeNode.updated_at.desc())
+                .limit(max(1, max_related_nodes + 1))
+            )
+            docs_nodes = list(related_result.scalars().all())
+            if canonical_node and all(node.id != canonical_node.id for node in docs_nodes):
+                docs_nodes.insert(0, canonical_node)
+
+            child_nodes: list[Any] = []
+            if canonical_node:
+                child_result = await session.execute(
+                    select(KnowledgeNode)
+                    .where(
+                        KnowledgeNode.archived_at.is_(None),
+                        or_(
+                            KnowledgeNode.parent_id == canonical_node.id,
+                            KnowledgeNode.root_page_id == canonical_node.id,
+                        ),
+                    )
+                    .order_by(KnowledgeNode.sort_order, KnowledgeNode.created_at)
+                    .limit(120)
+                )
+                child_nodes = list(child_result.scalars().all())
+
+            all_context_nodes = docs_nodes + [
+                node for node in child_nodes if all(existing.id != node.id for existing in docs_nodes)
+            ]
+            docs_tags_by_node: dict[uuid.UUID, list[dict[str, str]]] = {}
+            ai_instructions: dict[str, tuple[str, str, str]] = {}
+            fields_by_tag: dict[uuid.UUID, list[KnowledgeField]] = {}
+            field_values_by_node: dict[uuid.UUID, list[tuple[str, str]]] = {}
+            edges: list[Any] = []
+            revisions: list[Any] = []
+            canonical_outline_lines: list[str] = []
+            if docs_nodes:
+                node_ids = [node.id for node in all_context_nodes]
+                tag_rows = await session.execute(
+                    select(
+                        KnowledgeNodeSupertag.node_id,
+                        KnowledgeSupertag.id,
+                        KnowledgeSupertag.name,
+                        KnowledgeSupertag.base_type,
+                        KnowledgeSupertag.ai_instructions,
+                    )
+                    .join(
+                        KnowledgeSupertag,
+                        KnowledgeNodeSupertag.supertag_id == KnowledgeSupertag.id,
+                    )
+                    .where(KnowledgeNodeSupertag.node_id.in_(node_ids))
+                )
+                tag_ids: set[uuid.UUID] = set()
+                for node_id, tag_id, tag_name, base_type, instructions in tag_rows.all():
+                    tag_ids.add(tag_id)
+                    docs_tags_by_node.setdefault(node_id, []).append(
+                        {
+                            "id": str(tag_id),
+                            "name": tag_name,
+                            "base_type": base_type or "note",
+                        }
+                    )
+                    if instructions:
+                        ai_instructions[tag_name] = (
+                            base_type or "note",
+                            str(tag_id),
+                            instructions.strip(),
+                        )
+
+                if tag_ids:
+                    fields_result = await session.execute(
+                        select(KnowledgeField)
+                        .where(KnowledgeField.supertag_id.in_(tag_ids))
+                        .order_by(KnowledgeField.sort_order, KnowledgeField.created_at)
+                    )
+                    for field in fields_result.scalars().all():
+                        fields_by_tag.setdefault(field.supertag_id, []).append(field)
+
+                values_result = await session.execute(
+                    select(KnowledgeFieldValue, KnowledgeField)
+                    .join(KnowledgeField, KnowledgeFieldValue.field_id == KnowledgeField.id)
+                    .where(KnowledgeFieldValue.node_id.in_(node_ids))
+                    .order_by(KnowledgeField.sort_order, KnowledgeField.created_at)
+                )
+                for value, field in values_result.all():
+                    rendered = _field_value_text(value)
+                    if rendered:
+                        field_values_by_node.setdefault(value.node_id, []).append(
+                            (field.name, rendered)
+                        )
+
+                edge_result = await session.execute(
+                    select(KnowledgeEdge).where(
+                        or_(
+                            KnowledgeEdge.source_node_id.in_(node_ids),
+                            KnowledgeEdge.target_node_id.in_(node_ids),
+                        )
+                    ).limit(60)
+                )
+                edges = list(edge_result.scalars().all())
+
+                if canonical_node:
+                    try:
+                        from .docs_graph_service import DocsGraphService
+
+                        canonical_outline_lines = await DocsGraphService(
+                            session
+                        ).outline_lines(root=canonical_node, depth=4)
+                    except Exception as exc:
+                        logger.warning(
+                            "[ContextBuilder] project Docs outline failed: %s",
+                            exc,
+                        )
+
+                    revision_result = await session.execute(
+                        select(KnowledgeRevision)
+                        .where(KnowledgeRevision.node_id == canonical_node.id)
+                        .order_by(KnowledgeRevision.created_at.desc())
+                        .limit(5)
+                    )
+                    revisions = list(revision_result.scalars().all())
+
+        if not tables and not docs_nodes and not qa_entries:
             return ""
 
+        node_title_by_id = {
+            node.id: (node.title or "(untitled)").strip()
+            for node in all_context_nodes
+        }
         lines = [
-            "## Project Information DB Snapshot",
+            "## Project Information Docs Source of Truth",
             (
-                "Saved project facts/documents/tables only. Use this as grounded "
-                "case context and do not infer missing details."
+                "Use this canonical project Docs context as grounded evidence. Read it before "
+                "writing; preserve headings/blocks; update with revision change_summary and "
+                "source_refs; route unsupported claims to 要確認 or candidate Q&A."
             ),
         ]
-        if facts:
-            lines.append("- Facts:")
-            for fact in facts:
-                title = (fact.title or "(untitled)").strip()
-                content = _clip_text((fact.content or "").strip(), fact_content_chars)
-                meta = f"type={fact.fact_type}, importance={fact.importance}"
-                if fact.confidence is not None:
-                    meta += f", confidence={fact.confidence:g}"
-                lines.append(f"  - {title}: {content} ({meta})")
+        if project:
+            lines.append(
+                f"- Project: {project.name} (id={project.id}, slug={project.slug})"
+            )
 
-        if documents:
-            lines.append("- Documents:")
-            for document in documents:
-                title = (document.title or "(untitled)").strip()
-                target = (
-                    document.file_path
-                    or document.external_url
-                    or (
-                        f"record_table:{document.record_table_id}"
-                        if document.record_table_id
-                        else ""
+        if canonical_node:
+            tags = docs_tags_by_node.get(canonical_node.id, [])
+            tag_text = ", ".join(f"#{tag['name']}:{tag['base_type']}" for tag in tags)
+            lines.append(
+                f"- Canonical Page: {canonical_node.title} (ref=@docs:{canonical_node.id}, updated={_iso(canonical_node.updated_at)})"
+            )
+            if tag_text:
+                lines.append(f"- Canonical Tags: {tag_text}")
+            headings = _heading_outline(canonical_node.body_text or "")
+            if headings:
+                lines.append("- Section Outline: " + " > ".join(headings))
+            canonical_fields = field_values_by_node.get(canonical_node.id, [])
+            if canonical_fields:
+                lines.append("- Canonical Fields:")
+                for name, rendered in canonical_fields[:20]:
+                    lines.append(f"  - {name}: {_clip_text(rendered, 240)}")
+            if canonical_outline_lines:
+                lines.append("### Canonical Outline")
+                lines.append(_clip_text("\n".join(canonical_outline_lines), docs_node_chars))
+            if (canonical_node.body_text or "").strip():
+                lines.append("### Canonical Body")
+                lines.append(_clip_text((canonical_node.body_text or "").strip(), docs_node_chars))
+
+        typed_nodes = [
+            node
+            for node in all_context_nodes
+            if not canonical_node or node.id != canonical_node.id
+        ][:max_related_nodes]
+        if typed_nodes:
+            lines.append("### Related Typed Docs Nodes")
+            for node in typed_nodes:
+                tags = docs_tags_by_node.get(node.id, [])
+                tag_text = ", ".join(f"#{tag['name']}:{tag['base_type']}" for tag in tags[:5])
+                meta = [f"ref=@docs:{node.id}"]
+                if tag_text:
+                    meta.append(f"tags={tag_text}")
+                lines.append(f"- {node.title or '(untitled)'} ({', '.join(meta)})")
+                fields = field_values_by_node.get(node.id, [])
+                if fields:
+                    field_text = "; ".join(
+                        f"{name}={_clip_text(rendered, 80)}"
+                        for name, rendered in fields[:8]
                     )
-                    or "metadata_only"
+                    lines.append(f"  fields: {field_text}")
+                body = _clip_text((node.body_text or "").strip(), 320)
+                if body:
+                    lines.append(f"  body: {body}")
+
+        if ai_instructions:
+            lines.append("### Supertag AI Instructions")
+            for tag_name, (base_type, tag_id, instructions) in sorted(ai_instructions.items()):
+                field_names = [
+                    field.name
+                    for field in fields_by_tag.get(uuid.UUID(tag_id), [])[:8]
+                ]
+                suffix = f" fields={', '.join(field_names)}" if field_names else ""
+                lines.append(
+                    f"- #{tag_name} ({base_type},{suffix}): {_clip_text(instructions, 420)}"
                 )
-                description = _clip_text(
-                    (document.description or "").strip(),
-                    document_description_chars,
-                )
-                detail = (
-                    f"{document.document_type}, {document.role}, "
-                    f"target={target}"
-                )
-                if document.is_primary:
-                    detail = f"primary, {detail}"
-                line = f"  - {title} ({detail})"
-                if description:
-                    line += f": {description}"
+
+        if qa_entries:
+            lines.append("### Accepted Project Q&A")
+            for entry in qa_entries:
+                question = _clip_text((entry.question or "").strip(), 180)
+                answer = _clip_text((entry.answer or "").strip(), 220)
+                meta = f"status={entry.status}, review={entry.review_state}"
+                line = f"- Q: {question} ({meta}, asked={entry.asked_count})"
+                if answer:
+                    line += f" / A: {answer}"
                 lines.append(line)
 
+        if edges:
+            lines.append("### Docs References")
+            for edge in edges[:24]:
+                source = node_title_by_id.get(edge.source_node_id, str(edge.source_node_id))
+                target = node_title_by_id.get(edge.target_node_id, str(edge.target_node_id))
+                lines.append(
+                    f"- {source} -> {target} ({edge.relation_type}, confidence={edge.confidence})"
+                )
+
+        if revisions:
+            lines.append("### Canonical Revision Meta")
+            for revision in revisions:
+                refs = revision.source_refs_json or []
+                ref_note = f", source_refs={len(refs)}" if refs else ""
+                lines.append(
+                    f"- {revision.created_at.isoformat() if revision.created_at else ''}: "
+                    f"{_clip_text(revision.change_summary or '', 180)}{ref_note}"
+                )
+
         if tables:
-            lines.append("- Record Tables:")
+            lines.append("### Record Tables")
             for table in tables:
                 description = _clip_text((table.description or "").strip(), 140)
-                line = f"  - {table.name}.dbtable"
+                line = f"- {table.name}.dbtable"
                 if description:
                     line += f": {description}"
                 lines.append(line)

@@ -63,6 +63,7 @@ import {
   chatTimelineReducer,
   initialChatTimelineState,
 } from "@/lib/chat-state";
+import { getWebSocketMessageAgentRunId } from "@/lib/chat-websocket-events";
 import {
   AlertCircle,
   FolderOpen,
@@ -682,6 +683,7 @@ function ChatPageInner() {
     lastMessage,
     isStreaming,
     activeTool,
+    activityMessage,
     activeAgentRunId,
     streamBuffer,
     sendMessage,
@@ -2074,18 +2076,24 @@ function ChatPageInner() {
         setSteeringInstructions([]);
         const content = (data.message as string) || "";
         if (content && activeSessionId) {
+          const agentRunId =
+            getWebSocketMessageAgentRunId(lastMessage) ?? pendingAgentRunId;
+          const metadata: ConversationMessage["metadata"] = {
+            character: data.character,
+            ...(typeof data.session_id === "string" && data.session_id
+              ? {}
+              : { transient_source: "unscoped_ws_new_message" }),
+          };
+          if (agentRunId) {
+            metadata.agent_run_id = agentRunId;
+          }
           dispatchChatTimeline({
             type: "append",
             message: createLocalMessage(
               activeSessionId,
               "assistant",
               content,
-              {
-                character: data.character,
-                ...(typeof data.session_id === "string" && data.session_id
-                  ? {}
-                  : { transient_source: "unscoped_ws_new_message" }),
-              },
+              metadata,
             ),
           });
           void refreshPersistedMessages(activeSessionId);
@@ -2223,13 +2231,22 @@ function ChatPageInner() {
         (lastMessage.content as string) || streamBuffer.current;
       if (finalContent && activeSessionId) {
         const toolResults = liveToolResultsRef.current;
+        const streamEndAgentRunId =
+          getWebSocketMessageAgentRunId(lastMessage) ?? pendingAgentRunId;
+        const assistantMetadata: ConversationMessage["metadata"] = {};
+        if (toolResults.length > 0) {
+          assistantMetadata.tool_results = toolResults;
+        }
+        if (streamEndAgentRunId) {
+          assistantMetadata.agent_run_id = streamEndAgentRunId;
+        }
         dispatchChatTimeline({
           type: "append",
           message: createLocalMessage(
             activeSessionId,
             "assistant",
             finalContent,
-            toolResults.length > 0 ? { tool_results: toolResults } : {},
+            assistantMetadata,
           ),
         });
       }
@@ -2253,6 +2270,7 @@ function ChatPageInner() {
     currentSession,
     maybeGenerateLoadedSessionTitle,
     clearWaitingResponse,
+    pendingAgentRunId,
   ]);
 
   // クリーンアップ
@@ -2353,6 +2371,7 @@ function ChatPageInner() {
             streamingContent={streamingContent}
             liveToolResults={liveToolResults}
             activeTool={displayActiveTool}
+            activityMessage={activityMessage}
             activeAgentRunId={displayAgentRunId}
             onEditMessage={handleEditMessage}
             onRerunMessage={handleRerunMessage}

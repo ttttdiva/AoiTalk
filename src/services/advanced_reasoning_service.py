@@ -63,12 +63,12 @@ def advanced_reasoning_enabled(config: Any) -> bool:
 
 
 def advanced_reasoning_provider(config: Any) -> str:
-    member = agent_team_member_settings(config, ADVANCED_REASONING_MEMBER_KEY)
+    member = agent_team_member_for(config, ADVANCED_REASONING_MEMBER_KEY) or agent_team_member_settings(config, ADVANCED_REASONING_MEMBER_KEY)
     return str(member.get("provider") or "openai").strip().lower()
 
 
 def advanced_reasoning_model(config: Any) -> str:
-    member = agent_team_member_settings(config, ADVANCED_REASONING_MEMBER_KEY)
+    member = agent_team_member_for(config, ADVANCED_REASONING_MEMBER_KEY) or agent_team_member_settings(config, ADVANCED_REASONING_MEMBER_KEY)
     return str(member.get("model") or "gpt-4o").strip()
 
 

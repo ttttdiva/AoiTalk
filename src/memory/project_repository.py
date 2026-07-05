@@ -15,8 +15,7 @@ from .models import (
     ConversationSession, LocalTask, Task, TaskAssignee, TaskComment, TaskActivity,
     TaskDependency, TaskRecurrenceRule, TaskOccurrence, TimeEntry,
     ProjectNotificationSetting, NotificationDelivery, KnowledgeSourcePermission,
-    KnowledgeSource, ProjectContextPack, ContextMemory, ProjectInfoCategory,
-    ProjectDocument, ProjectFact, ProjectInfoSyncState, RecordAttachment,
+    KnowledgeSource, ProjectContextPack, ContextMemory, RecordAttachment,
     RecordEvent, RecordField, RecordRow, RecordTable, RecordView,
 )
 
@@ -445,7 +444,7 @@ class ProjectRepository:
         """Delete a project from the active app surface.
 
         Sync 対象の `projects` / `tasks` / `task_occurrences` / `time_entries`
-        は `deleted_at` tombstone を付与する。案件情報、台帳補助データ、
+        は `deleted_at` tombstone を付与する。台帳補助データ、
         メンバー、ナレッジ、コンテキストなどの非sync補助データは物理削除し、
         会話セッションは project_id を NULL にして保持する。
         """
@@ -514,10 +513,6 @@ class ProjectRepository:
             await session.execute(delete(RecordView).where(RecordView.table_id.in_(record_table_ids)))
         await session.execute(delete(RecordEvent).where(RecordEvent.project_id == project_id))
 
-        await session.execute(delete(ProjectFact).where(ProjectFact.project_id == project_id))
-        await session.execute(delete(ProjectDocument).where(ProjectDocument.project_id == project_id))
-        await session.execute(delete(ProjectInfoSyncState).where(ProjectInfoSyncState.project_id == project_id))
-        await session.execute(delete(ProjectInfoCategory).where(ProjectInfoCategory.project_id == project_id))
         await session.execute(delete(ProjectContextPack).where(ProjectContextPack.project_id == project_id))
         await session.execute(delete(ContextMemory).where(ContextMemory.project_id == project_id))
         await session.execute(delete(NotificationDelivery).where(NotificationDelivery.project_id == project_id))

@@ -5,10 +5,12 @@ import {
   text,
   boolean,
   timestamp,
+  date,
   json,
   integer,
   doublePrecision,
   primaryKey,
+  unique,
   type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { DEFAULT_TASK_TIMEZONE } from "../lib/task-time";
@@ -64,6 +66,10 @@ export const projects = pgTable("projects", {
     .references(() => users.id)
     .notNull(),
   spaceId: uuid("space_id").references(() => spaces.id),
+  knowledgeNodeId: uuid("knowledge_node_id").references(
+    (): AnyPgColumn => knowledgeNodes.id,
+    { onDelete: "restrict" },
+  ),
   allowJoinRequests: boolean("allow_join_requests"),
   storageQuotaMb: integer("storage_quota_mb"),
   storageUsedMb: doublePrecision("storage_used_mb"),
@@ -91,96 +97,39 @@ export const projectMembers = pgTable("project_members", {
   invitedBy: uuid("invited_by"),
 });
 
-export const projectInfoCategories = pgTable("project_info_categories", {
+export const projectQaEntries = pgTable("project_qa_entries", {
   id: uuid("id")
     .primaryKey()
     .$defaultFn(() => crypto.randomUUID()),
   projectId: uuid("project_id")
     .references(() => projects.id, { onDelete: "cascade" })
     .notNull(),
-  key: varchar("category_key", { length: 120 }).notNull(),
-  label: varchar("label", { length: 200 }).notNull(),
-  description: text("description"),
-  status: varchar("status", { length: 32 }).default("active"),
-  source: varchar("source", { length: 32 }).default("template"),
-  sortOrder: doublePrecision("sort_order").default(0),
-  createdBy: uuid("created_by").references(() => users.id),
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
-});
-
-export const projectDocuments = pgTable("project_documents", {
-  id: uuid("id")
-    .primaryKey()
-    .$defaultFn(() => crypto.randomUUID()),
-  projectId: uuid("project_id")
-    .references(() => projects.id, { onDelete: "cascade" })
-    .notNull(),
-  categoryId: uuid("category_id").references(() => projectInfoCategories.id, {
-    onDelete: "set null",
-  }),
-  title: varchar("title", { length: 255 }).notNull(),
-  description: text("description"),
-  documentType: varchar("document_type", { length: 64 }).default("document"),
-  targetKind: varchar("target_kind", { length: 32 }).default("file"),
-  filePath: text("file_path"),
-  recordTableId: uuid("record_table_id"),
-  externalUrl: text("external_url"),
-  role: varchar("role", { length: 64 }).default("reference"),
-  isPrimary: boolean("is_primary").default(false),
-  aiAccessLevel: varchar("ai_access_level", { length: 32 }).default("metadata"),
-  status: varchar("status", { length: 32 }).default("active"),
-  notes: text("notes"),
-  sourceType: varchar("source_type", { length: 32 }).default("manual"),
-  sourceRef: text("source_ref"),
-  createdBy: uuid("created_by").references(() => users.id),
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
-  deletedAt: timestamp("deleted_at"),
-});
-
-export const projectFacts = pgTable("project_facts", {
-  id: uuid("id")
-    .primaryKey()
-    .$defaultFn(() => crypto.randomUUID()),
-  projectId: uuid("project_id")
-    .references(() => projects.id, { onDelete: "cascade" })
-    .notNull(),
-  categoryId: uuid("category_id").references(() => projectInfoCategories.id, {
-    onDelete: "set null",
-  }),
-  sourceDocumentId: uuid("source_document_id").references(() => projectDocuments.id, {
-    onDelete: "set null",
-  }),
-  sourceTaskId: uuid("source_task_id"),
-  title: varchar("title", { length: 255 }).notNull(),
-  content: text("content").notNull(),
-  factType: varchar("fact_type", { length: 64 }).default("fact"),
+  knowledgeNodeId: uuid("knowledge_node_id").references(
+    (): AnyPgColumn => knowledgeNodes.id,
+    { onDelete: "set null" },
+  ),
+  question: text("question").notNull(),
+  answer: text("answer"),
+  normalizedQuestionHash: varchar("normalized_question_hash", { length: 128 }),
+  status: varchar("status", { length: 32 }).default("unanswered"),
+  reviewState: varchar("review_state", { length: 32 }).default("candidate"),
   confidence: doublePrecision("confidence").default(1),
-  importance: integer("importance").default(5),
-  status: varchar("status", { length: 32 }).default("active"),
-  sourceType: varchar("source_type", { length: 32 }).default("manual"),
-  sourceRef: text("source_ref"),
+  askedCount: integer("asked_count").default(1),
+  sourceSessionId: uuid("source_session_id").references(
+    (): AnyPgColumn => conversationSessions.id,
+    { onDelete: "set null" },
+  ),
+  sourceMessageIds: json("source_message_ids").default([]),
+  sourceAgentRunIds: json("source_agent_run_ids").default([]),
+  sourceToolCallIds: json("source_tool_call_ids").default([]),
+  answerSourceRefs: json("answer_source_refs").default([]),
   createdBy: uuid("created_by").references(() => users.id),
+  updatedBy: uuid("updated_by").references(() => users.id),
+  createdByAgent: boolean("created_by_agent").default(false),
   createdAt: timestamp("created_at").defaultNow(),
   updatedAt: timestamp("updated_at").defaultNow(),
+  lastAskedAt: timestamp("last_asked_at").defaultNow(),
   deletedAt: timestamp("deleted_at"),
-});
-
-export const projectInfoSyncStates = pgTable("project_info_sync_states", {
-  id: uuid("id")
-    .primaryKey()
-    .$defaultFn(() => crypto.randomUUID()),
-  projectId: uuid("project_id")
-    .references(() => projects.id, { onDelete: "cascade" })
-    .notNull(),
-  sourceType: varchar("source_type", { length: 64 }).default("tasks"),
-  lastSyncedAt: timestamp("last_synced_at"),
-  lastSeenUpdatedAt: timestamp("last_seen_updated_at"),
-  cursor: json("cursor"),
-  syncMetadata: json("sync_metadata"),
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
 });
 
 export const recordTables = pgTable("record_tables", {
@@ -308,6 +257,10 @@ export const tasks = pgTable("tasks", {
     .references(() => projects.id)
     .notNull(),
   legacyLocalTaskId: uuid("legacy_local_task_id"),
+  knowledgeNodeId: uuid("knowledge_node_id").references(
+    (): AnyPgColumn => knowledgeNodes.id,
+    { onDelete: "set null" },
+  ).unique(),
   title: varchar("title").notNull(),
   description: text("description"),
   status: varchar("status").default("todo"),
@@ -737,6 +690,323 @@ export const knowledgeEditEvents = pgTable("knowledge_edit_events", {
   postHash: varchar("post_hash", { length: 64 }),
   createdAt: timestamp("created_at").defaultNow(),
   appliedAt: timestamp("applied_at"),
+});
+
+// ─── DB正本 Docs ───
+
+export const knowledgeWorkspaces = pgTable("knowledge_workspaces", {
+  id: uuid("id")
+    .primaryKey()
+    .$defaultFn(() => crypto.randomUUID()),
+  name: varchar("name", { length: 200 }).notNull(),
+  description: text("description"),
+  ownerUserId: uuid("owner_user_id").references(() => users.id, {
+    onDelete: "set null",
+  }),
+  settingsJson: json("settings_json").default({}),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+}, (table) => [
+  unique("uq_knowledge_workspaces_owner_user").on(table.ownerUserId),
+]);
+
+export const knowledgeNodes = pgTable("knowledge_nodes", {
+  id: uuid("id")
+    .primaryKey()
+    .$defaultFn(() => crypto.randomUUID()),
+  workspaceId: uuid("workspace_id")
+    .references(() => knowledgeWorkspaces.id, { onDelete: "cascade" })
+    .notNull(),
+  parentId: uuid("parent_id").references((): AnyPgColumn => knowledgeNodes.id, {
+    onDelete: "cascade",
+  }),
+  rootPageId: uuid("root_page_id").references(
+    (): AnyPgColumn => knowledgeNodes.id,
+    { onDelete: "set null" },
+  ),
+  projectId: uuid("project_id").references(() => projects.id, {
+    onDelete: "set null",
+  }),
+  title: varchar("title", { length: 500 }).notNull(),
+  description: text("description").default(""),
+  bodyJson: json("body_json").default({}),
+  bodyText: text("body_text").default(""),
+  nodeType: varchar("node_type", { length: 40 }).default("node"),
+  displayProps: json("display_props").default({}),
+  queryJson: json("query_json"),
+  viewJson: json("view_json").default({}),
+  dayDate: date("day_date"),
+  sortOrder: doublePrecision("sort_order").default(0),
+  createdBy: uuid("created_by").references(() => users.id),
+  updatedBy: uuid("updated_by").references(() => users.id),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+  archivedAt: timestamp("archived_at"),
+});
+
+export const knowledgeSupertags = pgTable("knowledge_supertags", {
+  id: uuid("id")
+    .primaryKey()
+    .$defaultFn(() => crypto.randomUUID()),
+  workspaceId: uuid("workspace_id")
+    .references(() => knowledgeWorkspaces.id, { onDelete: "cascade" })
+    .notNull(),
+  parentSupertagId: uuid("parent_supertag_id").references(
+    (): AnyPgColumn => knowledgeSupertags.id,
+    { onDelete: "set null" },
+  ),
+  systemKey: text("system_key"),
+  name: varchar("name", { length: 120 }).notNull(),
+  baseType: varchar("base_type", { length: 40 }).default("note"),
+  description: text("description"),
+  icon: varchar("icon", { length: 64 }),
+  color: varchar("color", { length: 32 }),
+  templateJson: json("template_json").default({}),
+  pinnedFieldIds: json("pinned_field_ids").default([]),
+  configJson: json("config_json").default({}),
+  titleTemplate: text("title_template"),
+  aiInstructions: text("ai_instructions"),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+}, (table) => [
+  unique("uq_knowledge_supertags_workspace_system_key").on(table.workspaceId, table.systemKey),
+]);
+
+export const knowledgeNodeSupertags = pgTable(
+  "knowledge_node_supertags",
+  {
+    nodeId: uuid("node_id")
+      .references(() => knowledgeNodes.id, { onDelete: "cascade" })
+      .notNull(),
+    supertagId: uuid("supertag_id")
+      .references(() => knowledgeSupertags.id, { onDelete: "cascade" })
+      .notNull(),
+    createdAt: timestamp("created_at").defaultNow(),
+    createdBy: uuid("created_by").references(() => users.id),
+  },
+  (table) => [primaryKey({ columns: [table.nodeId, table.supertagId] })],
+);
+
+export const knowledgeFields = pgTable("knowledge_fields", {
+  id: uuid("id")
+    .primaryKey()
+    .$defaultFn(() => crypto.randomUUID()),
+  workspaceId: uuid("workspace_id")
+    .references(() => knowledgeWorkspaces.id, { onDelete: "cascade" })
+    .notNull(),
+  supertagId: uuid("supertag_id")
+    .references(() => knowledgeSupertags.id, { onDelete: "cascade" })
+    .notNull(),
+  systemKey: text("system_key"),
+  name: varchar("name", { length: 120 }).notNull(),
+  fieldType: varchar("field_type", { length: 40 }).default("text"),
+  required: boolean("required").default(false),
+  optionsJson: json("options_json").default({}),
+  defaultValueJson: json("default_value_json"),
+  sortOrder: doublePrecision("sort_order").default(0),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+
+export const knowledgeFieldValues = pgTable(
+  "knowledge_field_values",
+  {
+    nodeId: uuid("node_id")
+      .references(() => knowledgeNodes.id, { onDelete: "cascade" })
+      .notNull(),
+    fieldId: uuid("field_id")
+      .references(() => knowledgeFields.id, { onDelete: "cascade" })
+      .notNull(),
+    valueJson: json("value_json"),
+    valueText: text("value_text"),
+    valueNumber: doublePrecision("value_number"),
+    valueDatetime: timestamp("value_datetime"),
+    targetNodeId: uuid("target_node_id").references(
+      (): AnyPgColumn => knowledgeNodes.id,
+      { onDelete: "set null" },
+    ),
+    updatedAt: timestamp("updated_at").defaultNow(),
+    updatedBy: uuid("updated_by").references(() => users.id),
+  },
+  (table) => [primaryKey({ columns: [table.nodeId, table.fieldId] })],
+);
+
+export const knowledgeEdges = pgTable("knowledge_edges", {
+  id: uuid("id")
+    .primaryKey()
+    .$defaultFn(() => crypto.randomUUID()),
+  sourceNodeId: uuid("source_node_id")
+    .references(() => knowledgeNodes.id, { onDelete: "cascade" })
+    .notNull(),
+  targetNodeId: uuid("target_node_id")
+    .references(() => knowledgeNodes.id, { onDelete: "cascade" })
+    .notNull(),
+  relationType: varchar("relation_type", { length: 80 }).default("related_to"),
+  confidence: doublePrecision("confidence").default(1),
+  createdBy: uuid("created_by").references(() => users.id),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export const knowledgeSearchIndex = pgTable("knowledge_search_index", {
+  nodeId: uuid("node_id")
+    .primaryKey()
+    .references(() => knowledgeNodes.id, { onDelete: "cascade" }),
+  workspaceId: uuid("workspace_id")
+    .references(() => knowledgeWorkspaces.id, { onDelete: "cascade" })
+    .notNull(),
+  projectId: uuid("project_id").references(() => projects.id, {
+    onDelete: "set null",
+  }),
+  titleText: text("title_text").default("").notNull(),
+  bodyTextPlain: text("body_text_plain").default("").notNull(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+
+export const knowledgeSupertagFields = pgTable(
+  "knowledge_supertag_fields",
+  {
+    supertagId: uuid("supertag_id")
+      .references(() => knowledgeSupertags.id, { onDelete: "cascade" })
+      .notNull(),
+    fieldId: uuid("field_id")
+      .references(() => knowledgeFields.id, { onDelete: "cascade" })
+      .notNull(),
+    sortOrder: doublePrecision("sort_order").default(0),
+    required: boolean("required").default(false),
+    showInTemplate: boolean("show_in_template").default(true),
+    optional: boolean("optional").default(false),
+    createdAt: timestamp("created_at").defaultNow(),
+  },
+  (table) => [primaryKey({ columns: [table.supertagId, table.fieldId] })],
+);
+
+export const knowledgeNodePlacements = pgTable(
+  "knowledge_node_placements",
+  {
+    id: uuid("id")
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+    nodeId: uuid("node_id")
+      .references(() => knowledgeNodes.id, { onDelete: "cascade" })
+      .notNull(),
+    parentNodeId: uuid("parent_node_id")
+      .references((): AnyPgColumn => knowledgeNodes.id, { onDelete: "cascade" })
+      .notNull(),
+    sortOrder: doublePrecision("sort_order").default(0),
+    collapsed: boolean("collapsed").default(false),
+    createdBy: uuid("created_by").references(() => users.id),
+    createdAt: timestamp("created_at").defaultNow(),
+  },
+  (table) => [unique("uq_knowledge_node_placement_parent").on(table.nodeId, table.parentNodeId)],
+);
+
+export const knowledgeSavedViews = pgTable("knowledge_saved_views", {
+  id: uuid("id")
+    .primaryKey()
+    .$defaultFn(() => crypto.randomUUID()),
+  workspaceId: uuid("workspace_id")
+    .references(() => knowledgeWorkspaces.id, { onDelete: "cascade" })
+    .notNull(),
+  supertagId: uuid("supertag_id").references(() => knowledgeSupertags.id, {
+    onDelete: "set null",
+  }),
+  name: varchar("name", { length: 200 }).notNull(),
+  layout: varchar("layout", { length: 40 }).default("table"),
+  configJson: json("config_json").default({}),
+  sortOrder: doublePrecision("sort_order").default(0),
+  createdBy: uuid("created_by").references(() => users.id),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+
+export const knowledgeRevisions = pgTable("knowledge_revisions", {
+  id: uuid("id")
+    .primaryKey()
+    .$defaultFn(() => crypto.randomUUID()),
+  nodeId: uuid("node_id")
+    .references(() => knowledgeNodes.id, { onDelete: "cascade" })
+    .notNull(),
+  title: varchar("title", { length: 500 }).notNull(),
+  bodyJson: json("body_json").default({}),
+  bodyText: text("body_text").default(""),
+  changeSummary: text("change_summary"),
+  sourceRefsJson: json("source_refs_json").default([]),
+  createdBy: uuid("created_by").references(() => users.id),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export const knowledgeAiSuggestions = pgTable("knowledge_ai_suggestions", {
+  id: uuid("id")
+    .primaryKey()
+    .$defaultFn(() => crypto.randomUUID()),
+  workspaceId: uuid("workspace_id")
+    .references(() => knowledgeWorkspaces.id, { onDelete: "cascade" })
+    .notNull(),
+  nodeId: uuid("node_id").references(() => knowledgeNodes.id, {
+    onDelete: "cascade",
+  }),
+  suggestionType: varchar("suggestion_type", { length: 80 }).notNull(),
+  payloadJson: json("payload_json").default({}),
+  status: varchar("status", { length: 20 }).default("proposed"),
+  confidence: doublePrecision("confidence"),
+  createdBy: uuid("created_by").references(() => users.id),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+
+export const knowledgeAttachments = pgTable("knowledge_attachments", {
+  id: uuid("id")
+    .primaryKey()
+    .$defaultFn(() => crypto.randomUUID()),
+  nodeId: uuid("node_id")
+    .references(() => knowledgeNodes.id, { onDelete: "cascade" })
+    .notNull(),
+  fileName: varchar("file_name", { length: 255 }).notNull(),
+  filePath: text("file_path").notNull(),
+  mimeType: varchar("mime_type", { length: 120 }),
+  sizeBytes: integer("size_bytes"),
+  attachmentMetadata: json("attachment_metadata").default({}),
+  createdBy: uuid("created_by").references(() => users.id),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export const knowledgeImportJobs = pgTable("knowledge_import_jobs", {
+  id: uuid("id")
+    .primaryKey()
+    .$defaultFn(() => crypto.randomUUID()),
+  workspaceId: uuid("workspace_id")
+    .references(() => knowledgeWorkspaces.id, { onDelete: "cascade" })
+    .notNull(),
+  projectId: uuid("project_id").references(() => projects.id, {
+    onDelete: "set null",
+  }),
+  sourceType: varchar("source_type", { length: 40 }).notNull(),
+  sourceName: text("source_name").notNull(),
+  status: varchar("status", { length: 20 }).default("proposed"),
+  optionsJson: json("options_json").default({}),
+  summaryJson: json("summary_json").default({}),
+  createdBy: uuid("created_by").references(() => users.id),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+
+export const knowledgeImportItems = pgTable("knowledge_import_items", {
+  id: uuid("id")
+    .primaryKey()
+    .$defaultFn(() => crypto.randomUUID()),
+  jobId: uuid("job_id")
+    .references(() => knowledgeImportJobs.id, { onDelete: "cascade" })
+    .notNull(),
+  nodeId: uuid("node_id").references(() => knowledgeNodes.id, {
+    onDelete: "set null",
+  }),
+  sourceRef: text("source_ref").notNull(),
+  title: varchar("title", { length: 500 }).notNull(),
+  itemType: varchar("item_type", { length: 40 }).default("page"),
+  status: varchar("status", { length: 20 }).default("proposed"),
+  previewJson: json("preview_json").default({}),
+  errorMessage: text("error_message"),
+  createdAt: timestamp("created_at").defaultNow(),
 });
 
 // ─── ログイン履歴 ───

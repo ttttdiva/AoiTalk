@@ -93,7 +93,7 @@ class AntigravityCLIBackend(CLIBackendBase):
         self,
         prompt: str,
         cwd: Optional[Path] = None,
-        timeout: int = 300,
+        timeout: Optional[int] = None,
         extra_args: Optional[List[str]] = None,
         system_context: Optional[str] = None,
         event_callback: Optional[CLIEventCallback] = None,
@@ -116,7 +116,7 @@ class AntigravityCLIBackend(CLIBackendBase):
         execution_cwd, add_dirs = self._execution_workspace(cwd)
         started_at = time.time()
         self._active_print_timeout = os.getenv("AGY_PRINT_TIMEOUT") or (
-            f"{max(int(timeout) - 2, 1)}s"
+            f"{max(int(timeout) - 2, 1)}s" if timeout is not None else None
         )
         self._active_add_dirs = add_dirs
         try:

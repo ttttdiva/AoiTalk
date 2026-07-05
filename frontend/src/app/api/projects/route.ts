@@ -54,6 +54,7 @@ function toSnake(row: Record<string, unknown>): Record<string, unknown> {
     estimatedHours: "estimated_hours",
     isCompleted: "is_completed",
     spaceId: "space_id",
+    knowledgeNodeId: "knowledge_node_id",
     createdAt: "created_at",
     updatedAt: "updated_at",
     deletedAt: "deleted_at",

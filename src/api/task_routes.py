@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 class CreateTaskPayload(BaseModel):
     project_id: Optional[str] = None
+    knowledge_node_id: Optional[str] = None
     title: str
     description: Optional[str] = None
     status: str = "todo"
@@ -53,6 +54,7 @@ class CreateTaskPayload(BaseModel):
     all_day: bool = False
     reminder_offsets: Optional[list[int]] = None
     notifications_enabled: Optional[bool] = None
+    source: str = "local"
     assignee_ids: list[str] = Field(default_factory=list)
     tag_ids: list[str] = Field(default_factory=list)
     recurrence_rrule: Optional[str] = None
@@ -62,6 +64,7 @@ class CreateTaskPayload(BaseModel):
 
 class UpdateTaskPayload(BaseModel):
     project_id: Optional[str] = None
+    knowledge_node_id: Optional[str] = None
     title: Optional[str] = None
     description: Optional[str] = None
     status: Optional[str] = None
@@ -222,6 +225,12 @@ def _build_update_task_updates(payload: UpdateTaskPayload) -> dict[str, Any]:
         updates["project_id"] = (
             _parse_uuid(payload.project_id, "project_id")
             if payload.project_id is not None
+            else None
+        )
+    if "knowledge_node_id" in fields_set:
+        updates["knowledge_node_id"] = (
+            _parse_uuid(payload.knowledge_node_id, "knowledge_node_id")
+            if payload.knowledge_node_id is not None
             else None
         )
     if "title" in fields_set:
@@ -810,6 +819,7 @@ def create_task_router(
                 session,
                 user_id=user_id,
                 project_id=_parse_uuid(payload.project_id, "project_id"),
+                knowledge_node_id=_parse_uuid(payload.knowledge_node_id, "knowledge_node_id"),
                 title=payload.title,
                 description=payload.description,
                 status=payload.status,
@@ -823,6 +833,7 @@ def create_task_router(
                     if payload.notifications_enabled is not None
                     else None
                 ),
+                source=payload.source,
                 assignee_ids=[
                     _parse_uuid(value, "assignee_id") for value in payload.assignee_ids
                 ],

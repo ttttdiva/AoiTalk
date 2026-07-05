@@ -11,8 +11,9 @@ from .payloads import SettingsPayload
 from ...services.agent_team_service import (
     AGENT_TEAM_MEMBER_KEYS,
     AGENT_TEAM_PROVIDERS,
+    AGENT_HARNESS_PROVIDERS,
+    MODEL_ROUTING_PROVIDERS,
     agent_team_confirm_prompt,
-    agent_team_enabled,
     agent_team_member_for,
     agent_team_member_mode,
     agent_team_member_requires_external_approval,
@@ -123,7 +124,6 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
     # Allowed settings that can be modified via WebUI
     ALLOWED_SETTINGS = {
         "external_llm.auto_approve": {"type": "bool"},
-        "agent_team.enabled": {"type": "bool"},
         "agent_team.confirm_prompt": {"type": "bool"},
         "agent_team.notify": {"type": "bool"},
         "agent_team.redaction_terms": {"type": "str_list"},
@@ -147,42 +147,61 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         "mcp_enabled": {"type": "bool"},
         "agents.spotify.enabled": {"type": "bool"},
         "spotify.enabled": {"type": "bool"},
-    }
-    for member_key in sorted(AGENT_TEAM_MEMBER_KEYS):
-        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.enabled"] = {
-            "type": "bool"
-        }
-        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.provider"] = {
+        "model_routing.media.image_mode": {
             "type": "enum",
-            "values": sorted(AGENT_TEAM_PROVIDERS),
+            "values": ["auto", "always", "off"],
+        },
+    }
+    class_provider_values = {
+        "heavy": [""] + sorted(AGENT_TEAM_PROVIDERS - {"antigravity-cli", "codex-cli", "claude-cli"}),
+        "light": [""] + sorted(AGENT_TEAM_PROVIDERS - {"antigravity-cli", "codex-cli", "claude-cli"}),
+        "vision": [""] + sorted(MODEL_ROUTING_PROVIDERS - {"antigravity-cli", "codex-cli", "claude-cli"}),
+    }
+    for route_class in ("heavy", "light", "vision"):
+        ALLOWED_SETTINGS[f"model_routing.classes.{route_class}.provider"] = {
+            "type": "enum",
+            "values": class_provider_values[route_class],
         }
-        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.model"] = {
-            "type": "str"
+        ALLOWED_SETTINGS[f"model_routing.classes.{route_class}.model"] = {"type": "str"}
+        ALLOWED_SETTINGS[f"model_routing.classes.{route_class}.base_url"] = {"type": "str"}
+        ALLOWED_SETTINGS[f"model_routing.classes.{route_class}.api_key"] = {"type": "str"}
+        ALLOWED_SETTINGS[f"model_routing.classes.{route_class}.reasoning_effort"] = {"type": "str"}
+        ALLOWED_SETTINGS[f"model_routing.classes.{route_class}.mode"] = {"type": "str"}
+    ALLOWED_SETTINGS["model_routing.classes.audio.engine"] = {
+        "type": "enum",
+        "values": ["speech_recognition", "llm", "off"],
+    }
+    ALLOWED_SETTINGS["model_routing.classes.audio.reasoning_effort"] = {"type": "str"}
+    ALLOWED_SETTINGS["model_routing.classes.audio.mode"] = {"type": "str"}
+    for field in ("provider", "model", "base_url", "api_key"):
+        ALLOWED_SETTINGS[f"model_routing.classes.audio.{field}"] = (
+            {
+                "type": "enum",
+                "values": ["openai", "gemini", "openrouter", "openai_compatible_local", "sglang", "ollama", ""],
+            }
+            if field == "provider"
+            else {"type": "str"}
+        )
+    for member_key in sorted(AGENT_TEAM_MEMBER_KEYS):
+        provider_values = (
+            sorted(AGENT_HARNESS_PROVIDERS)
+            if member_key == "agent_harness"
+            else sorted(AGENT_TEAM_PROVIDERS)
+        )
+        ALLOWED_SETTINGS[f"model_routing.overrides.{member_key}.provider"] = {
+            "type": "enum",
+            "values": [""] + provider_values,
         }
-        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.mode"] = {
-            "type": "str"
-        }
-        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.reasoning_effort"] = {
-            "type": "str"
-        }
-        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.label"] = {
-            "type": "str"
-        }
-        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.role"] = {
-            "type": "str"
-        }
-        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.runner"] = {
-            "type": "str"
-        }
-        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.scalable"] = {
-            "type": "bool"
-        }
-        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.default_instances"] = {
+        for field in ("model", "mode", "reasoning_effort", "runner"):
+            ALLOWED_SETTINGS[f"model_routing.overrides.{member_key}.{field}"] = {
+                "type": "str"
+            }
+        ALLOWED_SETTINGS[f"model_routing.overrides.{member_key}.default_instances"] = {
             "type": "int",
             "min": 0,
             "max": 32,
         }
-        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.max_instances"] = {
+        ALLOWED_SETTINGS[f"model_routing.overrides.{member_key}.max_instances"] = {
             "type": "int",
             "min": 1,
             "max": 32,
@@ -231,7 +250,6 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                     )
                 },
                 "agent_team": {
-                    "enabled": agent_team_enabled(server.config),
                     "confirm_prompt": agent_team_confirm_prompt(server.config),
                     "notify": agent_team_notify(server.config),
                     "redaction_terms": server.config.get(
@@ -246,6 +264,7 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                     },
                     "roster": agent_team_roster(server.config),
                 },
+                "model_routing": server.config.get("model_routing", {}),
                 "knowledge": {
                     "enabled": server.config.get("search.knowledge_enabled", False)
                 },

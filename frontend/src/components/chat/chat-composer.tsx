@@ -161,6 +161,15 @@ function isImageFile(file: File) {
   return file.type.startsWith("image/");
 }
 
+function isAudioFile(file: File) {
+  return file.type.startsWith("audio/") || /\.(wav|mp3|m4a|flac|ogg|webm)$/i.test(file.name);
+}
+
+const MAX_IMAGE_ATTACHMENTS = 4;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_AUDIO_ATTACHMENTS = 1;
+const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
+
 function ComposerAttachmentPreview({
   file,
   onRemove,
@@ -502,6 +511,7 @@ export function ChatComposer({
     useState(false);
   const [llmModeMenuOpen, setLlmModeMenuOpen] = useState(false);
   const [toolsMenuOpen, setToolsMenuOpen] = useState(false);
+  const [audioAttachmentEnabled, setAudioAttachmentEnabled] = useState(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const slashMenuRef = useRef<HTMLDivElement>(null);
@@ -518,6 +528,27 @@ export function ChatComposer({
     generationProfileChangedByUser || !settingsGenerationProfile
       ? localGenerationProfile
       : settingsGenerationProfile;
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch("/api/python-proxy/settings", {
+          credentials: "include",
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        const engine =
+          data?.settings?.model_routing?.classes?.audio?.engine ?? "speech_recognition";
+        if (!cancelled) setAudioAttachmentEnabled(engine !== "off");
+      } catch {
+        if (!cancelled) setAudioAttachmentEnabled(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const isSteeringMode = busy;
   const isEmpty =
@@ -1014,10 +1045,43 @@ export function ChatComposer({
   // ファイル追加
   const addFiles = useCallback(
     (files: FileList | File[]) => {
-      const newFiles = Array.from(files);
-      onAttachedFilesChange((prev) => [...prev, ...newFiles]);
+      const incoming = Array.from(files);
+      onAttachedFilesChange((prev) => {
+        const accepted: File[] = [];
+        let imageCount = prev.filter(isImageFile).length;
+        let audioCount = prev.filter(isAudioFile).length;
+        for (const file of incoming) {
+          if (isImageFile(file)) {
+            if (file.size > MAX_IMAGE_BYTES) {
+              toast.error(`画像は1枚 ${formatFileSize(MAX_IMAGE_BYTES)} までです`);
+              continue;
+            }
+            if (imageCount >= MAX_IMAGE_ATTACHMENTS) {
+              toast.error(`画像は最大 ${MAX_IMAGE_ATTACHMENTS} 枚まで添付できます`);
+              continue;
+            }
+            imageCount += 1;
+          } else if (isAudioFile(file)) {
+            if (!audioAttachmentEnabled) {
+              toast.error("音声認識が無効なため音声ファイルは添付できません");
+              continue;
+            }
+            if (file.size > MAX_AUDIO_BYTES) {
+              toast.error(`音声は ${formatFileSize(MAX_AUDIO_BYTES)} までです`);
+              continue;
+            }
+            if (audioCount >= MAX_AUDIO_ATTACHMENTS) {
+              toast.error("音声ファイルは1件まで添付できます");
+              continue;
+            }
+            audioCount += 1;
+          }
+          accepted.push(file);
+        }
+        return accepted.length > 0 ? [...prev, ...accepted] : prev;
+      });
     },
-    [onAttachedFilesChange],
+    [audioAttachmentEnabled, onAttachedFilesChange],
   );
 
   // ファイル削除
@@ -1183,6 +1247,7 @@ export function ChatComposer({
             ref={fileInputRef}
             type="file"
             multiple
+            accept="image/*,audio/*,.txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.xml,.log"
             className="hidden"
             onChange={handleFileSelect}
           />

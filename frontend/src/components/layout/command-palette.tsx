@@ -15,14 +15,12 @@ import { Checkbox } from "@/components/ui/checkbox";
 import {
   Plus,
   CheckSquare,
-  Calendar,
-  BarChart3,
-  Settings,
   Layers,
   FolderOpen,
 } from "lucide-react";
 import { taskApi, type Task } from "@/lib/task-api";
 import { useProject } from "@/contexts/project-context";
+import { APP_VIEW_TABS } from "@/lib/app-navigation";
 
 const COMMANDS = [
   { id: "new-chat", label: "新規会話", icon: Plus, action: "/chat?new=1" },
@@ -33,10 +31,13 @@ const COMMANDS = [
     action: "__create-task__",
     keywords: "t task タスク作成",
   },
-  { id: "tasks", label: "タスク一覧", icon: CheckSquare, action: "/tasks" },
-  { id: "calendar", label: "カレンダー", icon: Calendar, action: "/calendar" },
-  { id: "reports", label: "レポート", icon: BarChart3, action: "/reports" },
-  { id: "settings", label: "設定", icon: Settings, action: "/settings" },
+  ...APP_VIEW_TABS.map((tab) => ({
+    id: tab.href.replace(/^\//, "") || "home",
+    label: tab.title,
+    icon: tab.icon,
+    action: tab.href,
+    keywords: `${tab.title} navigation`,
+  })),
 ];
 
 type SearchScope = {

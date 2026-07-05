@@ -7,7 +7,11 @@ import type {
   ChatCommandCapability,
   ChatResponseModelSelection,
 } from "@/lib/chat-api";
-import { isWebSocketMessageForSession } from "@/lib/chat-websocket-events";
+import {
+  getWebSocketMessageAgentRunId,
+  isWebSocketMessageForSession,
+} from "@/lib/chat-websocket-events";
+import { getToolLabel, normalizeToolName } from "@/lib/tool-labels";
 
 type WSMessage = {
   type: string;
@@ -75,7 +79,7 @@ async function uploadProjectAttachment(
   };
 }
 
-async function fileToImagePayload(file: File) {
+async function fileToMediaPayload(file: File) {
   const dataUrl = await new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(reader.result as string);
@@ -86,31 +90,6 @@ async function fileToImagePayload(file: File) {
 }
 
 const MAX_ATTACHMENT_CONTEXT_LENGTH = 10000;
-
-const TOOL_LABELS: Record<string, string> = {
-  web_search: "Web検索",
-  search_web: "Web検索",
-  deep_research: "Deep Research",
-  search_files: "ファイル検索",
-  read_file: "ファイル読み取り",
-  write_file: "ファイル書き込み",
-  execute_command: "コマンド実行",
-  execute_code: "コード実行",
-  generate_image: "画像生成",
-};
-
-function getToolLabel(toolName: string): string {
-  const normalized = toolName.trim();
-  if (!normalized) return "ツール";
-  if (TOOL_LABELS[normalized]) return TOOL_LABELS[normalized];
-  if (/search/i.test(normalized)) {
-    return `${normalized.replace(/_/g, " ")} 検索`;
-  }
-  if (/agent|delegate|assistant/i.test(normalized)) {
-    return `${normalized.replace(/_/g, " ")} への委譲`;
-  }
-  return normalized.replace(/_/g, " ");
-}
 
 function extractActivityMessage(data: WSMessage): string | null {
   const nestedData =
@@ -128,20 +107,6 @@ function extractActivityMessage(data: WSMessage): string | null {
   return message && message.trim().length > 0 ? message : null;
 }
 
-function extractAgentRunId(data: WSMessage): string | null {
-  const nestedData =
-    data.data && typeof data.data === "object"
-      ? (data.data as Record<string, unknown>)
-      : null;
-  const value =
-    typeof data.agent_run_id === "string"
-      ? data.agent_run_id
-      : typeof nestedData?.agent_run_id === "string"
-        ? nestedData.agent_run_id
-        : null;
-  return value && value.trim().length > 0 ? value : null;
-}
-
 function createBaseAttachment(file: File): ChatAttachmentMetadata {
   return {
     name: file.name,
@@ -157,9 +122,20 @@ function isLikelyTextFile(file: File): boolean {
   );
 }
 
+function isImageFile(file: File): boolean {
+  return file.type.startsWith("image/") || /\.(png|jpe?g|gif|webp|bmp|avif)$/i.test(file.name);
+}
+
+function isAudioFile(file: File): boolean {
+  return file.type.startsWith("audio/") || /\.(wav|mp3|m4a|flac|ogg|webm)$/i.test(file.name);
+}
+
 async function fileToAttachmentContext(file: File): Promise<string> {
-  if (file.type.startsWith("image/")) {
+  if (isImageFile(file)) {
     return `[添付画像: ${file.name}]`;
+  }
+  if (isAudioFile(file)) {
+    return `[添付音声: ${file.name}]`;
   }
   if (!isLikelyTextFile(file)) {
     return `[添付ファイル: ${file.name}]`;
@@ -266,7 +242,7 @@ export function useWebSocket(sessionId: string | null) {
           }
 
           setLastMessage(data);
-          const nextAgentRunId = extractAgentRunId(data);
+          const nextAgentRunId = getWebSocketMessageAgentRunId(data);
           if (nextAgentRunId) {
             setActiveAgentRunId(nextAgentRunId);
           }
@@ -284,10 +260,11 @@ export function useWebSocket(sessionId: string | null) {
           if (data.type === "tool_start") {
             const toolName =
               typeof data.tool === "string" && data.tool ? data.tool : "tool";
-            setActiveTool(toolName);
+            const normalizedToolName = normalizeToolName(toolName);
+            setActiveTool(normalizedToolName);
             setActivityMessage(
               extractActivityMessage(data) ??
-                `${getToolLabel(toolName)} を実行しています...`,
+                `${getToolLabel(normalizedToolName)} を実行しています...`,
             );
           }
           if (data.type === "tool_end") {
@@ -374,9 +351,15 @@ export function useWebSocket(sessionId: string | null) {
           const attachments: ChatAttachmentMetadata[] = files.map((file) =>
             createBaseAttachment(file),
           );
-          const firstImage = files.find((file) => file.type.startsWith("image/"));
-          if (firstImage) {
-            data.image = await fileToImagePayload(firstImage);
+          const imageFiles = files.filter(isImageFile);
+          if (imageFiles.length > 0) {
+            data.images = await Promise.all(
+              imageFiles.map((file) => fileToMediaPayload(file)),
+            );
+          }
+          const audioFile = files.find(isAudioFile);
+          if (audioFile) {
+            data.audio = await fileToMediaPayload(audioFile);
           }
 
           if (projectId) {

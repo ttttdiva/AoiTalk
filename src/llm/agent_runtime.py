@@ -44,13 +44,12 @@ PROJECT_PROGRESS_REVIEW_MAX_TOOL_ROUNDS = 120
 
 PROJECT_PROGRESS_REFRESH_TOOL_NAMES: set[str] = {
     "organize_project_information_from_folder",
+    "patch_project_information_doc",
+    "attach_project_information_reference",
     "sync_wbs_tasks",
     "sync_issue_table",
     "append_record_rows",
     "update_record_row",
-    "upsert_project_fact",
-    "upsert_project_info_category",
-    "register_project_document",
 }
 
 PROJECT_CONTEXT_REQUIRED_READ_TOOL_NAMES: tuple[str, ...] = (
@@ -81,7 +80,8 @@ DIRECT_PROJECT_TOOL_HINT_NAMES: tuple[str, ...] = (
     "sync_issue_table",
     "create_record_table",
     "create_task",
-    "upsert_project_fact",
+    "patch_project_information_doc",
+    "attach_project_information_reference",
 )
 
 DIRECT_SEARCH_TOOL_HINT_NAMES: tuple[str, ...] = (
@@ -769,7 +769,7 @@ def _build_context_block(
             "`organize_project_information_from_folder` を使ってください。"
         )
         tool_lines.append(
-            "- 案件DBや台帳を更新した場合は、最終回答前に `get_project_progress` を再実行してください。"
+            "- 案件情報Docsや台帳を更新した場合は、最終回答前に `get_project_progress` を再実行してください。"
         )
     block = "\n".join(["## Tool Hints", *tool_lines]).strip()
     matched_tool_names = [rule.tool_name for rule in rules]

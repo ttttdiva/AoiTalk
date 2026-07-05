@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 
 
@@ -333,71 +333,6 @@ record_field_types = {
 }
 
 
-project_info_category_statuses = {"active", "suggested", "hidden", "archived"}
-
-
-project_info_item_statuses = {"active", "suggested", "archived"}
-
-
-project_info_target_kinds = {"file", "record_table", "url"}
-
-
-project_info_ai_access_levels = {"metadata", "read", "edit", "blocked"}
-
-
-default_project_info_categories = [
-    {
-        "key": "overview",
-        "label": "概要",
-        "description": "案件の目的・範囲・前提を置く入口カテゴリ。",
-        "status": "active",
-        "sort_order": 0,
-    },
-    {
-        "key": "important_documents",
-        "label": "重要資料",
-        "description": "パラメーターシート、構成図、設計書などの正本資料。",
-        "status": "active",
-        "sort_order": 10,
-    },
-    {
-        "key": "decisions",
-        "label": "決定事項",
-        "description": "顧客・社内・ベンダー間で決まったこと。",
-        "status": "active",
-        "sort_order": 20,
-    },
-    {
-        "key": "open_questions",
-        "label": "要確認",
-        "description": "未確定事項、回答待ち、確認依頼。",
-        "status": "active",
-        "sort_order": 30,
-    },
-    {
-        "key": "architecture",
-        "label": "構成",
-        "description": "構成図、接続関係、環境一覧などがある案件で使う。",
-        "status": "suggested",
-        "sort_order": 40,
-    },
-    {
-        "key": "detail_design",
-        "label": "詳細設計",
-        "description": "パラメーターシート、設定値、設計書を扱う案件で使う。",
-        "status": "suggested",
-        "sort_order": 50,
-    },
-    {
-        "key": "verification",
-        "label": "検証",
-        "description": "テスト計画、検証項目、結果報告を扱う案件で使う。",
-        "status": "suggested",
-        "sort_order": 60,
-    },
-]
-
-
 def _clean_text(value: Any, fallback: str = "") -> str:
     text = str(value or "").strip()
     return text or fallback
@@ -413,35 +348,11 @@ def _one_of(value: Any, allowed: set[str], fallback: str) -> str:
     return text if text in allowed else fallback
 
 
-def _project_info_category_key(label: str) -> str:
-    import re
-
-    key = re.sub(r"[^a-zA-Z0-9_\-\u3040-\u30ff\u3400-\u9fff]+", "_", label)
-    key = key.strip("_").lower()
-    return key[:120] or f"category_{datetime.utcnow().timestamp():.0f}"
-
-
 def _parse_optional_uuid(value: str) -> UUID | None:
     text = (value or "").strip()
     if not text:
         return None
     return UUID(text)
-
-
-def _clamp_project_info_importance(value: int | str) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        parsed = 5
-    return max(1, min(10, parsed))
-
-
-def _clamp_project_info_confidence(value: float | int | str) -> float:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        parsed = 1.0
-    return max(0.0, min(1.0, parsed))
 
 
 def _parse_json_array(payload: str, field_name: str) -> list[Any]:
@@ -1030,127 +941,6 @@ async def _resolve_record_table(session, project_id: UUID, table_ref: str):
     if len(exact) > 1 or len(partial) > 1:
         raise ValueError(f"Record table reference is ambiguous: {table_ref}")
     raise ValueError(f"Record table not found: {table_ref}")
-
-
-async def _ensure_project_info_defaults(
-    session,
-    project_id: UUID,
-    user_id: UUID,
-) -> None:
-    from ...memory.models import ProjectInfoCategory
-
-    result = await session.execute(
-        select(ProjectInfoCategory.key).where(
-            ProjectInfoCategory.project_id == project_id
-        )
-    )
-    existing_keys = set(result.scalars().all())
-    for item in default_project_info_categories:
-        if item["key"] in existing_keys:
-            continue
-        session.add(
-            ProjectInfoCategory(
-                project_id=project_id,
-                key=item["key"],
-                label=item["label"],
-                description=item["description"],
-                status=item["status"],
-                source="template",
-                sort_order=item["sort_order"],
-                created_by=user_id,
-            )
-        )
-    await session.flush()
-
-
-async def _resolve_project_info_category(
-    session,
-    project_id: UUID,
-    category_ref: str = "",
-    category_id: str = "",
-    create_if_missing: bool = False,
-    user_id: UUID | None = None,
-    status: str = "suggested",
-):
-    from ...memory.models import ProjectInfoCategory
-
-    target = (category_id or category_ref or "").strip()
-    if not target:
-        return None
-
-    try:
-        parsed_category_id = UUID(target)
-    except ValueError:
-        parsed_category_id = None
-
-    if parsed_category_id is not None:
-        category = await session.get(ProjectInfoCategory, parsed_category_id)
-        if category and category.project_id == project_id:
-            return category
-
-    result = await session.execute(
-        select(ProjectInfoCategory).where(
-            ProjectInfoCategory.project_id == project_id,
-            ProjectInfoCategory.status != "archived",
-        )
-    )
-    categories = list(result.scalars().all())
-    normalized = target.casefold()
-    exact = [
-        category
-        for category in categories
-        if normalized
-        in {
-            str(category.id).casefold(),
-            category.key.casefold(),
-            category.label.casefold(),
-        }
-    ]
-    if len(exact) == 1:
-        return exact[0]
-    partial = [
-        category
-        for category in categories
-        if normalized
-        and (
-            normalized in category.key.casefold()
-            or normalized in category.label.casefold()
-        )
-    ]
-    if len(partial) == 1:
-        return partial[0]
-    if len(exact) > 1 or len(partial) > 1:
-        raise ValueError(f"Project information category is ambiguous: {target}")
-
-    if not create_if_missing:
-        return None
-
-    existing_keys = {category.key for category in categories}
-    base_key = _project_info_category_key(target)
-    key = base_key
-    index = 2
-    while key in existing_keys:
-        key = f"{base_key[:114]}_{index}"[:120]
-        index += 1
-
-    max_sort = await session.execute(
-        select(func.max(ProjectInfoCategory.sort_order)).where(
-            ProjectInfoCategory.project_id == project_id
-        )
-    )
-    category = ProjectInfoCategory(
-        project_id=project_id,
-        key=key,
-        label=target[:200],
-        description=None,
-        status=_one_of(status, project_info_category_statuses, "suggested"),
-        source="agent",
-        sort_order=float(max_sort.scalar_one_or_none() or 0) + 10,
-        created_by=user_id,
-    )
-    session.add(category)
-    await session.flush()
-    return category
 
 
 def _management_documents_from_project(project) -> list[dict[str, Any]]:

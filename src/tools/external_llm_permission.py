@@ -62,14 +62,11 @@ EXTERNAL_SEARCH_TOOLS = {"web_search", "grok_x_search"}
 
 PROJECT_MANAGEMENT_MUTATION_TOOLS = {
     "organize_project_information_from_folder",
+    "patch_project_information_doc",
+    "attach_project_information_reference",
+    "upsert_project_qa_entry",
+    "archive_project_qa_entry",
     "configure_project_management_files",
-    "upsert_project_info_category",
-    "archive_project_info_category",
-    "register_project_document",
-    "delete_project_document",
-    "upsert_project_fact",
-    "delete_project_fact",
-    "set_project_information_sync_state",
     "create_record_table",
     "append_record_rows",
     "update_record_row",
@@ -87,12 +84,23 @@ PROJECT_MANAGEMENT_MUTATION_TOOLS = {
     "sync_wbs_tasks",
 }
 
+DOCS_MUTATION_TOOLS = {
+    "docs_create_nodes",
+    "docs_update_node",
+    "docs_set_fields",
+    "docs_add_tag",
+    "docs_remove_tag",
+    "docs_move_node",
+    "docs_archive_node",
+}
+
 DEFAULT_PERMISSION_TOOLS = sorted(
     EXTERNAL_SEARCH_TOOLS
     | FILE_WRITE_TOOLS
     | FILE_DELETE_TOOLS
     | COMMAND_TOOLS
     | PROJECT_MANAGEMENT_MUTATION_TOOLS
+    | DOCS_MUTATION_TOOLS
 )
 
 
@@ -177,6 +185,7 @@ class ExternalLLMPermissionManager:
                 | FILE_DELETE_TOOLS
                 | COMMAND_TOOLS
                 | PROJECT_MANAGEMENT_MUTATION_TOOLS
+                | DOCS_MUTATION_TOOLS
             )
         if permission_policy == PermissionPolicy.CONFIRM_ALL_TOOLS:
             return tool_name in self.enabled_tools

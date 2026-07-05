@@ -32,7 +32,7 @@ class ReasoningPlanner:
             },
             'create': {
                 'keywords': ['作成', '登録', '追加', '生成', '保存'],
-                'tools': ['create_task', 'upsert_project_fact', 'create_record_table', 'spotify_assistant', 'create_file', 'media_assistant', 'invoke_skill']
+                'tools': ['create_task', 'patch_project_information_doc', 'create_record_table', 'spotify_assistant', 'create_file', 'media_assistant', 'invoke_skill']
             },
             'analyze': {
                 'keywords': ['分析', '解析', '評価', '判定', '比較'],
@@ -201,10 +201,10 @@ class ReasoningPlanner:
             'WebSearch': 'インターネットから最新情報を検索',
             'web_search': 'General web search for fresh information',
             'grok_x_search': 'Fresh X/Twitter search via Grok',
-            'list_project_information': 'Read project/case information DB facts and documents',
+            'list_project_information': 'Read project/case information Docs, Q&A, and tables',
             'create_task': 'Create a project task',
-            'upsert_project_fact': 'Create or update project DB facts',
-            'organize_project_information_from_folder': 'Read project files and organize project information DB entries',
+            'patch_project_information_doc': 'Create or update the canonical project information Docs page',
+            'organize_project_information_from_folder': 'Read project files and organize canonical project information Docs',
             'sync_wbs_tasks': 'Synchronize WBS tasks',
             'spotify_assistant': 'Spotify auth, playback, queue, playlist, and activity operations',
             'find_workspace_items': 'Find workspace files or folders by name',

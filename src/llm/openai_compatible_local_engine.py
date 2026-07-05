@@ -68,6 +68,7 @@ from .openai_compatible_local_profiles import (
     DEFAULT_OPENAI_COMPATIBLE_LOCAL_BASE_URL,
     openai_compatible_local_base_url,
 )
+from .multimodal import openai_content_parts
 from .prompts import build_unified_instructions
 from .provider_capabilities import ProviderCapabilities
 from .runtime_tool_registry import build_runtime_tool_registry
@@ -599,7 +600,7 @@ class OpenAICompatibleLocalClient:
         return "\n".join(
             [
                 "You are AoiTalk's assistant. Answer in the user's language.",
-                "Use selected project context, project information DB, and confirmed tool results as ground truth.",
+                "Use selected project context, project information Docs, and confirmed tool results as ground truth.",
                 "Use tool hints as short candidate reminders and decide tool use from the full request.",
                 "Do not claim search, file reading, project updates, time/weather lookup, or calculation unless a successful tool result exists.",
                 "Do not invent case details. If evidence is insufficient, say what is missing and answer only from available facts.",
@@ -782,7 +783,7 @@ class OpenAICompatibleLocalClient:
             "organize_project_information_from_folder",
             "sync_wbs_tasks",
             "sync_issue_table",
-            "upsert_project_fact",
+            "patch_project_information_doc",
             "create_record_table",
             "create_task",
             "update_task",
@@ -1458,10 +1459,6 @@ class OpenAICompatibleLocalClient:
         image_data: Optional[Dict[str, Any]] = None,
         stream_callback: Any = None,
     ) -> Union[str, Generator[str, None, None]]:
-        if image_data:
-            logger.warning(
-                "[OpenAICompatibleLocalClient] image_data is ignored by this client"
-            )
         self._last_generation_metrics = None
         self._last_tool_calls = []
         self._last_agentic_events = []
@@ -1484,6 +1481,11 @@ class OpenAICompatibleLocalClient:
                 project_context,
                 context_budget,
             )
+            if image_data and messages:
+                messages[-1]["content"] = openai_content_parts(
+                    str(messages[-1].get("content") or ""),
+                    image_data,
+                )
             required_tool_name = self._required_tool_name(user_input)
             if stream:
                 return self._stream_response(messages, temperature, max_tokens, user_input)
@@ -1684,7 +1686,7 @@ class OpenAICompatibleLocalClient:
             parts.append(clip_text(evidence, budget.context_bundle_chars))
         else:
             parts.append(
-                "取得済みの案件情報DB・ツール実行結果・会話根拠はありませんでした。"
+                "取得済みの案件情報Docs・ツール実行結果・会話根拠はありませんでした。"
                 "メッセージを短くするか、ローカルLLMサーバーのコンテキスト設定を確認してください。"
             )
         return "\n\n".join(parts)

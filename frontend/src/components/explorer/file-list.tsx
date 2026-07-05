@@ -89,6 +89,7 @@ export function FileList({ onFileClick, onContextMenu }: FileListProps) {
     focusedItemPath,
     selectItem,
     toggleSelect,
+    selectRange,
     refresh,
   } = useExplorer();
   const [sortKey, setSortKey] = useState<SortKey>("name");
@@ -111,6 +112,10 @@ export function FileList({ onFileClick, onContextMenu }: FileListProps) {
     e: React.MouseEvent,
     item: ExplorerDirectory | ExplorerFile,
   ) => {
+    if (e.shiftKey) {
+      selectRange(item.path, orderedPaths, e.ctrlKey || e.metaKey);
+      return;
+    }
     if (e.ctrlKey || e.metaKey) {
       toggleSelect(item.path);
       return;
@@ -198,6 +203,10 @@ export function FileList({ onFileClick, onContextMenu }: FileListProps) {
     }
     return 0;
   });
+  const orderedPaths = [
+    ...sortedDirs.map((dir) => dir.path),
+    ...sortedFiles.map((file) => file.path),
+  ];
 
   return (
     <div className="overflow-auto p-1">

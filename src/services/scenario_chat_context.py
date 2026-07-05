@@ -24,7 +24,7 @@ DISABLED_SCENARIO_WORKFLOW_TOOLS = {
     "create_task",
     "update_task",
     "sync_wbs_tasks",
-    "upsert_project_fact",
+    "patch_project_information_doc",
 }
 
 

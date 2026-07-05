@@ -18,7 +18,7 @@ from ..services.agent_team_service import (
     agent_team_clamp_instances,
     agent_team_delegate_member,
     agent_team_enabled,
-    agent_team_member_enabled,
+    agent_team_member_for,
     agent_team_scalable_members,
 )
 from .tool_policy import (
@@ -44,8 +44,8 @@ from .specialist_delegate import (
 def _agent_enabled(config: Any, domain_key: str, default: bool = True) -> bool:
     if not config:
         return default
-    if agent_team_enabled(config) and domain_key in AGENT_TEAM_MEMBER_KEYS:
-        return agent_team_member_enabled(config, domain_key)
+    if domain_key in AGENT_TEAM_MEMBER_KEYS:
+        return agent_team_member_for(config, domain_key) is not None
     return bool(config.get("agents", {}).get(domain_key, {}).get("enabled", default))
 
 
@@ -331,6 +331,41 @@ def _register_project_management_direct_tools(
         )
         direct_tool_available = True
     return direct_tool_available
+
+
+def _register_docs_direct_tools(registry: ToolRegistry) -> bool:
+    """Expose AoiTalk Docs read/write tools directly to the root turn runtime."""
+
+    try:
+        from ..tools.docs_direct import (
+            DOCS_MUTATION_TOOL_NAMES,
+            build_docs_direct_tools,
+        )
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Docs direct tools could not be loaded",
+            exc_info=True,
+        )
+        return False
+
+    registered = False
+    for tool_def in ensure_tool_definitions(build_docs_direct_tools()):
+        is_mutation = tool_def.name in DOCS_MUTATION_TOOL_NAMES
+        registered = (
+            _register_tool_definition(
+                registry,
+                tool_def,
+                owner="docs",
+                side_effect="mutation" if is_mutation else "none",
+                risk="medium" if is_mutation else "low",
+                requires_approval=is_mutation,
+                supports_parallel=not is_mutation,
+            )
+            or registered
+        )
+    return registered
 
 
 def _register_delegation_tool(
@@ -636,6 +671,9 @@ def build_runtime_tool_registry(config: Any) -> ToolRegistry:
             registry,
             config=config,
         )
+
+    if _agent_enabled(config, "docs", True):
+        _register_docs_direct_tools(registry)
 
     if _agent_enabled(config, "scenario", True):
         _register_delegation_tool(

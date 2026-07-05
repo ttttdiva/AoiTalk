@@ -158,7 +158,7 @@ class CLIBackendBase(ABC):
         self,
         prompt: str,
         cwd: Optional[Path] = None,
-        timeout: int = 300,
+        timeout: Optional[int] = None,
         extra_args: Optional[List[str]] = None,
         system_context: Optional[str] = None,
         event_callback: Optional[CLIEventCallback] = None,
@@ -169,7 +169,7 @@ class CLIBackendBase(ABC):
         Args:
             prompt: Prompt to execute (user message or full prompt)
             cwd: Working directory
-            timeout: Timeout in seconds
+            timeout: Timeout in seconds. None means wait until the CLI exits.
             extra_args: Additional CLI arguments (e.g., MCP config)
             system_context: System context to pass via stdin (instructions, history, tools).
                            When provided, prompt is passed via CLI argument and
@@ -325,7 +325,7 @@ class CLIBackendBase(ABC):
         stdin_input_bytes: Optional[bytes],
         cwd: Optional[Path],
         env: Optional[Dict[str, str]],
-        timeout: int,
+        timeout: Optional[int],
         event_callback: CLIEventCallback,
     ) -> tuple[int, str, str]:
         """Run a CLI process while forwarding stdout lines as progress events."""
@@ -360,16 +360,20 @@ class CLIBackendBase(ABC):
             except BrokenPipeError:
                 pass
 
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + timeout if timeout is not None else None
         reader_done = False
         while not reader_done:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                process.kill()
-                reader.join(timeout=1.0)
-                raise subprocess.TimeoutExpired(cmd, timeout)
+            if deadline is None:
+                queue_timeout = 0.1
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    process.kill()
+                    reader.join(timeout=1.0)
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                queue_timeout = min(0.1, max(remaining, 0.01))
             try:
-                chunk = stdout_queue.get(timeout=min(0.1, max(remaining, 0.01)))
+                chunk = stdout_queue.get(timeout=queue_timeout)
             except queue.Empty:
                 continue
             if chunk is None:
@@ -388,7 +392,7 @@ class CLIBackendBase(ABC):
                     exc_info=True,
                 )
 
-        return_code = process.wait(timeout=1)
+        return_code = process.wait()
         return return_code, _decode_cli_output(b"".join(stdout_chunks)), ""
 
     def prepare_image_attachment(

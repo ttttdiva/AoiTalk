@@ -132,6 +132,26 @@ export interface GitLogResponse {
 
 // ─── API Helpers ───
 
+function extractApiErrorMessage(status: number, text: string): string {
+  if (!text) return `API Error ${status}`;
+  try {
+    const json = JSON.parse(text) as { detail?: unknown; error?: unknown };
+    const message = json.detail ?? json.error;
+    if (typeof message === "string" && message.trim()) {
+      return message;
+    }
+  } catch {
+    // use raw text below
+  }
+  return text;
+}
+
+export function explorerErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) return error.message;
+  if (typeof error === "string" && error.trim()) return error;
+  return "不明なエラーです";
+}
+
 async function pyFetch<T = unknown>(
   path: string,
   init?: RequestInit,
@@ -146,7 +166,7 @@ async function pyFetch<T = unknown>(
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`API Error ${res.status}: ${text}`);
+    throw new Error(extractApiErrorMessage(res.status, text));
   }
   return res.json();
 }
@@ -322,6 +342,53 @@ export function explorerDownloadUrl(path: string): string {
   return `/api/python-proxy/explorer/download?path=${encodeURIComponent(path)}`;
 }
 
+function downloadFilenameFromDisposition(
+  disposition: string | null,
+  fallback: string,
+): string {
+  if (!disposition) return fallback;
+  const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded);
+    } catch {
+      // fall through to filename below
+    }
+  }
+  const quoted = disposition.match(/filename="([^"]+)"/i)?.[1];
+  return quoted || fallback;
+}
+
+export async function explorerDownloadPaths(paths: string[]): Promise<void> {
+  const res = await fetch("/api/python-proxy/explorer/download", {
+    method: "POST",
+    credentials: "include",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ paths }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(extractApiErrorMessage(res.status, text));
+  }
+
+  const blob = await res.blob();
+  const filename = downloadFilenameFromDisposition(
+    res.headers.get("Content-Disposition"),
+    paths.length === 1
+      ? paths[0].split(/[/\\]/).pop() || "download"
+      : "archive.zip",
+  );
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
 export async function explorerRename(path: string, newName: string) {
   return pyFetchJson<{ success: boolean; new_name: string; new_path: string }>(
     "/explorer/rename",
@@ -417,10 +484,13 @@ export async function explorerFullContent(
 export interface SearchResult {
   name: string;
   path: string;
-  type: string;
-  extension: string;
+  kind?: "directory" | "file";
+  type?: string;
+  extension?: string;
   size_bytes?: number;
   size_display?: string;
+  item_count?: number | null;
+  modified_at?: string;
   icon?: string;
 }
 
@@ -428,6 +498,9 @@ export interface ExplorerSearchResponse {
   success: boolean;
   results: SearchResult[];
   total: number;
+  total_returned?: number;
+  root_path?: string;
+  truncated?: boolean;
   query: string;
 }
 

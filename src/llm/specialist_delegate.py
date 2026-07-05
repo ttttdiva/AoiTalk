@@ -33,6 +33,7 @@ from ..services.agent_team_service import (
     agent_team_notify,
     apply_agent_team_member_mode,
     config_get,
+    model_route_is_explicit,
 )
 from ..tools.adapters import CLIAdapter, OpenAIAPIAdapter
 from ..tools.core import ToolDefinition, ToolParam, ensure_tool_definitions
@@ -133,7 +134,7 @@ _COMPACT_TOOL_DESCRIPTIONS = {
     "get_workspace_file_info": "Get workspace file metadata.",
     "list_workspace_files": "List direct workspace folder contents.",
     "get_project_context": "Get the active project context.",
-    "list_project_information": "List saved project facts, documents, and tables.",
+    "list_project_information": "List saved project information Docs, Q&A, and tables.",
     "list_record_tables": "List project record tables.",
     "list_tasks": "List project tasks.",
     "create_task": "Create a project task.",
@@ -247,6 +248,7 @@ class SpecialistDelegationRunner:
         self.agent_class = agent_class
         self.mcp_server_names = tuple(mcp_server_names or ())
         self._agent_team_member_config = agent_team_member_for(config, domain_key)
+        self._agent_team_member_explicit = model_route_is_explicit(config, domain_key)
 
         self.provider = self._select_provider()
         self.model = model or self._select_model()
@@ -277,7 +279,7 @@ class SpecialistDelegationRunner:
         return agents_config, domain_config
 
     def _uses_agent_team_member_target(self) -> bool:
-        return self._agent_team_member_config is not None
+        return self._agent_team_member_config is not None and self._agent_team_member_explicit
 
     def _main_provider(self) -> str:
         provider = str(_config_get(self.config, "llm_provider", "openai")).strip().lower()

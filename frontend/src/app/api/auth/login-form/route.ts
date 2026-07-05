@@ -9,14 +9,29 @@ import {
 } from "@/lib/auth";
 import { recordWebUILoginLog } from "@/lib/server/login-log";
 
+function safeLoginDestination(rawNext: FormDataEntryValue | null, baseUrl: string) {
+  if (typeof rawNext !== "string" || !rawNext.trim()) return "/chat";
+  try {
+    const url = new URL(rawNext, baseUrl);
+    const base = new URL(baseUrl);
+    if (url.origin !== base.origin) return "/chat";
+    if (url.pathname === "/login" || url.pathname.startsWith("/api/auth/")) return "/chat";
+    return `${url.pathname}${url.search}${url.hash}`;
+  } catch {
+    return "/chat";
+  }
+}
+
 export async function POST(request: NextRequest) {
   const formData = await request.formData();
   const username = formData.get("username") as string;
   const password = formData.get("password") as string;
+  const next = formData.get("next");
   const host = request.headers.get("host") || "localhost:3002";
   const protocol = request.headers.get("x-forwarded-proto") || "http";
   const baseUrl = `${protocol}://${host}`;
   const loginUrl = new URL("/login", baseUrl);
+  if (typeof next === "string" && next.trim()) loginUrl.searchParams.set("next", next);
 
   if (!username || !password) {
     await recordWebUILoginLog({
@@ -92,7 +107,7 @@ export async function POST(request: NextRequest) {
 
   const destination = user.isPasswordResetRequired
     ? "/settings?password=required"
-    : "/chat";
+    : safeLoginDestination(next, baseUrl);
   const response = NextResponse.redirect(new URL(destination, baseUrl), {
     status: 303,
   });

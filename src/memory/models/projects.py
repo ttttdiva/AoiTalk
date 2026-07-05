@@ -1,4 +1,4 @@
-"""スペース・プロジェクト・プロジェクト情報(カテゴリ/文書/ファクト)系モデル。"""
+"""スペース・プロジェクト・Docs案件情報系モデル。"""
 
 import uuid
 from datetime import datetime
@@ -75,6 +75,12 @@ class Project(Base):
     # オーナー（作成者）
     owner_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     space_id = Column(UUID(as_uuid=True), ForeignKey("spaces.id"), nullable=True)
+    knowledge_node_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_nodes.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
 
     # 設定
     allow_join_requests = Column(Boolean, default=True)  # 参加申請を受け付けるか
@@ -144,26 +150,8 @@ class Project(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
-    info_categories = relationship(
-        "ProjectInfoCategory",
-        back_populates="project",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
-    documents = relationship(
-        "ProjectDocument",
-        back_populates="project",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
-    facts = relationship(
-        "ProjectFact",
-        back_populates="project",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
-    info_sync_states = relationship(
-        "ProjectInfoSyncState",
+    qa_entries = relationship(
+        "ProjectQaEntry",
         back_populates="project",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -180,6 +168,9 @@ class Project(Base):
             "aliases": self.aliases or [],
             "owner_id": str(self.owner_id),
             "space_id": str(self.space_id) if self.space_id else None,
+            "knowledge_node_id": (
+                str(self.knowledge_node_id) if self.knowledge_node_id else None
+            ),
             "allow_join_requests": self.allow_join_requests,
             "storage_quota_mb": self.storage_quota_mb,
             "storage_used_mb": self.storage_used_mb,
@@ -319,59 +310,10 @@ class ContextMemory(Base):
         }
 
 
-class ProjectInfoCategory(Base):
-    """Project-specific information shelf/category."""
+class ProjectQaEntry(Base):
+    """Question and answer entries derived from project conversations."""
 
-    __tablename__ = "project_info_categories"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    project_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("projects.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    key = Column("category_key", String(120), nullable=False)
-    label = Column(String(200), nullable=False)
-    description = Column(Text)
-    status = Column(String(32), default="active", nullable=False, index=True)
-    source = Column(String(32), default="template", nullable=False)
-    sort_order = Column(Float, default=0, nullable=False)
-    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
-    )
-
-    project = relationship("Project", back_populates="info_categories")
-    documents = relationship("ProjectDocument", back_populates="category")
-    facts = relationship("ProjectFact", back_populates="category")
-
-    __table_args__ = (
-        UniqueConstraint("project_id", "category_key", name="uq_project_info_category_key"),
-        Index("ix_project_info_categories_project_sort", "project_id", "sort_order"),
-    )
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "project_id": str(self.project_id),
-            "key": self.key,
-            "label": self.label,
-            "description": self.description,
-            "status": self.status,
-            "source": self.source,
-            "sort_order": self.sort_order,
-            "created_by": str(self.created_by) if self.created_by else None,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
-
-
-class ProjectDocument(Base):
-    """Important project document/catalog entry."""
-
-    __tablename__ = "project_documents"
+    __tablename__ = "project_qa_entries"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     project_id = Column(
@@ -380,168 +322,49 @@ class ProjectDocument(Base):
         nullable=False,
         index=True,
     )
-    category_id = Column(
+    knowledge_node_id = Column(
         UUID(as_uuid=True),
-        ForeignKey("project_info_categories.id", ondelete="SET NULL"),
+        ForeignKey("knowledge_nodes.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
     )
-    title = Column(String(255), nullable=False)
-    description = Column(Text)
-    document_type = Column(String(64), default="document", nullable=False)
-    target_kind = Column(String(32), default="file", nullable=False)
-    file_path = Column(Text)
-    record_table_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("record_tables.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    external_url = Column(Text)
-    role = Column(String(64), default="reference", nullable=False)
-    is_primary = Column(Boolean, default=False, nullable=False)
-    ai_access_level = Column(String(32), default="metadata", nullable=False)
-    status = Column(String(32), default="active", nullable=False, index=True)
-    notes = Column(Text)
-    source_type = Column(String(32), default="manual", nullable=False)
-    source_ref = Column(Text)
-    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
-    )
-    deleted_at = Column(DateTime, nullable=True, index=True)
-
-    project = relationship("Project", back_populates="documents")
-    category = relationship("ProjectInfoCategory", back_populates="documents")
-    facts = relationship("ProjectFact", back_populates="source_document")
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "project_id": str(self.project_id),
-            "category_id": str(self.category_id) if self.category_id else None,
-            "title": self.title,
-            "description": self.description,
-            "document_type": self.document_type,
-            "target_kind": self.target_kind,
-            "file_path": self.file_path,
-            "record_table_id": str(self.record_table_id) if self.record_table_id else None,
-            "external_url": self.external_url,
-            "role": self.role,
-            "is_primary": self.is_primary,
-            "ai_access_level": self.ai_access_level,
-            "status": self.status,
-            "notes": self.notes,
-            "source_type": self.source_type,
-            "source_ref": self.source_ref,
-            "created_by": str(self.created_by) if self.created_by else None,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-            "deleted_at": self.deleted_at.isoformat() if self.deleted_at else None,
-        }
-
-
-class ProjectFact(Base):
-    """Project fact extracted from documents, tasks, or manual input."""
-
-    __tablename__ = "project_facts"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    project_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("projects.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    category_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("project_info_categories.id", ondelete="SET NULL"),
-        nullable=True,
-        index=True,
-    )
-    source_document_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("project_documents.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    source_task_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("tasks.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    title = Column(String(255), nullable=False)
-    _content = Column("content", Text, nullable=False)
-    content = _encrypted_text_property("_content", "project_facts.content")
-    fact_type = Column(String(64), default="fact", nullable=False)
+    _question = Column("question", Text, nullable=False)
+    question = _encrypted_text_property("_question", "project_qa_entries.question")
+    _answer = Column("answer", Text, nullable=True)
+    answer = _encrypted_text_property("_answer", "project_qa_entries.answer")
+    normalized_question_hash = Column(String(128), index=True)
+    status = Column(String(32), default="unanswered", nullable=False, index=True)
+    review_state = Column(String(32), default="candidate", nullable=False, index=True)
     confidence = Column(Float, default=1.0, nullable=False)
-    importance = Column(Integer, default=5, nullable=False, index=True)
-    status = Column(String(32), default="active", nullable=False, index=True)
-    source_type = Column(String(32), default="manual", nullable=False)
-    source_ref = Column(Text)
-    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
-    )
-    deleted_at = Column(DateTime, nullable=True, index=True)
-
-    project = relationship("Project", back_populates="facts")
-    category = relationship("ProjectInfoCategory", back_populates="facts")
-    source_document = relationship("ProjectDocument", back_populates="facts")
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "project_id": str(self.project_id),
-            "category_id": str(self.category_id) if self.category_id else None,
-            "source_document_id": (
-                str(self.source_document_id) if self.source_document_id else None
-            ),
-            "source_task_id": str(self.source_task_id) if self.source_task_id else None,
-            "title": self.title,
-            "content": self.content,
-            "fact_type": self.fact_type,
-            "confidence": self.confidence,
-            "importance": self.importance,
-            "status": self.status,
-            "source_type": self.source_type,
-            "source_ref": self.source_ref,
-            "created_by": str(self.created_by) if self.created_by else None,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-            "deleted_at": self.deleted_at.isoformat() if self.deleted_at else None,
-        }
-
-
-class ProjectInfoSyncState(Base):
-    """Cursor state for incremental project information extraction."""
-
-    __tablename__ = "project_info_sync_states"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    project_id = Column(
+    asked_count = Column(Integer, default=1, nullable=False)
+    source_session_id = Column(
         UUID(as_uuid=True),
-        ForeignKey("projects.id", ondelete="CASCADE"),
-        nullable=False,
+        ForeignKey("conversation_sessions.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
     )
-    source_type = Column(String(64), default="tasks", nullable=False)
-    last_synced_at = Column(DateTime)
-    last_seen_updated_at = Column(DateTime)
-    cursor = Column(JSON, default=dict)
-    sync_metadata = Column(JSON, default=dict)
+    source_message_ids = Column(JSON, default=list)
+    source_agent_run_ids = Column(JSON, default=list)
+    source_tool_call_ids = Column(JSON, default=list)
+    answer_source_refs = Column(JSON, default=list)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    updated_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_by_agent = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
     )
+    last_asked_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    deleted_at = Column(DateTime, nullable=True, index=True)
 
-    project = relationship("Project", back_populates="info_sync_states")
+    project = relationship("Project", back_populates="qa_entries")
 
     __table_args__ = (
-        UniqueConstraint(
+        Index(
+            "ix_project_qa_entries_project_review",
             "project_id",
-            "source_type",
-            name="uq_project_info_sync_state_source",
+            "review_state",
+            "status",
         ),
     )
 
@@ -549,19 +372,32 @@ class ProjectInfoSyncState(Base):
         return {
             "id": str(self.id),
             "project_id": str(self.project_id),
-            "source_type": self.source_type,
-            "last_synced_at": (
-                self.last_synced_at.isoformat() if self.last_synced_at else None
+            "knowledge_node_id": (
+                str(self.knowledge_node_id) if self.knowledge_node_id else None
             ),
-            "last_seen_updated_at": (
-                self.last_seen_updated_at.isoformat()
-                if self.last_seen_updated_at
-                else None
+            "question": self.question,
+            "answer": self.answer,
+            "normalized_question_hash": self.normalized_question_hash,
+            "status": self.status,
+            "review_state": self.review_state,
+            "confidence": self.confidence,
+            "asked_count": self.asked_count,
+            "source_session_id": (
+                str(self.source_session_id) if self.source_session_id else None
             ),
-            "cursor": self.cursor or {},
-            "sync_metadata": self.sync_metadata or {},
+            "source_message_ids": self.source_message_ids or [],
+            "source_agent_run_ids": self.source_agent_run_ids or [],
+            "source_tool_call_ids": self.source_tool_call_ids or [],
+            "answer_source_refs": self.answer_source_refs or [],
+            "created_by": str(self.created_by) if self.created_by else None,
+            "updated_by": str(self.updated_by) if self.updated_by else None,
+            "created_by_agent": self.created_by_agent,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "last_asked_at": (
+                self.last_asked_at.isoformat() if self.last_asked_at else None
+            ),
+            "deleted_at": self.deleted_at.isoformat() if self.deleted_at else None,
         }
 
 

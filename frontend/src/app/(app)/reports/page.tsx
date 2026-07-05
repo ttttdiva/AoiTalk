@@ -1199,9 +1199,14 @@ export default function ReportsPage() {
     if (!editingEntry) return;
     setEditSaving(true);
     try {
-      await taskApi.startTimer(editingEntry.task_id);
+      const started = await taskApi.startTimer(editingEntry.task_id);
       closeEditDialog();
       fetchReport();
+      window.dispatchEvent(
+        new CustomEvent("timer-changed", {
+          detail: { activeEntry: started },
+        }),
+      );
       window.dispatchEvent(new Event("task-list-refresh"));
     } catch (err) {
       console.error("タイマー開始失敗:", err);
@@ -1218,6 +1223,11 @@ export default function ReportsPage() {
       await taskApi.stopTimer(editingEntry.id);
       closeEditDialog();
       fetchReport();
+      window.dispatchEvent(
+        new CustomEvent("timer-changed", {
+          detail: { activeEntry: null },
+        }),
+      );
       window.dispatchEvent(new Event("task-list-refresh"));
     } catch (err) {
       console.error("タイマー停止失敗:", err);

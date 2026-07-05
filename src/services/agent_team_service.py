@@ -18,6 +18,25 @@ AGENT_TEAM_PROVIDERS = {
     "codex-cli",
 }
 
+MODEL_ROUTE_CLASS_BY_ROUTE = {
+    "advanced_reasoning": "heavy",
+    "architect": "heavy",
+    "explorer": "light",
+    "implementer": "light",
+    "reviewer": "light",
+    "utility": "light",
+    "media": "light",
+    "spotify": "light",
+    "import": "light",
+}
+
+MODEL_ROUTING_PROVIDERS = AGENT_TEAM_PROVIDERS | {
+    "claude",
+    "grok",
+}
+
+AGENT_HARNESS_PROVIDERS = {"codex-cli", "claude-cli"}
+
 SCALABLE_MEMBER_KEYS = {
     "architect",
     "explorer",
@@ -236,39 +255,144 @@ def _clean_member_key(member_key: str) -> str:
     return str(member_key or "").strip()
 
 
-def _member_from_agent_team(config: Any, member_key: str) -> dict[str, Any] | None:
-    member = config_get(config, f"agent_team.members.{member_key}", None)
-    return member if isinstance(member, dict) else None
+def _route_from_model_routing(config: Any, route: str) -> dict[str, Any] | None:
+    route = _clean_member_key(route)
+    raw = config_get(config, f"model_routing.overrides.{route}", None)
+    return raw if isinstance(raw, dict) else None
 
 
-def _member_from_roster(config: Any, member_key: str) -> dict[str, Any] | None:
-    raw_roster = config_get(config, "agent_team.roster", None)
-    if not isinstance(raw_roster, list):
+def _class_route_from_model_routing(config: Any, route: str) -> dict[str, Any] | None:
+    route_class = MODEL_ROUTE_CLASS_BY_ROUTE.get(_clean_member_key(route))
+    if not route_class:
         return None
-    key = _clean_member_key(member_key)
-    for raw in raw_roster:
-        if not isinstance(raw, dict):
-            continue
-        raw_key = _clean_member_key(
-            raw.get("member_key")
-            or raw.get("key")
-            or raw.get("id")
-            or raw.get("role")
+    raw = config_get(config, f"model_routing.classes.{route_class}", None)
+    return raw if isinstance(raw, dict) else None
+
+
+def _main_route(config: Any) -> dict[str, Any]:
+    provider = str(config_get(config, "llm_provider", "openai") or "openai").strip().lower()
+    model = str(config_get(config, "llm_model", "") or "").strip()
+    if not model:
+        provider_model_keys = {
+            "openai": ("openai.model",),
+            "gemini": ("gemini.model",),
+            "openrouter": ("openrouter.model",),
+            "ollama": ("ollama.model",),
+            "sglang": ("sglang.model",),
+            "openai_compatible_local": ("openai_compatible_local.model",),
+            "codex-cli": ("codex_cli.model",),
+            "claude-cli": ("claude_cli.model",),
+            "antigravity-cli": ("antigravity_cli.model",),
+        }
+        for key in provider_model_keys.get(provider, ()):
+            model = str(config_get(config, key, "") or "").strip()
+            if model:
+                break
+    return {"provider": provider, "model": model}
+
+
+def _provider_configured(config: Any, provider: str, route: dict[str, Any], *, main: bool = False) -> bool:
+    provider = str(provider or "").strip().lower()
+    if not provider:
+        return False
+    if main:
+        return True
+    if provider in {"codex-cli", "claude-cli", "antigravity-cli"}:
+        return True
+    if str(route.get("api_key") or "").strip() or str(route.get("base_url") or "").strip():
+        return True
+    if provider in {"openai", "gemini", "openrouter", "grok", "claude"}:
+        env_names = {
+            "openai": ("OPENAI_API_KEY", "openai_api_key"),
+            "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY", "gemini_api_key"),
+            "openrouter": ("OPENROUTER_API_KEY", "openrouter_api_key"),
+            "grok": ("XAI_API_KEY", "xai_api_key", "grok_api_key"),
+            "claude": ("ANTHROPIC_API_KEY", "anthropic_api_key"),
+        }.get(provider, ())
+        import os
+
+        if any(os.getenv(name) for name in env_names if name.isupper()):
+            return True
+        if any(config_get(config, name, None) for name in env_names if not name.isupper()):
+            return True
+    if provider in {"ollama", "sglang", "openai_compatible_local"}:
+        return bool(
+            config_get(config, f"{provider}.base_url", None)
+            or config_get(config, f"{provider}.host", None)
+            or config_get(config, f"{provider}.model", None)
         )
-        raw_id = _clean_member_key(raw.get("id"))
-        if raw_key == key or raw_id == key:
-            return raw
+    return False
+
+
+def _normalize_route_target(config: Any, raw: dict[str, Any] | None, *, route: str, main: bool = False) -> dict[str, str] | None:
+    if not isinstance(raw, dict):
+        return None
+    provider = str(raw.get("provider") or "").strip().lower()
+    model = str(raw.get("model") or "").strip()
+    if route == "agent_harness":
+        provider = provider or "codex-cli"
+        model = model or "gpt-5-codex"
+    if provider not in MODEL_ROUTING_PROVIDERS or not model:
+        return None
+    if route == "agent_harness" and provider not in AGENT_HARNESS_PROVIDERS:
+        return None
+    if not _provider_configured(config, provider, raw, main=main):
+        return None
+    result: dict[str, str] = {"provider": provider, "model": model}
+    mode = str(raw.get("mode") or raw.get("reasoning_effort") or "").strip()
+    if mode:
+        result["mode"] = mode
+        result["reasoning_effort"] = mode
+    runner = str(raw.get("runner") or "").strip()
+    if route == "agent_harness":
+        if not runner:
+            runner = "claude_code" if provider == "claude-cli" else "codex_exec"
+        result["runner"] = runner
+    elif runner:
+        result["runner"] = runner
+    return result
+
+
+def resolve_model_route(config: Any, route: str) -> dict[str, str] | None:
+    """Resolve one model route by override, class target, then main model."""
+    key = _clean_member_key(route)
+    if key not in AGENT_TEAM_MEMBER_KEYS:
+        return None
+    if key == "agent_harness":
+        return _normalize_route_target(
+            config,
+            _route_from_model_routing(config, key) or {"provider": "codex-cli", "model": "gpt-5-codex", "runner": "codex_exec"},
+            route=key,
+        )
+    for raw, is_main in (
+        (_route_from_model_routing(config, key), False),
+        (_class_route_from_model_routing(config, key), False),
+        (_main_route(config), True),
+    ):
+        target = _normalize_route_target(config, raw, route=key, main=is_main)
+        if target is not None:
+            return target
     return None
 
 
-def _member_has_explicit_field(config: Any, member_key: str, *fields: str) -> bool:
-    for raw in (_member_from_agent_team(config, member_key), _member_from_roster(config, member_key)):
-        if not isinstance(raw, dict):
-            continue
-        for field in fields:
-            if str(raw.get(field) or "").strip():
-                return True
-    return False
+def model_route_is_explicit(config: Any, route: str) -> bool:
+    """Return whether a route resolved from model_routing rather than main defaults."""
+    key = _clean_member_key(route)
+    if key not in AGENT_TEAM_MEMBER_KEYS:
+        return False
+    override_target = _normalize_route_target(
+        config,
+        _route_from_model_routing(config, key),
+        route=key,
+    )
+    if override_target is not None:
+        return True
+    class_target = _normalize_route_target(
+        config,
+        _class_route_from_model_routing(config, key),
+        route=key,
+    )
+    return class_target is not None
 
 
 def _default_member_settings(member_key: str) -> dict[str, Any]:
@@ -345,17 +469,8 @@ def _normalize_roster_item(raw: dict[str, Any], fallback_key: str | None = None)
     return item
 
 
-def _legacy_roster(config: Any) -> list[dict[str, Any]]:
-    roster: list[dict[str, Any]] = []
-    for member_key in sorted(AGENT_TEAM_MEMBER_KEYS):
-        defaults = _default_member_settings(member_key)
-        legacy = _member_from_agent_team(config, member_key) or {}
-        roster.append(_normalize_roster_item({**defaults, **legacy}, member_key))
-    return roster
-
-
 def agent_team_enabled(config: Any) -> bool:
-    return bool(config_get(config, "agent_team.enabled", False))
+    return True
 
 
 def agent_team_confirm_prompt(config: Any) -> bool:
@@ -367,39 +482,43 @@ def agent_team_notify(config: Any) -> bool:
 
 
 def agent_team_roster(config: Any) -> list[dict[str, Any]]:
-    raw_roster = config_get(config, "agent_team.roster", None)
-    if isinstance(raw_roster, list) and raw_roster:
-        normalized: list[dict[str, Any]] = []
-        seen_keys: set[str] = set()
-        for raw in raw_roster:
-            if not isinstance(raw, dict):
-                continue
-            raw_key = _clean_member_key(
-                raw.get("member_key")
-                or raw.get("key")
-                or raw.get("id")
-                or raw.get("role")
+    roster: list[dict[str, Any]] = []
+    for member_key in sorted(AGENT_TEAM_MEMBER_KEYS):
+        defaults = _default_member_settings(member_key)
+        override = _route_from_model_routing(config, member_key) or {}
+        target = resolve_model_route(config, member_key)
+        item = _normalize_roster_item({**defaults, **override}, member_key)
+        item["enabled"] = target is not None
+        if target:
+            item.update(target)
+        if member_key in SCALABLE_MEMBER_KEYS:
+            item["scalable"] = True
+            item["max_instances"] = max(
+                1,
+                _normalize_int(
+                    override.get("max_instances"),
+                    _normalize_int(defaults.get("max_instances"), 1),
+                ),
             )
-            legacy = _member_from_agent_team(config, raw_key) or {}
-            item = _normalize_roster_item({**raw, **legacy})
-            if item["member_key"] in AGENT_TEAM_MEMBER_KEYS:
-                seen_keys.add(item["member_key"])
-            normalized.append(item)
-        for member_key in sorted(AGENT_TEAM_MEMBER_KEYS - seen_keys):
-            defaults = _default_member_settings(member_key)
-            legacy = _member_from_agent_team(config, member_key) or {}
-            normalized.append(_normalize_roster_item({**defaults, **legacy}, member_key))
-        return normalized
-    return _legacy_roster(config)
+            item["default_instances"] = max(
+                1,
+                min(
+                    _normalize_int(
+                        override.get("default_instances"),
+                        _normalize_int(defaults.get("default_instances"), 1),
+                    ),
+                    item["max_instances"],
+                ),
+            )
+        roster.append(item)
+    return roster
 
 
 def agent_team_member_declared(config: Any, member_key: str) -> bool:
     key = _clean_member_key(member_key)
     if key not in AGENT_TEAM_MEMBER_KEYS:
         return False
-    if _member_from_agent_team(config, key) is not None:
-        return True
-    return any(item["member_key"] == key for item in agent_team_roster(config))
+    return resolve_model_route(config, key) is not None
 
 
 def agent_team_member_settings(config: Any, member_key: str) -> dict[str, Any]:
@@ -416,8 +535,7 @@ def agent_team_member_enabled(config: Any, member_key: str) -> bool:
     key = _clean_member_key(member_key)
     if key not in AGENT_TEAM_MEMBER_KEYS:
         return False
-    member = agent_team_member_settings(config, key)
-    return agent_team_enabled(config) and bool(member.get("enabled", False))
+    return resolve_model_route(config, key) is not None
 
 
 def agent_team_member_for(config: Any, member_key: str) -> dict[str, str] | None:
@@ -425,29 +543,10 @@ def agent_team_member_for(config: Any, member_key: str) -> dict[str, str] | None
     key = _clean_member_key(member_key)
     if key not in AGENT_TEAM_MEMBER_KEYS:
         return None
-    if not agent_team_member_enabled(config, key):
-        return None
-
-    member = agent_team_member_settings(config, key)
-    provider = str(member.get("provider") or "").strip().lower()
-    model = str(member.get("model") or "").strip()
-    if provider not in AGENT_TEAM_PROVIDERS or not model:
-        return None
-
-    result = {"provider": provider, "model": model}
-    mode = str(member.get("mode") or member.get("reasoning_effort") or "").strip()
-    if mode and _member_has_explicit_field(config, key, "mode", "reasoning_effort"):
-        result["mode"] = mode
-        result["reasoning_effort"] = mode
-    runner = str(member.get("runner") or "").strip()
-    if runner and _member_has_explicit_field(config, key, "runner"):
-        result["runner"] = runner
-    return result
+    return resolve_model_route(config, key)
 
 
 def agent_team_active_roster(config: Any) -> list[dict[str, Any]]:
-    if not agent_team_enabled(config):
-        return []
     return [item for item in agent_team_roster(config) if item.get("enabled")]
 
 
@@ -502,6 +601,11 @@ def agent_team_member_mode(
     member_key: str,
     default: str = "",
 ) -> str:
+    route = resolve_model_route(config, member_key)
+    if route:
+        mode = str(route.get("mode") or route.get("reasoning_effort") or "").strip()
+        if mode:
+            return mode
     member = agent_team_member_settings(config, member_key)
     return str(
         member.get("mode")
@@ -561,10 +665,15 @@ def apply_agent_team_member_mode(
 
 def agent_team_members_by_provider(config: Any) -> dict[str, list[dict[str, str]]]:
     result: dict[str, list[dict[str, str]]] = {}
-    for member in agent_team_roster(config):
+    overrides = config_get(config, "model_routing.overrides", {}) or {}
+    if not isinstance(overrides, dict):
+        return result
+    for member_key, member in overrides.items():
+        if not isinstance(member, dict):
+            continue
         provider = str(member.get("provider") or "").strip()
         model = str(member.get("model") or "").strip()
-        member_key = str(member.get("member_key") or member.get("id") or "").strip()
+        member_key = str(member_key or "").strip()
         if not provider or not model or not member_key:
             continue
         result.setdefault(provider, []).append(

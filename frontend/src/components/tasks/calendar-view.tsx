@@ -61,6 +61,21 @@ type CalendarViewSettings = {
   current_date?: string | null;
 };
 
+type DocsCalendarItem = {
+  id: string;
+  node: {
+    id: string;
+    title: string;
+    project_id: string | null;
+  };
+  field: {
+    name: string;
+  };
+  start: string;
+  end: string | null;
+  all_day: boolean;
+};
+
 interface CalendarEvent {
   id: string;
   title: string;
@@ -88,6 +103,9 @@ interface CalendarEvent {
     remoteServerId?: string | null;
     remoteServerName?: string | null;
     remoteBaseUrl?: string | null;
+    isDocs?: boolean;
+    docsNodeId?: string | null;
+    docsFieldName?: string | null;
   };
 }
 
@@ -174,6 +192,8 @@ export default function CalendarView() {
   const [scope, setScope] = useState<ScopeMode>("project");
   const [tasks, setTasks] = useState<Task[]>([]);
   const [occurrences, setOccurrences] = useState<TaskOccurrence[]>([]);
+  const [docsCalendarItems, setDocsCalendarItems] = useState<DocsCalendarItem[]>([]);
+  const [showDocsLayer, setShowDocsLayer] = useState(true);
   const [loading, setLoading] = useState(false);
   const dateRangeRef = useRef<{ start: string; end: string } | null>(null);
   const fetchGenerationRef = useRef(0);
@@ -360,18 +380,33 @@ export default function CalendarView() {
       fetchGenerationRef.current = generation;
       setLoading(true);
       try {
-        const [taskList, occList] = await Promise.all([
+        const [taskList, occList, docsItems] = await Promise.all([
           taskApi.listTasks(scopeArg),
           taskApi.listOccurrences(scopeArg, dr.start, dr.end).catch((err) => {
             console.error("カレンダー繰り返し予定取得失敗:", err);
             return [] as TaskOccurrence[];
           }),
+          fetch(`/api/docs/calendar-items?${new URLSearchParams({
+            start: dr.start,
+            end: dr.end,
+            ...(scopeArg.project_id ? { project_id: scopeArg.project_id } : {}),
+            ...(scopeArg.space_id ? { space_id: scopeArg.space_id } : {}),
+          }).toString()}`, {
+            credentials: "include",
+          })
+            .then((res) => (res.ok ? res.json() : { items: [] }))
+            .then((data) => Array.isArray(data.items) ? data.items as DocsCalendarItem[] : [])
+            .catch((err) => {
+              console.error("Docsカレンダー取得失敗:", err);
+              return [] as DocsCalendarItem[];
+            }),
         ]);
         if (fetchGenerationRef.current !== generation) {
           return;
         }
         setTasks(taskList);
         setOccurrences(occList);
+        setDocsCalendarItems(docsItems);
       } catch (err) {
         if (fetchGenerationRef.current !== generation) {
           return;
@@ -402,6 +437,7 @@ export default function CalendarView() {
       setLoading(false);
       setTasks([]);
       setOccurrences([]);
+      setDocsCalendarItems([]);
     }
   }, [fetchData, scopeArg]);
 
@@ -594,10 +630,38 @@ export default function CalendarView() {
         };
       });
 
-    return [...taskEvents, ...occurrenceEvents, ...remoteEvents];
+    const docsEvents: CalendarEvent[] = showDocsLayer
+      ? docsCalendarItems.map((item) => ({
+          id: `docs-${item.id}`,
+          title: item.node.title || item.field.name,
+          start: item.start,
+          end: item.end ?? item.start,
+          allDay: item.all_day,
+          backgroundColor: "color-mix(in srgb, #0ea5e9 16%, transparent)",
+          borderColor: "#0ea5e9",
+          textColor: "var(--foreground)",
+          classNames: ["event-docs"],
+          editable: false,
+          extendedProps: {
+            taskId: "",
+            projectId: item.node.project_id,
+            status: "docs",
+            tags: [],
+            projectColor: "#0ea5e9",
+            projectName: "Docs",
+            isDocs: true,
+            docsNodeId: item.node.id,
+            docsFieldName: item.field.name,
+          },
+        }))
+      : [];
+
+    return [...taskEvents, ...occurrenceEvents, ...remoteEvents, ...docsEvents];
   }, [
     tasks,
     occurrences,
+    docsCalendarItems,
+    showDocsLayer,
     showClosed,
     hideRecurring,
     resolvedTheme,
@@ -644,6 +708,10 @@ export default function CalendarView() {
 
   const handleEventClick = useCallback((info: EventClickArg) => {
     const props = info.event.extendedProps;
+    if (props.isDocs && props.docsNodeId) {
+      window.location.href = `/docs/${encodeURIComponent(props.docsNodeId as string)}`;
+      return;
+    }
     if (props.isRemote && props.remoteServerId) {
       setRemoteDialogTarget({
         profileId: props.remoteServerId as string,
@@ -938,6 +1006,13 @@ export default function CalendarView() {
         </div>
 
         <div className="ml-auto flex items-center gap-4">
+          <label className="flex items-center gap-1.5 text-sm text-muted-foreground cursor-pointer select-none">
+            <Checkbox
+              checked={showDocsLayer}
+              onCheckedChange={(checked) => setShowDocsLayer(!!checked)}
+            />
+            Docsを表示
+          </label>
           <label className="flex items-center gap-1.5 text-sm text-muted-foreground cursor-pointer select-none">
             <Checkbox
               checked={hideRecurring}

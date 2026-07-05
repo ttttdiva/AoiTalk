@@ -6,9 +6,11 @@ import { useExplorer } from "@/contexts/explorer-context";
 import { useContextMenuPosition } from "@/hooks/use-context-menu-position";
 import {
   explorerDownloadUrl,
+  explorerDownloadPaths,
   explorerDelete,
   explorerCopy,
   explorerMove,
+  explorerErrorMessage,
   explorerSetFolderThumbnail,
   explorerClearFolderThumbnail,
   type ExplorerDirectory,
@@ -35,6 +37,7 @@ import {
   Image as ImageIcon,
   ImageOff,
 } from "lucide-react";
+import { toast } from "sonner";
 
 // 画像ファイル拡張子（フォルダサムネに設定可能）
 const IMAGE_EXTS = new Set([
@@ -271,8 +274,22 @@ export function FileContextMenu({
 
   const handleDownload = async () => {
     if (isRecordTable) return;
-    const url = await explorerDownloadUrl(item.path);
-    window.open(url, "_blank");
+    if (activeRegularPaths.length === 0) {
+      onClose();
+      return;
+    }
+
+    try {
+      if (activeRegularPaths.length === 1) {
+        const url = explorerDownloadUrl(activeRegularPaths[0]);
+        window.open(url, "_blank");
+      } else {
+        await explorerDownloadPaths(activeRegularPaths);
+        toast.success(`${activeRegularPaths.length}件をダウンロードします`);
+      }
+    } catch (error) {
+      toast.error(`ダウンロードに失敗しました: ${explorerErrorMessage(error)}`);
+    }
     onClose();
   };
 
@@ -320,8 +337,9 @@ export function FileContextMenu({
       }
       clearSelection();
       refresh();
-    } catch {
-      // delete error
+      toast.success("削除しました");
+    } catch (error) {
+      toast.error(`削除に失敗しました: ${explorerErrorMessage(error)}`);
     }
     onClose();
   };

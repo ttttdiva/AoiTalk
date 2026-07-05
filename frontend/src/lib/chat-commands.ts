@@ -55,8 +55,8 @@ export const CHAT_COMMANDS: ChatCommandDefinition[] = [
   },
   {
     command: "/db",
-    label: "Project DB",
-    description: "次の送信で案件情報DB更新を必ず扱う",
+    label: "Project Docs",
+    description: "次の送信で案件情報Docs更新を必ず扱う",
     kind: "capability",
     capability: "project_db_update",
   },

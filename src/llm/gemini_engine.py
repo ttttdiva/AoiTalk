@@ -46,6 +46,7 @@ from .agent_runtime import (
 )
 from .tool_policy import reset_current_user_input, set_current_user_input
 from .unified_turn_runtime import RegistryToolRouter, UnifiedToolCall
+from .multimodal import data_url_to_bytes, normalize_image_payloads
 from ..services.user_settings_service import get_user_custom_instructions_sync
 
 
@@ -777,34 +778,24 @@ class GeminiLLMClient:
             # Build the message content - handle multimodal input
             message_parts = []
             
-            # Add image if provided
-            if image_data:
-                import base64
+            # Add images if provided
+            for image_item in normalize_image_payloads(image_data):
                 from google.generativeai import protos
-                data_url = image_data.get("data", "")
-                if data_url.startswith("data:"):
-                    # Extract Base64 portion from data URL
-                    try:
-                        header, encoded = data_url.split(",", 1)
-                        mime_type = image_data.get("mimeType", "image/jpeg")
-                        
-                        # Decode base64 to bytes
-                        image_bytes = base64.b64decode(encoded)
-                        
-                        # Create Gemini Part with inline_data Blob
-                        image_part = protos.Part(
-                            inline_data=protos.Blob(
-                                mime_type=mime_type,
-                                data=image_bytes
-                            )
+                try:
+                    mime_type, image_bytes = data_url_to_bytes(image_item["data"])
+                    mime_type = image_item.get("mimeType") or mime_type or "image/jpeg"
+                    image_part = protos.Part(
+                        inline_data=protos.Blob(
+                            mime_type=mime_type,
+                            data=image_bytes
                         )
-                        message_parts.append(image_part)
-                        
-                        print(f"[GeminiLLMClient] 画像添付あり: {image_data.get('name', 'unknown')} ({mime_type}, {len(image_bytes)} bytes)")
-                    except Exception as img_error:
-                        print(f"[GeminiLLMClient] 画像処理エラー: {img_error}")
-                        import traceback
-                        traceback.print_exc()
+                    )
+                    message_parts.append(image_part)
+                    print(f"[GeminiLLMClient] 画像添付あり: {image_item.get('name', 'unknown')} ({mime_type}, {len(image_bytes)} bytes)")
+                except Exception as img_error:
+                    print(f"[GeminiLLMClient] 画像処理エラー: {img_error}")
+                    import traceback
+                    traceback.print_exc()
             
             # Add text if provided
             if user_input:

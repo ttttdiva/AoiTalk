@@ -388,6 +388,138 @@ def format_cli_tool_results(
     return "\n".join(lines)
 
 
+def format_cli_tool_history(
+    results: Sequence[UnifiedToolResult],
+    *,
+    original_input: str,
+    max_chars: int | None = None,
+) -> str:
+    """Summarize same-turn CLI tool history for follow-up completion control."""
+
+    lines = [
+        "Same-turn tool history:",
+        f"  Original objective: {original_input}",
+    ]
+    if not results:
+        lines.extend(
+            [
+                "  Already executed tools: none",
+                "  Successful tool results: none",
+                "  Failed tool results: none",
+                "  Remaining original objective: decide whether a tool is required.",
+            ]
+        )
+        return "\n".join(lines)
+
+    executed = [
+        f"{index}. {result.call.tool}({json.dumps(result.call.arguments, ensure_ascii=False, sort_keys=True)})"
+        for index, result in enumerate(results, start=1)
+    ]
+    successful = []
+    failed = []
+    for index, result in enumerate(results, start=1):
+        output = clip_text(result.output, max_chars)
+        error = clip_text(result.error or result.output, max_chars)
+        entry = f"{index}. [{result.call.tool}] {output}"
+        if result.success:
+            successful.append(entry)
+        else:
+            failed.append(f"{index}. [{result.call.tool}] Error: {error}")
+
+    lines.append("  Already executed tools:")
+    lines.extend(f"    {entry}" for entry in executed)
+    lines.append("  Successful tool results:")
+    lines.extend(f"    {entry}" for entry in successful or ["none"])
+    lines.append("  Failed tool results:")
+    lines.extend(f"    {entry}" for entry in failed or ["none"])
+    lines.append(
+        "  Remaining original objective: first decide whether the original user request is already satisfied by the successful results above."
+    )
+    return "\n".join(lines)
+
+
+def format_cli_follow_up_tool_context(
+    current_results: Sequence[UnifiedToolResult],
+    all_results: Sequence[UnifiedToolResult],
+    *,
+    original_input: str,
+    max_chars: int | None = None,
+    config: Any | None = None,
+    user_input: str = "",
+) -> str:
+    return "\n\n".join(
+        [
+            format_cli_tool_results(
+                current_results,
+                max_chars=max_chars,
+                config=config,
+                user_input=user_input or original_input,
+            ),
+            format_cli_tool_history(
+                all_results,
+                original_input=original_input,
+                max_chars=max_chars,
+            ),
+            CLI_TOOL_COMPLETION_CONTROL_PROMPT,
+        ]
+    )
+
+
+CLI_TOOL_COMPLETION_CONTROL_PROMPT = """Completion control after tool results:
+- After receiving tool results, first decide whether the original user request is already satisfied.
+- If satisfied, output the final answer immediately and do not call another tool.
+- Call another tool only when the previous result is missing, failed, contradictory, stale, or the original request still has unfinished subgoals.
+- A new tool call is also allowed when the previous result created a concrete new target to inspect, or when a mutation was made and post-change verification is still incomplete.
+- Do not call another tool just to reconfirm a successful result.
+- Re-running the same tool is allowed only when a concrete new reason exists, such as verifying a mutation, checking a changed file, resolving an error, or completing a distinct remaining subtask."""
+
+
+def _cli_tool_call_signature(call: UnifiedToolCall) -> tuple[str, str]:
+    return (
+        call.tool,
+        json.dumps(call.arguments, ensure_ascii=False, sort_keys=True, default=str),
+    )
+
+
+def _is_redundant_successful_cli_recall(
+    calls: Sequence[UnifiedToolCall],
+    all_results: Sequence[UnifiedToolResult],
+) -> bool:
+    if not calls or not all_results:
+        return False
+
+    for call in calls:
+        signature = _cli_tool_call_signature(call)
+        matched_index = None
+        for index in range(len(all_results) - 1, -1, -1):
+            previous = all_results[index]
+            if _cli_tool_call_signature(previous.call) == signature:
+                matched_index = index
+                break
+        if matched_index is None:
+            return False
+        previous = all_results[matched_index]
+        if not previous.success or not previous.output.strip():
+            return False
+        if matched_index != len(all_results) - 1:
+            return False
+    return True
+
+
+def _redundant_cli_recall_final_output(
+    calls: Sequence[UnifiedToolCall],
+    all_results: Sequence[UnifiedToolResult],
+) -> str:
+    outputs: list[str] = []
+    for call in calls:
+        signature = _cli_tool_call_signature(call)
+        for previous in reversed(all_results):
+            if _cli_tool_call_signature(previous.call) == signature and previous.success:
+                outputs.append(previous.output)
+                break
+    return "\n".join(output for output in outputs if output).strip()
+
+
 def run_openai_compatible_turn_loop(
     *,
     initial_messages: list[dict[str, Any]],
@@ -616,6 +748,18 @@ def run_cli_tool_call_loop(
             )
 
         calls = cli_tool_calls_from_parsed(parsed_calls)
+        if _is_redundant_successful_cli_recall(calls, all_results):
+            final_output = _redundant_cli_recall_final_output(calls, all_results)
+            logger.info(
+                "[%s] Suppressed redundant successful CLI tool recall",
+                log_prefix,
+            )
+            return UnifiedTurnResult(
+                final_output=final_output or current_output,
+                tool_results=all_results,
+                rounds=round_index - 1,
+                stopped_reason="redundant_tool_call_suppressed",
+            )
         logger.info(
             "[%s] Executing %s CLI tool call(s)",
             log_prefix,
@@ -654,8 +798,10 @@ def run_cli_tool_call_loop(
         follow_up = build_follow_up_prompt(
             original_input,
             current_output,
-            format_cli_tool_results(
+            format_cli_follow_up_tool_context(
                 results,
+                all_results,
+                original_input=original_input,
                 max_chars=max_tool_result_chars,
                 config=config,
                 user_input=user_input or original_input,

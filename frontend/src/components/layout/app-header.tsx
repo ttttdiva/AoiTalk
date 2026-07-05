@@ -23,6 +23,7 @@ import {
 import { useProject } from "@/contexts/project-context";
 import { useTheme } from "@/contexts/theme-context";
 import { taskApi, type TimeEntry } from "@/lib/task-api";
+import { APP_VIEW_TABS } from "@/lib/app-navigation";
 import { formatTimerClock, getElapsedTimerSeconds } from "@/lib/task-time";
 import { performAdminRestart } from "@/components/layout/global-admin-restart";
 import { SidebarTrigger } from "@/components/ui/sidebar";
@@ -44,18 +45,6 @@ import {
 } from "@/components/ui/tooltip";
 
 const AVATAR_STORAGE_KEY = "user-avatar-image";
-
-const viewTabs = [
-  { title: "チャット", href: "/chat" },
-  { title: "タスク", href: "/tasks" },
-  { title: "カレンダー", href: "/calendar" },
-  { title: "レポート", href: "/reports" },
-  { title: "ファイラー", href: "/filer" },
-  { title: "プロジェクト", href: "/projects" },
-  { title: "シナリオ", href: "/scenarios" },
-  { title: "TRPG", href: "/trpg" },
-  { title: "設定", href: "/settings" },
-];
 
 type LlmEngine = { provider: string; model: string; label: string };
 
@@ -294,23 +283,38 @@ function useActiveTimer() {
   const [elapsedValue, setElapsedValue] = useState("00:00:00");
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const originalTitleRef = useRef<string | null>(null);
+  const lastTimerEventAtRef = useRef(0);
 
   // アクティブタイマーをポーリング（10秒間隔）+ timer-changed イベント購読
   useEffect(() => {
     let mounted = true;
 
     const poll = async () => {
+      const requestedAt = Date.now();
       try {
         const entry = await taskApi.getActiveTimeEntry();
-        if (mounted) setActiveEntry(entry ?? null);
+        if (mounted && requestedAt >= lastTimerEventAtRef.current) {
+          setActiveEntry(entry ?? null);
+        }
       } catch {
-        if (mounted) setActiveEntry(null);
+        if (mounted && requestedAt >= lastTimerEventAtRef.current) {
+          setActiveEntry(null);
+        }
       }
     };
 
     poll();
     const interval = setInterval(poll, 10000);
-    const onChange = () => poll();
+    const onChange = (event: Event) => {
+      const detail = (event as CustomEvent<{ activeEntry?: TimeEntry | null }>)
+        .detail;
+      if (detail && typeof detail === "object" && "activeEntry" in detail) {
+        lastTimerEventAtRef.current = Date.now();
+        setActiveEntry(detail.activeEntry ?? null);
+        return;
+      }
+      void poll();
+    };
     window.addEventListener("timer-changed", onChange);
     return () => {
       mounted = false;
@@ -368,7 +372,9 @@ function useActiveTimer() {
     try {
       await taskApi.stopTimer(activeEntry.id);
       setActiveEntry(null);
-      window.dispatchEvent(new Event("timer-changed"));
+      window.dispatchEvent(
+        new CustomEvent("timer-changed", { detail: { activeEntry: null } }),
+      );
     } catch (err) {
       console.error("タイマー停止失敗:", err);
     }
@@ -563,7 +569,7 @@ export function AppHeader() {
             ref={tabsScrollRef}
             className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto whitespace-nowrap [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           >
-            {viewTabs.map((tab) => {
+            {APP_VIEW_TABS.map((tab) => {
               const isActive = pathname.startsWith(tab.href);
               return (
                 <Link

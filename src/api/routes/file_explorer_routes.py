@@ -3,12 +3,28 @@
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from ..router_helpers import cookie_auth_dependency
+
+
+def _download_response(content: bytes, filename: str, mime_type: str) -> Response:
+    # RFC 5987: Use filename* for non-ASCII filenames, with ASCII fallback.
+    ascii_filename = filename.encode("ascii", "replace").decode("ascii")
+    encoded_filename = quote(filename, safe="")
+    content_disposition = (
+        f"attachment; filename=\"{ascii_filename}\"; "
+        f"filename*=UTF-8''{encoded_filename}"
+    )
+    return Response(
+        content=content,
+        media_type=mime_type,
+        headers={"Content-Disposition": content_disposition},
+    )
 
 # Import absolute filer path support (server.py と同じフォールバック付き)
 try:
@@ -35,6 +51,7 @@ try:
         create_directory as explorer_create_directory,
         upload_file as explorer_upload_file,
         download_file as explorer_download_file,
+        download_items as explorer_download_items,
         rename_item as explorer_rename_item,
         move_item as explorer_move_item,
         copy_item as explorer_copy_item,
@@ -47,7 +64,7 @@ try:
         # Editor functions
         save_file as explorer_save_file,
         get_full_content as explorer_get_full_content,
-        search_files as explorer_search_files,
+        find_workspace_items as explorer_find_workspace_items,
         resolve_file_path as explorer_resolve_file_path,
         # Folder thumbnail
         set_folder_thumbnail as explorer_set_folder_thumbnail,
@@ -61,6 +78,7 @@ except ImportError:
     explorer_create_directory = None
     explorer_upload_file = None
     explorer_download_file = None
+    explorer_download_items = None
     explorer_rename_item = None
     explorer_move_item = None
     explorer_copy_item = None
@@ -70,6 +88,7 @@ except ImportError:
     explorer_get_file_info = None
     explorer_get_preview = None
     explorer_get_directory_tree = None
+    explorer_find_workspace_items = None
     explorer_resolve_file_path = None
 
 # Import storage context (memo 保存先解決用)
@@ -215,6 +234,9 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
     class ExplorerArchivePayload(BaseModel):
         paths: list[str]
         dest: str = ""
+
+    class ExplorerDownloadPayload(BaseModel):
+        paths: list[str]
 
     @app.get("/api/explorer/tree")
     async def get_explorer_tree(root: str = "", _: None = Depends(require_auth)):
@@ -386,20 +408,30 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
         if content is None:
             raise HTTPException(status_code=404, detail="File not found")
 
-        from fastapi.responses import Response
-        from urllib.parse import quote
+        return _download_response(content, filename, mime_type)
 
-        # RFC 5987: Use filename* for non-ASCII filenames
-        # Also include ASCII-safe filename for compatibility
-        ascii_filename = filename.encode("ascii", "replace").decode("ascii")
-        encoded_filename = quote(filename, safe="")
-        content_disposition = f"attachment; filename=\"{ascii_filename}\"; filename*=UTF-8''{encoded_filename}"
+    @app.post("/api/explorer/download")
+    async def explorer_download_selected(
+        payload: ExplorerDownloadPayload,
+        request: Request,
+        _: None = Depends(require_auth),
+    ):
+        """Download selected files or folders as a single payload"""
+        if not FILE_EXPLORER_AVAILABLE:
+            raise HTTPException(
+                status_code=503, detail="File explorer is not available"
+            )
+        if not payload.paths:
+            raise HTTPException(status_code=400, detail="No files selected")
 
-        return Response(
-            content=content,
-            media_type=mime_type,
-            headers={"Content-Disposition": content_disposition},
+        is_admin = await server._is_admin_user(request)
+        content, filename, mime_type = explorer_download_items(
+            payload.paths, is_admin=is_admin
         )
+        if content is None:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        return _download_response(content, filename, mime_type)
 
     @app.get("/api/explorer/serve")
     async def explorer_serve(
@@ -984,18 +1016,28 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
         limit: int = Query(20, ge=1, le=50),
         _: None = Depends(require_auth),
     ):
-        """Search files by name"""
+        """Search files and directories by name"""
         if not FILE_EXPLORER_AVAILABLE:
             raise HTTPException(
                 status_code=503, detail="File explorer is not available"
             )
         try:
             is_admin = await server._is_admin_user(request)
-            result = explorer_search_files(q, root, limit, is_admin=is_admin)
+            result = explorer_find_workspace_items(
+                q,
+                path=root,
+                include_dirs=True,
+                include_files=True,
+                max_results=limit,
+                is_admin=is_admin,
+            )
             if not result.get("success"):
                 raise HTTPException(
                     status_code=400, detail=result.get("error", "Search failed")
                 )
+            result["total"] = result.get(
+                "total_returned", len(result.get("results", []))
+            )
             return JSONResponse(result)
         except HTTPException:
             raise

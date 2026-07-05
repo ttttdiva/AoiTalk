@@ -47,9 +47,16 @@ import type {
   ChatResponseModelSelection,
   ConversationMessage,
 } from "@/lib/chat-api";
+import {
+  getChatScrollContentHash,
+  isChatScrollPinnedToBottom,
+} from "@/lib/chat-scroll";
 import { getFileServeUrl, getImageThumbnailUrl } from "@/lib/explorer-serve-url";
+import { getToolLabel } from "@/lib/tool-labels";
 import { cn } from "@/lib/utils";
 import Link from "next/link";
+
+const AUTO_SCROLL_BOTTOM_THRESHOLD_PX = 96;
 
 function generatedImageSrc(imagePath: string): string {
   if (!imagePath) return "";
@@ -157,6 +164,7 @@ type MessageListProps = {
   streamingContent?: string;
   liveToolResults?: ChatToolResultMetadata[];
   activeTool?: string | null;
+  activityMessage?: string | null;
   activeAgentRunId?: string | null;
   onEditMessage?: (messageId: string, newContent: string) => void;
   onRerunMessage?: (
@@ -165,19 +173,6 @@ type MessageListProps = {
   ) => void;
   responseModelOptions?: ChatResponseModelOption[];
   responseModelOptionsLoading?: boolean;
-};
-
-const TOOL_LABELS: Record<string, string> = {
-  play_music: "音楽を再生",
-  search_music: "音楽を検索",
-  get_weather: "天気を取得",
-  web_search: "Web検索",
-  generate_image: "画像を生成",
-  read_file: "ファイルを読み取り",
-  write_file: "ファイルに書き込み",
-  execute_code: "コードを実行",
-  create_task: "タスクを作成",
-  list_tasks: "タスクを取得",
 };
 
 const FEEDBACK_CATEGORIES = [
@@ -194,17 +189,6 @@ function getCharacterColor(name: string): string {
     hash = name.charCodeAt(i) + ((hash << 5) - hash);
   const hue = Math.abs(hash % 360);
   return `hsl(${hue}, 70%, 60%)`;
-}
-
-function getToolLabel(toolName: string): string {
-  if (TOOL_LABELS[toolName]) return TOOL_LABELS[toolName];
-  if (/agent|delegate|assistant/i.test(toolName)) {
-    return `${toolName.replace(/_/g, " ")} へ委譲`;
-  }
-  if (/search/i.test(toolName)) {
-    return `${toolName.replace(/_/g, " ")} 検索`;
-  }
-  return toolName.replace(/_/g, " ");
 }
 
 function formatFileSize(bytes?: number): string | null {
@@ -239,6 +223,33 @@ function getMessageToolResults(
       (typeof (result as ChatToolResultMetadata).output === "string" ||
         Array.isArray((result as ChatToolResultMetadata).urls)),
   );
+}
+
+function toolResultsScrollKey(results: ChatToolResultMetadata[]): string {
+  return results
+    .map((result, index) =>
+      [
+        index,
+        result.tool ?? "",
+        result.query ?? "",
+        result.output?.length ?? 0,
+        result.urls?.length ?? 0,
+      ].join(":"),
+    )
+    .join("|");
+}
+
+function metadataScrollValue(value: unknown): string {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "";
+  }
 }
 
 function getMessageGenerationMetrics(
@@ -741,13 +752,15 @@ export function MessageList({
   streamingContent,
   liveToolResults,
   activeTool,
+  activityMessage,
   activeAgentRunId,
   onEditMessage,
   onRerunMessage,
   responseModelOptions = [],
   responseModelOptionsLoading = false,
 }: MessageListProps) {
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const isPinnedToBottomRef = useRef(true);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editContent, setEditContent] = useState("");
   const editTextareaRef = useRef<HTMLTextAreaElement>(null);
@@ -758,6 +771,8 @@ export function MessageList({
   const [feedbackComment, setFeedbackComment] = useState("");
   const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [savingDocsId, setSavingDocsId] = useState<string | null>(null);
+  const [savedDocsId, setSavedDocsId] = useState<string | null>(null);
 
   const startEditing = useCallback((msg: ConversationMessage) => {
     setEditingId(msg.id);
@@ -821,6 +836,45 @@ export function MessageList({
     }, 1200);
   }, []);
 
+  const saveMessageToDocs = useCallback(async (msg: ConversationMessage) => {
+    if (!msg.content.trim() || savingDocsId) return;
+    setSavingDocsId(msg.id);
+    try {
+      const todayResponse = await fetch("/api/docs/today", { credentials: "include" });
+      if (!todayResponse.ok) throw new Error("Today Docsの取得に失敗しました");
+      const today = await todayResponse.json() as { node?: { id?: string } };
+      const parentId = today.node?.id;
+      if (!parentId) throw new Error("Today Docsが見つかりません");
+      const title = msg.content.trim().split(/\r?\n/)[0]?.slice(0, 120) || "Chat message";
+      const response = await fetch("/api/docs", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          parent_id: parentId,
+          title,
+          body_text: msg.content,
+          body_json: {
+            source: "chat_message",
+            message_id: msg.id,
+            role: msg.role,
+          },
+          display_props: {
+            source: "chat",
+            chat_message_id: msg.id,
+          },
+        }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      setSavedDocsId(msg.id);
+      window.setTimeout(() => {
+        setSavedDocsId((current) => (current === msg.id ? null : current));
+      }, 1600);
+    } finally {
+      setSavingDocsId(null);
+    }
+  }, [savingDocsId]);
+
   const actionButtonClass =
     "h-7 w-7 p-0 text-muted-foreground hover:text-foreground";
 
@@ -840,6 +894,16 @@ export function MessageList({
           title={copiedId === msg.id ? "コピーしました" : "コピー"}
         >
           <Copy className="size-3.5" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className={actionButtonClass}
+          disabled={savingDocsId === msg.id}
+          onClick={() => void saveMessageToDocs(msg)}
+          title={savedDocsId === msg.id ? "Docsへ保存しました" : "Docsへ保存"}
+        >
+          {savingDocsId === msg.id ? <Loader2 className="size-3.5 animate-spin" /> : <FileText className="size-3.5" />}
         </Button>
         {msg.role === "user" && onEditMessage && isPersisted && (
           <Button
@@ -918,6 +982,9 @@ export function MessageList({
     [
       copiedId,
       copyMessage,
+      savedDocsId,
+      saveMessageToDocs,
+      savingDocsId,
       onEditMessage,
       onRerunMessage,
       openFeedback,
@@ -974,33 +1041,104 @@ export function MessageList({
     }
     return result;
   }, [messages, branchInfo, branchSelections]);
+  const visibleMessageIds = useMemo(
+    () => visibleMessages.map((message) => message.id),
+    [visibleMessages],
+  );
 
   const showEmptyState =
     visibleMessages.length === 0 && !isStreaming && !isWaitingResponse;
 
-  const scrollToBottom = useCallback(() => {
-    requestAnimationFrame(() => {
-      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-    });
+  const updatePinnedToBottom = useCallback(() => {
+    const scrollContainer = scrollContainerRef.current;
+    if (!scrollContainer) return;
+    isPinnedToBottomRef.current = isChatScrollPinnedToBottom(scrollContainer);
   }, []);
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
+    if (!isPinnedToBottomRef.current) return;
+    requestAnimationFrame(() => {
+      if (!isPinnedToBottomRef.current) return;
+      const scrollContainer = scrollContainerRef.current;
+      if (!scrollContainer) return;
+      scrollContainer.scrollTo({
+        top: scrollContainer.scrollHeight,
+        behavior,
+      });
+      isPinnedToBottomRef.current = true;
+    });
+    return true;
+  }, []);
+
+  const visibleMessagesScrollKey = useMemo(
+    () =>
+      visibleMessages
+        .map((message) => {
+          const agentRunId =
+            typeof message.metadata?.agent_run_id === "string"
+              ? message.metadata.agent_run_id
+              : "";
+          const deepResearchStatus =
+            typeof message.metadata?.status === "string"
+              ? message.metadata.status
+              : "";
+          const deepResearchProgress = metadataScrollValue(
+            message.metadata?.progress,
+          );
+          return [
+            message.id,
+            message.role,
+            getChatScrollContentHash(message.content),
+            agentRunId,
+            deepResearchStatus,
+            deepResearchProgress,
+            toolResultsScrollKey(getMessageToolResults(message)),
+          ].join(":");
+        })
+        .join("|"),
+    [visibleMessages],
+  );
+
+  const liveToolResultsScrollKey = useMemo(
+    () => toolResultsScrollKey(liveToolResults ?? []),
+    [liveToolResults],
+  );
+  const previousVisibleMessageIdsRef = useRef<string[]>([]);
+
+  useEffect(() => {
+    const previousIds = previousVisibleMessageIdsRef.current;
+    const isAppendOnlyUpdate =
+      previousIds.length <= visibleMessageIds.length &&
+      previousIds.every((id, index) => visibleMessageIds[index] === id);
+
+    if (!isAppendOnlyUpdate) {
+      isPinnedToBottomRef.current = true;
+    }
+
+    previousVisibleMessageIdsRef.current = visibleMessageIds;
+  }, [visibleMessageIds]);
 
   // 自動スクロール
   useEffect(() => {
     scrollToBottom();
   }, [
-    visibleMessages.length,
+    visibleMessagesScrollKey,
     isStreaming,
     isWaitingResponse,
     streamingContent,
+    liveToolResultsScrollKey,
     activeTool,
+    activityMessage,
     activeAgentRunId,
     scrollToBottom,
   ]);
 
   return (
     <div
+      ref={scrollContainerRef}
       data-testid="chat-message-list"
       className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
+      onScroll={updatePinnedToBottom}
     >
       <div className="mx-auto flex max-w-3xl flex-col gap-4 p-4 transition-transform duration-200 ease-linear xl:translate-x-[var(--chat-viewport-offset)]">
         {showEmptyState && (
@@ -1210,7 +1348,14 @@ export function MessageList({
               <div className="min-w-0 max-w-full overflow-hidden rounded-2xl rounded-bl-md border border-white/60 bg-white/62 px-4 py-2.5 text-sm text-card-foreground shadow-[inset_0_1px_rgba(255,255,255,0.72),0_16px_34px_-30px_rgba(6,81,110,0.7)] [overflow-wrap:anywhere] backdrop-blur-xl prose-sm dark:border-white/12 dark:bg-card/75 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12),0_16px_34px_-30px_rgba(0,0,0,0.85)]">
                 <MessageContent content={streamingContent} />
                 <ToolResultDetails results={liveToolResults} />
-                {!activeTool && <TypingIndicator />}
+                {!activeTool && (activityMessage ? (
+                  <span className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+                    <Loader2 className="size-3 animate-spin" />
+                    {activityMessage}
+                  </span>
+                ) : (
+                  <TypingIndicator />
+                ))}
               </div>
               {activeTool && <ToolIndicator toolName={activeTool} />}
               <AgentRunTimeline
@@ -1230,7 +1375,14 @@ export function MessageList({
                 {activeTool ? (
                   <ToolIndicator toolName={activeTool} />
                 ) : (
-                  <TypingIndicator />
+                  activityMessage ? (
+                    <span className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+                      <Loader2 className="size-3 animate-spin" />
+                      {activityMessage}
+                    </span>
+                  ) : (
+                    <TypingIndicator />
+                  )
                 )}
               </div>
               <AgentRunTimeline
@@ -1260,7 +1412,6 @@ export function MessageList({
           </div>
         )}
 
-        <div ref={bottomRef} />
       </div>
       <Dialog
         open={!!feedbackTarget}

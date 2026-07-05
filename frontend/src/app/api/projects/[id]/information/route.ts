@@ -1,88 +1,51 @@
 import { NextRequest, NextResponse } from "next/server";
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { createHash } from "crypto";
+import { and, desc, eq, isNull, or } from "drizzle-orm";
 import { db } from "@/db";
 import {
-  projectDocuments,
-  projectFacts,
-  projectInfoCategories,
+  knowledgeNodes,
+  knowledgeNodeSupertags,
+  knowledgeSupertags,
+  projectQaEntries,
+  projects,
   recordTables,
 } from "@/db/schema";
 import { getSession } from "@/lib/auth";
 import { decryptTextIfNeeded, encryptText } from "@/lib/server/field-crypto";
+import {
+  appendKnowledgeRevision,
+  decryptNodeBodyText,
+  encryptNodeBodyJson,
+  encryptNodeBodyText,
+  ensureDocsWorkspace,
+  serializeNode,
+  serializeSupertag,
+  upsertKnowledgeSearchIndex,
+} from "@/lib/server/knowledge-docs-utils";
 import {
   getAccessibleProject,
   getWritableProject,
 } from "@/lib/server/project-access";
 import { normalizeProjectManagementConfig } from "@/lib/server/project-workspace-management";
 
-const DEFAULT_CATEGORIES = [
-  {
-    key: "overview",
-    label: "概要",
-    description: "案件の入口として最低限の目的・範囲・前提を置きます。",
-    status: "active",
-    source: "template",
-    sortOrder: 0,
-  },
-  {
-    key: "important_documents",
-    label: "重要資料",
-    description: "パラメーターシート、構成図、設計書など作業時に参照する正本資料です。",
-    status: "active",
-    source: "template",
-    sortOrder: 10,
-  },
-  {
-    key: "decisions",
-    label: "決定事項",
-    description: "顧客・社内・ベンダー間で決まったことと、その出典を置きます。",
-    status: "active",
-    source: "template",
-    sortOrder: 20,
-  },
-  {
-    key: "open_questions",
-    label: "要確認",
-    description: "未確定事項、回答待ち、確認依頼を置きます。",
-    status: "active",
-    source: "template",
-    sortOrder: 30,
-  },
-  {
-    key: "architecture",
-    label: "構成",
-    description: "構成図、接続関係、環境一覧などがある案件で使います。",
-    status: "suggested",
-    source: "template",
-    sortOrder: 40,
-  },
-  {
-    key: "detail_design",
-    label: "詳細設計",
-    description: "パラメーターシート、設定値、設計書を扱う案件で使います。",
-    status: "suggested",
-    source: "template",
-    sortOrder: 50,
-  },
-  {
-    key: "verification",
-    label: "検証",
-    description: "テスト計画、検証項目、結果報告を扱う案件で使います。",
-    status: "suggested",
-    source: "template",
-    sortOrder: 60,
-  },
+const QA_STATUSES = new Set(["unanswered", "answered", "stale", "archived"]);
+const QA_REVIEW_STATES = new Set(["candidate", "accepted", "rejected"]);
+const PROJECT_INFORMATION_SUPERTAG = "Project information";
+const PROJECT_INFORMATION_SYSTEM_KEY = "project_info";
+const PROJECT_INFORMATION_SECTIONS = [
+  "Overview",
+  "Scope",
+  "Assumptions",
+  "Decisions",
+  "Issues",
+  "References",
+  "Q&A",
 ];
 
-const CATEGORY_STATUSES = new Set(["active", "suggested", "hidden", "archived"]);
-const ITEM_STATUSES = new Set(["active", "suggested", "archived"]);
-const TARGET_KINDS = new Set(["file", "record_table", "url"]);
-const AI_ACCESS_LEVELS = new Set(["metadata", "read", "edit", "blocked"]);
-
-function cleanString(value: unknown, fallback = ""): string {
+function cleanString(value: unknown, fallback = "", maxLength = 500): string {
   if (typeof value !== "string") return fallback;
   const trimmed = value.trim();
-  return trimmed || fallback;
+  return (trimmed || fallback).slice(0, maxLength);
 }
 
 function cleanNullableString(value: unknown): string | null {
@@ -90,15 +53,9 @@ function cleanNullableString(value: unknown): string | null {
   return text || null;
 }
 
-function slugKey(value: string): string {
-  return (
-    value
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9_\-\u3040-\u30ff\u3400-\u9fff]+/g, "_")
-      .replace(/^_+|_+$/g, "")
-      .slice(0, 120) || `category_${Date.now().toString(36)}`
-  );
+function cleanText(value: unknown, maxLength = 200000): string {
+  if (typeof value !== "string") return "";
+  return value.slice(0, maxLength);
 }
 
 function oneOf(value: unknown, allowed: Set<string>, fallback: string): string {
@@ -111,108 +68,222 @@ function numberValue(value: unknown, fallback: number): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
-function decryptFact<T extends { content: string }>(fact: T): T {
+function jsonObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return { ...(value as Record<string, unknown>) };
+}
+
+function decryptQaEntry<T extends { question: string; answer: string | null }>(
+  entry: T,
+): T {
   return {
-    ...fact,
-    content: decryptTextIfNeeded(fact.content, "project_facts.content") || "",
+    ...entry,
+    question:
+      decryptTextIfNeeded(entry.question, "project_qa_entries.question") || "",
+    answer:
+      entry.answer == null
+        ? null
+        : decryptTextIfNeeded(entry.answer, "project_qa_entries.answer") || "",
   };
 }
 
-async function ensureDefaultCategories(projectId: string, userId: string) {
-  const existing = await db
-    .select({ key: projectInfoCategories.key })
-    .from(projectInfoCategories)
-    .where(eq(projectInfoCategories.projectId, projectId));
-  const existingKeys = new Set(existing.map((row) => row.key));
-  const missing = DEFAULT_CATEGORIES.filter((item) => !existingKeys.has(item.key));
-  if (missing.length === 0) return;
-
-  await db.insert(projectInfoCategories).values(
-    missing.map((item) => ({
-      projectId,
-      key: item.key,
-      label: item.label,
-      description: item.description,
-      status: item.status,
-      source: item.source,
-      sortOrder: item.sortOrder,
-      createdBy: userId,
-    })),
-  );
+function normalizedQuestionHash(value: string) {
+  const normalized = value.replace(/\s+/g, " ").trim().toLowerCase();
+  return createHash("sha256").update(normalized).digest("hex");
 }
 
-async function categoryBelongsToProject(projectId: string, categoryId: unknown) {
-  const id = cleanNullableString(categoryId);
-  if (!id) return null;
-  const [category] = await db
+function initialSectionBody(project: { description: string | null }, title: string) {
+  if (title === "Overview") return project.description?.trim() || "Not documented yet";
+  if (title === "Q&A") return "[[project-qa]]";
+  return "Not documented yet";
+}
+
+function projectInformationBodyJson() {
+  return {
+    format: "project_information_doc_block",
+    source: "docs_canonical",
+    blocks: [{ type: "project_qa_block", source: "project_qa_entries" }],
+  };
+}
+
+async function ensureProjectInformationSections(
+  parent: typeof knowledgeNodes.$inferSelect,
+  project: typeof projects.$inferSelect,
+  userId: string,
+) {
+  const children = await db
     .select()
-    .from(projectInfoCategories)
-    .where(
-      and(
-        eq(projectInfoCategories.id, id),
-        eq(projectInfoCategories.projectId, projectId),
-      ),
-    )
+    .from(knowledgeNodes)
+    .where(and(eq(knowledgeNodes.parentId, parent.id), isNull(knowledgeNodes.archivedAt)));
+  const existingTitles = new Set(children.map((child) => child.title));
+  for (const [index, title] of PROJECT_INFORMATION_SECTIONS.entries()) {
+    if (existingTitles.has(title)) continue;
+    await db.insert(knowledgeNodes).values({
+      workspaceId: parent.workspaceId,
+      projectId: project.id,
+      parentId: parent.id,
+      title,
+      bodyText: encryptNodeBodyText(initialSectionBody(project, title)),
+      bodyJson: encryptNodeBodyJson({ format: "project_information_section", title }),
+      nodeType: "node",
+      sortOrder: index,
+      createdBy: userId,
+      updatedBy: userId,
+    });
+  }
+  const [updated] = await db
+    .update(knowledgeNodes)
+    .set({
+      bodyText: encryptNodeBodyText(""),
+      bodyJson: encryptNodeBodyJson(projectInformationBodyJson()),
+      updatedBy: userId,
+      updatedAt: new Date(),
+    })
+    .where(eq(knowledgeNodes.id, parent.id))
+    .returning();
+  await upsertKnowledgeSearchIndex(db, updated, "");
+  return updated;
+}
+
+async function findProjectInformationSection(parentId: string, title: string) {
+  const [section] = await db
+    .select()
+    .from(knowledgeNodes)
+    .where(and(eq(knowledgeNodes.parentId, parentId), eq(knowledgeNodes.title, title), isNull(knowledgeNodes.archivedAt)))
     .limit(1);
-  return category ? id : null;
+  return section ?? null;
 }
 
 function managementDocuments(project: { projectMetadata: unknown }) {
   const config = normalizeProjectManagementConfig(project.projectMetadata);
   const docs: Array<Record<string, unknown>> = [];
-  if (config.wbsFile) {
+  const pushFile = (kind: string, title: string, filePath?: string | null) => {
+    if (!filePath) return;
     docs.push({
-      id: `management:wbs:${config.wbsFile}`,
-      title: "WBS",
-      document_type: "wbs",
-      target_kind: "file",
-      file_path: config.wbsFile,
-      role: "management",
-      status: "active",
-      source_type: "project_management",
-      synthetic: true,
-    });
-  }
-  if (config.issueFile) {
-    docs.push({
-      id: `management:issue:${config.issueFile}`,
-      title: "課題管理表",
-      document_type: "issue",
-      target_kind: "file",
-      file_path: config.issueFile,
-      role: "management",
-      status: "active",
-      source_type: "project_management",
-      synthetic: true,
-    });
-  }
-  if (config.riskFile) {
-    docs.push({
-      id: `management:risk:${config.riskFile}`,
-      title: "リスク管理表",
-      document_type: "risk",
-      target_kind: "file",
-      file_path: config.riskFile,
-      role: "management",
-      status: "active",
-      source_type: "project_management",
-      synthetic: true,
-    });
-  }
-  for (const filePath of config.requestFiles) {
-    docs.push({
-      id: `management:request:${filePath}`,
-      title: filePath.split("/").at(-1) || "補助資料",
-      document_type: "support",
+      id: `management:${kind}:${filePath}`,
+      title,
+      document_type: kind,
       target_kind: "file",
       file_path: filePath,
-      role: "reference",
+      role: "management",
       status: "active",
       source_type: "project_management",
       synthetic: true,
     });
+  };
+  pushFile("wbs", "WBS", config.wbsFile);
+  pushFile("issue", "課題管理表", config.issueFile);
+  pushFile("risk", "リスク管理表", config.riskFile);
+  for (const filePath of config.requestFiles) {
+    pushFile("support", filePath.split("/").at(-1) || "補助資料", filePath);
   }
   return docs;
+}
+
+async function ensureProjectInformationDocument(
+  user: { id: string; role?: string | null },
+  project: typeof projects.$inferSelect,
+) {
+  const workspace = await ensureDocsWorkspace(user);
+  const [supertag] = await db
+    .select()
+    .from(knowledgeSupertags)
+    .where(
+      and(
+        eq(knowledgeSupertags.workspaceId, workspace.id),
+        or(
+          eq(knowledgeSupertags.systemKey, PROJECT_INFORMATION_SYSTEM_KEY),
+          eq(knowledgeSupertags.name, PROJECT_INFORMATION_SUPERTAG),
+          eq(knowledgeSupertags.name, "案件情報"),
+        ),
+      ),
+    )
+    .limit(1);
+
+  if (!supertag) {
+    throw new Error("案件情報スーパータグが見つかりません");
+  }
+
+  let node: typeof knowledgeNodes.$inferSelect | null = null;
+  if (project.knowledgeNodeId) {
+    const [existing] = await db
+      .select()
+      .from(knowledgeNodes)
+      .where(
+        and(
+          eq(knowledgeNodes.id, project.knowledgeNodeId),
+          eq(knowledgeNodes.workspaceId, workspace.id),
+          isNull(knowledgeNodes.archivedAt),
+        ),
+      )
+      .limit(1);
+    node = existing ?? null;
+  }
+
+  if (!node) {
+    const [existing] = await db
+      .select({ node: knowledgeNodes })
+      .from(knowledgeNodes)
+      .innerJoin(
+        knowledgeNodeSupertags,
+        eq(knowledgeNodeSupertags.nodeId, knowledgeNodes.id),
+      )
+      .where(
+        and(
+          eq(knowledgeNodes.workspaceId, workspace.id),
+          eq(knowledgeNodes.projectId, project.id),
+          eq(knowledgeNodeSupertags.supertagId, supertag.id),
+          isNull(knowledgeNodes.archivedAt),
+        ),
+      )
+      .limit(1);
+    node = existing?.node ?? null;
+  }
+
+  if (node) {
+    if (project.knowledgeNodeId !== node.id) {
+      await db
+        .update(projects)
+        .set({ knowledgeNodeId: node.id, updatedAt: new Date() })
+        .where(eq(projects.id, project.id));
+    }
+    const ensured = await ensureProjectInformationSections(node, project, user.id);
+    return { node: ensured, supertag };
+  }
+
+  const initialBodyJson = projectInformationBodyJson();
+
+  const created = await db.transaction(async (tx) => {
+    const [newNode] = await tx
+      .insert(knowledgeNodes)
+      .values({
+        workspaceId: workspace.id,
+        projectId: project.id,
+        title: `${project.name} 案件情報`,
+        bodyText: encryptNodeBodyText(""),
+        bodyJson: encryptNodeBodyJson(initialBodyJson),
+        nodeType: "node",
+        sortOrder: 0,
+        createdBy: user.id,
+        updatedBy: user.id,
+      })
+      .returning();
+    await tx.insert(knowledgeNodeSupertags).values({
+      nodeId: newNode.id,
+      supertagId: supertag.id,
+      createdBy: user.id,
+    });
+    await tx
+      .update(projects)
+      .set({ knowledgeNodeId: newNode.id, updatedAt: new Date() })
+      .where(eq(projects.id, project.id));
+    await upsertKnowledgeSearchIndex(tx, newNode, "");
+    await appendKnowledgeRevision(tx, newNode, user.id, "案件情報Docs正本を作成");
+    return newNode;
+  });
+
+  const ensured = await ensureProjectInformationSections(created, project, user.id);
+  return { node: ensured, supertag };
 }
 
 export async function GET(
@@ -233,31 +304,21 @@ export async function GET(
     );
   }
 
-  await ensureDefaultCategories(projectId, user.id);
-
-  const [categories, documents, facts, tables] = await Promise.all([
+  const { node, supertag } = await ensureProjectInformationDocument(
+    user,
+    access.project,
+  );
+  const [qaEntries, tables] = await Promise.all([
     db
       .select()
-      .from(projectInfoCategories)
-      .where(eq(projectInfoCategories.projectId, projectId))
-      .orderBy(projectInfoCategories.sortOrder, projectInfoCategories.createdAt),
-    db
-      .select()
-      .from(projectDocuments)
+      .from(projectQaEntries)
       .where(
         and(
-          eq(projectDocuments.projectId, projectId),
-          isNull(projectDocuments.deletedAt),
+          eq(projectQaEntries.projectId, projectId),
+          isNull(projectQaEntries.deletedAt),
         ),
       )
-      .orderBy(desc(projectDocuments.isPrimary), desc(projectDocuments.updatedAt)),
-    db
-      .select()
-      .from(projectFacts)
-      .where(
-        and(eq(projectFacts.projectId, projectId), isNull(projectFacts.deletedAt)),
-      )
-      .orderBy(desc(projectFacts.importance), desc(projectFacts.updatedAt)),
+      .orderBy(desc(projectQaEntries.updatedAt)),
     db
       .select({
         id: recordTables.id,
@@ -275,11 +336,12 @@ export async function GET(
       id: access.project.id,
       name: access.project.name,
       description: access.project.description,
+      knowledge_node_id: node.id,
     },
-    categories,
-    documents,
+    node: serializeNode(node),
+    supertag: serializeSupertag(supertag),
+    qa_entries: qaEntries.map(decryptQaEntry),
     management_documents: managementDocuments(access.project),
-    facts: facts.map(decryptFact),
     record_tables: tables,
   });
 }
@@ -304,87 +366,88 @@ export async function POST(
 
   const body = await request.json().catch(() => ({}));
   const kind = cleanString(body.kind);
+  const { node } = await ensureProjectInformationDocument(user, access.project);
 
-  if (kind === "category") {
-    const label = cleanString(body.label);
-    if (!label) return NextResponse.json({ detail: "label is required" }, { status: 400 });
-    const key = slugKey(cleanString(body.key, label));
+  if (kind === "qa") {
+    const question = cleanString(body.question);
+    if (!question) {
+      return NextResponse.json({ detail: "question is required" }, { status: 400 });
+    }
+    const answer = cleanNullableString(body.answer);
     const [created] = await db
-      .insert(projectInfoCategories)
+      .insert(projectQaEntries)
       .values({
         projectId,
-        key,
-        label,
-        description: cleanNullableString(body.description),
-        status: oneOf(body.status, CATEGORY_STATUSES, "active"),
-        source: "manual",
-        sortOrder: numberValue(body.sort_order, Date.now()),
+        knowledgeNodeId: node.id,
+        question: encryptText(question, "project_qa_entries.question"),
+        answer: answer ? encryptText(answer, "project_qa_entries.answer") : null,
+        normalizedQuestionHash: normalizedQuestionHash(question),
+        status: oneOf(body.status, QA_STATUSES, answer ? "answered" : "unanswered"),
+        reviewState: oneOf(body.review_state, QA_REVIEW_STATES, "accepted"),
+        confidence: numberValue(body.confidence, 1),
+        askedCount: Math.max(1, Math.round(numberValue(body.asked_count, 1))),
+        sourceMessageIds: Array.isArray(body.source_message_ids)
+          ? body.source_message_ids
+          : [],
+        sourceAgentRunIds: Array.isArray(body.source_agent_run_ids)
+          ? body.source_agent_run_ids
+          : [],
+        sourceToolCallIds: Array.isArray(body.source_tool_call_ids)
+          ? body.source_tool_call_ids
+          : [],
+        answerSourceRefs: Array.isArray(body.answer_source_refs)
+          ? body.answer_source_refs
+          : [],
         createdBy: user.id,
+        updatedBy: user.id,
+        createdByAgent: Boolean(body.created_by_agent),
       })
       .returning();
-    return NextResponse.json({ category: created }, { status: 201 });
+    return NextResponse.json({ qa_entry: decryptQaEntry(created) }, { status: 201 });
   }
 
-  if (kind === "document") {
+  if (kind === "reference") {
     const title = cleanString(body.title);
-    if (!title) return NextResponse.json({ detail: "title is required" }, { status: 400 });
-    const targetKind = oneOf(body.target_kind, TARGET_KINDS, "file");
-    const categoryId = await categoryBelongsToProject(projectId, body.category_id);
-    const [created] = await db
-      .insert(projectDocuments)
-      .values({
-        projectId,
-        categoryId,
-        title,
-        description: cleanNullableString(body.description),
-        documentType: cleanString(body.document_type, "document"),
-        targetKind,
-        filePath: targetKind === "file" ? cleanNullableString(body.file_path) : null,
-        recordTableId:
-          targetKind === "record_table" ? cleanNullableString(body.record_table_id) : null,
-        externalUrl: targetKind === "url" ? cleanNullableString(body.external_url) : null,
-        role: cleanString(body.role, "reference"),
-        isPrimary: Boolean(body.is_primary),
-        aiAccessLevel: oneOf(body.ai_access_level, AI_ACCESS_LEVELS, "metadata"),
-        status: oneOf(body.status, ITEM_STATUSES, "active"),
-        notes: cleanNullableString(body.notes),
-        sourceType: cleanString(body.source_type, "manual"),
-        sourceRef: cleanNullableString(body.source_ref),
-        createdBy: user.id,
-      })
-      .returning();
-    return NextResponse.json({ document: created }, { status: 201 });
-  }
-
-  if (kind === "fact") {
-    const title = cleanString(body.title);
-    const content = cleanString(body.content);
-    if (!title || !content) {
+    const target =
+      cleanNullableString(body.file_path) ||
+      cleanNullableString(body.external_url) ||
+      cleanNullableString(body.record_table_id);
+    if (!title || !target) {
       return NextResponse.json(
-        { detail: "title and content are required" },
+        { detail: "title and reference target are required" },
         { status: 400 },
       );
     }
-    const categoryId = await categoryBelongsToProject(projectId, body.category_id);
+    const description = cleanNullableString(body.description);
+    const section = await findProjectInformationSection(node.id, "References");
+    const referenceBody = `${target}${description ? `\n${description}` : ""}`;
     const [created] = await db
-      .insert(projectFacts)
+      .insert(knowledgeNodes)
       .values({
+        workspaceId: node.workspaceId,
         projectId,
-        categoryId,
+        parentId: section?.id ?? node.id,
         title,
-        content: encryptText(content, "project_facts.content"),
-        factType: cleanString(body.fact_type, "fact"),
-        confidence: numberValue(body.confidence, 1),
-        importance: Math.max(1, Math.min(10, Math.round(numberValue(body.importance, 5)))),
-        status: oneOf(body.status, ITEM_STATUSES, "active"),
-        sourceType: cleanString(body.source_type, "manual"),
-        sourceRef: cleanNullableString(body.source_ref),
-        sourceDocumentId: cleanNullableString(body.source_document_id),
-        sourceTaskId: cleanNullableString(body.source_task_id),
+        bodyText: encryptNodeBodyText(referenceBody),
+        bodyJson: encryptNodeBodyJson({
+          format: "project_information_reference",
+          target,
+          description,
+          source: {
+            file_path: cleanNullableString(body.file_path),
+            external_url: cleanNullableString(body.external_url),
+            record_table_id: cleanNullableString(body.record_table_id),
+          },
+        }),
+        nodeType: "reference",
+        sortOrder: Date.now(),
         createdBy: user.id,
+        updatedBy: user.id,
       })
       .returning();
-    return NextResponse.json({ fact: decryptFact(created) }, { status: 201 });
+    await upsertKnowledgeSearchIndex(db, created, referenceBody);
+    await appendKnowledgeRevision(db, created, user.id, "Project information reference added");
+    return NextResponse.json({ node: serializeNode(created) }, { status: 201 });
   }
 
   return NextResponse.json({ detail: "Invalid kind" }, { status: 400 });
@@ -410,119 +473,98 @@ export async function PATCH(
 
   const body = await request.json().catch(() => ({}));
   const kind = cleanString(body.kind);
+
+  if (kind === "document_node") {
+    const nodeId = cleanString(body.node_id);
+    if (!nodeId) return NextResponse.json({ detail: "node_id is required" }, { status: 400 });
+    const [node] = await db
+      .select()
+      .from(knowledgeNodes)
+      .where(
+        and(
+          eq(knowledgeNodes.id, nodeId),
+          eq(knowledgeNodes.projectId, projectId),
+          isNull(knowledgeNodes.archivedAt),
+        ),
+      )
+      .limit(1);
+    if (!node) {
+      return NextResponse.json({ detail: "node not found" }, { status: 404 });
+    }
+
+    const updates: Partial<typeof knowledgeNodes.$inferInsert> = {
+      updatedBy: user.id,
+      updatedAt: new Date(),
+    };
+    let nextBodyText = decryptNodeBodyText(node.bodyText ?? "");
+    if (body.title !== undefined) {
+      updates.title = cleanString(body.title, node.title, 500);
+    }
+    if (body.body_text !== undefined) {
+      nextBodyText = cleanText(body.body_text, 200000);
+      updates.bodyText = encryptNodeBodyText(nextBodyText);
+    }
+    if (body.body_json !== undefined) {
+      updates.bodyJson = encryptNodeBodyJson(jsonObject(body.body_json));
+    }
+
+    const [updated] = await db
+      .update(knowledgeNodes)
+      .set(updates)
+      .where(eq(knowledgeNodes.id, node.id))
+      .returning();
+    await upsertKnowledgeSearchIndex(db, updated, nextBodyText);
+    await appendKnowledgeRevision(
+      db,
+      updated,
+      user.id,
+      cleanString(body.update_reason, "案件情報Docs正本を更新", 200),
+    );
+    return NextResponse.json({ node: serializeNode(updated) });
+  }
+
   const id = cleanString(body.id);
   if (!id) return NextResponse.json({ detail: "id is required" }, { status: 400 });
 
-  if (kind === "category") {
-    const updates: Partial<typeof projectInfoCategories.$inferInsert> = {
+  if (kind === "qa") {
+    const updates: Partial<typeof projectQaEntries.$inferInsert> = {
+      updatedBy: user.id,
       updatedAt: new Date(),
     };
-    if (body.label !== undefined) updates.label = cleanString(body.label);
-    if (body.description !== undefined) {
-      updates.description = cleanNullableString(body.description);
+    if (body.question !== undefined) {
+      const question = cleanString(body.question);
+      if (!question) {
+        return NextResponse.json({ detail: "question is required" }, { status: 400 });
+      }
+      updates.question = encryptText(question, "project_qa_entries.question");
+      updates.normalizedQuestionHash = normalizedQuestionHash(question);
+    }
+    if (body.answer !== undefined) {
+      const answer = cleanNullableString(body.answer);
+      updates.answer = answer ? encryptText(answer, "project_qa_entries.answer") : null;
+      if (answer && body.status === undefined) updates.status = "answered";
     }
     if (body.status !== undefined) {
-      updates.status = oneOf(body.status, CATEGORY_STATUSES, "active");
+      updates.status = oneOf(body.status, QA_STATUSES, "unanswered");
     }
-    if (body.sort_order !== undefined) {
-      updates.sortOrder = numberValue(body.sort_order, 0);
+    if (body.review_state !== undefined) {
+      updates.reviewState = oneOf(body.review_state, QA_REVIEW_STATES, "candidate");
+    }
+    if (body.confidence !== undefined) {
+      updates.confidence = numberValue(body.confidence, 1);
+    }
+    if (body.answer_source_refs !== undefined) {
+      updates.answerSourceRefs = Array.isArray(body.answer_source_refs)
+        ? body.answer_source_refs
+        : [];
     }
     const [updated] = await db
-      .update(projectInfoCategories)
+      .update(projectQaEntries)
       .set(updates)
-      .where(
-        and(
-          eq(projectInfoCategories.id, id),
-          eq(projectInfoCategories.projectId, projectId),
-        ),
-      )
+      .where(and(eq(projectQaEntries.id, id), eq(projectQaEntries.projectId, projectId)))
       .returning();
     return updated
-      ? NextResponse.json({ category: updated })
-      : NextResponse.json({ detail: "not found" }, { status: 404 });
-  }
-
-  if (kind === "document") {
-    const categoryId =
-      body.category_id === undefined
-        ? undefined
-        : await categoryBelongsToProject(projectId, body.category_id);
-    const updates: Partial<typeof projectDocuments.$inferInsert> = {
-      updatedAt: new Date(),
-    };
-    if (body.title !== undefined) updates.title = cleanString(body.title);
-    if (body.description !== undefined) {
-      updates.description = cleanNullableString(body.description);
-    }
-    if (body.category_id !== undefined) updates.categoryId = categoryId;
-    if (body.document_type !== undefined) {
-      updates.documentType = cleanString(body.document_type, "document");
-    }
-    if (body.target_kind !== undefined) {
-      updates.targetKind = oneOf(body.target_kind, TARGET_KINDS, "file");
-    }
-    if (body.file_path !== undefined) updates.filePath = cleanNullableString(body.file_path);
-    if (body.record_table_id !== undefined) {
-      updates.recordTableId = cleanNullableString(body.record_table_id);
-    }
-    if (body.external_url !== undefined) {
-      updates.externalUrl = cleanNullableString(body.external_url);
-    }
-    if (body.role !== undefined) updates.role = cleanString(body.role, "reference");
-    if (body.is_primary !== undefined) updates.isPrimary = Boolean(body.is_primary);
-    if (body.ai_access_level !== undefined) {
-      updates.aiAccessLevel = oneOf(body.ai_access_level, AI_ACCESS_LEVELS, "metadata");
-    }
-    if (body.status !== undefined) {
-      updates.status = oneOf(body.status, ITEM_STATUSES, "active");
-    }
-    if (body.notes !== undefined) updates.notes = cleanNullableString(body.notes);
-    const [updated] = await db
-      .update(projectDocuments)
-      .set(updates)
-      .where(
-        and(eq(projectDocuments.id, id), eq(projectDocuments.projectId, projectId)),
-      )
-      .returning();
-    return updated
-      ? NextResponse.json({ document: updated })
-      : NextResponse.json({ detail: "not found" }, { status: 404 });
-  }
-
-  if (kind === "fact") {
-    const categoryId =
-      body.category_id === undefined
-        ? undefined
-        : await categoryBelongsToProject(projectId, body.category_id);
-    const updates: Partial<typeof projectFacts.$inferInsert> = {
-      updatedAt: new Date(),
-    };
-    if (body.title !== undefined) updates.title = cleanString(body.title);
-    if (body.content !== undefined) {
-      updates.content = encryptText(
-        cleanString(body.content),
-        "project_facts.content",
-      );
-    }
-    if (body.category_id !== undefined) updates.categoryId = categoryId;
-    if (body.fact_type !== undefined) updates.factType = cleanString(body.fact_type, "fact");
-    if (body.importance !== undefined) {
-      updates.importance = Math.max(
-        1,
-        Math.min(10, Math.round(numberValue(body.importance, 5))),
-      );
-    }
-    if (body.status !== undefined) {
-      updates.status = oneOf(body.status, ITEM_STATUSES, "active");
-    }
-    if (body.source_ref !== undefined) updates.sourceRef = cleanNullableString(body.source_ref);
-    const [updated] = await db
-      .update(projectFacts)
-      .set(updates)
-      .where(and(eq(projectFacts.id, id), eq(projectFacts.projectId, projectId)))
-      .returning();
-    return updated
-      ? NextResponse.json({ fact: decryptFact(updated) })
+      ? NextResponse.json({ qa_entry: decryptQaEntry(updated) })
       : NextResponse.json({ detail: "not found" }, { status: 404 });
   }
 
@@ -537,7 +579,6 @@ export async function DELETE(
   if (!user) {
     return NextResponse.json({ detail: "認証が必要です" }, { status: 401 });
   }
-
   const { id: projectId } = await params;
   const access = await getWritableProject(projectId, user);
   if (!access) {
@@ -546,40 +587,20 @@ export async function DELETE(
       { status: 404 },
     );
   }
-
-  const body = await request.json().catch(() => ({}));
-  const kind = cleanString(body.kind);
-  const id = cleanString(body.id);
-  if (!id) return NextResponse.json({ detail: "id is required" }, { status: 400 });
-
-  if (kind === "category") {
-    await db
-      .update(projectInfoCategories)
-      .set({ status: "archived", updatedAt: new Date() })
-      .where(
-        and(
-          eq(projectInfoCategories.id, id),
-          eq(projectInfoCategories.projectId, projectId),
-        ),
-      );
-    return NextResponse.json({ success: true });
-  }
-  if (kind === "document") {
-    await db
-      .update(projectDocuments)
-      .set({ deletedAt: new Date(), updatedAt: new Date() })
-      .where(
-        and(eq(projectDocuments.id, id), eq(projectDocuments.projectId, projectId)),
-      );
-    return NextResponse.json({ success: true });
-  }
-  if (kind === "fact") {
-    await db
-      .update(projectFacts)
-      .set({ deletedAt: new Date(), updatedAt: new Date() })
-      .where(and(eq(projectFacts.id, id), eq(projectFacts.projectId, projectId)));
-    return NextResponse.json({ success: true });
+  const { searchParams } = new URL(request.url);
+  const kind = searchParams.get("kind");
+  const id = searchParams.get("id");
+  if (kind !== "qa" || !id) {
+    return NextResponse.json({ detail: "Invalid kind or id" }, { status: 400 });
   }
 
-  return NextResponse.json({ detail: "Invalid kind" }, { status: 400 });
+  const now = new Date();
+  const [updated] = await db
+    .update(projectQaEntries)
+    .set({ status: "archived", deletedAt: now, updatedAt: now, updatedBy: user.id })
+    .where(and(eq(projectQaEntries.id, id), eq(projectQaEntries.projectId, projectId)))
+    .returning();
+  return updated
+    ? NextResponse.json({ ok: true })
+    : NextResponse.json({ detail: "not found" }, { status: 404 });
 }

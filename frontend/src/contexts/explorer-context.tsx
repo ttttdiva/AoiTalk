@@ -30,6 +30,7 @@ import {
   creatorMatchesQuery,
   type CreatorMapping,
 } from "@/lib/hf/creator-mapping";
+import { buildExplorerRangeSelection } from "@/lib/explorer-selection";
 
 export type ViewMode = "grid" | "list";
 export type FilerTab = "workspace" | "user" | "hf" | "hydrus";
@@ -63,6 +64,7 @@ interface ExplorerContextType {
   focusedItemPath: string | null;
   selectItem: (path: string) => void;
   toggleSelect: (path: string) => void;
+  selectRange: (path: string, orderedPaths: string[], additive?: boolean) => void;
   selectAll: () => void;
   clearSelection: () => void;
 
@@ -192,6 +194,8 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   const [viewMode, setViewModeState] = useState<ViewMode>("grid");
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
   const [focusedItemPath, setFocusedItemPath] = useState<string | null>(null);
+  const selectionAnchorPathRef = useRef<string | null>(null);
+  const previousShiftRangeRef = useRef<Set<string>>(new Set());
   const [clipboard, setClipboard] = useState<ClipboardState | null>(null);
   const [bookmarks, setBookmarks] = useState<ExplorerBookmark[]>([]);
   const [storageCtx, setStorageCtx] = useState<StorageContext | null>(null);
@@ -413,6 +417,8 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
           }
           setSelectedItems(new Set());
           setFocusedItemPath(null);
+          selectionAnchorPathRef.current = null;
+          previousShiftRangeRef.current = new Set();
         } catch {
           setError("ディレクトリの読み込みに失敗しました");
         } finally {
@@ -489,6 +495,8 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   const selectItem = useCallback((path: string) => {
     setSelectedItems(new Set([path]));
     setFocusedItemPath(path);
+    selectionAnchorPathRef.current = path;
+    previousShiftRangeRef.current = new Set();
   }, []);
 
   const toggleSelect = useCallback((path: string) => {
@@ -499,7 +507,29 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       return next;
     });
     setFocusedItemPath(path);
+    selectionAnchorPathRef.current = path;
+    previousShiftRangeRef.current = new Set();
   }, []);
+
+  const selectRange = useCallback(
+    (path: string, orderedPaths: string[], additive = false) => {
+      setSelectedItems((prev) => {
+        const result = buildExplorerRangeSelection({
+          orderedPaths,
+          anchorPath: selectionAnchorPathRef.current,
+          targetPath: path,
+          selectedPaths: prev,
+          previousShiftRange: previousShiftRangeRef.current,
+          additive,
+        });
+        selectionAnchorPathRef.current = result.anchorPath;
+        previousShiftRangeRef.current = result.shiftRange;
+        return result.selectedPaths;
+      });
+      setFocusedItemPath(path);
+    },
+    [],
+  );
 
   const selectAll = useCallback(() => {
     if (!browseData) return;
@@ -512,11 +542,18 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     setFocusedItemPath((current) =>
       current && all.has(current) ? current : allPaths[0] ?? null,
     );
-  }, [browseData]);
+    selectionAnchorPathRef.current =
+      focusedItemPath && all.has(focusedItemPath)
+        ? focusedItemPath
+        : (allPaths[0] ?? null);
+    previousShiftRangeRef.current = new Set();
+  }, [browseData, focusedItemPath]);
 
   const clearSelection = useCallback(() => {
     setSelectedItems(new Set());
     setFocusedItemPath(null);
+    selectionAnchorPathRef.current = null;
+    previousShiftRangeRef.current = new Set();
   }, []);
 
   // ブックマーク
@@ -712,6 +749,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
         focusedItemPath,
         selectItem,
         toggleSelect,
+        selectRange,
         selectAll,
         clearSelection,
         clipboard,

@@ -62,6 +62,11 @@ export async function mockAuthenticatedApis(page: Page) {
       return;
     }
 
+    if (url.pathname === "/api/users/list") {
+      await route.fulfill({ json: [] });
+      return;
+    }
+
     if (url.pathname === "/api/spaces") {
       await route.fulfill({ json: { spaces: [], total: 0 } });
       return;
@@ -74,6 +79,40 @@ export async function mockAuthenticatedApis(page: Page) {
 
     if (url.pathname === "/api/tasks") {
       await route.fulfill({ json: [] });
+      return;
+    }
+
+    if (url.pathname === "/api/time-entries/active") {
+      await route.fulfill({ json: null });
+      return;
+    }
+
+    if (url.pathname === "/api/docs") {
+      await route.fulfill({
+        json: {
+          workspace: {
+            id: "workspace-1",
+            name: "Personal Docs",
+            description: "",
+            owner_user_id: "user-1",
+            settings: {},
+            created_at: "2026-06-30T00:00:00",
+            updated_at: "2026-06-30T00:00:00",
+          },
+          nodes: [],
+          supertags: [],
+          node_supertags: [],
+          fields: [],
+          field_values: [],
+          views: [],
+          ai_suggestions: [],
+          import_jobs: [],
+          import_items: [],
+          attachments: [],
+          edges: [],
+          projects: [],
+        },
+      });
       return;
     }
 
@@ -157,6 +196,16 @@ export async function mockAuthenticatedApis(page: Page) {
 
     if (url.pathname === "/api/python-proxy/llm/engine") {
       await route.fulfill({ json: { available: [], provider: "", model: "" } });
+      return;
+    }
+
+    if (url.pathname === "/api/python-proxy/llm/models") {
+      await route.fulfill({
+        json: {
+          current: { provider: "mock", model: "mock-model" },
+          providers: [{ id: "mock", label: "Mock", models: [] }],
+        },
+      });
       return;
     }
 

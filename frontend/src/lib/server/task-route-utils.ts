@@ -19,6 +19,7 @@ export function taskToSnake(
   const map: Record<string, string> = {
     id: "id",
     projectId: "project_id",
+    knowledgeNodeId: "knowledge_node_id",
     title: "title",
     description: "description",
     status: "status",

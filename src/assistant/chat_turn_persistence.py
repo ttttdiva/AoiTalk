@@ -110,7 +110,7 @@ class ChatTurnPersistence:
             return None
         if not await self._ensure_ready():
             return None
-        return await self.memory_manager.add_message_to_session(
+        message = await self.memory_manager.add_message_to_session(
             session_id=session_id,
             role="user",
             content=content,
@@ -120,6 +120,16 @@ class ChatTurnPersistence:
             sender_id=sender_id,
             sender_display_name=sender_display_name,
         )
+        if message is not None:
+            try:
+                from ..services.project_qa_candidate_service import (
+                    queue_project_qa_candidate_extraction,
+                )
+
+                queue_project_qa_candidate_extraction(message.id)
+            except Exception:
+                pass
+        return message
 
     async def save_assistant_message(
         self,

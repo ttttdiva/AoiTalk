@@ -28,8 +28,8 @@ def build_diagram_tools() -> list:
         """Render a Mermaid diagram from stored project data. scope: auto / system / wbs / record_table. Returns mermaid text plus source facts so the caller can refine labels or compose a diagram when no deterministic one is available."""
         from ...memory.database import get_database_manager
         from ...memory.models import (
+            KnowledgeNode,
             Project,
-            ProjectFact,
             RecordField,
             RecordRow,
             RecordTable,
@@ -136,27 +136,22 @@ def build_diagram_tools() -> list:
                     for task in tasks_result.scalars().all()
                 ]
 
-                facts_result = await session.execute(
-                    select(ProjectFact)
+                docs_result = await session.execute(
+                    select(KnowledgeNode)
                     .where(
-                        ProjectFact.project_id == resolved_project_id,
-                        ProjectFact.deleted_at.is_(None),
-                        ProjectFact.status != "archived",
+                        KnowledgeNode.project_id == resolved_project_id,
+                        KnowledgeNode.archived_at.is_(None),
                     )
-                    .order_by(
-                        ProjectFact.importance.desc(),
-                        ProjectFact.updated_at.desc(),
-                    )
+                    .order_by(KnowledgeNode.updated_at.desc())
                     .limit(50)
                 )
-                facts = [
+                docs_nodes = [
                     {
-                        "id": str(fact.id),
-                        "title": fact.title,
-                        "fact_type": fact.fact_type,
-                        "content": (fact.content or "")[:500],
+                        "id": str(node.id),
+                        "title": node.title,
+                        "body_text": (node.body_text or "")[:500],
                     }
-                    for fact in facts_result.scalars().all()
+                    for node in docs_result.scalars().all()
                 ]
 
                 mermaid = None
@@ -199,7 +194,7 @@ def build_diagram_tools() -> list:
                     if mermaid is None:
                         notes.append(
                             "機器一覧/接続一覧に該当するrecord tableがない。"
-                            "facts を元に構成図を作成すること。"
+                            "Docs本文を元に構成図を作成すること。"
                         )
                 else:
                     mermaid = build_system_diagram(project_name, tables)
@@ -211,7 +206,7 @@ def build_diagram_tools() -> list:
                         used_scope = "none"
                         notes.append(
                             "構造化データから図を生成できなかった。"
-                            "facts を元に構成図を作成すること。"
+                            "Docs本文を元に構成図を作成すること。"
                         )
 
                 return {
@@ -221,7 +216,7 @@ def build_diagram_tools() -> list:
                     "scope": used_scope,
                     "mermaid": mermaid,
                     "sources": {
-                        "facts": facts,
+                        "docs_nodes": docs_nodes,
                         "record_tables": [
                             {
                                 "name": t["name"],

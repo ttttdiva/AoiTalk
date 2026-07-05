@@ -210,7 +210,7 @@ AoiTalk は会話本文・OAuthトークン・APIキーなどを扱うため、�
 
 - PostgreSQL / Qdrant は localhost でのみ待ち受ける
 - `.env` は AoiTalk 実行ユーザー、SYSTEM、Administrators 以外に読ませない
-- DB内の OAuth トークン、APIキー、会話本文、履歴、summary、context、案件DBレコード、knowledge chunk はアプリ層で暗号化する
+- DB内の OAuth トークン、APIキー、会話本文、履歴、summary、context、案件情報Docs本文、record table、knowledge chunk はアプリ層で暗号化する
 - 暗号化データキーは `.env` に置かず、Windows では DPAPI 保護ファイルから取得する
 - Qdrant payload の本文も暗号化され、検索結果は AoiTalk サーバ内で復号される
 

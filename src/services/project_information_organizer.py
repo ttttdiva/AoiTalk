@@ -15,13 +15,8 @@ from uuid import UUID, uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..memory.models import (
-    ProjectContextPack,
-    ProjectDocument,
-    ProjectFact,
-    ProjectInfoCategory,
-    ProjectInfoSyncState,
-)
+from ..memory.models import Project, ProjectContextPack
+from .project_information_docs import update_project_information_doc
 
 logger = logging.getLogger(__name__)
 
@@ -654,12 +649,12 @@ async def organize_with_llm(
     ]
     prompt = f"""
 あなたは案件情報整理エージェントです。
-プロジェクト「{project_name}」のファイラー資料を読み、案件情報DBへ保存する構造化案を作ってください。
+プロジェクト「{project_name}」のファイラー資料を読み、案件情報Docs正本へ反映する構造化案を作ってください。
 
 対象フォルダ: {source_folder or "プロジェクトファイラー直下"}
 
 重要:
-- 案件情報DBの主語は資料ではなく案件です。
+- 案件情報Docsの主語は資料ではなく案件です。
 - documents は根拠資料リンクです。資料名や資料要約を facts に複製しないでください。
 - facts には案件の概要、前提、要件、構成、決定事項、要確認事項、リスク、課題、検証条件など、案件そのものの知識だけを入れてください。
 - Markdown表、表の1行、CSV行、機器一覧、接続一覧、WBS行は facts に入れないでください。これらは record table / 台帳に分離する対象です。
@@ -737,52 +732,59 @@ are valid when supported by the documents.
     return _draft_from_llm_json(parsed, source_folder, fallback)
 
 
-async def _ensure_categories(
-    session: AsyncSession,
-    project_id: UUID,
-    user_id: UUID,
-    draft_categories: list[DraftCategory] | None = None,
-) -> dict[str, ProjectInfoCategory]:
-    result = await session.execute(
-        select(ProjectInfoCategory).where(ProjectInfoCategory.project_id == project_id)
-    )
-    categories = {item.key: item for item in result.scalars().all()}
-    for item in DEFAULT_CATEGORIES:
-        if item["key"] in categories:
-            continue
-        category = ProjectInfoCategory(
-            project_id=project_id,
-            key=item["key"],
-            label=item["label"],
-            description=item["description"],
-            status="active",
-            source="agent",
-            sort_order=item["sort_order"],
-            created_by=user_id,
-        )
-        session.add(category)
-        categories[item["key"]] = category
+def _draft_to_markdown(draft: OrganizationDraft, scanned_files: list[ScannedProjectFile]) -> str:
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    folder = draft.source_folder or "プロジェクトファイラー直下"
+    lines = [
+        f"## 資料整理 {now}",
+        "",
+        f"- 対象: `{folder}`",
+        f"- 走査ファイル数: {len(scanned_files)}",
+        f"- 生成方式: {draft.generated_by}",
+        "",
+    ]
 
-    max_sort_order = max((item.sort_order or 0 for item in categories.values()), default=0)
-    for item in draft_categories or []:
-        key = _category_key(item.key, "custom_category")
-        if not key or key in categories:
-            continue
-        max_sort_order = max(max_sort_order + 10, float(item.sort_order or 0))
-        category = ProjectInfoCategory(
-            project_id=project_id,
-            key=key,
-            label=_clip(_clean_text(item.label, key), 200),
-            description=_clip(_clean_text(item.description), 1000) or None,
-            status=item.status if item.status in {"active", "suggested", "archived"} else "active",
-            source="agent",
-            sort_order=max_sort_order,
-            created_by=user_id,
-        )
-        session.add(category)
-        categories[key] = category
-    await session.flush()
-    return categories
+    if draft.summary_md:
+        lines.extend(["### サマリー", "", draft.summary_md.strip(), ""])
+
+    if draft.documents:
+        lines.extend(["### 根拠資料", ""])
+        for document in draft.documents:
+            description = f" - {document.description}" if document.description else ""
+            lines.append(
+                f"- **{document.title}**: `{document.file_path}`"
+                f" ({document.document_type}, {document.role}){description}"
+            )
+        lines.append("")
+
+    if draft.facts:
+        lines.extend(["### 案件情報候補", ""])
+        for fact in draft.facts:
+            source = f" / source: `{fact.source_ref}`" if fact.source_ref else ""
+            lines.extend(
+                [
+                    f"#### {fact.title}",
+                    "",
+                    fact.content.strip(),
+                    "",
+                    f"- type: {fact.fact_type}",
+                    f"- category: {fact.category_key}",
+                    f"- importance: {fact.importance}{source}",
+                    "",
+                ]
+            )
+
+    if draft.decisions:
+        lines.extend(["### 決定事項", ""])
+        lines.extend(f"- {item}" for item in draft.decisions)
+        lines.append("")
+
+    if draft.open_questions:
+        lines.extend(["### 要確認", ""])
+        lines.extend(f"- {item}" for item in draft.open_questions)
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
 
 
 async def apply_organization_draft(
@@ -793,82 +795,17 @@ async def apply_organization_draft(
     draft: OrganizationDraft,
     scanned_files: list[ScannedProjectFile],
 ) -> dict[str, int]:
-    categories = await _ensure_categories(
+    project = await session.get(Project, project_id)
+    if project is None:
+        raise ValueError("Project not found.")
+
+    node = await update_project_information_doc(
         session,
-        project_id,
-        user_id,
-        draft.categories,
+        project=project,
+        user_id=user_id,
+        append_text=_draft_to_markdown(draft, scanned_files),
+        change_summary="フォルダ整理結果を案件情報Docs正本へ反映",
     )
-    document_count = 0
-    fact_count = 0
-
-    for item in draft.documents:
-        category = categories.get(item.category_key) or categories["important_documents"]
-        result = await session.execute(
-            select(ProjectDocument)
-            .where(ProjectDocument.project_id == project_id)
-            .where(ProjectDocument.deleted_at.is_(None))
-            .where(ProjectDocument.file_path == item.file_path)
-            .limit(1)
-        )
-        doc = result.scalar_one_or_none()
-        if doc is None:
-            doc = ProjectDocument(
-                project_id=project_id,
-                created_by=user_id,
-                source_type="agent",
-            )
-            session.add(doc)
-        doc.category_id = category.id
-        doc.title = item.title[:255]
-        doc.description = item.description or None
-        doc.document_type = item.document_type[:64]
-        doc.target_kind = "file"
-        doc.file_path = item.file_path
-        doc.role = item.role[:64]
-        doc.is_primary = item.is_primary
-        doc.ai_access_level = (
-            item.ai_access_level
-            if item.ai_access_level in {"metadata", "read", "edit", "blocked"}
-            else "read"
-        )
-        doc.status = "active"
-        doc.notes = item.notes or None
-        doc.source_ref = draft.source_folder or None
-        doc.updated_at = datetime.utcnow()
-        document_count += 1
-
-    await session.flush()
-
-    for item in draft.facts:
-        category = categories.get(item.category_key) or categories["overview"]
-        result = await session.execute(
-            select(ProjectFact)
-            .where(ProjectFact.project_id == project_id)
-            .where(ProjectFact.deleted_at.is_(None))
-            .where(ProjectFact.title == item.title[:255])
-            .where(ProjectFact.source_ref == (item.source_ref or None))
-            .limit(1)
-        )
-        fact = result.scalar_one_or_none()
-        if fact is None:
-            fact = ProjectFact(
-                project_id=project_id,
-                created_by=user_id,
-                source_type="agent",
-            )
-            session.add(fact)
-        fact.category_id = category.id
-        fact.title = item.title[:255]
-        fact.content = item.content
-        fact.fact_type = item.fact_type[:64]
-        fact.confidence = 0.85 if draft.generated_by == "llm" else 0.65
-        fact.importance = max(1, min(10, int(item.importance or 5)))
-        fact.status = "active"
-        fact.source_type = "agent"
-        fact.source_ref = item.source_ref or None
-        fact.updated_at = datetime.utcnow()
-        fact_count += 1
 
     pack_result = await session.execute(
         select(ProjectContextPack).where(ProjectContextPack.project_id == project_id)
@@ -891,33 +828,12 @@ async def apply_organization_draft(
     }
     pack.updated_at = datetime.utcnow()
 
-    state_result = await session.execute(
-        select(ProjectInfoSyncState)
-        .where(ProjectInfoSyncState.project_id == project_id)
-        .where(ProjectInfoSyncState.source_type == "folder_organizer")
-        .limit(1)
-    )
-    state = state_result.scalar_one_or_none()
-    if state is None:
-        state = ProjectInfoSyncState(
-            project_id=project_id,
-            source_type="folder_organizer",
-        )
-        session.add(state)
-    now = datetime.utcnow()
-    state.last_synced_at = now
-    state.last_seen_updated_at = now
-    state.cursor = {"folder": draft.source_folder}
-    state.sync_metadata = {
-        "generated_by": draft.generated_by,
-        "documents": document_count,
-        "facts": fact_count,
-        "files": len(scanned_files),
-    }
-    state.updated_at = now
-
     await session.commit()
-    return {"documents": document_count, "facts": fact_count}
+    return {
+        "documents": len(draft.documents),
+        "facts": len(draft.facts),
+        "knowledge_node_id": str(node.id),
+    }
 
 
 async def organize_project_folder(

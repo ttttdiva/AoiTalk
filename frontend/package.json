@@ -8,7 +8,10 @@
     "start": "next start",
     "lint": "eslint && node scripts/check-time-safety.mjs",
     "test": "vitest run",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "docs:migrate-supertags": "node scripts/migrate-docs-supertags-out-of-body.mjs",
+    "docs:migrate-markdown": "node scripts/migrate-docs-markdown-to-blocks.mjs",
+    "docs:verify-markdown-blocks": "node scripts/verify-docs-markdown-blocks.mjs"
   },
   "dependencies": {
     "@auth/core": "^0.41.0",

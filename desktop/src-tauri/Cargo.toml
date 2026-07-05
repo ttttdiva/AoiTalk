@@ -1,0 +1,14 @@
+[package]
+name = "aoitalk-desktop"
+version = "0.1.0"
+description = "AoiTalk Desktop"
+authors = ["AoiTalk"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+libc = "0.2"
+tauri = { version = "2", features = [] }
+time = "=0.3.36"

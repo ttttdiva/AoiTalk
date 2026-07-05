@@ -674,7 +674,7 @@ class CLILLMClient:
                                          user_input=user_input,
                                          context=context,
                                      ))
-            return future.result(timeout=300)
+            return future.result()
 
     def _run_async_in_new_loop(self, coro):
         """Run a coroutine in a new event loop (thread-safe)"""
@@ -942,7 +942,11 @@ class CLILLMClient:
             else f"キャラクターとしての応答を維持してください: {self.character_name}"
         )
         parts.extend([
-            "追加確認が必要な場合は `[TOOL_CALL: tool_name(key=value)]` 形式で続けてください。",
+            "ツール結果を受け取った後は、まず元のユーザー要求がすでに満たされたかを判定してください。",
+            "満たされている場合は、追加の `[TOOL_CALL: ...]` を出さず、直ちに最終回答してください。",
+            "追加の `[TOOL_CALL: tool_name(key=value)]` が許されるのは、直前の結果がエラー、空、不完全、不整合、古い、元の要求に未完了の別サブタスクが残っている、直前の結果で新しい確認対象が発生した、または変更系作業で変更後の検証が未完了の場合だけです。",
+            "「念のため」「もう一度確認」だけを理由に、成功したツール結果を再確認しないでください。",
+            "同じツールの再実行は、変更後検証、変更されたファイルの確認、エラー解消、未完了サブタスクの処理など、具体的な新しい理由がある場合だけ許可されます。",
             "",
             "元のユーザー発話:",
             original_input,

@@ -87,15 +87,31 @@ interface LlmEngineResponse {
 interface SettingsPayload {
   settings?: {
     agent_team?: {
-      enabled?: boolean;
       confirm_prompt?: boolean;
       notify?: boolean;
       redaction_terms?: string[];
       strategy?: string;
-      members?: Record<string, ModelRouteSettings>;
       roster?: ModelRouteSettings[];
     };
+    model_routing?: ModelRoutingSettings;
   };
+}
+
+interface ModelRoutingSettings {
+  classes?: {
+    heavy?: ModelRouteSettings;
+    light?: ModelRouteSettings;
+    vision?: ModelRouteSettings & { base_url?: string; api_key?: string };
+    audio?: ModelRouteSettings & {
+      engine?: "speech_recognition" | "llm" | "off";
+      base_url?: string;
+      api_key?: string;
+    };
+  };
+  media?: {
+    image_mode?: "auto" | "always" | "off";
+  };
+  overrides?: Record<string, ModelRouteSettings>;
 }
 
 interface ModelRouteSettings {
@@ -176,6 +192,16 @@ type ModelRouteDraft = {
   defaultInstances: number;
   maxInstances: number;
   runner: string;
+};
+
+type ModelClassDraft = {
+  provider: string;
+  model: string;
+  customModel: string;
+  mode: string;
+  baseUrl: string;
+  apiKey: string;
+  engine?: "speech_recognition" | "llm" | "off";
 };
 
 const MODEL_ROUTE_DEFINITIONS: ModelRouteDefinition[] = [
@@ -405,7 +431,7 @@ function buildRouteDrafts(
       return [
         definition.key,
         {
-          enabled: route.enabled === true,
+          enabled: Boolean(route.provider && route.model),
           provider: routeProvider,
           model: selection.model,
           customModel: selection.customModel,
@@ -418,6 +444,34 @@ function buildRouteDrafts(
       ];
     }),
   ) as Record<ModelRouteKey, ModelRouteDraft>;
+}
+
+function suggestedLightModel(providerId: string, currentModelId: string): string {
+  if (providerId === "openai") return "gpt-4o-mini";
+  if (providerId === "gemini") return "gemini-2.5-flash";
+  if (providerId === "openrouter") return "openai/gpt-4o-mini";
+  return currentModelId;
+}
+
+function buildClassDraft(
+  route: (ModelRouteSettings & { base_url?: string; api_key?: string; engine?: "speech_recognition" | "llm" | "off" }) | undefined,
+  providers: LlmProviderCatalog[] | undefined,
+): ModelClassDraft {
+  const routeProvider = route?.provider || "";
+  const routeModel = route?.model || "";
+  const providerCatalog = providers?.find((item) => item.id === routeProvider);
+  const selection = routeProvider && routeModel
+    ? routeSelection(providerCatalog, routeModel)
+    : { model: "", customModel: "" };
+  return {
+    provider: routeProvider,
+    model: selection.model,
+    customModel: selection.customModel || (!providerCatalog && routeModel ? routeModel : ""),
+    mode: route?.mode || route?.reasoning_effort || "",
+    baseUrl: route?.base_url || "",
+    apiKey: "",
+    engine: route?.engine,
+  };
 }
 
 export function LlmModelSection() {
@@ -439,10 +493,17 @@ export function LlmModelSection() {
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [reasoningEffort, setReasoningEffort] = useState("medium");
-  const [routingEnabled, setRoutingEnabled] = useState(false);
   const [routingConfirmPrompt, setRoutingConfirmPrompt] = useState(true);
   const [routingNotify, setRoutingNotify] = useState(true);
   const [agentTeamRedactionText, setAgentTeamRedactionText] = useState("");
+  const [imageMode, setImageMode] = useState<"auto" | "always" | "off">("auto");
+  const [routingDetailsOpen, setRoutingDetailsOpen] = useState(false);
+  const [classDrafts, setClassDrafts] = useState<Record<"heavy" | "light" | "vision" | "audio", ModelClassDraft>>({
+    heavy: buildClassDraft(undefined, undefined),
+    light: buildClassDraft(undefined, undefined),
+    vision: buildClassDraft(undefined, undefined),
+    audio: { ...buildClassDraft(undefined, undefined), engine: "speech_recognition" },
+  });
   const [routingDrafts, setRoutingDrafts] = useState<Record<ModelRouteKey, ModelRouteDraft>>(() =>
     buildRouteDrafts(undefined, undefined),
   );
@@ -821,13 +882,23 @@ export function LlmModelSection() {
     try {
       const data = await pyFetch<SettingsPayload>("/settings");
       const team = data.settings?.agent_team;
-      setRoutingEnabled(team?.enabled ?? false);
+      const routing = data.settings?.model_routing;
       setRoutingConfirmPrompt(team?.confirm_prompt ?? true);
       setRoutingNotify(team?.notify ?? true);
       setAgentTeamRedactionText((team?.redaction_terms ?? []).join(", "));
-      setRoutingDrafts(buildRouteDrafts(team?.members, catalog?.providers));
+      setImageMode(routing?.media?.image_mode ?? "auto");
+      setClassDrafts({
+        heavy: buildClassDraft(routing?.classes?.heavy, catalog?.providers),
+        light: buildClassDraft(routing?.classes?.light, catalog?.providers),
+        vision: buildClassDraft(routing?.classes?.vision, catalog?.providers),
+        audio: {
+          ...buildClassDraft(routing?.classes?.audio, catalog?.providers),
+          engine: routing?.classes?.audio?.engine ?? "speech_recognition",
+        },
+      });
+      setRoutingDrafts(buildRouteDrafts(routing?.overrides, catalog?.providers));
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Agent Team 設定を取得できませんでした");
+      toast.error(error instanceof Error ? error.message : "モデルルーティング設定を取得できませんでした");
     }
   }, [catalog]);
 
@@ -887,10 +958,6 @@ export function LlmModelSection() {
     try {
       await pyFetch("/settings", {
         method: "PATCH",
-        body: JSON.stringify({ key: "agent_team.enabled", value: routingEnabled }),
-      });
-      await pyFetch("/settings", {
-        method: "PATCH",
         body: JSON.stringify({ key: "agent_team.confirm_prompt", value: routingConfirmPrompt }),
       });
       await pyFetch("/settings", {
@@ -907,6 +974,48 @@ export function LlmModelSection() {
             .filter(Boolean),
         }),
       });
+      await pyFetch("/settings", {
+        method: "PATCH",
+        body: JSON.stringify({ key: "model_routing.media.image_mode", value: imageMode }),
+      });
+
+      for (const classKey of ["heavy", "light", "vision", "audio"] as const) {
+        const draft = classDrafts[classKey];
+        const targetModel = (draft.customModel.trim() || draft.model).trim();
+        if (classKey === "audio") {
+          await pyFetch("/settings", {
+            method: "PATCH",
+            body: JSON.stringify({
+              key: "model_routing.classes.audio.engine",
+              value: draft.engine ?? "speech_recognition",
+            }),
+          });
+        }
+        for (const [field, value] of [
+          ["provider", draft.provider],
+          ["model", targetModel],
+          ["base_url", draft.baseUrl.trim()],
+          ["reasoning_effort", draft.mode],
+          ["mode", draft.mode],
+        ] as const) {
+          await pyFetch("/settings", {
+            method: "PATCH",
+            body: JSON.stringify({
+              key: `model_routing.classes.${classKey}.${field}`,
+              value,
+            }),
+          });
+        }
+        if (draft.apiKey.trim()) {
+          await pyFetch("/settings", {
+            method: "PATCH",
+            body: JSON.stringify({
+              key: `model_routing.classes.${classKey}.api_key`,
+              value: draft.apiKey.trim(),
+            }),
+          });
+        }
+      }
 
       for (const definition of MODEL_ROUTE_DEFINITIONS) {
         const draft = routingDrafts[definition.key];
@@ -923,85 +1032,64 @@ export function LlmModelSection() {
         await pyFetch("/settings", {
           method: "PATCH",
           body: JSON.stringify({
-            key: `agent_team.members.${definition.key}.enabled`,
-            value: draft.enabled,
+            key: `model_routing.overrides.${definition.key}.provider`,
+            value: draft.enabled ? draft.provider : "",
           }),
         });
         await pyFetch("/settings", {
           method: "PATCH",
           body: JSON.stringify({
-            key: `agent_team.members.${definition.key}.provider`,
-            value: draft.provider,
-          }),
-        });
-        await pyFetch("/settings", {
-          method: "PATCH",
-          body: JSON.stringify({
-            key: `agent_team.members.${definition.key}.model`,
-            value: targetModel || definition.defaultModel,
+            key: `model_routing.overrides.${definition.key}.model`,
+            value: draft.enabled ? targetModel : "",
           }),
         });
         if (routeMode) {
           await pyFetch("/settings", {
             method: "PATCH",
             body: JSON.stringify({
-              key: `agent_team.members.${definition.key}.mode`,
-              value: routeMode,
+              key: `model_routing.overrides.${definition.key}.mode`,
+              value: draft.enabled ? routeMode : "",
             }),
           });
           await pyFetch("/settings", {
             method: "PATCH",
             body: JSON.stringify({
-              key: `agent_team.members.${definition.key}.reasoning_effort`,
-              value: routeMode,
+              key: `model_routing.overrides.${definition.key}.reasoning_effort`,
+              value: draft.enabled ? routeMode : "",
             }),
           });
         }
         await pyFetch("/settings", {
           method: "PATCH",
           body: JSON.stringify({
-            key: `agent_team.members.${definition.key}.label`,
-            value: definition.label,
+            key: `model_routing.overrides.${definition.key}.default_instances`,
+            value: draft.enabled ? draft.defaultInstances : 1,
           }),
         });
         await pyFetch("/settings", {
           method: "PATCH",
           body: JSON.stringify({
-            key: `agent_team.members.${definition.key}.scalable`,
-            value: draft.scalable,
-          }),
-        });
-        await pyFetch("/settings", {
-          method: "PATCH",
-          body: JSON.stringify({
-            key: `agent_team.members.${definition.key}.default_instances`,
-            value: draft.defaultInstances,
-          }),
-        });
-        await pyFetch("/settings", {
-          method: "PATCH",
-          body: JSON.stringify({
-            key: `agent_team.members.${definition.key}.max_instances`,
-            value: draft.maxInstances,
+            key: `model_routing.overrides.${definition.key}.max_instances`,
+            value: draft.enabled ? draft.maxInstances : definition.defaultMaxInstances ?? 1,
           }),
         });
         if (definition.key === "agent_harness" || draft.runner) {
           await pyFetch("/settings", {
             method: "PATCH",
             body: JSON.stringify({
-              key: `agent_team.members.${definition.key}.runner`,
-              value: draft.runner || "codex_exec",
+              key: `model_routing.overrides.${definition.key}.runner`,
+              value: draft.enabled ? draft.runner || "codex_exec" : "",
             }),
           });
         }
       }
-      toast.success("Agent Team 設定を保存しました");
+      toast.success("モデルルーティング設定を保存しました");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Agent Team 設定を保存できませんでした");
+      toast.error(error instanceof Error ? error.message : "モデルルーティング設定を保存できませんでした");
     } finally {
       setSavingRouting(false);
     }
-  }, [agentTeamRedactionText, catalog, routingConfirmPrompt, routingDrafts, routingEnabled, routingNotify]);
+  }, [agentTeamRedactionText, catalog, classDrafts, imageMode, routingConfirmPrompt, routingDrafts, routingNotify]);
 
   return (
     <Card size="sm">
@@ -1099,7 +1187,262 @@ export function LlmModelSection() {
               </div>
 
               {hasProviderSettings && (
-                <div className="space-y-3 rounded-md border p-3">
+                  <div className="space-y-3 rounded-md border p-3">
+                    <div className="grid gap-3 md:grid-cols-2">
+                      {(["heavy", "light"] as const).map((classKey) => {
+                        const draft = classDrafts[classKey];
+                        const providerCatalog = catalog.providers.find((item) => item.id === draft.provider);
+                        return (
+                          <div key={classKey} className="space-y-2 rounded border p-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="text-xs font-medium">
+                                {classKey === "heavy" ? "高負荷推論" : "軽量・大量呼び出し"}
+                              </div>
+                              {classKey === "light" && (
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-7 px-2 text-[11px]"
+                                  disabled={savingRouting}
+                                  onClick={() => {
+                                    const nextModel = suggestedLightModel(provider, selectedModelId);
+                                    setClassDrafts((current) => ({
+                                      ...current,
+                                      light: {
+                                        ...current.light,
+                                        provider,
+                                        model: nextModel,
+                                        customModel: catalog.providers.find((item) => item.id === provider)?.models.some((item) => item.id === nextModel) ? "" : nextModel,
+                                      },
+                                    }));
+                                  }}
+                                >
+                                  推奨を適用
+                                </Button>
+                              )}
+                            </div>
+                            <select
+                              value={draft.provider}
+                              onChange={(event) => {
+                                const nextProvider = event.target.value;
+                                const next = catalog.providers.find((item) => item.id === nextProvider);
+                                const selection = nextProvider ? providerSelection(next) : { model: "", customModel: "" };
+                                setClassDrafts((current) => ({
+                                  ...current,
+                                  [classKey]: { ...current[classKey], provider: nextProvider, ...selection },
+                                }));
+                              }}
+                              disabled={savingRouting}
+                              className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none dark:bg-input/30"
+                            >
+                              <option value="">メインを継承</option>
+                              {catalog.providers
+                                .filter((item) => !item.id.endsWith("-cli") && item.id !== "claude" && item.id !== "grok")
+                                .map((item) => (
+                                  <option key={item.id} value={item.id}>
+                                    {item.label}
+                                  </option>
+                                ))}
+                            </select>
+                            {draft.provider && (
+                              <div className="grid gap-2 md:grid-cols-2">
+                                <select
+                                  value={draft.model}
+                                  onChange={(event) =>
+                                    setClassDrafts((current) => ({
+                                      ...current,
+                                      [classKey]: { ...current[classKey], model: event.target.value, customModel: "" },
+                                    }))
+                                  }
+                                  disabled={savingRouting}
+                                  className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none dark:bg-input/30"
+                                >
+                                  {(providerCatalog?.models ?? []).map((item) => (
+                                    <option key={item.id} value={item.id}>
+                                      {item.label}
+                                    </option>
+                                  ))}
+                                </select>
+                                <Input
+                                  value={draft.customModel}
+                                  onChange={(event) =>
+                                    setClassDrafts((current) => ({
+                                      ...current,
+                                      [classKey]: { ...current[classKey], customModel: event.target.value },
+                                    }))
+                                  }
+                                  placeholder="カスタムID"
+                                  disabled={savingRouting}
+                                  className="h-8"
+                                />
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    <div className="grid gap-3 md:grid-cols-2">
+                      <div className="space-y-2 rounded border p-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="text-xs font-medium">画像認識</div>
+                          <select
+                            value={imageMode}
+                            onChange={(event) => setImageMode(event.target.value as "auto" | "always" | "off")}
+                            disabled={savingRouting}
+                            className="h-8 rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none dark:bg-input/30"
+                          >
+                            <option value="auto">auto</option>
+                            <option value="always">always</option>
+                            <option value="off">off</option>
+                          </select>
+                        </div>
+                        <div className="grid gap-2 md:grid-cols-2">
+                          <select
+                            value={classDrafts.vision.provider}
+                            onChange={(event) => {
+                              const nextProvider = event.target.value;
+                              const next = catalog.providers.find((item) => item.id === nextProvider);
+                              const selection = nextProvider ? providerSelection(next) : { model: "", customModel: "" };
+                              setClassDrafts((current) => ({
+                                ...current,
+                                vision: { ...current.vision, provider: nextProvider, ...selection },
+                              }));
+                            }}
+                            disabled={savingRouting || imageMode === "off"}
+                            className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none dark:bg-input/30"
+                          >
+                            <option value="">未設定</option>
+                            {catalog.providers.filter((item) => !item.id.endsWith("-cli")).map((item) => (
+                              <option key={item.id} value={item.id}>{item.label}</option>
+                            ))}
+                          </select>
+                          <Input
+                            value={classDrafts.vision.customModel || classDrafts.vision.model}
+                            onChange={(event) =>
+                              setClassDrafts((current) => ({
+                                ...current,
+                                vision: { ...current.vision, customModel: event.target.value, model: "" },
+                              }))
+                            }
+                            placeholder="モデルID"
+                            disabled={savingRouting || imageMode === "off"}
+                            className="h-8"
+                          />
+                        </div>
+                        <div className="grid gap-2 md:grid-cols-2">
+                          <Input
+                            value={classDrafts.vision.baseUrl}
+                            onChange={(event) =>
+                              setClassDrafts((current) => ({
+                                ...current,
+                                vision: { ...current.vision, baseUrl: event.target.value },
+                              }))
+                            }
+                            placeholder="Base URL"
+                            disabled={savingRouting || imageMode === "off"}
+                            className="h-8"
+                          />
+                          <Input
+                            value={classDrafts.vision.apiKey}
+                            onChange={(event) =>
+                              setClassDrafts((current) => ({
+                                ...current,
+                                vision: { ...current.vision, apiKey: event.target.value },
+                              }))
+                            }
+                            placeholder="API key（空なら維持）"
+                            disabled={savingRouting || imageMode === "off"}
+                            className="h-8"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="space-y-2 rounded border p-2">
+                        <div className="text-xs font-medium">音声認識</div>
+                        <select
+                          value={classDrafts.audio.engine ?? "speech_recognition"}
+                          onChange={(event) =>
+                            setClassDrafts((current) => ({
+                              ...current,
+                              audio: { ...current.audio, engine: event.target.value as "speech_recognition" | "llm" | "off" },
+                            }))
+                          }
+                          disabled={savingRouting}
+                          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none dark:bg-input/30"
+                        >
+                          <option value="speech_recognition">既存STT</option>
+                          <option value="llm">LLM</option>
+                          <option value="off">無効</option>
+                        </select>
+                        {classDrafts.audio.engine === "llm" && (
+                          <div className="grid gap-2 md:grid-cols-2">
+                            <select
+                              value={classDrafts.audio.provider}
+                              onChange={(event) => {
+                                const nextProvider = event.target.value;
+                                const next = catalog.providers.find((item) => item.id === nextProvider);
+                                const selection = nextProvider ? providerSelection(next) : { model: "", customModel: "" };
+                                setClassDrafts((current) => ({
+                                  ...current,
+                                  audio: { ...current.audio, provider: nextProvider, ...selection },
+                                }));
+                              }}
+                              disabled={savingRouting}
+                              className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none dark:bg-input/30"
+                            >
+                              <option value="">未設定</option>
+                              {catalog.providers
+                                .filter((item) => ["openai", "gemini", "openrouter", "openai_compatible_local", "sglang", "ollama"].includes(item.id))
+                                .map((item) => (
+                                  <option key={item.id} value={item.id}>{item.label}</option>
+                                ))}
+                            </select>
+                            <Input
+                              value={classDrafts.audio.customModel || classDrafts.audio.model}
+                              onChange={(event) =>
+                                setClassDrafts((current) => ({
+                                  ...current,
+                                  audio: { ...current.audio, customModel: event.target.value, model: "" },
+                                }))
+                              }
+                              placeholder="モデルID"
+                              disabled={savingRouting}
+                              className="h-8"
+                            />
+                          </div>
+                        )}
+                        {classDrafts.audio.engine === "llm" && (
+                          <div className="grid gap-2 md:grid-cols-2">
+                            <Input
+                              value={classDrafts.audio.baseUrl}
+                              onChange={(event) =>
+                                setClassDrafts((current) => ({
+                                  ...current,
+                                  audio: { ...current.audio, baseUrl: event.target.value },
+                                }))
+                              }
+                              placeholder="Base URL"
+                              disabled={savingRouting}
+                              className="h-8"
+                            />
+                            <Input
+                              value={classDrafts.audio.apiKey}
+                              onChange={(event) =>
+                                setClassDrafts((current) => ({
+                                  ...current,
+                                  audio: { ...current.audio, apiKey: event.target.value },
+                                }))
+                              }
+                              placeholder="API key（空なら維持）"
+                              disabled={savingRouting}
+                              className="h-8"
+                            />
+                          </div>
+                        )}
+                      </div>
+                    </div>
                   {showConnectionSettings && (
                     <div className="grid gap-3 md:grid-cols-2">
                       <div className="space-y-1">
@@ -1359,33 +1702,28 @@ export function LlmModelSection() {
 
               <div className="space-y-3">
                 <div className="flex items-center justify-between gap-3">
-                  <label className="flex items-center gap-2 text-xs">
-                    <Checkbox
-                      checked={routingEnabled}
-                      onCheckedChange={(checked) => setRoutingEnabled(checked === true)}
-                      disabled={savingRouting}
-                    />
-                    Agent Team を使う
-                  </label>
-                  {!routingEnabled && (
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={saveRoutingSettings}
-                      disabled={savingRouting}
-                    >
-                      {savingRouting ? (
-                        <Loader2 className="mr-1 size-3 animate-spin" />
-                      ) : (
-                        <Save className="mr-1 size-3" />
-                      )}
-                      保存
-                    </Button>
-                  )}
+                  <div>
+                    <div className="text-xs font-medium">モデルルーティング</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      未設定の行はメインモデルを継承します。
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={saveRoutingSettings}
+                    disabled={savingRouting}
+                  >
+                    {savingRouting ? (
+                      <Loader2 className="mr-1 size-3 animate-spin" />
+                    ) : (
+                      <Save className="mr-1 size-3" />
+                    )}
+                    保存
+                  </Button>
                 </div>
 
-                {routingEnabled && (
-                  <div className="space-y-3 rounded-md border p-3">
+                <div className="space-y-3 rounded-md border p-3">
                     <div className="flex flex-wrap items-center gap-4">
                       <label className="flex items-center gap-2 text-xs">
                         <Checkbox
@@ -1436,7 +1774,21 @@ export function LlmModelSection() {
                           {current?.provider ?? "-"} / {current?.model ?? "-"}
                         </Badge>
                       </div>
-                      {MODEL_ROUTE_DEFINITIONS.map((definition) => {
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        className="h-8 justify-start px-2 text-xs"
+                        onClick={() => setRoutingDetailsOpen((value) => !value)}
+                      >
+                        {routingDetailsOpen ? (
+                          <ChevronUp className="mr-1 size-3" />
+                        ) : (
+                          <ChevronDown className="mr-1 size-3" />
+                        )}
+                        用途別の詳細設定
+                      </Button>
+                      {routingDetailsOpen && MODEL_ROUTE_DEFINITIONS.map((definition) => {
                         const draft = routingDrafts[definition.key];
                         const providers = routeProviderOptions(definition);
                         const providerCatalog = catalog.providers.find((item) => item.id === draft.provider);
@@ -1625,7 +1977,6 @@ export function LlmModelSection() {
                       })}
                     </div>
                   </div>
-                )}
               </div>
             </>
           ) : (

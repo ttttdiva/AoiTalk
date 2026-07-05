@@ -11,6 +11,7 @@ import mimetypes
 import os
 import re
 import shutil
+import stat
 import zipfile
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -296,6 +297,12 @@ def _format_path_for_response(path: Path, root: Optional[Path] = None) -> str:
         return str(path.relative_to(root)).replace("\\", "/")
     except ValueError:
         return str(path).replace("\\", "/")
+
+
+def _remove_readonly(function, path, _exc_info) -> None:
+    """Retry removal after making Windows read-only files writable."""
+    os.chmod(path, stat.S_IWRITE)
+    function(path)
 
 
 def _next_available_path(parent: Path, filename: str) -> Path:
@@ -723,6 +730,81 @@ def download_file(
         return None, None, None
 
 
+def _selected_archive_name(resolved_items: List[Path]) -> str:
+    if len(resolved_items) == 1:
+        source = resolved_items[0]
+        base_name = source.name if source.is_dir() else source.stem
+        return f"{base_name or 'archive'}.zip"
+    return "archive.zip"
+
+
+def _write_selected_items_to_archive(
+    archive: zipfile.ZipFile, resolved_items: List[Path]
+) -> None:
+    for source in resolved_items:
+        if source.is_symlink():
+            continue
+        if source.is_file():
+            archive.write(source, source.name)
+            continue
+
+        for child in sorted(source.rglob("*"), key=lambda p: str(p).lower()):
+            if child.is_symlink():
+                continue
+            rel = child.relative_to(source)
+            arcname = PurePosixPath(source.name, *rel.parts).as_posix()
+            if child.is_dir():
+                # Preserve empty directories.
+                if not any(child.iterdir()):
+                    archive.writestr(f"{arcname}/", b"")
+            elif child.is_file():
+                archive.write(child, arcname)
+
+
+def _resolve_selected_items(
+    paths: List[str], is_admin: bool = False
+) -> Tuple[List[Path], Optional[str]]:
+    if not paths:
+        return [], "対象が選択されていません"
+
+    root = get_root_dir()
+    resolved_items: List[Path] = []
+    for raw_path in paths:
+        target, valid = _resolve_path(raw_path, is_admin=is_admin)
+        if not valid or not target.exists():
+            return [], f"対象が見つかりません: {raw_path}"
+        if target == root or (is_admin and target.parent == target):
+            return [], "ルートディレクトリは対象にできません"
+        resolved_items.append(target)
+    return resolved_items, None
+
+
+def download_items(
+    paths: List[str], is_admin: bool = False
+) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+    """Get selected files/folders as a downloadable payload without creating files."""
+    if len(paths) == 1:
+        return download_file(paths[0], is_admin=is_admin)
+
+    resolved_items, error = _resolve_selected_items(paths, is_admin=is_admin)
+    if error:
+        return None, None, None
+
+    try:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(
+            buffer, mode="w", compression=zipfile.ZIP_DEFLATED
+        ) as archive:
+            _write_selected_items_to_archive(archive, resolved_items)
+        return (
+            buffer.getvalue(),
+            _selected_archive_name(resolved_items),
+            "application/zip",
+        )
+    except Exception:
+        return None, None, None
+
+
 def archive_items(
     paths: List[str], dest_path: str = "", is_admin: bool = False
 ) -> Dict[str, Any]:
@@ -736,47 +818,22 @@ def archive_items(
     if not dest.exists() or not dest.is_dir():
         return {"success": False, "error": "圧縮先ディレクトリが見つかりません"}
 
+    resolved_items, error = _resolve_selected_items(paths, is_admin=is_admin)
+    if error:
+        return {
+            "success": False,
+            "error": error.replace("対象にできません", "圧縮できません"),
+        }
+
     root = get_root_dir()
-    resolved_items: List[Path] = []
-    for raw_path in paths:
-        target, valid = _resolve_path(raw_path, is_admin=is_admin)
-        if not valid or not target.exists():
-            return {"success": False, "error": f"対象が見つかりません: {raw_path}"}
-        if target == root or (is_admin and target.parent == target):
-            return {"success": False, "error": "ルートディレクトリは圧縮できません"}
-        resolved_items.append(target)
-
-    if len(resolved_items) == 1:
-        source = resolved_items[0]
-        base_name = source.name if source.is_dir() else source.stem
-        archive_name = f"{base_name or 'archive'}.zip"
-    else:
-        archive_name = "archive.zip"
-
+    archive_name = _selected_archive_name(resolved_items)
     archive_path = _next_available_path(dest, _sanitize_name(archive_name))
 
     try:
         with zipfile.ZipFile(
             archive_path, mode="w", compression=zipfile.ZIP_DEFLATED
         ) as archive:
-            for source in resolved_items:
-                if source.is_symlink():
-                    continue
-                if source.is_file():
-                    archive.write(source, source.name)
-                    continue
-
-                for child in sorted(source.rglob("*"), key=lambda p: str(p).lower()):
-                    if child.is_symlink():
-                        continue
-                    rel = child.relative_to(source)
-                    arcname = PurePosixPath(source.name, *rel.parts).as_posix()
-                    if child.is_dir():
-                        # Preserve empty directories.
-                        if not any(child.iterdir()):
-                            archive.writestr(f"{arcname}/", b"")
-                    elif child.is_file():
-                        archive.write(child, arcname)
+            _write_selected_items_to_archive(archive, resolved_items)
 
         return {
             "success": True,
@@ -1075,8 +1132,10 @@ def delete_item(path: str, is_admin: bool = False) -> Dict[str, Any]:
 
     try:
         name = target.name
-        if target.is_dir():
-            shutil.rmtree(str(target))
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        elif target.is_dir():
+            shutil.rmtree(str(target), onerror=_remove_readonly)
         else:
             target.unlink()
 
@@ -1451,6 +1510,13 @@ def find_workspace_items(
                         "size_display": _format_size(stat.st_size),
                     }
                 )
+            if is_dir:
+                try:
+                    result["item_count"] = sum(
+                        1 for child in item.iterdir() if not child.name.startswith(".")
+                    )
+                except (OSError, PermissionError):
+                    result["item_count"] = None
             results.append(result)
             if len(results) >= max_results:
                 truncated = True

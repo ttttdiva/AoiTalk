@@ -8,11 +8,10 @@ import {
   taskComments,
   taskActivities,
   taskRecurrenceRules,
-  taskOccurrences,
-  notificationDeliveries,
   users,
   timeEntries,
   projects,
+  knowledgeNodes,
 } from "@/db/schema";
 import { eq, desc, inArray, sql, isNull, and, max } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
@@ -42,6 +41,14 @@ import {
   taskToSnake,
   type SessionUser,
 } from "@/lib/server/task-route-utils";
+import {
+  collectTaskTreeIds,
+  deleteTaskTreeRows,
+} from "@/lib/server/task-delete";
+import {
+  appendKnowledgeRevision,
+  upsertKnowledgeSearchIndex,
+} from "@/lib/server/knowledge-docs-utils";
 
 async function hasWritableProjectAccess(
   user: SessionUser,
@@ -539,6 +546,9 @@ export async function PATCH(
   if (body.estimated_hours !== undefined)
     updateData.estimatedHours =
       body.estimated_hours != null ? Number(body.estimated_hours) : null;
+  if (body.knowledge_node_id !== undefined) {
+    updateData.knowledgeNodeId = normalizeOptionalUuid(body.knowledge_node_id);
+  }
   if (
     body.metadata !== undefined &&
     body.metadata &&
@@ -559,6 +569,41 @@ export async function PATCH(
       { detail: "タスクが見つかりません" },
       { status: 404 },
     );
+  }
+
+  if (
+    body.title !== undefined &&
+    updated.knowledgeNodeId &&
+    updated.title !== priorTask.title
+  ) {
+    const [linkedNode] = await db
+      .update(knowledgeNodes)
+      .set({
+        title: updated.title,
+        updatedBy: user.id,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(knowledgeNodes.id, updated.knowledgeNodeId),
+          isNull(knowledgeNodes.archivedAt),
+        ),
+      )
+      .returning();
+    if (linkedNode) {
+      await upsertKnowledgeSearchIndex(
+        db,
+        linkedNode,
+        decryptTextIfNeeded(linkedNode.bodyText ?? "", "knowledge_nodes.body_text") ??
+          "",
+      );
+      await appendKnowledgeRevision(
+        db,
+        linkedNode,
+        user.id,
+        "タスクタイトルをDocs nodeへ同期",
+      );
+    }
   }
 
   if (body.project_id !== undefined) {
@@ -903,59 +948,13 @@ export async function DELETE(
   }
 
   try {
-    // サブタスクを先に削除（再帰的に子タスクの関連レコードも削除）
-    const subtaskRows = await db
-      .select({ id: tasks.id })
-      .from(tasks)
-      .where(and(eq(tasks.parentTaskId, id), isNull(tasks.deletedAt)));
-    for (const sub of subtaskRows) {
-      await deleteAutoGoogleCalendarForTask(sub.id, user);
-      await db
-        .delete(notificationDeliveries)
-        .where(eq(notificationDeliveries.taskId, sub.id));
-      await db.delete(timeEntries).where(eq(timeEntries.taskId, sub.id));
-      await db
-        .delete(taskOccurrences)
-        .where(eq(taskOccurrences.taskId, sub.id));
-      await db.execute(
-        sql`DELETE FROM task_activities WHERE task_id = ${sub.id}`,
-      );
-      await db.execute(
-        sql`DELETE FROM task_dependencies WHERE task_id = ${sub.id} OR depends_on_task_id = ${sub.id}`,
-      );
-      await db
-        .delete(taskRecurrenceRules)
-        .where(eq(taskRecurrenceRules.taskId, sub.id));
-      await db.delete(taskComments).where(eq(taskComments.taskId, sub.id));
-      await db.delete(taskTags).where(eq(taskTags.taskId, sub.id));
-      await db.delete(taskAssignees).where(eq(taskAssignees.taskId, sub.id));
-      await db.delete(tasks).where(eq(tasks.id, sub.id));
+    const taskIds = await collectTaskTreeIds(id);
+    for (const taskId of taskIds) {
+      await deleteAutoGoogleCalendarForTask(taskId, user);
     }
 
-    // 子レコードを先に削除（FK依存順: notification/timeEntries→occurrences→残り）
-    // DBのFK制約はcascadeではないため全て手動削除が必要
-    await db
-      .delete(notificationDeliveries)
-      .where(eq(notificationDeliveries.taskId, id));
-    await db.delete(timeEntries).where(eq(timeEntries.taskId, id));
-    await db.delete(taskOccurrences).where(eq(taskOccurrences.taskId, id));
-    // Drizzleスキーマ未定義テーブル（DBに存在するFK制約）
-    await db.execute(sql`DELETE FROM task_activities WHERE task_id = ${id}`);
-    await db.execute(
-      sql`DELETE FROM task_dependencies WHERE task_id = ${id} OR depends_on_task_id = ${id}`,
-    );
-    await db
-      .delete(taskRecurrenceRules)
-      .where(eq(taskRecurrenceRules.taskId, id));
-    await db.delete(taskComments).where(eq(taskComments.taskId, id));
-    await db.delete(taskTags).where(eq(taskTags.taskId, id));
-    await db.delete(taskAssignees).where(eq(taskAssignees.taskId, id));
-    await deleteAutoGoogleCalendarForTask(id, user);
-
-    const [deleted] = await db
-      .delete(tasks)
-      .where(eq(tasks.id, id))
-      .returning();
+    const deletedRows = await deleteTaskTreeRows(taskIds);
+    const deleted = deletedRows.some((row) => row.id === id);
 
     if (!deleted) {
       return NextResponse.json(

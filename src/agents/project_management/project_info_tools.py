@@ -1,39 +1,34 @@
-"""プロジェクト情報DB（カテゴリ・文書リンク・ファクト・同期状態）関連ツール。"""
+"""Docs正本の案件情報関連ツール。"""
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
-from ...tools.core import tool
 from sqlalchemy import select
 
+from ...tools.core import tool
 from .common import (
-    _run_async,
-    _project_reference_match_score,
-    _resolve_operator_user_id,
-    _resolve_project,
-    _resolve_actor_and_project,
-    _parse_datetime,
-    _json,
-    project_info_category_statuses,
-    project_info_item_statuses,
-    project_info_target_kinds,
-    project_info_ai_access_levels,
     _clean_text,
+    _json,
+    _management_documents_from_project,
     _nullable_text,
     _one_of,
-    _project_info_category_key,
+    _parse_datetime,
     _parse_optional_uuid,
-    _clamp_project_info_importance,
-    _clamp_project_info_confidence,
-    _resolve_record_table,
-    _ensure_project_info_defaults,
-    _resolve_project_info_category,
-    _management_documents_from_project,
+    _project_reference_match_score,
+    _resolve_actor_and_project,
+    _resolve_operator_user_id,
+    _resolve_project,
+    _run_async,
 )
+
+
+project_qa_statuses = {"unanswered", "answered", "stale", "archived"}
+project_qa_review_states = {"candidate", "accepted", "rejected"}
 
 
 def _normalize_management_file_path(
@@ -74,90 +69,83 @@ def _bounded_project_info_limit(value: object, default: int) -> int:
     return max(1, min(parsed, 50))
 
 
+def _normalized_project_question_hash(value: str) -> str:
+    normalized = " ".join(str(value or "").strip().lower().split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _json_array(value: str) -> list:
+    if not str(value or "").strip():
+        return []
+    parsed = json.loads(value)
+    if not isinstance(parsed, list):
+        raise ValueError("JSON value must be an array.")
+    return parsed
+
+
 def _compact_project_information_payload(
     payload: dict,
     *,
-    fact_limit: int,
-    document_limit: int,
+    docs_node_chars: int,
     record_table_limit: int,
 ) -> dict:
     project = payload.get("project") if isinstance(payload.get("project"), dict) else {}
-    categories = payload.get("categories") if isinstance(payload.get("categories"), list) else []
-    documents = payload.get("documents") if isinstance(payload.get("documents"), list) else []
-    facts = payload.get("facts") if isinstance(payload.get("facts"), list) else []
+    node = payload.get("node") if isinstance(payload.get("node"), dict) else {}
     record_tables = (
         payload.get("record_tables")
         if isinstance(payload.get("record_tables"), list)
         else []
     )
-
+    qa_entries = (
+        payload.get("qa_entries")
+        if isinstance(payload.get("qa_entries"), list)
+        else []
+    )
     return {
         "project": {
             "id": project.get("id"),
             "name": project.get("name"),
             "slug": project.get("slug"),
             "description": _clip_project_info_text(project.get("description"), 240),
+            "knowledge_node_id": project.get("knowledge_node_id"),
         },
         "counts": {
-            "categories": len(categories),
-            "documents": len(documents),
-            "management_documents": len(payload.get("management_documents") or []),
-            "facts": len(facts),
+            "qa_entries": len(qa_entries),
             "record_tables": len(record_tables),
-            "sync_states": len(payload.get("sync_states") or []),
+            "management_documents": len(payload.get("management_documents") or []),
         },
-        "categories": [
+        "node": {
+            "id": node.get("id"),
+            "title": node.get("title"),
+            "body_text": _clip_project_info_text(
+                node.get("body_text"),
+                docs_node_chars,
+            ),
+            "updated_at": node.get("updated_at"),
+        },
+        "qa_entries": [
             {
                 "id": item.get("id"),
-                "key": item.get("key"),
-                "label": item.get("label"),
+                "question": _clip_project_info_text(item.get("question"), 180),
+                "answer": _clip_project_info_text(item.get("answer"), 220),
                 "status": item.get("status"),
+                "review_state": item.get("review_state"),
+                "asked_count": item.get("asked_count"),
             }
-            for item in categories
-        ],
-        "documents": [
-            {
-                "id": item.get("id"),
-                "title": item.get("title"),
-                "document_type": item.get("document_type"),
-                "target_kind": item.get("target_kind"),
-                "file_path": item.get("file_path"),
-                "record_table_id": item.get("record_table_id"),
-                "external_url": item.get("external_url"),
-                "role": item.get("role"),
-                "is_primary": item.get("is_primary"),
-                "ai_access_level": item.get("ai_access_level"),
-                "description": _clip_project_info_text(item.get("description"), 180),
-            }
-            for item in documents[:document_limit]
-            if isinstance(item, dict)
-        ],
-        "management_documents": payload.get("management_documents") or [],
-        "facts": [
-            {
-                "id": item.get("id"),
-                "title": item.get("title"),
-                "content": _clip_project_info_text(item.get("content"), 240),
-                "fact_type": item.get("fact_type"),
-                "importance": item.get("importance"),
-                "confidence": item.get("confidence"),
-                "status": item.get("status"),
-                "source_ref": item.get("source_ref"),
-            }
-            for item in facts[:fact_limit]
+            for item in qa_entries[:8]
             if isinstance(item, dict)
         ],
         "record_tables": record_tables[:record_table_limit],
-        "sync_states": payload.get("sync_states") or [],
+        "management_documents": payload.get("management_documents") or [],
         "output_note": (
-            "This is a compact project information summary. "
-            "Call list_project_information(detail_level='full') only when exact full records are required."
+            "案件情報の正本はDocs nodeです。"
+            "必要な場合だけ detail_level='full' で全文を取得してください。"
         ),
     }
 
 
 def build_project_info_tools() -> list:
-    """プロジェクト情報DB（カテゴリ・文書リンク・ファクト・同期状態）関連ツールのツール群を生成して返す。"""
+    """Docs正本の案件情報ツール群を生成して返す。"""
 
     @tool
     def get_project_context(project_id: str = "") -> str:
@@ -242,19 +230,15 @@ def build_project_info_tools() -> list:
         project_id: str = "",
         include_archived: bool = False,
         detail_level: str = "summary",
-        limit_facts: int = 12,
-        limit_documents: int = 8,
         limit_record_tables: int = 8,
+        docs_node_chars: int = 2000,
     ) -> str:
-        """List project information categories, document links, durable facts, record tables, and sync state. Defaults to compact summary; set detail_level='full' for exact full records."""
+        """Read the canonical project information Docs source of truth before answering or editing project facts. Prefer detail_level='full' before a write. The response includes Docs body, accepted/candidate Q&A, record tables, and references; use it as grounded evidence and do not invent missing facts."""
         from ...memory.database import get_database_manager
-        from ...memory.models import (
-            Project,
-            ProjectDocument,
-            ProjectFact,
-            ProjectInfoCategory,
-            ProjectInfoSyncState,
-            RecordTable,
+        from ...memory.models import Project, ProjectQaEntry, RecordTable
+        from ...services.project_information_docs import (
+            ensure_project_information_doc,
+            serialize_project_information_node,
         )
 
         async def _list():
@@ -268,53 +252,16 @@ def build_project_info_tools() -> list:
                 )
                 if resolved_project_id is None:
                     raise ValueError("No project could be resolved.")
-                await _ensure_project_info_defaults(
-                    session,
-                    resolved_project_id,
-                    user_id,
-                )
                 project_obj = await session.get(Project, resolved_project_id)
+                if project_obj is None:
+                    raise ValueError("Project not found.")
 
-                categories_stmt = select(ProjectInfoCategory).where(
-                    ProjectInfoCategory.project_id == resolved_project_id
+                node = await ensure_project_information_doc(
+                    session,
+                    project=project_obj,
+                    user_id=user_id,
                 )
-                documents_stmt = select(ProjectDocument).where(
-                    ProjectDocument.project_id == resolved_project_id
-                )
-                facts_stmt = select(ProjectFact).where(
-                    ProjectFact.project_id == resolved_project_id
-                )
-                if not include_archived:
-                    categories_stmt = categories_stmt.where(
-                        ProjectInfoCategory.status != "archived"
-                    )
-                    documents_stmt = documents_stmt.where(
-                        ProjectDocument.deleted_at.is_(None),
-                        ProjectDocument.status != "archived",
-                    )
-                    facts_stmt = facts_stmt.where(
-                        ProjectFact.deleted_at.is_(None),
-                        ProjectFact.status != "archived",
-                    )
 
-                categories_result = await session.execute(
-                    categories_stmt.order_by(
-                        ProjectInfoCategory.sort_order,
-                        ProjectInfoCategory.created_at,
-                    )
-                )
-                documents_result = await session.execute(
-                    documents_stmt.order_by(
-                        ProjectDocument.is_primary.desc(),
-                        ProjectDocument.updated_at.desc(),
-                    )
-                )
-                facts_result = await session.execute(
-                    facts_stmt.order_by(
-                        ProjectFact.importance.desc(),
-                        ProjectFact.updated_at.desc(),
-                    )
-                )
                 record_tables_result = await session.execute(
                     select(RecordTable)
                     .where(
@@ -323,28 +270,20 @@ def build_project_info_tools() -> list:
                     )
                     .order_by(RecordTable.sort_order, RecordTable.created_at)
                 )
-                sync_states_result = await session.execute(
-                    select(ProjectInfoSyncState).where(
-                        ProjectInfoSyncState.project_id == resolved_project_id
-                    )
+                qa_stmt = select(ProjectQaEntry).where(
+                    ProjectQaEntry.project_id == resolved_project_id,
+                    ProjectQaEntry.deleted_at.is_(None),
+                )
+                if not include_archived:
+                    qa_stmt = qa_stmt.where(ProjectQaEntry.status != "archived")
+                qa_entries_result = await session.execute(
+                    qa_stmt.order_by(ProjectQaEntry.updated_at.desc())
                 )
                 await session.commit()
                 payload = {
-                    "project": project_obj.to_dict() if project_obj else None,
-                    "categories": [
-                        category.to_dict()
-                        for category in categories_result.scalars().all()
-                    ],
-                    "documents": [
-                        document.to_dict()
-                        for document in documents_result.scalars().all()
-                    ],
-                    "management_documents": (
-                        _management_documents_from_project(project_obj)
-                        if project_obj
-                        else []
-                    ),
-                    "facts": [fact.to_dict() for fact in facts_result.scalars().all()],
+                    "project": project_obj.to_dict(),
+                    "node": serialize_project_information_node(node),
+                    "management_documents": _management_documents_from_project(project_obj),
                     "record_tables": [
                         {
                             "id": str(table.id),
@@ -359,9 +298,9 @@ def build_project_info_tools() -> list:
                         }
                         for table in record_tables_result.scalars().all()
                     ],
-                    "sync_states": [
-                        state.to_dict()
-                        for state in sync_states_result.scalars().all()
+                    "qa_entries": [
+                        entry.to_dict()
+                        for entry in qa_entries_result.scalars().all()
                     ],
                 }
                 if str(detail_level or "summary").strip().casefold() in {
@@ -373,8 +312,11 @@ def build_project_info_tools() -> list:
                     return payload
                 return _compact_project_information_payload(
                     payload,
-                    fact_limit=_bounded_project_info_limit(limit_facts, 12),
-                    document_limit=_bounded_project_info_limit(limit_documents, 8),
+                    docs_node_chars=_bounded_project_info_limit(
+                        docs_node_chars,
+                        2000,
+                    )
+                    * 100,
                     record_table_limit=_bounded_project_info_limit(
                         limit_record_tables,
                         8,
@@ -392,6 +334,106 @@ def build_project_info_tools() -> list:
             return _json({"success": False, "error": str(exc)})
 
     @tool
+    def patch_project_information_doc(
+        project: str = "",
+        project_id: str = "",
+        title: str = "",
+        body_text: str = "",
+        append_text: str = "",
+        section_heading: str = "",
+        operation: str = "append",
+        change_summary: str = "",
+        source_refs_json: str = "",
+        update_reason: str = "案件情報Docs正本を更新",
+    ) -> str:
+        """Patch the canonical project information Docs source of truth. Respect existing headings; use section_heading with operation='append' or 'replace' for section/block edits, and only use body_text for deliberate full-document replacement. Always provide change_summary and source_refs_json (JSON array) when evidence exists; unsupported claims belong in a 要確認 section or a candidate Q&A entry."""
+        from ...memory.database import get_database_manager
+        from ...memory.models import Project
+        from ...services.project_information_docs import (
+            serialize_project_information_node,
+            update_project_information_doc,
+        )
+
+        async def _patch():
+            db = get_database_manager()
+            session = await db.get_session()
+            try:
+                user_id, resolved_project_id = await _resolve_actor_and_project(
+                    session,
+                    project=project,
+                    project_id=project_id,
+                )
+                if resolved_project_id is None:
+                    raise ValueError("No project could be resolved.")
+                project_obj = await session.get(Project, resolved_project_id)
+                if project_obj is None:
+                    raise ValueError("Project not found.")
+                if not body_text.strip() and not append_text.strip() and not title.strip():
+                    raise ValueError("body_text, append_text, or title is required.")
+                source_refs = _json_array(source_refs_json) if source_refs_json.strip() else []
+                summary = _clean_text(
+                    change_summary or update_reason,
+                    "案件情報Docs正本を更新",
+                )
+                node = await update_project_information_doc(
+                    session,
+                    project=project_obj,
+                    user_id=user_id,
+                    title=title if title.strip() else None,
+                    body_text=body_text if body_text.strip() else None,
+                    append_text=append_text if append_text.strip() else None,
+                    section_heading=section_heading if section_heading.strip() else None,
+                    operation=_one_of(operation, {"append", "replace"}, "append"),
+                    change_summary=summary,
+                    source_refs=source_refs,
+                )
+                await session.commit()
+                return {
+                    "success": True,
+                    "node": serialize_project_information_node(node),
+                }
+            except Exception:
+                await session.rollback()
+                raise
+            finally:
+                await session.close()
+
+        try:
+            return _json(_run_async(_patch()))
+        except Exception as exc:
+            return _json({"success": False, "error": str(exc)})
+
+    @tool
+    def attach_project_information_reference(
+        title: str,
+        project: str = "",
+        project_id: str = "",
+        file_path: str = "",
+        external_url: str = "",
+        record_table_id: str = "",
+        description: str = "",
+    ) -> str:
+        """Append a reference link to the canonical project information Docs node."""
+        target = file_path.strip() or external_url.strip() or record_table_id.strip()
+        if not title.strip() or not target:
+            return _json({"success": False, "error": "title and a reference target are required."})
+        append_text = "\n".join(
+            [
+                "## 参照追加",
+                "",
+                f"- **{title.strip()}**: `{target}`"
+                + (f" - {description.strip()}" if description.strip() else ""),
+                "",
+            ]
+        )
+        return patch_project_information_doc(
+            project=project,
+            project_id=project_id,
+            append_text=append_text,
+            update_reason="案件情報Docs正本へ参照を追加",
+        )
+
+    @tool
     def organize_project_information_from_folder(
         folder_path: str = "",
         project: str = "",
@@ -400,7 +442,8 @@ def build_project_info_tools() -> list:
         use_llm: bool = True,
         max_files: int = 80,
     ) -> str:
-        """Scan a project filer folder and organize documents/facts into project information. Use apply=false for preview and apply=true to save."""
+        """Scan a project filer folder and organize the result into the canonical Docs node."""
+        from ...config import Config
         from ...memory.database import get_database_manager
         from ...memory.models import Project
         from ...memory.project_repository import ProjectRepository
@@ -432,8 +475,6 @@ def build_project_info_tools() -> list:
                 config = None
                 if use_llm:
                     try:
-                        from ...config import Config
-
                         config = Config()
                         config.set("use_tools", False)
                     except Exception:
@@ -548,17 +589,25 @@ def build_project_info_tools() -> list:
             return _json({"success": False, "error": str(exc)})
 
     @tool
-    def upsert_project_info_category(
-        label: str,
+    def upsert_project_qa_entry(
+        question: str,
+        answer: str = "",
         project: str = "",
         project_id: str = "",
-        key: str = "",
-        description: str = "",
-        status: str = "suggested",
+        qa_entry_id: str = "",
+        status: str = "",
+        review_state: str = "accepted",
+        confidence: float = 1.0,
+        source_session_id: str = "",
+        source_message_ids_json: str = "",
+        source_agent_run_ids_json: str = "",
+        source_tool_call_ids_json: str = "",
+        answer_source_refs_json: str = "",
     ) -> str:
-        """Create or update a project-specific information category/shelf."""
+        """Create or update an accepted Q&A entry linked to the project information Docs node."""
         from ...memory.database import get_database_manager
-        from ...memory.models import ProjectInfoCategory
+        from ...memory.models import Project, ProjectQaEntry
+        from ...services.project_information_docs import ensure_project_information_doc
 
         async def _upsert():
             db = get_database_manager()
@@ -571,48 +620,79 @@ def build_project_info_tools() -> list:
                 )
                 if resolved_project_id is None:
                     raise ValueError("No project could be resolved.")
-                await _ensure_project_info_defaults(
+                project_obj = await session.get(Project, resolved_project_id)
+                if project_obj is None:
+                    raise ValueError("Project not found.")
+                node = await ensure_project_information_doc(
                     session,
-                    resolved_project_id,
-                    user_id,
+                    project=project_obj,
+                    user_id=user_id,
                 )
-                target_label = _clean_text(label)
-                if not target_label:
-                    raise ValueError("label is required.")
-                requested_key = _clean_text(key)
-                target_key = _project_info_category_key(
-                    requested_key or target_label
-                )
-                result = await session.execute(
-                    select(ProjectInfoCategory).where(
-                        ProjectInfoCategory.project_id == resolved_project_id,
-                        ProjectInfoCategory.key == target_key,
+                target_question = _clean_text(question)
+                if not target_question:
+                    raise ValueError("question is required.")
+                target_answer = _nullable_text(answer)
+                question_hash = _normalized_project_question_hash(target_question)
+
+                entry = None
+                parsed_entry_id = _parse_optional_uuid(qa_entry_id)
+                if parsed_entry_id is not None:
+                    entry = await session.get(ProjectQaEntry, parsed_entry_id)
+                    if entry and entry.project_id != resolved_project_id:
+                        raise ValueError("qa_entry_id belongs to another project.")
+                if entry is None:
+                    existing_result = await session.execute(
+                        select(ProjectQaEntry)
+                        .where(
+                            ProjectQaEntry.project_id == resolved_project_id,
+                            ProjectQaEntry.deleted_at.is_(None),
+                            ProjectQaEntry.normalized_question_hash == question_hash,
+                        )
+                        .limit(1)
                     )
-                )
-                category = result.scalar_one_or_none()
-                if category is None:
-                    category = await _resolve_project_info_category(
-                        session,
-                        resolved_project_id,
-                        target_label,
-                        create_if_missing=True,
-                        user_id=user_id,
-                        status=status,
+                    entry = existing_result.scalar_one_or_none()
+                if entry is None:
+                    entry = ProjectQaEntry(
+                        project_id=resolved_project_id,
+                        knowledge_node_id=node.id,
+                        created_by=user_id,
+                        asked_count=0,
                     )
-                if requested_key:
-                    category.key = target_key
-                category.label = target_label[:200]
-                if description:
-                    category.description = description.strip()
-                category.status = _one_of(
+                    session.add(entry)
+
+                now = datetime.utcnow()
+                entry.knowledge_node_id = node.id
+                entry.question = target_question
+                entry.answer = target_answer
+                entry.normalized_question_hash = question_hash
+                entry.status = _one_of(
                     status,
-                    project_info_category_statuses,
-                    "suggested",
+                    project_qa_statuses,
+                    "answered" if target_answer else "unanswered",
                 )
-                category.source = "agent"
-                category.updated_at = datetime.utcnow()
+                entry.review_state = _one_of(
+                    review_state,
+                    project_qa_review_states,
+                    "accepted",
+                )
+                entry.confidence = max(0.0, min(1.0, float(confidence or 1.0)))
+                entry.asked_count = max(1, int(entry.asked_count or 0) + 1)
+                if source_session_id.strip():
+                    entry.source_session_id = _parse_optional_uuid(source_session_id)
+                if source_message_ids_json.strip():
+                    entry.source_message_ids = _json_array(source_message_ids_json)
+                if source_agent_run_ids_json.strip():
+                    entry.source_agent_run_ids = _json_array(source_agent_run_ids_json)
+                if source_tool_call_ids_json.strip():
+                    entry.source_tool_call_ids = _json_array(source_tool_call_ids_json)
+                if answer_source_refs_json.strip():
+                    entry.answer_source_refs = _json_array(answer_source_refs_json)
+                entry.updated_by = user_id
+                entry.last_asked_at = now
+                entry.updated_at = now
+                entry.created_by_agent = True
                 await session.commit()
-                return {"success": True, "category": category.to_dict()}
+                return {"success": True, "qa_entry": entry.to_dict()}
             except Exception:
                 await session.rollback()
                 raise
@@ -625,182 +705,28 @@ def build_project_info_tools() -> list:
             return _json({"success": False, "error": str(exc)})
 
     @tool
-    def register_project_document(
-        title: str,
-        project: str = "",
-        project_id: str = "",
-        category: str = "",
-        category_id: str = "",
-        document_type: str = "document",
-        target_kind: str = "file",
-        file_path: str = "",
-        record_table: str = "",
-        record_table_id: str = "",
-        external_url: str = "",
-        role: str = "reference",
-        is_primary: bool = False,
-        ai_access_level: str = "metadata",
-        description: str = "",
-        notes: str = "",
-        source_ref: str = "",
-    ) -> str:
-        """Register or update an important project document link."""
+    def archive_project_qa_entry(qa_entry_id: str) -> str:
+        """Archive a project Q&A entry without hard-deleting it."""
         from ...memory.database import get_database_manager
-        from ...memory.models import ProjectDocument
-
-        async def _register():
-            db = get_database_manager()
-            session = await db.get_session()
-            try:
-                user_id, resolved_project_id = await _resolve_actor_and_project(
-                    session,
-                    project=project,
-                    project_id=project_id,
-                )
-                if resolved_project_id is None:
-                    raise ValueError("No project could be resolved.")
-                await _ensure_project_info_defaults(
-                    session,
-                    resolved_project_id,
-                    user_id,
-                )
-                category_obj = await _resolve_project_info_category(
-                    session,
-                    resolved_project_id,
-                    category,
-                    category_id=category_id,
-                    create_if_missing=bool(category or category_id),
-                    user_id=user_id,
-                    status="active",
-                )
-                normalized_target_kind = _one_of(
-                    target_kind,
-                    project_info_target_kinds,
-                    "file",
-                )
-                resolved_record_table_id = None
-                target_title_input = title
-                if normalized_target_kind == "record_table":
-                    table_ref = record_table_id or record_table
-                    table = await _resolve_record_table(
-                        session,
-                        resolved_project_id,
-                        table_ref,
-                    )
-                    resolved_record_table_id = table.id
-                    if not target_title_input:
-                        target_title_input = table.name
-
-                target_title = _clean_text(target_title_input)
-                if not target_title:
-                    raise ValueError("title is required.")
-
-                stmt = select(ProjectDocument).where(
-                    ProjectDocument.project_id == resolved_project_id,
-                    ProjectDocument.deleted_at.is_(None),
-                )
-                if normalized_target_kind == "file" and file_path:
-                    stmt = stmt.where(ProjectDocument.file_path == file_path.strip())
-                elif normalized_target_kind == "url" and external_url:
-                    stmt = stmt.where(
-                        ProjectDocument.external_url == external_url.strip()
-                    )
-                elif normalized_target_kind == "record_table":
-                    stmt = stmt.where(
-                        ProjectDocument.record_table_id == resolved_record_table_id
-                    )
-                else:
-                    stmt = stmt.where(ProjectDocument.title == target_title)
-
-                existing_result = await session.execute(stmt.limit(1))
-                document = existing_result.scalar_one_or_none()
-                if document is None:
-                    document = ProjectDocument(
-                        project_id=resolved_project_id,
-                        created_by=user_id,
-                        source_type="agent",
-                    )
-                    session.add(document)
-
-                document.category_id = category_obj.id if category_obj else None
-                document.title = target_title[:255]
-                document.description = _nullable_text(description)
-                document.document_type = _clean_text(document_type, "document")[:64]
-                document.target_kind = normalized_target_kind
-                document.file_path = (
-                    _nullable_text(file_path)
-                    if normalized_target_kind == "file"
-                    else None
-                )
-                document.record_table_id = (
-                    resolved_record_table_id
-                    if normalized_target_kind == "record_table"
-                    else None
-                )
-                document.external_url = (
-                    _nullable_text(external_url)
-                    if normalized_target_kind == "url"
-                    else None
-                )
-                document.role = _clean_text(role, "reference")[:64]
-                document.is_primary = bool(is_primary)
-                document.ai_access_level = _one_of(
-                    ai_access_level,
-                    project_info_ai_access_levels,
-                    "metadata",
-                )
-                document.status = "active"
-                document.notes = _nullable_text(notes)
-                document.source_ref = _nullable_text(source_ref)
-                document.updated_at = datetime.utcnow()
-                await session.commit()
-                return {"success": True, "document": document.to_dict()}
-            except Exception:
-                await session.rollback()
-                raise
-            finally:
-                await session.close()
-
-        try:
-            return _json(_run_async(_register()))
-        except Exception as exc:
-            return _json({"success": False, "error": str(exc)})
-
-    @tool
-    def archive_project_info_category(
-        category: str = "",
-        category_id: str = "",
-        project: str = "",
-        project_id: str = "",
-    ) -> str:
-        """Archive a project information category without deleting its records."""
-        from ...memory.database import get_database_manager
+        from ...memory.models import ProjectQaEntry
 
         async def _archive():
             db = get_database_manager()
             session = await db.get_session()
             try:
-                user_id, resolved_project_id = await _resolve_actor_and_project(
+                entry = await session.get(ProjectQaEntry, UUID(qa_entry_id))
+                if entry is None or entry.deleted_at is not None:
+                    raise ValueError("Project Q&A entry not found.")
+                await _resolve_actor_and_project(
                     session,
-                    project=project,
-                    project_id=project_id,
+                    project_id=str(entry.project_id),
                 )
-                if resolved_project_id is None:
-                    raise ValueError("No project could be resolved.")
-                category_obj = await _resolve_project_info_category(
-                    session,
-                    resolved_project_id,
-                    category,
-                    category_id=category_id,
-                    create_if_missing=False,
-                    user_id=user_id,
-                )
-                if category_obj is None:
-                    raise ValueError("Project information category not found.")
-                category_obj.status = "archived"
-                category_obj.updated_at = datetime.utcnow()
+                now = datetime.utcnow()
+                entry.status = "archived"
+                entry.deleted_at = now
+                entry.updated_at = now
                 await session.commit()
-                return {"success": True, "category": category_obj.to_dict()}
+                return {"success": True, "qa_entry_id": str(entry.id)}
             except Exception:
                 await session.rollback()
                 raise
@@ -813,182 +739,15 @@ def build_project_info_tools() -> list:
             return _json({"success": False, "error": str(exc)})
 
     @tool
-    def delete_project_document(document_id: str) -> str:
-        """Soft-delete a registered project document/link by id."""
-        from ...memory.database import get_database_manager
-        from ...memory.models import ProjectDocument
-
-        async def _delete():
-            db = get_database_manager()
-            session = await db.get_session()
-            try:
-                document = await session.get(ProjectDocument, UUID(document_id))
-                if document is None or document.deleted_at is not None:
-                    raise ValueError("Project document not found.")
-                await _resolve_actor_and_project(
-                    session,
-                    project_id=str(document.project_id),
-                )
-                now = datetime.utcnow()
-                document.deleted_at = now
-                document.updated_at = now
-                await session.commit()
-                return {"success": True, "document_id": str(document.id)}
-            except Exception:
-                await session.rollback()
-                raise
-            finally:
-                await session.close()
-
-        try:
-            return _json(_run_async(_delete()))
-        except Exception as exc:
-            return _json({"success": False, "error": str(exc)})
-
-    @tool
-    def upsert_project_fact(
-        title: str,
-        content: str,
-        project: str = "",
-        project_id: str = "",
-        category: str = "",
-        category_id: str = "",
-        fact_id: str = "",
-        fact_type: str = "fact",
-        confidence: float = 1.0,
-        importance: int = 5,
-        status: str = "active",
-        source_type: str = "agent",
-        source_ref: str = "",
-        source_document_id: str = "",
-        source_task_id: str = "",
-    ) -> str:
-        """Create or update a durable project fact extracted from tasks, documents, or conversation. Use source_type='conversation' for user-provided facts from the current chat."""
-        from ...memory.database import get_database_manager
-        from ...memory.models import ProjectFact
-
-        async def _upsert():
-            db = get_database_manager()
-            session = await db.get_session()
-            try:
-                user_id, resolved_project_id = await _resolve_actor_and_project(
-                    session,
-                    project=project,
-                    project_id=project_id,
-                )
-                if resolved_project_id is None:
-                    raise ValueError("No project could be resolved.")
-                await _ensure_project_info_defaults(
-                    session,
-                    resolved_project_id,
-                    user_id,
-                )
-                category_obj = await _resolve_project_info_category(
-                    session,
-                    resolved_project_id,
-                    category,
-                    category_id=category_id,
-                    create_if_missing=bool(category or category_id),
-                    user_id=user_id,
-                    status="active",
-                )
-                target_title = _clean_text(title)
-                target_content = _clean_text(content)
-                if not target_title or not target_content:
-                    raise ValueError("title and content are required.")
-
-                fact = None
-                parsed_fact_id = _parse_optional_uuid(fact_id)
-                if parsed_fact_id is not None:
-                    fact = await session.get(ProjectFact, parsed_fact_id)
-                    if fact and fact.project_id != resolved_project_id:
-                        raise ValueError("fact_id belongs to another project.")
-                if fact is None:
-                    stmt = select(ProjectFact).where(
-                        ProjectFact.project_id == resolved_project_id,
-                        ProjectFact.deleted_at.is_(None),
-                        ProjectFact.title == target_title,
-                    )
-                    if category_obj:
-                        stmt = stmt.where(ProjectFact.category_id == category_obj.id)
-                    existing_result = await session.execute(stmt.limit(1))
-                    fact = existing_result.scalar_one_or_none()
-                if fact is None:
-                    fact = ProjectFact(
-                        project_id=resolved_project_id,
-                        created_by=user_id,
-                    )
-                    session.add(fact)
-
-                fact.category_id = category_obj.id if category_obj else None
-                fact.title = target_title[:255]
-                fact.content = target_content
-                fact.fact_type = _clean_text(fact_type, "fact")[:64]
-                fact.confidence = _clamp_project_info_confidence(confidence)
-                fact.importance = _clamp_project_info_importance(importance)
-                fact.status = _one_of(status, project_info_item_statuses, "active")
-                fact.source_type = _clean_text(source_type, "agent")[:32]
-                fact.source_ref = _nullable_text(source_ref)
-                fact.source_document_id = _parse_optional_uuid(source_document_id)
-                fact.source_task_id = _parse_optional_uuid(source_task_id)
-                fact.updated_at = datetime.utcnow()
-                await session.commit()
-                return {"success": True, "fact": fact.to_dict()}
-            except Exception:
-                await session.rollback()
-                raise
-            finally:
-                await session.close()
-
-        try:
-            return _json(_run_async(_upsert()))
-        except Exception as exc:
-            return _json({"success": False, "error": str(exc)})
-
-    @tool
-    def delete_project_fact(fact_id: str) -> str:
-        """Soft-delete a durable project fact by id."""
-        from ...memory.database import get_database_manager
-        from ...memory.models import ProjectFact
-
-        async def _delete():
-            db = get_database_manager()
-            session = await db.get_session()
-            try:
-                fact = await session.get(ProjectFact, UUID(fact_id))
-                if fact is None or fact.deleted_at is not None:
-                    raise ValueError("Project fact not found.")
-                await _resolve_actor_and_project(
-                    session,
-                    project_id=str(fact.project_id),
-                )
-                now = datetime.utcnow()
-                fact.deleted_at = now
-                fact.updated_at = now
-                await session.commit()
-                return {"success": True, "fact_id": str(fact.id)}
-            except Exception:
-                await session.rollback()
-                raise
-            finally:
-                await session.close()
-
-        try:
-            return _json(_run_async(_delete()))
-        except Exception as exc:
-            return _json({"success": False, "error": str(exc)})
-
-    @tool
     def list_project_tasks_changed_since(
         project: str = "",
         project_id: str = "",
         changed_after: str = "",
-        source_type: str = "tasks",
         limit: int = 50,
     ) -> str:
-        """List project tasks changed after a timestamp or saved project-info sync cursor."""
+        """List project tasks changed after an explicit timestamp."""
         from ...memory.database import get_database_manager
-        from ...memory.models import ProjectInfoSyncState, Task
+        from ...memory.models import Task
 
         async def _list_changed():
             db = get_database_manager()
@@ -1001,23 +760,7 @@ def build_project_info_tools() -> list:
                 )
                 if resolved_project_id is None:
                     raise ValueError("No project could be resolved.")
-                state_result = await session.execute(
-                    select(ProjectInfoSyncState).where(
-                        ProjectInfoSyncState.project_id == resolved_project_id,
-                        ProjectInfoSyncState.source_type == _clean_text(
-                            source_type,
-                            "tasks",
-                        ),
-                    )
-                )
-                sync_state = state_result.scalar_one_or_none()
                 checkpoint = _parse_datetime(changed_after)
-                if checkpoint is None and sync_state:
-                    checkpoint = (
-                        sync_state.last_seen_updated_at
-                        or sync_state.last_synced_at
-                    )
-
                 stmt = select(Task).where(
                     Task.project_id == resolved_project_id,
                     Task.archived_at.is_(None),
@@ -1044,7 +787,6 @@ def build_project_info_tools() -> list:
                     "recommended_next_checkpoint": (
                         next_checkpoint.isoformat() if next_checkpoint else None
                     ),
-                    "sync_state": sync_state.to_dict() if sync_state else None,
                     "tasks": [
                         {
                             "id": str(task.id),
@@ -1081,80 +823,15 @@ def build_project_info_tools() -> list:
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
 
-    @tool
-    def set_project_information_sync_state(
-        project: str = "",
-        project_id: str = "",
-        source_type: str = "tasks",
-        last_seen_updated_at: str = "",
-        last_synced_at: str = "",
-        metadata_json: str = "",
-    ) -> str:
-        """Update the project information sync cursor after a successful extraction pass."""
-        from ...memory.database import get_database_manager
-        from ...memory.models import ProjectInfoSyncState
-
-        async def _set_state():
-            db = get_database_manager()
-            session = await db.get_session()
-            try:
-                _, resolved_project_id = await _resolve_actor_and_project(
-                    session,
-                    project=project,
-                    project_id=project_id,
-                )
-                if resolved_project_id is None:
-                    raise ValueError("No project could be resolved.")
-                normalized_source = _clean_text(source_type, "tasks")
-                result = await session.execute(
-                    select(ProjectInfoSyncState).where(
-                        ProjectInfoSyncState.project_id == resolved_project_id,
-                        ProjectInfoSyncState.source_type == normalized_source,
-                    )
-                )
-                state = result.scalar_one_or_none()
-                if state is None:
-                    state = ProjectInfoSyncState(
-                        project_id=resolved_project_id,
-                        source_type=normalized_source,
-                    )
-                    session.add(state)
-
-                seen_at = _parse_datetime(last_seen_updated_at)
-                synced_at = _parse_datetime(last_synced_at) or datetime.utcnow()
-                state.last_synced_at = synced_at
-                state.last_seen_updated_at = seen_at or synced_at
-                state.updated_at = datetime.utcnow()
-                if metadata_json.strip():
-                    metadata = json.loads(metadata_json)
-                    if not isinstance(metadata, dict):
-                        raise ValueError("metadata_json must be a JSON object.")
-                    state.sync_metadata = metadata
-                await session.commit()
-                return {"success": True, "sync_state": state.to_dict()}
-            except Exception:
-                await session.rollback()
-                raise
-            finally:
-                await session.close()
-
-        try:
-            return _json(_run_async(_set_state()))
-        except Exception as exc:
-            return _json({"success": False, "error": str(exc)})
-
     return [
         get_project_context,
         list_projects,
         list_project_information,
+        patch_project_information_doc,
+        attach_project_information_reference,
         organize_project_information_from_folder,
         configure_project_management_files,
-        upsert_project_info_category,
-        register_project_document,
-        archive_project_info_category,
-        delete_project_document,
-        upsert_project_fact,
-        delete_project_fact,
+        upsert_project_qa_entry,
+        archive_project_qa_entry,
         list_project_tasks_changed_since,
-        set_project_information_sync_state,
     ]

@@ -63,11 +63,14 @@ Task type: {task_type}
 
 Selection rules:
 - 情報検索には `search_memory`、`knowledge_search`、またはWeb検索を使う。
-- タスク/TODO、案件情報、案件DB facts/documents、内部 WBS.dbtable、
+- タスク/TODO、案件情報Docs、内部 WBS.dbtable、
   follow-up planning には `list_project_information`、`list_record_tables`、
   `get_upcoming_wbs_tasks`、`create_record_table`、`append_record_rows`、
-  `create_task`、`upsert_project_fact` などの直toolを使う。
+  `create_task`、`patch_project_information_doc` などの直toolを使う。
   外部WBS Excelを内部 WBS.dbtable に取り込む時だけ `sync_wbs_tasks` を使う。
+- 案件情報Docsを書く前に `list_project_information` で正本を読み、既存見出しを尊重して
+  `patch_project_information_doc` の section_heading / operation / change_summary /
+  source_refs_json を使う。根拠のない断定は本文ではなく要確認またはQ&A candidateに回す。
 - Spotify操作には `spotify_assistant` を使う。
 - ローカルファイル作業には `find_workspace_items`、
   `inspect_workspace_tree`、`read_workspace_file`、`view_file`、

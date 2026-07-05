@@ -65,6 +65,8 @@ import {
   Hourglass,
   CheckCircle,
   Repeat,
+  BookOpen,
+  ExternalLink,
 } from "lucide-react";
 import {
   DropdownMenu,
@@ -208,6 +210,7 @@ export function TaskDetailModal({
   const [subtaskInputOpenSignal, setSubtaskInputOpenSignal] = useState(0);
   const [launchingAgent, setLaunchingAgent] = useState(false);
   const [triagingAgent, setTriagingAgent] = useState(false);
+  const [docsNodeLoading, setDocsNodeLoading] = useState(false);
   const [, setStatusSelectOpen] = useState(false);
   const draftSuppressTitleBlurRef = useRef(false);
   const draftSubmitIntentRef = useRef(false);
@@ -970,15 +973,25 @@ export function TaskDetailModal({
     try {
       if (task?.active_time_entry) {
         await taskApi.stopTimer(task.active_time_entry.id);
+        setElapsedSeconds(0);
         setTask((prev) => (prev ? { ...prev, active_time_entry: null } : prev));
+        window.dispatchEvent(
+          new CustomEvent("timer-changed", {
+            detail: { activeEntry: null },
+          }),
+        );
       } else {
         const started = await taskApi.startTimer(effectiveTaskId);
         setElapsedSeconds(0);
         setTask((prev) =>
           prev ? { ...prev, active_time_entry: started } : prev,
         );
+        window.dispatchEvent(
+          new CustomEvent("timer-changed", {
+            detail: { activeEntry: started },
+          }),
+        );
       }
-      window.dispatchEvent(new Event("timer-changed"));
       await fetchTask();
       onTaskUpdated();
     } catch (err) {
@@ -1427,6 +1440,34 @@ export function TaskDetailModal({
     },
     [effectiveTaskId, hasUnsavedDraft, onOpenChange],
   );
+
+  const handleOpenDocsNode = useCallback(async () => {
+    if (!effectiveTaskId || !task) return;
+    if (task.knowledge_node_id) {
+      handleDialogOpenChange(false);
+      router.push(`/docs/${task.knowledge_node_id}`);
+      return;
+    }
+
+    setDocsNodeLoading(true);
+    try {
+      const result = await taskApi.ensureDocsNode(effectiveTaskId);
+      setTask((prev) =>
+        prev ? { ...prev, knowledge_node_id: result.node.id } : prev,
+      );
+      onTaskUpdated();
+      toast.success(
+        result.created ? "Docsノートを作成しました" : "Docsノートを開きます",
+      );
+      handleDialogOpenChange(false);
+      router.push(`/docs/${result.node.id}`);
+    } catch (err) {
+      console.error("Docsノート化に失敗しました:", err);
+      toast.error("Docsノート化に失敗しました");
+    } finally {
+      setDocsNodeLoading(false);
+    }
+  }, [effectiveTaskId, handleDialogOpenChange, onTaskUpdated, router, task]);
 
   const handleDraftSubmitIntent = useCallback(
     async (submitOverrides: Record<string, unknown> = {}) => {
@@ -2368,6 +2409,33 @@ export function TaskDetailModal({
                       onDeleteTag={handleDeleteTag}
                       onCopyTagToSpace={handleCopyTagToSpace}
                     />
+                  </PropertyRow>
+
+                  <PropertyRow
+                    icon={<BookOpen className="size-3.5" />}
+                    label="Docs"
+                  >
+                    {effectiveTaskId ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-6 gap-1 px-2 text-xs"
+                        onClick={() => void handleOpenDocsNode()}
+                        disabled={docsNodeLoading}
+                      >
+                        {task.knowledge_node_id ? (
+                          <ExternalLink className="size-3" />
+                        ) : (
+                          <BookOpen className="size-3" />
+                        )}
+                        {task.knowledge_node_id ? "Docsで開く" : "Docsノート化"}
+                      </Button>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">
+                        保存後に作成できます
+                      </span>
+                    )}
                   </PropertyRow>
 
                   {/* Reminders */}

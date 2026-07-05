@@ -175,12 +175,13 @@ class CodexCLIBackend(CLIBackendBase):
         label = self._stream_item_label(item)
         if event_type == "item.started":
             if self._is_tool_like_item(item):
+                tool_name, tool_args = self._stream_tool_context(item)
                 event_callback(
                     "tool_start",
                     {
-                        "tool": label,
-                        "tool_args": {},
-                        "message": f"Codex CLI started {label}",
+                        "tool": tool_name,
+                        "tool_args": tool_args,
+                        "message": f"Codex CLI started {tool_name}",
                     },
                 )
             elif item_type:
@@ -194,15 +195,16 @@ class CodexCLIBackend(CLIBackendBase):
             return
         if event_type == "item.completed":
             if self._is_tool_like_item(item):
+                tool_name, tool_args = self._stream_tool_context(item)
                 event_callback(
                     "tool_end",
                     {
-                        "tool": label,
-                        "tool_args": {},
-                        "message": f"Codex CLI completed {label}",
+                        "tool": tool_name,
+                        "tool_args": tool_args,
+                        "message": f"Codex CLI completed {tool_name}",
                         "tool_result": {
-                            "tool": label,
-                            "arguments": {},
+                            "tool": tool_name,
+                            "arguments": tool_args,
                             "output": self._stream_item_output(item),
                         },
                     },
@@ -217,11 +219,53 @@ class CodexCLIBackend(CLIBackendBase):
                 )
 
     def _stream_item_label(self, item: dict[str, Any]) -> str:
-        for key in ("name", "command", "tool", "title", "type"):
+        for key in ("name", "tool", "title", "type"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                if self._looks_like_shell_command(value):
+                    return "shell_command"
+                return value.strip()
+        return "item"
+
+    def _stream_tool_context(self, item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        item_type = str(item.get("type") or "").lower()
+        if item_type in {"command", "command_execution", "shell"}:
+            command = self._stream_item_command(item)
+            args: dict[str, Any] = {"item_type": item_type or "command"}
+            if command:
+                args["command"] = command
+            return "shell_command", args
+
+        label = self._stream_item_label(item)
+        args = {}
+        raw_args = item.get("arguments") or item.get("args")
+        if isinstance(raw_args, dict):
+            args = raw_args
+        return label, args
+
+    def _stream_item_command(self, item: dict[str, Any]) -> str:
+        for key in ("command", "cmd", "title", "name"):
             value = item.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
-        return "item"
+        return ""
+
+    def _looks_like_shell_command(self, value: str) -> bool:
+        lower = value.strip().lower()
+        return any(
+            marker in lower
+            for marker in (
+                "powershell.exe",
+                "\\pwsh.exe",
+                "/pwsh",
+                "cmd.exe",
+                " -command ",
+                " -command'",
+                " -command\"",
+                " /c ",
+                " -c ",
+            )
+        )
 
     def _stream_item_output(self, item: dict[str, Any]) -> str:
         for key in ("output", "text", "result"):
@@ -289,7 +333,7 @@ class CodexCLIBackend(CLIBackendBase):
         self,
         prompt: str,
         cwd: Optional[Path] = None,
-        timeout: int = 300,
+        timeout: Optional[int] = None,
         extra_args: Optional[List[str]] = None,
         system_context: Optional[str] = None,
         event_callback: Optional[CLIEventCallback] = None,

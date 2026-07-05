@@ -44,17 +44,24 @@ import {
   X,
   Star,
   GitBranch,
+  Search,
 } from "lucide-react";
-import type { ExplorerDirectory, ExplorerFile } from "@/lib/explorer-api";
+import type {
+  ExplorerDirectory,
+  ExplorerFile,
+  SearchResult,
+} from "@/lib/explorer-api";
 import {
   explorerArchive,
   explorerCopy,
   explorerDelete,
+  explorerErrorMessage,
   explorerExtract,
   explorerFullContent,
   explorerMove,
   explorerRemoveBookmark,
   explorerSave,
+  explorerSearch,
 } from "@/lib/explorer-api";
 import {
   buildFallbackMigemoTerms,
@@ -108,6 +115,27 @@ function isAudio(type: string) {
 type ExplorerItem = ExplorerDirectory | ExplorerFile;
 function isExplorerDirectory(item: ExplorerItem): item is ExplorerDirectory {
   return !("type" in item);
+}
+
+function searchResultToDirectory(item: SearchResult): ExplorerDirectory {
+  return {
+    name: item.name,
+    path: item.path,
+    item_count: item.item_count ?? undefined,
+    modified_at: item.modified_at,
+  };
+}
+
+function searchResultToFile(item: SearchResult): ExplorerFile {
+  return {
+    name: item.name,
+    path: item.path,
+    type: item.type || "binary",
+    extension: item.extension || "",
+    size: item.size_bytes,
+    size_display: item.size_display,
+    modified_at: item.modified_at,
+  };
 }
 
 // 画像表示（onError フォールバック付き）
@@ -727,6 +755,11 @@ function ExplorerContent() {
 
   // Hydrus 検索エラー（検索結果そのものは context の browseData に流し込む）
   const [hydrusError, setHydrusError] = useState<string | null>(null);
+  const [fileSearchQuery, setFileSearchQuery] = useState("");
+  const [fileSearchActive, setFileSearchActive] = useState(false);
+  const [fileSearchLoading, setFileSearchLoading] = useState(false);
+  const [fileSearchError, setFileSearchError] = useState<string | null>(null);
+  const [fileSearchCount, setFileSearchCount] = useState(0);
   const audioPlayer = useAudioPlayer();
 
   // ダイアログ状態
@@ -804,6 +837,7 @@ function ExplorerContent() {
   const activeItem = activePath ? (itemByPath.get(activePath) ?? null) : null;
   const canUseFileShortcuts =
     !isAbsoluteFilerPath && !isHfMode && filerTab !== "hydrus";
+  const canUseExplorerSearch = !isHfMode && filerTab !== "hydrus";
   const isExplorerInteractionBlocked =
     !!editingFile ||
     !!recordTableFile ||
@@ -839,6 +873,74 @@ function ExplorerContent() {
       window.setTimeout(() => setRecordTableFile(file), 0);
     }
   }, [searchParams, openEditor]);
+
+  const resetFileSearchState = useCallback((clearQuery = false) => {
+    if (clearQuery) setFileSearchQuery("");
+    setFileSearchActive(false);
+    setFileSearchError(null);
+    setFileSearchCount(0);
+  }, []);
+
+  const clearFileSearch = useCallback(() => {
+    resetFileSearchState(true);
+    clearSelection();
+    void refresh();
+  }, [clearSelection, refresh, resetFileSearchState]);
+
+  const runFileSearch = useCallback(async () => {
+    const query = fileSearchQuery.trim();
+    if (!query) {
+      clearFileSearch();
+      return;
+    }
+
+    setFileSearchLoading(true);
+    setFileSearchError(null);
+    try {
+      const data = await explorerSearch(query, currentPath, 50);
+      const directories: ExplorerDirectory[] = [];
+      const files: ExplorerFile[] = [];
+
+      for (const item of data.results) {
+        if (item.kind === "directory" || !item.type) {
+          directories.push(searchResultToDirectory(item));
+        } else {
+          files.push(searchResultToFile(item));
+        }
+      }
+
+      setBrowseData({
+        success: true,
+        current_path: currentPath,
+        parent_path: browseData?.parent_path ?? null,
+        can_go_up: browseData?.can_go_up ?? false,
+        directories,
+        files,
+        total_items: directories.length + files.length,
+        is_admin_mode: browseData?.is_admin_mode,
+      });
+      setFileSearchActive(true);
+      setFileSearchCount(directories.length + files.length);
+      clearSelection();
+    } catch (error) {
+      setFileSearchError(explorerErrorMessage(error));
+    } finally {
+      setFileSearchLoading(false);
+    }
+  }, [
+    browseData?.can_go_up,
+    browseData?.is_admin_mode,
+    browseData?.parent_path,
+    clearFileSearch,
+    clearSelection,
+    currentPath,
+    fileSearchQuery,
+    setBrowseData,
+  ]);
+
+  useEffect(() => {
+    resetFileSearchState();
+  }, [currentPath, resetFileSearchState]);
 
   // ファイルを開く
   const handleFileClick = useCallback(
@@ -1001,18 +1103,23 @@ function ExplorerContent() {
 
   const deleteSelectedItems = useCallback(async () => {
     if (!canUseFileShortcuts || selectedPaths.length === 0) return;
-    for (const path of selectedPaths) {
-      const item = itemByPath.get(path);
-      if (item && "type" in item && isRecordTableFile(item)) {
-        if (item.project_id && item.record_table_id) {
-          await deleteProjectRecordTable(item.project_id, item.record_table_id);
+    try {
+      for (const path of selectedPaths) {
+        const item = itemByPath.get(path);
+        if (item && "type" in item && isRecordTableFile(item)) {
+          if (item.project_id && item.record_table_id) {
+            await deleteProjectRecordTable(item.project_id, item.record_table_id);
+          }
+        } else {
+          await explorerDelete(path);
         }
-      } else {
-        await explorerDelete(path);
       }
+      clearSelection();
+      await refresh();
+      toast.success("削除しました");
+    } catch (error) {
+      toast.error(`削除に失敗しました: ${explorerErrorMessage(error)}`);
     }
-    clearSelection();
-    await refresh();
   }, [canUseFileShortcuts, clearSelection, itemByPath, refresh, selectedPaths]);
 
   const getRenderedItemPaths = useCallback(() => {
@@ -1092,12 +1199,13 @@ function ExplorerContent() {
   const openExplorerItem = useCallback(
     (item: ExplorerItem) => {
       if (isExplorerDirectory(item)) {
+        resetFileSearchState();
         navigate(item.path);
       } else {
         handleFileClick(item);
       }
     },
-    [handleFileClick, navigate],
+    [handleFileClick, navigate, resetFileSearchState],
   );
 
   const getRenderedSearchItems = useCallback((): FilerSearchItem[] => {
@@ -1199,8 +1307,9 @@ function ExplorerContent() {
   ]);
 
   useEffect(() => {
+    const searchState = incrementalSearchRef.current;
     return () => {
-      const timeoutId = incrementalSearchRef.current.timeoutId;
+      const timeoutId = searchState.timeoutId;
       if (timeoutId !== null) window.clearTimeout(timeoutId);
     };
   }, []);
@@ -1597,6 +1706,53 @@ function ExplorerContent() {
               />
             )}
 
+            {canUseExplorerSearch && (
+              <form
+                className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/20 p-2"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void runFileSearch();
+                }}
+              >
+                <div className="relative min-w-56 flex-1">
+                  <Search className="pointer-events-none absolute left-2 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    value={fileSearchQuery}
+                    onChange={(e) => setFileSearchQuery(e.target.value)}
+                    placeholder="現在のフォルダ内を検索..."
+                    className="h-9 pl-8"
+                  />
+                </div>
+                <Button
+                  type="submit"
+                  size="sm"
+                  disabled={fileSearchLoading || !fileSearchQuery.trim()}
+                >
+                  {fileSearchLoading ? "検索中..." : "検索"}
+                </Button>
+                {(fileSearchActive || fileSearchQuery) && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    onClick={clearFileSearch}
+                  >
+                    クリア
+                  </Button>
+                )}
+                {fileSearchActive && (
+                  <span className="text-xs text-muted-foreground">
+                    {fileSearchCount}件
+                  </span>
+                )}
+                {fileSearchError && (
+                  <span className="text-xs text-destructive">
+                    {fileSearchError}
+                  </span>
+                )}
+              </form>
+            )}
+
             {/* パンくず */}
             {filerTab !== "hydrus" && (
               <div className="flex items-center gap-1 text-sm flex-wrap">
@@ -1718,9 +1874,11 @@ function ExplorerContent() {
                     className="aspect-[16/7] w-full object-cover"
                   />
                   <div className="px-6 py-5">
-                    {isHfMode
-                      ? "HFリポジトリは空です。"
-                      : "このフォルダは空です。ファイルをドラッグ&ドロップでアップロードできます。"}
+                    {fileSearchActive
+                      ? "検索結果はありません。"
+                      : isHfMode
+                        ? "HFリポジトリは空です。"
+                        : "このフォルダは空です。ファイルをドラッグ&ドロップでアップロードできます。"}
                   </div>
                 </div>
               )}

@@ -40,6 +40,7 @@ export type TaskComment = {
 export type Task = {
   id: string;
   project_id: string;
+  knowledge_node_id?: string | null;
   project_name?: string | null;
   project_color?: string | null;
   title: string;
@@ -223,9 +224,21 @@ export type Project = {
   slug: string;
   aliases?: string[];
   space_id?: string | null;
+  knowledge_node_id?: string | null;
   is_completed?: boolean;
   color?: string | null;
   metadata?: Record<string, unknown>;
+};
+
+export type TaskDocsNode = {
+  id: string;
+  title: string;
+  project_id?: string | null;
+};
+
+export type TaskDocsNodeResult = {
+  node: TaskDocsNode;
+  created: boolean;
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -364,6 +377,10 @@ export const taskApi = {
         normalizeTaskPayload({ ...data, project_move_intent: true }),
       ),
     }).then(normalizeTaskResponse),
+  ensureDocsNode: (taskId: string) =>
+    request<TaskDocsNodeResult>(`/api/tasks/${taskId}/docs-node`, {
+      method: "POST",
+    }),
   deleteTask: (taskId: string) =>
     request<void>(`/api/tasks/${taskId}`, { method: "DELETE" }),
   reorderTasks: (projectId: string, taskIds: string[]) =>

@@ -163,8 +163,18 @@ export function useTaskContextMenu({
     try {
       if (task.active_time_entry) {
         await taskApi.stopTimer(task.active_time_entry.id);
+        window.dispatchEvent(
+          new CustomEvent("timer-changed", {
+            detail: { activeEntry: null },
+          }),
+        );
       } else {
-        await taskApi.startTimer(task.id);
+        const started = await taskApi.startTimer(task.id);
+        window.dispatchEvent(
+          new CustomEvent("timer-changed", {
+            detail: { activeEntry: started },
+          }),
+        );
       }
       await fetchData();
     } catch (err) {
