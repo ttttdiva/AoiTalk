@@ -1,8 +1,8 @@
 {
-  "mobile": {
-    "version": "0.1.83",
-    "url": "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.83/aoitalk-mobile.apk",
-    "notes": "AI応答設定を刷新（フォールバック設定の独立化、OpenRouter/Anthropic対応）",
-    "date": "2026-07-16"
-  }
+    "mobile":  {
+                   "date":  "2026-07-16",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.84/aoitalk-mobile.apk",
+                   "version":  "0.1.84",
+                   "notes":  "AI応答設定を刷新（フォールバック独立設定化、OpenRouter/Anthropic対応、モデル一覧の動的取得）"
+               }
 }
