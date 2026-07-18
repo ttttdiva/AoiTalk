@@ -1,8 +1,8 @@
 {
     "mobile":  {
                    "date":  "2026-07-18",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.86/aoitalk-mobile.apk",
-                   "version":  "0.1.86",
-                   "notes":  "同期処理とFiles画面の遷移性能を改善。Settingsのタッチ操作、Docsの縦スクロール・空ノードのフォーカス・タイトルのダブルタップ遷移を修正。"
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.87/aoitalk-mobile.apk",
+                   "version":  "0.1.87",
+                   "notes":  "同期処理とFiles画面の遷移性能を改善。Settingsのタッチ操作、Docsの縦スクロール・空ノードのフォーカス・ページタイトル入力・タイトルのダブルタップ遷移を修正。"
                }
 }
