@@ -6,7 +6,10 @@
 """
 
 import logging
+import ipaddress
+import os
 from typing import TYPE_CHECKING, Optional
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -14,6 +17,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from ..router_helpers import cookie_auth_dependency
+from ..uuid_http import parse_uuid_or_400
 
 try:
     from ...memory.remote_server_repository import RemoteServerRepository
@@ -81,6 +85,33 @@ def register_remote_server_routes(app: FastAPI, server: "WebChatServer") -> None
                 detail="Remote server view is disabled on this server",
             )
 
+    def _validate_base_url(value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        parsed = urlsplit(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise HTTPException(status_code=422, detail="base_url must be an HTTP(S) URL")
+        if parsed.username or parsed.password:
+            raise HTTPException(status_code=422, detail="base_url must not contain credentials")
+        if os.getenv("AOITALK_ALLOW_PRIVATE_REMOTE_SERVERS", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            hostname = parsed.hostname.lower().rstrip(".")
+            if hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(".localhost"):
+                raise HTTPException(status_code=422, detail="private remote server hosts are disabled")
+            try:
+                address = ipaddress.ip_address(hostname)
+            except ValueError:
+                address = None
+            if address is not None and (
+                address.is_private
+                or address.is_loopback
+                or address.is_link_local
+                or address.is_reserved
+                or address.is_multicast
+                or address.is_unspecified
+                or not address.is_global
+            ):
+                raise HTTPException(status_code=422, detail="private remote server hosts are disabled")
+        return normalized
+
     @app.get("/api/remote-servers")
     async def list_remote_servers(
         request: Request, _: None = Depends(require_auth)
@@ -114,7 +145,7 @@ def register_remote_server_routes(app: FastAPI, server: "WebChatServer") -> None
                 session,
                 user_id=user_id,
                 name=payload.name.strip(),
-                base_url=payload.base_url,
+                base_url=_validate_base_url(payload.base_url),
                 auth_token=payload.auth_token,
                 display_color=payload.display_color,
                 enabled=payload.enabled,
@@ -134,8 +165,10 @@ def register_remote_server_routes(app: FastAPI, server: "WebChatServer") -> None
         _ensure_feature_enabled()
         _ensure_available()
         user_id = await _require_user_id(request)
-        profile_uuid = _parse_uuid(profile_id)
+        profile_uuid = parse_uuid_or_400(profile_id, "profile id")
         updates = payload.model_dump(exclude_unset=True)
+        if "base_url" in updates and updates["base_url"] is not None:
+            updates["base_url"] = _validate_base_url(updates["base_url"])
         session = await server._db_manager.get_session()
         try:
             record = await RemoteServerRepository.update_profile(
@@ -157,7 +190,7 @@ def register_remote_server_routes(app: FastAPI, server: "WebChatServer") -> None
         _ensure_feature_enabled()
         _ensure_available()
         user_id = await _require_user_id(request)
-        profile_uuid = _parse_uuid(profile_id)
+        profile_uuid = parse_uuid_or_400(profile_id, "profile id")
         session = await server._db_manager.get_session()
         try:
             deleted = await RemoteServerRepository.delete_profile(
@@ -181,7 +214,7 @@ def register_remote_server_routes(app: FastAPI, server: "WebChatServer") -> None
         if RemoteServerConnector is None:
             raise HTTPException(status_code=503, detail="Connector is not available")
         user_id = await _require_user_id(request)
-        profile_uuid = _parse_uuid(profile_id)
+        profile_uuid = parse_uuid_or_400(profile_id, "profile id")
         session = await server._db_manager.get_session()
         try:
             record = await RemoteServerRepository.get_profile(
@@ -217,8 +250,3 @@ def register_remote_server_routes(app: FastAPI, server: "WebChatServer") -> None
             await session.close()
 
 
-def _parse_uuid(value: str) -> UUID:
-    try:
-        return UUID(value)
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid profile id")

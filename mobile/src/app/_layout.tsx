@@ -10,6 +10,7 @@ import { StatusBar } from "expo-status-bar";
 import * as ScreenOrientation from "expo-screen-orientation";
 import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client";
 import { SafeAreaProvider } from "react-native-safe-area-context";
+import { KeyboardProvider } from "react-native-keyboard-controller";
 import { AuthProvider } from "../contexts/AuthContext";
 import { AppSidebar } from "../components/app-sidebar";
 import { TaskCompletionUndoStack } from "../components/task-completion-undo-stack";
@@ -89,28 +90,30 @@ export default function RootLayout() {
 
   return (
     <SafeAreaProvider>
-      <PaperProvider theme={theme}>
-        <PersistQueryClientProvider
-          client={queryClient}
-          persistOptions={{ persister: asyncStoragePersister }}
-        >
-          <AuthProvider>
-            <ProjectProvider>
-              <StatusBar style="light" />
-              {ready ? (
-                <AppSidebar>
-                  <Slot />
-                </AppSidebar>
-              ) : (
-                <View
-                  style={{ flex: 1, backgroundColor: theme.colors.background }}
-                />
-              )}
-              <TaskCompletionUndoStack />
-            </ProjectProvider>
-          </AuthProvider>
-        </PersistQueryClientProvider>
-      </PaperProvider>
+      <KeyboardProvider>
+        <PaperProvider theme={theme}>
+          <PersistQueryClientProvider
+            client={queryClient}
+            persistOptions={{ persister: asyncStoragePersister }}
+          >
+            <AuthProvider>
+              <ProjectProvider>
+                <StatusBar style="light" />
+                {ready ? (
+                  <AppSidebar>
+                    <Slot />
+                  </AppSidebar>
+                ) : (
+                  <View
+                    style={{ flex: 1, backgroundColor: theme.colors.background }}
+                  />
+                )}
+                <TaskCompletionUndoStack />
+              </ProjectProvider>
+            </AuthProvider>
+          </PersistQueryClientProvider>
+        </PaperProvider>
+      </KeyboardProvider>
     </SafeAreaProvider>
   );
 }

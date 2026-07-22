@@ -87,6 +87,16 @@ class ProjectInformationOrganizePayload(BaseModel):
     draft: Optional[dict[str, Any]] = None
 
 
+class DailyIntakePayload(BaseModel):
+    """Payload for the daily intake (日次インテーク) endpoint."""
+    raw_input: str = ""
+    intake_date: str = ""
+    clarification_answers: str = ""
+    apply: bool = False
+    use_llm: bool = True
+    draft: Optional[dict[str, Any]] = None
+
+
 # ── Router Factory ───────────────────────────────────────────────────────
 
 
@@ -126,6 +136,8 @@ def create_project_router(
         delete_item as delete_workspace_item,
         get_file_info as get_workspace_file_info,
         get_preview as get_workspace_file_preview,
+        get_full_content as get_workspace_file_content,
+        search_files as search_workspace_files,
     )
     from ..tools.file_explorer.storage_context import calculate_storage_usage
 
@@ -982,6 +994,94 @@ def create_project_router(
             logger.error(f"Failed to preview project file: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
+    @router.get("/{project_id}/files/content")
+    async def get_project_file_content(
+        project_id: str,
+        request: Request,
+        path: str,
+        _: None = Depends(require_auth_dependency),
+    ):
+        """Read text content from a project file without exposing its absolute path."""
+        db_manager = get_db_manager()
+        if db_manager is None:
+            raise HTTPException(status_code=503, detail="Database not available")
+        user_info = await get_user_from_request(request)
+        if not user_info:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        try:
+            session = await db_manager.get_session()
+            try:
+                has_perm = await ProjectRepository.has_permission(
+                    session,
+                    project_id=UUID(project_id),
+                    user_id=UUID(user_info["id"]),
+                    permission="read",
+                )
+                if not has_perm:
+                    raise HTTPException(status_code=403, detail="Permission denied")
+                storage_root = await ProjectRepository.get_storage_path(UUID(project_id))
+                ensure_project_storage_root(storage_root)
+                result = get_workspace_file_content(
+                    normalize_project_member_path(storage_root, path)
+                )
+                if not result.get("success"):
+                    raise HTTPException(status_code=400, detail=result.get("error", "Failed to read file"))
+                result["path"] = strip_project_storage_prefix(storage_root, result.get("path")) or ""
+                return JSONResponse(result)
+            finally:
+                await session.close()
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to read project file: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.get("/{project_id}/files/search")
+    async def search_project_files(
+        project_id: str,
+        request: Request,
+        q: str,
+        path: str = "",
+        limit: int = 50,
+        _: None = Depends(require_auth_dependency),
+    ):
+        """Search file names within a project-scoped workspace only."""
+        db_manager = get_db_manager()
+        if db_manager is None:
+            raise HTTPException(status_code=503, detail="Database not available")
+        user_info = await get_user_from_request(request)
+        if not user_info:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        try:
+            session = await db_manager.get_session()
+            try:
+                has_perm = await ProjectRepository.has_permission(
+                    session,
+                    project_id=UUID(project_id),
+                    user_id=UUID(user_info["id"]),
+                    permission="read",
+                )
+                if not has_perm:
+                    raise HTTPException(status_code=403, detail="Permission denied")
+                storage_root = await ProjectRepository.get_storage_path(UUID(project_id))
+                ensure_project_storage_root(storage_root)
+                result = search_workspace_files(
+                    q,
+                    normalize_project_member_path(storage_root, path),
+                    max_results=max(1, min(limit, 200)),
+                )
+                result["root_path"] = ""
+                for item in result.get("results", []):
+                    item["path"] = strip_project_storage_prefix(storage_root, item.get("path")) or ""
+                return JSONResponse(result)
+            finally:
+                await session.close()
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to search project files: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
     @router.post("/{project_id}/files/folders")
     async def create_project_folder(
         project_id: str,
@@ -1356,6 +1456,88 @@ def create_project_router(
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             logger.error(f"Failed to organize project information: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.post("/{project_id}/information/daily-intake")
+    async def run_project_daily_intake(
+        project_id: str,
+        payload: DailyIntakePayload,
+        request: Request,
+        _: None = Depends(require_auth_dependency),
+    ):
+        """Structure a free-form daily note and reflect it into project information."""
+        db_manager = get_db_manager()
+        if db_manager is None:
+            raise HTTPException(status_code=503, detail="Database not available")
+
+        user_info = await get_user_from_request(request)
+        if not user_info:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+
+        try:
+            session = await db_manager.get_session()
+            try:
+                project_uuid = UUID(project_id)
+                user_uuid = UUID(user_info["id"])
+                has_perm = await ProjectRepository.has_permission(
+                    session,
+                    project_id=project_uuid,
+                    user_id=user_uuid,
+                    permission="write",
+                )
+                if not has_perm:
+                    raise HTTPException(status_code=403, detail="Permission denied")
+
+                project = await ProjectRepository.get_by_id(session, project_uuid)
+                if not project:
+                    raise HTTPException(status_code=404, detail="Project not found")
+
+                config = None
+                if payload.use_llm:
+                    try:
+                        from ..config import Config
+
+                        config = Config()
+                        config.set("use_tools", False)
+                    except Exception as exc:
+                        logger.warning(
+                            "Daily intake will use empty draft (no LLM): %s",
+                            exc,
+                        )
+
+                intake_date = (payload.intake_date or "").strip()
+                if not intake_date:
+                    from datetime import datetime
+                    from zoneinfo import ZoneInfo
+
+                    intake_date = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d")
+
+                from ..services.daily_intake_service import run_daily_intake
+
+                result = await run_daily_intake(
+                    session,
+                    project_id=project_uuid,
+                    project_name=project.name,
+                    user_id=user_uuid,
+                    raw_input=payload.raw_input,
+                    intake_date=intake_date,
+                    clarification_answers=payload.clarification_answers,
+                    apply=payload.apply,
+                    use_llm=payload.use_llm,
+                    config=config,
+                    draft_override=payload.draft,
+                )
+                return JSONResponse(result)
+            finally:
+                await session.close()
+        except HTTPException:
+            raise
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.error(f"Failed to run daily intake: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
     @router.get("/resolve/context")

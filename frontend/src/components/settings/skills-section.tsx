@@ -1,12 +1,14 @@
 "use client";
 
 import { useState, useCallback } from "react";
+import useSWR from "swr";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { LongTextEditor } from "@/components/editor/long-text-editor";
+import { useConfirm } from "@/hooks/use-confirm";
 import {
   Dialog,
   DialogContent,
@@ -46,7 +48,27 @@ async function pyFetch<T = unknown>(path: string, init?: RequestInit): Promise<T
 }
 
 export function SkillsSection() {
-  const [skills, setSkills] = useState<Skill[]>([]);
+  const confirm = useConfirm();
+  // スキル一覧（サーバー状態）は SWR で管理。取得タイミングは従来どおり
+  // 呼び出し側（トグル/更新/保存・削除後）で駆動するため自動 revalidation は無効化する。
+  const { data: skills = [], mutate: mutateSkills } = useSWR<Skill[]>(
+    "settings/skills",
+    async () => {
+      try {
+        return (await pyFetch<{ skills: Skill[] }>("/skills")).skills || [];
+      } catch {
+        return [];
+      }
+    },
+    {
+      revalidateOnMount: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+      keepPreviousData: true,
+      dedupingInterval: 0,
+    },
+  );
   const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [editSkill, setEditSkill] = useState<Skill | null>(null);
@@ -66,14 +88,11 @@ export function SkillsSection() {
   const fetchSkills = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await pyFetch<{ skills: Skill[] }>("/skills");
-      setSkills(data.skills || []);
-    } catch {
-      setSkills([]);
+      await mutateSkills();
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [mutateSkills]);
 
   const handleToggle = useCallback(() => {
     if (!expanded && skills.length === 0) fetchSkills();
@@ -142,7 +161,13 @@ export function SkillsSection() {
 
   const handleDelete = useCallback(
     async (name: string) => {
-      if (!window.confirm(`スキル「${name}」を削除しますか？`)) return;
+      if (
+        !(await confirm({
+          description: `スキル「${name}」を削除しますか？`,
+          destructive: true,
+        }))
+      )
+        return;
       setDeleting(name);
       try {
         await pyFetch(`/skills/${encodeURIComponent(name)}`, { method: "DELETE" });
@@ -153,7 +178,7 @@ export function SkillsSection() {
         setDeleting(null);
       }
     },
-    [fetchSkills]
+    [fetchSkills, confirm]
   );
 
   const handleTest = useCallback(async () => {

@@ -2,7 +2,7 @@
   "expo": {
     "name": "AoiTalk",
     "slug": "aoitalk",
-    "version": "0.1.76",
+    "version": "0.1.89",
     "orientation": "default",
     "scheme": "aoitalk",
     "icon": "./assets/icon.png",
@@ -18,6 +18,7 @@
       "bundleIdentifier": "com.aoitalk.mobile"
     },
     "android": {
+      "softwareKeyboardLayoutMode": "resize",
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#1a1a2e"
@@ -28,7 +29,7 @@
         "android.permission.ACCESS_WIFI_STATE",
         "android.permission.POST_NOTIFICATIONS"
       ],
-      "versionCode": 76,
+      "versionCode": 89,
       "package": "com.aoitalk.mobile"
     },
     "web": {

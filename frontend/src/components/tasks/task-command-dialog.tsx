@@ -12,6 +12,7 @@ import {
 import {
   SlashCommandInput,
   TASK_SLASH_COMMANDS as DEFAULT_TASK_SLASH_COMMANDS,
+  type CommandCandidateSelection,
 } from "@/components/tasks/slash-command-input";
 import {
   taskValueCompletion,
@@ -51,7 +52,7 @@ export function TaskCommandDialog({
   onErrorClear: () => void;
   loading: boolean;
   commandCandidates: CommandCandidates;
-  onSubmit: (raw: string) => Promise<string>;
+  onSubmit: (raw: string, selectedTargetProjectId?: string) => Promise<string>;
 }) {
   return (
     <Dialog
@@ -80,8 +81,15 @@ export function TaskCommandDialog({
             commandCandidates={commandCandidates}
             getValuePreview={taskValuePreview}
             getValueCompletion={taskValueCompletion}
-            onParseSlashCommands={(text) => {
-              void onSubmit(text);
+            onParseSlashCommands={(
+              text,
+              selection?: CommandCandidateSelection,
+            ) => {
+              const selectedTargetProjectId =
+                selection?.command === "/m"
+                  ? selection.candidate.projectId
+                  : undefined;
+              void onSubmit(text, selectedTargetProjectId);
               return "";
             }}
             onSubmitIntent={() => {

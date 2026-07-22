@@ -2,16 +2,21 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { DocsWorkspace } from "@/components/docs/docs-workspace";
+import type { DocsNode, DocsNodeSupertag, DocsSupertag } from "@/components/docs/types";
 import { RecordTableEditor } from "@/components/records/record-table-editor";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import {
   BookOpen,
+  Check,
   Database,
-  FileText,
-  HelpCircle,
+  ListChecks,
   Loader2,
   RefreshCw,
+  RotateCcw,
+  Sparkles,
   Table2,
 } from "lucide-react";
 
@@ -53,68 +58,404 @@ type ProjectInformationResponse = {
     knowledge_node_id: string;
   };
   node: ProjectInformationNode;
+  tree_nodes: DocsNode[];
+  node_supertags: DocsNodeSupertag[];
+  supertags: DocsSupertag[];
   qa_entries: ProjectQaEntry[];
   management_documents: Array<Record<string, unknown>>;
   record_tables: RecordTableSummary[];
 };
 
-function ProjectInformationLanding({
-  data,
+type IntakeTaskCandidate = {
+  title: string;
+  description: string;
+  due_date: string | null;
+  priority: string | null;
+};
+
+type IntakeDocsUpdate = {
+  content: string;
+  section_heading: string | null;
+  source_ref: string | null;
+};
+
+type DailyIntakeDraft = {
+  intake_date: string;
+  raw_input: string;
+  summary_md: string;
+  done_items: string[];
+  decisions: string[];
+  confirmations: string[];
+  inquiries: string[];
+  issues: string[];
+  task_candidates: IntakeTaskCandidate[];
+  docs_updates: IntakeDocsUpdate[];
+  clarifying_questions: string[];
+};
+
+type DailyIntakePreviewResponse = {
+  success: boolean;
+  needs_clarification: boolean;
+  draft: DailyIntakeDraft;
+  clarifying_questions: string[];
+};
+
+type DailyIntakeApplyResult = {
+  decisions: number;
+  confirmations: number;
+  issues: number;
+  inquiries: number;
+  tasks: number;
+  record_rows: number;
+  docs_updates: number;
+  knowledge_node_id: string;
+};
+
+type DailyIntakeApplyResponse = {
+  success: boolean;
+  applied: boolean;
+  result: DailyIntakeApplyResult;
+};
+
+type IntakePhase = "input" | "clarify" | "preview" | "done";
+
+function todayString() {
+  const now = new Date();
+  const offset = now.getTimezoneOffset();
+  const local = new Date(now.getTime() - offset * 60000);
+  return local.toISOString().slice(0, 10);
+}
+
+function IntakeListCard({ label, items }: { label: string; items: string[] }) {
+  if (!items || items.length === 0) return null;
+  return (
+    <div className="rounded-md border bg-muted/20 p-3">
+      <div className="text-xs font-medium text-muted-foreground">{label}</div>
+      <ul className="mt-2 space-y-1 text-sm">
+        {items.map((item, index) => (
+          <li key={index} className="flex gap-2">
+            <span className="text-muted-foreground">・</span>
+            <span className="min-w-0 break-words">{item}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function IntakeTaskCard({ items }: { items: IntakeTaskCandidate[] }) {
+  if (!items || items.length === 0) return null;
+  return (
+    <div className="rounded-md border bg-muted/20 p-3">
+      <div className="text-xs font-medium text-muted-foreground">タスク候補</div>
+      <div className="mt-2 space-y-2">
+        {items.map((task, index) => (
+          <div key={index} className="rounded-md border bg-background p-2">
+            <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
+              <ListChecks className="size-4 text-primary" />
+              <span className="min-w-0 break-words">{task.title}</span>
+              {task.priority ? <Badge variant="outline">{task.priority}</Badge> : null}
+              {task.due_date ? <Badge variant="secondary">{task.due_date}</Badge> : null}
+            </div>
+            {task.description ? (
+              <p className="mt-1 text-xs text-muted-foreground break-words">{task.description}</p>
+            ) : null}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function IntakeDocsCard({ items }: { items: IntakeDocsUpdate[] }) {
+  if (!items || items.length === 0) return null;
+  return (
+    <div className="rounded-md border bg-muted/20 p-3">
+      <div className="text-xs font-medium text-muted-foreground">Docs反映候補</div>
+      <div className="mt-2 space-y-2">
+        {items.map((update, index) => (
+          <div key={index} className="rounded-md border bg-background p-2">
+            {update.section_heading ? (
+              <div className="text-sm font-medium break-words">{update.section_heading}</div>
+            ) : null}
+            <p className="mt-1 text-sm text-muted-foreground break-words whitespace-pre-wrap">
+              {update.content}
+            </p>
+            {update.source_ref ? (
+              <p className="mt-1 text-[11px] text-muted-foreground">出典: {update.source_ref}</p>
+            ) : null}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function DailyIntakeSection({
+  project,
+  onApplied,
 }: {
-  data: ProjectInformationResponse;
+  project: ProjectInfo;
+  onApplied: () => Promise<void> | void;
 }) {
-  const summaryItems = [
-    {
-      label: "Docs page",
-      value: data.node.title || data.project.name,
-      icon: FileText,
+  const [phase, setPhase] = useState<IntakePhase>("input");
+  const [rawInput, setRawInput] = useState("");
+  const [intakeDate, setIntakeDate] = useState(() => todayString());
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+  const [draft, setDraft] = useState<DailyIntakeDraft | null>(null);
+  const [clarifyingQuestions, setClarifyingQuestions] = useState<string[]>([]);
+  const [answers, setAnswers] = useState<string[]>([]);
+  const [applied, setApplied] = useState<DailyIntakeApplyResult | null>(null);
+
+  const intakeUrl = `/api/python-proxy/projects/${project.id}/information/daily-intake`;
+
+  const submitPreview = useCallback(
+    async (options: {
+      rawInput: string;
+      clarificationAnswers: string;
+      draft: DailyIntakeDraft | null;
+    }) => {
+      setSubmitting(true);
+      setError("");
+      try {
+        const response = await apiFetch<DailyIntakePreviewResponse>(intakeUrl, {
+          method: "POST",
+          body: JSON.stringify({
+            raw_input: options.rawInput,
+            intake_date: intakeDate || undefined,
+            clarification_answers: options.clarificationAnswers,
+            apply: false,
+            use_llm: true,
+            draft: options.draft,
+          }),
+        });
+        setDraft(response.draft);
+        const questions = response.clarifying_questions ?? [];
+        if (response.needs_clarification && questions.length > 0) {
+          setClarifyingQuestions(questions);
+          setAnswers(questions.map(() => ""));
+          setPhase("clarify");
+        } else {
+          setClarifyingQuestions([]);
+          setPhase("preview");
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "整理に失敗しました");
+      } finally {
+        setSubmitting(false);
+      }
     },
-    {
-      label: "Q&A",
-      value: `${data.qa_entries.length}`,
-      icon: HelpCircle,
-    },
-    {
-      label: "Tables",
-      value: `${data.record_tables.length}`,
-      icon: Table2,
-    },
-    {
-      label: "Management docs",
-      value: `${data.management_documents.length}`,
-      icon: Database,
-    },
-    {
-      label: "Updated",
-      value: formatDate(data.node.updated_at) || "Not saved",
-      icon: RefreshCw,
-    },
-  ];
+    [intakeUrl, intakeDate],
+  );
+
+  const handleStart = useCallback(() => {
+    if (!rawInput.trim()) {
+      setError("その日やったことを入力してください");
+      return;
+    }
+    void submitPreview({ rawInput, clarificationAnswers: "", draft: null });
+  }, [rawInput, submitPreview]);
+
+  const handleClarifySubmit = useCallback(() => {
+    const combined = clarifyingQuestions
+      .map((question, index) => `Q: ${question}\nA: ${answers[index]?.trim() ?? ""}`)
+      .join("\n\n");
+    void submitPreview({ rawInput, clarificationAnswers: combined, draft });
+  }, [answers, clarifyingQuestions, draft, rawInput, submitPreview]);
+
+  const handleApply = useCallback(async () => {
+    if (!draft) return;
+    setSubmitting(true);
+    setError("");
+    try {
+      const response = await apiFetch<DailyIntakeApplyResponse>(intakeUrl, {
+        method: "POST",
+        body: JSON.stringify({
+          raw_input: rawInput,
+          intake_date: intakeDate || undefined,
+          clarification_answers: "",
+          apply: true,
+          use_llm: true,
+          draft,
+        }),
+      });
+      setApplied(response.result);
+      setPhase("done");
+      await onApplied();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "案件情報への反映に失敗しました");
+    } finally {
+      setSubmitting(false);
+    }
+  }, [draft, intakeDate, intakeUrl, onApplied, rawInput]);
+
+  const resetToInput = useCallback(() => {
+    setPhase("input");
+    setDraft(null);
+    setClarifyingQuestions([]);
+    setAnswers([]);
+    setApplied(null);
+    setError("");
+  }, []);
+
+  const startNew = useCallback(() => {
+    resetToInput();
+    setRawInput("");
+    setIntakeDate(todayString());
+  }, [resetToInput]);
 
   return (
-    <section className="border-b pb-4">
-      <div className="max-w-5xl">
-        <div className="text-xs font-semibold uppercase text-primary">Project information</div>
-        <h2 className="mt-2 text-3xl font-semibold tracking-normal">{data.project.name}</h2>
-        {data.project.description && (
-          <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-            {data.project.description}
-          </p>
-        )}
+    <section className="rounded-md border bg-background">
+      <div className="flex items-center justify-between border-b px-3 py-2">
+        <div className="flex items-center gap-2 text-sm font-medium">
+          <Sparkles className="size-4 text-primary" />
+          日次インテーク
+        </div>
+        {phase !== "input" ? (
+          <Badge variant="secondary">
+            {phase === "clarify" ? "逆質問応答" : phase === "preview" ? "整理案の確認" : "反映済み"}
+          </Badge>
+        ) : null}
       </div>
-      <div className="mt-4 grid overflow-hidden rounded-md border bg-muted/20 sm:grid-cols-2 xl:grid-cols-5">
-        {summaryItems.map((item) => {
-          const Icon = item.icon;
-          return (
-            <div key={item.label} className="min-w-0 border-b px-3 py-3 last:border-b-0 sm:border-r sm:last:border-r-0 xl:border-b-0">
-              <div className="flex items-center gap-2 text-xs font-medium uppercase text-muted-foreground">
-                <Icon className="size-3.5" />
-                {item.label}
-              </div>
-              <div className="mt-1 truncate text-sm font-medium">{item.value}</div>
+      <div className="space-y-3 p-3">
+        {error ? (
+          <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+            {error}
+          </div>
+        ) : null}
+
+        {phase === "input" ? (
+          <div className="space-y-3">
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-muted-foreground">その日やったこと</label>
+              <Textarea
+                value={rawInput}
+                onChange={(event) => setRawInput(event.target.value)}
+                placeholder="今日やったこと・決めたこと・気になったことを雑に書いてください"
+                className="min-h-28"
+                disabled={submitting}
+              />
             </div>
-          );
-        })}
+            <div className="flex flex-wrap items-end gap-3">
+              <div className="space-y-1">
+                <label className="text-xs font-medium text-muted-foreground">対象日</label>
+                <Input
+                  type="date"
+                  value={intakeDate}
+                  onChange={(event) => setIntakeDate(event.target.value)}
+                  className="w-40"
+                  disabled={submitting}
+                />
+              </div>
+              <Button onClick={handleStart} disabled={submitting}>
+                {submitting ? (
+                  <Loader2 className="mr-2 size-4 animate-spin" />
+                ) : (
+                  <Sparkles className="mr-2 size-4" />
+                )}
+                整理する
+              </Button>
+            </div>
+          </div>
+        ) : null}
+
+        {phase === "clarify" ? (
+          <div className="space-y-3">
+            <p className="text-sm text-muted-foreground">
+              内容を整理するため、以下の不明点にお答えください。
+            </p>
+            <div className="space-y-3">
+              {clarifyingQuestions.map((question, index) => (
+                <div key={index} className="space-y-1">
+                  <label className="text-sm font-medium break-words">{question}</label>
+                  <Textarea
+                    value={answers[index] ?? ""}
+                    onChange={(event) => {
+                      const next = [...answers];
+                      next[index] = event.target.value;
+                      setAnswers(next);
+                    }}
+                    placeholder="回答を入力（不明な場合は空欄でも構いません）"
+                    disabled={submitting}
+                  />
+                </div>
+              ))}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button onClick={handleClarifySubmit} disabled={submitting}>
+                {submitting ? (
+                  <Loader2 className="mr-2 size-4 animate-spin" />
+                ) : (
+                  <Sparkles className="mr-2 size-4" />
+                )}
+                回答して再整理
+              </Button>
+              <Button variant="outline" onClick={resetToInput} disabled={submitting}>
+                <RotateCcw className="mr-2 size-4" />
+                やり直す
+              </Button>
+            </div>
+          </div>
+        ) : null}
+
+        {phase === "preview" && draft ? (
+          <div className="space-y-3">
+            {draft.summary_md ? (
+              <div className="rounded-md border bg-muted/20 p-3">
+                <div className="text-xs font-medium text-muted-foreground">サマリ</div>
+                <p className="mt-2 text-sm break-words whitespace-pre-wrap">{draft.summary_md}</p>
+              </div>
+            ) : null}
+            <div className="grid gap-3 md:grid-cols-2">
+              <IntakeListCard label="実施事項" items={draft.done_items} />
+              <IntakeListCard label="決定事項" items={draft.decisions} />
+              <IntakeListCard label="確認事項" items={draft.confirmations} />
+              <IntakeListCard label="問い合わせ" items={draft.inquiries} />
+              <IntakeListCard label="課題" items={draft.issues} />
+            </div>
+            <IntakeTaskCard items={draft.task_candidates} />
+            <IntakeDocsCard items={draft.docs_updates} />
+            <div className="flex flex-wrap items-center gap-2">
+              <Button onClick={() => void handleApply()} disabled={submitting}>
+                {submitting ? (
+                  <Loader2 className="mr-2 size-4 animate-spin" />
+                ) : (
+                  <Check className="mr-2 size-4" />
+                )}
+                案件情報へ反映
+              </Button>
+              <Button variant="outline" onClick={resetToInput} disabled={submitting}>
+                <RotateCcw className="mr-2 size-4" />
+                やり直す
+              </Button>
+            </div>
+          </div>
+        ) : null}
+
+        {phase === "done" && applied ? (
+          <div className="space-y-3">
+            <div className="rounded-md border border-primary/30 bg-primary/5 p-3 text-sm">
+              <div className="flex items-center gap-2 font-medium text-primary">
+                <Check className="size-4" />
+                案件情報へ反映しました
+              </div>
+              <div className="mt-2 grid gap-2 text-xs text-muted-foreground sm:grid-cols-3">
+                <span>決定事項 {applied.decisions}件</span>
+                <span>確認事項 {applied.confirmations}件</span>
+                <span>問い合わせ {applied.inquiries}件</span>
+                <span>課題 {applied.issues}件</span>
+                <span>タスク {applied.tasks}件</span>
+                <span>台帳行 {applied.record_rows}件</span>
+                <span>Docs反映 {applied.docs_updates}件</span>
+              </div>
+            </div>
+            <Button variant="outline" onClick={startNew}>
+              <RotateCcw className="mr-2 size-4" />
+              新しく入力する
+            </Button>
+          </div>
+        ) : null}
       </div>
     </section>
   );
@@ -224,13 +565,13 @@ export function ProjectInformationPanel({ project }: { project: ProjectInfo }) {
         </div>
       )}
 
-      {data && <ProjectInformationLanding data={data} />}
-
       {data?.node.id && (
-        <section className="min-h-[680px] overflow-hidden rounded-md border bg-background">
+        <section className="min-h-[680px] overflow-hidden border bg-background">
           <DocsWorkspace initialNodeId={data.node.id} />
         </section>
       )}
+
+      <DailyIntakeSection project={project} onApplied={load} />
 
       <div className="grid gap-4 xl:grid-cols-2">
           <section className="rounded-md border bg-background">
@@ -282,7 +623,7 @@ export function ProjectInformationPanel({ project }: { project: ProjectInfo }) {
                     >
                       <div className="flex items-center gap-2 text-sm font-medium">
                         <Table2 className="size-4" />
-                        {table.name}.dbtable
+                        {table.name}
                       </div>
                       {table.description && (
                         <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">
@@ -301,7 +642,7 @@ export function ProjectInformationPanel({ project }: { project: ProjectInfo }) {
         <div className="rounded-md border bg-background p-3">
           <div className="mb-3 flex items-center justify-between">
             <div>
-              <h4 className="text-sm font-semibold">{selectedTable.name}.dbtable</h4>
+              <h4 className="text-sm font-semibold">{selectedTable.name}</h4>
               {selectedTable.description && (
                 <p className="text-xs text-muted-foreground">{selectedTable.description}</p>
               )}

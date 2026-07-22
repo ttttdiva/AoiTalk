@@ -22,6 +22,19 @@ from sqlalchemy.orm import relationship
 from .base import Base, _encrypted_text_property
 
 
+def _public_message_metadata(value: Any) -> Any:
+    """Hide provider-internal reasoning while retaining it in persisted metadata."""
+    if isinstance(value, dict):
+        return {
+            key: _public_message_metadata(item)
+            for key, item in value.items()
+            if key != "reasoning_content"
+        }
+    if isinstance(value, list):
+        return [_public_message_metadata(item) for item in value]
+    return value
+
+
 class ConversationSession(Base):
     """Active conversation session"""
 
@@ -194,7 +207,7 @@ class ConversationMessage(Base):
             "session_id": str(self.session_id),
             "role": self.role,
             "content": self.content,
-            "metadata": self.message_metadata,
+            "metadata": _public_message_metadata(self.message_metadata or {}),
             "sender_type": self.sender_type,
             "sender_id": self.sender_id,
             "sender_display_name": self.sender_display_name,
@@ -240,7 +253,7 @@ class ConversationArchive(Base):
             "message_count": self.message_count,
             "start_time": self.start_time.isoformat() if self.start_time else None,
             "end_time": self.end_time.isoformat() if self.end_time else None,
-            "metadata": self.message_metadata,
+            "metadata": _public_message_metadata(self.message_metadata or {}),
             "archived_at": self.archived_at.isoformat() if self.archived_at else None,
         }
 
@@ -270,7 +283,7 @@ class ConversationHistory(Base):
             "character_name": self.character_name,
             "role": self.role,
             "content": self.content,
-            "metadata": self.message_metadata,
+            "metadata": _public_message_metadata(self.message_metadata or {}),
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "token_count": self.token_count,
             "function_call_data": self.function_call_data,

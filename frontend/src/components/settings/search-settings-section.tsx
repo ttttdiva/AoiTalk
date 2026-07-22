@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import useSWR from "swr";
 import { ChevronDown, ChevronUp, Search } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
@@ -46,32 +47,69 @@ async function pyFetch<T = unknown>(path: string, init?: RequestInit): Promise<T
   return res.json();
 }
 
+interface SearchSettingsState {
+  provider: string | null;
+  providerValues: string[];
+}
+
+const INITIAL_SEARCH_STATE: SearchSettingsState = {
+  provider: null,
+  providerValues: ["openai", "local"],
+};
+
 export function SearchSettingsSection() {
   const [expanded, setExpanded] = useState(false);
-  const [provider, setProvider] = useState<string | null>(null);
-  const [providerValues, setProviderValues] = useState(["openai", "local"]);
+  // 検索設定（サーバー状態）は SWR で管理。取得タイミングは従来どおりマウント時に
+  // 駆動するため自動 revalidation は無効化する。取得失敗時は従来同様に直前値を保持する。
+  const stateRef = useRef<SearchSettingsState>(INITIAL_SEARCH_STATE);
+  const { data = INITIAL_SEARCH_STATE, mutate: mutateSearch } = useSWR<SearchSettingsState>(
+    "settings/search-provider",
+    async () => {
+      try {
+        const payload = await pyFetch<SettingsPayload>("/settings");
+        return {
+          provider: payload.settings?.search?.provider ?? "openai",
+          providerValues:
+            payload.schema?.["search.provider"]?.values ?? ["openai", "local"],
+        };
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "検索設定を取得できませんでした");
+        return stateRef.current;
+      }
+    },
+    {
+      revalidateOnMount: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+      keepPreviousData: true,
+      dedupingInterval: 0,
+    },
+  );
+  stateRef.current = data;
+  const { provider, providerValues } = data;
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
 
   const loadSettings = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await pyFetch<SettingsPayload>("/settings");
-      setProvider(data.settings?.search?.provider ?? "openai");
-      setProviderValues(data.schema?.["search.provider"]?.values ?? ["openai", "local"]);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "検索設定を取得できませんでした");
+      await mutateSearch();
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [mutateSearch]);
 
   useEffect(() => {
     void loadSettings();
   }, [loadSettings]);
 
   const updateProvider = useCallback(async (value: string) => {
-    setProvider(value);
+    // 楽観的更新：保存中はローカルキャッシュを即時反映する。
+    await mutateSearch(
+      (current = INITIAL_SEARCH_STATE) => ({ ...current, provider: value }),
+      { revalidate: false },
+    );
     setSaving(true);
     try {
       await pyFetch("/settings", {
@@ -81,11 +119,11 @@ export function SearchSettingsSection() {
       toast.success("検索設定を保存しました");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "検索設定を保存できませんでした");
-      void loadSettings();
+      void mutateSearch();
     } finally {
       setSaving(false);
     }
-  }, [loadSettings]);
+  }, [mutateSearch]);
 
   return (
     <Card size="sm">

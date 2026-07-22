@@ -20,6 +20,18 @@ from .context_compression import model_tool_result_payload
 logger = logging.getLogger(__name__)
 
 
+def tool_output_indicates_success(output: Any) -> tuple[bool, str]:
+    """Interpret structured tool failures instead of treating every return as success."""
+    text = str(output)
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return True, ""
+    if isinstance(payload, dict) and payload.get("success") is False:
+        return False, str(payload.get("error") or "tool reported failure")
+    return True, ""
+
+
 @dataclass(frozen=True)
 class UnifiedToolCall:
     """Provider-neutral tool call."""
@@ -53,6 +65,7 @@ class UnifiedTurnResult:
     tool_results: list[UnifiedToolResult] = field(default_factory=list)
     rounds: int = 0
     stopped_reason: str = "final"
+    messages: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def tool_calls(self) -> list[UnifiedToolCall]:
@@ -180,8 +193,7 @@ class RegistryToolRouter:
         try:
             result = self.registry.execute(call.tool, **dict(call.arguments or {}))
             output = str(result)
-            success = True
-            error = ""
+            success, error = tool_output_indicates_success(output)
         except Exception as exc:
             output = str(exc)
             success = False
@@ -223,8 +235,7 @@ class RegistryToolRouter:
                 **dict(call.arguments or {}),
             )
             output = str(result)
-            success = True
-            error = ""
+            success, error = tool_output_indicates_success(output)
         except Exception as exc:
             output = str(exc)
             success = False
@@ -330,6 +341,29 @@ def serialize_openai_tool_call(tool_call: Any) -> dict[str, Any]:
             "arguments": raw_arguments,
         },
     }
+
+
+def serialize_openai_assistant_message(message: Any) -> dict[str, Any]:
+    if isinstance(message, dict):
+        payload = dict(message)
+    else:
+        dumped = None
+        model_dump = getattr(message, "model_dump", None)
+        if callable(model_dump):
+            try:
+                dumped = model_dump(exclude_none=True)
+            except TypeError:
+                dumped = model_dump()
+        payload = dict(dumped) if isinstance(dumped, dict) else {}
+        extra = getattr(message, "model_extra", None)
+        if isinstance(extra, dict):
+            payload.update(extra)
+    payload["role"] = str(payload.get("role") or getattr(message, "role", "assistant") or "assistant")
+    payload["content"] = payload.get("content") or getattr(message, "content", "") or ""
+    calls = list(payload.get("tool_calls") or getattr(message, "tool_calls", None) or [])
+    if calls:
+        payload["tool_calls"] = [serialize_openai_tool_call(call) for call in calls]
+    return payload
 
 
 def openai_tool_calls_from_message(message: Any) -> list[UnifiedToolCall]:
@@ -549,6 +583,7 @@ def run_openai_compatible_turn_loop(
         enforce_tool_policy=enforce_tool_policy,
     )
     current_messages = list(initial_messages)
+    current_message = assistant_message
     current_tool_calls = list(getattr(assistant_message, "tool_calls", None) or [])
     current_content = openai_message_content(assistant_message, message_content)
     all_results: list[UnifiedToolResult] = []
@@ -561,9 +596,7 @@ def run_openai_compatible_turn_loop(
                 else None
             )
             if continuation_prompt:
-                current_messages.append(
-                    {"role": "assistant", "content": current_content or ""}
-                )
+                current_messages.append(serialize_openai_assistant_message(current_message))
                 current_messages.append(
                     {"role": "user", "content": continuation_prompt}
                 )
@@ -573,6 +606,7 @@ def run_openai_compatible_turn_loop(
                     follow_up_kwargs["tool_choice"] = "auto"
                 response = create_completion(follow_up_kwargs)
                 message = response.choices[0].message
+                current_message = message
                 current_tool_calls = list(getattr(message, "tool_calls", None) or [])
                 current_content = openai_message_content(message, message_content)
                 continue
@@ -581,18 +615,13 @@ def run_openai_compatible_turn_loop(
                 tool_results=all_results,
                 rounds=round_index - 1,
                 stopped_reason="final",
+                messages=[
+                    *current_messages,
+                    serialize_openai_assistant_message(current_message),
+                ],
             )
 
-        current_messages.append(
-            {
-                "role": "assistant",
-                "content": current_content or "",
-                "tool_calls": [
-                    serialize_openai_tool_call(tool_call)
-                    for tool_call in current_tool_calls
-                ],
-            }
-        )
+        current_messages.append(serialize_openai_assistant_message(current_message))
 
         calls = [
             UnifiedToolCall(
@@ -631,6 +660,7 @@ def run_openai_compatible_turn_loop(
 
         response = create_completion(follow_up_kwargs)
         message = response.choices[0].message
+        current_message = message
         next_tool_calls = getattr(message, "tool_calls", None)
         current_content = openai_message_content(message, message_content)
         if next_tool_calls:
@@ -642,9 +672,7 @@ def run_openai_compatible_turn_loop(
             else None
         )
         if continuation_prompt:
-            current_messages.append(
-                {"role": "assistant", "content": current_content or ""}
-            )
+            current_messages.append(serialize_openai_assistant_message(current_message))
             current_messages.append({"role": "user", "content": continuation_prompt})
             follow_up_kwargs = dict(api_kwargs)
             follow_up_kwargs["messages"] = current_messages
@@ -652,6 +680,7 @@ def run_openai_compatible_turn_loop(
                 follow_up_kwargs["tool_choice"] = "auto"
             response = create_completion(follow_up_kwargs)
             message = response.choices[0].message
+            current_message = message
             current_tool_calls = list(getattr(message, "tool_calls", None) or [])
             current_content = openai_message_content(message, message_content)
             continue
@@ -661,6 +690,10 @@ def run_openai_compatible_turn_loop(
             tool_results=all_results,
             rounds=round_index,
             stopped_reason="final",
+            messages=[
+                *current_messages,
+                serialize_openai_assistant_message(current_message),
+            ],
         )
 
     logger.warning("[%s] Unified turn loop exceeded max rounds", log_prefix)
@@ -669,6 +702,10 @@ def run_openai_compatible_turn_loop(
         tool_results=all_results,
         rounds=max_rounds,
         stopped_reason="max_rounds",
+        messages=[
+            *current_messages,
+            serialize_openai_assistant_message(current_message),
+        ],
     )
 
 

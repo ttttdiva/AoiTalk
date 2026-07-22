@@ -9,8 +9,14 @@ Bearer 認証付きで中継する。リモートから取得したデータ本�
 """
 
 import logging
+import asyncio
+import ipaddress
+import os
+import socket
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -26,6 +32,15 @@ class RemoteConnectorError(RuntimeError):
     """リモート接続・応答に関する失敗。"""
 
 
+@dataclass(frozen=True)
+class RemoteRawResponse:
+    """ファイル中継用のレスポンススナップショット。"""
+
+    status_code: int
+    headers: Dict[str, str]
+    content: bytes
+
+
 class RemoteServerConnector:
     """1つの外部AoiTalkサーバーに対する中継クライアント。"""
 
@@ -39,6 +54,51 @@ class RemoteServerConnector:
         self._auth_token = auth_token
         self._timeout = timeout
         self._capabilities_cache: Optional[Tuple[float, Dict[str, Any]]] = None
+
+    @staticmethod
+    def _private_targets_allowed() -> bool:
+        return os.getenv("AOITALK_ALLOW_PRIVATE_REMOTE_SERVERS", "").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+
+    async def _ensure_safe_network_target(self) -> None:
+        """Prevent a saved hostname from being used for SSRF into private networks."""
+        if self._private_targets_allowed():
+            return
+        try:
+            parsed = urlsplit(self._base_url)
+            hostname = parsed.hostname
+            if parsed.scheme not in {"http", "https"} or not hostname:
+                raise RemoteConnectorError("remote base URL must be an HTTP(S) URL")
+            if parsed.username or parsed.password:
+                raise RemoteConnectorError("remote base URL must not contain credentials")
+            lowered = hostname.lower().rstrip(".")
+            if lowered in {"localhost", "localhost.localdomain"} or lowered.endswith(".localhost"):
+                raise RemoteConnectorError("private remote server hosts are disabled")
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            addresses = await asyncio.to_thread(
+                socket.getaddrinfo,
+                hostname,
+                port,
+                type=socket.SOCK_STREAM,
+            )
+        except (ValueError, socket.gaierror, OSError) as exc:
+            raise RemoteConnectorError(f"remote host cannot be resolved safely: {exc}") from exc
+        for result in addresses:
+            try:
+                address = ipaddress.ip_address(result[4][0])
+            except ValueError as exc:
+                raise RemoteConnectorError("remote host resolved to an invalid address") from exc
+            if (
+                address.is_private
+                or address.is_loopback
+                or address.is_link_local
+                or address.is_reserved
+                or address.is_multicast
+                or address.is_unspecified
+                or not address.is_global
+            ):
+                raise RemoteConnectorError("private remote server hosts are disabled")
 
     def _headers(self) -> Dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -57,6 +117,7 @@ class RemoteServerConnector:
         params: Optional[Dict[str, Any]] = None,
         json_body: Optional[Dict[str, Any]] = None,
     ) -> Any:
+        await self._ensure_safe_network_target()
         url = self._url(path)
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
@@ -79,6 +140,49 @@ class RemoteServerConnector:
             return response.json()
         except ValueError:
             return None
+
+    async def request_raw(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> RemoteRawResponse:
+        """JSONに変換せず、許可済みファイル応答を中継する。"""
+        await self._ensure_safe_network_target()
+        url = self._url(path)
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                response = await client.request(
+                    method,
+                    url,
+                    params=params,
+                    headers=self._headers(),
+                )
+        except httpx.HTTPError as exc:
+            raise RemoteConnectorError(f"request to {url} failed: {exc}") from exc
+        if response.status_code == 401:
+            raise RemoteConnectorError("remote authentication failed (401)")
+        if response.status_code >= 400:
+            raise RemoteConnectorError(
+                f"remote returned {response.status_code} for {method} {path}"
+            )
+        allowed_headers = {
+            "content-type",
+            "content-disposition",
+            "content-length",
+            "accept-ranges",
+            "content-range",
+        }
+        return RemoteRawResponse(
+            status_code=response.status_code,
+            headers={
+                key.lower(): value
+                for key, value in response.headers.items()
+                if key.lower() in allowed_headers
+            },
+            content=response.content,
+        )
 
     async def fetch_capabilities(self, use_cache: bool = True) -> Dict[str, Any]:
         """リモートの capabilities を取得する（短TTLキャッシュ付き）。"""
@@ -112,7 +216,14 @@ class RemoteServerConnector:
         capabilities = await self.fetch_capabilities()
         if feature is not None:
             features = capabilities.get("features") or {}
-            if not features.get(feature, False):
+            resources = capabilities.get("resources") or {}
+            resource = resources.get(feature)
+            resource_write = (
+                resource.get("write") if isinstance(resource, dict) else None
+            )
+            if resource_write is False or (
+                resource_write is None and not features.get(feature, False)
+            ):
                 raise RemoteConnectorError(
                     f"remote feature '{feature}' is disabled; write not allowed"
                 )

@@ -9,19 +9,45 @@ import { normalizeApiUrl } from "./api-url";
 
 export type AuthMode = "signed_out" | "anonymous" | "authenticated";
 
+let cachedToken: string | null | undefined;
+let tokenLoadPromise: Promise<string | null> | null = null;
+let tokenRevision = 0;
+
 /** トークンを安全に保存 */
 export async function saveToken(token: string): Promise<void> {
   await SecureStore.setItemAsync(STORAGE_KEYS.ACCESS_TOKEN, token);
+  tokenRevision += 1;
+  cachedToken = token;
 }
 
 /** トークンを取得 */
-export async function getToken(): Promise<string | null> {
-  return SecureStore.getItemAsync(STORAGE_KEYS.ACCESS_TOKEN);
+export function getToken(): Promise<string | null> {
+  if (cachedToken !== undefined) return Promise.resolve(cachedToken);
+  if (tokenLoadPromise) return tokenLoadPromise;
+
+  const revision = tokenRevision;
+  tokenLoadPromise = SecureStore.getItemAsync(STORAGE_KEYS.ACCESS_TOKEN)
+    .then((token) => {
+      if (revision !== tokenRevision) return cachedToken ?? null;
+      cachedToken = token;
+      return token;
+    })
+    .finally(() => {
+      tokenLoadPromise = null;
+    });
+  return tokenLoadPromise;
+}
+
+/** SecureStoreを待たずに、既に解決済みの認証トークンを参照する。 */
+export function getCachedToken(): string | null | undefined {
+  return cachedToken;
 }
 
 /** トークンを削除（ログアウト時） */
 export async function removeToken(): Promise<void> {
   await SecureStore.deleteItemAsync(STORAGE_KEYS.ACCESS_TOKEN);
+  tokenRevision += 1;
+  cachedToken = null;
 }
 
 /** 認証モードを保存 */
@@ -104,4 +130,11 @@ export function decodeTokenPayload(
   } catch {
     return null;
   }
+}
+
+/** tokenからユーザー単位のcache/sync scopeを得る。 */
+export function getTokenAuthScope(token: string | null | undefined): string {
+  if (!token) return "anonymous";
+  const user = decodeTokenPayload(token, { ignoreExpiration: true });
+  return user?.user_id ? `auth:${user.user_id}` : "auth:unknown";
 }

@@ -49,93 +49,89 @@
 }
 
 :root {
-  --background: oklch(0.968 0.035 200);
-  --foreground: oklch(0.245 0.04 225);
-  --card: oklch(0.995 0.01 205 / 0.9);
-  --card-foreground: oklch(0.245 0.04 225);
-  --popover: oklch(0.995 0.006 205 / 0.94);
-  --popover-foreground: oklch(0.245 0.04 225);
-  --primary: oklch(0.54 0.18 198);
-  --primary-foreground: oklch(0.99 0.006 205);
-  --secondary: oklch(0.94 0.035 185 / 0.86);
-  --secondary-foreground: oklch(0.29 0.055 215);
-  --muted: oklch(0.925 0.035 205 / 0.78);
-  --muted-foreground: oklch(0.48 0.04 225);
-  --accent: oklch(0.875 0.095 182 / 0.86);
-  --accent-foreground: oklch(0.26 0.065 215);
-  --destructive: oklch(0.56 0.18 25);
-  --border: oklch(0.84 0.035 210 / 0.72);
-  --input: oklch(0.89 0.03 205 / 0.74);
-  --ring: oklch(0.66 0.12 196);
-  --chart-1: oklch(0.64 0.14 202);
-  --chart-2: oklch(0.63 0.12 165);
-  --chart-3: oklch(0.58 0.12 260);
-  --chart-4: oklch(0.72 0.13 85);
-  --chart-5: oklch(0.66 0.14 20);
+  /* ライト: 白 + ニュートラルグレー / アクセント #0F9FA8 */
+  color-scheme: light;
+  --background: #e9eef4; /* アプリ外周（サイドバーよりわずかに暗い） */
+  --foreground: #172033; /* メイン文字 */
+  --card: #ffffff; /* メイン面・カード・エディタ面 */
+  --card-foreground: #172033;
+  --popover: #ffffff;
+  --popover-foreground: #172033;
+  --primary: #0f9fa8; /* アクセント */
+  --primary-foreground: #ffffff;
+  --secondary: #f8fafc; /* 補助面 */
+  --secondary-foreground: #172033;
+  --muted: #f8fafc;
+  --muted-foreground: #667085; /* 補助文字 */
+  --accent: #eef3f7; /* ホバー面 */
+  --accent-foreground: #172033;
+  --destructive: #d64545;
+  --border: #dce3ea;
+  --input: #dce3ea;
+  --ring: #0f9fa8;
+  --chart-1: #0f9fa8;
+  --chart-2: #3b82c4;
+  --chart-3: #6366a8;
+  --chart-4: #c48a2e;
+  --chart-5: #c4574f;
   --radius: 0.625rem;
-  --sidebar: oklch(0.955 0.04 195 / 0.9);
-  --sidebar-foreground: oklch(0.28 0.045 225);
-  --sidebar-primary: oklch(0.58 0.14 205);
-  --sidebar-primary-foreground: oklch(0.99 0.006 205);
-  --sidebar-accent: oklch(0.84 0.11 186 / 0.9);
-  --sidebar-accent-foreground: oklch(0.24 0.06 220);
-  --sidebar-border: oklch(0.82 0.035 205 / 0.58);
-  --sidebar-ring: oklch(0.66 0.12 196);
+  --sidebar: #f1f4f8; /* サイドバー・ヘッダー面（本文の白より一段暗いグレー） */
+  --sidebar-foreground: #172033;
+  --sidebar-primary: #0f9fa8;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #e4eaf1; /* サイドバー内ホバー（面よりわずかに暗く） */
+  --sidebar-accent-foreground: #172033;
+  --sidebar-border: #dce3ea;
+  --sidebar-ring: #0f9fa8;
 }
 
 .dark {
-  --background: oklch(0.18 0.035 235);
-  --foreground: oklch(0.93 0.018 215);
-  --card: oklch(0.24 0.035 235 / 0.78);
-  --card-foreground: oklch(0.93 0.018 215);
-  --popover: oklch(0.22 0.035 235 / 0.96);
-  --popover-foreground: oklch(0.93 0.018 215);
-  --primary: oklch(0.7 0.14 195);
-  --primary-foreground: oklch(0.16 0.035 235);
-  --secondary: oklch(0.32 0.04 228 / 0.78);
-  --secondary-foreground: oklch(0.9 0.022 215);
-  --muted: oklch(0.3 0.034 230 / 0.74);
-  --muted-foreground: oklch(0.72 0.028 220);
-  --accent: oklch(0.4 0.08 205 / 0.78);
-  --accent-foreground: oklch(0.94 0.022 210);
-  --destructive: oklch(0.66 0.17 22);
-  --border: oklch(0.56 0.045 220 / 0.34);
-  --input: oklch(0.38 0.035 225 / 0.52);
-  --ring: oklch(0.72 0.13 195);
-  --chart-1: oklch(0.7 0.14 202);
-  --chart-2: oklch(0.72 0.13 165);
-  --chart-3: oklch(0.68 0.13 270);
-  --chart-4: oklch(0.76 0.12 95);
-  --chart-5: oklch(0.72 0.14 24);
-  --sidebar: oklch(0.2 0.04 235 / 0.82);
-  --sidebar-foreground: oklch(0.91 0.02 215);
-  --sidebar-primary: oklch(0.72 0.14 198);
-  --sidebar-primary-foreground: oklch(0.15 0.035 235);
-  --sidebar-accent: oklch(0.37 0.07 205 / 0.72);
-  --sidebar-accent-foreground: oklch(0.94 0.022 210);
-  --sidebar-border: oklch(0.58 0.045 220 / 0.3);
-  --sidebar-ring: oklch(0.72 0.13 195);
+  /* ダーク: 濃紺 + 青緑アクセント #55D6C2 */
+  color-scheme: dark;
+  --background: #0b172a; /* アプリ背景 */
+  --foreground: #d7e1f2; /* メイン文字 */
+  --card: #12233d; /* メイン面・カード・エディタ面 */
+  --card-foreground: #d7e1f2;
+  --popover: #12233d;
+  --popover-foreground: #d7e1f2;
+  --primary: #55d6c2; /* アクセント */
+  --primary-foreground: #0b172a;
+  --secondary: #172b49; /* 浮いた面・ホバー */
+  --secondary-foreground: #d7e1f2;
+  --muted: #172b49;
+  --muted-foreground: #91a2bf; /* 補助文字 */
+  --accent: #172b49;
+  --accent-foreground: #d7e1f2;
+  --destructive: #e5706b;
+  --border: #263b59;
+  --input: #263b59;
+  --ring: #55d6c2;
+  --chart-1: #55d6c2;
+  --chart-2: #5aa8e0;
+  --chart-3: #8b90d6;
+  --chart-4: #d9a84e;
+  --chart-5: #e5706b;
+  --sidebar: #0e1c31; /* サイドバー・ヘッダー面（本文 #12233d より一段暗い） */
+  --sidebar-foreground: #d7e1f2;
+  --sidebar-primary: #55d6c2;
+  --sidebar-primary-foreground: #0b172a;
+  --sidebar-accent: #172b49;
+  --sidebar-accent-foreground: #d7e1f2;
+  --sidebar-border: #263b59;
+  --sidebar-ring: #55d6c2;
 }
 
 @layer base {
   * {
     @apply border-border outline-ring/50;
   }
-  body {
-    @apply bg-background text-foreground;
-    background:
-      linear-gradient(135deg, rgba(219, 249, 255, 0.98) 0%, rgba(246, 255, 252, 0.9) 38%, rgba(225, 239, 255, 0.98) 100%),
-      repeating-linear-gradient(115deg, rgba(255, 255, 255, 0.44) 0 1px, transparent 1px 20px);
-    color-scheme: light;
-  }
-  .dark body {
-    background:
-      linear-gradient(135deg, rgba(7, 14, 27, 0.98) 0%, rgba(10, 25, 42, 0.94) 44%, rgba(16, 22, 44, 0.98) 100%),
-      repeating-linear-gradient(115deg, rgba(132, 231, 255, 0.09) 0 1px, transparent 1px 24px);
-    color-scheme: dark;
-  }
   html {
     @apply font-sans;
+    background: var(--background);
+  }
+  body {
+    @apply bg-background text-foreground;
+    background: var(--background);
   }
 }
 
@@ -147,146 +143,50 @@
 }
 
 @layer components {
+  /* マットで落ち着いた業務アプリ配色。ガラス・blur・多重グラデーションは撤去し、
+     明度差 + 細い境界線で階層を表現する。 */
   .ao-app-shell {
     position: relative;
     isolation: isolate;
     overflow: hidden;
-    background:
-      linear-gradient(118deg, rgba(226, 251, 255, 0.84), rgba(246, 255, 252, 0.7) 48%, rgba(225, 239, 255, 0.82)),
-      url("/images/ui/login-crystal.png") center / cover no-repeat;
-  }
-
-  .dark .ao-app-shell {
-    background:
-      linear-gradient(118deg, rgba(8, 18, 32, 0.92), rgba(11, 30, 48, 0.78) 48%, rgba(17, 23, 44, 0.92)),
-      url("/images/ui/login-crystal.png") center / cover no-repeat;
-  }
-
-  .ao-app-shell::before {
-    content: "";
-    position: fixed;
-    inset: 0;
-    z-index: -2;
-    background:
-      linear-gradient(90deg, rgba(255, 255, 255, 0.76), rgba(255, 255, 255, 0.48)),
-      url("/images/ui/login-crystal.png") center / cover no-repeat;
-    opacity: 0.82;
-  }
-
-  .dark .ao-app-shell::before {
-    background:
-      linear-gradient(90deg, rgba(6, 13, 24, 0.86), rgba(8, 19, 32, 0.62)),
-      linear-gradient(132deg, rgba(96, 220, 255, 0.18) 0 19%, transparent 19% 42%, rgba(178, 145, 255, 0.12) 42% 68%, transparent 68% 100%),
-      url("/images/ui/login-crystal.png") center / cover no-repeat;
-    opacity: 0.9;
-  }
-
-  .ao-app-shell::after {
-    content: "";
-    position: fixed;
-    inset: 0;
-    z-index: -1;
-    background:
-      linear-gradient(120deg, rgba(255, 255, 255, 0.72) 0 18%, transparent 18% 32%, rgba(255, 255, 255, 0.36) 32% 48%, transparent 48% 100%),
-      repeating-linear-gradient(120deg, rgba(11, 117, 145, 0.08) 0 1px, transparent 1px 34px);
-    pointer-events: none;
-  }
-
-  .dark .ao-app-shell::after {
-    background:
-      linear-gradient(120deg, rgba(125, 231, 255, 0.14) 0 18%, transparent 18% 32%, rgba(255, 255, 255, 0.06) 32% 48%, transparent 48% 100%),
-      repeating-linear-gradient(120deg, rgba(132, 231, 255, 0.12) 0 1px, transparent 1px 34px);
+    background: var(--background);
   }
 
   .ao-main-panel {
     margin: 0;
     overflow: hidden;
-    border: 1px solid rgba(255, 255, 255, 0.76);
+    border: 1px solid var(--border);
     border-radius: 0;
-    background: rgba(255, 255, 255, 0.42);
-    box-shadow: inset 0 1px rgba(255, 255, 255, 0.78);
-    backdrop-filter: blur(24px) saturate(1.18);
-  }
-
-  .dark .ao-main-panel {
-    border-color: rgba(156, 224, 255, 0.22);
-    background: rgba(9, 18, 32, 0.56);
-    box-shadow: inset 0 1px rgba(255, 255, 255, 0.12);
-    backdrop-filter: blur(28px) saturate(1.18);
+    background: var(--card);
   }
 
   .ao-main-scroll {
-    background:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.38), rgba(255, 255, 255, 0.18)),
-      repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.24) 0 1px, transparent 1px 48px);
-  }
-
-  .dark .ao-main-scroll {
-    background:
-      linear-gradient(180deg, rgba(9, 20, 36, 0.34), rgba(11, 24, 40, 0.2)),
-      repeating-linear-gradient(90deg, rgba(128, 230, 255, 0.08) 0 1px, transparent 1px 48px);
+    background: var(--card);
   }
 
   .ao-topbar {
     min-height: 64px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.72);
-    background:
-      linear-gradient(90deg, rgba(255, 255, 255, 0.82), rgba(224, 250, 255, 0.66) 44%, rgba(255, 255, 255, 0.7)),
-      linear-gradient(180deg, rgba(255, 255, 255, 0.66), rgba(255, 255, 255, 0.32));
-    box-shadow:
-      inset 0 1px rgba(255, 255, 255, 0.9),
-      0 18px 46px -42px rgba(5, 96, 124, 0.78);
-    backdrop-filter: blur(24px) saturate(1.25);
-  }
-
-  .dark .ao-topbar {
-    border-bottom-color: rgba(156, 224, 255, 0.2);
-    background:
-      linear-gradient(90deg, rgba(13, 28, 46, 0.88), rgba(15, 42, 60, 0.7) 44%, rgba(13, 26, 44, 0.82)),
-      linear-gradient(180deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.035));
-    box-shadow:
-      inset 0 1px rgba(255, 255, 255, 0.14),
-      0 18px 46px -36px rgba(0, 0, 0, 0.9);
+    border-bottom: 1px solid var(--sidebar-border);
+    background: var(--sidebar);
   }
 
   .ao-sidebar-panel {
-    background:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.78), rgba(218, 248, 255, 0.66) 45%, rgba(255, 255, 255, 0.56));
-    box-shadow:
-      inset -1px 0 rgba(255, 255, 255, 0.74),
-      20px 0 72px -54px rgba(0, 76, 102, 0.86);
-    backdrop-filter: blur(28px) saturate(1.24);
-  }
-
-  .dark .ao-sidebar-panel {
-    background:
-      linear-gradient(180deg, rgba(11, 23, 39, 0.86), rgba(10, 32, 48, 0.72) 46%, rgba(9, 18, 33, 0.74));
-    box-shadow:
-      inset -1px 0 rgba(156, 224, 255, 0.16),
-      20px 0 72px -54px rgba(0, 0, 0, 0.95);
+    background: var(--sidebar);
+    border-right: 1px solid var(--sidebar-border);
   }
 
   .ao-sidebar-hero {
     min-height: 84px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.74);
-    background:
-      linear-gradient(145deg, rgba(255, 255, 255, 0.8), rgba(195, 243, 255, 0.56)),
-      repeating-linear-gradient(115deg, rgba(0, 104, 132, 0.09) 0 1px, transparent 1px 22px);
-  }
-
-  .dark .ao-sidebar-hero {
-    border-bottom-color: rgba(156, 224, 255, 0.18);
-    background:
-      linear-gradient(145deg, rgba(20, 43, 65, 0.82), rgba(13, 45, 60, 0.54)),
-      repeating-linear-gradient(115deg, rgba(132, 231, 255, 0.11) 0 1px, transparent 1px 22px);
+    border-bottom: 1px solid var(--sidebar-border);
+    background: var(--sidebar);
   }
 }
 
 /* ネイティブ select のダーク配色修正 */
 .dark select,
 .dark select option {
-  background-color: oklch(0.22 0.035 235);
-  color: oklch(0.92 0.018 215);
+  background-color: var(--popover);
+  color: var(--popover-foreground);
 }
 
 .message-content pre {
@@ -312,7 +212,31 @@
 .dark input,
 .dark textarea {
   color: var(--foreground);
-  caret-color: var(--foreground);
+  caret-color: var(--primary);
+}
+
+/* テキスト選択色（ブラウザ既定だとダークテーマで潰れて読めないため明示） */
+::selection {
+  background: color-mix(in oklch, var(--primary) 40%, transparent);
+  color: var(--foreground);
+}
+.dark ::selection {
+  background: color-mix(in oklch, var(--primary) 42%, transparent);
+  color: var(--foreground);
+}
+
+/* Docs / CodeMirror エディタのカレット可視化（行末でカーソルが消える問題対策） */
+.docs-block-editor,
+.cm-editor .cm-content {
+  caret-color: var(--primary);
+}
+.cm-cursor,
+.cm-cursor-primary {
+  border-left-color: var(--primary);
+}
+.dark .cm-cursor,
+.dark .cm-cursor-primary {
+  border-left-color: var(--primary);
 }
 
 .dark .prose-sm {
@@ -348,151 +272,176 @@
   text-decoration: line-through;
 }
 
-/* ── FullCalendar ダークテーマ調整 ──
-   デフォルトのライト配色のままだと dayGrid/popover が白背景+白文字で潰れるので
-   CSS 変数ベースで上書きする */
+/* ── FullCalendar（ClickUp 風の密度・トークンベース配色） ──
+   グリッド線は細く控えめ、ヘッダー・日付番号はコンパクト。
+   ガラス・強い影・過剰角丸は使わず、明度差と細い境界線で表現する。 */
 .fc {
-  --fc-border-color: oklch(0.83 0.035 210 / 0.78);
+  --fc-border-color: var(--border);
   --fc-page-bg-color: transparent;
-  --fc-neutral-bg-color: oklch(0.955 0.02 205 / 0.8);
-  --fc-neutral-text-color: oklch(0.34 0.04 225);
-  --fc-list-event-hover-bg-color: oklch(0.93 0.04 185 / 0.72);
-  --fc-today-bg-color: oklch(0.82 0.08 190 / 0.24);
-  --fc-event-bg-color: oklch(0.58 0.14 205 / 0.72);
-  --fc-event-border-color: oklch(0.58 0.14 205 / 0.88);
+  --fc-neutral-bg-color: var(--secondary);
+  --fc-neutral-text-color: var(--muted-foreground);
+  --fc-list-event-hover-bg-color: var(--accent);
+  --fc-today-bg-color: color-mix(in oklch, var(--primary) 12%, transparent);
+  --fc-event-bg-color: color-mix(in oklch, var(--primary) 14%, transparent);
+  --fc-event-border-color: color-mix(in oklch, var(--primary) 45%, transparent);
   --fc-event-text-color: var(--foreground);
-  color: oklch(0.34 0.04 225);
+  color: var(--foreground);
+  font-size: 0.8125rem;
 }
 
 .fc .fc-scrollgrid,
 .fc .fc-scrollgrid-section > *,
-.fc .fc-scrollgrid-section-liquid > td {
-  border-color: oklch(0.83 0.035 210 / 0.78);
+.fc .fc-scrollgrid-section-liquid > td,
+.fc .fc-list {
+  border-color: var(--border);
 }
 
-.fc .fc-col-header-cell-cushion,
-.fc .fc-daygrid-day-number,
+/* 曜日ヘッダー: コンパクト・小さめフォント */
+.fc .fc-col-header-cell {
+  background: var(--secondary);
+}
+.fc .fc-col-header-cell-cushion {
+  padding: 6px 8px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--foreground);
+}
+
+/* 日付番号: 曜日と同程度に見やすく */
+.fc .fc-daygrid-day-number {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--foreground);
+}
 .fc .fc-list-day-cushion,
 .fc .fc-timegrid-axis-cushion,
 .fc .fc-timegrid-slot-label-cushion {
-  color: oklch(0.39 0.04 225);
+  font-size: 0.72rem;
+  color: var(--muted-foreground);
+}
+/* 日付上部の余白を詰める（日付番号は通常フロー・右上） */
+.fc .fc-daygrid-day-top {
+  padding: 2px 5px 0;
 }
 
-.fc .fc-col-header-cell {
-  background: oklch(0.96 0.018 205 / 0.78);
-}
-
+/* 当日: 淡い青緑の背景 + 細い境界 */
 .fc .fc-daygrid-day.fc-day-today,
 .fc .fc-timegrid-col.fc-day-today {
-  background-color: oklch(0.82 0.08 190 / 0.24);
+  background-color: color-mix(in oklch, var(--primary) 10%, transparent);
+}
+.fc .fc-daygrid-day.fc-day-today .fc-daygrid-day-number {
+  color: var(--primary);
+  font-weight: 700;
 }
 
+/* 前月・翌月は十分に薄く */
 .fc .fc-day-other .fc-daygrid-day-number {
-  color: oklch(0.62 0.035 225);
+  opacity: 0.45;
 }
 
-/* 週末の色分け（読みやすさ向上） */
-.fc .fc-day-sat .fc-daygrid-day-number {
-  color: oklch(0.55 0.13 225);
-}
+/* 週末は控えめに（派手な赤青は使わない） */
+.fc .fc-day-sat .fc-daygrid-day-number,
 .fc .fc-day-sun .fc-daygrid-day-number {
-  color: hsl(0 65% 70%);
+  color: var(--muted-foreground);
 }
 
-/* ツールバーのボタン */
+/* ツールバーのボタン: 小さく統一 */
+.fc .fc-toolbar-title {
+  font-size: 1.05rem;
+  font-weight: 600;
+}
 .fc .fc-button {
-  background: oklch(0.98 0.01 205 / 0.86);
-  border-color: oklch(0.83 0.035 210 / 0.78);
-  color: oklch(0.28 0.045 225);
+  padding: 3px 9px;
+  font-size: 0.78rem;
+  font-weight: 500;
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  border-color: var(--border);
+  color: var(--foreground);
   box-shadow: none;
 }
 .fc .fc-button:hover {
-  background: oklch(0.92 0.055 178 / 0.78);
-  border-color: oklch(0.72 0.08 190 / 0.8);
+  background: var(--accent);
+  border-color: var(--border);
+}
+.fc .fc-button:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+  box-shadow: none;
 }
 .fc .fc-button-primary:not(:disabled).fc-button-active,
 .fc .fc-button-primary:not(:disabled):active {
-  background: oklch(0.58 0.14 205);
-  border-color: oklch(0.58 0.14 205);
-  color: white;
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--primary-foreground);
 }
 .fc .fc-button-primary:disabled {
-  background: oklch(0.93 0.02 205 / 0.72);
-  color: oklch(0.56 0.035 225);
+  background: var(--muted);
+  border-color: var(--border);
+  color: var(--muted-foreground);
 }
 
-/* イベント */
+/* イベント: 彩度の高いベタ塗りでなく薄い背景 + 細い境界（影・ガラスなし） */
 .fc .fc-event {
-  border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
-  padding: 1px 4px;
-  font-size: 0.75rem;
+  border-width: 1px;
+  border-style: solid;
+  /* inline borderColor 未指定時のデフォルト（プロジェクト色未設定イベント用） */
+  border-color: color-mix(in srgb, currentColor 45%, transparent);
+  border-radius: var(--radius-sm);
+  padding: 0 3px;
+  font-size: 0.86rem;
   font-weight: 500;
-  box-shadow:
-    inset 0 1px rgba(255, 255, 255, 0.28),
-    0 10px 22px -18px rgba(0, 0, 0, 0.55);
-  backdrop-filter: blur(10px) saturate(1.16);
+  box-shadow: none;
 }
 .fc .fc-daygrid-event {
   white-space: nowrap;
 }
 .fc .fc-event .fc-event-main,
 .fc .fc-event .fc-event-title {
-  color: var(--foreground) !important;
+  color: var(--foreground);
   text-shadow: none;
 }
 .fc .fc-daygrid-dot-event .fc-event-title {
-  color: oklch(0.34 0.04 225) !important;
+  color: var(--foreground);
   text-shadow: none;
 }
 
-/* 「+N more」ポップオーバー（ダーク化） */
-.fc .fc-more-popover,
-.fc .fc-popover {
-  background: oklch(0.99 0.008 205 / 0.94) !important;
-  color: oklch(0.28 0.045 225) !important;
-  border: 1px solid oklch(0.83 0.035 210 / 0.78) !important;
-  border-radius: 0.5rem;
-  box-shadow:
-    0 18px 45px -22px rgba(20, 79, 112, 0.38),
-    inset 0 1px 0 rgba(255, 255, 255, 0.8);
-  backdrop-filter: blur(18px);
-  z-index: 40;
+/* 新規イベントチップ（month 表示の eventContent が出す構造） */
+/* 高さ・フォントは「改行なしのタスク名なら3個で日付セルの縦枠が埋まる」目安 */
+.ao-cal-event {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 30px;
+  overflow: hidden;
+  font-size: 0.92rem;
+  line-height: 1.1;
 }
-.fc .fc-popover-header {
-  background: oklch(0.94 0.035 185 / 0.76) !important;
-  color: oklch(0.28 0.045 225) !important;
-  padding: 6px 10px;
-  border-bottom: 1px solid oklch(0.83 0.035 210 / 0.78);
+.ao-cal-event-bar {
+  flex: 0 0 auto;
+  width: 5px;
+  align-self: stretch;
+  margin: 3px 0;
+  border-radius: 2px;
+  /* 縦バー色は inline style（プロジェクト色）で供給される */
+  background: currentColor;
 }
-.fc .fc-popover-title {
-  color: oklch(0.28 0.045 225);
-  font-weight: 600;
+.ao-cal-event-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* 名前が右端まで詰まって見えないよう少し余白を残して切る */
+  padding-right: 2px;
 }
-.fc .fc-popover-close {
-  color: oklch(0.45 0.04 225);
-  opacity: 0.8;
-}
-.fc .fc-popover-close:hover {
-  opacity: 1;
-}
-.fc .fc-popover-body {
-  background: transparent !important;
-  padding: 6px;
-}
-.fc .fc-popover .fc-event,
-.fc .fc-more-popover .fc-event {
-  margin-bottom: 2px;
-}
-/* ポップオーバー内の「もっと」リンク */
-.fc .fc-daygrid-more-link {
-  color: oklch(0.52 0.13 205);
-  font-weight: 500;
-}
-.fc .fc-daygrid-more-link:hover {
-  color: oklch(0.45 0.15 205);
-  text-decoration: underline;
+.ao-cal-event-time {
+  flex: 0 0 auto;
+  font-size: 0.82rem;
+  color: var(--muted-foreground);
 }
 
+/* 月表示: 折りたたみ中の週は 1 日あたり 3 件までを表示 */
 .fc
   .ao-calendar-week-collapsed
   .fc-daygrid-day-events
@@ -504,11 +453,12 @@
   min-height: 1.5rem;
 }
 
+/* 「+N件」インライン展開トグル */
 .fc .ao-calendar-toggle {
   appearance: none;
   border: none;
   background: transparent;
-  color: oklch(0.52 0.13 205);
+  color: var(--primary);
   cursor: pointer;
   font-size: 0.75rem;
   font-weight: 600;
@@ -516,147 +466,29 @@
 }
 
 .fc .ao-calendar-toggle:hover {
-  color: oklch(0.45 0.15 205);
+  color: color-mix(in oklch, var(--primary) 80%, var(--foreground));
   text-decoration: underline;
 }
 
 /* リストビュー */
-.fc .fc-list {
-  border-color: oklch(0.83 0.035 210 / 0.78);
-}
 .fc .fc-list-day-cushion {
-  background: oklch(0.955 0.02 205 / 0.8) !important;
+  background: var(--secondary);
 }
 .fc .fc-list-event:hover td {
-  background: oklch(0.93 0.04 185 / 0.72) !important;
+  background: var(--accent);
 }
 .fc .fc-list-event-dot {
   border-color: currentColor;
 }
 .fc .fc-list-empty {
   background: transparent;
-  color: oklch(0.52 0.04 225);
+  color: var(--muted-foreground);
 }
 
 /* タイムグリッドの「現在時刻」ライン */
 .fc .fc-timegrid-now-indicator-line,
 .fc .fc-timegrid-now-indicator-arrow {
-  border-color: hsl(0 70% 60%);
-}
-
-.dark .fc {
-  --fc-border-color: oklch(0.56 0.045 220 / 0.34);
-  --fc-neutral-bg-color: oklch(0.26 0.035 232 / 0.72);
-  --fc-neutral-text-color: oklch(0.86 0.02 215);
-  --fc-list-event-hover-bg-color: oklch(0.34 0.04 228 / 0.72);
-  --fc-today-bg-color: oklch(0.44 0.09 200 / 0.28);
-  --fc-event-bg-color: oklch(0.58 0.14 205 / 0.82);
-  --fc-event-border-color: oklch(0.72 0.13 195 / 0.76);
-  --fc-event-text-color: oklch(0.98 0.006 205);
-  color: var(--foreground);
-}
-
-.dark .fc .fc-scrollgrid,
-.dark .fc .fc-scrollgrid-section > *,
-.dark .fc .fc-scrollgrid-section-liquid > td,
-.dark .fc .fc-list {
-  border-color: oklch(0.56 0.045 220 / 0.34);
-}
-
-.dark .fc .fc-col-header-cell-cushion,
-.dark .fc .fc-daygrid-day-number,
-.dark .fc .fc-list-day-cushion,
-.dark .fc .fc-timegrid-axis-cushion,
-.dark .fc .fc-timegrid-slot-label-cushion {
-  color: oklch(0.86 0.02 215);
-}
-
-.dark .fc .fc-col-header-cell,
-.dark .fc .fc-list-day-cushion {
-  background: oklch(0.26 0.035 232 / 0.74) !important;
-}
-
-.dark .fc .fc-daygrid-day.fc-day-today,
-.dark .fc .fc-timegrid-col.fc-day-today {
-  background-color: oklch(0.44 0.09 200 / 0.28);
-}
-
-.dark .fc .fc-day-other .fc-daygrid-day-number {
-  color: oklch(0.58 0.03 220);
-}
-
-.dark .fc .fc-day-sat .fc-daygrid-day-number {
-  color: oklch(0.76 0.11 232);
-}
-
-.dark .fc .fc-day-sun .fc-daygrid-day-number {
-  color: oklch(0.76 0.13 20);
-}
-
-.dark .fc .fc-button {
-  background: oklch(0.28 0.035 232 / 0.78);
-  border-color: oklch(0.56 0.045 220 / 0.34);
-  color: var(--foreground);
-}
-
-.dark .fc .fc-button:hover {
-  background: oklch(0.36 0.055 205 / 0.8);
-  border-color: oklch(0.7 0.11 195 / 0.6);
-}
-
-.dark .fc .fc-button-primary:not(:disabled).fc-button-active,
-.dark .fc .fc-button-primary:not(:disabled):active {
-  background: var(--primary);
-  border-color: var(--primary);
-  color: var(--primary-foreground);
-}
-
-.dark .fc .fc-button-primary:disabled {
-  background: oklch(0.24 0.032 232 / 0.58);
-  color: var(--muted-foreground);
-}
-
-.dark .fc .fc-daygrid-dot-event .fc-event-title {
-  color: var(--foreground) !important;
-}
-
-.dark .fc .fc-more-popover,
-.dark .fc .fc-popover {
-  background: oklch(0.22 0.035 235 / 0.96) !important;
-  color: var(--foreground) !important;
-  border-color: oklch(0.56 0.045 220 / 0.34) !important;
-  box-shadow:
-    0 18px 45px -22px rgba(0, 0, 0, 0.86),
-    inset 0 1px 0 rgba(255, 255, 255, 0.12);
-}
-
-.dark .fc .fc-popover-header {
-  background: oklch(0.3 0.04 228 / 0.88) !important;
-  color: var(--foreground) !important;
-  border-bottom-color: oklch(0.56 0.045 220 / 0.34);
-}
-
-.dark .fc .fc-popover-title,
-.dark .fc .fc-popover-close {
-  color: var(--foreground);
-}
-
-.dark .fc .fc-daygrid-more-link,
-.dark .fc .ao-calendar-toggle {
-  color: var(--primary);
-}
-
-.dark .fc .fc-daygrid-more-link:hover,
-.dark .fc .ao-calendar-toggle:hover {
-  color: oklch(0.8 0.13 195);
-}
-
-.dark .fc .fc-list-event:hover td {
-  background: oklch(0.34 0.04 228 / 0.72) !important;
-}
-
-.dark .fc .fc-list-empty {
-  color: var(--muted-foreground);
+  border-color: var(--destructive);
 }
 
 .docs-block-editor {

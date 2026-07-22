@@ -20,6 +20,8 @@ gemini:
   model: gemini-3-flash-preview
 openai:
   model: gpt-5.5
+  conversation_state_mode: stateless
+  prompt_cache_retention: ''
 sglang:
   auto_start: true
   model: default
@@ -29,12 +31,17 @@ sglang:
   tensor_parallel_size: 1
   max_model_len: null
   dtype: auto
+  cache:
+    enabled: true
+    extra_args: []
   startup_timeout: 300
 ollama:
   base_url: http://127.0.0.1:11434/v1
   model: gemma4:e4b
   api_key: ollama
   enable_tools: false
+  keep_alive: 5m
+  cache_prompt: true
 openai_compatible_local:
   base_url: http://127.0.0.1:8080/v1
   model: local-model
@@ -48,6 +55,11 @@ openai_compatible_local:
   enable_response_format: false
   enable_extra_body: false
   extra_body: {}
+  server_profile: auto
+  cache:
+    mode: auto
+    extra_body: {}
+  keep_alive: null
   qwopus:
     auto_start: true
   exo:
@@ -82,12 +94,19 @@ openrouter:
   enable_tools: false
   app_name: AoiTalk
   site_url: ''
+kimi:
+  base_url: https://api.moonshot.ai/v1
+  model: kimi-k3
+  reasoning_effort: max
+  context_window_tokens: 1048576
 codex_cli:
   model: gpt-5-codex
   reasoning_effort: medium
 claude_cli:
   model: default
   reasoning_effort: medium
+grok_cli:
+  model: grok-build
 antigravity_cli:
   model: default
 runtime_feature_permissions:
@@ -110,14 +129,14 @@ external_llm:
   - web_search
 model_routing:
   classes:
-    heavy: {}
-    light: {}
     vision:
+      inherit: true
       provider: ''
       model: ''
       base_url: ''
       api_key: ''
     audio:
+      inherit: false
       engine: speech_recognition
       provider: ''
       model: ''
@@ -127,10 +146,33 @@ model_routing:
     image_mode: auto
   overrides: {}
 agent_team:
+  delegation_enabled: false
+  member_settings_initialized: false
+  model_groups:
+    heavy:
+      name: 高負荷
+      provider: ''
+      model: ''
+      effort_policy: same
+      effort: ''
+    light:
+      name: 軽量
+      provider: ''
+      model: ''
+      effort_policy: lower
+      effort: ''
+  members: {}
   confirm_prompt: true
   notify: true
   redaction_terms: []
   strategy: adaptive
+routing_profiles:
+  free-team:
+    display_name: 無料Team
+    enabled: true
+    main_pool_id: coordinator
+    agent_team_enabled: true
+    max_fallbacks: 6
 search:
   provider: openai
   x_enabled: false
@@ -421,6 +463,23 @@ reasoning:
 tts:
   speed_adjustment: 1.0
   synthesis_timeout: 30.0
+  yomi_linter:
+    enabled: false
+    model_id: ayousanz/yomi-linter-modernbert-ja-130m
+    device: cpu
+    quantization: int8
+    confidence_threshold: 0.5
+    log_detections: true
+    cache_dir: cache/yomi_linter
+    policies:
+      voicevox: dictionary
+      aivisspeech: dictionary
+      irodori_tts: detect_only
+      miotts: detect_only
+      voiceroid: detect_only
+      aivoice: detect_only
+      cevio: detect_only
+      nijivoice: detect_only
 tts_settings:
   voicevox:
     host: 127.0.0.1
@@ -430,8 +489,7 @@ tts_settings:
     port: 10101
     use_gpu: false
   irodori_tts:
-    hf_checkpoint: Aratako/Irodori-TTS-500M-v2
-    voice_design_checkpoint: Aratako/Irodori-TTS-500M-v2-VoiceDesign
+    hf_checkpoint: Aratako/Irodori-TTS-600M-v3-VoiceDesign
     codec_repo: Aratako/Semantic-DACVAE-Japanese-32dim
     refs_dir: config/irodori_refs
     cache_dir: cache/irodori_tts
@@ -443,9 +501,9 @@ tts_settings:
     num_steps: 6
     t_schedule_mode: sway
     sway_coeff: -1.0
-    seconds: 30.0
+    duration_scale: 1.0
     max_ref_seconds: 30.0
-    ref_normalize_db: null
+    ref_normalize_db: -16.0
     ref_ensure_max: true
   miotts:
     model_id: Aratako/MioTTS-0.6B
@@ -472,18 +530,19 @@ tts_settings:
 moderations: false
 use_tools: true
 rag:
-  enabled: true
+  docs_enabled: true
+  docs_collection_name: aoitalk_docs
   qdrant:
     local_path: cache/qdrant
     collection_name: aoitalk_knowledge
   embedding:
     model: BAAI/bge-m3
     batch_size: 32
-    device: cpu
+    device: cuda
   reranker:
     model: BAAI/bge-reranker-v2-m3
     top_n: 5
-    device: cpu
+    device: cuda
   chunking:
     chunk_size: 512
     chunk_overlap: 50

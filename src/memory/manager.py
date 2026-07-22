@@ -482,7 +482,12 @@ class ConversationMemoryManager:
             llm_client: LLM client for summarization
         """
         # Get messages to summarize (all except the most recent ones to keep)
-        all_messages = await self.repository.get_session_messages(session.id)
+        get_active = getattr(self.repository, "get_active_branch_messages", None)
+        all_messages = await (
+            get_active(session.id)
+            if callable(get_active)
+            else self.repository.get_session_messages(session.id)
+        )
         
         if len(all_messages) < self.config.max_active_messages:
             print(f"[ConversationMemoryManager] Not enough messages to summarize: {len(all_messages)}")
@@ -497,10 +502,21 @@ class ConversationMemoryManager:
         
         # Create summary
         summary = await self.summarization_service.create_summary(messages_to_summarize, llm_client)
-        
+
         if not summary:
             print(f"[ConversationMemoryManager] Failed to create summary")
             return
+
+        # A branch edit can happen while the summarizer is running.  Commit
+        # the checkpoint only while the snapshotted messages are still on the
+        # active branch; otherwise the summary would mix inactive history into
+        # the next prompt.
+        if callable(get_active):
+            current_active = await get_active(session.id)
+            active_ids = {str(message.id) for message in current_active}
+            if any(str(message.id) not in active_ids for message in messages_to_summarize):
+                print("[ConversationMemoryManager] Active branch changed; summary discarded")
+                return
         
         # Create archive
         start_time = messages_to_summarize[0].created_at
@@ -517,12 +533,22 @@ class ConversationMemoryManager:
             metadata={"summarization_config": self.config.__dict__}
         )
 
-        await self.repository.update_session_summary(session.id, summary)
+        # Delete exactly the snapshotted messages.  New turns may have been
+        # appended while the LLM was generating the summary.
+        if hasattr(self.repository, "delete_messages_by_ids"):
+            deleted_count = await self.repository.delete_messages_by_ids(
+                session.id,
+                [message.id for message in messages_to_summarize],
+            )
+        else:
+            deleted_count = await self.repository.delete_old_messages(
+                session.id, self.config.summary_overlap
+            )
 
-        # Delete old messages (keep recent ones)
-        deleted_count = await self.repository.delete_old_messages(
-            session.id, self.config.summary_overlap
-        )
+        if deleted_count <= 0:
+            print("[ConversationMemoryManager] Summary deletion skipped; active branch changed")
+            return
+        await self.repository.update_session_summary(session.id, summary)
 
         print(f"[ConversationMemoryManager] Summarization complete:")
         print(f"  - Archive ID: {archive.id}")

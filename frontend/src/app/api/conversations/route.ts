@@ -10,6 +10,89 @@ import { getSession } from "@/lib/auth";
 import { decryptTextIfNeeded, encryptText } from "@/lib/server/field-crypto";
 import { messageToSnake } from "@/lib/server/conversation-route-utils";
 import { cleanupExpiredDeletedConversationsIfDue } from "@/lib/server/conversation-retention-cleanup";
+import { fetchPythonApi, type InternalPythonUser } from "@/lib/server/python-api-proxy";
+
+class CharacterResolutionError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "CharacterResolutionError";
+  }
+}
+
+async function resolveCharacterSlug(
+  requestedName: string,
+  user: InternalPythonUser,
+): Promise<string | null> {
+  const normalized = requestedName.trim();
+  if (!normalized) return null;
+  if (
+    normalized.startsWith("scenario_roleplay:") ||
+    normalized.startsWith("scenario_") ||
+    normalized.startsWith("trpg_room_")
+  ) {
+    return normalized;
+  }
+
+  let response: Response;
+  try {
+    response = await fetchPythonApi(
+      "/api/characters/manage?enabled_only=true",
+      { method: "GET", user },
+    );
+  } catch (error) {
+    throw new CharacterResolutionError(
+      502,
+      error instanceof Error
+        ? error.message
+        : "キャラクターサービスに接続できません",
+    );
+  }
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as {
+      detail?: unknown;
+    } | null;
+    const detail =
+      typeof payload?.detail === "string" && payload.detail.trim()
+        ? payload.detail
+        : "キャラクター一覧を取得できませんでした";
+    const status =
+      response.status === 401 || response.status === 403
+        ? response.status
+        : response.status >= 500
+          ? 502
+          : response.status;
+    throw new CharacterResolutionError(status, detail);
+  }
+  const payload = (await response.json().catch(() => null)) as {
+    characters?: Array<{
+      slug?: string;
+      name?: string;
+      recognition_aliases?: string[];
+    }>;
+  } | null;
+  const characters = Array.isArray(payload?.characters)
+    ? payload.characters
+    : [];
+  const key = normalized.toLocaleLowerCase();
+  const character = characters.find((item) => {
+    const candidates = [
+      item.slug,
+      item.name,
+      ...(Array.isArray(item.recognition_aliases)
+        ? item.recognition_aliases
+        : []),
+    ];
+    return candidates.some(
+      (candidate) =>
+        typeof candidate === "string" &&
+          candidate.trim().toLocaleLowerCase() === key,
+    );
+  });
+  return character?.slug?.trim() || null;
+}
 
 function sessionToSnake(row: Record<string, unknown>): Record<string, unknown> {
   const map: Record<string, string> = {
@@ -152,13 +235,32 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  let characterSlug: string | null;
+  try {
+    characterSlug = await resolveCharacterSlug(String(character_name), user);
+  } catch (error) {
+    if (error instanceof CharacterResolutionError) {
+      return NextResponse.json(
+        { detail: error.message },
+        { status: error.status },
+      );
+    }
+    throw error;
+  }
+  if (!characterSlug) {
+    return NextResponse.json(
+      { detail: `存在しないキャラクターです: ${String(character_name)}` },
+      { status: 400 },
+    );
+  }
+
   const now = new Date();
   const result = await db.transaction(async (tx) => {
     const [session] = await tx
       .insert(conversationSessions)
       .values({
         userId: user.id,
-        characterName: character_name,
+        characterName: characterSlug,
         projectId: project_id || null,
         sessionStart: now,
         lastActivity: now,

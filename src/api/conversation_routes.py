@@ -30,6 +30,7 @@ class UpdateSessionRequest(BaseModel):
     title: Optional[str] = None
     is_active: Optional[bool] = None
     project_id: Optional[str] = None
+    character_name: Optional[str] = None
 
 
 class AddMessageRequest(BaseModel):
@@ -223,10 +224,23 @@ def create_conversation_router(
             user_info = await _get_current_conversation_user(request)
             user_id = str(user_info.get("id") or "default_user")
 
+            from ..services.character_service import get_character_for_prompt
+
+            requested_character_name = str(payload.character_name or "").strip()
+            char_data = await get_character_for_prompt(requested_character_name)
+            if not char_data:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"存在しないキャラクターです: {requested_character_name}",
+                )
+            character_name = str(
+                char_data.get("slug") or requested_character_name
+            ).strip()
+
             repo = ConversationRepository()
 
             # Deactivate current active session for this user/character
-            active = await repo.get_active_session(user_id, payload.character_name)
+            active = await repo.get_active_session(user_id, character_name)
             if active:
                 await repo.deactivate_session(str(active.id))
 
@@ -240,7 +254,7 @@ def create_conversation_router(
             # Create new session
             session = await repo.create_session(
                 user_id=user_id,
-                character_name=payload.character_name,
+                character_name=character_name,
                 title="",  # Will be generated on first message
                 project_id=normalized_project_id,
             )
@@ -260,9 +274,6 @@ def create_conversation_router(
             # first_message 挿入
             first_msg_content = None
             try:
-                from ..services.character_service import get_character_for_prompt
-
-                char_data = await get_character_for_prompt(payload.character_name)
                 if char_data:
                     first_msg_content = char_data.get("first_message", "")
                     if not first_msg_content and char_data.get("alternate_greetings"):
@@ -280,14 +291,18 @@ def create_conversation_router(
                     role="assistant",
                     content=first_msg_content,
                     sender_type="character",
-                    sender_id=payload.character_name,
-                    sender_display_name=payload.character_name,
+                    sender_id=character_name,
+                    sender_display_name=str(
+                        char_data.get("name") or requested_character_name
+                    ).strip(),
                 )
 
             response = {"success": True, "session": session.to_dict()}
             if first_msg_content:
                 response["first_message"] = first_msg_content
             return JSONResponse(response)
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Failed to create session: {e}")
             raise HTTPException(status_code=500, detail=str(e))
@@ -358,6 +373,46 @@ def create_conversation_router(
         except Exception as e:
             logger.error(f"Failed to get session: {e}")
             raise HTTPException(status_code=500, detail=str(e))
+
+    @router.get("/{session_id}/context-snapshot")
+    async def get_session_context_snapshot(
+        session_id: str,
+        _: None = Depends(require_auth),
+        request: Request = None,
+    ):
+        """Return the latest active-branch model request snapshot for a session."""
+        if not REPO_AVAILABLE:
+            raise HTTPException(status_code=503, detail="Database not available")
+        try:
+            repo = ConversationRepository()
+            session = await repo.get_session_by_id(session_id, with_messages=False)
+            if not session:
+                raise HTTPException(status_code=404, detail="Session not found")
+            visible_user_ids = await _get_visible_conversation_user_ids(request)
+            if not _session_is_visible(session, visible_user_ids):
+                raise HTTPException(status_code=403, detail="Access denied")
+            messages = await repo.get_recent_messages(session_id, count=100)
+            latest = None
+            for message in reversed(messages):
+                if message.role != "assistant" or not getattr(message, "is_active_branch", True):
+                    continue
+                metadata = message.message_metadata or {}
+                candidate = metadata.get("context_snapshot")
+                if isinstance(candidate, dict):
+                    latest = dict(candidate)
+                    latest.setdefault("session_id", session_id)
+                    latest.setdefault("message_id", str(message.id))
+                    break
+            return JSONResponse({
+                "success": True,
+                "status": "available" if latest else "unavailable",
+                "snapshot": latest,
+            })
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error("Failed to get context snapshot: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc))
 
     @router.get("/{session_id}/messages")
     async def get_session_messages(
@@ -532,6 +587,19 @@ def create_conversation_router(
                 updates["project_id"] = (
                     UUID(payload.project_id) if payload.project_id else None
                 )
+            if payload.character_name is not None:
+                from ..services.character_service import get_character_for_prompt
+
+                requested_character_name = str(payload.character_name).strip()
+                char_data = await get_character_for_prompt(requested_character_name)
+                if not char_data:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"存在しないキャラクターです: {requested_character_name}",
+                    )
+                updates["character_name"] = str(
+                    char_data.get("slug") or requested_character_name
+                ).strip()
 
             if updates:
                 await repo.update_session(session_id, **updates)

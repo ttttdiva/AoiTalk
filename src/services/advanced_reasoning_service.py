@@ -19,6 +19,8 @@ from .agent_team_service import (
     agent_team_notify,
     config_get,
     config_set,
+    resolve_agent_team_member_mode,
+    resolve_model_route,
 )
 logger = logging.getLogger(__name__)
 
@@ -102,7 +104,13 @@ def advanced_reasoning_notify(config: Any) -> bool:
 
 
 def advanced_reasoning_effort(config: Any) -> str:
-    return agent_team_member_mode(config, ADVANCED_REASONING_MEMBER_KEY, "medium")
+    route = resolve_model_route(config, ADVANCED_REASONING_MEMBER_KEY) or {}
+    return resolve_agent_team_member_mode(
+        config,
+        member_key=ADVANCED_REASONING_MEMBER_KEY,
+        provider=str(route.get("provider") or ""),
+        model=str(route.get("model") or ""),
+    )
 
 
 def apply_advanced_reasoning_mode(
@@ -118,18 +126,11 @@ def apply_advanced_reasoning_mode(
     if not options:
         return ""
 
-    effort = advanced_reasoning_effort(config)
-    if effort not in options:
-        effort = default_llm_mode_for_options(options)
+    effort = resolve_agent_team_member_mode(
+        config, member_key=ADVANCED_REASONING_MEMBER_KEY, provider=provider, model=model
+    )
 
-    provider_id = str(provider or "").strip().lower()
-    if provider_id == "openai":
-        config_set(config, "openai.reasoning_effort", effort)
-    elif provider_id == "codex-cli":
-        config_set(config, "codex_cli.reasoning_effort", effort)
-    elif provider_id == "claude-cli":
-        config_set(config, "claude_cli.reasoning_effort", effort)
-    elif client is not None and hasattr(client, "set_llm_mode"):
+    if effort and client is not None and hasattr(client, "set_llm_mode"):
         client.set_llm_mode(effort)
     return effort
 

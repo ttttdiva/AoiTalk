@@ -20,6 +20,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
+import { useConfirm } from "@/hooks/use-confirm";
 
 const TAG_COLORS = [
   "#ef4444",
@@ -72,6 +73,7 @@ export function SpaceTagManagementPanel({
   space,
   spaces,
 }: SpaceTagManagementPanelProps) {
+  const confirm = useConfirm();
   const [tags, setTags] = useState<TagInfo[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
@@ -190,9 +192,10 @@ export function SpaceTagManagementPanel({
   const handleDelete = useCallback(
     async (tag: TagInfo) => {
       if (
-        !window.confirm(
-          `"${tag.name}" を削除します。関連タスクからも外れます。`,
-        )
+        !(await confirm({
+          description: `"${tag.name}" を削除します。関連タスクからも外れます。`,
+          destructive: true,
+        }))
       ) {
         return;
       }
@@ -210,7 +213,7 @@ export function SpaceTagManagementPanel({
         setSaving(false);
       }
     },
-    [fetchTags],
+    [fetchTags, confirm],
   );
 
   const handleCopySelected = useCallback(async () => {

@@ -264,7 +264,10 @@ Q&A の正本は `project_qa_entries`。Docs 本文側は Q&A block の表示位
 
 - `project_info_categories` / `project_documents` / `project_facts` / `project_info_sync_states` は旧案件情報メモ schema なので現行 schema から落とす。
 - canonical Docs node がない案件は、API/tool の初回 ensure で `案件情報` Docs node を作る。
-- record table は旧案件情報メモ schema ではなく、構造化一覧の正本として残す。本文へコピーせず、Docs から参照する。
+- 既存 record table は WBS・課題同期・agent tool・参照 ID の互換性を保つ移行元として残し、本文へコピーせず Docs から参照する。
+- 新しく人が管理する構造化一覧は、Supertag を行の型、`knowledge_fields` を列、Docs node を行、Saved View の `table` layout を表として作成する。
+- `.dbtable` は物理ファイルではないため Workspace filer には表示しない。大量データ・外部ミラー用途の record table は内部データ基盤として扱う。
+- 既存 record table の正本移行は、project scope、添付、監査イベント、sensitivity、外部同期、参照 ID の対応と件数・値検証を用意してから段階的に行う。
 
 ローカル DB では旧 facts/documents/sync states は空、categories は既定値のみだったため、drop による案件本文の消失はない。
 
@@ -295,7 +298,7 @@ Q&A の正本は `project_qa_entries`。Docs 本文側は Q&A block の表示位
 
 ## 実装順序
 
-1. 旧 DB 実装を互換経路として残さず、Docs 正本と record table 参照へ一本化する。
+1. 旧案件情報 DB 実装を互換経路として残さず、Docs 正本へ一本化する。既存 record table は移行完了まで参照元として維持する。
 2. `projects.knowledge_node_id` について、DB 既存列の有無を確認し、SQLAlchemy model / Drizzle schema / API serializer に復旧する。Alembic は存在確認つきにする。
 3. `knowledge_nodes.body_text/body_json` と `knowledge_revisions.body_text/body_json` の暗号化、読み取り互換、検索 index 方針を実装する。
 4. `案件情報` スーパータグと field 定義を seed する。

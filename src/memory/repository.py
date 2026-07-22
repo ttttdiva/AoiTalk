@@ -352,6 +352,23 @@ class ConversationRepository:
             conversation.last_activity = datetime.utcnow()
             await session.commit()
             return True
+
+    async def update_session_context(
+        self,
+        session_id: Union[str, uuid.UUID],
+        context: Dict[str, Any],
+    ) -> bool:
+        """Merge non-display runtime state into a conversation session."""
+        session_uuid = uuid.UUID(str(session_id)) if isinstance(session_id, str) else session_id
+        async with await get_db_session() as session:
+            conversation = await session.get(ConversationSession, session_uuid)
+            if not conversation:
+                return False
+            existing = conversation.context if isinstance(conversation.context, dict) else {}
+            conversation.context = {**existing, **(context or {})}
+            conversation.last_activity = datetime.utcnow()
+            await session.commit()
+            return True
     
     async def get_session_messages(self, session_id: Union[str, uuid.UUID], limit: Optional[int] = None) -> List[ConversationMessage]:
         """Get messages for a session
@@ -463,6 +480,63 @@ class ConversationRepository:
             await session.commit()
 
             return result.rowcount
+
+    async def delete_messages_by_ids(
+        self,
+        session_id: Union[str, uuid.UUID],
+        message_ids: List[Union[str, uuid.UUID]],
+    ) -> int:
+        """Delete only a previously snapshotted prefix.
+
+        This is used by asynchronous summarization so messages appended while
+        the summary was being generated are never deleted accidentally.
+        """
+        if not message_ids:
+            return 0
+        session_uuid = uuid.UUID(str(session_id)) if isinstance(session_id, str) else session_id
+        ids = [uuid.UUID(str(message_id)) if isinstance(message_id, str) else message_id for message_id in message_ids]
+        async with await get_db_session() as session:
+            active_result = await session.execute(
+                select(ConversationMessage.id).where(
+                    ConversationMessage.session_id == session_uuid,
+                    ConversationMessage.is_active_branch == True,
+                    ConversationMessage.id.in_(ids),
+                )
+            )
+            active_ids = {row[0] for row in active_result.fetchall()}
+            if active_ids != set(ids):
+                # The branch changed while summarization was running.  Never
+                # delete rows that are no longer part of the active branch.
+                return 0
+            await session.execute(
+                update(ConversationMessage)
+                .where(
+                    ConversationMessage.session_id == session_uuid,
+                    ConversationMessage.is_active_branch == True,
+                    ConversationMessage.parent_message_id.in_(ids),
+                )
+                .values(parent_message_id=None, branch_index=0)
+            )
+            result = await session.execute(
+                delete(ConversationMessage).where(
+                    ConversationMessage.session_id == session_uuid,
+                    ConversationMessage.is_active_branch == True,
+                    ConversationMessage.id.in_(ids),
+                )
+            )
+            remaining = await session.execute(
+                select(ConversationMessage.id).where(
+                    ConversationMessage.session_id == session_uuid,
+                    ConversationMessage.deleted_at.is_(None),
+                )
+            )
+            await session.execute(
+                update(ConversationSession)
+                .where(ConversationSession.id == session_uuid)
+                .values(message_count=len(remaining.all()), last_activity=datetime.utcnow())
+            )
+            await session.commit()
+            return int(result.rowcount or 0)
     
     async def create_archive(self, user_id: str, character_name: str, original_session_id: Union[str, uuid.UUID],
                            summary: str, message_count: int, start_time: datetime, 

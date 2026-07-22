@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional, Sequence, Type
@@ -28,7 +29,6 @@ from ..services.advanced_reasoning_service import (
 from ..services.agent_team_service import (
     agent_team_confirm_prompt,
     agent_team_member_for,
-    agent_team_member_mode,
     agent_team_member_requires_external_approval,
     agent_team_notify,
     apply_agent_team_member_mode,
@@ -80,13 +80,14 @@ def set_runtime_specialist_provider(provider: Optional[str]) -> contextvars.Toke
 def reset_runtime_specialist_provider(token: contextvars.Token) -> None:
     _runtime_specialist_provider.reset(token)
 
-CLI_PROVIDER_NAMES = {"antigravity-cli", "claude-cli", "codex-cli"}
+CLI_PROVIDER_NAMES = {"antigravity-cli", "claude-cli", "codex-cli", "grok-cli"}
 NATIVE_OPENAI_MODEL_PREFIXES = ("openai/", "litellm/", "gpt-", "o1", "o3", "o4")
 OLLAMA_PROVIDER_NAME = "ollama"
 OPENAI_COMPATIBLE_PROVIDER_NAMES = {
     "openai_compatible_local",
     "sglang",
     "openrouter",
+    "kimi",
 }
 CONSTRAINED_OPENAI_COMPATIBLE_CONTEXT_TOKENS = 16384
 
@@ -241,14 +242,58 @@ class SpecialistDelegationRunner:
         agent_class: Type,
         mcp_server_names: Sequence[str] | None = None,
         model: Optional[str] = None,
+        agent_team_group_id: Optional[str] = None,
+        tool_required: Optional[bool] = None,
     ):
         self.config = config
         self.domain_key = domain_key
         self.display_name = display_name
         self.agent_class = agent_class
         self.mcp_server_names = tuple(mcp_server_names or ())
-        self._agent_team_member_config = agent_team_member_for(config, domain_key)
-        self._agent_team_member_explicit = model_route_is_explicit(config, domain_key)
+        self._agent_team_group_id = str(agent_team_group_id or "").strip() or None
+        self._turn_tool_required = tool_required
+        self._agent_team_member_config = agent_team_member_for(
+            config,
+            domain_key,
+            delegation_group_id=self._agent_team_group_id,
+        )
+        self._agent_team_member_explicit = model_route_is_explicit(
+            config,
+            domain_key,
+            delegation_group_id=self._agent_team_group_id,
+        )
+        self._route_intent = None
+        if (
+            isinstance(self._agent_team_member_config, dict)
+            and self._agent_team_member_config.get("kind") == "pool"
+        ):
+            from ..services.free_team_service import RouteIntent, free_team_profile
+
+            pool_id = str(self._agent_team_member_config.get("pool_id") or "")
+            pool = (free_team_profile(config).get("pools") or {}).get(pool_id, {}) or {}
+            self._route_intent = RouteIntent(
+                kind="pool",
+                routing_profile_id=str(
+                    self._agent_team_member_config.get("routing_profile_id")
+                    or "free-team"
+                ),
+                pool_id=pool_id,
+                member_key=domain_key,
+                group_id=str(self._agent_team_group_id or ""),
+                effort_policy=str(
+                    self._agent_team_member_config.get("effort_policy") or ""
+                ),
+                effort=str(
+                    self._agent_team_member_config.get("effort")
+                    or self._agent_team_member_config.get("reasoning_effort")
+                    or ""
+                ),
+                tool_mode=str(pool.get("tool_mode") or "auto"),
+                candidate_ids=tuple(
+                    str(value) for value in (pool.get("candidate_ids") or [])
+                ),
+            )
+        self.route_metadata: dict[str, Any] = {}
 
         self.provider = self._select_provider()
         self.model = model or self._select_model()
@@ -259,6 +304,7 @@ class SpecialistDelegationRunner:
                 member_key=self.domain_key,
                 provider=self.provider,
                 model=self.model or "",
+                delegation_group_id=self._agent_team_group_id,
             )
         self.cli_backend = (
             self._create_cli_backend() if self.provider in CLI_PROVIDER_NAMES else None
@@ -266,6 +312,230 @@ class SpecialistDelegationRunner:
 
         self._agent_definition = None
         self._tool_registry: ToolRegistry | None = None
+
+    async def _run_pool_route(self, request: str) -> str:
+        """Agent Teamの1インスタンスに1つの候補を固定して実行する。"""
+
+        from .free_team_client import (
+            _call_target_method,
+            _error_class,
+            _reservation_prompt,
+            _target_supports_stream_callback,
+            _usage_from_client,
+        )
+        from .manager import create_llm_client_for_target
+        from ..services.free_team_service import (
+            acquire_route_lease,
+            finalize_route_lease,
+            free_team_profile,
+        )
+
+        profile = free_team_profile(self.config)
+        max_fallbacks = max(0, min(10, int(profile.get("max_fallbacks") or 0)))
+        agent_definition = self._get_agent_definition()
+        role_instructions = str(
+            getattr(agent_definition, "instructions", "") or ""
+        ).strip()
+        tool_registry = self._build_tool_registry()
+        # pool定義を明示的なturn intentとして扱う。heavyは渡された文脈を
+        # 推論/レビューするtool-free pool、coding/tool-executor等は必須。
+        tool_mode = str(self._route_intent.tool_mode or "auto").lower()
+        tools_available = bool(tool_registry.get_names())
+        tools_required = (
+            bool(self._turn_tool_required)
+            if isinstance(self._turn_tool_required, bool)
+            else False
+            if tool_mode == "disabled"
+            else tools_available
+        )
+        lease_prompt = _reservation_prompt(
+            request,
+            system_prompt=role_instructions,
+            session_metadata={
+                "agent_member": self.domain_key,
+                "project_id": str(self.current_project_id or ""),
+            },
+            tool_registry=tool_registry if tools_required else None,
+        )
+        excluded: set[str] = set()
+        last_error: BaseException | None = None
+        for fallback_count in range(max_fallbacks + 1):
+            lease = await acquire_route_lease(
+                self._route_intent,
+                prompt=lease_prompt,
+                required_capabilities=(
+                    {"text", "tools"} if tools_required else {"text"}
+                ),
+                member_key=self.domain_key,
+                excluded_candidate_ids=excluded,
+                fallback_count=fallback_count,
+            )
+            excluded.add(lease.candidate_id)
+            self.route_metadata = lease.safe_metadata()
+            client: Any = None
+            side_effect_started = False
+            side_effect_observable = False
+
+            async def monitor(event_type: str, _data: dict[str, Any]) -> None:
+                nonlocal side_effect_started
+                event = str(event_type or "").lower()
+                if "tool" in event and (
+                    "start" in event or "call" in event or "execut" in event
+                ):
+                    side_effect_started = True
+
+            started = time.perf_counter()
+            try:
+                approved_request = await self._approve_pool_route_request(
+                    request,
+                    provider=lease.provider,
+                    model=lease.model,
+                )
+                if approved_request is None:
+                    await finalize_route_lease(
+                        lease,
+                        success=False,
+                        error_class="cancelled",
+                    )
+                    return f"{self.display_name} delegation cancelled"
+                execution_request = approved_request
+                client = create_llm_client_for_target(
+                    self.config,
+                    provider=lease.provider,
+                    model=lease.model,
+                    effort=lease.effort,
+                    base_url=lease.base_url,
+                    api_key=lease.api_key,
+                    provider_options={
+                        **lease.provider_options,
+                        "max_output_tokens": lease.max_output_tokens,
+                    },
+                )
+                if role_instructions and hasattr(client, "set_system_prompt"):
+                    client.set_system_prompt(role_instructions)
+                self._configure_pool_client_tools(client, enabled=tools_required)
+                side_effect_observable = _target_supports_stream_callback(
+                    client, "generate_response_async"
+                )
+                result = await asyncio.wait_for(
+                    _call_target_method(
+                        client,
+                        "generate_response_async",
+                        execution_request,
+                        max_tokens=lease.max_output_tokens,
+                        stream_callback=monitor,
+                    ),
+                    timeout=max(1, lease.timeout_seconds),
+                )
+                await finalize_route_lease(
+                    lease,
+                    actual_usage=_usage_from_client(client),
+                    success=True,
+                    latency_ms=(time.perf_counter() - started) * 1000,
+                )
+                self.provider = lease.provider
+                self.model = lease.model
+                self._mode_preset = lease.effort
+                return str(result)
+            except asyncio.CancelledError:
+                await asyncio.shield(
+                    finalize_route_lease(
+                        lease,
+                        success=False,
+                        consume_reserved_on_failure=True,
+                        error_class="cancelled",
+                        latency_ms=(time.perf_counter() - started) * 1000,
+                    )
+                )
+                raise
+            except Exception as exc:
+                last_error = exc
+                error_class = _error_class(exc)
+                reported_side_effect = getattr(
+                    exc, "free_team_side_effect_started", None
+                )
+                if reported_side_effect is not None:
+                    side_effect_started = bool(reported_side_effect)
+                    side_effect_observable = True
+                await finalize_route_lease(
+                    lease,
+                    success=False,
+                    consume_reserved_on_failure=error_class == "timeout",
+                    error_class=error_class,
+                    latency_ms=(time.perf_counter() - started) * 1000,
+                )
+                retryable = error_class in {
+                    "429",
+                    "402",
+                    "5xx",
+                    "timeout",
+                    "connection",
+                }
+                if (
+                    side_effect_started
+                    or not side_effect_observable
+                    or error_class == "timeout"
+                    or not retryable
+                    or fallback_count >= max_fallbacks
+                ):
+                    raise
+            finally:
+                cleanup = getattr(client, "cleanup", None) if client is not None else None
+                if callable(cleanup):
+                    value = cleanup()
+                    if asyncio.iscoroutine(value):
+                        await value
+        if last_error:
+            raise last_error
+        raise RuntimeError("無料Teamの利用可能枠がありません")
+
+    def _configure_pool_client_tools(self, client: Any, *, enabled: bool = True) -> None:
+        """専門ロールで許可されたtoolだけを候補clientへ渡す。"""
+
+        registry = self._build_tool_registry() if enabled else ToolRegistry()
+        if hasattr(client, "_native_tools_enabled"):
+            client._native_tools_enabled = enabled
+        setter = getattr(client, "set_tool_registry", None)
+        if callable(setter):
+            setter(registry)
+            return
+        if hasattr(client, "_tool_registry"):
+            client._tool_registry = registry
+        recreate_agent = getattr(client, "_create_character_agent", None)
+        if callable(recreate_agent) and hasattr(client, "agent"):
+            client.agent = recreate_agent()
+
+    async def _approve_pool_route_request(
+        self,
+        request: str,
+        *,
+        provider: str,
+        model: str,
+    ) -> Optional[str]:
+        """動的に決まった外部providerにも既存の確認・redactionを適用する。"""
+
+        if not agent_team_member_requires_external_approval({"provider": provider}):
+            return request
+        redacted_prompt, redaction_findings = build_redacted_prompt(
+            request,
+            config=self.config,
+        )
+        return await request_external_model_prompt(
+            request,
+            redacted_prompt=redacted_prompt,
+            redaction_findings=redaction_findings,
+            provider=provider,
+            model=model,
+            description=(
+                f"Review the {self.display_name} assistant prompt before "
+                f"sending it to {provider}/{model}."
+            ),
+            confirm=self._external_route_prompt_confirmation_enabled(
+                agent_team_confirm_prompt(self.config)
+            ),
+            notify=agent_team_notify(self.config),
+            request_kind=f"{self.domain_key}_assistant",
+        )
 
     def _get_agent_configs(self) -> tuple[dict[str, Any], dict[str, Any]]:
         agents_config = _config_get(self.config, "agents", {}) or {}
@@ -302,10 +572,12 @@ class SpecialistDelegationRunner:
             ),
             "sglang": ("sglang.model", "sglang_model"),
             "openrouter": ("openrouter.model", "openrouter_model"),
+            "kimi": ("kimi.model", "kimi_model"),
             "ollama": ("ollama.model", "ollama_model"),
             "codex-cli": ("codex_cli.model",),
             "claude-cli": ("claude_cli.model",),
             "antigravity-cli": ("antigravity_cli.model",),
+            "grok-cli": ("grok_cli.model",),
         }
         for key in provider_model_keys.get(provider, ()):
             value = str(_config_get(self.config, key, "") or "").strip()
@@ -391,7 +663,7 @@ class SpecialistDelegationRunner:
             return ClaudeCLIBackend(
                 model=self.model,
                 reasoning_effort=(
-                    agent_team_member_mode(self.config, self.domain_key)
+                    self._mode_preset
                     if self._uses_agent_team_member_target()
                     else _config_get(self.config, "claude_cli.reasoning_effort")
                 ),
@@ -403,11 +675,16 @@ class SpecialistDelegationRunner:
             return CodexCLIBackend(
                 model=self.model,
                 reasoning_effort=(
-                    agent_team_member_mode(self.config, self.domain_key)
+                    self._mode_preset
                     if self._uses_agent_team_member_target()
                     else _config_get(self.config, "codex_cli.reasoning_effort")
                 ),
             )
+
+        if self.provider == "grok-cli":
+            from .cli_backends.grok import GrokCLIBackend
+
+            return GrokCLIBackend(model=self.model)
 
         raise ValueError(f"Unsupported specialist CLI provider: {self.provider}")
 
@@ -741,6 +1018,13 @@ class SpecialistDelegationRunner:
                 or "https://openrouter.ai/api/v1"
             )
             api_key = _config_get(self.config, "openrouter_api_key") or os.getenv("OPENROUTER_API_KEY")
+        elif provider == "kimi":
+            base_url = (
+                os.getenv("MOONSHOT_BASE_URL")
+                or _config_get(self.config, "kimi.base_url")
+                or "https://api.moonshot.ai/v1"
+            )
+            api_key = _config_get(self.config, "kimi_api_key") or os.getenv("MOONSHOT_API_KEY")
         else:
             raise ValueError(f"Unsupported OpenAI-compatible specialist provider: {provider}")
 
@@ -754,6 +1038,8 @@ class SpecialistDelegationRunner:
             return client.chat.completions.create(**api_kwargs)
         except Exception as exc:
             if _is_context_overflow_error(exc):
+                raise
+            if self.provider == "kimi":
                 raise
             retry_kwargs = dict(api_kwargs)
             removed = []
@@ -805,9 +1091,13 @@ class SpecialistDelegationRunner:
         api_kwargs: dict[str, Any] = {
             "model": self.model or "local-model",
             "messages": messages,
-            "temperature": 0,
-            "max_tokens": context_budget.response_tokens,
         }
+        if self.provider == "kimi" and self.model == "kimi-k3":
+            api_kwargs["reasoning_effort"] = "max"
+            api_kwargs["max_completion_tokens"] = context_budget.response_tokens
+        else:
+            api_kwargs["temperature"] = 0
+            api_kwargs["max_tokens"] = context_budget.response_tokens
         extra_body = self._mode_extra_body()
         if extra_body:
             api_kwargs["extra_body"] = extra_body
@@ -1019,6 +1309,20 @@ class SpecialistDelegationRunner:
         if not request or not request.strip():
             return f"{self.display_name} request is empty"
 
+        if self._route_intent is not None:
+            delegated_request = self._augment_request_with_project_context(
+                request,
+                project_context=project_context,
+            )
+            project_context_token = (
+                set_runtime_project_context(project_context) if project_context else None
+            )
+            try:
+                return await self._run_pool_route(delegated_request)
+            finally:
+                if project_context_token is not None:
+                    reset_runtime_project_context(project_context_token)
+
         self._configure_model_environment()
         delegated_request = self._augment_request_with_project_context(
             request,
@@ -1202,6 +1506,8 @@ class AgentTeamRoleDelegationRunner(SpecialistDelegationRunner):
         member_key: str,
         display_name: str,
         model: Optional[str] = None,
+        group_id: Optional[str] = None,
+        tool_required: Optional[bool] = None,
     ):
         super().__init__(
             config,
@@ -1209,6 +1515,8 @@ class AgentTeamRoleDelegationRunner(SpecialistDelegationRunner):
             display_name=display_name,
             agent_class=object,
             model=model,
+            agent_team_group_id=group_id,
+            tool_required=tool_required,
         )
 
     def _create_agent_instance(self, model: Optional[str] = None):

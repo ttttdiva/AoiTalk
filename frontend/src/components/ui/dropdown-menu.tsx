@@ -5,6 +5,16 @@ import { Menu as MenuPrimitive } from "@base-ui/react/menu";
 
 import { cn } from "@/lib/utils";
 import { ChevronRightIcon, CheckIcon } from "lucide-react";
+import {
+  handleMenuMnemonicKeyDown,
+  MENU_MNEMONIC_SURFACE_ATTRIBUTE,
+  normalizeMenuMnemonic,
+} from "@/lib/menu-mnemonics";
+
+type DropdownMenuMnemonicProps = {
+  mnemonic?: string;
+  showMnemonic?: boolean;
+};
 
 function DropdownMenu({ ...props }: MenuPrimitive.Root.Props) {
   return <MenuPrimitive.Root data-slot="dropdown-menu" {...props} />;
@@ -33,12 +43,29 @@ function DropdownMenuContent({
   side = "bottom",
   sideOffset = 4,
   className,
+  onKeyDownCapture,
   ...props
 }: MenuPrimitive.Popup.Props &
   Pick<
     MenuPrimitive.Positioner.Props,
     "align" | "alignOffset" | "side" | "sideOffset"
   >) {
+  const popupRef = React.useRef<HTMLDivElement | null>(null);
+
+  React.useLayoutEffect(() => {
+    const root = popupRef.current;
+    if (!root) return;
+
+    const handleDocumentKeyDown = (event: KeyboardEvent) => {
+      if (!root.hasAttribute("data-open")) return;
+      handleMenuMnemonicKeyDown(event, root);
+    };
+
+    document.addEventListener("keydown", handleDocumentKeyDown, true);
+    return () =>
+      document.removeEventListener("keydown", handleDocumentKeyDown, true);
+  }, []);
+
   return (
     <MenuPrimitive.Portal>
       <MenuPrimitive.Positioner
@@ -49,11 +76,19 @@ function DropdownMenuContent({
         sideOffset={sideOffset}
       >
         <MenuPrimitive.Popup
+          ref={popupRef}
           data-slot="dropdown-menu-content"
+          {...{ [MENU_MNEMONIC_SURFACE_ATTRIBUTE]: "" }}
           className={cn(
             "z-50 max-h-(--available-height) w-(--anchor-width) min-w-32 origin-(--transform-origin) overflow-x-hidden overflow-y-auto rounded-lg bg-popover p-1 text-popover-foreground shadow-md ring-1 ring-foreground/10 duration-100 outline-none data-[side=bottom]:slide-in-from-top-2 data-[side=inline-end]:slide-in-from-left-2 data-[side=inline-start]:slide-in-from-right-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:overflow-hidden data-closed:fade-out-0 data-closed:zoom-out-95",
             className,
           )}
+          onKeyDownCapture={(event) => {
+            onKeyDownCapture?.(event);
+            if (!event.defaultPrevented) {
+              handleMenuMnemonicKeyDown(event, event.currentTarget);
+            }
+          }}
           {...props}
         />
       </MenuPrimitive.Positioner>
@@ -86,25 +121,37 @@ function DropdownMenuLabel({
 }
 
 function DropdownMenuItem({
+  children,
   className,
   inset,
+  mnemonic,
+  showMnemonic = true,
   variant = "default",
   ...props
 }: MenuPrimitive.Item.Props & {
   inset?: boolean;
   variant?: "default" | "destructive";
-}) {
+} & DropdownMenuMnemonicProps) {
+  const normalizedMnemonic = normalizeMenuMnemonic(mnemonic);
+
   return (
     <MenuPrimitive.Item
       data-slot="dropdown-menu-item"
       data-inset={inset}
       data-variant={variant}
+      data-menu-mnemonic={normalizedMnemonic ?? undefined}
+      aria-keyshortcuts={normalizedMnemonic ?? undefined}
       className={cn(
         "group/dropdown-menu-item relative flex cursor-default items-center gap-1.5 rounded-md px-1.5 py-1 text-sm outline-hidden select-none focus:bg-accent focus:text-accent-foreground not-data-[variant=destructive]:focus:**:text-accent-foreground data-inset:pl-7 data-[variant=destructive]:text-destructive data-[variant=destructive]:focus:bg-destructive/10 data-[variant=destructive]:focus:text-destructive dark:data-[variant=destructive]:focus:bg-destructive/20 data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 data-[variant=destructive]:*:[svg]:text-destructive",
         className,
       )}
       {...props}
-    />
+    >
+      {children}
+      {showMnemonic && normalizedMnemonic ? (
+        <DropdownMenuShortcut>{normalizedMnemonic}</DropdownMenuShortcut>
+      ) : null}
+    </MenuPrimitive.Item>
   );
 }
 
@@ -165,14 +212,20 @@ function DropdownMenuCheckboxItem({
   children,
   checked,
   inset,
+  mnemonic,
+  showMnemonic = true,
   ...props
 }: MenuPrimitive.CheckboxItem.Props & {
   inset?: boolean;
-}) {
+} & DropdownMenuMnemonicProps) {
+  const normalizedMnemonic = normalizeMenuMnemonic(mnemonic);
+
   return (
     <MenuPrimitive.CheckboxItem
       data-slot="dropdown-menu-checkbox-item"
       data-inset={inset}
+      data-menu-mnemonic={normalizedMnemonic ?? undefined}
+      aria-keyshortcuts={normalizedMnemonic ?? undefined}
       className={cn(
         "relative flex cursor-default items-center gap-1.5 rounded-md py-1 pr-8 pl-1.5 text-sm outline-hidden select-none focus:bg-accent focus:text-accent-foreground focus:**:text-accent-foreground data-inset:pl-7 data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
         className,
@@ -189,6 +242,11 @@ function DropdownMenuCheckboxItem({
         </MenuPrimitive.CheckboxItemIndicator>
       </span>
       {children}
+      {showMnemonic && normalizedMnemonic ? (
+        <DropdownMenuShortcut className="mr-5">
+          {normalizedMnemonic}
+        </DropdownMenuShortcut>
+      ) : null}
     </MenuPrimitive.CheckboxItem>
   );
 }
@@ -206,14 +264,20 @@ function DropdownMenuRadioItem({
   className,
   children,
   inset,
+  mnemonic,
+  showMnemonic = true,
   ...props
 }: MenuPrimitive.RadioItem.Props & {
   inset?: boolean;
-}) {
+} & DropdownMenuMnemonicProps) {
+  const normalizedMnemonic = normalizeMenuMnemonic(mnemonic);
+
   return (
     <MenuPrimitive.RadioItem
       data-slot="dropdown-menu-radio-item"
       data-inset={inset}
+      data-menu-mnemonic={normalizedMnemonic ?? undefined}
+      aria-keyshortcuts={normalizedMnemonic ?? undefined}
       className={cn(
         "relative flex cursor-default items-center gap-1.5 rounded-md py-1 pr-8 pl-1.5 text-sm outline-hidden select-none focus:bg-accent focus:text-accent-foreground focus:**:text-accent-foreground data-inset:pl-7 data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
         className,
@@ -229,6 +293,11 @@ function DropdownMenuRadioItem({
         </MenuPrimitive.RadioItemIndicator>
       </span>
       {children}
+      {showMnemonic && normalizedMnemonic ? (
+        <DropdownMenuShortcut className="mr-5">
+          {normalizedMnemonic}
+        </DropdownMenuShortcut>
+      ) : null}
     </MenuPrimitive.RadioItem>
   );
 }

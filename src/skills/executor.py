@@ -19,12 +19,18 @@ def invoke_skill(skill_name: str, input_text: str) -> str:
         展開されたスキルプロンプト
     """
     from .registry import get_skill_registry
+    from .loader import load_project_skills
+    from ..services.project_context import get_runtime_project_context
 
     registry = get_skill_registry()
-    skill = registry.get_by_alias(skill_name) or registry.get(skill_name)
+    context = get_runtime_project_context() or {}
+    project_id = str(context.get("id") or "") or None
+    if project_id:
+        load_project_skills(project_id)
+    skill = registry.get_by_alias(skill_name, project_id) or registry.get(skill_name, project_id)
 
     if not skill:
-        available = ", ".join(registry.get_names())
+        available = ", ".join(registry.get_names(project_id))
         return f"スキル '{skill_name}' が見つかりません。利用可能なスキル: {available}"
 
     rendered = skill.render_prompt(input_text)

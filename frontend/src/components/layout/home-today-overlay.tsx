@@ -527,7 +527,7 @@ export function HomeTodayOverlay() {
           };
         }
         const created = await chatApi.createSession(
-          "aoi",
+          await chatApi.getCurrentCharacterName(),
           launchTask.project_id || undefined,
         );
         const sessionId = created.session.id;

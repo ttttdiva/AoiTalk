@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useCallback } from "react";
+import useSWR from "swr";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -44,7 +45,26 @@ const STATUS_STYLES: Record<string, { label: string; variant: "default" | "secon
 };
 
 export function McpSection() {
-  const [servers, setServers] = useState<McpServer[]>([]);
+  // MCPサーバー一覧（サーバー状態）は SWR で管理。取得タイミングは従来どおり
+  // 呼び出し側（トグル/更新/再起動後）で駆動するため自動 revalidation は無効化する。
+  const { data: servers = [], mutate: mutateServers } = useSWR<McpServer[]>(
+    "settings/mcp-servers",
+    async () => {
+      try {
+        return (await pyFetch<{ servers: McpServer[] }>("/mcp/servers")).servers || [];
+      } catch {
+        return [];
+      }
+    },
+    {
+      revalidateOnMount: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+      keepPreviousData: true,
+      dedupingInterval: 0,
+    },
+  );
   const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [expandedServer, setExpandedServer] = useState<string | null>(null);
@@ -55,14 +75,11 @@ export function McpSection() {
   const fetchServers = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await pyFetch<{ servers: McpServer[] }>("/mcp/servers");
-      setServers(data.servers || []);
-    } catch {
-      setServers([]);
+      await mutateServers();
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [mutateServers]);
 
   const handleToggle = useCallback(() => {
     if (!expanded && servers.length === 0) fetchServers();

@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from sqlalchemy import select, delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +16,7 @@ from sqlalchemy.orm import selectinload
 
 from ..memory.database import get_db_session
 from ..models.ecc_models import WorldBook, WorldBookEntry, CharacterWorldBook, Character
+from ..utils.uuid_utils import parse_uuid, parse_uuid_strict
 
 logger = logging.getLogger(__name__)
 
@@ -25,20 +26,6 @@ logger = logging.getLogger(__name__)
 # ────────────────────────────────────────────
 
 
-def _parse_uuid(value: Any) -> Optional[uuid.UUID]:
-    if value is None:
-        return None
-    try:
-        return uuid.UUID(str(value))
-    except (ValueError, AttributeError):
-        return None
-
-
-def _parse_uuid_strict(value: str) -> uuid.UUID:
-    try:
-        return uuid.UUID(str(value))
-    except (ValueError, AttributeError):
-        raise WorldBookError(f"無効なUUID形式です: {value}")
 
 
 def _run_sync(coro):
@@ -102,7 +89,7 @@ async def create_worldbook(data: dict) -> dict:
     async with await get_db_session() as session:
         wb = WorldBook(
             id=uuid.uuid4(),
-            scenario_id=_parse_uuid(data.get("scenario_id")),
+            scenario_id=parse_uuid(data.get("scenario_id")),
             name=data["name"],
             description=data.get("description", ""),
             is_enabled=data.get("is_enabled", True),
@@ -117,7 +104,7 @@ async def create_worldbook(data: dict) -> dict:
 
 async def update_worldbook(worldbook_id: str, data: dict) -> dict:
     """ワールドブックを更新する。"""
-    uid = _parse_uuid_strict(worldbook_id)
+    uid = parse_uuid_strict(worldbook_id, lambda v: WorldBookError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         wb = await session.get(WorldBook, uid)
@@ -128,7 +115,7 @@ async def update_worldbook(worldbook_id: str, data: dict) -> dict:
             if key in data:
                 setattr(wb, key, data[key])
         if "scenario_id" in data:
-            wb.scenario_id = _parse_uuid(data.get("scenario_id"))
+            wb.scenario_id = parse_uuid(data.get("scenario_id"))
 
         wb.updated_at = datetime.utcnow()
         await session.commit()
@@ -140,7 +127,7 @@ async def update_worldbook(worldbook_id: str, data: dict) -> dict:
 
 async def delete_worldbook(worldbook_id: str) -> bool:
     """ワールドブックを削除する。"""
-    uid = _parse_uuid_strict(worldbook_id)
+    uid = parse_uuid_strict(worldbook_id, lambda v: WorldBookError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         wb = await session.get(WorldBook, uid)
@@ -158,7 +145,7 @@ async def delete_worldbook(worldbook_id: str) -> bool:
 async def list_worldbooks(scenario_id: Optional[str] = None) -> list:
     """ワールドブック一覧を取得する。"""
     async with await get_db_session() as session:
-        scenario_uid = _parse_uuid(scenario_id)
+        scenario_uid = parse_uuid(scenario_id)
         stmt = (
             select(WorldBook)
             .options(selectinload(WorldBook.entries))
@@ -173,7 +160,7 @@ async def list_worldbooks(scenario_id: Optional[str] = None) -> list:
 
 async def get_worldbook(worldbook_id: str) -> dict:
     """ワールドブックをエントリ込みで取得する。"""
-    uid = _parse_uuid_strict(worldbook_id)
+    uid = parse_uuid_strict(worldbook_id, lambda v: WorldBookError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         stmt = (
@@ -217,7 +204,7 @@ _ENTRY_UPDATABLE_FIELDS = {
 
 async def create_entry(worldbook_id: str, data: dict) -> dict:
     """ワールドブックにエントリを追加する。"""
-    wb_uid = _parse_uuid_strict(worldbook_id)
+    wb_uid = parse_uuid_strict(worldbook_id, lambda v: WorldBookError(f"無効なUUID形式です: {v}"))
 
     if not data.get("content"):
         raise WorldBookError("エントリのcontentは必須です")
@@ -246,7 +233,7 @@ async def create_entry(worldbook_id: str, data: dict) -> dict:
 
 async def update_entry(entry_id: str, data: dict) -> dict:
     """エントリを更新する。"""
-    uid = _parse_uuid_strict(entry_id)
+    uid = parse_uuid_strict(entry_id, lambda v: WorldBookError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         entry = await session.get(WorldBookEntry, uid)
@@ -267,7 +254,7 @@ async def update_entry(entry_id: str, data: dict) -> dict:
 
 async def delete_entry(entry_id: str) -> bool:
     """エントリを削除する。"""
-    uid = _parse_uuid_strict(entry_id)
+    uid = parse_uuid_strict(entry_id, lambda v: WorldBookError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         entry = await session.get(WorldBookEntry, uid)
@@ -288,8 +275,8 @@ async def delete_entry(entry_id: str) -> bool:
 
 async def link_character(worldbook_id: str, character_id: str) -> dict:
     """キャラクターとワールドブックを紐づける。"""
-    wb_uid = _parse_uuid_strict(worldbook_id)
-    char_uid = _parse_uuid_strict(character_id)
+    wb_uid = parse_uuid_strict(worldbook_id, lambda v: WorldBookError(f"無効なUUID形式です: {v}"))
+    char_uid = parse_uuid_strict(character_id, lambda v: WorldBookError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         # 存在確認
@@ -334,8 +321,8 @@ async def link_character(worldbook_id: str, character_id: str) -> dict:
 
 async def unlink_character(worldbook_id: str, character_id: str) -> bool:
     """キャラクターとワールドブックの紐づけを解除する。"""
-    wb_uid = _parse_uuid_strict(worldbook_id)
-    char_uid = _parse_uuid_strict(character_id)
+    wb_uid = parse_uuid_strict(worldbook_id, lambda v: WorldBookError(f"無効なUUID形式です: {v}"))
+    char_uid = parse_uuid_strict(character_id, lambda v: WorldBookError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         result = await session.execute(
@@ -359,7 +346,7 @@ async def unlink_character(worldbook_id: str, character_id: str) -> bool:
 
 async def get_linked_characters(worldbook_id: str) -> list:
     """ワールドブックに紐づいたキャラクター一覧を取得する。"""
-    wb_uid = _parse_uuid_strict(worldbook_id)
+    wb_uid = parse_uuid_strict(worldbook_id, lambda v: WorldBookError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         stmt = (
@@ -412,7 +399,7 @@ async def get_matching_entries(
         wb_id_set = set()
 
         if scenario_id:
-            scenario_uid = _parse_uuid(scenario_id)
+            scenario_uid = parse_uuid(scenario_id)
             if scenario_uid:
                 scenario_books = await session.execute(
                     select(WorldBook.id).where(

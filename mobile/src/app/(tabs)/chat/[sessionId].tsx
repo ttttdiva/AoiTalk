@@ -7,19 +7,18 @@ import React, {
 } from "react";
 import {
   FlatList,
-  KeyboardAvoidingView,
-  Platform,
+  Keyboard,
   Pressable,
   ScrollView,
   StyleSheet,
   View,
 } from "react-native";
 import * as Clipboard from "expo-clipboard";
-import { useLocalSearchParams, useNavigation } from "expo-router";
+import { useLocalSearchParams, useNavigation, useRouter } from "expo-router";
+import { KeyboardStickyView } from "react-native-keyboard-controller";
 import Markdown from "react-native-markdown-display";
 import {
   ActivityIndicator,
-  Badge,
   Button,
   Chip,
   Dialog,
@@ -31,20 +30,49 @@ import {
   Text,
   TextInput,
 } from "react-native-paper";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useAuth } from "../../../contexts/AuthContext";
 import { useProject } from "../../../contexts/ProjectContext";
 import { useConversationController } from "../../../features/conversation/useConversationController";
 import { groupMessageKey } from "../../../features/conversation/timeline";
 import type { TimelineItem } from "../../../features/conversation/models";
 import type { ConversationMessage } from "../../../types/api";
+import type { ChatResponseModelSelection } from "../../../types/api";
+import {
+  getFallbackConfig,
+  getMainSlot,
+  getProviderProfile,
+  getDirectReasoningEffortOptions,
+  isDirectProvider,
+  type DirectMobileLlmSelection,
+} from "../../../lib/mobile-llm";
+import {
+  DIRECT_PROVIDER_ORDER,
+  getProviderLabel,
+  getSeedModelIds,
+  mergeModelIds,
+  readCachedModels,
+  type DirectMobileLlmProvider,
+} from "../../../lib/cloud-model-catalog";
+import {
+  filterSlashCommands,
+  MOBILE_CHAT_COMMANDS,
+  resolveMobileCommandSubmission,
+  type MobileChatCommand,
+  type SkillSlashCommand,
+} from "../../../features/conversation/chat-commands";
 
 function compactLabel(value: string): string {
   return value.length > 18 ? `${value.slice(0, 17)}...` : value;
 }
 
+type DirectModelOption = DirectMobileLlmSelection & { label: string };
+
 export default function ChatScreen() {
   const { sessionId } = useLocalSearchParams<{ sessionId: string }>();
   const navigation = useNavigation();
+  const router = useRouter();
+  const insets = useSafeAreaInsets();
   const { user, isAuthenticated } = useAuth();
   const { selectedProjectId } = useProject();
   const flatListRef = useRef<FlatList<TimelineItem>>(null);
@@ -62,9 +90,28 @@ export default function ChatScreen() {
   const [commandSheetVisible, setCommandSheetVisible] = useState(false);
   const [llmModeVisible, setLlmModeVisible] = useState(false);
   const [llmModeSaving, setLlmModeSaving] = useState(false);
+  const [responseModelVisible, setResponseModelVisible] = useState(false);
+  const [responseModel, setResponseModel] =
+    useState<ChatResponseModelSelection | null>(null);
+  const [directResponse, setDirectResponse] =
+    useState<DirectMobileLlmSelection | null>(null);
+  const [directModelOptions, setDirectModelOptions] = useState<DirectModelOption[]>([]);
+  const [activeCommand, setActiveCommand] = useState<MobileChatCommand | null>(null);
+  const [composerError, setComposerError] = useState<string | null>(null);
   const [pendingQueueVisible, setPendingQueueVisible] = useState(false);
+  const [keyboardVisible, setKeyboardVisible] = useState(false);
   const [actionTarget, setActionTarget] = useState<ConversationMessage | null>(
     null,
+  );
+
+  const handleSessionPromoted = useCallback(
+    (remoteSessionId: string) => {
+      router.replace({
+        pathname: "/(tabs)/chat/[sessionId]",
+        params: { sessionId: remoteSessionId },
+      });
+    },
+    [router],
   );
 
   const controller = useConversationController({
@@ -72,6 +119,7 @@ export default function ChatScreen() {
     isAuthenticated,
     userRole: user?.role,
     selectedProjectId,
+    onSessionPromoted: handleSessionPromoted,
   });
 
   const messageGroups = useMemo(() => {
@@ -97,9 +145,86 @@ export default function ChatScreen() {
       ),
     [controller.messages],
   );
-  const currentLlmModeLabel = controller.llmMode
-    ? controller.llmModeLabels[controller.llmMode] ?? controller.llmMode
-    : "LLM";
+  const directEffortOptions = directResponse
+    ? getDirectReasoningEffortOptions(directResponse.provider, directResponse.model)
+    : [];
+  const currentLlmModeLabel = directResponse
+    ? directResponse.reasoningEffort || directEffortOptions[0] || "標準"
+    : controller.llmMode
+      ? controller.llmModeLabels[controller.llmMode] ?? controller.llmMode
+      : "LLM";
+  const currentResponseModelLabel = useMemo(() => {
+    if (directResponse) {
+      return `Direct · ${getProviderLabel(directResponse.provider)} / ${directResponse.model}`;
+    }
+    const option = responseModel
+      ? controller.responseModelOptions.find(
+          (item) =>
+            item.provider === responseModel.provider &&
+            item.model === responseModel.model,
+        )
+      : controller.responseModelOptions.find((item) => item.isCurrent);
+    return option?.modelLabel ?? responseModel?.model ?? "自動";
+  }, [controller.responseModelOptions, directResponse, responseModel]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const [main, fallback] = await Promise.all([getMainSlot(), getFallbackConfig()]);
+      const preferredModels = new Map<DirectMobileLlmProvider, string[]>();
+      if (isDirectProvider(main.provider)) {
+        preferredModels.set(main.provider, main.model ? [main.model] : []);
+      }
+      if (fallback.enabled) {
+        preferredModels.set(
+          fallback.provider,
+          mergeModelIds(
+            preferredModels.get(fallback.provider) ?? [],
+            fallback.model ? [fallback.model] : [],
+          ),
+        );
+      }
+      const providerModels = new Map<DirectMobileLlmProvider, string[]>();
+      for (const provider of DIRECT_PROVIDER_ORDER) {
+        const profile = await getProviderProfile(provider);
+        if (!profile.apiKey.trim()) continue;
+        const cached = await readCachedModels(provider);
+        const merged = mergeModelIds(
+          preferredModels.get(provider) ?? [],
+          mergeModelIds(cached, getSeedModelIds(provider)),
+        );
+        providerModels.set(provider, merged);
+      }
+      if (cancelled) return;
+      setDirectModelOptions(
+        Array.from(providerModels.entries()).flatMap(([provider, models]) =>
+          models.slice(0, 30).map((model) => ({
+            provider,
+            model,
+            label: `Direct · ${getProviderLabel(provider)} / ${model}`,
+          })),
+        ),
+      );
+    })().catch(() => {
+      if (!cancelled) setDirectModelOptions([]);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const slashQuery = /^\/[^\s\n]*$/.test(input) ? input : null;
+  const slashSuggestions = useMemo(() => {
+    if (!slashQuery) return [];
+    const builtIns = filterSlashCommands(MOBILE_CHAT_COMMANDS, slashQuery).map((command) => ({
+      kind: "command" as const,
+      command,
+    }));
+    const skills = filterSlashCommands(controller.skillCommands, slashQuery).map((command) => ({
+      kind: "skill" as const,
+      command,
+    }));
+    return [...builtIns, ...skills].slice(0, 6);
+  }, [controller.skillCommands, slashQuery]);
 
   useEffect(() => {
     navigation.setOptions({
@@ -111,22 +236,71 @@ export default function ChatScreen() {
     setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 80);
   }, [controller.timeline.length]);
 
+  useEffect(() => {
+    const showSubscription = Keyboard.addListener("keyboardDidShow", () => {
+      setKeyboardVisible(true);
+      setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 80);
+    });
+    const hideSubscription = Keyboard.addListener("keyboardDidHide", () => {
+      setKeyboardVisible(false);
+    });
+    return () => {
+      showSubscription.remove();
+      hideSubscription.remove();
+    };
+  }, []);
+
+  const selectBuiltInCommand = useCallback((command: MobileChatCommand) => {
+    setActiveCommand(command);
+    setComposerError(null);
+    setInput((value) => (/^\/[^\s\n]*$/.test(value) ? "" : value));
+    setCommandSheetVisible(false);
+  }, []);
+
+  const selectSkillCommand = useCallback((command: SkillSlashCommand) => {
+    setActiveCommand(null);
+    setComposerError(null);
+    setInput(`${command.command} `);
+    setCommandSheetVisible(false);
+  }, []);
+
   const handleSend = useCallback(() => {
-    const text = input.trim();
+    const submission = resolveMobileCommandSubmission(input, activeCommand);
+    if (submission.error) {
+      setComposerError(submission.error);
+      return;
+    }
+    const text = submission.content;
     if (!text || !sendEnabled) return;
+    if (
+      directResponse &&
+      (Boolean(submission.capabilities?.length) || text.startsWith("/"))
+    ) {
+      setComposerError("組み込みコマンドとSkillsはServerモデルで実行してください。");
+      return;
+    }
     setInput("");
+    setActiveCommand(null);
+    setComposerError(null);
     void controller.sendConversationCommand({
       message: text,
       projectId: selectedProjectId,
       includeProjectContext,
       agentMode: "confirm",
+      target: directResponse
+        ? { kind: "direct", selection: directResponse }
+        : { kind: "server", responseModel: responseModel ?? undefined },
+      commandCapabilities: submission.capabilities,
     });
   }, [
+    activeCommand,
     controller,
     includeProjectContext,
     input,
     selectedProjectId,
     sendEnabled,
+    responseModel,
+    directResponse,
   ]);
 
   const openEdit = useCallback((message: ConversationMessage) => {
@@ -156,9 +330,14 @@ export default function ChatScreen() {
   const changeLlmMode = useCallback(
     async (mode: string) => {
       setLlmModeSaving(true);
+      setComposerError(null);
       try {
         await controller.changeLlmMode(mode);
         setLlmModeVisible(false);
+      } catch (error) {
+        setComposerError(
+          error instanceof Error ? error.message : "Effortの変更に失敗しました。",
+        );
       } finally {
         setLlmModeSaving(false);
       }
@@ -311,46 +490,7 @@ export default function ChatScreen() {
   }
 
   return (
-    <KeyboardAvoidingView
-      style={styles.container}
-      behavior={Platform.OS === "ios" ? "padding" : "height"}
-      keyboardVerticalOffset={Platform.OS === "ios" ? 90 : 0}
-    >
-      <Surface style={styles.header} elevation={1}>
-        <View style={styles.headerRow}>
-          <View style={styles.headerText}>
-            <Text style={styles.sessionTitle} numberOfLines={1}>
-              {controller.session?.title || "チャット"}
-            </Text>
-            <Text style={styles.sessionSubtitle} numberOfLines={1}>
-              {controller.diagnostics.connectionCapability}
-            </Text>
-          </View>
-          {pendingMessages.length > 0 ? (
-            <View style={styles.pendingBadgeWrap}>
-              <IconButton
-                icon="cloud-upload-outline"
-                iconColor="#f9e2af"
-                size={20}
-                onPress={() => setPendingQueueVisible(true)}
-                accessibilityLabel="未送信キューを開く"
-              />
-              <Badge style={styles.pendingBadge}>{pendingMessages.length}</Badge>
-            </View>
-          ) : null}
-          <Chip
-            compact
-            icon="tune-variant"
-            disabled={controller.llmModeOptions.length === 0}
-            style={styles.llmModeChip}
-            textStyle={styles.llmModeChipText}
-            onPress={() => setLlmModeVisible(true)}
-          >
-            {compactLabel(currentLlmModeLabel)}
-          </Chip>
-        </View>
-      </Surface>
-
+    <View style={styles.container}>
       {controller.error ? (
         <Surface style={styles.errorBanner} elevation={0}>
           <Text style={styles.errorText}>{controller.error}</Text>
@@ -380,36 +520,138 @@ export default function ChatScreen() {
         }
       />
 
-      <Surface style={styles.inputBar} elevation={2}>
-        <View style={styles.inputRow}>
-          <IconButton
-            icon="plus"
-            iconColor="#a6adc8"
-            onPress={() => setCommandSheetVisible(true)}
-          />
+      <KeyboardStickyView offset={{ closed: 0, opened: 0 }}>
+        <View
+          style={[
+            styles.inputBar,
+            {
+              paddingBottom: keyboardVisible ? 4 : Math.max(4, insets.bottom),
+            },
+          ]}
+        >
+        {slashSuggestions.length > 0 ? (
+          <Surface style={styles.slashSuggestions} elevation={3}>
+            {slashSuggestions.map((item) => (
+              <Pressable
+                key={`${item.kind}-${item.command.command}`}
+                style={styles.slashSuggestionRow}
+                onPress={() =>
+                  item.kind === "command"
+                    ? selectBuiltInCommand(item.command)
+                    : selectSkillCommand(item.command)
+                }
+              >
+                <Text style={styles.slashCommand}>{item.command.command}</Text>
+                <Text style={styles.slashDescription} numberOfLines={1}>
+                  {item.command.description}
+                </Text>
+              </Pressable>
+            ))}
+          </Surface>
+        ) : null}
+        {activeCommand ? (
+          <View style={styles.composerStatus}>
+            <Text style={styles.composerStatusText} numberOfLines={1}>
+              {activeCommand.command} · {activeCommand.label}
+            </Text>
+            <IconButton
+              icon="close"
+              size={16}
+              iconColor="#a6adc8"
+              style={styles.clearCommandButton}
+              onPress={() => setActiveCommand(null)}
+              accessibilityLabel="選択中のコマンドを解除"
+            />
+          </View>
+        ) : null}
+        {composerError ? <Text style={styles.composerError}>{composerError}</Text> : null}
+        <Surface style={styles.composerCard} elevation={1}>
           <TextInput
             value={input}
             onChangeText={setInput}
             placeholder="メッセージを入力..."
             placeholderTextColor="#585b70"
             style={styles.textInput}
-            mode="outlined"
-            outlineStyle={styles.textInputOutline}
+            mode="flat"
+            underlineColor="transparent"
+            activeUnderlineColor="transparent"
             multiline
             maxLength={4000}
             disabled={!sendEnabled}
             onSubmitEditing={handleSend}
             blurOnSubmit={false}
           />
-          <IconButton
-            icon="send"
-            iconColor={input.trim() && sendEnabled ? "#7c3aed" : "#585b70"}
-            size={24}
-            onPress={handleSend}
-            disabled={!input.trim() || !sendEnabled}
-          />
+          <View style={styles.composerActions}>
+            <IconButton
+              icon="plus"
+              iconColor="#cdd6f4"
+              size={24}
+              style={styles.composerIconButton}
+              onPress={() => {
+                Keyboard.dismiss();
+                setCommandSheetVisible(true);
+              }}
+              accessibilityLabel="ツールとコマンドを開く"
+            />
+            <Pressable
+              style={styles.composerSelector}
+              onPress={() => {
+                Keyboard.dismiss();
+                setResponseModelVisible(true);
+              }}
+              accessibilityRole="button"
+              accessibilityLabel={`モデルを選択。現在は${currentResponseModelLabel}`}
+            >
+              <Text style={styles.composerSelectorText} numberOfLines={1}>
+                {compactLabel(currentResponseModelLabel)}
+              </Text>
+              <Text style={styles.composerSelectorChevron}>⌄</Text>
+            </Pressable>
+            <Pressable
+              style={styles.composerSelector}
+              disabled={
+                directResponse
+                  ? directEffortOptions.length === 0
+                  : controller.llmModeOptions.length === 0
+              }
+              onPress={() => {
+                Keyboard.dismiss();
+                setLlmModeVisible(true);
+              }}
+              accessibilityRole="button"
+              accessibilityLabel={`Effortを選択。現在は${currentLlmModeLabel}`}
+            >
+              <Text
+                style={[
+                  styles.composerSelectorText,
+                  (directResponse
+                    ? directEffortOptions.length === 0
+                    : controller.llmModeOptions.length === 0)
+                    ? styles.composerSelectorDisabled
+                    : null,
+                ]}
+                numberOfLines={1}
+              >
+                {compactLabel(currentLlmModeLabel)}
+              </Text>
+              <Text style={styles.composerSelectorChevron}>⌄</Text>
+            </Pressable>
+            <IconButton
+              icon="arrow-up"
+              iconColor={input.trim() && sendEnabled ? "#11111b" : "#6c7086"}
+              containerColor={
+                input.trim() && sendEnabled ? "#89b4fa" : "#313244"
+              }
+              size={22}
+              style={styles.sendButton}
+              onPress={handleSend}
+              disabled={!input.trim() || !sendEnabled}
+              accessibilityLabel="送信"
+            />
+          </View>
+        </Surface>
         </View>
-      </Surface>
+      </KeyboardStickyView>
 
       <Portal>
         <Dialog
@@ -465,6 +707,96 @@ export default function ChatScreen() {
         </Dialog>
 
         <Dialog
+          visible={responseModelVisible}
+          onDismiss={() => setResponseModelVisible(false)}
+          style={styles.dialog}
+        >
+          <Dialog.Title style={styles.dialogTitle}>次の応答モデル</Dialog.Title>
+          <Dialog.ScrollArea style={styles.dialogScrollArea}>
+            <ScrollView contentContainerStyle={styles.dialogScrollContent}>
+              <Button
+                mode={!responseModel ? "contained" : "outlined"}
+                buttonColor={!responseModel ? "#7c3aed" : undefined}
+                textColor={!responseModel ? "#f5e9ff" : "#89b4fa"}
+                style={styles.modeButton}
+                onPress={() => {
+                  setResponseModel(null);
+                  setDirectResponse(null);
+                  setResponseModelVisible(false);
+                }}
+              >
+                サーバー既定（自動）
+              </Button>
+              {directModelOptions.length > 0 ? (
+                <>
+                  <Divider style={styles.innerDivider} />
+                  <Text style={styles.commandSectionTitle}>Direct</Text>
+                  {directModelOptions.map((option) => {
+                    const selected =
+                      directResponse?.provider === option.provider &&
+                      directResponse?.model === option.model;
+                    return (
+                      <Button
+                        key={`direct:${option.provider}:${option.model}`}
+                        mode={selected ? "contained" : "outlined"}
+                        buttonColor={selected ? "#7c3aed" : undefined}
+                        textColor={selected ? "#f5e9ff" : "#89b4fa"}
+                        style={styles.modeButton}
+                        onPress={() => {
+                          const efforts = getDirectReasoningEffortOptions(
+                            option.provider,
+                            option.model,
+                          );
+                          setDirectResponse({
+                            provider: option.provider,
+                            model: option.model,
+                            reasoningEffort: efforts.includes("medium")
+                              ? "medium"
+                              : efforts[0],
+                          });
+                          setResponseModel(null);
+                          setResponseModelVisible(false);
+                        }}
+                      >
+                        {option.label}
+                      </Button>
+                    );
+                  })}
+                  <Divider style={styles.innerDivider} />
+                  <Text style={styles.commandSectionTitle}>Server</Text>
+                </>
+              ) : null}
+              {controller.responseModelOptions.map((option) => {
+                const selected =
+                  responseModel?.provider === option.provider &&
+                  responseModel?.model === option.model;
+                return (
+                  <Button
+                    key={`${option.provider}:${option.model}`}
+                    mode={selected ? "contained" : "outlined"}
+                    buttonColor={selected ? "#7c3aed" : undefined}
+                    textColor={selected ? "#f5e9ff" : "#89b4fa"}
+                    style={styles.modeButton}
+                    onPress={() => {
+                      setResponseModel({ provider: option.provider, model: option.model });
+                      setDirectResponse(null);
+                      setResponseModelVisible(false);
+                    }}
+                  >
+                    {option.label}
+                  </Button>
+                );
+              })}
+            </ScrollView>
+          </Dialog.ScrollArea>
+          <Dialog.Actions>
+            <Button textColor="#a6adc8" onPress={() => setResponseModelVisible(false)}>
+              Cancel
+            </Button>
+          </Dialog.Actions>
+        </Dialog>
+
+        <Dialog
           visible={llmModeVisible}
           onDismiss={() => setLlmModeVisible(false)}
           style={styles.dialog}
@@ -476,8 +808,10 @@ export default function ChatScreen() {
                 ? "reasoning effort を切り替えます。"
                 : "現在の応答モードを切り替えます。"}
             </Text>
-            {controller.llmModeOptions.map((mode) => {
-              const selected = mode === controller.llmMode;
+            {(directResponse ? directEffortOptions : controller.llmModeOptions).map((mode) => {
+              const selected = directResponse
+                ? mode === directResponse.reasoningEffort
+                : mode === controller.llmMode;
               return (
                 <Button
                   key={mode}
@@ -485,15 +819,22 @@ export default function ChatScreen() {
                   compact
                   buttonColor={selected ? "#7c3aed" : undefined}
                   textColor={selected ? "#f5e9ff" : "#89b4fa"}
-                  disabled={llmModeSaving}
+                  disabled={!directResponse && llmModeSaving}
                   style={styles.modeButton}
-                  onPress={() => void changeLlmMode(mode)}
+                  onPress={() => {
+                    if (directResponse) {
+                      setDirectResponse({ ...directResponse, reasoningEffort: mode });
+                      setLlmModeVisible(false);
+                    } else {
+                      void changeLlmMode(mode);
+                    }
+                  }}
                 >
-                  {controller.llmModeLabels[mode] ?? mode}
+                  {directResponse ? mode : controller.llmModeLabels[mode] ?? mode}
                 </Button>
               );
             })}
-            {controller.llmModeOptions.length === 0 ? (
+            {(directResponse ? directEffortOptions : controller.llmModeOptions).length === 0 ? (
               <Text style={styles.diagnosticsText}>
                 サーバー接続中のみ利用できます。
               </Text>
@@ -728,36 +1069,68 @@ export default function ChatScreen() {
           onDismiss={() => setCommandSheetVisible(false)}
           style={styles.dialog}
         >
-          <Dialog.Title style={styles.dialogTitle}>Commands</Dialog.Title>
+          <Dialog.Title style={styles.dialogTitle}>追加と設定</Dialog.Title>
           <Dialog.ScrollArea style={styles.dialogScrollArea}>
             <ScrollView contentContainerStyle={styles.dialogScrollContent}>
-              {controller.commands.map((command) => (
-                <Surface
-                  key={command.id}
+              <Text style={styles.commandSectionTitle}>ツール</Text>
+              <Button
+                icon="magnify"
+                textColor="#cdd6f4"
+                contentStyle={styles.quickActionContent}
+                disabled={!isAuthenticated}
+                onPress={() => {
+                  setCommandSheetVisible(false);
+                  setDeepResearchVisible(true);
+                }}
+              >
+                Deep Research
+              </Button>
+              {pendingMessages.length > 0 ? (
+                <Button
+                  icon="cloud-upload-outline"
+                  textColor="#f9e2af"
+                  contentStyle={styles.quickActionContent}
+                  onPress={() => {
+                    setCommandSheetVisible(false);
+                    setPendingQueueVisible(true);
+                  }}
+                >
+                  未送信メッセージ {pendingMessages.length}件
+                </Button>
+              ) : null}
+              <Divider style={styles.innerDivider} />
+              <Text style={styles.commandSectionTitle}>組み込みコマンド</Text>
+              {MOBILE_CHAT_COMMANDS.map((command) => (
+                <Pressable
+                  key={command.command}
                   style={styles.commandRow}
-                  elevation={0}
+                  onPress={() => selectBuiltInCommand(command)}
                 >
                   <View style={styles.commandText}>
-                    <Text style={styles.commandTitle}>{command.label}</Text>
+                    <Text style={styles.commandTitle}>{command.command} · {command.label}</Text>
                     <Text style={styles.commandDescription}>
-                      {command.enabled ? command.description : command.reason}
+                      {command.description}
                     </Text>
                   </View>
-                  <Chip
-                    compact
-                    disabled={!command.enabled}
-                    style={styles.commandChip}
-                  >
-                    {command.category}
-                  </Chip>
-                </Surface>
+                </Pressable>
               ))}
               <Divider style={styles.innerDivider} />
-              <Text style={styles.diagnosticsText}>
-                user={controller.diagnostics.userCapability} / connection=
-                {controller.diagnostics.connectionCapability} / pending=
-                {controller.diagnostics.pendingMessages}
-              </Text>
+              <Text style={styles.commandSectionTitle}>Skills</Text>
+              {controller.skillCommands.map((command) => (
+                <Pressable
+                  key={command.command}
+                  style={styles.commandRow}
+                  onPress={() => selectSkillCommand(command)}
+                >
+                  <View style={styles.commandText}>
+                    <Text style={styles.commandTitle}>{command.command}</Text>
+                    <Text style={styles.commandDescription}>{command.description}</Text>
+                  </View>
+                </Pressable>
+              ))}
+              {controller.skillCommands.length === 0 ? (
+                <Text style={styles.diagnosticsText}>利用可能な手動Skillはありません。</Text>
+              ) : null}
             </ScrollView>
           </Dialog.ScrollArea>
           <Dialog.Actions>
@@ -770,7 +1143,7 @@ export default function ChatScreen() {
           </Dialog.Actions>
         </Dialog>
       </Portal>
-    </KeyboardAvoidingView>
+    </View>
   );
 }
 
@@ -782,29 +1155,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     backgroundColor: "#11111b",
   },
-  header: {
-    backgroundColor: "#1e1e2e",
-    paddingHorizontal: 12,
-    paddingTop: 8,
-    paddingBottom: 8,
-  },
-  headerRow: { flexDirection: "row", alignItems: "center" },
-  headerText: { flex: 1 },
-  sessionTitle: { color: "#cdd6f4", fontSize: 17, fontWeight: "700" },
-  sessionSubtitle: { color: "#a6adc8", fontSize: 12, marginTop: 2 },
-  pendingBadgeWrap: { position: "relative", marginRight: 2 },
-  pendingBadge: {
-    position: "absolute",
-    right: 2,
-    top: 2,
-    backgroundColor: "#f38ba8",
-  },
-  llmModeChip: {
-    maxWidth: 132,
-    backgroundColor: "#181825",
-    marginRight: 2,
-  },
-  llmModeChipText: { color: "#cdd6f4", fontSize: 11 },
   statusChip: { backgroundColor: "#313244", marginRight: 6 },
   statusChipText: { color: "#cdd6f4", fontSize: 11 },
   commandChip: { backgroundColor: "#181825", marginRight: 6 },
@@ -828,18 +1178,24 @@ const styles = StyleSheet.create({
     padding: 10,
   },
   errorText: { color: "#f38ba8", fontSize: 13 },
-  messageList: { padding: 12, paddingBottom: 8 },
+  messageList: { paddingHorizontal: 14, paddingTop: 16, paddingBottom: 12 },
   empty: { alignItems: "center", paddingTop: 60 },
   emptyText: { color: "#a6adc8", fontSize: 14 },
   messageWrap: { marginBottom: 8 },
   messageBubble: {
     marginBottom: 8,
-    padding: 12,
-    borderRadius: 8,
+    paddingHorizontal: 13,
+    paddingVertical: 10,
+    borderRadius: 18,
     maxWidth: "88%",
   },
-  userBubble: { alignSelf: "flex-end", backgroundColor: "#3b236a" },
-  assistantBubble: { alignSelf: "flex-start", backgroundColor: "#1e1e2e" },
+  userBubble: { alignSelf: "flex-end", backgroundColor: "#2d2d3d" },
+  assistantBubble: {
+    alignSelf: "stretch",
+    backgroundColor: "transparent",
+    maxWidth: "100%",
+    paddingHorizontal: 2,
+  },
   userText: { color: "#cdd6f4", fontSize: 15 },
   branchRow: {
     flexDirection: "row",
@@ -889,19 +1245,79 @@ const styles = StyleSheet.create({
     backgroundColor: "#313244",
   },
   inputBar: {
+    backgroundColor: "#11111b",
+    paddingHorizontal: 10,
+    paddingTop: 6,
+  },
+  composerStatus: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginHorizontal: 48,
+    marginBottom: 2,
+  },
+  composerStatusText: { flex: 1, color: "#a6adc8", fontSize: 11 },
+  clearCommandButton: { margin: 0 },
+  composerError: { color: "#f38ba8", fontSize: 12, paddingHorizontal: 6, paddingTop: 4 },
+  slashSuggestions: {
+    backgroundColor: "#181825",
+    borderColor: "#45475a",
+    borderWidth: 1,
+    borderRadius: 10,
+    marginBottom: 4,
+    overflow: "hidden",
+  },
+  slashSuggestionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    borderBottomColor: "#313244",
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  slashCommand: { color: "#c084fc", fontSize: 13, fontWeight: "700" },
+  slashDescription: { flex: 1, color: "#a6adc8", fontSize: 12 },
+  composerCard: {
     backgroundColor: "#1e1e2e",
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    paddingBottom: Platform.OS === "ios" ? 24 : 4,
+    borderColor: "#45475a",
+    borderWidth: 1,
+    borderRadius: 24,
+    overflow: "hidden",
   },
-  inputRow: { flexDirection: "row", alignItems: "flex-end" },
   textInput: {
-    flex: 1,
-    backgroundColor: "#313244",
+    backgroundColor: "#1e1e2e",
     fontSize: 15,
+    minHeight: 54,
     maxHeight: 120,
+    paddingHorizontal: 8,
   },
-  textInputOutline: { borderColor: "#585b70", borderRadius: 20 },
+  composerActions: {
+    minHeight: 48,
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 4,
+    paddingBottom: 4,
+  },
+  composerIconButton: { margin: 0 },
+  composerSelector: {
+    minWidth: 0,
+    maxWidth: 116,
+    flexShrink: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 7,
+    paddingVertical: 7,
+  },
+  composerSelectorText: {
+    minWidth: 0,
+    flexShrink: 1,
+    color: "#cdd6f4",
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  composerSelectorChevron: { color: "#a6adc8", fontSize: 13, marginLeft: 2 },
+  composerSelectorDisabled: { color: "#585b70" },
+  sendButton: { margin: 2, marginLeft: "auto" },
   dialog: { backgroundColor: "#1e1e2e" },
   dialogTitle: { color: "#cdd6f4" },
   dialogHelp: { color: "#a6adc8", fontSize: 13, marginBottom: 8 },
@@ -917,8 +1333,16 @@ const styles = StyleSheet.create({
     backgroundColor: "transparent",
   },
   commandText: { flex: 1 },
+  commandSectionTitle: {
+    color: "#c084fc",
+    fontSize: 12,
+    fontWeight: "700",
+    marginTop: 4,
+    marginBottom: 2,
+  },
   commandTitle: { color: "#cdd6f4", fontSize: 14, fontWeight: "600" },
   commandDescription: { color: "#a6adc8", fontSize: 12, marginTop: 2 },
+  quickActionContent: { justifyContent: "flex-start" },
   diagnosticsText: { color: "#a6adc8", fontSize: 12, lineHeight: 18 },
   innerDivider: { backgroundColor: "#313244", marginVertical: 8 },
 });

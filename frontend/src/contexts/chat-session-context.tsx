@@ -6,11 +6,13 @@ import {
   useState,
   useCallback,
   useRef,
+  useEffect,
   type ReactNode,
 } from "react";
 import { chatApi, type ConversationSession } from "@/lib/chat-api";
 
 export const CHAT_SESSION_TITLE_UPDATED_EVENT = "aoitalk-chat-session-title-updated";
+export const CHAT_SESSION_CHARACTER_UPDATED_EVENT = "aoi-character-changed";
 
 type ChatSessionContextValue = {
   sessions: ConversationSession[];
@@ -29,6 +31,45 @@ export function ChatSessionProvider({ children }: { children: ReactNode }) {
   const [sessions, setSessions] = useState<ConversationSession[]>([]);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
   const optimisticSessionIdsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    const handleCharacterUpdated = (event: Event) => {
+      const detail = (
+        event as CustomEvent<{
+          sessionId?: unknown;
+          characterName?: unknown;
+          characterSlug?: unknown;
+        }>
+      ).detail;
+      const sessionId =
+        typeof detail?.sessionId === "string" ? detail.sessionId : "";
+      const characterName =
+        typeof detail?.characterSlug === "string" && detail.characterSlug.trim()
+          ? detail.characterSlug.trim()
+          : typeof detail?.characterName === "string"
+            ? detail.characterName.trim()
+          : "";
+      if (!sessionId || !characterName) return;
+      setSessions((prev) =>
+        prev.map((session) =>
+          session.id === sessionId
+            ? { ...session, character_name: characterName }
+            : session,
+        ),
+      );
+    };
+
+    window.addEventListener(
+      CHAT_SESSION_CHARACTER_UPDATED_EVENT,
+      handleCharacterUpdated,
+    );
+    return () => {
+      window.removeEventListener(
+        CHAT_SESSION_CHARACTER_UPDATED_EVENT,
+        handleCharacterUpdated,
+      );
+    };
+  }, []);
 
   const mergeFetchedSessions = useCallback(
     (

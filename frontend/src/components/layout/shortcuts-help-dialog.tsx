@@ -7,6 +7,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { APP_VIEW_TABS } from "@/lib/app-navigation";
 import { CHAT_SHORTCUT_HELP_ITEMS } from "@/lib/chat-keyboard-shortcuts";
 
 type ShortcutItem = {
@@ -26,17 +27,10 @@ const SHORTCUT_SECTIONS: ShortcutSection[] = [
   },
   {
     title: "ページ移動",
-    items: [
-      { keys: ["Alt", "1"], description: "チャット" },
-      { keys: ["Alt", "2"], description: "タスク" },
-      { keys: ["Alt", "3"], description: "カレンダー" },
-      { keys: ["Alt", "4"], description: "Docs" },
-      { keys: ["Alt", "5"], description: "ファイラー" },
-      { keys: ["Alt", "6"], description: "プロジェクト" },
-      { keys: ["Alt", "7"], description: "シナリオ" },
-      { keys: ["Alt", "8"], description: "TRPG" },
-      { keys: ["Alt", "9"], description: "設定" },
-    ],
+    items: APP_VIEW_TABS.map((tab) => ({
+      keys: ["Alt", tab.shortcut],
+      description: tab.title,
+    })),
   },
   {
     title: "スペース切り替え",
@@ -90,11 +84,21 @@ const SHORTCUT_SECTIONS: ShortcutSection[] = [
     title: "ファイラー",
     items: [
       { keys: ["Alt", "←"], description: "戻る" },
+      { keys: ["Backspace"], description: "戻る" },
       { keys: ["Alt", "Backspace"], description: "戻る" },
       { keys: ["Alt", "→"], description: "進む" },
       { keys: ["Alt", "↑"], description: "上の階層へ移動" },
+      { keys: [":"], description: "サムネイル表示" },
+      { keys: [";"], description: "リスト表示" },
+      { keys: ["F8"], description: "名前順" },
+      { keys: ["F9"], description: "更新日時順" },
+      { keys: ["Delete"], description: "削除" },
       { keys: ["Ctrl", "I"], description: "選択中の項目をZIP圧縮" },
-      { keys: ["Ctrl", "U"], description: "選択中のZIPを展開" },
+      { keys: ["Ctrl", "U"], description: "選択中の圧縮ファイルを展開" },
+      {
+        keys: ["Ctrl", "Shift", "L"],
+        description: "選択中の項目をダウンロード",
+      },
     ],
   },
   {
@@ -152,7 +156,7 @@ export function ShortcutsHelpDialog() {
               <div className="space-y-1">
                 {section.items.map((item) => (
                   <div
-                    key={item.description}
+                    key={`${item.description}-${item.keys.join("-")}`}
                     className="flex items-center justify-between rounded-md px-2 py-1.5 hover:bg-accent/50"
                   >
                     <span className="text-sm">{item.description}</span>

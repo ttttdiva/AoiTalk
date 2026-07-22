@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useCallback } from "react";
+import useSWR from "swr";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -13,6 +14,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { History, ChevronDown, ChevronUp, Trash2, Loader2 } from "lucide-react";
+import { useConfirm } from "@/hooks/use-confirm";
 
 interface LoginLog {
   id: string;
@@ -36,9 +38,37 @@ async function pyFetch<T = unknown>(path: string, init?: RequestInit): Promise<T
   return res.json();
 }
 
+interface LoginHistoryData {
+  logs: LoginLog[];
+  total_count: number;
+}
+
+const EMPTY_LOGIN_HISTORY: LoginHistoryData = { logs: [], total_count: 0 };
+
 export function LoginHistorySection({ isAdmin }: { isAdmin: boolean }) {
-  const [logs, setLogs] = useState<LoginLog[]>([]);
-  const [totalCount, setTotalCount] = useState(0);
+  const confirm = useConfirm();
+  // ログイン履歴（サーバー状態）は SWR で管理。取得タイミングは従来どおり
+  // 呼び出し側（トグル/更新）で駆動するため自動 revalidation は無効化する。
+  const { data = EMPTY_LOGIN_HISTORY, mutate: mutateLogs } = useSWR<LoginHistoryData>(
+    "settings/login-history",
+    async () => {
+      try {
+        return await pyFetch<LoginHistoryData>("/auth/login-history?limit=50");
+      } catch {
+        return EMPTY_LOGIN_HISTORY;
+      }
+    },
+    {
+      revalidateOnMount: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+      keepPreviousData: true,
+      dedupingInterval: 0,
+    },
+  );
+  const logs = data.logs;
+  const totalCount = data.total_count;
   const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [clearing, setClearing] = useState(false);
@@ -46,17 +76,11 @@ export function LoginHistorySection({ isAdmin }: { isAdmin: boolean }) {
   const fetchLogs = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await pyFetch<{ logs: LoginLog[]; total_count: number }>(
-        "/auth/login-history?limit=50"
-      );
-      setLogs(data.logs);
-      setTotalCount(data.total_count);
-    } catch {
-      setLogs([]);
+      await mutateLogs();
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [mutateLogs]);
 
   const handleToggle = useCallback(() => {
     if (!expanded && logs.length === 0) fetchLogs();
@@ -64,18 +88,24 @@ export function LoginHistorySection({ isAdmin }: { isAdmin: boolean }) {
   }, [expanded, logs.length, fetchLogs]);
 
   const handleClear = useCallback(async () => {
-    if (!window.confirm("ログイン履歴をすべて削除しますか？")) return;
+    if (
+      !(await confirm({
+        description: "ログイン履歴をすべて削除しますか？",
+        destructive: true,
+      }))
+    )
+      return;
     setClearing(true);
     try {
       await pyFetch("/auth/login-history/clear", { method: "DELETE" });
-      setLogs([]);
-      setTotalCount(0);
+      // 楽観的更新：クリア成功後は再取得せずローカルキャッシュを空にする。
+      await mutateLogs(EMPTY_LOGIN_HISTORY, { revalidate: false });
     } catch {
       // ignore
     } finally {
       setClearing(false);
     }
-  }, []);
+  }, [confirm, mutateLogs]);
 
   const formatDate = (iso: string) => {
     try {

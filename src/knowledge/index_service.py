@@ -36,6 +36,20 @@ except ImportError:  # pragma: no cover - optional dependency
 
 logger = logging.getLogger(__name__)
 
+
+def _knowledge_search_enabled() -> bool:
+    """ナレッジRAGのマスタースイッチ (`search.knowledge_enabled`, 既定OFF)。"""
+    try:
+        from ..config import Config
+
+        search = Config().config.get("search", {})
+        if not isinstance(search, dict):
+            return False
+        return bool(search.get("knowledge_enabled", False))
+    except Exception:
+        return False
+
+
 _ASCII_TOKEN_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:/#-]*")
 _CJK_RUN_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]+")
 
@@ -117,8 +131,10 @@ class KnowledgeIndexService:
     async def initialize(self) -> bool:
         if self._initialized:
             return True
-        if not self.config.enabled:
-            logger.info("Knowledge index is disabled by RAG configuration")
+        if not _knowledge_search_enabled():
+            logger.info(
+                "Knowledge index is disabled (search.knowledge_enabled is off)"
+            )
             return False
         if not QDRANT_AVAILABLE:
             logger.warning("qdrant-client is not installed; Knowledge index disabled")

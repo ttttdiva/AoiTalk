@@ -3,6 +3,7 @@
 /* eslint-disable @next/next/no-img-element */
 
 import { Suspense, useCallback, useEffect, useState } from "react";
+import useSWR from "swr";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   Card,
@@ -14,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
+import { useConfirm } from "@/hooks/use-confirm";
 import {
   Dialog,
   DialogContent,
@@ -86,6 +88,9 @@ function scenarioImageSrc(path?: string, size = 640): string {
   return `/api/python-proxy/filer/image-thumbnail?path=${encodeURIComponent(path)}&size=${size}`;
 }
 
+const EMPTY_ROOMS: Room[] = [];
+const EMPTY_SCENARIOS: Scenario[] = [];
+
 function RoomStatusBadge({ status }: { status: string }) {
   if (status === "completed") {
     return (
@@ -107,11 +112,9 @@ function RoomStatusBadge({ status }: { status: string }) {
 }
 
 function TRPGRoomListContent() {
+  const confirm = useConfirm();
   const router = useRouter();
   const searchParams = useSearchParams();
-  const [rooms, setRooms] = useState<Room[]>([]);
-  const [scenarios, setScenarios] = useState<Scenario[]>([]);
-  const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [deletingRoomId, setDeletingRoomId] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
@@ -124,31 +127,33 @@ function TRPGRoomListContent() {
   const [isPublic, setIsPublic] = useState(true);
   const [gmMode, setGmMode] = useState<"ai" | "human">("ai");
 
-  const loadRooms = useCallback(async () => {
-    setLoading(true);
-    try {
-      const data = await py<{ rooms: Room[] }>("/api/trpg/rooms?status=all");
-      setRooms(data.rooms || []);
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  const loadScenarios = useCallback(async () => {
-    try {
-      const data = await py<{ scenarios: Scenario[] }>("/scenarios");
-      setScenarios((data.scenarios || []).filter((s) => s.scenario_kind === "trpg"));
-    } catch (e) {
-      console.error(e);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadRooms();
-    loadScenarios();
-  }, [loadRooms, loadScenarios]);
+  // 一覧取得は SWR に委譲（マウント時取得のみ・再取得や自動 revalidation はしない）。
+  const {
+    data: rooms = EMPTY_ROOMS,
+    isLoading: loading,
+    mutate: mutateRooms,
+  } = useSWR<Room[]>(
+    "trpg/rooms?status=all",
+    async () =>
+      (await py<{ rooms: Room[] }>("/api/trpg/rooms?status=all")).rooms || [],
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      shouldRetryOnError: false,
+    },
+  );
+  const { data: scenarios = EMPTY_SCENARIOS } = useSWR<Scenario[]>(
+    "trpg/scenarios",
+    async () =>
+      ((await py<{ scenarios: Scenario[] }>("/scenarios")).scenarios || []).filter(
+        (s) => s.scenario_kind === "trpg",
+      ),
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      shouldRetryOnError: false,
+    },
+  );
 
   useEffect(() => {
     const requestedScenarioId = searchParams.get("scenario_id");
@@ -199,7 +204,12 @@ function TRPGRoomListContent() {
   }, [joinCode, router]);
 
   const handleDeleteRoom = useCallback(async (room: Room) => {
-    if (!confirm(`TRPGセッション「${room.room_title}」を削除しますか？`)) {
+    if (
+      !(await confirm({
+        description: `TRPGセッション「${room.room_title}」を削除しますか？`,
+        destructive: true,
+      }))
+    ) {
       return;
     }
 
@@ -208,14 +218,18 @@ function TRPGRoomListContent() {
       await py<{ ok: boolean }>(`/api/trpg/rooms/${room.id}`, {
         method: "DELETE",
       });
-      setRooms((current) => current.filter((item) => item.id !== room.id));
+      void mutateRooms(
+        (current) =>
+          (current ?? EMPTY_ROOMS).filter((item) => item.id !== room.id),
+        { revalidate: false },
+      );
     } catch (e) {
       console.error(e);
       alert("TRPGセッションの削除に失敗しました。ホストまたは管理者のみ削除できます。");
     } finally {
       setDeletingRoomId(null);
     }
-  }, []);
+  }, [confirm, mutateRooms]);
 
   return (
     <div className="mx-auto max-w-6xl space-y-6 p-6">
@@ -248,11 +262,11 @@ function TRPGRoomListContent() {
       </div>
 
       {loading ? (
-        <div className="rounded-2xl border border-white/65 bg-white/52 px-5 py-4 text-sm text-muted-foreground shadow-[inset_0_1px_rgba(255,255,255,0.76)] backdrop-blur-xl dark:border-white/12 dark:bg-card/70 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12)]">
+        <div className="rounded-2xl border border-border bg-card px-5 py-4 text-sm text-muted-foreground">
           読み込み中…
         </div>
       ) : rooms.length === 0 ? (
-        <Card className="overflow-hidden border-white/65 bg-white/58 shadow-[inset_0_1px_rgba(255,255,255,0.78),0_24px_64px_-46px_rgba(6,81,110,0.75)] backdrop-blur-xl dark:border-white/12 dark:bg-card/75 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12),0_24px_64px_-46px_rgba(0,0,0,0.9)]">
+        <Card className="overflow-hidden">
           <CardContent className="flex flex-col items-center justify-center gap-3 p-0 pb-10 text-center">
             <img
               src="/images/ui/trpg-room.png"
@@ -275,7 +289,7 @@ function TRPGRoomListContent() {
             return (
               <Card
                 key={room.id}
-                className="relative cursor-pointer overflow-hidden border-white/65 bg-white/58 shadow-[inset_0_1px_rgba(255,255,255,0.76),0_18px_48px_-42px_rgba(6,81,110,0.72)] backdrop-blur-xl transition hover:border-primary/70 hover:bg-white/72 dark:border-white/12 dark:bg-card/75 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12),0_18px_48px_-42px_rgba(0,0,0,0.9)] dark:hover:bg-card/90"
+                className="relative cursor-pointer overflow-hidden transition hover:border-primary/70 hover:bg-accent"
                 onClick={() => router.push(`/trpg/rooms/${room.id}`)}
               >
                 <div className="aspect-[16/9] w-full overflow-hidden bg-muted">
@@ -307,6 +321,7 @@ function TRPGRoomListContent() {
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end">
                           <DropdownMenuItem
+                            mnemonic="D"
                             variant="destructive"
                             onClick={(e) => {
                               e.stopPropagation();

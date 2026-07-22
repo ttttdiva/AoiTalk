@@ -15,6 +15,7 @@ from sqlalchemy import select
 
 from ..memory.database import get_db_session
 from ..models.ecc_models import TRPGReferenceDocument, TRPGRulesetProfile
+from ..utils.uuid_utils import parse_uuid
 from .trpg_rules import (
     get_builtin_ruleset_profile,
     list_builtin_ruleset_profiles,
@@ -33,15 +34,6 @@ class TRPGRulebookError(Exception):
 class TRPGReferenceDocumentNotFoundError(TRPGRulebookError):
     def __init__(self, identifier: str):
         super().__init__(f"TRPG資料が見つかりません: {identifier}", 404)
-
-
-def _parse_uuid(value: Any) -> Optional[uuid.UUID]:
-    if value is None:
-        return None
-    try:
-        return uuid.UUID(str(value))
-    except (ValueError, AttributeError):
-        return None
 
 
 def profile_model_to_runtime_dict(profile: Optional[TRPGRulesetProfile]) -> Dict[str, Any]:
@@ -167,7 +159,7 @@ async def upsert_reference_document(
 ) -> Dict[str, Any]:
     key = normalize_ruleset_key(ruleset_key)
     payload = _reference_document_payload(data, key)
-    document_id = _parse_uuid(data.get("id"))
+    document_id = parse_uuid(data.get("id"))
 
     async with await get_db_session() as session:
         profile = await session.get(TRPGRulesetProfile, key)
@@ -209,7 +201,7 @@ async def upsert_reference_document(
 
 async def delete_reference_document(ruleset_key: str, document_id: str) -> bool:
     key = normalize_ruleset_key(ruleset_key)
-    uid = _parse_uuid(document_id)
+    uid = parse_uuid(document_id)
     if uid is None:
         raise TRPGReferenceDocumentNotFoundError(document_id)
     async with await get_db_session() as session:

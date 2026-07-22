@@ -37,6 +37,7 @@ ENV/
 # Cache files
 .cache/
 cache/
+.ruff_cache/
 
 # Logs
 *.log
@@ -90,11 +91,13 @@ CLAUDE_*.md
 GEMINI*.md
 temp_*.md
 temp_*.py
+/_tmp_*.py
 temp/
 /query
 
 # Generated review artifacts and screenshots
 artifacts/
+.codex/
 
 # Backup files
 *.bak

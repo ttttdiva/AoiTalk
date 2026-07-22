@@ -32,12 +32,14 @@ LLM_PROVIDER_LABELS = {
     "gemini": "Gemini API",
     "openai": "OpenAI API",
     "openrouter": "OpenRouter",
+    "kimi": "Kimi API",
     "ollama": "Ollama",
     "sglang": "SGLang",
     "openai_compatible_local": "ローカルOpenAI互換サーバー",
     "codex-cli": "Codex CLI",
     "claude-cli": "Claude Code",
     "antigravity-cli": "Antigravity CLI",
+    "grok-cli": "Grok Build CLI",
 }
 
 LLM_ENGINE_OPTIONS = [
@@ -65,6 +67,7 @@ PROVIDER_MODEL_CONFIG_KEYS = {
     "gemini": ("gemini.model", "gemini_model"),
     "openai": ("openai.model", "openai_model"),
     "openrouter": ("openrouter.model", "openrouter_model"),
+    "kimi": ("kimi.model", "kimi_model"),
     "ollama": ("ollama.model", "ollama_model"),
     "sglang": ("sglang.model", "sglang_model"),
     "openai_compatible_local": (
@@ -74,18 +77,21 @@ PROVIDER_MODEL_CONFIG_KEYS = {
     "codex-cli": ("codex_cli.model", "codex_model"),
     "claude-cli": ("claude_cli.model", "claude_model"),
     "antigravity-cli": ("antigravity_cli.model", "antigravity_cli_model"),
+    "grok-cli": ("grok_cli.model", "grok_cli_model"),
 }
 
 PROVIDER_ORDER = [
     "openai",
     "gemini",
     "openrouter",
+    "kimi",
     "ollama",
     "sglang",
     "openai_compatible_local",
     "codex-cli",
     "claude-cli",
     "antigravity-cli",
+    "grok-cli",
 ]
 
 
@@ -104,6 +110,10 @@ def model_supports_vision(provider: str, model: str) -> bool | None:
         return None
     if provider_id == "gemini":
         return True
+    # CLI backends use file attachments rather than the app's native image
+    # payload, so let the media-recognition route prepare the attachment.
+    if provider_id in {"codex-cli", "antigravity-cli"}:
+        return None
     if provider_id == "openai":
         if model_id.startswith(("gpt-4o", "gpt-4.1", "gpt-5", "o3", "o4")):
             return True
@@ -112,6 +122,8 @@ def model_supports_vision(provider: str, model: str) -> bool | None:
         if any(part in model_id for part in ("gpt-4o", "gpt-4.1", "gpt-5", "gemini", "claude-3", "claude-sonnet", "claude-opus")):
             return True
         return None
+    if provider_id == "kimi":
+        return model_id == "kimi-k3"
     if provider_id == "claude":
         if "claude-3" in model_id or "sonnet" in model_id or "opus" in model_id:
             return True
@@ -173,6 +185,16 @@ STATIC_MODEL_CATALOG = {
         {
             "id": "google/gemini-2.5-flash",
             "label": "Google: Gemini 2.5 Flash",
+        },
+    ],
+    "kimi": [
+        {
+            "id": "kimi-k3",
+            "label": "Kimi K3",
+            "description": "Moonshot AI公式APIの長文・推論・画像対応モデル",
+            "context_length": 1048576,
+            "supports_reasoning": True,
+            "media": {"image": True, "audio": False},
         },
     ],
     "ollama": [
@@ -267,6 +289,19 @@ STATIC_MODEL_CATALOG = {
             "label": "Claude Opus 4.6 (Thinking)",
         },
     ],
+    "grok-cli": [
+        {
+            "id": "grok-build",
+            "label": "grok-build",
+            "description": "Grok Build CLI の既定コーディングモデル。",
+        },
+        {
+            "id": "grok-build-0.1",
+            "label": "grok-build-0.1",
+            "description": "Grok Build 0.1。CLI側の設定で利用可能な場合に指定します。",
+        },
+        {"id": "grok-4.5", "label": "grok-4.5"},
+    ],
 }
 
 PROVIDER_CAPABILITIES = {
@@ -276,6 +311,11 @@ PROVIDER_CAPABILITIES = {
         supports_response_format=True,
     ),
     "openrouter": ProviderCapabilities(
+        supports_stream=True,
+        supports_tools=True,
+        supports_response_format=False,
+    ),
+    "kimi": ProviderCapabilities(
         supports_stream=True,
         supports_tools=True,
         supports_response_format=False,
@@ -306,12 +346,14 @@ PROVIDER_CAPABILITIES = {
     "codex-cli": ProviderCapabilities(),
     "claude-cli": ProviderCapabilities(),
     "antigravity-cli": ProviderCapabilities(),
+    "grok-cli": ProviderCapabilities(),
 }
 
 STATIC_SOURCE_BY_PROVIDER = {
     "codex-cli": ("cli-suggested", "CLI候補"),
     "claude-cli": ("cli-suggested", "CLI候補"),
     "antigravity-cli": ("cli-suggested", "CLI候補"),
+    "grok-cli": ("cli-suggested", "CLI候補"),
     "ollama": ("pull-suggested", "Pull候補"),
 }
 
@@ -319,6 +361,7 @@ CACHEABLE_REMOTE_PROVIDERS = {
     "openai",
     "gemini",
     "openrouter",
+    "kimi",
     "sglang",
     "openai_compatible_local",
 }
@@ -330,6 +373,14 @@ DEFAULT_MODEL_CATALOG_CACHE_PATH = Path("cache") / "llm_model_catalog.json"
 CODEX_REASONING_EFFORT_OPTIONS = ["low", "medium", "high", "xhigh"]
 CLAUDE_REASONING_EFFORT_OPTIONS = ["low", "medium", "high", "xhigh", "max"]
 OPENAI_FULL_REASONING_EFFORT_OPTIONS = ["none", "low", "medium", "high", "xhigh"]
+OPENAI_GPT56_REASONING_EFFORT_OPTIONS = [
+    "none",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+]
 OPENAI_GPT5_REASONING_EFFORT_OPTIONS = ["minimal", "low", "medium", "high"]
 OPENAI_GPT51_REASONING_EFFORT_OPTIONS = ["none", "low", "medium", "high"]
 OPENAI_GPT52_PRO_REASONING_EFFORT_OPTIONS = ["medium", "high", "xhigh"]
@@ -388,6 +439,55 @@ def dedupe_models(models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         next_model.setdefault("source_label", "候補")
         result.append(next_model)
     return result
+
+
+_OPENAI_GPT_VERSION_RE = re.compile(r"^gpt-(\d+)(?:\.(\d+))?(?:-|$)")
+_DATED_MODEL_RE = re.compile(r"-\d{4}-\d{2}-\d{2}(?:-|$)")
+_OPENAI_VARIANT_ORDER = {
+    "": 0,
+    "sol": 1,
+    "terra": 2,
+    "luna": 3,
+    "pro": 4,
+    "mini": 5,
+    "nano": 6,
+    "codex": 7,
+}
+
+
+def _openai_model_sort_key(model: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Put recent numbered GPT families first while preserving unrelated API order."""
+
+    model_id = str(model.get("id") or "").strip().lower()
+    match = _OPENAI_GPT_VERSION_RE.match(model_id)
+    if not match:
+        return (1,)
+
+    major = int(match.group(1))
+    minor = int(match.group(2) or 0)
+    suffix = model_id[match.end() :]
+    variant = suffix.split("-", 1)[0] if suffix else ""
+    if re.fullmatch(r"\d{4}", variant):
+        variant = ""
+    variant_order = _OPENAI_VARIANT_ORDER.get(variant, 50)
+    is_dated_snapshot = bool(_DATED_MODEL_RE.search(model_id))
+    return (
+        0,
+        -major,
+        -minor,
+        is_dated_snapshot,
+        variant_order,
+        model_id,
+    )
+
+
+def sort_provider_models(
+    provider: str,
+    models: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if provider != "openai":
+        return models
+    return sorted(models, key=_openai_model_sort_key)
 
 
 def enrich_model_reasoning_options(
@@ -584,6 +684,49 @@ def _openrouter_models(fetch_json: Callable[..., Dict[str, Any]]) -> List[Dict[s
     return models
 
 
+def _kimi_models(
+    cfg: Any,
+    fetch_json: Callable[..., Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    api_key = _config_get(cfg, "kimi_api_key") or os.environ.get("MOONSHOT_API_KEY")
+    if not api_key:
+        return []
+    base_url = str(
+        _config_get(cfg, "kimi_base_url")
+        or os.environ.get("MOONSHOT_BASE_URL")
+        or _config_get(cfg, "kimi.base_url", "https://api.moonshot.ai/v1")
+        or "https://api.moonshot.ai/v1"
+    ).rstrip("/")
+    data = fetch_json(
+        f"{base_url}/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=5.0,
+    )
+    models: List[Dict[str, Any]] = []
+    for item in data.get("data", []):
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "").strip()
+        if not model_id:
+            continue
+        models.append(
+            model_option(
+                model_id,
+                model_id,
+                source="provider-api",
+                source_label="API取得",
+                context_length=item.get("context_length"),
+                supports_reasoning=bool(item.get("supports_reasoning", False)),
+                supports_video_in=bool(item.get("supports_video_in", False)),
+                media={
+                    "image": bool(item.get("supports_image_in", False)),
+                    "audio": False,
+                },
+            )
+        )
+    return models
+
+
 def _openai_models(
     cfg: Any,
     fetch_json: Callable[..., Dict[str, Any]],
@@ -724,6 +867,8 @@ def provider_models(
                 remote_models = _openrouter_models(fetch_json)
                 if remote_models:
                     models = dedupe_models(remote_models + _static_models(provider))
+            elif provider == "kimi":
+                models = dedupe_models(_kimi_models(cfg, fetch_json) + models)
             elif provider == "openai":
                 models = dedupe_models(_openai_models(cfg, fetch_json) + models)
             elif provider == "gemini":
@@ -762,7 +907,25 @@ def provider_models(
         except Exception as exc:
             remote_error = str(exc)
 
-    return dedupe_models(models), remote_error
+    media_capabilities = {
+        "openai": {"image": True, "audio": False},
+        "gemini": {"image": True, "audio": True},
+        "codex-cli": {"image": True, "audio": False},
+        "antigravity-cli": {"image": True, "audio": True},
+        "claude": {"image": True, "audio": False},
+        "grok": {"image": True, "audio": False},
+    }.get(provider, {"image": False, "audio": False})
+    annotated_models = [
+        {
+            **model,
+            "media": {
+                **media_capabilities,
+                **(model.get("media") if isinstance(model.get("media"), dict) else {}),
+            },
+        }
+        for model in dedupe_models(models)
+    ]
+    return sort_provider_models(provider, annotated_models), remote_error
 
 
 def provider_settings(provider: str, cfg: Any) -> Dict[str, Any]:
@@ -808,6 +971,22 @@ def provider_settings(provider: str, cfg: Any) -> Dict[str, Any]:
             "api_key_placeholder": "設定済み" if api_key else "",
             "enable_tools": True,
         }
+    if provider == "kimi":
+        api_key = _config_get(cfg, "kimi_api_key") or os.environ.get(
+            "MOONSHOT_API_KEY", ""
+        )
+        return {
+            "base_url": _config_get(
+                cfg, "kimi_base_url"
+            ) or os.environ.get("MOONSHOT_BASE_URL") or _config_get(
+                cfg, "kimi.base_url", "https://api.moonshot.ai/v1"
+            ),
+            "api_key_configured": bool(api_key),
+            "api_key_placeholder": "設定済み" if api_key else "",
+            "reasoning_effort": "max",
+            "reasoning_effort_options": ["max"],
+            "enable_tools": True,
+        }
     if provider == "sglang":
         sglang_config = _config_get(cfg, "sglang", {}) or {}
         port = sglang_config.get("port", 30000) if isinstance(sglang_config, dict) else 30000
@@ -835,6 +1014,10 @@ def provider_settings(provider: str, cfg: Any) -> Dict[str, Any]:
             ),
             "reasoning_effort_options": CLAUDE_REASONING_EFFORT_OPTIONS,
         }
+    if provider == "grok-cli":
+        return {
+            "api_key_configured": bool(os.environ.get("XAI_API_KEY")),
+        }
     return {}
 
 
@@ -853,6 +1036,8 @@ def _gpt5_minor_version(model_id: str) -> Optional[int]:
         return int(match.group(1))
     except ValueError:
         return None
+def _is_gpt5_pro_model(model_id: str) -> bool:
+    return bool(re.search(r"-pro(?:-|$)", model_id))
 
 
 def reasoning_effort_options_for_model(provider: str, model: str) -> List[str]:
@@ -865,14 +1050,19 @@ def reasoning_effort_options_for_model(provider: str, model: str) -> List[str]:
         return CODEX_REASONING_EFFORT_OPTIONS
     if provider_id == "claude-cli":
         return CLAUDE_REASONING_EFFORT_OPTIONS
+    if provider_id == "kimi" and model_id == "kimi-k3":
+        return ["max"]
     if provider_id == "openai":
         if "-codex" in model_id or model_id.startswith("codex"):
             return OPENAI_CODEX_REASONING_EFFORT_OPTIONS
-        if model_id == "gpt-5-pro":
-            return ["high"]
         minor = _gpt5_minor_version(model_id)
-        if model_id.endswith("-pro") and minor is not None and minor >= 2:
-            return OPENAI_GPT52_PRO_REASONING_EFFORT_OPTIONS
+        if _is_gpt5_pro_model(model_id):
+            if model_id.startswith("gpt-5-pro"):
+                return ["high"]
+            if minor is not None and minor >= 2:
+                return OPENAI_GPT52_PRO_REASONING_EFFORT_OPTIONS
+        if minor == 6:
+            return OPENAI_GPT56_REASONING_EFFORT_OPTIONS
         if model_id == "gpt-5.1":
             return OPENAI_GPT51_REASONING_EFFORT_OPTIONS
         if minor is not None and minor >= 2:
@@ -892,7 +1082,7 @@ def llm_mode_kind_for_provider(provider: str, model: str) -> str:
     provider_id = str(provider or "").strip().lower()
     if provider_id in {"codex-cli", "claude-cli"}:
         return "reasoning_effort"
-    if provider_id == "openai" and reasoning_effort_options_for_model(provider, model):
+    if provider_id in {"openai", "kimi"} and reasoning_effort_options_for_model(provider, model):
         return "reasoning_effort"
     return "response_mode"
 
@@ -1070,6 +1260,41 @@ def build_model_catalog(
                 "error": error,
             }
         )
+    providers.insert(
+        0,
+        {
+            "id": "routing-profile",
+            "label": "AoiTalk",
+            "disabled": not bool(
+                _config_get(cfg, "routing_profiles.free-team.enabled", True)
+            ),
+            "selection_kind": "routing_profile",
+            "models": [
+                model_option(
+                    "free-team",
+                    "無料Team",
+                    description="複数の無料API枠・プロモーションクレジット・CLI枠を安全に自動使用します",
+                    selection_kind="routing_profile",
+                    routing_profile_id="free-team",
+                )
+            ],
+            "configured_model": "free-team",
+            "supports_custom_model": False,
+            "capabilities": ProviderCapabilities(
+                supports_stream=True,
+                supports_tools=True,
+                supports_response_format=True,
+                supports_model_pull=False,
+                supports_model_delete=False,
+                supports_extra_body=False,
+            ).to_dict(),
+            "settings": {},
+            "source": "virtual",
+            "refreshed": False,
+            "cached_at": None,
+            "error": None,
+        },
+    )
     return {
         "current": {"provider": current_p, "model": current_m},
         "providers": providers,
@@ -1081,6 +1306,7 @@ def _has_provider_key(cfg: Any, provider: str) -> bool:
         "gemini": ("gemini_api_key", "GEMINI_API_KEY"),
         "openai": ("openai_api_key", "OPENAI_API_KEY"),
         "openrouter": ("openrouter_api_key", "OPENROUTER_API_KEY"),
+        "kimi": ("kimi_api_key", "MOONSHOT_API_KEY"),
     }
     config_key, env_key = key_map.get(provider, ("", ""))
     if not config_key:
@@ -1118,6 +1344,8 @@ def configured_provider_model(
 
 
 def header_engine_label(provider: str, model: str) -> str:
+    if provider == "routing-profile" and model == "free-team":
+        return "無料Team"
     provider_label = LLM_PROVIDER_LABELS.get(provider, provider)
     return f"{provider_label} ({model})" if model else provider_label
 
@@ -1140,7 +1368,7 @@ def build_engine_options(
 
     for provider in catalog["providers"]:
         provider_id = provider["id"]
-        if provider_id in {"openai", "gemini", "openrouter"} and not _has_provider_key(
+        if provider_id in {"openai", "gemini", "openrouter", "kimi"} and not _has_provider_key(
             cfg,
             provider_id,
         ):

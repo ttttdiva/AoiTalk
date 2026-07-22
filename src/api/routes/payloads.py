@@ -42,6 +42,7 @@ class ConversationDispatchRequest(BaseModel):
     response_model: Optional[ResponseModelSelection] = None
     client_message_id: Optional[str] = None
     command_capabilities: Optional[List[str]] = None
+    tools_required: Optional[bool] = None
     skip_user_persistence: bool = False
     persisted_user_message_id: Optional[str] = None
     attachments: Optional[List[Dict[str, Any]]] = None

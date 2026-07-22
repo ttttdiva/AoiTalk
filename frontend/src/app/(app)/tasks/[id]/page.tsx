@@ -19,6 +19,12 @@ import {
   SelectTrigger,
 } from "@/components/ui/select";
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { TaskStatusMenuItems } from "@/components/tasks/task-status-menu-items";
+import {
   ArrowLeft,
   Play,
   Square,
@@ -26,6 +32,7 @@ import {
   Send,
   Trash2,
   Repeat,
+  ChevronDown,
 } from "lucide-react";
 import { taskApi, type Task } from "@/lib/task-api";
 import {
@@ -409,11 +416,8 @@ export default function TaskDetailPage() {
         {/* ステータス */}
         <div className="space-y-2">
           <Label>ステータス</Label>
-          <Select
-            value={task.status}
-            onValueChange={(v) => v && immediateUpdate({ status: v })}
-          >
-            <SelectTrigger className="w-full">
+          <DropdownMenu>
+            <DropdownMenuTrigger className="flex h-8 w-full items-center justify-between gap-1.5 rounded-lg border border-input bg-transparent py-2 pr-2 pl-2.5 text-sm outline-none transition-colors hover:bg-accent focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 data-[state=open]:border-ring dark:bg-input/30 dark:hover:bg-input/50">
               <span>
                 {{
                   open: "未着手",
@@ -423,15 +427,15 @@ export default function TaskDetailPage() {
                   closed: "完了",
                 }[task.status] || task.status}
               </span>
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="open">未着手</SelectItem>
-              <SelectItem value="in_progress">進行中</SelectItem>
-              <SelectItem value="on_hold">保留</SelectItem>
-              <SelectItem value="review">確認待ち</SelectItem>
-              <SelectItem value="closed">完了</SelectItem>
-            </SelectContent>
-          </Select>
+              <ChevronDown className="size-4 text-muted-foreground" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="min-w-40">
+              <TaskStatusMenuItems
+                currentStatus={task.status}
+                onSelect={(status) => void immediateUpdate({ status })}
+              />
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
 
         {/* 優先度 */}

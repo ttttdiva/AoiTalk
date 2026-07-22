@@ -5,10 +5,13 @@
 
 import "server-only";
 import {
+  datasetInfo,
   whoAmI,
   listModels,
   listDatasets,
   listFiles,
+  modelInfo,
+  uploadFile,
 } from "@huggingface/hub";
 import type { RepoDesignation } from "@huggingface/hub";
 import {
@@ -55,6 +58,11 @@ export interface FileEntry {
   };
 }
 
+export interface DetectedRepo {
+  repoId: string;
+  repoType: RepoType;
+}
+
 export async function verifyToken(accessToken: string): Promise<HfUserInfo> {
   const info = await whoAmI({ accessToken });
   const infoAny = info as unknown as Record<string, unknown>;
@@ -64,6 +72,35 @@ export async function verifyToken(accessToken: string): Promise<HfUserInfo> {
     fullname: String(infoAny.fullname ?? info.name),
     avatarUrl: String(infoAny.avatarUrl ?? ""),
   };
+}
+
+export async function detectRepoTypes(
+  repoId: string,
+  accessToken?: string,
+): Promise<RepoType[]> {
+  const results = await Promise.allSettled([
+    modelInfo({ name: repoId, accessToken }),
+    datasetInfo({ name: repoId, accessToken }),
+  ]);
+  const types: RepoType[] = [];
+  if (results[0].status === "fulfilled") types.push("model");
+  if (results[1].status === "fulfilled") types.push("dataset");
+  return types;
+}
+
+export async function uploadRepoFile(params: {
+  accessToken: string;
+  repoId: string;
+  repoType: RepoType;
+  path: string;
+  file: File;
+}): Promise<void> {
+  await uploadFile({
+    accessToken: params.accessToken,
+    repo: { type: params.repoType, name: params.repoId },
+    file: { path: params.path, content: params.file },
+    commitTitle: `AoiTalkから ${params.path} をアップロード`,
+  });
 }
 
 export async function listUserRepos(

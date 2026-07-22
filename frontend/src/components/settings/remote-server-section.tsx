@@ -1,9 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import useSWR from "swr";
 import {
-  ChevronDown,
-  ChevronUp,
   Loader2,
   Plug,
   Plus,
@@ -11,7 +10,6 @@ import {
   Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
@@ -23,6 +21,9 @@ import {
   testRemoteServer,
   type RemoteServerProfile,
 } from "@/lib/remote-servers";
+import { useUserSettings } from "@/contexts/user-settings-context";
+import { getRemoteServerConnectionEnabled } from "@/lib/user-settings";
+import { SettingsDisclosure } from "@/components/settings/settings-disclosure";
 
 const DEFAULT_COLOR = "#3b82f6";
 
@@ -35,30 +36,70 @@ function statusBadge(status?: string | null) {
 }
 
 export function RemoteServerSection() {
+  const { settings, patch } = useUserSettings();
+  const remoteConnectionEnabled = getRemoteServerConnectionEnabled(settings);
   const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [profiles, setProfiles] = useState<RemoteServerProfile[]>([]);
+  // 接続先一覧（サーバー状態）は SWR で管理。取得タイミングは従来どおり
+  // 呼び出し側（展開/テスト後）で駆動するため自動 revalidation は無効化する。
+  // 取得失敗時は従来同様に直前値を保持する。
+  const profilesRef = useRef<RemoteServerProfile[]>([]);
+  const { data: profiles = [], mutate: mutateProfiles } = useSWR<RemoteServerProfile[]>(
+    "settings/remote-servers",
+    async () => {
+      try {
+        return await listRemoteServers();
+      } catch (error) {
+        toast.error(
+          error instanceof Error ? error.message : "接続先の読み込みに失敗しました",
+        );
+        return profilesRef.current;
+      }
+    },
+    {
+      revalidateOnMount: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+      keepPreviousData: true,
+      dedupingInterval: 0,
+    },
+  );
+  profilesRef.current = profiles;
   const [creating, setCreating] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [savingConnectionSetting, setSavingConnectionSetting] = useState(false);
 
   const [name, setName] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
   const [authToken, setAuthToken] = useState("");
   const [color, setColor] = useState(DEFAULT_COLOR);
 
+  const handleConnectionSettingChange = useCallback(
+    async (checked: boolean) => {
+      setSavingConnectionSetting(true);
+      try {
+        await patch({ remote_server_connection_enabled: checked });
+      } catch (error) {
+        toast.error(
+          error instanceof Error ? error.message : "接続設定の保存に失敗しました",
+        );
+      } finally {
+        setSavingConnectionSetting(false);
+      }
+    },
+    [patch],
+  );
+
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      setProfiles(await listRemoteServers());
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : "接続先の読み込みに失敗しました",
-      );
+      await mutateProfiles();
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [mutateProfiles]);
 
   useEffect(() => {
     if (expanded && profiles.length === 0) void load();
@@ -77,7 +118,8 @@ export function RemoteServerSection() {
         auth_token: authToken.trim() || null,
         display_color: color,
       });
-      setProfiles((prev) => [created, ...prev]);
+      // 楽観的更新：作成成功後は再取得せずローカルキャッシュへ追加する。
+      await mutateProfiles((prev = []) => [created, ...prev], { revalidate: false });
       setName("");
       setBaseUrl("");
       setAuthToken("");
@@ -88,7 +130,7 @@ export function RemoteServerSection() {
     } finally {
       setCreating(false);
     }
-  }, [name, baseUrl, authToken, color]);
+  }, [name, baseUrl, authToken, color, mutateProfiles]);
 
   const handleTest = useCallback(async (id: string) => {
     setTestingId(id);
@@ -116,40 +158,48 @@ export function RemoteServerSection() {
     setDeletingId(id);
     try {
       await deleteRemoteServer(id);
-      setProfiles((prev) => prev.filter((p) => p.id !== id));
+      // 楽観的更新：削除成功後は再取得せずローカルキャッシュから除去する。
+      await mutateProfiles((prev = []) => prev.filter((p) => p.id !== id), {
+        revalidate: false,
+      });
       toast.success("接続先を削除しました");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "削除に失敗しました");
     } finally {
       setDeletingId(null);
     }
-  }, []);
+  }, [mutateProfiles]);
 
   return (
-    <Card size="sm">
-      <CardHeader
-        className="cursor-pointer select-none"
-        onClick={() => setExpanded((v) => !v)}
-      >
-        <CardTitle className="flex items-center justify-between text-sm">
-          <span className="flex items-center gap-2">
-            <Server className="size-4" />
-            外部AoiTalkサーバー接続
-            {profiles.length > 0 ? (
-              <span className="text-xs font-normal text-muted-foreground">
-                {profiles.length} 件
-              </span>
-            ) : null}
+    <SettingsDisclosure
+      title="外部AoiTalkサーバー接続"
+      icon={<Server className="size-4" />}
+      summary={
+        profiles.length > 0 ? (
+          <span className="text-xs font-normal text-muted-foreground">
+            {profiles.length} 件
           </span>
-          {expanded ? (
-            <ChevronUp className="size-4" />
-          ) : (
-            <ChevronDown className="size-4" />
-          )}
-        </CardTitle>
-      </CardHeader>
-      {expanded && (
-        <CardContent className="space-y-4">
+        ) : undefined
+      }
+      onOpenChange={setExpanded}
+      contentClassName="space-y-4"
+    >
+        <label className="flex cursor-pointer items-start gap-3 rounded-md border p-3">
+          <input
+            type="checkbox"
+            className="mt-0.5 size-4 accent-primary"
+            checked={remoteConnectionEnabled}
+            onChange={(event) => void handleConnectionSettingChange(event.target.checked)}
+            disabled={savingConnectionSetting}
+          />
+          <span className="space-y-1">
+            <span className="block text-sm font-medium">Enterpriseサーバーへの自動接続</span>
+            <span className="block text-xs text-muted-foreground">
+              ONのときだけ、登録済みの接続先からSpace・Project・Docsなどを取得します。
+              OFFでも接続先の登録と手動テストは利用できます。
+            </span>
+          </span>
+        </label>
           {loading ? (
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <Loader2 className="size-3 animate-spin" />
@@ -286,8 +336,6 @@ export function RemoteServerSection() {
               </div>
             </>
           )}
-        </CardContent>
-      )}
-    </Card>
+    </SettingsDisclosure>
   );
 }

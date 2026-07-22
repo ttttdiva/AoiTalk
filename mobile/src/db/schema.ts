@@ -13,7 +13,14 @@
  * milestones.
  */
 
-import { sqliteTable, text, integer, real, index } from 'drizzle-orm/sqlite-core';
+import {
+  sqliteTable,
+  text,
+  integer,
+  real,
+  index,
+  primaryKey,
+} from 'drizzle-orm/sqlite-core';
 
 // ---------- users ----------
 export const users = sqliteTable('users', {
@@ -377,6 +384,171 @@ export const scenarioEpisodes = sqliteTable(
   }),
 );
 
+// ---------- Docs（アウトライン型ナレッジ） ----------
+// 詳細設計書 2.1。workspace 単一前提のため workspace 列は保持のみ。
+export const knowledgeNodes = sqliteTable(
+  'knowledge_nodes',
+  {
+    id: text('id').primaryKey(),
+    workspaceId: text('workspace_id'),
+    parentId: text('parent_id'),
+    rootPageId: text('root_page_id'),
+    projectId: text('project_id'),
+    systemKey: text('system_key'),
+    title: text('title').notNull(),
+    aliases: text('aliases', { mode: 'json' }),
+    description: text('description'),
+    bodyJson: text('body_json', { mode: 'json' }),
+    bodyText: text('body_text'),
+    nodeType: text('node_type').notNull().default('node'),
+    displayProps: text('display_props', { mode: 'json' }),
+    queryJson: text('query_json', { mode: 'json' }),
+    viewJson: text('view_json', { mode: 'json' }),
+    dayDate: text('day_date'),
+    sortOrder: real('sort_order'),
+    createdBy: text('created_by'),
+    updatedBy: text('updated_by'),
+    createdAt: text('created_at'),
+    updatedAt: text('updated_at'),
+    serverUpdatedAt: text('server_updated_at'),
+    dirty: integer('dirty', { mode: 'boolean' }).notNull().default(false),
+    conflictPayload: text('conflict_payload', { mode: 'json' }),
+    archivedAt: text('archived_at'),
+  },
+  (t) => ({
+    byParent: index('idx_knodes_parent').on(t.parentId, t.sortOrder),
+    byRoot: index('idx_knodes_root').on(t.rootPageId),
+    byUpdatedAt: index('idx_knodes_updated_at').on(t.updatedAt),
+    byDay: index('idx_knodes_day').on(t.dayDate),
+  }),
+);
+
+export const knowledgeSupertags = sqliteTable('knowledge_supertags', {
+  id: text('id').primaryKey(),
+  workspaceId: text('workspace_id'),
+  parentSupertagId: text('parent_supertag_id'),
+  systemKey: text('system_key'),
+  name: text('name').notNull(),
+  baseType: text('base_type'),
+  description: text('description'),
+  icon: text('icon'),
+  color: text('color'),
+  templateJson: text('template_json', { mode: 'json' }),
+  pinnedFieldIds: text('pinned_field_ids', { mode: 'json' }),
+  configJson: text('config_json', { mode: 'json' }),
+  titleTemplate: text('title_template'),
+  aiInstructions: text('ai_instructions'),
+  createdAt: text('created_at'),
+  updatedAt: text('updated_at'),
+  serverUpdatedAt: text('server_updated_at'),
+  dirty: integer('dirty', { mode: 'boolean' }).notNull().default(false),
+  conflictPayload: text('conflict_payload', { mode: 'json' }),
+});
+
+export const knowledgeNodeSupertags = sqliteTable(
+  'knowledge_node_supertags',
+  {
+    nodeId: text('node_id').notNull(),
+    supertagId: text('supertag_id').notNull(),
+    createdAt: text('created_at'),
+    updatedAt: text('updated_at'),
+    serverUpdatedAt: text('server_updated_at'),
+    dirty: integer('dirty', { mode: 'boolean' }).notNull().default(false),
+    conflictPayload: text('conflict_payload', { mode: 'json' }),
+    createdBy: text('created_by'),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.nodeId, t.supertagId] }),
+    byNode: index('idx_knst_node').on(t.nodeId),
+  }),
+);
+
+export const knowledgeFields = sqliteTable(
+  'knowledge_fields',
+  {
+    id: text('id').primaryKey(),
+    workspaceId: text('workspace_id'),
+    supertagId: text('supertag_id'),
+    systemKey: text('system_key'),
+    name: text('name').notNull(),
+    fieldType: text('field_type').notNull().default('text'),
+    required: integer('required', { mode: 'boolean' }),
+    optionsJson: text('options_json', { mode: 'json' }),
+    defaultValueJson: text('default_value_json', { mode: 'json' }),
+    sortOrder: real('sort_order'),
+    createdAt: text('created_at'),
+    updatedAt: text('updated_at'),
+  },
+  (t) => ({ bySupertag: index('idx_kfields_supertag').on(t.supertagId) }),
+);
+
+export const knowledgeSupertagFields = sqliteTable(
+  'knowledge_supertag_fields',
+  {
+    supertagId: text('supertag_id').notNull(),
+    fieldId: text('field_id').notNull(),
+    sortOrder: real('sort_order'),
+    required: integer('required', { mode: 'boolean' }),
+    showInTemplate: integer('show_in_template', { mode: 'boolean' }),
+    optional: integer('optional', { mode: 'boolean' }),
+    createdAt: text('created_at'),
+  },
+  (t) => ({ pk: primaryKey({ columns: [t.supertagId, t.fieldId] }) }),
+);
+
+export const knowledgeFieldValues = sqliteTable(
+  'knowledge_field_values',
+  {
+    nodeId: text('node_id').notNull(),
+    fieldId: text('field_id').notNull(),
+    valueJson: text('value_json', { mode: 'json' }),
+    valueText: text('value_text'),
+    valueNumber: real('value_number'),
+    valueDatetime: text('value_datetime'),
+    targetNodeId: text('target_node_id'),
+    updatedAt: text('updated_at'),
+    serverUpdatedAt: text('server_updated_at'),
+    dirty: integer('dirty', { mode: 'boolean' }).notNull().default(false),
+    conflictPayload: text('conflict_payload', { mode: 'json' }),
+    updatedBy: text('updated_by'),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.nodeId, t.fieldId] }),
+    byNode: index('idx_kfv_node').on(t.nodeId),
+  }),
+);
+
+export const knowledgeNodePlacements = sqliteTable(
+  'knowledge_node_placements',
+  {
+    id: text('id').primaryKey(),
+    nodeId: text('node_id').notNull(),
+    parentNodeId: text('parent_node_id').notNull(),
+    sortOrder: real('sort_order'),
+    collapsed: integer('collapsed', { mode: 'boolean' }),
+    createdBy: text('created_by'),
+    createdAt: text('created_at'),
+  },
+  (t) => ({ byParent: index('idx_knp_parent').on(t.parentNodeId) }),
+);
+
+export const knowledgeEdges = sqliteTable(
+  'knowledge_edges',
+  {
+    id: text('id').primaryKey(),
+    sourceNodeId: text('source_node_id').notNull(),
+    targetNodeId: text('target_node_id').notNull(),
+    relationType: text('relation_type'),
+    confidence: real('confidence'),
+    createdBy: text('created_by'),
+    createdAt: text('created_at'),
+  },
+  (t) => ({
+    bySource: index('idx_kedge_source').on(t.sourceNodeId),
+    byTarget: index('idx_kedge_target').on(t.targetNodeId),
+  }),
+);
+
 // ---------- outbox (sync queue) ----------
 export const outbox = sqliteTable(
   'outbox',
@@ -388,6 +560,8 @@ export const outbox = sqliteTable(
     entityId: text('entity_id').notNull(),
     payload: text('payload').notNull(), // JSON string
     baseUpdatedAt: text('base_updated_at'),
+    basePayload: text('base_payload', { mode: 'json' }),
+    conflictPayload: text('conflict_payload', { mode: 'json' }),
     retryCount: integer('retry_count').notNull().default(0),
     lastError: text('last_error'),
   },
@@ -423,3 +597,11 @@ export type ScenarioScene = typeof scenarioScenes.$inferSelect;
 export type ScenarioEpisode = typeof scenarioEpisodes.$inferSelect;
 export type OutboxOp = typeof outbox.$inferSelect;
 export type SyncState = typeof syncState.$inferSelect;
+export type KnowledgeNode = typeof knowledgeNodes.$inferSelect;
+export type KnowledgeSupertag = typeof knowledgeSupertags.$inferSelect;
+export type KnowledgeNodeSupertag = typeof knowledgeNodeSupertags.$inferSelect;
+export type KnowledgeField = typeof knowledgeFields.$inferSelect;
+export type KnowledgeSupertagField = typeof knowledgeSupertagFields.$inferSelect;
+export type KnowledgeFieldValue = typeof knowledgeFieldValues.$inferSelect;
+export type KnowledgeNodePlacement = typeof knowledgeNodePlacements.$inferSelect;
+export type KnowledgeEdge = typeof knowledgeEdges.$inferSelect;

@@ -147,7 +147,7 @@ fi
 . venv/bin/activate
 pip install --upgrade pip
 # Linux では windows extras を除外
-pip install -e ".[audio,test,irodori]"
+pip install -e ".[audio,test,irodori,yomi-linter]"
 pip install --no-deps "dacvae @ git+https://github.com/facebookresearch/dacvae" \
     descript-audiotools argbind julius pystoi torch-stoi flatten-dict \
     markdown2 randomname importlib-resources

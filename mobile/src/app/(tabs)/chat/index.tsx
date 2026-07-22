@@ -14,7 +14,6 @@ import {
   IconButton,
   List,
   Portal,
-  Surface,
   Text,
 } from "react-native-paper";
 import { useRouter, useFocusEffect } from "expo-router";
@@ -23,6 +22,7 @@ import { useProject } from "../../../contexts/ProjectContext";
 import { conversationsRepo } from "../../../repositories";
 import { runSync } from "../../../sync/engine";
 import { getDefaultCharacterName } from "../../../lib/preferences";
+import { ScreenHeader } from "../../../components/screen-header";
 import type { ConversationSession } from "../../../types/api";
 
 export default function ChatListScreen() {
@@ -112,11 +112,7 @@ export default function ChatListScreen() {
 
   return (
     <View style={styles.container}>
-      <Surface style={styles.header} elevation={1}>
-        <Text variant="titleLarge" style={styles.headerTitle}>
-          Chat
-        </Text>
-      </Surface>
+      <ScreenHeader title="Chat" />
 
       <FlatList
         data={sessions}
@@ -180,8 +176,6 @@ export default function ChatListScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b" },
-  header: { padding: 16, paddingTop: 56, backgroundColor: "#1e1e2e" },
-  headerTitle: { color: "#cdd6f4", fontWeight: "bold" },
   listItem: { backgroundColor: "#11111b", paddingVertical: 4 },
   sessionTitle: { color: "#cdd6f4" },
   sessionDesc: { color: "#a6adc8", fontSize: 12 },

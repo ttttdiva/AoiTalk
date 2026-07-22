@@ -22,6 +22,7 @@ from ..chat_attachment_utils import (
 )
 from ..conversation_title_events import maybe_generate_and_broadcast_session_title
 from ...llm.generation_policy import generation_policy_for_profile
+from ...llm.generation_error import empty_response_failure
 from src.tools.keyword.character_manager import get_character_manager
 
 
@@ -71,6 +72,7 @@ class VoiceChatMode(BaseAssistant):
             "codex-cli": ("codex_cli.model",),
             "claude-cli": ("claude_cli.model",),
             "antigravity-cli": ("antigravity_cli.model",),
+            "grok-cli": ("grok_cli.model",),
             "ollama": ("ollama_model", "ollama.model"),
             "sglang": ("sglang_model", "sglang.model"),
             "openai_compatible_local": ("openai_compatible_local.model",),
@@ -155,6 +157,7 @@ class VoiceChatMode(BaseAssistant):
         client_message_id=None,
         include_generation_metrics: bool = False,
         media_recognition_metadata=None,
+        command_capabilities=None,
     ) -> dict:
         metadata = {}
         if llm_client and hasattr(llm_client, "_get_memory_metadata"):
@@ -171,13 +174,18 @@ class VoiceChatMode(BaseAssistant):
                 metadata.update(llm_client.get_generation_metadata() or {})
             except Exception:
                 pass
-        sanitized_attachments = sanitize_chat_attachments(attachments)
+        sanitized_attachments = sanitize_chat_attachments(
+            attachments,
+            include_binary=False,
+        )
         if client_message_id:
             metadata["client_message_id"] = client_message_id
         if sanitized_attachments:
             metadata["attachments"] = sanitized_attachments
         if media_recognition_metadata:
             metadata["media_recognition"] = list(media_recognition_metadata)
+        if command_capabilities:
+            metadata["command_capabilities"] = list(command_capabilities)
         if image_data:
             image_items = []
             if isinstance(image_data, dict) and isinstance(image_data.get("images"), list):
@@ -733,6 +741,7 @@ class VoiceChatMode(BaseAssistant):
     async def _process_user_message_web(
         self,
         message: str,
+        persist_content=None,
         image_data=None,
         session_id=None,
         project_id=None,
@@ -756,12 +765,15 @@ class VoiceChatMode(BaseAssistant):
         media_recognition_metadata=None,
     ):
         """Process user message from web interface
-        
+
         Args:
-            message: User's message text
-            image_data: Optional image data dict with 'data', 'mimeType', 'name' keys  
+            message: User's message text（LLM へ渡す展開済み本文）
+            persist_content: DB へ保存する生入力。未指定時は message を使う。
+            image_data: Optional image data dict with 'data', 'mimeType', 'name' keys
             session_id: Optional conversation session ID from frontend
         """
+        if persist_content is None:
+            persist_content = message
         try:
             llm_client = (
                 self.response_handler.llm_client
@@ -779,13 +791,14 @@ class VoiceChatMode(BaseAssistant):
                 try:
                     user_message = await chat_persistence.save_user_message(
                         session_id=session_id,
-                        content=message,
+                        content=persist_content,
                         metadata=self._get_chat_turn_metadata(
                             llm_client,
                             image_data,
                             attachments,
                             client_message_id,
                             media_recognition_metadata=media_recognition_metadata,
+                            command_capabilities=command_capabilities,
                         ),
                         branch_from_message_id=edit_message_id,
                         sender_type="user" if sender_user_id else None,
@@ -981,6 +994,7 @@ class VoiceChatMode(BaseAssistant):
                 if self.response_handler:
                     self.response_handler.llm_client = llm_client
                 turn_user_context_snapshot = None
+                session_character_name = None
                 if llm_client and session_id:
                     exclude_message_id = (
                         str(user_message.id)
@@ -991,6 +1005,60 @@ class VoiceChatMode(BaseAssistant):
                         session_id=session_id,
                         exclude_message_id=exclude_message_id,
                     )
+                    session_character_name = (
+                        await chat_persistence.resolve_session_character_name(session_id)
+                    )
+                    if session_character_name:
+                        current_character_name = str(
+                            getattr(llm_client, "character_name", "") or ""
+                        ).strip()
+                        if current_character_name != session_character_name:
+                            try:
+                                if hasattr(llm_client, "set_character"):
+                                    llm_client.set_character(session_character_name)
+                                elif hasattr(llm_client, "update_character"):
+                                    llm_client.update_character(session_character_name)
+                                else:
+                                    raise RuntimeError(
+                                        "LLMクライアントがキャラクター切替に対応していません"
+                                    )
+                            except Exception as exc:
+                                if self.response_handler:
+                                    self.response_handler.llm_client = (
+                                        original_handler_client
+                                    )
+                                raise RuntimeError(
+                                    "セッションのキャラクターを適用できないため、"
+                                    f"別キャラクターで応答せず処理を中断しました: "
+                                    f"{session_character_name}: {exc}"
+                                )
+                        # LLMだけでなく、応答ハンドラとTTSもセッションの
+                        # キャラクターへ揃える。ここを揃えないと、Bの人格で
+                        # 生成した応答をAの声・設定で読み上げてしまう。
+                        if self.character_name != session_character_name:
+                            try:
+                                self._on_tts_character_switch(
+                                    session_character_name,
+                                    session_character_name,
+                                )
+                            except Exception as exc:
+                                if self.response_handler:
+                                    self.response_handler.llm_client = (
+                                        original_handler_client
+                                    )
+                                raise RuntimeError(
+                                    "セッションの音声キャラクターを適用できないため、"
+                                    f"処理を中断しました: {session_character_name}: {exc}"
+                                )
+                        if self.character_name != session_character_name:
+                            if self.response_handler:
+                                self.response_handler.llm_client = original_handler_client
+                            raise RuntimeError(
+                                "セッションのキャラクター設定が反映されませんでした: "
+                                f"{session_character_name}"
+                            )
+                        if self.response_handler:
+                            self.response_handler.character_name = session_character_name
                     chat_persistence.apply_prompt_history_to_client(
                         llm_client,
                         session_id=session_id,
@@ -1023,6 +1091,26 @@ class VoiceChatMode(BaseAssistant):
                 stream_callback = None
                 steering_callback = None
                 used_streaming = False
+                memory_character_context_token = None
+                if session_id and llm_client:
+                    session_character_for_memory = str(
+                        session_character_name
+                        or getattr(llm_client, "character_name", "")
+                        or ""
+                    ).strip()
+                    if session_character_for_memory:
+                        try:
+                            from ...tools.memory.memory_tools import (
+                                set_current_memory_character_name,
+                            )
+
+                            memory_character_context_token = (
+                                set_current_memory_character_name(
+                                    session_character_for_memory
+                                )
+                            )
+                        except Exception:
+                            memory_character_context_token = None
                 supports_streaming = bool(
                     llm_client and hasattr(llm_client, '_run_streamed_with_callback')
                 )
@@ -1081,6 +1169,17 @@ class VoiceChatMode(BaseAssistant):
                         **generation_kwargs,
                     )
                 finally:
+                    if memory_character_context_token is not None:
+                        try:
+                            from ...tools.memory.memory_tools import (
+                                reset_current_memory_character_name,
+                            )
+
+                            reset_current_memory_character_name(
+                                memory_character_context_token
+                            )
+                        except Exception:
+                            pass
                     if self.response_handler:
                         self.response_handler.llm_client = original_handler_client
                     if llm_client:
@@ -1103,9 +1202,15 @@ class VoiceChatMode(BaseAssistant):
                 if response and self.web_interface and not used_streaming:
                     self.web_interface.add_assistant_message(response, session_id=session_id)
                 elif not response:
-                    failure_reply = (
-                        "応答生成に失敗しました。LLMサーバーまたはモデル設定を確認してください。"
+                    # 失敗理由を分類し、ユーザーには原因と次の行動が分かる文言を返す。
+                    failure = getattr(
+                        self.response_handler, "last_generation_failure", None
+                    ) or empty_response_failure()
+                    print(
+                        f"[VoiceChatMode] 応答生成失敗[{failure.kind}]: "
+                        f"{failure.technical_detail}"
                     )
+                    failure_reply = failure.user_message
                     await persist_assistant_reply(failure_reply)
                     if self.web_interface:
                         self.web_interface.add_assistant_message(

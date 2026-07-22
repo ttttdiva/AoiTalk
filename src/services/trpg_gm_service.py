@@ -23,6 +23,7 @@ from sqlalchemy.orm import selectinload
 
 from ..agents.gm_agent import GMAgent
 from ..memory.database import get_db_session
+from ..utils.uuid_utils import parse_uuid
 from ..models.ecc_models import (
     Scenario,
     ScenarioCharacter,
@@ -69,15 +70,6 @@ def _clip_text(value: Any, limit: int = 220) -> str:
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + "..."
-
-
-def _parse_uuid(value: Any) -> Optional[uuid.UUID]:
-    if value is None:
-        return None
-    try:
-        return uuid.UUID(str(value))
-    except (ValueError, AttributeError):
-        return None
 
 
 def _participants_summary(
@@ -839,7 +831,7 @@ async def generate_current_scene_image(
 ) -> Dict[str, Any]:
     """参加者の要求で、現在の卓状況を画像化してログへ追加する。"""
     room_uid = uuid.UUID(str(room_id))
-    requester_uid = _parse_uuid(participant_id)
+    requester_uid = parse_uuid(participant_id)
     if requester_uid is None:
         raise TRPGPlayError("参加者IDが不正です", status_code=400)
 
@@ -1013,7 +1005,7 @@ async def submit_player_action(
 ) -> Dict[str, Any]:
     """プレイヤーの行動/発言を記録し、続けて GM ナレーションを生成する。"""
     room_uid = uuid.UUID(str(room_id))
-    pid = _parse_uuid(participant_id)
+    pid = parse_uuid(participant_id)
 
     async with await get_db_session() as session:
         play_session = await session.get(ScenarioPlaySession, room_uid)

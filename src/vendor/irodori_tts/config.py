@@ -22,6 +22,7 @@ class ModelConfig:
     text_layers: int = 14
     text_heads: int = 10
     use_caption_condition: bool = False
+    use_speaker_condition: bool | None = None
     caption_vocab_size: int | None = None
     caption_tokenizer_repo: str | None = None
     caption_add_bos: bool | None = None
@@ -36,6 +37,17 @@ class ModelConfig:
     timestep_embed_dim: int = 512
     adaln_rank: int = 256
     norm_eps: float = 1e-5
+    use_duration_predictor: bool = False
+    duration_aux_dim: int = 14
+    duration_hidden_dim: int = 1024
+    duration_layers: int = 3
+    duration_dropout: float = 0.1
+    duration_attention_heads: int = 8
+    duration_architecture: str = "token_sum_adarn_zero_no_aux"
+    duration_token_init_frames: float = 9.0
+    duration_speaker_fusion: str = "adarn_zero"
+    duration_caption_fusion: str = "adarn_zero"
+    duration_caption_pooling: str = "masked_mean"
 
     @property
     def patched_latent_dim(self) -> int:
@@ -46,10 +58,11 @@ class ModelConfig:
         return self.patched_latent_dim * self.speaker_patch_size
 
     @property
-    def use_speaker_condition(self) -> bool:
-        # Voice-design checkpoints are caption-driven and intentionally omit
-        # reference-speaker conditioning to avoid the easier shortcut.
-        return not bool(self.use_caption_condition)
+    def use_speaker_condition_resolved(self) -> bool:
+        # Legacy compatibility: old caption configs implied no speaker branch.
+        if self.use_speaker_condition is None:
+            return not bool(self.use_caption_condition)
+        return bool(self.use_speaker_condition)
 
     @property
     def text_mlp_ratio_resolved(self) -> float:
@@ -116,6 +129,8 @@ class TrainConfig:
     dataloader_prefetch_factor: int = 2
     allow_tf32: bool = False
     compile_model: bool = False
+    gradient_checkpointing: bool = False
+    train_mode: str = "rf"
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     optimizer: str = "muon"
@@ -146,9 +161,18 @@ class TrainConfig:
     text_condition_dropout: float = 0.1
     caption_condition_dropout: float = 0.1
     speaker_condition_dropout: float = 0.1
+    speaker_inversion_enabled: bool = False
+    speaker_inversion_tokens: int = 16
+    speaker_inversion_init_std: float = 0.02
+    speaker_inversion_init_embedding: str | None = None
     max_latent_steps: int = 750
     fixed_target_latent_steps: int | None = 750
     fixed_target_full_mask: bool = True
+    rf_loss_mode: str = "echo"
+    duration_loss_weight: float = 0.1
+    duration_speaker_dropout: float = 0.1
+    duration_caption_dropout: float = 0.1
+    duration_huber_delta: float = 0.1
     timestep_logit_mean: float = 0.0
     timestep_logit_std: float = 1.0
     timestep_stratified: bool = True
@@ -166,6 +190,7 @@ class TrainConfig:
     lora_dropout: float = 0.0
     lora_bias: str = "none"
     lora_target_modules: str = "diffusion_attn"
+    lora_modules_to_save: str | None = "auto"
     seed: int = 0
 
 

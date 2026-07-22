@@ -1,7 +1,7 @@
 """
-CLI-based LLM Client (supports Antigravity CLI, Claude Code, Codex CLI)
+CLI-based LLM Client (supports Antigravity CLI, Claude Code, Codex CLI, Grok Build CLI)
 
-CLI（Antigravity/Claude/Codex）をLLMバックエンドとして使用するクライアント実装。
+CLI（Antigravity/Claude/Codex/Grok Build）をLLMバックエンドとして使用するクライアント実装。
 AgentLLMClientと互換のインターフェースを提供する。
 """
 
@@ -10,6 +10,8 @@ import concurrent.futures
 import inspect
 import logging
 import os
+import time
+import uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union, Generator
 
@@ -23,6 +25,7 @@ from ..services.project_context import (
     set_runtime_project_context,
 )
 from ..services.context_builder import ContextBuilder, ContextBundle
+from .context_snapshot import component, context_bundle_components, reconcile_snapshot, snapshot
 from ..services.scenario_chat_context import (
     build_scenario_chat_context,
     is_scenario_workflow_tool_allowed,
@@ -75,9 +78,21 @@ logger = logging.getLogger(__name__)
 DEFAULT_CLI_TOOL_RESULT_MAX_CHARS = 8000
 
 
+def _truncate_cli_output_to_token_cap(value: str, max_tokens: Optional[int]) -> str:
+    """Tokenizer非依存でtoken上限を超えないUTF-8 byte上限を適用する。"""
+
+    if not max_tokens:
+        return value
+    encoded = str(value or "").encode("utf-8")
+    limit = max(1, int(max_tokens))
+    if len(encoded) <= limit:
+        return str(value or "")
+    return encoded[:limit].decode("utf-8", errors="ignore")
+
+
 class CLILLMClient:
     """
-    CLI-based LLM client (supports Antigravity/Claude/Codex)
+    CLI-based LLM client (supports Antigravity/Claude/Codex/Grok Build)
 
     AgentLLMClientと互換性のあるインターフェースを提供し、
     外部CLIツールを通じて推論・応答生成を行う。
@@ -91,7 +106,7 @@ class CLILLMClient:
         self.character_name = config.default_character
         self.model_name = config.get('llm_model', 'cli')
 
-        # CLI backend (Antigravity/Claude/Codex)
+        # CLI backend (Antigravity/Claude/Codex/Grok Build)
         if cli_backend is None:
             from .cli_backends.antigravity import AntigravityCLIBackend
             self.cli_backend = AntigravityCLIBackend()
@@ -111,6 +126,8 @@ class CLILLMClient:
         self.generation_policy = DEFAULT_GENERATION_POLICY
         self.current_edit_message_id: Optional[str] = None
         self._current_context_bundle: Optional[ContextBundle] = None
+        self._last_context_snapshots: list[dict[str, Any]] = []
+        self._last_cli_usage: dict[str, Any] = {}
 
         # History manager (HistoryManager を使用、独自リストではなく)
         self.history_manager = HistoryManager()
@@ -216,6 +233,10 @@ class CLILLMClient:
     def set_character(self, character_name: str):
         self.character_name = character_name
         self.character_config = self.config.get_character_config(character_name)
+        # キャラクター変更後に起動時の古いプロンプトを再利用しない。
+        # _build_system_context は custom_system_prompt を最優先するため、
+        # ここを残すとヘッダーで選択したキャラクターが実生成へ反映されない。
+        self.custom_system_prompt = None
         logger.info(f"[CLILLMClient] Character changed to: {character_name}")
 
     def update_character(self, yaml_filename: str):
@@ -224,6 +245,9 @@ class CLILLMClient:
             if new_config:
                 self.character_name = new_config.get('name', yaml_filename)
                 self.character_config = new_config
+                # update_character はヘッダー切替からも呼ばれるため、
+                # set_character と同じく旧キャラクターのプロンプトを破棄する。
+                self.custom_system_prompt = None
                 self.clear_history()
                 logger.info(f"[CLILLMClient] キャラクター更新: {self.character_name} (会話履歴クリア済み)")
             else:
@@ -254,6 +278,97 @@ class CLILLMClient:
     def get_history(self) -> List[Dict[str, Any]]:
         return self.history_manager.get_all()
 
+    def _execute_prompt_tracked(self, *args: Any, **kwargs: Any):
+        """CLI実行と、その構造化usageの永続化を一体で行う。"""
+        started = time.monotonic()
+        if not hasattr(self, "_last_context_snapshots"):
+            self._last_context_snapshots = []
+        snapshot_components = list(kwargs.pop("_snapshot_components", []) or [])
+        prompt = kwargs.get("prompt", args[0] if args else "")
+        system_context = kwargs.get("system_context", "")
+        mcp_args = kwargs.get("extra_args") or []
+        parts = []
+        rendered_bundle, bundle_parts = context_bundle_components(getattr(self, "_current_context_bundle", None))
+        reduced_system_context = str(system_context)
+        if rendered_bundle:
+            reduced_system_context = reduced_system_context.replace(rendered_bundle, "", 1)
+        for traced in snapshot_components:
+            traced_text = str(traced.pop("_text", "") or "")
+            if traced_text:
+                reduced_system_context = reduced_system_context.replace(traced_text, "", 1)
+        if reduced_system_context.strip():
+            parts.append(component("system_instructions", "System instructions", reduced_system_context, source="CLI system_context"))
+        parts.extend(bundle_parts)
+        parts.extend(snapshot_components)
+        if prompt:
+            parts.append(component("current_user_message", "Current user message", prompt, source="CLI prompt/stdin"))
+        if mcp_args:
+            parts.append(component("cli_tool_descriptions", "CLI tool descriptions", source="CLI MCP arguments", measurement="unavailable", preview=f"MCP設定を渡しました（{len(self._mcp_servers)} server）"))
+        parts.append(component("provider_managed", "Provider-managed context", source=self.cli_backend.get_provider_name(), measurement="unavailable", preview="CLI内部のsystem prompt・組み込みtoolは詳細取得不能"))
+        request_snapshot = snapshot(
+            provider=self.cli_backend.get_provider_name().lower().replace(" ", "-"),
+            model=str(getattr(self.cli_backend, "_model", None) or getattr(self, "model_name", "cli")),
+            components=parts,
+            request_index=len(self._last_context_snapshots),
+            request_kind="cli.execute_prompt",
+        )
+        self._last_context_snapshots.append(request_snapshot)
+        self._last_context_snapshots = self._last_context_snapshots[-8:]
+        success, output = self.cli_backend.execute_prompt(*args, **kwargs)
+        consume_usage = getattr(self.cli_backend, "consume_last_usage", None)
+        usage = consume_usage() if callable(consume_usage) else None
+        self._last_cli_usage = dict(usage or {})
+        if usage:
+            self._last_context_snapshots[-1] = reconcile_snapshot(
+                request_snapshot, usage.get("input_tokens")
+            )
+        if success and usage:
+            try:
+                from ..services.token_tracking_service import get_token_tracking_service
+
+                def _uuid_or_none(value: Any):
+                    try:
+                        return uuid.UUID(str(value)) if value else None
+                    except (TypeError, ValueError, AttributeError):
+                        return None
+
+                async def _record() -> None:
+                    await get_token_tracking_service().record_usage(
+                        provider=self.cli_backend.get_provider_name().lower().replace(" ", "-"),
+                        model=str(getattr(self.cli_backend, "_model", None) or self.model_name),
+                        input_tokens=usage["input_tokens"],
+                        output_tokens=usage["output_tokens"],
+                        cached_tokens=usage.get("cached_tokens", 0),
+                        cache_read_tokens=usage.get(
+                            "cache_read_tokens", usage.get("cached_tokens", 0)
+                        ),
+                        cache_write_tokens=usage.get("cache_write_tokens", 0),
+                        reasoning_tokens=usage.get("reasoning_tokens", 0),
+                        prompt_eval_tokens=usage.get("prompt_eval_tokens", 0),
+                        prompt_eval_ms=usage.get("prompt_eval_ms", 0),
+                        session_id=_uuid_or_none(self.current_session_id),
+                        user_id=self._get_session_user_id(),
+                        project_id=_uuid_or_none(self.current_project_id),
+                        agent_name=self.character_name,
+                        request_type="cli",
+                        latency_ms=int((time.monotonic() - started) * 1000),
+                    )
+
+                self._run_async_in_new_loop(_record())
+            except Exception:
+                logger.warning("[CLILLMClient] CLI usageの保存に失敗しました", exc_info=True)
+        return success, output
+
+    def get_generation_metadata(self) -> Dict[str, Any]:
+        if not self._last_context_snapshots:
+            return {}
+        latest = dict(self._last_context_snapshots[-1])
+        latest["requests"] = [dict(item) for item in self._last_context_snapshots]
+        metadata = {"context_snapshot": latest}
+        if self._last_cli_usage:
+            metadata["cache_usage"] = dict(self._last_cli_usage)
+        return metadata
+
     def check_and_summarize_history(self, history_manager=None) -> None:
         hm = history_manager or self.history_manager
         if len(hm.history) > self._summarize_threshold:
@@ -281,9 +396,12 @@ class CLILLMClient:
                 user_input,
                 image_data=image_data,
                 stream_callback=stream_callback,
+                max_tokens=max_tokens,
             )
         except Exception as e:
             logger.error(f"[CLILLMClient] Error: {e}", exc_info=True)
+            if self.config.get("free_team.propagate_errors", False):
+                raise
             personality = self.character_config.get('personality', {}) if self.character_config else {}
             response = personality.get('fallbackReply', 'エラーが発生しました')
             self._emit_stream_event_sync(
@@ -291,6 +409,8 @@ class CLILLMClient:
                 "stream_end",
                 {"content": response},
             )
+
+        response = _truncate_cli_output_to_token_cap(response, max_tokens)
 
         if stream:
             def response_generator():
@@ -303,8 +423,10 @@ class CLILLMClient:
         user_input: str,
         image_data: Optional[Dict[str, Any]] = None,
         stream_callback: Any = None,
+        max_tokens: Optional[int] = None,
     ) -> str:
         """Core synchronous generation logic"""
+        self._last_context_snapshots = []
         project_token = None
         tool_policy_token = set_current_user_input(user_input)
         generation_policy_token = set_current_generation_policy(
@@ -346,6 +468,11 @@ class CLILLMClient:
 
             # Build system context (instructions + history + tools) separately from user input
             system_context = self._build_system_context(user_input=user_input)
+            if max_tokens:
+                system_context = (
+                    f"{system_context}\n\n"
+                    f"Keep the final response within {max(1, int(max_tokens))} tokens."
+                )
             project_context_read_block = self._run_project_context_read_before_cli(
                 user_input,
                 event_callback=event_callback,
@@ -362,6 +489,18 @@ class CLILLMClient:
                 prompt,
                 tool_hint_context,
             )
+            snapshot_components = []
+            get_all_history = getattr(self.history_manager, "get_all", None)
+            history = get_all_history() if callable(get_all_history) else list(getattr(self.history_manager, "history", []) or [])
+            if history:
+                history_text = "\n".join(str(item.get("content") or "") for item in history)
+                snapshot_components.append({**component("conversation_history", "Conversation history", history_text, source="CLI history manager"), "_text": history_text})
+            if project_context_read_block:
+                snapshot_components.append({**component("project_context", "Project context", project_context_read_block, source="CLI project pre-read"), "_text": project_context_read_block})
+            if tool_hint_context:
+                snapshot_components.append({**component("tool_hints", "Tool hints", tool_hint_context, source="CLI tool hint context"), "_text": tool_hint_context})
+            if image_data:
+                snapshot_components.append(component("attachments", "添付ファイル・画像由来の入力", source="CLI image attachment", measurement="unavailable", preview="画像入力（バイナリ・パスは保存しません）"))
 
             # MCP args (CLI-native delegation)
             mcp_args = self.cli_backend.get_mcp_args(self._mcp_servers) if self._mcp_servers else None
@@ -381,12 +520,19 @@ class CLILLMClient:
             )
 
             # Execute via CLI: system_context → stdin, prompt → -p
-            success, cli_output = self.cli_backend.execute_prompt(
+            if max_tokens:
+                system_context = (
+                    f"{system_context}\n\n# Strict final response budget\n"
+                    f"The final response must not exceed {max(1, int(max_tokens))} "
+                    "UTF-8 bytes. Keep the answer concise and stop before this limit."
+                )
+            success, cli_output = self._execute_prompt_tracked(
                 prompt=prompt,
                 cwd=Path.cwd(),
                 extra_args=mcp_args,
                 system_context=system_context,
                 event_callback=event_callback,
+                _snapshot_components=snapshot_components,
             )
 
             if not success:
@@ -401,6 +547,8 @@ class CLILLMClient:
                         "error": str(cli_output or ""),
                     },
                 )
+                if self.config.get("free_team.propagate_errors", False):
+                    raise RuntimeError(str(cli_output or "CLI execution failed"))
                 return f"エラーが発生しました: {cli_output}"
 
             turn_result = run_cli_tool_call_loop(
@@ -408,7 +556,7 @@ class CLILLMClient:
                 initial_output=cli_output,
                 registry=self._tool_registry,
                 parse_tool_calls=self.cli_backend.parse_tool_calls,
-                execute_follow_up=lambda follow_up: self.cli_backend.execute_prompt(
+                execute_follow_up=lambda follow_up: self._execute_prompt_tracked(
                     follow_up,
                     cwd=Path.cwd(),
                     event_callback=event_callback,
@@ -492,7 +640,7 @@ class CLILLMClient:
         event_callback: Any,
         user_input: str,
     ) -> str:
-        success, cli_output = self.cli_backend.execute_prompt(
+        success, cli_output = self._execute_prompt_tracked(
             prompt=prompt,
             cwd=Path.cwd(),
             system_context=system_context,
@@ -507,7 +655,7 @@ class CLILLMClient:
             initial_output=cli_output,
             registry=self._tool_registry,
             parse_tool_calls=self.cli_backend.parse_tool_calls,
-            execute_follow_up=lambda follow_up: self.cli_backend.execute_prompt(
+            execute_follow_up=lambda follow_up: self._execute_prompt_tracked(
                 follow_up,
                 cwd=Path.cwd(),
                 event_callback=event_callback,

@@ -13,10 +13,15 @@ ALLOWED_ATTACHMENT_KEYS = {
     "mime_type",
     "upload_failed",
     "error",
+    "data_url",
 }
 
 
-def sanitize_chat_attachments(attachments: Any) -> List[Dict[str, Any]]:
+def sanitize_chat_attachments(
+    attachments: Any,
+    *,
+    include_binary: bool = True,
+) -> List[Dict[str, Any]]:
     if not isinstance(attachments, list):
         return []
 
@@ -30,6 +35,8 @@ def sanitize_chat_attachments(attachments: Any) -> List[Dict[str, Any]]:
 
         clean: Dict[str, Any] = {"name": name}
         for key in ALLOWED_ATTACHMENT_KEYS - {"name"}:
+            if key == "data_url" and not include_binary:
+                continue
             if key not in item:
                 continue
             value = item.get(key)

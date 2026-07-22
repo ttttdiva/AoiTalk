@@ -14,13 +14,22 @@ export type SyncTable =
   | 'scenarios'
   | 'scenario_characters'
   | 'scenario_scenes'
-  | 'scenario_episodes';
+  | 'scenario_episodes'
+  | 'knowledge_nodes'
+  | 'knowledge_supertags'
+  | 'knowledge_node_supertags'
+  | 'knowledge_supertag_fields'
+  | 'knowledge_fields'
+  | 'knowledge_field_values'
+  | 'knowledge_node_placements'
+  | 'knowledge_edges';
 
 export interface SyncTablePayload<T = Record<string, unknown>> {
   changes: T[];
   tombstones: Array<{ id: string; deleted_at?: string | null }>;
   cursor?: string | null;
   authoritative_ids?: string[];
+  authoritative_scope_id?: string;
 }
 
 export interface SyncPullResponse {

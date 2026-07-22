@@ -14,6 +14,10 @@ import {
 import { Folder, Film, Music, FileIcon, Play, Table2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { isRecordTableFile } from "@/lib/record-tables-api";
+import {
+  sortExplorerDirectories,
+  sortExplorerFiles,
+} from "@/lib/explorer-sort";
 
 // ファイルタイプ判定
 const IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "svg", "bmp"];
@@ -249,10 +253,14 @@ export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
     navigate,
     selectedItems,
     focusedItemPath,
+    clipboard,
     selectItem,
     toggleSelect,
     selectRange,
     refresh,
+    sortKey,
+    sortDir,
+    isHydrusMode,
   } = useExplorer();
   const containerRef = useRef<HTMLDivElement>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
@@ -374,9 +382,18 @@ export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
   const gridTemplate = `repeat(auto-fill, minmax(min(${cellWidth}px, calc((100% - ${(minColumns - 1) * 4}px) / ${minColumns})), 1fr))`;
 
   if (!browseData) return null;
+
+  // Hydrus は検索時に Hydrus 側で全件ソート済みのため、1ページ分だけを
+  // フロント側で並べ替えると全体の順序が壊れる。API 応答順のまま描画する。
+  const sortedDirs = isHydrusMode
+    ? browseData.directories
+    : sortExplorerDirectories(browseData.directories, sortKey, sortDir);
+  const sortedFiles = isHydrusMode
+    ? browseData.files
+    : sortExplorerFiles(browseData.files, sortKey, sortDir);
   const orderedPaths = [
-    ...browseData.directories.map((dir) => dir.path),
-    ...browseData.files.map((file) => file.path),
+    ...sortedDirs.map((dir) => dir.path),
+    ...sortedFiles.map((file) => file.path),
   ];
 
   return (
@@ -395,15 +412,18 @@ export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
         }}
       >
         {/* フォルダ */}
-        {browseData.directories.map((dir) => (
+        {sortedDirs.map((dir) => (
           <div
             key={dir.path}
             data-explorer-item-path={dir.path}
             draggable
             className={cn(
-              "flex cursor-pointer flex-col items-center gap-1 rounded-lg p-2 text-center hover:bg-muted",
+              "flex cursor-pointer flex-col items-center gap-1 rounded-lg p-2 text-center transition-opacity hover:bg-muted",
               selectedItems.has(dir.path) && "bg-accent",
               focusedItemPath === dir.path && "ring-2 ring-primary/45",
+              clipboard?.operation === "cut" &&
+                clipboard.paths.includes(dir.path) &&
+                "opacity-50",
               dropTarget === dir.path && "ring-2 ring-blue-400 bg-blue-500/10",
             )}
             onClick={(e) => handleClick(e, dir)}
@@ -451,15 +471,18 @@ export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
         ))}
 
         {/* ファイル */}
-        {browseData.files.map((file) => (
+        {sortedFiles.map((file) => (
           <div
             key={file.path}
             data-explorer-item-path={file.path}
             draggable={!isRecordTableFile(file)}
             className={cn(
-              "flex cursor-pointer flex-col items-center gap-1 rounded-lg p-2 text-center hover:bg-muted",
+              "flex cursor-pointer flex-col items-center gap-1 rounded-lg p-2 text-center transition-opacity hover:bg-muted",
               selectedItems.has(file.path) && "bg-accent",
               focusedItemPath === file.path && "ring-2 ring-primary/45",
+              clipboard?.operation === "cut" &&
+                clipboard.paths.includes(file.path) &&
+                "opacity-50",
             )}
             onClick={(e) => handleClick(e, file)}
             onDoubleClick={() => handleDoubleClick(file, false)}

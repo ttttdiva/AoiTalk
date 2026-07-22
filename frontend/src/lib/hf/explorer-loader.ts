@@ -28,6 +28,11 @@ interface AccountsResp {
     label: string;
     source: string;
   }>;
+  references?: Array<{
+    repoId: string;
+    repoType: "model" | "dataset";
+    accountId?: string;
+  }>;
 }
 
 interface ReposResp {
@@ -76,6 +81,7 @@ export async function hfExplorerList(
 async function loadRoot(): Promise<ExplorerListResponse> {
   const accResp = await jsonFetch<AccountsResp>("/api/huggingface/accounts");
   const accounts = accResp.accounts ?? [];
+  const references = accResp.references ?? [];
 
   const results = await Promise.all(
     accounts.map(async (a) => {
@@ -108,6 +114,30 @@ async function loadRoot(): Promise<ExplorerListResponse> {
       };
     }),
   );
+
+  const seen = new Set(
+    directories.map((directory) => {
+      const parsed = parseHfPath(directory.path);
+      return `${parsed?.repoType}:${parsed?.repoId?.toLowerCase()}`;
+    }),
+  );
+  for (const reference of references) {
+    const key = `${reference.repoType}:${reference.repoId.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    directories.push({
+      name: `${reference.repoId}${reference.repoType === "dataset" ? " (dataset)" : ""}`,
+      path: buildHfPath({
+        kind: "repo",
+        accountId: reference.accountId,
+        repoType: reference.repoType,
+        repoId: reference.repoId,
+        subPath: "",
+      }),
+      item_count: undefined,
+      modified_at: undefined,
+    });
+  }
 
   directories.sort((a, b) => {
     const ta = a.modified_at ? new Date(a.modified_at).getTime() : 0;

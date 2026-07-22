@@ -9,6 +9,7 @@ import {
   useRef,
   useMemo,
 } from "react";
+import useSWR from "swr";
 import {
   explorerList,
   explorerBookmarks,
@@ -18,10 +19,7 @@ import {
   type ExplorerBookmark,
   type StorageContext,
 } from "@/lib/explorer-api";
-import {
-  listProjectRecordTables,
-  recordTableToExplorerFile,
-} from "@/lib/record-tables-api";
+import { listRemoteWorkspaceFiles } from "@/lib/remote-servers";
 import { useProject } from "@/contexts/project-context";
 import { hfExplorerList } from "@/lib/hf/explorer-loader";
 import { HF_PREFIX, isHfPath, parseHfPath } from "@/lib/hf/virtual-path";
@@ -31,6 +29,14 @@ import {
   type CreatorMapping,
 } from "@/lib/hf/creator-mapping";
 import { buildExplorerRangeSelection } from "@/lib/explorer-selection";
+import {
+  DEFAULT_SORT_DIR,
+  DEFAULT_SORT_KEY,
+  isSortDir,
+  isSortKey,
+  type SortDir,
+  type SortKey,
+} from "@/lib/explorer-sort";
 
 export type ViewMode = "grid" | "list";
 export type FilerTab = "workspace" | "user" | "hf" | "hydrus";
@@ -58,6 +64,11 @@ interface ExplorerContextType {
   // View
   viewMode: ViewMode;
   setViewMode: (mode: ViewMode) => void;
+
+  // Sort（FileGrid / FileList / F8・F9 ショートカットで共有）
+  sortKey: SortKey;
+  sortDir: SortDir;
+  setSort: (key: SortKey, dir: SortDir) => void;
 
   // Selection
   selectedItems: Set<string>;
@@ -103,8 +114,16 @@ interface ExplorerContextType {
 
 const ExplorerContext = createContext<ExplorerContextType | null>(null);
 const EXPLORER_VIEW_MODE_STORAGE_KEY = "explorer-view-mode";
+const EXPLORER_SORT_KEY_STORAGE_KEY = "explorer-sort-key";
+const EXPLORER_SORT_DIR_STORAGE_KEY = "explorer-sort-dir";
 const FILER_TAB_STORAGE_KEY = "filer-tab";
 const FILER_PATH_STORAGE_PREFIX = "filer-last-path";
+
+// ブックマーク一覧の SWR キャッシュキー。ファイラー全体で一意なので固定文字列を使う。
+// 取得タイミングは従来どおり呼び出し側の refreshBookmarks（= 手動 revalidate）で駆動し、
+// SWR の自動 revalidation は全て無効化して表示挙動を不変に保つ。
+const BOOKMARKS_SWR_KEY = "explorer/bookmarks";
+const EMPTY_BOOKMARKS: ExplorerBookmark[] = [];
 
 export function useExplorer() {
   const ctx = useContext(ExplorerContext);
@@ -179,8 +198,18 @@ function userRoot(id: string): string {
   return `_users/user_${id}`;
 }
 
+function remoteWorkspacePath(profileId: string, projectId: string, path = ""): string {
+  const cleanPath = path.replace(/^\/+|\/+$/g, "");
+  return `remote://${profileId}/${projectId}${cleanPath ? `/${cleanPath}` : ""}`;
+}
+
+function remoteWorkspaceRelativePath(path: string): string {
+  const parts = path.replace(/^remote:\/\//, "").split("/");
+  return parts.slice(2).join("/");
+}
+
 export function ExplorerProvider({ children }: { children: React.ReactNode }) {
-  const { selectedProjectId } = useProject();
+  const { selectedProjectId, selectedProject } = useProject();
 
   const [currentPath, setCurrentPath] = useState("");
   const [browseDataState, setBrowseDataState] =
@@ -192,12 +221,13 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [viewMode, setViewModeState] = useState<ViewMode>("grid");
+  const [sortKey, setSortKeyState] = useState<SortKey>(DEFAULT_SORT_KEY);
+  const [sortDir, setSortDirState] = useState<SortDir>(DEFAULT_SORT_DIR);
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
   const [focusedItemPath, setFocusedItemPath] = useState<string | null>(null);
   const selectionAnchorPathRef = useRef<string | null>(null);
   const previousShiftRangeRef = useRef<Set<string>>(new Set());
   const [clipboard, setClipboard] = useState<ClipboardState | null>(null);
-  const [bookmarks, setBookmarks] = useState<ExplorerBookmark[]>([]);
   const [storageCtx, setStorageCtx] = useState<StorageContext | null>(null);
   const [storageCtxList, setStorageCtxList] = useState<StorageContext[]>([]);
   const [isAdmin, setIsAdmin] = useState(false);
@@ -222,11 +252,22 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       activeFilerTabRef.current = savedTab;
       setFilerTabState(savedTab);
     }
+    const savedSortKey = readLocalStorage(EXPLORER_SORT_KEY_STORAGE_KEY);
+    if (isSortKey(savedSortKey)) setSortKeyState(savedSortKey);
+    const savedSortDir = readLocalStorage(EXPLORER_SORT_DIR_STORAGE_KEY);
+    if (isSortDir(savedSortDir)) setSortDirState(savedSortDir);
   }, []);
 
   const setViewMode = useCallback((mode: ViewMode) => {
     setViewModeState(mode);
     writeLocalStorage(EXPLORER_VIEW_MODE_STORAGE_KEY, mode);
+  }, []);
+
+  const setSort = useCallback((key: SortKey, dir: SortDir) => {
+    setSortKeyState(key);
+    setSortDirState(dir);
+    writeLocalStorage(EXPLORER_SORT_KEY_STORAGE_KEY, key);
+    writeLocalStorage(EXPLORER_SORT_DIR_STORAGE_KEY, dir);
   }, []);
 
   // HF 検索クエリで絞り込んだ browseData（HFモード時のみフィルタ）
@@ -262,6 +303,12 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   // コンテキストルートパス（タブに応じた基準パス）
   const contextRootPath = useMemo(() => {
     if (isAbsoluteFilerPath) return "";
+    if (filerTab === "workspace" && selectedProject?.source === "remote") {
+      return remoteWorkspacePath(
+        selectedProject.remote_server_id ?? "",
+        selectedProject.resource_id ?? "",
+      );
+    }
     if (filerTab === "workspace" && selectedProjectId) {
       return workspaceRoot(selectedProjectId);
     }
@@ -269,12 +316,18 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       return userRoot(userId);
     }
     return "";
-  }, [filerTab, selectedProjectId, userId, isAbsoluteFilerPath]);
+  }, [filerTab, selectedProject, selectedProjectId, userId, isAbsoluteFilerPath]);
 
   const initialPathForTab = useCallback(
     (tab: FilerTab, uid: string | null = userId): string | null => {
       if (tab === "workspace") {
         if (!selectedProjectId) return null;
+        if (selectedProject?.source === "remote") {
+          return remoteWorkspacePath(
+            selectedProject.remote_server_id ?? "",
+            selectedProject.resource_id ?? "",
+          );
+        }
         return (
           readLastPath(tab, selectedProjectId) ??
           workspaceRoot(selectedProjectId)
@@ -289,7 +342,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       }
       return null;
     },
-    [selectedProjectId, userId],
+    [selectedProject, selectedProjectId, userId],
   );
 
   const rememberCurrentPath = useCallback(
@@ -321,30 +374,6 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   );
 
   // ディレクトリ読み込み（explorer API or filer path API or HF API を自動判定）
-  const attachRecordTables = useCallback(
-    async (data: ExplorerListResponse): Promise<ExplorerListResponse> => {
-      if (
-        !selectedProjectId ||
-        data.current_path !== `_projects/project_${selectedProjectId}`
-      ) {
-        return data;
-      }
-
-      const records = await listProjectRecordTables(selectedProjectId);
-      const recordFiles = records.tables.map((table) =>
-        recordTableToExplorerFile(selectedProjectId, table),
-      );
-
-      return {
-        ...data,
-        files: [...recordFiles, ...data.files],
-        total_items:
-          data.directories.length + recordFiles.length + data.files.length,
-      };
-    },
-    [selectedProjectId],
-  );
-
   const fetchDirectory = useCallback(
     async (path: string) => {
       if (fetchingRef.current) {
@@ -386,7 +415,6 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
                   repoType: parsed.repoType,
                   repoId: parsed.repoId,
                 }).then((m) => {
-                  // 途中で別リポに移っていたら捨てる
                   if (loadedRepoKeyRef.current === key) setHfCreatorMapping(m);
                 });
               }
@@ -395,6 +423,63 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
               setHfCreatorMapping(null);
               setHfSearchQuery("");
             }
+          } else if (
+            targetPath.startsWith("remote://") &&
+            selectedProject?.source === "remote" &&
+            selectedProject.remote_server_id &&
+            selectedProject.resource_id
+          ) {
+            const relativePath = remoteWorkspaceRelativePath(targetPath);
+            const remoteData = await listRemoteWorkspaceFiles(
+              selectedProject.remote_server_id,
+              selectedProject.resource_id,
+              relativePath,
+            );
+            const basePath = (remoteData.current_path ?? relativePath).replace(/^\/+|\/+$/g, "");
+            const data: ExplorerListResponse = {
+              success: remoteData.success !== false,
+              current_path: remoteWorkspacePath(
+                selectedProject.remote_server_id,
+                selectedProject.resource_id,
+                basePath,
+              ),
+              parent_path: remoteData.parent_path
+                ? remoteWorkspacePath(
+                    selectedProject.remote_server_id,
+                    selectedProject.resource_id,
+                    remoteData.parent_path,
+                  )
+                : null,
+              can_go_up: Boolean(remoteData.can_go_up),
+              directories: (remoteData.directories ?? []).map((item) => ({
+                name: String(item.name ?? ""),
+                path: remoteWorkspacePath(
+                  selectedProject.remote_server_id!,
+                  selectedProject.resource_id!,
+                  String(item.path ?? item.name ?? ""),
+                ),
+                item_count: typeof item.item_count === "number" ? item.item_count : undefined,
+                modified_at: typeof item.modified_at === "string" ? item.modified_at : undefined,
+              })),
+              files: (remoteData.files ?? []).map((item) => ({
+                name: String(item.name ?? ""),
+                path: remoteWorkspacePath(
+                  selectedProject.remote_server_id!,
+                  selectedProject.resource_id!,
+                  String(item.path ?? item.name ?? ""),
+                ),
+                type: String(item.type ?? "file"),
+                size: typeof item.size === "number" ? item.size : undefined,
+                modified_at: typeof item.modified_at === "string" ? item.modified_at : undefined,
+              })),
+              total_items: remoteData.total_items ?? 0,
+            };
+            setIsAbsoluteFilerPath(true);
+            setIsHfMode(false);
+            setIsHydrusMode(false);
+            setBrowseDataState(data);
+            setCurrentPath(data.current_path);
+            rememberCurrentPath(data.current_path);
           } else if (useAbsoluteFilerPath && isAdmin) {
             const data = await explorerList(targetPath);
             setIsAbsoluteFilerPath(true);
@@ -411,7 +496,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
             setIsAbsoluteFilerPath(false);
             setIsHfMode(false);
             setIsHydrusMode(false);
-            setBrowseDataState(await attachRecordTables(data));
+            setBrowseDataState(data);
             setCurrentPath(data.current_path);
             rememberCurrentPath(data.current_path);
           }
@@ -429,7 +514,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
         }
       }
     },
-    [attachRecordTables, isAdmin, rememberCurrentPath],
+    [isAdmin, rememberCurrentPath, selectedProject],
   );
 
   const navigate = useCallback(
@@ -556,15 +641,35 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     previousShiftRangeRef.current = new Set();
   }, []);
 
-  // ブックマーク
-  const refreshBookmarks = useCallback(async () => {
+  // ブックマーク（取得・キャッシュ・重複排除を SWR に委譲）。
+  // 取得失敗時は従来同様に空配列扱いにするため、fetcher 内で例外を握りつぶす。
+  const bookmarksFetcher = useCallback(async (): Promise<ExplorerBookmark[]> => {
     try {
       const data = await explorerBookmarks();
-      setBookmarks(data.success ? data.bookmarks : []);
+      return data.success ? data.bookmarks : [];
     } catch {
-      setBookmarks([]);
+      return [];
     }
   }, []);
+
+  const { data: bookmarksData, mutate: mutateBookmarks } = useSWR<
+    ExplorerBookmark[]
+  >(BOOKMARKS_SWR_KEY, bookmarksFetcher, {
+    // 取得タイミングを従来実装（refreshBookmarks 呼び出し）に一致させるため、
+    // SWR の自動 revalidation は全て無効化し、全ての取得を refreshBookmarks 経由にする。
+    revalidateOnMount: false,
+    revalidateOnFocus: false,
+    revalidateOnReconnect: false,
+    revalidateIfStale: false,
+    keepPreviousData: true,
+    dedupingInterval: 0,
+  });
+  const bookmarks = bookmarksData ?? EMPTY_BOOKMARKS;
+
+  // revalidate を実行（従来の refreshBookmarks と同じ呼び出し駆動）。
+  const refreshBookmarks = useCallback(async () => {
+    await mutateBookmarks();
+  }, [mutateBookmarks]);
 
   // タブ切り替え
   const setFilerTab = useCallback(
@@ -584,6 +689,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
         setIsHydrusMode(false);
         fetchDirectory(restorePath);
       } else if (tab === "hf") {
+        setIsHfMode(true);
         setIsHydrusMode(false);
         fetchDirectory(restorePath ?? HF_PREFIX);
       } else if (tab === "hydrus") {
@@ -673,15 +779,21 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   // プロジェクト変更時（初期ロード含む）にワークスペースタブなら自動ナビゲート
   useEffect(() => {
     if (!selectedProjectId) return;
-    if (filerTab === "workspace" && !isAbsoluteFilerPath) {
+    if (filerTab === "workspace") {
       clearNavigationHistory();
       fetchDirectory(
-        readLastPath("workspace", selectedProjectId) ??
-          workspaceRoot(selectedProjectId),
+        selectedProject?.source === "remote"
+          ? readLastPath("workspace", selectedProjectId) ??
+            remoteWorkspacePath(
+              selectedProject.remote_server_id ?? "",
+              selectedProject.resource_id ?? "",
+            )
+          : readLastPath("workspace", selectedProjectId) ??
+            workspaceRoot(selectedProjectId),
       );
     }
     if (!initDoneRef.current) initDoneRef.current = true;
-  }, [selectedProjectId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [selectedProject, selectedProjectId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 初期化
   useEffect(() => {
@@ -745,6 +857,9 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
         error,
         viewMode,
         setViewMode,
+        sortKey,
+        sortDir,
+        setSort,
         selectedItems,
         focusedItemPath,
         selectItem,

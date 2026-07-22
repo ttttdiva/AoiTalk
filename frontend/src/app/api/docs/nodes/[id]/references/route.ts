@@ -156,7 +156,6 @@ export async function GET(
   return NextResponse.json({
     backlinks: Array.from(backlinks.values()).map(serialize),
     referenced_in: Array.from(referencedIn.values()).map(serialize),
-    mentioned_in: Array.from(backlinks.values()).map(serialize),
     field_refs: Array.from(fieldReferences.values()).map(serialize),
     outgoing: Array.from(outgoing.values()).map(serialize),
   });

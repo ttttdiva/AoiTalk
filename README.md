@@ -131,8 +131,6 @@ MCPサーバー設定は `config/config.yaml` の `mcp` セクションで管理
 - `docs/public_publish.md`
 - `docs/enterprise_publish.md`
 - `docs/DISCORD_BOT_SETUP.md`
-- `docs/docker_setup.md`
-- `docs/rag-index-guide.md`
 
 ## License
 

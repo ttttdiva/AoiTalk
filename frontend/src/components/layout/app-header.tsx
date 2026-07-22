@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef } from "react";
+import useSWR from "swr";
 import { usePathname, useRouter } from "next/navigation";
 import Link from "next/link";
 import {
@@ -24,6 +25,8 @@ import { useProject } from "@/contexts/project-context";
 import { useTheme } from "@/contexts/theme-context";
 import { taskApi, type TimeEntry } from "@/lib/task-api";
 import { APP_VIEW_TABS } from "@/lib/app-navigation";
+import { getAppNavigationVisibility } from "@/lib/user-settings";
+import { useUserSettings } from "@/contexts/user-settings-context";
 import { formatTimerClock, getElapsedTimerSeconds } from "@/lib/task-time";
 import { performAdminRestart } from "@/components/layout/global-admin-restart";
 import { SidebarTrigger } from "@/components/ui/sidebar";
@@ -52,6 +55,11 @@ type VoiceStatus = {
   ready: boolean;
   rms: number;
   recording: boolean;
+};
+
+type AuthStatus = {
+  authenticated?: boolean;
+  user?: { role?: string } | null;
 };
 
 type RuntimeFeatures = {
@@ -188,14 +196,40 @@ function usePythonApi() {
 
   const changeCharacter = useCallback(async (name: string) => {
     try {
+      const sessionId =
+        typeof window === "undefined"
+          ? ""
+          : new URLSearchParams(window.location.search).get("s") || "";
+      const query = sessionId
+        ? `?session_id=${encodeURIComponent(sessionId)}`
+        : "";
       const res = await fetch(
-        `/api/python-proxy/character/${encodeURIComponent(name)}`,
+        `/api/python-proxy/character/${encodeURIComponent(name)}${query}`,
         {
           method: "POST",
           credentials: "include",
         },
       );
-      if (res.ok) setCurrentCharacter(name);
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const selectedCharacter =
+          typeof data?.character === "string" && data.character.trim()
+            ? data.character
+            : name;
+        setCurrentCharacter(selectedCharacter);
+        window.dispatchEvent(
+          new CustomEvent("aoi-character-changed", {
+            detail: {
+              characterName: selectedCharacter,
+              characterSlug:
+                typeof data?.character_slug === "string"
+                  ? data.character_slug
+                  : null,
+              sessionId: sessionId || null,
+            },
+          }),
+        );
+      }
     } catch (err) {
       console.error("キャラクター変更失敗:", err);
     }
@@ -396,9 +430,16 @@ function useActiveTimer() {
 }
 
 const selectClassName =
-  "h-7 rounded-lg border border-input bg-white/45 px-2 text-xs text-foreground shadow-[inset_0_1px_rgba(255,255,255,0.65)] outline-none backdrop-blur-xl transition-colors focus-visible:border-ring dark:bg-white/10 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12)]";
+  "h-7 rounded-lg border border-input bg-card px-2 text-xs text-foreground outline-none transition-colors focus-visible:border-ring";
 
 export function AppHeader() {
+  const { settings: userSettings } = useUserSettings();
+  const navigationVisibility = getAppNavigationVisibility(userSettings);
+  const visibleViewTabs = APP_VIEW_TABS.filter((tab) => {
+    if (tab.href === "/scenarios") return navigationVisibility.scenarios;
+    if (tab.href === "/trpg") return navigationVisibility.trpg;
+    return true;
+  });
   const router = useRouter();
   const pathname = usePathname();
   const { resolvedTheme, setTheme } = useTheme();
@@ -423,11 +464,12 @@ export function AppHeader() {
     projects,
     selectedProjectId,
     setSelectedProjectId,
+    remoteErrors,
   } = useProject();
 
-  const [isAdmin, setIsAdmin] = useState(false);
   const [restarting, setRestarting] = useState(false);
   const [avatarSrc, setAvatarSrc] = useState<string>("");
+  const [themeMounted, setThemeMounted] = useState(false);
   const avatarInputRef = useRef<HTMLInputElement>(null);
 
   const tabsScrollRef = useRef<HTMLDivElement>(null);
@@ -447,10 +489,15 @@ export function AppHeader() {
           : discordBotState === "failed"
             ? `Discord Bot: 起動失敗${discordBotService?.last_error ? ` - ${discordBotService.last_error}` : ""}`
             : "Discord Bot/VC";
-  const nextThemeLabel = resolvedTheme === "dark" ? "ライト" : "ダーク";
+  const visibleResolvedTheme = themeMounted ? resolvedTheme : "light";
+  const nextThemeLabel = visibleResolvedTheme === "dark" ? "ライト" : "ダーク";
   const toggleTheme = useCallback(() => {
     setTheme(resolvedTheme === "dark" ? "light" : "dark");
   }, [resolvedTheme, setTheme]);
+
+  useEffect(() => {
+    setThemeMounted(true);
+  }, []);
 
   const updateTabScrollState = useCallback(() => {
     const el = tabsScrollRef.current;
@@ -471,6 +518,15 @@ export function AppHeader() {
       resizeObs.disconnect();
     };
   }, [updateTabScrollState]);
+
+  useEffect(() => {
+    const frameId = requestAnimationFrame(updateTabScrollState);
+    return () => cancelAnimationFrame(frameId);
+  }, [
+    navigationVisibility.scenarios,
+    navigationVisibility.trpg,
+    updateTabScrollState,
+  ]);
 
   useEffect(() => {
     const el = tabsScrollRef.current;
@@ -515,14 +571,19 @@ export function AppHeader() {
     e.target.value = "";
   };
 
-  useEffect(() => {
-    fetch("/api/auth/status", { credentials: "include" })
-      .then((r) => r.json())
-      .then((d) => {
-        if (d.authenticated && d.user?.role === "admin") setIsAdmin(true);
-      })
-      .catch(() => {});
-  }, []);
+  // 認証状態の取得を SWR に委譲（マウント時取得のみ・自動 revalidation なし）。
+  const { data: authStatus } = useSWR<AuthStatus>(
+    "auth/status",
+    async () =>
+      (await fetch("/api/auth/status", { credentials: "include" })).json(),
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      shouldRetryOnError: false,
+    },
+  );
+  const isAdmin =
+    authStatus?.authenticated === true && authStatus.user?.role === "admin";
 
   const handleRestart = async () => {
     setRestarting(true);
@@ -557,7 +618,7 @@ export function AppHeader() {
             tabIndex={canScrollTabsLeft ? 0 : -1}
             aria-label="タブを左にスクロール"
             aria-hidden={!canScrollTabsLeft}
-            className={`shrink-0 rounded-lg p-0.5 text-muted-foreground transition-opacity hover:bg-white/55 hover:text-foreground dark:hover:bg-white/12 ${
+            className={`shrink-0 rounded-lg p-0.5 text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground ${
               canScrollTabsLeft
                 ? "opacity-100"
                 : "pointer-events-none opacity-0"
@@ -569,7 +630,7 @@ export function AppHeader() {
             ref={tabsScrollRef}
             className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto whitespace-nowrap [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           >
-            {APP_VIEW_TABS.map((tab) => {
+            {visibleViewTabs.map((tab) => {
               const isActive = pathname.startsWith(tab.href);
               return (
                 <Link
@@ -578,8 +639,8 @@ export function AppHeader() {
                   data-tab-active={isActive}
                   className={`shrink-0 rounded-xl px-3 py-1.5 text-xs font-semibold transition-all ${
                     isActive
-                      ? "bg-primary text-primary-foreground shadow-[inset_0_1px_rgba(255,255,255,0.28),0_14px_26px_-22px_rgba(0,90,120,0.95)] ring-1 ring-white/55"
-                      : "border border-white/50 bg-white/36 text-muted-foreground shadow-[inset_0_1px_rgba(255,255,255,0.62)] hover:bg-white/66 hover:text-foreground dark:border-white/12 dark:bg-white/8 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12)] dark:hover:bg-white/14"
+                      ? "bg-primary text-primary-foreground"
+                      : "border border-border bg-card text-muted-foreground hover:bg-accent hover:text-foreground"
                   }`}
                 >
                   {tab.title}
@@ -593,7 +654,7 @@ export function AppHeader() {
             tabIndex={canScrollTabsRight ? 0 : -1}
             aria-label="タブを右にスクロール"
             aria-hidden={!canScrollTabsRight}
-            className={`shrink-0 rounded-lg p-0.5 text-muted-foreground transition-opacity hover:bg-white/55 hover:text-foreground dark:hover:bg-white/12 ${
+            className={`shrink-0 rounded-lg p-0.5 text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground ${
               canScrollTabsRight
                 ? "opacity-100"
                 : "pointer-events-none opacity-0"
@@ -619,6 +680,7 @@ export function AppHeader() {
             >
               {spaces.map((s) => (
                 <option key={s.id} value={s.id}>
+                  {s.source === "remote" ? "[EP] " : ""}
                   {s.name}
                 </option>
               ))}
@@ -637,10 +699,16 @@ export function AppHeader() {
             >
               {projects.map((p) => (
                 <option key={p.id} value={p.id}>
+                  {p.source === "remote" ? "[EP] " : ""}
                   {p.name}
                 </option>
               ))}
             </select>
+            {remoteErrors.length > 0 && (
+              <span className="max-w-40 truncate text-[10px] text-amber-600" title={remoteErrors.join("\n")}>
+                Remote接続エラー
+              </span>
+            )}
           </div>
         )}
 
@@ -708,7 +776,7 @@ export function AppHeader() {
                       className={`relative inline-flex size-7 items-center justify-center rounded border text-xs transition-colors ${
                         enabled
                           ? enabledClass
-                          : "border-input bg-white/35 text-muted-foreground backdrop-blur-xl hover:bg-accent/75 hover:text-foreground dark:bg-white/8 dark:hover:bg-white/14"
+                          : "border-input bg-card text-muted-foreground hover:bg-accent hover:text-foreground"
                       }`}
                     >
                       <Icon className="size-3.5" />
@@ -772,7 +840,7 @@ export function AppHeader() {
 
         {/* アクティブタイマー */}
         {activeEntry && (
-          <div className="mr-1 flex shrink-0 items-center gap-1.5 rounded-lg border border-input bg-white/45 px-2 py-1 shadow-[inset_0_1px_rgba(255,255,255,0.68)] backdrop-blur-xl dark:bg-white/10 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12)]">
+          <div className="mr-1 flex shrink-0 items-center gap-1.5 rounded-lg border border-input bg-card px-2 py-1">
             <Timer className="size-3.5 text-yellow-500 animate-pulse" />
             <button
               type="button"
@@ -839,12 +907,12 @@ export function AppHeader() {
 
         <button
           type="button"
-          className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground outline-none transition-colors hover:bg-white/55 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring dark:hover:bg-white/12"
+          className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground outline-none transition-colors hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
           title={`テーマを${nextThemeLabel}に切り替え`}
           aria-label={`テーマを${nextThemeLabel}に切り替え`}
           onClick={toggleTheme}
         >
-          {resolvedTheme === "dark" ? (
+          {visibleResolvedTheme === "dark" ? (
             <Moon className="size-4" />
           ) : (
             <Sun className="size-4" />
@@ -854,7 +922,7 @@ export function AppHeader() {
         <Button
           variant="ghost"
           size="icon"
-          className="hidden md:inline-flex size-7 rounded-full text-muted-foreground hover:bg-white/55 hover:text-foreground dark:hover:bg-white/12"
+          className="hidden md:inline-flex size-7 rounded-full text-muted-foreground hover:bg-accent hover:text-foreground"
           title="ショートカット一覧 (?)"
           onClick={() =>
             window.dispatchEvent(new Event("global-shortcuts-help"))
@@ -865,7 +933,7 @@ export function AppHeader() {
 
         <DropdownMenu>
           <DropdownMenuTrigger className="shrink-0 rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring">
-            <Avatar className="size-7 ring-1 ring-border/70 shadow-[inset_0_1px_rgba(255,255,255,0.7)]">
+            <Avatar className="size-7 ring-1 ring-border">
               {avatarSrc && (
                 <AvatarImage src={avatarSrc} alt="ユーザーアイコン" />
               )}
@@ -873,20 +941,27 @@ export function AppHeader() {
             </Avatar>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
-            <DropdownMenuItem onClick={() => avatarInputRef.current?.click()}>
+            <DropdownMenuItem
+              mnemonic="I"
+              onClick={() => avatarInputRef.current?.click()}
+            >
               <Camera className="mr-2 size-4" />
               アイコン画像を変更
             </DropdownMenuItem>
             <DropdownMenuSeparator />
             {isAdmin && (
-              <DropdownMenuItem onClick={handleRestart} disabled={restarting}>
+              <DropdownMenuItem
+                mnemonic="R"
+                onClick={handleRestart}
+                disabled={restarting}
+              >
                 <RotateCcw
                   className={`mr-2 size-4 ${restarting ? "animate-spin" : ""}`}
                 />
                 {restarting ? "再起動中..." : "再起動"}
               </DropdownMenuItem>
             )}
-            <DropdownMenuItem onClick={handleLogout}>
+            <DropdownMenuItem mnemonic="L" onClick={handleLogout}>
               <LogOut className="mr-2 size-4" />
               ログアウト
             </DropdownMenuItem>
@@ -896,7 +971,7 @@ export function AppHeader() {
 
       {/* 音声ステータス: voice_chatモード時のみヘッダー下にオーバーレイ */}
       {pythonConnected && voiceStatus && voiceStatus.ready && (
-        <div className="absolute left-1/2 top-16 z-50 flex -translate-x-1/2 items-center gap-2 rounded-b-lg border border-t-0 border-border/70 bg-background/82 px-4 py-1.5 shadow-md backdrop-blur-2xl">
+        <div className="absolute left-1/2 top-16 z-50 flex -translate-x-1/2 items-center gap-2 rounded-b-lg border border-t-0 border-border bg-popover px-4 py-1.5 shadow-md">
           <span
             className={`inline-block size-2 rounded-full ${
               voiceStatus.recording

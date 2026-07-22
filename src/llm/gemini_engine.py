@@ -10,7 +10,7 @@ import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold, FunctionDeclaration, Tool
 
 from ..config import Config
-from ..tools.registry import get_registry
+from ..tools.registry import ToolRegistry, get_registry
 from ..tools.adapters import GeminiAdapter
 from ..memory.manager import ConversationMemoryManager
 from ..memory.config import MemoryConfig
@@ -91,7 +91,7 @@ class GeminiLLMClient:
                 memory_config.llm_model = config.get(
                     'llm_model', memory_config.llm_model
                 )
-                memory_config.enable_search = memory_settings.get("enable_search", False)
+                memory_config.enable_search = memory_settings.get("enable_search", True)
                 memory_config.preload_embedding_model = memory_settings.get(
                     "preload_embedding_model", False
                 )
@@ -105,7 +105,7 @@ class GeminiLLMClient:
             self._memory_thread.start()
 
             memory_settings = config.get("memory", {}) if config else {}
-            if memory_settings.get("enable_search", False):
+            if memory_settings.get("enable_search", True):
                 # Pre-warm cross-session memory only when semantic memory search is enabled.
                 asyncio.run_coroutine_threadsafe(
                     self._warmup_cross_session_memory(), self._memory_loop
@@ -126,7 +126,7 @@ class GeminiLLMClient:
         self.tools = self._setup_tools()
         
         # Initialize model with safety settings and tools
-        safety_settings = {
+        self._safety_settings = {
             HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
@@ -135,7 +135,7 @@ class GeminiLLMClient:
         
         self.model = genai.GenerativeModel(
             model_name=model,
-            safety_settings=safety_settings,
+            safety_settings=self._safety_settings,
             tools=self.tools
         )
         
@@ -153,6 +153,17 @@ class GeminiLLMClient:
         print(f"[GeminiLLMClient] Geminiクライアント初期化: {self.character_name}")
         print(f"[GeminiLLMClient] 使用モデル: {model}")
         print(f"[GeminiLLMClient] 利用可能ツール数: {len(self._tool_registry)}")
+
+    def set_tool_registry(self, registry: ToolRegistry) -> None:
+        """専門委譲用に許可済みtoolだけでGemini宣言を再構築する。"""
+
+        self._tool_registry = registry
+        self.tools = self._setup_tools()
+        self.model = genai.GenerativeModel(
+            model_name=self.model_name,
+            safety_settings=self._safety_settings,
+            tools=self.tools,
+        )
     
     def _setup_tools(self) -> List[Tool]:
         """Setup Function Calling tools for Gemini using the unified registry"""
@@ -277,7 +288,6 @@ class GeminiLLMClient:
 
     def _get_memory_metadata(self) -> Dict[str, Any]:
         return self.session_metadata.copy() if self.session_metadata else {}
-        print(f"[GeminiLLMClient] キャラクター変更: {character_name}")
     
     def update_character(self, yaml_filename: str):
         """Update character from YAML file
@@ -816,6 +826,12 @@ class GeminiLLMClient:
                     )
                 except Exception as e:
                     print(f"[GeminiLLMClient] Gemini API呼び出しエラー: {e}")
+                    if self.config.get("free_team.propagate_errors", False):
+                        try:
+                            e.free_team_side_effect_started = tool_call_count > 0
+                        except Exception:
+                            pass
+                        raise
                     # フォールバック応答
                     fallback = self._get_fallback_response()
                     self.conversation_history.append({"role": "user", "content": user_input})
@@ -1052,8 +1068,12 @@ class GeminiLLMClient:
                                 return response_text
                 except Exception as e:
                     print(f"[GeminiLLMClient] 最終応答生成エラー: {e}")
+                    if self.config.get("free_team.propagate_errors", False):
+                        raise
             
             # Fallback if no valid response
+            if self.config.get("free_team.propagate_errors", False):
+                raise RuntimeError("Gemini returned no valid response")
             fallback = self._get_fallback_response()
             self.conversation_history.append({"role": "user", "content": user_input})
             self.conversation_history.append({"role": "assistant", "content": fallback})
@@ -1068,6 +1088,8 @@ class GeminiLLMClient:
             print(f"[GeminiLLMClient] エラー: {e}")
             import traceback
             traceback.print_exc()
+            if self.config.get("free_team.propagate_errors", False):
+                raise
             
             fallback = self._get_fallback_response()
             

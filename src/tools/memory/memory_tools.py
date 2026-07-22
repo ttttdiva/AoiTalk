@@ -1,6 +1,7 @@
 """Memory search tools for function calling."""
 
 import re
+from contextvars import ContextVar
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..core import tool
@@ -10,6 +11,19 @@ from src.services.context_memory_service import _keywords
 
 
 _memory_manager: Optional[ConversationMemoryManager] = None
+_current_character_name: ContextVar[Optional[str]] = ContextVar(
+    "aoi_current_memory_character_name", default=None
+)
+
+
+def set_current_memory_character_name(character_name: Optional[str]):
+    """Bind the session character for memory tools during one generation turn."""
+    return _current_character_name.set(character_name or None)
+
+
+def reset_current_memory_character_name(token) -> None:
+    """Restore the previous session character binding."""
+    _current_character_name.reset(token)
 
 
 def get_memory_manager() -> ConversationMemoryManager:
@@ -191,7 +205,18 @@ async def search_memory(
     user_id: Optional[str] = None,
     character_name: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Search relevant past conversation memory."""
+    """過去会話メモリを検索する読み取り専用ツール。
+
+    現在の会話コンテキストに無い情報（ユーザーの好み・名前・過去の決定・
+    以前の作業内容や約束など）が必要になったら、自分の判断でいつでも呼んでよい。
+    毎ターン自動で添えられる過去会話の抜粋で不足する場合の深掘りにも使う。
+    キーワードが明示されていなくても、必要と判断すれば呼び出してよい。
+
+    Args:
+        query: 検索クエリ（探したい話題・人物・決定事項などを簡潔に）。
+        time_range: 対象期間。"all"（既定）/"today"/"week"/"month" 等。
+        max_results: 返す件数の上限（既定 10）。
+    """
     max_results = int(max_results) if max_results is not None else 5
 
     if not query or not query.strip():
@@ -208,7 +233,26 @@ async def search_memory(
 
     try:
         memory_manager = get_memory_manager()
-        resolved_character_name = character_name or "aoi"
+        resolved_character_name = character_name or _current_character_name.get()
+        if not resolved_character_name:
+            try:
+                from src.tools.keyword.character_manager import get_character_manager
+
+                resolved_character_name = get_character_manager().get_current_character()
+            except Exception:
+                resolved_character_name = None
+        if not resolved_character_name:
+            resolved_character_name = "aoi"
+        if not character_name:
+            try:
+                from src.services.character_service import get_character_for_prompt
+
+                character = await get_character_for_prompt(resolved_character_name)
+                resolved_character_name = str(
+                    (character or {}).get("slug") or resolved_character_name
+                ).strip()
+            except Exception:
+                pass
         searched_sources = ["dreaming_memory", "conversation_memory"]
         source_errors: Dict[str, str] = {}
 

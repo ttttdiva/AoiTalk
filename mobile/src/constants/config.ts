@@ -23,17 +23,38 @@ export const STORAGE_KEYS = {
   SELECTED_PROJECT_ID: "aoitalk_selected_project_id",
   SELECTED_SPACE_ID: "aoitalk_selected_space_id",
   DEFAULT_CHARACTER_NAME: "aoitalk_default_character_name",
+  // メインスロットのプロバイダー選択（"server" | direct各種）。
   CHAT_LLM_PROVIDER: "aoitalk_chat_llm_provider",
+  // メインスロットのモデルID（スロット単位）。
+  CHAT_LLM_MAIN_MODEL: "aoitalk_chat_llm_main_model",
+  // フォールバック設定（独立オブジェクト）。
+  CHAT_LLM_FALLBACK_ENABLED: "aoitalk_chat_llm_fallback_enabled",
   CHAT_LLM_FALLBACK_PROVIDER: "aoitalk_chat_llm_fallback_provider",
+  CHAT_LLM_FALLBACK_MODEL: "aoitalk_chat_llm_fallback_model",
+  // 新設定へ移行済みかどうかのフラグ。
+  CHAT_LLM_SLOT_MIGRATED: "aoitalk_chat_llm_slot_migrated",
+  // プロバイダー別のモデル一覧キャッシュ（AsyncStorage・モデルIDのみ。APIキーは保持しない）。
+  CHAT_LLM_MODEL_CATALOG_CACHE: "aoitalk_chat_llm_model_catalog_cache",
+  // プロバイダー単位の共有プロファイル（APIキー / Base URL）。
+  // モデルはスロット単位へ移行したため、ここではモデルを保持しない。
+  CHAT_LLM_OPENAI_API_KEY: "aoitalk_chat_llm_openai_api_key",
+  CHAT_LLM_OPENAI_BASE_URL: "aoitalk_chat_llm_openai_base_url",
+  CHAT_LLM_GEMINI_API_KEY: "aoitalk_chat_llm_gemini_api_key",
+  CHAT_LLM_GEMINI_BASE_URL: "aoitalk_chat_llm_gemini_base_url",
+  CHAT_LLM_KIMI_API_KEY: "aoitalk_chat_llm_kimi_api_key",
+  CHAT_LLM_KIMI_BASE_URL: "aoitalk_chat_llm_kimi_base_url",
+  CHAT_LLM_OPENROUTER_API_KEY: "aoitalk_chat_llm_openrouter_api_key",
+  CHAT_LLM_OPENROUTER_BASE_URL: "aoitalk_chat_llm_openrouter_base_url",
+  CHAT_LLM_ANTHROPIC_API_KEY: "aoitalk_chat_llm_anthropic_api_key",
+  CHAT_LLM_ANTHROPIC_BASE_URL: "aoitalk_chat_llm_anthropic_base_url",
+  CHAT_LLM_CUSTOM_API_KEY: "aoitalk_chat_llm_custom_api_key",
+  CHAT_LLM_CUSTOM_BASE_URL: "aoitalk_chat_llm_custom_base_url",
+  // --- 以下は移行元として読むだけのレガシーキー（新規書き込みしない） ---
   CHAT_LLM_API_KEY: "aoitalk_chat_llm_api_key",
   CHAT_LLM_MODEL: "aoitalk_chat_llm_model",
   CHAT_LLM_BASE_URL: "aoitalk_chat_llm_base_url",
-  CHAT_LLM_OPENAI_API_KEY: "aoitalk_chat_llm_openai_api_key",
   CHAT_LLM_OPENAI_MODEL: "aoitalk_chat_llm_openai_model",
-  CHAT_LLM_OPENAI_BASE_URL: "aoitalk_chat_llm_openai_base_url",
-  CHAT_LLM_GEMINI_API_KEY: "aoitalk_chat_llm_gemini_api_key",
   CHAT_LLM_GEMINI_MODEL: "aoitalk_chat_llm_gemini_model",
-  CHAT_LLM_GEMINI_BASE_URL: "aoitalk_chat_llm_gemini_base_url",
   CHAT_LLM_OPENAI_COMPATIBLE_API_KEY:
     "aoitalk_chat_llm_openai_compatible_api_key",
   CHAT_LLM_OPENAI_COMPATIBLE_MODEL:
@@ -45,3 +66,5 @@ export const STORAGE_KEYS = {
 
 export const API_TIMEOUT = 10000;
 export const CHAT_TIMEOUT = 30000;
+// プロバイダーAPIからのモデル一覧取得タイムアウト。
+export const MODEL_LIST_TIMEOUT = 8000;

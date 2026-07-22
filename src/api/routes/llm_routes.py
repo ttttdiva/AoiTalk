@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import uuid
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -226,6 +227,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
         command = str(body.get("command") or "continue").strip()[:80]
         prompt = str(body.get("prompt") or "").strip()[:8000]
         node_id = str(body.get("node_id") or "").strip()[:80] or None
+
         llm_client = server._llm_client
         if llm_client is None:
             raise HTTPException(status_code=503, detail="LLM client is not configured")
@@ -300,11 +302,16 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 elif provider == "openai":
                     _apply_config("openai.reasoning_effort", mode)
                     should_recreate_client = True
+                elif provider == "kimi" and mode == "max":
+                    _apply_config("kimi.reasoning_effort", "max")
+                    should_recreate_client = True
                 server._current_llm_mode = mode
             elif server._llm_client and hasattr(server._llm_client, "set_llm_mode"):
                 server._llm_client.set_llm_mode(mode)
                 logger.info(f"LLM mode set to: {mode}")
                 server._current_llm_mode = mode
+
+            server.config.set("llm_runtime_mode", mode)
 
             if should_recreate_client:
                 from ...llm.manager import create_llm_client
@@ -418,6 +425,29 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 raise HTTPException(
                     status_code=400, detail="provider と model は必須です"
                 )
+            if provider == "kimi":
+                supplied_key = str(body.get("api_key") or "").strip()
+                configured_key = str(server.config.get("kimi_api_key", "") or "").strip()
+                if not supplied_key and not configured_key and not os.getenv("MOONSHOT_API_KEY"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Kimi APIキーを設定してください",
+                    )
+            if provider == "routing-profile" and model != "free-team":
+                raise HTTPException(
+                    status_code=400,
+                    detail="未対応のルーティングプロファイルです",
+                )
+            if (
+                provider == "routing-profile"
+                and model == "free-team"
+                and server.config.get("routing_profiles.free-team.enabled", True)
+                is False
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="無料Teamを有効にしてから選択してください",
+                )
 
             previous_provider = str(server.config.get("llm_provider", "") or "")
             previous_model = str(server.config.get("llm_model", "") or "")
@@ -456,6 +486,14 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
             # configを更新して永続化する
             _apply_config("llm_provider", provider)
             _apply_config("llm_model", model)
+            _apply_config(
+                "llm_selection_kind",
+                "routing_profile" if provider == "routing-profile" else "static",
+            )
+            _apply_config(
+                "routing_profile_id",
+                "free-team" if provider == "routing-profile" else "",
+            )
             if provider == "sglang":
                 _apply_config("sglang.model", model)
             elif provider == "ollama":
@@ -470,15 +508,20 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 _apply_config("claude_cli.model", model)
             elif provider == "antigravity-cli":
                 _apply_config("antigravity_cli.model", model)
+            elif provider == "grok-cli":
+                _apply_config("grok_cli.model", model)
             elif provider == "gemini":
                 _apply_config("gemini.model", model)
             elif provider == "openai":
                 _apply_config("openai.model", model)
+            elif provider == "kimi":
+                _apply_config("kimi.model", model)
 
             if isinstance(base_url, str) and base_url.strip():
                 if provider in {
                     "ollama",
                     "openrouter",
+                    "kimi",
                     "openai_compatible_local",
                 }:
                     _apply_config(f"{provider}.base_url", base_url.strip())
@@ -500,6 +543,8 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
             if isinstance(api_key, str) and api_key.strip():
                 if provider == "openrouter":
                     _apply_config("openrouter_api_key", api_key.strip())
+                elif provider == "kimi":
+                    _apply_config("kimi_api_key", api_key.strip())
                 elif provider == "ollama":
                     _apply_config("ollama.api_key", api_key.strip())
                 elif provider == "openai_compatible_local":
@@ -538,6 +583,8 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                     _apply_config("codex_cli.reasoning_effort", effort)
                 elif effort and provider == "claude-cli":
                     _apply_config("claude_cli.reasoning_effort", effort)
+                elif effort and provider == "kimi" and effort == "max":
+                    _apply_config("kimi.reasoning_effort", "max")
 
             if provider == "openai_compatible_local":
                 from src.service_manager import (
@@ -583,6 +630,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
 
             next_mode_state = build_llm_mode_state(server.config, client=new_client)
             server._current_llm_mode = str(next_mode_state.get("mode") or "fast")
+            server.config.set("llm_runtime_mode", server._current_llm_mode)
             if (
                 next_mode_state.get("kind") == "response_mode"
                 and hasattr(new_client, "set_llm_mode")

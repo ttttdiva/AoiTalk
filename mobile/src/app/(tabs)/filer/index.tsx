@@ -27,6 +27,7 @@ import {
   Dialog,
   Divider,
   IconButton,
+  Menu,
   Portal,
   ProgressBar,
   Surface,
@@ -36,6 +37,7 @@ import {
 import { useFocusEffect } from "expo-router";
 import { useAuth } from "../../../contexts/AuthContext";
 import { useProject } from "../../../contexts/ProjectContext";
+import { useProjectStore } from "../../../stores/project";
 import {
   filesApi,
   formatDisplayPath,
@@ -48,10 +50,17 @@ import {
   isTextEntry,
 } from "../../../lib/files-api";
 import {
+  filesLocationCache,
+  filesLocationKey,
+  isFilesLoadCurrent,
+  type FilesLocation,
+} from "../../../lib/files-location-cache";
+import {
   DEFAULT_AUDIO_PLAYER_SETTINGS,
   loadAudioPlayerSettings,
   type AudioPlayerSettings,
 } from "../../../lib/audio-player-settings";
+import { ScreenHeader } from "../../../components/screen-header";
 
 const SOURCE_LABELS: Record<FilesSource, string> = {
   local: "ローカル",
@@ -86,6 +95,11 @@ type ClipboardOperation = "copy" | "move";
 type ClipboardState = {
   operation: ClipboardOperation;
   entry: FilesEntry;
+  source: FilesSource;
+  scope: FilesScope;
+  // サーバー・ワークスペースでコピー／移動対象にした時点のプロジェクトルート。
+  // 別プロジェクトへ切り替えた後の貼り付けを防ぐために保持する。
+  projectRoot: string | null;
 };
 type ViewMode = "grid" | "list";
 type MediaSource = Awaited<ReturnType<typeof filesApi.getMediaSource>>;
@@ -256,6 +270,39 @@ function FileThumbnail({
         </View>
       ) : null}
     </View>
+  );
+}
+
+function FileMetadata({
+  entry,
+  grid = false,
+}: {
+  entry: FilesEntry;
+  grid?: boolean;
+}) {
+  const [size, setSize] = useState(entry.size);
+
+  useEffect(() => {
+    let cancelled = false;
+    setSize(entry.size);
+    if (entry.type === "file") {
+      void filesApi.getMetadata(entry).then((metadata) => {
+        if (!cancelled) setSize(metadata.size);
+      });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [entry]);
+
+  return (
+    <Text style={grid ? styles.gridFileMeta : styles.fileMeta} numberOfLines={1}>
+      {entry.type === "directory"
+        ? "フォルダー"
+        : grid
+          ? formatSize(size)
+          : `${entry.mimeType || "ファイル"}${size ? ` ・ ${formatSize(size)}` : ""}`}
+    </Text>
   );
 }
 
@@ -508,8 +555,20 @@ function FileNameDialog({
 
 export default function FilesScreen() {
   const { isAuthenticated, user } = useAuth();
-  const { selectedProjectId } = useProject();
+  const authScope = isAuthenticated
+    ? `auth:${user?.user_id ?? "unknown"}`
+    : "anonymous";
+  const {
+    projects,
+    selectedProjectId,
+    selectedProject,
+    selectedSpaceId,
+    setSelectedProjectId,
+  } = useProject();
+  const projectsLoaded = useProjectStore((s) => s.loaded);
   const isAdmin = user?.role === "admin";
+
+  const [projectMenuVisible, setProjectMenuVisible] = useState(false);
 
   const [source, setSource] = useState<FilesSource>("local");
   const [scope, setScope] = useState<FilesScope>("workspace");
@@ -565,6 +624,8 @@ export default function FilesScreen() {
   });
   const [audioPlayerSettings, setAudioPlayerSettings] =
     useState<AudioPlayerSettings>(DEFAULT_AUDIO_PLAYER_SETTINGS);
+  const activeRequestKeyRef = useRef<string | null>(null);
+  const displayedRequestKeyRef = useRef<string | null>(null);
 
   const activeKey = locationKey(source, scope);
   const activePath = paths[activeKey];
@@ -572,14 +633,54 @@ export default function FilesScreen() {
   const activeMeta = locationMetas[activeKey];
 
   const getServerRootPath = useCallback(
-    (nextScope: FilesScope) => {
+    (nextScope: FilesScope, projectIdOverride?: string | null) => {
       if (nextScope === "workspace") {
-        if (isAdmin && !selectedProjectId) return "";
-        return selectedProjectId ? `_projects/project_${selectedProjectId}` : "";
+        const projectId =
+          projectIdOverride !== undefined ? projectIdOverride : selectedProjectId;
+        if (isAdmin && !projectId) return "";
+        return projectId ? `_projects/project_${projectId}` : "";
       }
       return user?.user_id ? `_users/user_${user.user_id}` : "";
     },
     [isAdmin, selectedProjectId, user?.user_id],
+  );
+
+  // サーバー・ワークスペースの一覧を実際に取得できるか。
+  // 管理者はプロジェクト未選択でも管理者ルートを開ける。一般ユーザーは
+  // プロジェクトを選択している場合のみ。
+  const isServerWorkspaceListable = useCallback(
+    (projectIdOverride?: string | null) => {
+      const projectId =
+        projectIdOverride !== undefined ? projectIdOverride : selectedProjectId;
+      return isAdmin || Boolean(projectId);
+    },
+    [isAdmin, selectedProjectId],
+  );
+
+  // ソース／スコープの表示自体を開けるか（切替の可否）。
+  // プロジェクト未選択でもサーバー・ワークスペース表示は開けるようにし、
+  // 一覧取得や操作だけを別途無効化する。
+  const canOpenLocation = useCallback(
+    (nextSource: FilesSource) => {
+      if (nextSource === "local") return true;
+      return isAuthenticated;
+    },
+    [isAuthenticated],
+  );
+
+  // 指定パスが選択中プロジェクト（管理者ルート含む）の範囲内かどうか。
+  const isWithinWorkspaceRoot = useCallback(
+    (path: string) => {
+      if (isAdmin && !selectedProjectId) return true;
+      const root = getServerRootPath("workspace");
+      if (!root) return false;
+      const normalized = (path || "")
+        .replace(/\\/g, "/")
+        .replace(/^\/+/, "");
+      const prefix = root.replace(/\/+$/, "");
+      return normalized === prefix || normalized.startsWith(`${prefix}/`);
+    },
+    [getServerRootPath, isAdmin, selectedProjectId],
   );
 
   const setPathForLocation = useCallback(
@@ -590,23 +691,13 @@ export default function FilesScreen() {
     [],
   );
 
-  const canUseLocation = useCallback(
-    (nextSource: FilesSource, nextScope: FilesScope) => {
-      if (nextSource === "local") return true;
-      if (!isAuthenticated) return false;
-      if (isAdmin) return true;
-      return Boolean(getServerRootPath(nextScope));
-    },
-    [getServerRootPath, isAdmin, isAuthenticated],
-  );
-
   const locationUnavailableMessage = useCallback(
     (nextScope: FilesScope) => {
       if (!isAuthenticated) {
         return "サーバーファイルはログイン中のみ利用できます。";
       }
       return nextScope === "workspace"
-        ? "ワークスペースを開くにはプロジェクトを選択してください。"
+        ? "プロジェクトを選択してください。"
         : "ユーザー領域を開けませんでした。";
     },
     [isAuthenticated],
@@ -617,36 +708,106 @@ export default function FilesScreen() {
       nextSource: FilesSource,
       nextScope: FilesScope,
       nextPath?: string,
+      projectIdOverride?: string | null,
+      options: { revalidate?: boolean } = {},
     ) => {
-      setLoading(true);
-      setError(null);
+      const requestKeys: string[] = [];
+      const clearLocation = (message: string | null) => {
+        activeRequestKeyRef.current = null;
+        displayedRequestKeyRef.current = null;
+        setItems([]);
+        setPathForLocation(nextSource, nextScope, "");
+        setLocationMetas((prev) => ({
+          ...prev,
+          [locationKey(nextSource, nextScope)]: {
+            parentPath: null,
+            canGoUp: false,
+            isAdminMode: false,
+          },
+        }));
+        setError(message);
+        setLoading(false);
+      };
       try {
-        if (nextSource === "server" && !canUseLocation(nextSource, nextScope)) {
-          setItems([]);
-          setPathForLocation(nextSource, nextScope, "");
-          setLocationMetas((prev) => ({
-            ...prev,
-            [locationKey(nextSource, nextScope)]: {
-              parentPath: null,
-              canGoUp: false,
-              isAdminMode: false,
-            },
-          }));
-          setError(locationUnavailableMessage(nextScope));
+        if (nextSource === "server" && !isAuthenticated) {
+          clearLocation("サーバーファイルはログイン中のみ利用できます。");
           return;
         }
 
-        const serverRootPath = getServerRootPath(nextScope);
-        const requestPath =
+        // 一般ユーザーがプロジェクト未選択でワークスペースを開いた場合は、
+        // 拒否せずプロジェクト選択を促す空状態を表示する。
+        if (
+          nextSource === "server" &&
+          nextScope === "workspace" &&
+          !isServerWorkspaceListable(projectIdOverride)
+        ) {
+          clearLocation("プロジェクトを選択してください。");
+          return;
+        }
+
+        const serverRootPath = getServerRootPath(nextScope, projectIdOverride);
+        let requestPath =
           nextSource === "server"
             ? (nextPath ?? serverRootPath)
             : nextPath;
 
-        const result = await filesApi.list(
-          nextSource,
-          requestPath || undefined,
-          nextScope,
-        );
+        const projectId =
+          projectIdOverride !== undefined
+            ? projectIdOverride
+            : selectedProjectId;
+        if (
+          nextSource === "server" &&
+          nextScope === "workspace" &&
+          requestPath &&
+          serverRootPath &&
+          requestPath !== serverRootPath &&
+          !requestPath.startsWith(`${serverRootPath.replace(/\/+$/, "")}/`)
+        ) {
+          requestPath = serverRootPath;
+        }
+
+        const location: FilesLocation = {
+          source: nextSource,
+          scope: nextScope,
+          authScope,
+          path: requestPath || undefined,
+          projectId,
+        };
+        const requestKey = filesLocationKey(location);
+        requestKeys.push(requestKey);
+        activeRequestKeyRef.current = requestKey;
+        const cached = filesLocationCache.peek(location);
+        if (cached) {
+          setItems(cached.items);
+          setPathForLocation(nextSource, nextScope, cached.currentPath);
+          setLocationMetas((prev) => ({
+            ...prev,
+            [locationKey(nextSource, nextScope)]: {
+              parentPath: cached.parentPath,
+              canGoUp: cached.canGoUp,
+              isAdminMode: cached.isAdminMode,
+            },
+          }));
+          displayedRequestKeyRef.current = filesLocationKey({
+            ...location,
+            path: cached.currentPath,
+          });
+          setLoading(false);
+          setError(null);
+        } else if (displayedRequestKeyRef.current !== requestKey) {
+          setItems([]);
+          setLoading(true);
+          setError(null);
+        }
+
+        const loaded = await filesLocationCache.load(location, options);
+        requestKeys.push(loaded.resolvedKey);
+        if (!isFilesLoadCurrent(activeRequestKeyRef.current, loaded)) {
+          return;
+        }
+        activeRequestKeyRef.current = loaded.resolvedKey;
+        displayedRequestKeyRef.current = loaded.resolvedKey;
+        const result = loaded.result;
         setItems(result.items);
         setPathForLocation(nextSource, nextScope, result.currentPath);
         setLocationMetas((prev) => ({
@@ -658,20 +819,33 @@ export default function FilesScreen() {
           },
         }));
       } catch (loadError) {
-        setItems([]);
+        if (
+          requestKeys.length > 0 &&
+          !requestKeys.includes(activeRequestKeyRef.current ?? "")
+        ) {
+          return;
+        }
+        if (displayedRequestKeyRef.current === null) setItems([]);
         setError(
           loadError instanceof Error
             ? loadError.message
             : "ファイル一覧の取得に失敗しました",
         );
       } finally {
-        setLoading(false);
+        if (
+          requestKeys.length === 0 ||
+          requestKeys.includes(activeRequestKeyRef.current ?? "")
+        ) {
+          setLoading(false);
+        }
       }
     },
     [
-      canUseLocation,
       getServerRootPath,
-      locationUnavailableMessage,
+      authScope,
+      isAuthenticated,
+      isServerWorkspaceListable,
+      selectedProjectId,
       setPathForLocation,
     ],
   );
@@ -690,59 +864,100 @@ export default function FilesScreen() {
   }, [isAuthenticated]);
 
   useEffect(() => {
-    void loadEntries("local", "workspace");
-  }, [loadEntries]);
+    void loadEntries(source, scope, activePath || undefined);
+  }, [activePath, loadEntries, scope, source]);
+
+  const visibleLocationRef = useRef<() => Promise<void>>(async () => {});
+  visibleLocationRef.current = () =>
+    loadEntries(source, scope, activePath || undefined, undefined, {
+      revalidate: true,
+    });
 
   useFocusEffect(
     useCallback(() => {
-      void loadEntries(source, scope, activePath || undefined);
+      void visibleLocationRef.current();
       void loadBookmarks();
       void loadAudioPlayerSettings()
         .then(setAudioPlayerSettings)
         .catch(() => {});
-    }, [activePath, loadBookmarks, loadEntries, scope, source]),
+    }, [loadBookmarks]),
   );
 
   useEffect(() => {
     if (!isAuthenticated && source === "server") {
       setSource("local");
-      void loadEntries("local", scope, paths[locationKey("local", scope)] || undefined);
     }
-  }, [isAuthenticated, loadEntries, paths, scope, source]);
-
-  useEffect(() => {
-    if (source !== "server" || scope !== "workspace") return;
-    void loadEntries("server", "workspace", getServerRootPath("workspace"));
-  }, [getServerRootPath, loadEntries, scope, source]);
+  }, [isAuthenticated, source]);
 
   const onRefresh = async () => {
     setRefreshing(true);
     await Promise.all([
-      loadEntries(source, scope, activePath || undefined),
+      loadEntries(source, scope, activePath || undefined, undefined, {
+        revalidate: true,
+      }),
       loadBookmarks(),
     ]);
     setRefreshing(false);
   };
 
-  const changeSource = async (nextSource: FilesSource) => {
-    if (!canUseLocation(nextSource, scope)) {
+  const changeSource = (nextSource: FilesSource) => {
+    if (!canOpenLocation(nextSource)) {
       Alert.alert("Files", locationUnavailableMessage(scope));
       return;
     }
     setSource(nextSource);
-    const key = locationKey(nextSource, scope);
-    await loadEntries(nextSource, scope, paths[key] || undefined);
   };
 
-  const changeScope = async (nextScope: FilesScope) => {
-    if (!canUseLocation(source, nextScope)) {
+  const changeScope = (nextScope: FilesScope) => {
+    if (!canOpenLocation(source)) {
       Alert.alert("Files", locationUnavailableMessage(nextScope));
       return;
     }
     setScope(nextScope);
-    const key = locationKey(source, nextScope);
-    await loadEntries(source, nextScope, paths[key] || undefined);
   };
+
+  // ファイラー画面内でプロジェクトを切り替える。旧プロジェクトの現在地・履歴・
+  // クリップボード・検索・編集／プレビュー状態を一切引き継がず、新プロジェクトの
+  // ルートへ移動する。nextProjectId が null の場合、管理者は管理者ルート、
+  // 一般ユーザーはプロジェクト未選択状態になる。
+  const applyProjectSelection = useCallback(
+    (nextProjectId: string | null) => {
+      setProjectMenuVisible(false);
+      if (
+        nextProjectId === selectedProjectId &&
+        source === "server" &&
+        scope === "workspace"
+      ) {
+        return;
+      }
+
+      const workspaceKey = locationKey("server", "workspace");
+      // 旧プロジェクトの位置・履歴・親情報をクリアする。
+      setPaths((prev) => ({ ...prev, [workspaceKey]: "" }));
+      setHistories((prev) => ({ ...prev, [workspaceKey]: [] }));
+      setLocationMetas((prev) => ({
+        ...prev,
+        [workspaceKey]: { parentPath: null, canGoUp: false, isAdminMode: false },
+      }));
+      // 旧プロジェクトのクリップボード・検索・編集／プレビュー状態を破棄する。
+      setClipboard(null);
+      setQuery("");
+      setEditorVisible(false);
+      setEditorTarget(null);
+      setViewerVisible(false);
+      setViewerFile(null);
+
+      setSelectedProjectId(nextProjectId);
+      setSource("server");
+      setScope("workspace");
+    },
+    [
+      scope,
+      selectedProjectId,
+      setSelectedProjectId,
+      source,
+    ],
+  );
 
   const pushHistoryForKey = useCallback((key: LocationKey, path: string) => {
     setHistories((prev) => ({
@@ -765,28 +980,46 @@ export default function FilesScreen() {
     return previousPath;
   }, [activeHistory, activeKey]);
 
-  const goBack = async () => {
+  // サーバー・ワークスペースでは選択中プロジェクトのルートより上や、別プロジェクト
+  // 領域への移動を禁止する（履歴・ブックマーク・保存パス経由も含む）。
+  const isWorkspaceNavigationAllowed = useCallback(
+    (targetPath: string) => {
+      if (source !== "server" || scope !== "workspace") return true;
+      return isWithinWorkspaceRoot(targetPath);
+    },
+    [isWithinWorkspaceRoot, scope, source],
+  );
+
+  const goBack = () => {
     const previousPath = popHistory();
     if (previousPath == null) return;
+    if (!isWorkspaceNavigationAllowed(previousPath)) {
+      // 境界外の履歴はプロジェクトルートへ丸める。
+      const rootPath = getServerRootPath("workspace");
+      setPathForLocation(source, scope, rootPath);
+      return;
+    }
     setPathForLocation(source, scope, previousPath);
-    await loadEntries(source, scope, previousPath);
   };
 
-  const goUp = async () => {
+  const goUp = () => {
     if (!activeMeta.canGoUp || activeMeta.parentPath == null) return;
+    if (!isWorkspaceNavigationAllowed(activeMeta.parentPath)) return;
     if (activePath !== activeMeta.parentPath) {
       pushHistory(activePath);
     }
     setPathForLocation(source, scope, activeMeta.parentPath);
-    await loadEntries(source, scope, activeMeta.parentPath);
   };
 
-  const navigateTo = async (nextPath: string) => {
+  const navigateTo = (nextPath: string) => {
+    if (!isWorkspaceNavigationAllowed(nextPath)) {
+      Alert.alert("Files", "選択中プロジェクトの範囲外へは移動できません。");
+      return;
+    }
     if (activePath !== nextPath) {
       pushHistory(activePath);
     }
     setPathForLocation(source, scope, nextPath);
-    await loadEntries(source, scope, nextPath);
   };
 
   const openMediaViewer = (entry: FilesEntry) => {
@@ -993,12 +1226,12 @@ export default function FilesScreen() {
     }
   };
 
-  const focusAudioTrackLocation = async () => {
+  const focusAudioTrackLocation = () => {
     const track = audioState.track;
     if (!track) return;
 
     const targetScope = audioState.scope;
-    if (!canUseLocation(track.source, targetScope)) {
+    if (!canOpenLocation(track.source)) {
       Alert.alert("Files", locationUnavailableMessage(targetScope));
       return;
     }
@@ -1015,7 +1248,6 @@ export default function FilesScreen() {
     setSource(track.source);
     setScope(targetScope);
     setPathForLocation(track.source, targetScope, parentPath);
-    await loadEntries(track.source, targetScope, parentPath);
   };
 
   useEffect(() => {
@@ -1137,7 +1369,9 @@ export default function FilesScreen() {
     try {
       await filesApi.createTextFile(source, activePath, name);
       setCreateFileVisible(false);
-      await loadEntries(source, scope, activePath);
+      await loadEntries(source, scope, activePath, undefined, {
+        revalidate: true,
+      });
     } catch (createError) {
       Alert.alert(
         "Files",
@@ -1158,7 +1392,9 @@ export default function FilesScreen() {
     try {
       await filesApi.createFolder(source, activePath, name);
       setCreateFolderVisible(false);
-      await loadEntries(source, scope, activePath);
+      await loadEntries(source, scope, activePath, undefined, {
+        revalidate: true,
+      });
     } catch (createError) {
       Alert.alert(
         "Files",
@@ -1194,6 +1430,8 @@ export default function FilesScreen() {
         activePath === oldPath && renameTarget.type === "directory"
           ? nextPath
           : activePath,
+        undefined,
+        { revalidate: true },
       );
     } catch (renameError) {
       Alert.alert(
@@ -1218,7 +1456,9 @@ export default function FilesScreen() {
             void (async () => {
               try {
                 await filesApi.remove(entry.source, entry.path);
-                await loadEntries(source, scope, activePath);
+                await loadEntries(source, scope, activePath, undefined, {
+                  revalidate: true,
+                });
               } catch (deleteError) {
                 Alert.alert(
                   "Files",
@@ -1239,12 +1479,35 @@ export default function FilesScreen() {
     entry: FilesEntry,
     operation: ClipboardOperation,
   ) => {
-    setClipboard({ entry, operation });
+    setClipboard({
+      entry,
+      operation,
+      source: entry.source,
+      scope,
+      projectRoot:
+        entry.source === "server" && scope === "workspace"
+          ? getServerRootPath("workspace")
+          : null,
+    });
     Alert.alert(
       "Files",
       `${entry.name} を${operation === "copy" ? "コピー" : "移動"}対象にしました。移動先で貼り付けてください。`,
     );
   };
+
+  // クリップボードの項目を現在地に貼り付けできるか。ソース一致だけでなく、
+  // サーバー・ワークスペースでは同一プロジェクト（同一ルート）であることを要求する。
+  const clipboardMatchesCurrent = useCallback(() => {
+    if (!clipboard) return false;
+    if (clipboard.source !== source) return false;
+    if (source === "server" && scope === "workspace") {
+      return (
+        clipboard.scope === "workspace" &&
+        clipboard.projectRoot === getServerRootPath("workspace")
+      );
+    }
+    return true;
+  }, [clipboard, getServerRootPath, scope, source]);
 
   const pasteClipboard = async (destinationPath = activePath) => {
     if (!clipboard || transferring) return;
@@ -1252,8 +1515,13 @@ export default function FilesScreen() {
       Alert.alert("Files", "この場所には貼り付けできません。");
       return;
     }
-    if (clipboard.entry.source !== source) {
-      Alert.alert("Files", "ローカルとサーバーをまたいだ貼り付けはできません。");
+    if (!clipboardMatchesCurrent()) {
+      Alert.alert(
+        "Files",
+        clipboard.source !== source
+          ? "ローカルとサーバーをまたいだ貼り付けはできません。"
+          : "別プロジェクトの項目はここに貼り付けできません。",
+      );
       return;
     }
 
@@ -1265,7 +1533,9 @@ export default function FilesScreen() {
         await filesApi.move(source, clipboard.entry.path, destinationPath);
         setClipboard(null);
       }
-      await loadEntries(source, scope, activePath);
+      await loadEntries(source, scope, activePath, undefined, {
+        revalidate: true,
+      });
     } catch (transferError) {
       Alert.alert(
         "Files",
@@ -1281,8 +1551,7 @@ export default function FilesScreen() {
   const showEntryActions = (entry: FilesEntry) => {
     const pasteDestination = entry.type === "directory" ? entry.path : activePath;
     const canPasteHere =
-      Boolean(clipboard) &&
-      clipboard?.entry.source === source &&
+      clipboardMatchesCurrent() &&
       Boolean(pasteDestination) &&
       canMutateCurrentPath;
 
@@ -1334,7 +1603,9 @@ export default function FilesScreen() {
         editorContent,
       );
       setEditorVisible(false);
-      await loadEntries(source, scope, activePath);
+      await loadEntries(source, scope, activePath, undefined, {
+        revalidate: true,
+      });
     } catch (saveError) {
       Alert.alert(
         "Files",
@@ -1374,7 +1645,9 @@ export default function FilesScreen() {
         },
         { projectId: selectedProjectId },
       );
-      await loadEntries(source, scope, activePath);
+      await loadEntries(source, scope, activePath, undefined, {
+        revalidate: true,
+      });
     } catch (uploadError) {
       Alert.alert(
         "Upload failed",
@@ -1427,6 +1700,29 @@ export default function FilesScreen() {
     if (!relative || relative === "/") return prefix;
     return `${prefix}${relative}`;
   }, [activePath, getServerRootPath, scope, source]);
+
+  // プロジェクトセレクターに表示する候補。selectedSpaceId が設定されている場合は
+  // そのスペース内のプロジェクトに絞り込む。プロジェクト選択で store の
+  // selectedSpaceId がクリアされた後も、選択中プロジェクトの space_id を基準に
+  // スペース絞り込みを維持する（該当が無ければ全件にフォールバック）。
+  const selectorSpaceId = selectedSpaceId ?? selectedProject?.space_id ?? null;
+  const selectableProjects = useMemo(() => {
+    if (selectorSpaceId) {
+      const inSpace = projects.filter(
+        (project) => project.space_id === selectorSpaceId,
+      );
+      if (inSpace.length > 0) return inSpace;
+    }
+    return projects;
+  }, [projects, selectorSpaceId]);
+
+  const projectSelectorLabel = useMemo(() => {
+    if (selectedProject) return selectedProject.name;
+    if (isAdmin) return "管理者ルート";
+    return "プロジェクトを選択";
+  }, [isAdmin, selectedProject]);
+
+  const showProjectSelector = isAuthenticated && scope === "workspace";
 
   const filteredItems = useMemo(() => {
     const keyword = query.trim().toLowerCase();
@@ -1511,11 +1807,24 @@ export default function FilesScreen() {
 
   const bookmarkItems = useMemo(() => {
     if (source === "local") return [];
-    return bookmarks.filter((bookmark) => bookmark.path);
-  }, [bookmarks, source]);
+    const withPath = bookmarks.filter((bookmark) => bookmark.path);
+    if (scope !== "workspace") return withPath;
+    // 管理者ルート選択中は従来どおり全ブックマークを表示する。
+    if (isAdmin && !selectedProjectId) return withPath;
+    const root = getServerRootPath("workspace");
+    if (!root) return [];
+    const prefix = root.replace(/\/+$/, "");
+    // 選択中プロジェクト配下のブックマークだけに絞り込む。
+    return withPath.filter((bookmark) => {
+      const normalized = bookmark.path
+        .replace(/\\/g, "/")
+        .replace(/^\/+/, "");
+      return normalized === prefix || normalized.startsWith(`${prefix}/`);
+    });
+  }, [bookmarks, getServerRootPath, isAdmin, scope, selectedProjectId, source]);
 
   const canMutateCurrentPath =
-    canUseLocation(source, scope) &&
+    (source === "local" || isAuthenticated) &&
     (Boolean(activePath) || (source === "server" && activeMeta.isAdminMode));
 
   const renderListItem = ({ item }: { item: FilesEntry }) => (
@@ -1533,10 +1842,7 @@ export default function FilesScreen() {
             <Text style={styles.fileName} numberOfLines={1}>
               {item.name}
             </Text>
-            <Text style={styles.fileMeta} numberOfLines={1}>
-              {item.type === "directory" ? "フォルダー" : item.mimeType || "ファイル"}
-              {item.size ? ` ・ ${formatSize(item.size)}` : ""}
-            </Text>
+            <FileMetadata entry={item} />
           </View>
           <IconButton
             icon="dots-vertical"
@@ -1564,9 +1870,7 @@ export default function FilesScreen() {
           <Text style={styles.gridFileName} numberOfLines={2}>
             {item.name}
           </Text>
-          <Text style={styles.gridFileMeta} numberOfLines={1}>
-            {item.type === "directory" ? "フォルダー" : formatSize(item.size)}
-          </Text>
+          <FileMetadata entry={item} grid />
         </Surface>
       )}
     </Pressable>
@@ -1574,10 +1878,8 @@ export default function FilesScreen() {
 
   return (
     <View style={styles.container}>
+      <ScreenHeader title="Files" />
       <Surface style={styles.header} elevation={1}>
-        <Text variant="titleLarge" style={styles.headerTitle}>
-          Files
-        </Text>
         <View style={styles.segmentRow}>
           {(["local", "server"] as FilesSource[]).map((value) => (
             <Chip
@@ -1595,9 +1897,9 @@ export default function FilesScreen() {
         </View>
         <View style={styles.segmentRow}>
           {(["workspace", "user"] as FilesScope[]).map((value) => {
-            const disabled =
-              source === "server" &&
-              (!isAuthenticated || (!isAdmin && !getServerRootPath(value)));
+            // ワークスペースはプロジェクト未選択でも開けるようにするため、
+            // サーバー利用時は未ログインの場合のみ無効化する。
+            const disabled = source === "server" && !isAuthenticated;
             return (
               <Chip
                 key={value}
@@ -1613,6 +1915,54 @@ export default function FilesScreen() {
             );
           })}
         </View>
+        {showProjectSelector ? (
+          <View style={styles.projectSelectorRow}>
+            <Menu
+              visible={projectMenuVisible}
+              onDismiss={() => setProjectMenuVisible(false)}
+              anchor={
+                <Button
+                  mode="outlined"
+                  icon="folder-outline"
+                  style={styles.projectSelector}
+                  onPress={() => setProjectMenuVisible(true)}
+                  accessibilityRole="button"
+                  accessibilityLabel={`プロジェクトを選択（現在: ${projectSelectorLabel}）`}
+                  accessibilityHint="タップしてプロジェクト一覧を開きます"
+                  textColor="#cdd6f4"
+                  contentStyle={styles.projectSelectorContent}
+                  labelStyle={styles.projectSelectorName}
+                >
+                  {`プロジェクト: ${projectSelectorLabel}`}
+                </Button>
+              }
+            >
+              {isAdmin ? (
+                <Menu.Item
+                  leadingIcon={!selectedProjectId ? "check" : "shield-account-outline"}
+                  onPress={() => void applyProjectSelection(null)}
+                  title="管理者ルート"
+                />
+              ) : null}
+              {!projectsLoaded && selectableProjects.length === 0 ? (
+                <Menu.Item disabled title="読み込み中..." />
+              ) : selectableProjects.length === 0 ? (
+                <Menu.Item disabled title="参照可能なプロジェクトがありません" />
+              ) : (
+                selectableProjects.map((project) => (
+                  <Menu.Item
+                    key={project.id}
+                    leadingIcon={
+                      project.id === selectedProjectId ? "check" : undefined
+                    }
+                    onPress={() => void applyProjectSelection(project.id)}
+                    title={project.name}
+                  />
+                ))
+              )}
+            </Menu>
+          </View>
+        ) : null}
       </Surface>
 
       <View style={styles.toolbarRow}>
@@ -1649,8 +1999,13 @@ export default function FilesScreen() {
         />
         <IconButton
           icon="clipboard-arrow-down-outline"
-          iconColor={clipboard ? "#a6e3a1" : "#585b70"}
-          disabled={!clipboard || !canMutateCurrentPath || transferring}
+          iconColor={clipboard && clipboardMatchesCurrent() ? "#a6e3a1" : "#585b70"}
+          disabled={
+            !clipboard ||
+            !clipboardMatchesCurrent() ||
+            !canMutateCurrentPath ||
+            transferring
+          }
           onPress={() => void pasteClipboard()}
         />
         <IconButton
@@ -1949,9 +2304,23 @@ export default function FilesScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b" },
-  header: { padding: 16, paddingTop: 56, backgroundColor: "#1e1e2e" },
-  headerTitle: { color: "#cdd6f4", fontWeight: "bold", marginBottom: 12 },
+  header: {
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 4,
+    backgroundColor: "#1e1e2e",
+  },
   segmentRow: { flexDirection: "row", gap: 8, marginBottom: 8 },
+  projectSelectorRow: { marginBottom: 8 },
+  projectSelector: {
+    minHeight: 48,
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "#45475a",
+    backgroundColor: "#181825",
+  },
+  projectSelectorContent: { minHeight: 48, justifyContent: "flex-start" },
+  projectSelectorName: { color: "#cdd6f4", fontSize: 14, fontWeight: "600" },
   segmentChip: { backgroundColor: "#313244" },
   segmentChipActive: { backgroundColor: "#4c1d95" },
   scopeChipActive: { backgroundColor: "#3b2f5f" },

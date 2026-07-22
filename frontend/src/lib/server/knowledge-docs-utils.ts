@@ -1,4 +1,6 @@
-import { and, asc, desc, eq, ilike, inArray, isNull, or } from "drizzle-orm";
+import { and, asc, desc, eq, ilike, inArray, isNull, or, sql } from "drizzle-orm";
+import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
+import { basename, resolve, sep } from "node:path";
 import { db } from "@/db";
 import {
   knowledgeAiSuggestions,
@@ -38,6 +40,13 @@ import {
   encryptText,
 } from "./field-crypto";
 import { listDocsTaskSyntheticFieldValues } from "./docs-task-binding";
+import {
+  decryptDocsNodeBodyJson,
+  decryptDocsNodeBodyText,
+  DOCS_NODE_TITLE_MAX,
+  insertDocsNode,
+  updateDocsNode,
+} from "./docs-node-writer";
 
 type SessionUser = {
   id: string;
@@ -53,6 +62,103 @@ const VALID_SUGGESTION_STATUSES = new Set([
   "rejected",
   "stale",
 ]);
+
+const HOME_SYSTEM_KEY = "home";
+
+const HOME_QUERY_DEFAULTS = {
+  projects: {
+    and: [
+      { tag_system_key: "project_info" },
+      { field: "Page Role", op: "=", value: "canonical" },
+    ],
+    limit: 30,
+    sort: "updated_desc",
+  },
+  recent: { and: [], limit: 20, sort: "updated_desc" },
+  tasks: {
+    and: [
+      { tag_system_key: "task" },
+      { field: "task_status", op: "!=", value: "done" },
+    ],
+    include_virtual_tasks: true,
+    limit: 30,
+    sort: "updated_desc",
+  },
+} satisfies Record<string, Record<string, unknown>>;
+
+// 既存Homeの補正対象を明示する。legacyQueryと完全一致する場合だけ新しいqueryへ置き換え、
+// ユーザーが条件・ソート・limit等を編集したquery_jsonは意図的に変更しない。
+const HOME_QUERY_MIGRATIONS = [
+  {
+    title: "案件一覧",
+    legacyQuery: {
+      and: [
+        { tag_system_key: "project_info" },
+        { field: "Page Role", op: "=", value: "canonical" },
+      ],
+      limit: 100,
+      sort: "updated_desc",
+    },
+    nextQuery: HOME_QUERY_DEFAULTS.projects,
+  },
+  {
+    title: "最近更新されたノード",
+    legacyQuery: { and: [], limit: 20, sort: "updated_desc" },
+    nextQuery: HOME_QUERY_DEFAULTS.recent,
+  },
+  {
+    title: "未完了タスク",
+    legacyQuery: {
+      and: [
+        { tag_system_key: "task" },
+        { field: "task_status", op: "!=", value: "done" },
+      ],
+      include_virtual_tasks: true,
+      limit: 100,
+      sort: "updated_desc",
+    },
+    nextQuery: HOME_QUERY_DEFAULTS.tasks,
+  },
+] as const;
+
+const HOME_TEMPLATE: Array<{
+  title: string;
+  blockType?: string;
+  nodeType?: string;
+  queryJson?: Record<string, unknown>;
+}> = [
+  {
+    title: "案件",
+    blockType: "heading_2",
+  },
+  {
+    title: "案件一覧",
+    nodeType: "search",
+    queryJson: {
+      ...HOME_QUERY_DEFAULTS.projects,
+    },
+  },
+  {
+    title: "最近更新",
+    blockType: "heading_2",
+  },
+  {
+    title: "最近更新されたノード",
+    nodeType: "search",
+    queryJson: { ...HOME_QUERY_DEFAULTS.recent },
+  },
+  {
+    title: "タスク",
+    blockType: "heading_2",
+  },
+  {
+    title: "未完了タスク",
+    nodeType: "search",
+    queryJson: {
+      ...HOME_QUERY_DEFAULTS.tasks,
+    },
+  },
+];
 
 const VALID_IMPORT_STATUSES = new Set([
   "proposed",
@@ -73,21 +179,12 @@ const DOCS_WORKSPACE_SETTINGS = {
   derived_index: "qdrant",
 };
 
-export function encryptNodeBodyText(value: string | null | undefined) {
-  return encryptText(value ?? "", NODE_BODY_TEXT_AAD) ?? "";
-}
-
-export function encryptNodeBodyJson(value: Record<string, unknown>) {
-  return encryptJsonValue(value ?? {}, NODE_BODY_JSON_AAD) as Record<string, unknown> | string;
-}
-
 export function decryptNodeBodyText(value: string | null | undefined) {
-  return decryptTextIfNeeded(value ?? "", NODE_BODY_TEXT_AAD) ?? "";
+  return decryptDocsNodeBodyText(value);
 }
 
 export function decryptNodeBodyJson(value: unknown): Record<string, unknown> {
-  const decrypted = decryptJsonValueIfNeeded(value ?? {}, NODE_BODY_JSON_AAD);
-  return normalizeJsonObject(decrypted);
+  return decryptDocsNodeBodyJson(value);
 }
 
 export function cleanString(
@@ -115,13 +212,27 @@ export function normalizeJsonObject(value: unknown): Record<string, unknown> {
   return { ...(value as Record<string, unknown>) };
 }
 
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function jsonObjectsEqual(left: unknown, right: unknown) {
+  return stableJson(left) === stableJson(right);
+}
+
 export function deriveKnowledgeBlockTitle(bodyText: string): string {
   const firstLine = String(bodyText ?? "")
     .replace(/\r\n?/g, "\n")
     .split("\n")
-    .map((line) => line.trim())
-    .find(Boolean);
-  return (firstLine ?? "").slice(0, 500);
+    .find((line) => Boolean(line.trim()));
+  return (firstLine ?? "").slice(0, DOCS_NODE_TITLE_MAX);
 }
 
 function serializeDate(value: unknown): string | null {
@@ -153,17 +264,23 @@ export function serializeWorkspace(
   };
 }
 
-export function serializeNode(row: typeof knowledgeNodes.$inferSelect) {
+function serializeNodeWithOptions(
+  row: typeof knowledgeNodes.$inferSelect,
+  options: { includeBody: boolean },
+) {
+  const includeBody = options.includeBody;
   return {
     id: row.id,
     workspace_id: row.workspaceId,
     parent_id: row.parentId,
     root_page_id: row.rootPageId,
     project_id: row.projectId,
+    system_key: row.systemKey,
     title: row.title,
+    aliases: Array.isArray(row.aliases) ? row.aliases.filter((item): item is string => typeof item === "string") : [],
     description: row.description ?? "",
-    body_json: decryptNodeBodyJson(row.bodyJson ?? {}),
-    body_text: decryptNodeBodyText(row.bodyText ?? ""),
+    body_json: includeBody ? decryptNodeBodyJson(row.bodyJson ?? {}) : {},
+    body_text: includeBody ? decryptNodeBodyText(row.bodyText ?? "") : "",
     node_type: normalizeDocsNodeType(row.nodeType),
     display_props: normalizeJsonObject(row.displayProps ?? {}),
     query_json: normalizeDocsNodeType(row.nodeType) === "search" && row.queryJson && typeof row.queryJson === "object" && !Array.isArray(row.queryJson)
@@ -496,6 +613,9 @@ async function seedDefaultDocsWorkspace(
   workspaceId: string,
   userId: string,
 ) {
+  await tx.execute(
+    sql`select pg_advisory_xact_lock(hashtext(${`${workspaceId}:default-docs-seed`}))`,
+  );
   const existingTags = await tx
     .select()
     .from(knowledgeSupertags)
@@ -524,6 +644,7 @@ async function seedDefaultDocsWorkspace(
           color: tag.color,
           templateJson: tag.templateJson,
           pinnedFieldIds: tag.pinnedFieldKeys,
+          configJson: tag.configJson ?? {},
           aiInstructions: tag.aiInstructions,
         })
         .returning();
@@ -598,10 +719,80 @@ async function seedDefaultDocsWorkspace(
           color: tag.color,
           templateJson: tag.templateJson,
           pinnedFieldIds: pinnedIds,
+          // 既存 config_json を温存し、seed が宣言したキー(tools 等)だけ浅くマージ上書きする。
+          // backend(docs_workspace.py)の {**current_config, "tools": ...} と挙動を揃える。
+          ...(tag.configJson
+            ? { configJson: { ...normalizeJsonObject(targetTag.configJson ?? {}), ...tag.configJson } }
+            : {}),
           aiInstructions: tag.aiInstructions,
           updatedAt: new Date(),
         })
         .where(eq(knowledgeSupertags.id, targetTag.id));
+    }
+  }
+
+  const projectInformationTag = tagsBySystemKey.get("project_info");
+  if (projectInformationTag) {
+    const [pageRoleField] = await tx
+      .select()
+      .from(knowledgeFields)
+      .where(
+        and(
+          eq(knowledgeFields.supertagId, projectInformationTag.id),
+          eq(knowledgeFields.name, "Page Role"),
+        ),
+      )
+      .limit(1);
+    if (pageRoleField) {
+      const canonicalNodes = await tx
+        .select({ nodeId: knowledgeNodes.id })
+        .from(projects)
+        .innerJoin(
+          knowledgeNodes,
+          eq(projects.knowledgeNodeId, knowledgeNodes.id),
+        )
+        .innerJoin(
+          knowledgeNodeSupertags,
+          and(
+            eq(knowledgeNodeSupertags.nodeId, knowledgeNodes.id),
+            eq(knowledgeNodeSupertags.supertagId, projectInformationTag.id),
+          ),
+        )
+        .where(
+          and(
+            eq(knowledgeNodes.workspaceId, workspaceId),
+            isNull(knowledgeNodes.archivedAt),
+            isNull(projects.deletedAt),
+          ),
+        );
+      if (canonicalNodes.length > 0) {
+        const canonicalNodeIds = canonicalNodes.map((row) => row.nodeId);
+        const existingValues = await tx
+          .select({ nodeId: knowledgeFieldValues.nodeId })
+          .from(knowledgeFieldValues)
+          .where(
+            and(
+              eq(knowledgeFieldValues.fieldId, pageRoleField.id),
+              inArray(knowledgeFieldValues.nodeId, canonicalNodeIds),
+            ),
+          );
+        const existingNodeIds = new Set(existingValues.map((row) => row.nodeId));
+        const missingNodeIds = canonicalNodeIds.filter(
+          (nodeId) => !existingNodeIds.has(nodeId),
+        );
+        if (missingNodeIds.length > 0) {
+          await tx
+            .insert(knowledgeFieldValues)
+            .values(
+              missingNodeIds.map((nodeId) => ({
+                ...normalizeFieldValueInput(pageRoleField, "canonical"),
+                nodeId,
+                updatedBy: userId,
+              })),
+            )
+            .onConflictDoNothing();
+        }
+      }
     }
   }
 
@@ -625,20 +816,8 @@ async function seedDefaultDocsWorkspace(
       sortOrder: 1,
     });
   }
-  if (!existingViewNames.has("全案件 Risk table")) {
-    missingViews.push({
-      workspaceId,
-      name: "全案件 Risk table",
-      layout: "table",
-      configJson: {
-        filters: { supertag: "Risk", status: ["open", "watch"] },
-        sort: [{ field: "深刻度", direction: "desc" }],
-        columns: ["深刻度", "状態", "対策", "案件"],
-      },
-      createdBy: userId,
-      sortOrder: 2,
-    });
-  }
+  // 「全案件 Risk table」ビューは Risk タグ削除(D11)に伴い dead 定義のため seed から除去した。
+  // 既存DBに残る同名ビュー行は scripts/seed_docs_sample_content.ts が掃除する。
   if (!existingViewNames.has("今月の Meeting list")) {
     missingViews.push({
       workspaceId,
@@ -652,6 +831,137 @@ async function seedDefaultDocsWorkspace(
 
   if (missingViews.length > 0) {
     await tx.insert(knowledgeSavedViews).values(missingViews);
+  }
+
+  const [keyedHome] = await tx
+    .select({
+      id: knowledgeNodes.id,
+      archivedAt: knowledgeNodes.archivedAt,
+    })
+    .from(knowledgeNodes)
+    .where(
+      and(
+        eq(knowledgeNodes.workspaceId, workspaceId),
+        eq(knowledgeNodes.systemKey, HOME_SYSTEM_KEY),
+      ),
+    )
+    .limit(1);
+  let existingHome = keyedHome?.archivedAt ? undefined : keyedHome;
+  // Always count active root Homes, even when the canonical `home` key is
+  // already present. Otherwise a later duplicate could remain silently.
+  const activeRootHomes = await tx
+    .select({ id: knowledgeNodes.id })
+    .from(knowledgeNodes)
+    .where(
+      and(
+        eq(knowledgeNodes.workspaceId, workspaceId),
+        eq(knowledgeNodes.title, "Home"),
+        isNull(knowledgeNodes.parentId),
+        isNull(knowledgeNodes.archivedAt),
+      ),
+    )
+    .limit(2);
+
+  if (activeRootHomes.length > 1) {
+    throw new Error("Docs workspace has multiple active Home roots");
+  }
+
+  if (!existingHome) {
+    const [activeRootHome] = activeRootHomes;
+    if (activeRootHome) {
+      if (keyedHome && keyedHome.id !== activeRootHome.id) {
+        await updateDocsNode(tx, keyedHome.id, {
+          systemKey: null,
+          updatedBy: userId,
+          updatedAt: new Date(),
+        });
+      }
+      const adoptedHome = await updateDocsNode(tx, activeRootHome.id, {
+        systemKey: HOME_SYSTEM_KEY,
+        updatedBy: userId,
+        updatedAt: new Date(),
+      });
+      existingHome = adoptedHome ?? activeRootHome;
+    } else if (keyedHome) {
+      await updateDocsNode(tx, keyedHome.id, {
+        systemKey: null,
+        updatedBy: userId,
+        updatedAt: new Date(),
+      });
+    }
+  }
+  if (existingHome) {
+    const existingSearchNodes = await tx
+      .select({
+        id: knowledgeNodes.id,
+        title: knowledgeNodes.title,
+        queryJson: knowledgeNodes.queryJson,
+      })
+      .from(knowledgeNodes)
+      .where(
+        and(
+          eq(knowledgeNodes.workspaceId, workspaceId),
+          eq(knowledgeNodes.parentId, existingHome.id),
+          eq(knowledgeNodes.nodeType, "search"),
+          isNull(knowledgeNodes.archivedAt),
+        ),
+      );
+    for (const migration of HOME_QUERY_MIGRATIONS) {
+      const node = existingSearchNodes.find((item) => item.title === migration.title);
+      // 旧テンプレートのデフォルト値と完全一致するときだけ補正する。ユーザー編集値は保持する。
+      if (!node || !jsonObjectsEqual(node.queryJson, migration.legacyQuery)) continue;
+      const updated = await updateDocsNode(tx, node.id, {
+        queryJson: migration.nextQuery,
+        updatedBy: userId,
+        updatedAt: new Date(),
+      });
+      if (updated) await appendKnowledgeRevision(tx, updated, userId, "Home検索クエリの既定limitを補正");
+    }
+    return;
+  }
+
+  const homeId = crypto.randomUUID();
+  const home = await insertDocsNode(tx, {
+    id: homeId,
+    workspaceId,
+    parentId: null,
+    rootPageId: homeId,
+    projectId: null,
+    systemKey: HOME_SYSTEM_KEY,
+    title: "Home",
+    nodeType: "node",
+    bodyJson: { format: "doc_block", block_type: "paragraph" },
+    displayProps: {},
+    queryJson: null,
+    viewJson: {},
+    sortOrder: 0,
+    createdBy: userId,
+    updatedBy: userId,
+  });
+  await upsertKnowledgeSearchIndex(tx, home, home.title);
+  await appendKnowledgeRevision(tx, home, userId, "Homeノードを作成");
+  for (const [index, templateNode] of HOME_TEMPLATE.entries()) {
+    const child = await insertDocsNode(tx, {
+      workspaceId,
+      parentId: homeId,
+      rootPageId: homeId,
+      projectId: null,
+      systemKey: null,
+      title: templateNode.title,
+      nodeType: templateNode.nodeType ?? "node",
+      bodyJson: {
+        format: "doc_block",
+        block_type: templateNode.blockType ?? "paragraph",
+      },
+      displayProps: {},
+      queryJson: templateNode.queryJson ?? null,
+      viewJson: {},
+      sortOrder: index,
+      createdBy: userId,
+      updatedBy: userId,
+    });
+    await upsertKnowledgeSearchIndex(tx, child, child.title);
+    await appendKnowledgeRevision(tx, child, userId, "Home初期テンプレートを作成");
   }
 }
 
@@ -682,7 +992,9 @@ export async function ensureDocsWorkspace(user: SessionUser) {
             .returning()
         )[0] ?? existing
       : existing;
-    await seedDefaultDocsWorkspace(db, workspace.id, user.id);
+    await db.transaction(async (tx) => {
+      await seedDefaultDocsWorkspace(tx, workspace.id, user.id);
+    });
     return workspace;
   }
 
@@ -787,6 +1099,130 @@ export async function requireDocsField(fieldId: string, workspaceId: string) {
   return field ?? null;
 }
 
+export async function getKnowledgeNodeChildMetadata(
+  workspaceId: string,
+  nodeIds: string[],
+  accessibleProjectIds: string[],
+  includeArchived = false,
+) {
+  if (nodeIds.length === 0) {
+    return { hasChildrenIds: [], loadedChildrenParentIds: [] };
+  }
+  const accessibleNodeCondition = accessibleProjectIds.length > 0
+    ? or(isNull(knowledgeNodes.projectId), inArray(knowledgeNodes.projectId, accessibleProjectIds))
+    : isNull(knowledgeNodes.projectId);
+  const [childRows, placementRows] = await Promise.all([
+    db
+      .select({ parentId: knowledgeNodes.parentId })
+      .from(knowledgeNodes)
+      .where(
+        and(
+          eq(knowledgeNodes.workspaceId, workspaceId),
+          inArray(knowledgeNodes.parentId, nodeIds),
+          includeArchived ? undefined : isNull(knowledgeNodes.archivedAt),
+          accessibleNodeCondition,
+        ),
+      ),
+    db
+      .select({ parentId: knowledgeNodePlacements.parentNodeId })
+      .from(knowledgeNodePlacements)
+      .innerJoin(knowledgeNodes, eq(knowledgeNodePlacements.nodeId, knowledgeNodes.id))
+      .where(
+        and(
+          inArray(knowledgeNodePlacements.parentNodeId, nodeIds),
+          eq(knowledgeNodes.workspaceId, workspaceId),
+          includeArchived ? undefined : isNull(knowledgeNodes.archivedAt),
+          accessibleNodeCondition,
+        ),
+      ),
+  ]);
+  return {
+    hasChildrenIds: Array.from(new Set([
+      ...childRows.map((row) => row.parentId).filter((id): id is string => Boolean(id)),
+      ...placementRows.map((row) => row.parentId),
+    ])),
+    loadedChildrenParentIds: [],
+  };
+}
+
+export function serializeNode(row: typeof knowledgeNodes.$inferSelect) {
+  return serializeNodeWithOptions(row, { includeBody: true });
+}
+
+export function serializeNodeWithoutBody(row: typeof knowledgeNodes.$inferSelect) {
+  return serializeNodeWithOptions(row, { includeBody: false });
+}
+
+const DOCS_ARCHIVE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const docsArchiveLastPurgedAt = new Map<string, number>();
+const docsArchivePurgeInFlight = new Map<string, Promise<number>>();
+
+/**
+ * Docsを開いた時に最大1日1回、30日を過ぎたアーカイブだけを物理削除する。
+ * activeまたは保存期間内の子孫を持つ親はcascade対象にせず、データ欠損を防ぐ。
+ */
+export async function purgeExpiredDocsArchive(workspaceId: string, now = new Date()) {
+  const lastRun = docsArchiveLastPurgedAt.get(workspaceId) ?? 0;
+  if (now.getTime() - lastRun < 24 * 60 * 60 * 1000) return 0;
+  const existingRun = docsArchivePurgeInFlight.get(workspaceId);
+  if (existingRun) return existingRun;
+  const run = (async () => {
+    const cutoff = new Date(now.getTime() - DOCS_ARCHIVE_RETENTION_MS);
+    const cutoffIso = cutoff.toISOString();
+    const rows = await db.execute(sql`
+    with recursive purgeable as (
+      select n.id
+      from knowledge_nodes n
+      where n.workspace_id = ${workspaceId}
+        and n.archived_at < ${cutoffIso}
+        and not exists (
+          with recursive descendants as (
+            select child.id, child.archived_at
+            from knowledge_nodes child
+            where child.parent_id = n.id
+            union all
+            select child.id, child.archived_at
+            from knowledge_nodes child
+            join descendants parent on child.parent_id = parent.id
+          )
+          select 1 from descendants
+          where archived_at is null or archived_at >= ${cutoffIso}
+        )
+    ), deleted as (
+      delete from knowledge_nodes n
+      using purgeable p
+      where n.id = p.id
+      returning n.id
+    )
+    select count(*)::int as count from deleted
+    `) as Array<{ count: number }>;
+    const cwd = resolve(process.cwd());
+    const repoRoot = basename(cwd).toLowerCase() === "frontend" ? resolve(cwd, "..") : cwd;
+    const runRoot = resolve(repoRoot, "artifacts", "foam_curation", "phase3_source_v1", "semantic_overlay_runs");
+    if (existsSync(runRoot)) {
+      const safePrefix = `${runRoot}${sep}`;
+      for (const entry of readdirSync(runRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const target = resolve(runRoot, entry.name);
+        if (!target.startsWith(safePrefix) || !existsSync(target)) continue;
+        try {
+          if (statSync(target).mtimeMs < cutoff.getTime()) rmSync(target, { recursive: true, force: true });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      }
+    }
+    docsArchiveLastPurgedAt.set(workspaceId, now.getTime());
+    return Number(rows[0]?.count ?? 0);
+  })();
+  docsArchivePurgeInFlight.set(workspaceId, run);
+  try {
+    return await run;
+  } finally {
+    if (docsArchivePurgeInFlight.get(workspaceId) === run) docsArchivePurgeInFlight.delete(workspaceId);
+  }
+}
+
 export async function listDocsState(
   user: SessionUser,
   filters: {
@@ -797,6 +1233,9 @@ export async function listDocsState(
   } = {},
 ) {
   const workspace = await ensureDocsWorkspace(user);
+  await purgeExpiredDocsArchive(workspace.id);
+  const projectsForUser = await getUserProjects(user.id);
+  const accessibleProjectIds = projectsForUser.map((project) => project.id);
 
   if (filters.projectId) {
     const access = await ensureProjectReadable(filters.projectId, user);
@@ -826,6 +1265,8 @@ export async function listDocsState(
     return {
       workspace,
       nodes: [],
+      hasChildrenIds: [],
+      loadedChildrenParentIds: [],
       supertags: await getWorkspaceSupertags(workspace.id),
       nodeSupertags: [],
       supertagFields: await getWorkspaceSupertagFields(workspace.id),
@@ -838,15 +1279,21 @@ export async function listDocsState(
       importItems: [],
       attachments: [],
       edges: [],
-      projects: await getUserProjects(user.id),
+      projects: projectsForUser,
     };
   }
 
   const search = filters.search?.trim();
   const nodeConditions = [
     eq(knowledgeNodes.workspaceId, workspace.id),
+    // bootstrapはルートだけを返す。ページ配下は近傍APIで遅延ロードする。
+    isNull(knowledgeNodes.parentId),
     filters.includeArchived ? undefined : isNull(knowledgeNodes.archivedAt),
-    filters.projectId ? eq(knowledgeNodes.projectId, filters.projectId) : undefined,
+    filters.projectId
+      ? eq(knowledgeNodes.projectId, filters.projectId)
+      : accessibleProjectIds.length > 0
+        ? or(isNull(knowledgeNodes.projectId), inArray(knowledgeNodes.projectId, accessibleProjectIds))
+        : isNull(knowledgeNodes.projectId),
     tagNodeIds ? inArray(knowledgeNodes.id, tagNodeIds) : undefined,
   ].filter(Boolean);
 
@@ -870,6 +1317,8 @@ export async function listDocsState(
       return {
         workspace,
         nodes: [],
+        hasChildrenIds: [],
+        loadedChildrenParentIds: [],
         supertags: await getWorkspaceSupertags(workspace.id),
         nodeSupertags: [],
         supertagFields: await getWorkspaceSupertagFields(workspace.id),
@@ -882,7 +1331,7 @@ export async function listDocsState(
         importItems: [],
         attachments: [],
         edges: [],
-        projects: await getUserProjects(user.id),
+        projects: projectsForUser,
       };
     }
   }
@@ -893,8 +1342,14 @@ export async function listDocsState(
     .from(knowledgeNodes)
     .where(and(...nodeConditions))
     .orderBy(asc(knowledgeNodes.sortOrder), desc(knowledgeNodes.updatedAt))
-    .limit(300);
+    .limit(1000);
   const nodeIds = nodes.map((node) => node.id);
+  const childMetadata = await getKnowledgeNodeChildMetadata(
+    workspace.id,
+    nodeIds,
+    accessibleProjectIds,
+    filters.includeArchived,
+  );
 
   const [
     supertags,
@@ -903,7 +1358,6 @@ export async function listDocsState(
     views,
     suggestions,
     importJobs,
-    projectsForUser,
     edges,
   ] = await Promise.all([
     getWorkspaceSupertags(workspace.id),
@@ -913,22 +1367,35 @@ export async function listDocsState(
     db
       .select()
       .from(knowledgeAiSuggestions)
-      .where(eq(knowledgeAiSuggestions.workspaceId, workspace.id))
+      .where(
+        and(
+          eq(knowledgeAiSuggestions.workspaceId, workspace.id),
+          nodeIds.length > 0
+            ? or(isNull(knowledgeAiSuggestions.nodeId), inArray(knowledgeAiSuggestions.nodeId, nodeIds))
+            : isNull(knowledgeAiSuggestions.nodeId),
+        ),
+      )
       .orderBy(desc(knowledgeAiSuggestions.createdAt))
       .limit(50),
     db
       .select()
       .from(knowledgeImportJobs)
-      .where(eq(knowledgeImportJobs.workspaceId, workspace.id))
+      .where(
+        and(
+          eq(knowledgeImportJobs.workspaceId, workspace.id),
+          accessibleProjectIds.length > 0
+            ? or(isNull(knowledgeImportJobs.projectId), inArray(knowledgeImportJobs.projectId, accessibleProjectIds))
+            : isNull(knowledgeImportJobs.projectId),
+        ),
+      )
       .orderBy(desc(knowledgeImportJobs.createdAt))
       .limit(20),
-    getUserProjects(user.id),
     nodeIds.length
       ? db
           .select()
           .from(knowledgeEdges)
           .where(
-            or(
+            and(
               inArray(knowledgeEdges.sourceNodeId, nodeIds),
               inArray(knowledgeEdges.targetNodeId, nodeIds),
             ),
@@ -963,7 +1430,7 @@ export async function listDocsState(
         .select()
         .from(knowledgeNodePlacements)
         .where(
-          or(
+          and(
             inArray(knowledgeNodePlacements.nodeId, nodeIds),
             inArray(knowledgeNodePlacements.parentNodeId, nodeIds),
           ),
@@ -976,9 +1443,14 @@ export async function listDocsState(
           .select()
           .from(knowledgeImportItems)
           .where(
-            inArray(
-              knowledgeImportItems.jobId,
-              importJobs.map((job) => job.id),
+            and(
+              inArray(
+                knowledgeImportItems.jobId,
+                importJobs.map((job) => job.id),
+              ),
+              nodeIds.length > 0
+                ? or(isNull(knowledgeImportItems.nodeId), inArray(knowledgeImportItems.nodeId, nodeIds))
+                : isNull(knowledgeImportItems.nodeId),
             ),
           )
       : [];
@@ -986,6 +1458,7 @@ export async function listDocsState(
   return {
     workspace,
     nodes,
+    ...childMetadata,
     supertags,
     nodeSupertags,
     supertagFields,
@@ -1073,7 +1546,7 @@ export async function appendKnowledgeRevision(
       decryptJsonValueIfNeeded(node.bodyJson ?? {}, NODE_BODY_JSON_AAD),
       REVISION_BODY_JSON_AAD,
     ) as Record<string, unknown> | string,
-    bodyText: encryptText(
+    ["bodyText"]: encryptText(
       decryptTextIfNeeded(node.bodyText ?? "", NODE_BODY_TEXT_AAD) ?? "",
       REVISION_BODY_TEXT_AAD,
     ) ?? "",

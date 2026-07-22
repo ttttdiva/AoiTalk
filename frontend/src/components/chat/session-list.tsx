@@ -10,7 +10,7 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
 } from "@/components/ui/dropdown-menu";
-import { cn } from "@/lib/utils";
+import { cn, formatRelativeTime } from "@/lib/utils";
 import type { ConversationSession } from "@/lib/chat-api";
 
 type SessionListProps = {
@@ -21,24 +21,6 @@ type SessionListProps = {
   onDeleteSession: (id: string) => void;
 };
 
-/** 相対時間を返す */
-function formatRelativeTime(dateStr: string | null | undefined): string {
-  if (!dateStr) return "";
-  const date = new Date(dateStr);
-  const now = new Date();
-  const diffMs = now.getTime() - date.getTime();
-  const diffSec = Math.floor(diffMs / 1000);
-  const diffMin = Math.floor(diffSec / 60);
-  const diffHour = Math.floor(diffMin / 60);
-  const diffDay = Math.floor(diffHour / 24);
-
-  if (diffSec < 60) return "たった今";
-  if (diffMin < 60) return `${diffMin}分前`;
-  if (diffHour < 24) return `${diffHour}時間前`;
-  if (diffDay < 7) return `${diffDay}日前`;
-  if (diffDay < 30) return `${Math.floor(diffDay / 7)}週間前`;
-  return date.toLocaleDateString("ja-JP");
-}
 
 export function SessionList({
   sessions,
@@ -117,6 +99,7 @@ export function SessionList({
                   </DropdownMenuTrigger>
                   <DropdownMenuContent side="right" align="start">
                     <DropdownMenuItem
+                      mnemonic="D"
                       className="text-destructive focus:text-destructive"
                       onClick={(e) => {
                         e.stopPropagation();

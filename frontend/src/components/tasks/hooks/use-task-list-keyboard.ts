@@ -35,6 +35,7 @@ export function useTaskListKeyboard({
   handleClipboardPaste,
   clipboardRef,
   searchInputRef,
+  readOnly = false,
 }: {
   tasks: Task[];
   filteredTasks: Task[];
@@ -63,6 +64,7 @@ export function useTaskListKeyboard({
   handleClipboardPaste: () => Promise<void>;
   clipboardRef: React.RefObject<TaskClipboard>;
   searchInputRef: React.RefObject<HTMLInputElement | null>;
+  readOnly?: boolean;
 }) {
   useEffect(() => {
     const focusFirstRow = () => {
@@ -109,6 +111,7 @@ export function useTaskListKeyboard({
         e.key === "/" &&
         focusedTaskId
       ) {
+        if (readOnly) return;
         e.preventDefault();
         openTaskCommandDialog(focusedTaskId);
         return;
@@ -149,6 +152,7 @@ export function useTaskListKeyboard({
         e.key.toLowerCase() === "s" &&
         focusedTaskId
       ) {
+        if (readOnly) return;
         e.preventDefault();
         void handleFocusedTaskTimerStart();
         return;
@@ -183,6 +187,7 @@ export function useTaskListKeyboard({
       }
 
       if (e.key === "Delete") {
+        if (readOnly) return;
         const targetTasks = getKeyboardSelectionTasks();
         if (targetTasks.length === 0) return;
         e.preventDefault();
@@ -197,6 +202,7 @@ export function useTaskListKeyboard({
       }
 
       if ((e.ctrlKey || e.metaKey) && e.key === "x") {
+        if (readOnly) return;
         e.preventDefault();
         handleClipboardStore("cut");
         return;
@@ -207,6 +213,7 @@ export function useTaskListKeyboard({
         e.key === "v" &&
         clipboardRef.current.tasks.length > 0
       ) {
+        if (readOnly) return;
         e.preventDefault();
         void handleClipboardPaste();
       }
@@ -239,5 +246,6 @@ export function useTaskListKeyboard({
     selectedIds,
     selectedTaskId,
     tasks,
+    readOnly,
   ]);
 }

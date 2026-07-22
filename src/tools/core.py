@@ -5,6 +5,7 @@ OpenAI API, Gemini API, CLI, SGLang 等のどのバックエンドでも
 使える統一的なツール定義を提供する。
 """
 from dataclasses import dataclass, field
+from copy import deepcopy
 from typing import Any, Callable, Dict, Iterable, List, Optional, Union, get_type_hints
 import asyncio
 import inspect
@@ -19,6 +20,7 @@ class ToolParam:
     required: bool = True
     default: Any = None
     enum: Optional[List[str]] = None
+    schema: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -42,10 +44,11 @@ class ToolDefinition:
         properties: Dict[str, Any] = {}
         required: List[str] = []
         for p in self.parameters:
-            prop: Dict[str, Any] = {"type": p.type}
+            prop: Dict[str, Any] = deepcopy(p.schema) if p.schema else {"type": p.type}
+            prop.setdefault("type", p.type)
             if p.description:
-                prop["description"] = p.description
-            if p.enum:
+                prop.setdefault("description", p.description)
+            if p.enum and "enum" not in prop:
                 prop["enum"] = p.enum
             properties[p.name] = prop
             if p.required:

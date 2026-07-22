@@ -30,7 +30,7 @@ _KNOWN_FLAT_MANAGEMENT_KEYS = {
     "request_files",
     "task_rules",
 }
-_KNOWN_TOP_LEVEL_KEYS = {"schema_version", "links", "management"} | _KNOWN_FLAT_LINK_KEYS | _KNOWN_FLAT_MANAGEMENT_KEYS
+_KNOWN_TOP_LEVEL_KEYS = {"schema_version", "links", "management", "workspace_tools_enabled"} | _KNOWN_FLAT_LINK_KEYS | _KNOWN_FLAT_MANAGEMENT_KEYS
 
 _runtime_project_context: ContextVar[Optional[dict[str, Any]]] = ContextVar(
     "runtime_project_context",
@@ -165,6 +165,7 @@ def normalize_project_metadata(metadata: Optional[dict[str, Any]]) -> dict[str, 
     normalized["schema_version"] = DEFAULT_PROJECT_METADATA_SCHEMA_VERSION
     normalized["links"] = links
     normalized["management"] = management
+    normalized["workspace_tools_enabled"] = _coerce_bool(raw.get("workspace_tools_enabled"), False)
     return normalized
 
 
@@ -238,6 +239,7 @@ def build_project_context(project: Any) -> Optional[dict[str, Any]]:
     context["risk_file"] = normalized_metadata["management"].get("risk_file")
     context["request_files"] = normalized_metadata["management"].get("request_files", [])
     context["task_rules"] = normalized_metadata["management"]["task_rules"]
+    context["workspace_tools_enabled"] = normalized_metadata["workspace_tools_enabled"]
     return context
 
 

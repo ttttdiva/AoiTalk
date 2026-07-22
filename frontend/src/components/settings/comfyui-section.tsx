@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
+import useSWR from "swr";
 import { 
   ComfyUIConfig, 
   ComfyUIWorkflow, 
@@ -42,11 +43,55 @@ import {
 } from "@/components/ui/table";
 import { format } from "date-fns";
 import { Checkbox } from "@/components/ui/checkbox";
+import { useConfirm } from "@/hooks/use-confirm";
+
+type ComfyUIConfigResult = ComfyUIConfig & { success: boolean };
+
+interface ComfyUIData {
+  config: ComfyUIConfigResult | null;
+  workflows: ComfyUIWorkflow[];
+}
+
+const EMPTY_COMFYUI_DATA: ComfyUIData = { config: null, workflows: [] };
 
 export function ComfyUISection() {
+  const confirm = useConfirm();
   const [expanded, setExpanded] = useState(false);
-  const [config, setConfig] = useState<ComfyUIConfig | null>(null);
-  const [workflows, setWorkflows] = useState<ComfyUIWorkflow[]>([]);
+  // config / workflows（サーバー状態）は SWR で管理。取得タイミングは従来どおり
+  // 呼び出し側（展開/各操作/接続確認）で駆動するため自動 revalidation は無効化する。
+  // 接続状態(isAvailable)と入力中URL(tempUrl)は fetchData の制御に合わせて別管理する。
+  const comfyRef = useRef<ComfyUIData>(EMPTY_COMFYUI_DATA);
+  const { data: comfyData = EMPTY_COMFYUI_DATA, mutate: mutateComfy } = useSWR<ComfyUIData>(
+    "settings/comfyui",
+    async () => {
+      try {
+        const [configRes, workflowsRes] = await Promise.all([
+          comfyuiApi.getConfig(),
+          comfyuiApi.listWorkflows(),
+        ]);
+        const prev = comfyRef.current;
+        return {
+          config: configRes.success ? configRes : prev.config,
+          workflows: workflowsRes.success ? workflowsRes.workflows : prev.workflows,
+        };
+      } catch (error) {
+        console.error("Failed to fetch ComfyUI data:", error);
+        toast.error("ComfyUI設定の取得に失敗しました");
+        return comfyRef.current;
+      }
+    },
+    {
+      revalidateOnMount: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+      keepPreviousData: true,
+      dedupingInterval: 0,
+    },
+  );
+  comfyRef.current = comfyData;
+  const config = comfyData.config;
+  const workflows = comfyData.workflows;
   const [isAvailable, setIsAvailable] = useState<boolean | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
@@ -55,19 +100,12 @@ export function ComfyUISection() {
   const fetchData = useCallback(async (checkStatus = true) => {
     setIsLoading(true);
     try {
-      const [configRes, workflowsRes] = await Promise.all([
-        comfyuiApi.getConfig(),
-        comfyuiApi.listWorkflows()
-      ]);
-
-      if (configRes.success) {
-        setConfig(configRes);
-        setTempUrl(configRes.url);
+      const result = await mutateComfy();
+      const nextConfig = result?.config;
+      if (nextConfig?.success) {
+        setTempUrl(nextConfig.url);
       }
-      if (workflowsRes.success) {
-        setWorkflows(workflowsRes.workflows);
-      }
-      if (checkStatus && configRes.enabled) {
+      if (checkStatus && nextConfig?.enabled) {
         const statusRes = await comfyuiApi.getStatus();
         if (statusRes.success) {
           setIsAvailable(statusRes.is_available);
@@ -75,13 +113,10 @@ export function ComfyUISection() {
       } else {
         setIsAvailable(false);
       }
-    } catch (error) {
-      console.error("Failed to fetch ComfyUI data:", error);
-      toast.error("ComfyUI設定の取得に失敗しました");
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [mutateComfy]);
 
   useEffect(() => {
     if (expanded && !config) fetchData(false);
@@ -95,7 +130,10 @@ export function ComfyUISection() {
     try {
       const res = await comfyuiApi.updateConfig({ enabled });
       if (res.success) {
-        setConfig(res);
+        // 楽観的更新：更新レスポンスでローカルキャッシュの config を差し替える。
+        await mutateComfy((prev = EMPTY_COMFYUI_DATA) => ({ ...prev, config: res }), {
+          revalidate: false,
+        });
         setIsAvailable(false);
         toast.success(enabled ? "ComfyUI連携を有効にしました" : "ComfyUI連携を無効にしました");
         if (enabled) fetchData(true);
@@ -109,7 +147,9 @@ export function ComfyUISection() {
     try {
       const res = await comfyuiApi.updateConfig({ url: tempUrl });
       if (res.success) {
-        setConfig(res);
+        await mutateComfy((prev = EMPTY_COMFYUI_DATA) => ({ ...prev, config: res }), {
+          revalidate: false,
+        });
         toast.success("設定を更新しました");
         fetchData(false);
       }
@@ -143,7 +183,13 @@ export function ComfyUISection() {
   };
 
   const handleDelete = async (name: string) => {
-    if (!confirm(`ワークフロー "${name}" を削除してもよろしいですか？`)) return;
+    if (
+      !(await confirm({
+        description: `ワークフロー "${name}" を削除してもよろしいですか？`,
+        destructive: true,
+      }))
+    )
+      return;
 
     try {
       const res = await comfyuiApi.deleteWorkflow(name);

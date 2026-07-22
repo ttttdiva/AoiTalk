@@ -2,8 +2,12 @@ import { and, asc, desc, eq, isNull } from "drizzle-orm";
 import { getDb, schema } from "../db/client";
 import { getToken } from "../lib/auth";
 import { chatApi } from "../lib/chat-api";
-import { useNetworkStore } from "../stores/network";
+import { isServerKnownUnreachable, useNetworkStore } from "../stores/network";
 import type { ConversationMessage, ConversationSession } from "../types/api";
+import {
+  pendingCommandCapabilities,
+  pendingResponseModel,
+} from "./pending-conversation-dispatch";
 import { randomId } from "./outbox";
 
 type DbSession = typeof schema.conversationSessions.$inferSelect;
@@ -237,7 +241,9 @@ async function promoteLocalSession(
   return remote;
 }
 
-export async function flushPendingConversation(
+const pendingFlushFlights = new Map<string, Promise<string>>();
+
+async function flushPendingConversationOnce(
   sessionId: string,
 ): Promise<string> {
   if (!(await canAttemptServer())) return sessionId;
@@ -249,7 +255,15 @@ export async function flushPendingConversation(
       .from(schema.conversationSessions)
       .where(eq(schema.conversationSessions.id, sessionId))
   )[0];
-  if (!row || row.deletedAt) return sessionId;
+  if (!row) return sessionId;
+  if (row.deletedAt) {
+    const metadata = row.sessionMetadata as Record<string, unknown> | null;
+    const promotedTo = metadata?.promoted_to_session_id;
+    return typeof promotedTo === "string" ? promotedTo : sessionId;
+  }
+
+  const pendingBeforePromotion = await listPendingMessagesForSessionId(row.id);
+  if (!pendingBeforePromotion.length) return sessionId;
 
   let remoteSessionId = row.id;
   let projectId = row.projectId ?? undefined;
@@ -266,11 +280,40 @@ export async function flushPendingConversation(
       project_id: projectId,
       include_project_context: Boolean(projectId),
       agent_mode: "confirm",
+      response_model: pendingResponseModel(message),
+      command_capabilities: pendingCommandCapabilities(message),
     });
     await conversationsRepo.markPendingMessageQueued(message.id);
   }
 
   return remoteSessionId;
+}
+
+export function flushPendingConversation(sessionId: string): Promise<string> {
+  const existing = pendingFlushFlights.get(sessionId);
+  if (existing) return existing;
+  const flight = flushPendingConversationOnce(sessionId).finally(() => {
+    if (pendingFlushFlights.get(sessionId) === flight) {
+      pendingFlushFlights.delete(sessionId);
+    }
+  });
+  pendingFlushFlights.set(sessionId, flight);
+  return flight;
+}
+
+export async function getPromotedConversationSessionId(
+  sessionId: string,
+): Promise<string | null> {
+  const db = getDb();
+  const row = (
+    await db
+      .select({ metadata: schema.conversationSessions.sessionMetadata })
+      .from(schema.conversationSessions)
+      .where(eq(schema.conversationSessions.id, sessionId))
+  )[0];
+  const metadata = row?.metadata as Record<string, unknown> | null | undefined;
+  const promotedTo = metadata?.promoted_to_session_id;
+  return typeof promotedTo === "string" ? promotedTo : null;
 }
 
 export async function flushPendingConversations(): Promise<void> {
@@ -282,8 +325,9 @@ export async function flushPendingConversations(): Promise<void> {
     .from(schema.conversationSessions)
     .where(isNull(schema.conversationSessions.deletedAt));
   for (const session of sessions) {
+    if (!isServerBackedSession(session)) continue;
     const pending = await listPendingMessagesForSessionId(session.id);
-    if (!pending.length && isServerBackedSession(session)) continue;
+    if (!pending.length) continue;
     try {
       await flushPendingConversation(session.id);
     } catch {
@@ -500,7 +544,7 @@ export const conversationsRepo = {
     characterName = "default",
     projectId?: string | null,
   ): Promise<ConversationSession> {
-    if (await canAttemptServer()) {
+    if ((await canAttemptServer()) && !isServerKnownUnreachable()) {
       try {
         const session = await chatApi.createSession(
           characterName,
@@ -508,7 +552,16 @@ export const conversationsRepo = {
         );
         await applyRemoteConversationSessions([session]);
         return session;
-      } catch {
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          (error.name === "AbortError" ||
+            /abort|timeout|timed out|network request failed|failed to fetch|networkerror|connection refused/i.test(
+              error.message,
+            ))
+        ) {
+          useNetworkStore.getState().setServerReachable(false);
+        }
         // Fall back to local-first below.
       }
     }

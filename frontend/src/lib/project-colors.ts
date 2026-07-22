@@ -88,6 +88,60 @@ function hslCss(h: number, s: number, l: number): string {
   return `hsl(${Math.round(h)} ${Math.round(s * 100)}% ${Math.round(l * 100)}%)`;
 }
 
+/** 文字列を 32bit の決定的ハッシュへ（FNV-1a）。 */
+function hashString(input: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function hslToHex(h: number, s: number, l: number): string {
+  const hue = ((h % 360) + 360) % 360;
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const hp = hue / 60;
+  const x = c * (1 - Math.abs((hp % 2) - 1));
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  if (hp < 1) {
+    [r, g, b] = [c, x, 0];
+  } else if (hp < 2) {
+    [r, g, b] = [x, c, 0];
+  } else if (hp < 3) {
+    [r, g, b] = [0, c, x];
+  } else if (hp < 4) {
+    [r, g, b] = [0, x, c];
+  } else if (hp < 5) {
+    [r, g, b] = [x, 0, c];
+  } else {
+    [r, g, b] = [c, 0, x];
+  }
+  const m = l - c / 2;
+  const toHex = (value: number) =>
+    Math.round((value + m) * 255)
+      .toString(16)
+      .padStart(2, "0");
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+
+/**
+ * プロジェクト/サーバー ID から決定的にフォールバック色（hex）を生成する。
+ * 同じ ID は常に同じ色。ゴールデンアングルで色相を分散させる。
+ * project_color 未設定でもプロジェクトごとに識別可能な色を得るために使う。
+ */
+export function fallbackColorFromId(
+  id: string | null | undefined,
+): string | undefined {
+  const seed = id?.trim();
+  if (!seed) return undefined;
+  const hash = hashString(seed);
+  const hue = (hash * 137.508) % 360; // golden angle
+  return hslToHex(hue, 0.55, 0.55);
+}
+
 function fallbackTokens(
   color: string,
   theme: ProjectColorTheme,
@@ -135,40 +189,42 @@ export function resolveProjectColorTokens(
   const usableSaturation = Math.max(s, 0.18);
 
   if (theme === "dark") {
-    const surfaceSaturation = clamp(usableSaturation * 0.58, 0.26, 0.6);
+    // 本文面 --card(#12233d, l≈14%) と十分な明度差をつけて識別できるよう強化。
+    const surfaceSaturation = clamp(usableSaturation * 0.64, 0.35, 0.62);
     const accentSaturation = clamp(usableSaturation * 0.92, 0.45, 0.84);
 
     return {
       accent: hslCss(h, accentSaturation, clamp(Math.max(l, 0.58), 0.58, 0.68)),
-      surface: hslCss(h, surfaceSaturation, 0.26),
-      surfaceAlt: hslCss(h, clamp(surfaceSaturation * 0.92, 0.24, 0.56), 0.21),
-      surfaceHover: hslCss(h, surfaceSaturation, 0.3),
+      surface: hslCss(h, surfaceSaturation, 0.32),
+      surfaceAlt: hslCss(h, clamp(surfaceSaturation * 0.94, 0.32, 0.58), 0.27),
+      surfaceHover: hslCss(h, surfaceSaturation, 0.36),
       surfaceGradient: `linear-gradient(135deg, ${hslCss(
         h,
         surfaceSaturation,
-        0.27,
-      )}, ${hslCss(h, clamp(surfaceSaturation * 0.92, 0.24, 0.56), 0.21)})`,
-      border: hslCss(h, clamp(usableSaturation * 0.72, 0.36, 0.68), 0.48),
+        0.33,
+      )}, ${hslCss(h, clamp(surfaceSaturation * 0.94, 0.32, 0.58), 0.27)})`,
+      border: hslCss(h, clamp(usableSaturation * 0.78, 0.45, 0.72), 0.54),
       text: DEFAULT_TEXT_COLOR,
       mutedText: DEFAULT_MUTED_TEXT_COLOR,
       stripe: hslCss(h, accentSaturation, clamp(Math.max(l, 0.6), 0.6, 0.7)),
     };
   }
 
-  const surfaceSaturation = clamp(usableSaturation * 0.62, 0.24, 0.66);
+  // ライト: 白い本文面から識別できるよう、色味をもう少し乗せる。
+  const surfaceSaturation = clamp(usableSaturation * 0.7, 0.38, 0.7);
   const accentSaturation = clamp(usableSaturation * 0.92, 0.44, 0.82);
 
   return {
     accent: hslCss(h, accentSaturation, clamp(l, 0.34, 0.48)),
-    surface: hslCss(h, surfaceSaturation, 0.92),
-    surfaceAlt: hslCss(h, clamp(surfaceSaturation * 1.08, 0.28, 0.72), 0.88),
-    surfaceHover: hslCss(h, clamp(surfaceSaturation * 1.12, 0.3, 0.74), 0.84),
+    surface: hslCss(h, surfaceSaturation, 0.9),
+    surfaceAlt: hslCss(h, clamp(surfaceSaturation * 1.08, 0.42, 0.74), 0.86),
+    surfaceHover: hslCss(h, clamp(surfaceSaturation * 1.12, 0.44, 0.76), 0.82),
     surfaceGradient: `linear-gradient(135deg, ${hslCss(
       h,
       surfaceSaturation,
-      0.93,
-    )}, ${hslCss(h, clamp(surfaceSaturation * 1.08, 0.28, 0.72), 0.88)})`,
-    border: hslCss(h, clamp(usableSaturation * 0.5, 0.24, 0.56), 0.68),
+      0.91,
+    )}, ${hslCss(h, clamp(surfaceSaturation * 1.08, 0.42, 0.74), 0.86)})`,
+    border: hslCss(h, clamp(usableSaturation * 0.58, 0.4, 0.62), 0.62),
     text: DEFAULT_TEXT_COLOR,
     mutedText: DEFAULT_MUTED_TEXT_COLOR,
     stripe: hslCss(h, accentSaturation, clamp(l, 0.34, 0.48)),

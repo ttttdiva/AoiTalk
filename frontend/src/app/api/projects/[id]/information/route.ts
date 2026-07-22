@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createHash } from "crypto";
-import { and, desc, eq, isNull, or } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, or } from "drizzle-orm";
 import { db } from "@/db";
 import {
   knowledgeNodes,
+  knowledgeFields,
+  knowledgeFieldValues,
   knowledgeNodeSupertags,
   knowledgeSupertags,
   projectQaEntries,
@@ -14,11 +16,10 @@ import { getSession } from "@/lib/auth";
 import { decryptTextIfNeeded, encryptText } from "@/lib/server/field-crypto";
 import {
   appendKnowledgeRevision,
-  decryptNodeBodyText,
-  encryptNodeBodyJson,
-  encryptNodeBodyText,
   ensureDocsWorkspace,
+  normalizeFieldValueInput,
   serializeNode,
+  serializeNodeSupertag,
   serializeSupertag,
   upsertKnowledgeSearchIndex,
 } from "@/lib/server/knowledge-docs-utils";
@@ -27,20 +28,16 @@ import {
   getWritableProject,
 } from "@/lib/server/project-access";
 import { normalizeProjectManagementConfig } from "@/lib/server/project-workspace-management";
+import { insertDocsNode, updateDocsNode, type DocsNodeWriterUpdate } from "@/lib/server/docs-node-writer";
+import {
+  ensureProjectInformationHierarchyNode,
+  isDefaultInboxProject,
+} from "@/lib/server/project-information-hierarchy";
 
 const QA_STATUSES = new Set(["unanswered", "answered", "stale", "archived"]);
 const QA_REVIEW_STATES = new Set(["candidate", "accepted", "rejected"]);
 const PROJECT_INFORMATION_SUPERTAG = "Project information";
 const PROJECT_INFORMATION_SYSTEM_KEY = "project_info";
-const PROJECT_INFORMATION_SECTIONS = [
-  "Overview",
-  "Scope",
-  "Assumptions",
-  "Decisions",
-  "Issues",
-  "References",
-  "Q&A",
-];
 
 function cleanString(value: unknown, fallback = "", maxLength = 500): string {
   if (typeof value !== "string") return fallback;
@@ -51,11 +48,6 @@ function cleanString(value: unknown, fallback = "", maxLength = 500): string {
 function cleanNullableString(value: unknown): string | null {
   const text = cleanString(value);
   return text || null;
-}
-
-function cleanText(value: unknown, maxLength = 200000): string {
-  if (typeof value !== "string") return "";
-  return value.slice(0, maxLength);
 }
 
 function oneOf(value: unknown, allowed: Set<string>, fallback: string): string {
@@ -92,12 +84,6 @@ function normalizedQuestionHash(value: string) {
   return createHash("sha256").update(normalized).digest("hex");
 }
 
-function initialSectionBody(project: { description: string | null }, title: string) {
-  if (title === "Overview") return project.description?.trim() || "Not documented yet";
-  if (title === "Q&A") return "[[project-qa]]";
-  return "Not documented yet";
-}
-
 function projectInformationBodyJson() {
   return {
     format: "project_information_doc_block",
@@ -106,43 +92,54 @@ function projectInformationBodyJson() {
   };
 }
 
-async function ensureProjectInformationSections(
-  parent: typeof knowledgeNodes.$inferSelect,
+async function ensureProjectInformationFieldValues(
+  node: typeof knowledgeNodes.$inferSelect,
+  supertag: typeof knowledgeSupertags.$inferSelect,
   project: typeof projects.$inferSelect,
   userId: string,
 ) {
-  const children = await db
+  const fields = await db
     .select()
-    .from(knowledgeNodes)
-    .where(and(eq(knowledgeNodes.parentId, parent.id), isNull(knowledgeNodes.archivedAt)));
-  const existingTitles = new Set(children.map((child) => child.title));
-  for (const [index, title] of PROJECT_INFORMATION_SECTIONS.entries()) {
-    if (existingTitles.has(title)) continue;
-    await db.insert(knowledgeNodes).values({
-      workspaceId: parent.workspaceId,
-      projectId: project.id,
-      parentId: parent.id,
-      title,
-      bodyText: encryptNodeBodyText(initialSectionBody(project, title)),
-      bodyJson: encryptNodeBodyJson({ format: "project_information_section", title }),
-      nodeType: "node",
-      sortOrder: index,
-      createdBy: userId,
+    .from(knowledgeFields)
+    .where(eq(knowledgeFields.supertagId, supertag.id));
+  const projectField = fields.find((field) => field.name === "Project" || field.systemKey === "project");
+  if (projectField) {
+    const fieldValue = {
+      ...normalizeFieldValueInput(projectField, project.id),
+      nodeId: node.id,
+      targetNodeId: null,
       updatedBy: userId,
-    });
+    };
+    await db
+      .insert(knowledgeFieldValues)
+      .values(fieldValue)
+      .onConflictDoUpdate({
+        target: [knowledgeFieldValues.nodeId, knowledgeFieldValues.fieldId],
+        set: {
+          valueJson: fieldValue.valueJson,
+          valueText: fieldValue.valueText,
+          valueNumber: fieldValue.valueNumber,
+          valueDatetime: fieldValue.valueDatetime,
+          targetNodeId: fieldValue.targetNodeId,
+          updatedBy: fieldValue.updatedBy,
+        },
+      });
   }
-  const [updated] = await db
-    .update(knowledgeNodes)
-    .set({
-      bodyText: encryptNodeBodyText(""),
-      bodyJson: encryptNodeBodyJson(projectInformationBodyJson()),
-      updatedBy: userId,
-      updatedAt: new Date(),
-    })
-    .where(eq(knowledgeNodes.id, parent.id))
-    .returning();
-  await upsertKnowledgeSearchIndex(db, updated, "");
-  return updated;
+
+  const pageRoleField = fields.find(
+    (field) => field.name === "Page Role" || field.systemKey === "page_role",
+  );
+  if (pageRoleField) {
+    await db
+      .insert(knowledgeFieldValues)
+      .values({
+        ...normalizeFieldValueInput(pageRoleField, "canonical"),
+        nodeId: node.id,
+        targetNodeId: null,
+        updatedBy: userId,
+      })
+      .onConflictDoNothing();
+  }
 }
 
 async function findProjectInformationSection(parentId: string, title: string) {
@@ -203,87 +200,19 @@ async function ensureProjectInformationDocument(
   if (!supertag) {
     throw new Error("案件情報スーパータグが見つかりません");
   }
-
-  let node: typeof knowledgeNodes.$inferSelect | null = null;
-  if (project.knowledgeNodeId) {
-    const [existing] = await db
-      .select()
-      .from(knowledgeNodes)
-      .where(
-        and(
-          eq(knowledgeNodes.id, project.knowledgeNodeId),
-          eq(knowledgeNodes.workspaceId, workspace.id),
-          isNull(knowledgeNodes.archivedAt),
-        ),
-      )
-      .limit(1);
-    node = existing ?? null;
-  }
-
-  if (!node) {
-    const [existing] = await db
-      .select({ node: knowledgeNodes })
-      .from(knowledgeNodes)
-      .innerJoin(
-        knowledgeNodeSupertags,
-        eq(knowledgeNodeSupertags.nodeId, knowledgeNodes.id),
-      )
-      .where(
-        and(
-          eq(knowledgeNodes.workspaceId, workspace.id),
-          eq(knowledgeNodes.projectId, project.id),
-          eq(knowledgeNodeSupertags.supertagId, supertag.id),
-          isNull(knowledgeNodes.archivedAt),
-        ),
-      )
-      .limit(1);
-    node = existing?.node ?? null;
-  }
-
-  if (node) {
-    if (project.knowledgeNodeId !== node.id) {
-      await db
-        .update(projects)
-        .set({ knowledgeNodeId: node.id, updatedAt: new Date() })
-        .where(eq(projects.id, project.id));
-    }
-    const ensured = await ensureProjectInformationSections(node, project, user.id);
-    return { node: ensured, supertag };
-  }
-
-  const initialBodyJson = projectInformationBodyJson();
-
-  const created = await db.transaction(async (tx) => {
-    const [newNode] = await tx
-      .insert(knowledgeNodes)
-      .values({
-        workspaceId: workspace.id,
-        projectId: project.id,
-        title: `${project.name} 案件情報`,
-        bodyText: encryptNodeBodyText(""),
-        bodyJson: encryptNodeBodyJson(initialBodyJson),
-        nodeType: "node",
-        sortOrder: 0,
-        createdBy: user.id,
-        updatedBy: user.id,
-      })
-      .returning();
-    await tx.insert(knowledgeNodeSupertags).values({
-      nodeId: newNode.id,
-      supertagId: supertag.id,
-      createdBy: user.id,
-    });
-    await tx
-      .update(projects)
-      .set({ knowledgeNodeId: newNode.id, updatedAt: new Date() })
-      .where(eq(projects.id, project.id));
-    await upsertKnowledgeSearchIndex(tx, newNode, "");
-    await appendKnowledgeRevision(tx, newNode, user.id, "案件情報Docs正本を作成");
-    return newNode;
+  const hierarchyNode = await ensureProjectInformationHierarchyNode({
+    workspaceId: workspace.id,
+    userId: user.id,
+    project,
   });
-
-  const ensured = await ensureProjectInformationSections(created, project, user.id);
-  return { node: ensured, supertag };
+  const node = await updateDocsNode(db, hierarchyNode.id, {
+    bodyJson: projectInformationBodyJson(),
+    updatedBy: user.id,
+    updatedAt: new Date(),
+  });
+  await ensureProjectInformationFieldValues(node, supertag, project, user.id);
+  await upsertKnowledgeSearchIndex(db, node, node.title);
+  return { node, supertag };
 }
 
 export async function GET(
@@ -303,12 +232,18 @@ export async function GET(
       { status: 404 },
     );
   }
+  if (isDefaultInboxProject(access.project)) {
+    return NextResponse.json(
+      { detail: "Inboxは案件情報Docsの保存先ではありません" },
+      { status: 409 },
+    );
+  }
 
   const { node, supertag } = await ensureProjectInformationDocument(
     user,
     access.project,
   );
-  const [qaEntries, tables] = await Promise.all([
+  const [qaEntries, tables, treeNodes, projectSupertags] = await Promise.all([
     db
       .select()
       .from(projectQaEntries)
@@ -329,7 +264,23 @@ export async function GET(
       .from(recordTables)
       .where(and(eq(recordTables.projectId, projectId), isNull(recordTables.deletedAt)))
       .orderBy(recordTables.sortOrder, recordTables.createdAt),
+    db
+      .select()
+      .from(knowledgeNodes)
+      .where(and(eq(knowledgeNodes.projectId, projectId), eq(knowledgeNodes.workspaceId, node.workspaceId), isNull(knowledgeNodes.archivedAt)))
+      .orderBy(asc(knowledgeNodes.sortOrder), asc(knowledgeNodes.createdAt)),
+    db
+      .select()
+      .from(knowledgeSupertags)
+      .where(eq(knowledgeSupertags.workspaceId, node.workspaceId)),
   ]);
+  const treeNodeIds = treeNodes.map((entry) => entry.id);
+  const treeNodeSupertags = treeNodeIds.length > 0
+    ? await db
+        .select()
+        .from(knowledgeNodeSupertags)
+        .where(inArray(knowledgeNodeSupertags.nodeId, treeNodeIds))
+    : [];
 
   return NextResponse.json({
     project: {
@@ -339,6 +290,9 @@ export async function GET(
       knowledge_node_id: node.id,
     },
     node: serializeNode(node),
+    tree_nodes: treeNodes.map(serializeNode),
+    node_supertags: treeNodeSupertags.map(serializeNodeSupertag),
+    supertags: projectSupertags.map(serializeSupertag),
     supertag: serializeSupertag(supertag),
     qa_entries: qaEntries.map(decryptQaEntry),
     management_documents: managementDocuments(access.project),
@@ -361,6 +315,12 @@ export async function POST(
     return NextResponse.json(
       { detail: "プロジェクトが見つからないか権限がありません" },
       { status: 404 },
+    );
+  }
+  if (isDefaultInboxProject(access.project)) {
+    return NextResponse.json(
+      { detail: "Inboxは案件情報Docsの保存先ではありません" },
+      { status: 409 },
     );
   }
 
@@ -419,17 +379,14 @@ export async function POST(
       );
     }
     const description = cleanNullableString(body.description);
-    const section = await findProjectInformationSection(node.id, "References");
-    const referenceBody = `${target}${description ? `\n${description}` : ""}`;
-    const [created] = await db
-      .insert(knowledgeNodes)
-      .values({
+    const section = await findProjectInformationSection(node.id, "参照");
+    const created = await insertDocsNode(db, {
         workspaceId: node.workspaceId,
         projectId,
         parentId: section?.id ?? node.id,
+        rootPageId: node.rootPageId ?? node.id,
         title,
-        bodyText: encryptNodeBodyText(referenceBody),
-        bodyJson: encryptNodeBodyJson({
+        bodyJson: {
           format: "project_information_reference",
           target,
           description,
@@ -438,14 +395,32 @@ export async function POST(
             external_url: cleanNullableString(body.external_url),
             record_table_id: cleanNullableString(body.record_table_id),
           },
-        }),
+        },
         nodeType: "reference",
         sortOrder: Date.now(),
         createdBy: user.id,
         updatedBy: user.id,
-      })
-      .returning();
-    await upsertKnowledgeSearchIndex(db, created, referenceBody);
+      });
+    await upsertKnowledgeSearchIndex(db, created, created.title);
+    const referenceChildren = [
+      `参照先: ${target}`,
+      description ? `説明: ${description}` : null,
+    ].filter((item): item is string => !!item);
+    for (const [index, childTitle] of referenceChildren.entries()) {
+      const child = await insertDocsNode(db, {
+        workspaceId: node.workspaceId,
+        projectId,
+        parentId: created.id,
+        rootPageId: node.rootPageId ?? node.id,
+        title: childTitle,
+        bodyJson: { format: "doc_block", block_type: "paragraph" },
+        nodeType: "node",
+        sortOrder: index,
+        createdBy: user.id,
+        updatedBy: user.id,
+      });
+      await upsertKnowledgeSearchIndex(db, child, child.title);
+    }
     await appendKnowledgeRevision(db, created, user.id, "Project information reference added");
     return NextResponse.json({ node: serializeNode(created) }, { status: 201 });
   }
@@ -470,6 +445,12 @@ export async function PATCH(
       { status: 404 },
     );
   }
+  if (isDefaultInboxProject(access.project)) {
+    return NextResponse.json(
+      { detail: "Inboxは案件情報Docsの保存先ではありません" },
+      { status: 409 },
+    );
+  }
 
   const body = await request.json().catch(() => ({}));
   const kind = cleanString(body.kind);
@@ -492,28 +473,22 @@ export async function PATCH(
       return NextResponse.json({ detail: "node not found" }, { status: 404 });
     }
 
-    const updates: Partial<typeof knowledgeNodes.$inferInsert> = {
+    const updates: DocsNodeWriterUpdate = {
       updatedBy: user.id,
       updatedAt: new Date(),
     };
-    let nextBodyText = decryptNodeBodyText(node.bodyText ?? "");
     if (body.title !== undefined) {
       updates.title = cleanString(body.title, node.title, 500);
     }
     if (body.body_text !== undefined) {
-      nextBodyText = cleanText(body.body_text, 200000);
-      updates.bodyText = encryptNodeBodyText(nextBodyText);
+      updates.title = cleanString(body.body_text, updates.title ?? node.title, 500);
     }
     if (body.body_json !== undefined) {
-      updates.bodyJson = encryptNodeBodyJson(jsonObject(body.body_json));
+      updates.bodyJson = jsonObject(body.body_json);
     }
 
-    const [updated] = await db
-      .update(knowledgeNodes)
-      .set(updates)
-      .where(eq(knowledgeNodes.id, node.id))
-      .returning();
-    await upsertKnowledgeSearchIndex(db, updated, nextBodyText);
+    const updated = await updateDocsNode(db, node.id, updates);
+    await upsertKnowledgeSearchIndex(db, updated, updated.title);
     await appendKnowledgeRevision(
       db,
       updated,

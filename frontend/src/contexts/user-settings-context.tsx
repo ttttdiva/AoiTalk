@@ -6,6 +6,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import {
@@ -42,10 +43,14 @@ export function UserSettingsProvider({
   children: React.ReactNode;
 }) {
   const [settings, setSettings] = useState<UserSettings>({});
+  const requestVersionRef = useRef(0);
 
   const refresh = useCallback(() => {
+    const requestVersion = ++requestVersionRef.current;
     getUserSettings()
-      .then(setSettings)
+      .then((next) => {
+        if (requestVersion === requestVersionRef.current) setSettings(next);
+      })
       .catch(() => {});
   }, []);
 
@@ -54,8 +59,9 @@ export function UserSettingsProvider({
   }, [refresh]);
 
   const patch = useCallback(async (settingsPatch: UserSettings) => {
+    const requestVersion = ++requestVersionRef.current;
     const next = await patchUserSettings(settingsPatch);
-    setSettings(next);
+    if (requestVersion === requestVersionRef.current) setSettings(next);
     return next;
   }, []);
 

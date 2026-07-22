@@ -35,6 +35,14 @@ export const CHAT_SHORTCUT_HELP_ITEMS: ShortcutHelpItem[] = [
   },
 ];
 
+export type ComposerBusyEnterAction = "steer" | "queue";
+
+export function resolveComposerBusyEnterAction(
+  event: Pick<KeyboardShortcutEvent, "ctrlKey" | "metaKey">,
+): ComposerBusyEnterAction {
+  return event.ctrlKey || event.metaKey ? "steer" : "queue";
+}
+
 export function getChatComposerShortcutAction(
   event: KeyboardShortcutEvent,
 ): ChatComposerShortcutAction | null {

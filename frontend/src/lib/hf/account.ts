@@ -100,6 +100,7 @@ export function resolveToken(
     // ケース非依存で比較（大文字化された id が来ても復元できるように）
     picked = accounts.find((a) => a.id === accountId)
       || accounts.find((a) => a.id.toLowerCase() === accountId.toLowerCase());
+    if (!picked) return null;
   }
   if (!picked) picked = accounts[0];
 
@@ -107,6 +108,17 @@ export function resolveToken(
   if (!token) return null;
 
   return { accountId: picked.id, username: picked.username, token };
+}
+
+/** 登録済みアカウントとtokenの組。サーバー側のHF照会でのみ使用する。 */
+export function listResolvedTokens(): Array<{
+  accountId: string;
+  username: string;
+  token: string;
+}> {
+  return listAccounts()
+    .map((account) => resolveToken(account.id))
+    .filter((item): item is NonNullable<typeof item> => item !== null);
 }
 
 /** 公開リポジトリ閲覧用のフォールバックトークン（匿名閲覧も可） */

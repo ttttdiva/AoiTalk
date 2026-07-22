@@ -6,8 +6,10 @@ import { Button } from "@/components/ui/button";
 import { Loader2, Trash2 } from "lucide-react";
 import { chatApi, type ScenarioLogEntry } from "@/lib/chat-api";
 import { pyFetch } from "@/lib/scenarios-page-utils";
+import { useConfirm } from "@/hooks/use-confirm";
 
 function ScenarioLogPanel({ scenarioId }: { scenarioId: string }) {
+  const confirm = useConfirm();
   const [logs, setLogs] = useState<ScenarioLogEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [deletingLogId, setDeletingLogId] = useState<string | null>(null);
@@ -38,7 +40,12 @@ function ScenarioLogPanel({ scenarioId }: { scenarioId: string }) {
     async (log: ScenarioLogEntry) => {
       const roomId = log.room_id || log.id;
       if (!roomId) return;
-      if (!confirm(`TRPGセッション「${log.title || log.target_label}」を削除しますか？`)) {
+      if (
+        !(await confirm({
+          description: `TRPGセッション「${log.title || log.target_label}」を削除しますか？`,
+          destructive: true,
+        }))
+      ) {
         return;
       }
 
@@ -55,7 +62,7 @@ function ScenarioLogPanel({ scenarioId }: { scenarioId: string }) {
         setDeletingLogId(null);
       }
     },
-    [loadLogs],
+    [loadLogs, confirm],
   );
 
   return (

@@ -16,6 +16,7 @@ import { X, Download, FileIcon } from "lucide-react";
 import { hfServeUrl, hfTextUrl, isHfPath } from "@/lib/hf/virtual-path";
 import { isHydrusPath } from "@/lib/hydrus/virtual-path";
 import { getFileServeUrl } from "@/lib/explorer-serve-url";
+import { getFileExt } from "@/lib/utils";
 
 const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "gif", "webp", "svg", "bmp"]);
 const TEXT_EXTS = new Set([
@@ -39,12 +40,8 @@ const TEXT_EXTS = new Set([
   "sql",
 ]);
 
-function getExt(name: string): string {
-  return name.includes(".") ? name.split(".").pop()!.toLowerCase() : "";
-}
-
 async function loadHfPreview(file: ExplorerFile): Promise<FilePreview | null> {
-  const ext = getExt(file.name);
+  const ext = getFileExt(file.name);
   if (IMAGE_EXTS.has(ext)) {
     const url = hfServeUrl(file.path);
     return url ? { success: true, type: "image", data_url: url } : null;

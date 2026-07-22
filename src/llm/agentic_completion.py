@@ -247,6 +247,7 @@ def build_agentic_review_prompt(
     latest_response: str,
     round_index: int,
     user_input: str | None = None,
+    tool_evidence: str | None = None,
 ) -> str:
     lines = [
         "You are the completion verifier for this AoiTalk agent run.",
@@ -266,6 +267,10 @@ def build_agentic_review_prompt(
                 "Continue when the answer is based only on a first shallow result, when stored evidence is insufficient and project files have not been inspected/refreshed, or when needed external current facts have not been searched.",
             ]
         )
+    if tool_evidence:
+        lines.append(
+            "If the 'Confirmed tool executions in the latest run' section below lists tool executions, treat them as confirmed tool results backing the latest response."
+        )
     lines.extend(
         [
             "Return exactly one JSON object and no markdown:",
@@ -276,6 +281,18 @@ def build_agentic_review_prompt(
             "",
             "Original conversation context:",
             original_context,
+        ]
+    )
+    if tool_evidence:
+        lines.extend(
+            [
+                "",
+                "Confirmed tool executions in the latest run:",
+                tool_evidence,
+            ]
+        )
+    lines.extend(
+        [
             "",
             "Latest assistant response:",
             latest_response,
@@ -321,6 +338,7 @@ async def run_agentic_completion_loop_async(
     stream_callback: Optional[AsyncStreamCallback] = None,
     user_input: str | None = None,
     initial_response: str | None = None,
+    tool_evidence_provider: Callable[[], str] | None = None,
 ) -> str:
     if not agentic_completion_enabled(client, user_input):
         if initial_response is not None:
@@ -345,11 +363,15 @@ async def run_agentic_completion_loop_async(
                 },
             )
 
+        tool_evidence = (
+            tool_evidence_provider() if tool_evidence_provider is not None else None
+        )
         review_prompt = build_agentic_review_prompt(
             original_context=context,
             latest_response=response,
             round_index=round_index,
             user_input=user_input,
+            tool_evidence=tool_evidence or None,
         )
         review_response = await run_once(review_prompt)
         decision = parse_agentic_review_decision(str(review_response or ""))

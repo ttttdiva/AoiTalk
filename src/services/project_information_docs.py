@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..memory.models import (
@@ -23,33 +23,12 @@ from .docs_graph_service import DocsGraphService
 
 PROJECT_INFORMATION_SUPERTAG = "案件情報"
 PROJECT_INFORMATION_SYSTEM_KEY = "project_info"
-PROJECT_INFORMATION_SECTIONS = (
-    "概要",
-    "体制",
-    "確認事項",
-    "決定事項",
-    "課題管理",
-    "参照",
-    "Q&A",
-)
+PROJECT_INFORMATION_ROOT_SYSTEM_KEY = "project_information_root"
 
 
 def _clean_markdown(value: Any, *, max_chars: int = 200000) -> str:
     text = str(value or "").replace("\r\n", "\n").strip()
     return text[:max_chars]
-
-
-def _initial_project_information_sections(project: Project) -> dict[str, str]:
-    overview = project.description.strip() if project.description else "未記入"
-    return {
-        "概要": overview,
-        "体制": "未記入",
-        "確認事項": "未記入",
-        "決定事項": "未記入",
-        "課題管理": "未記入",
-        "参照": "未記入",
-        "Q&A": "[[project-qa]]",
-    }
 
 
 def _project_information_body_json() -> dict[str, Any]:
@@ -58,6 +37,54 @@ def _project_information_body_json() -> dict[str, Any]:
         "source": "docs_canonical",
         "blocks": [{"type": "project_qa_block", "source": "project_qa_entries"}],
     }
+
+
+def is_default_inbox_project(project: Project) -> bool:
+    metadata = project.project_metadata if isinstance(project.project_metadata, dict) else {}
+    return bool(
+        metadata.get("isInboxDefault") is True
+        or project.slug == f"inbox-project-{project.owner_id}"
+    )
+
+
+async def ensure_project_information_root(
+    session: AsyncSession,
+    *,
+    workspace_id: UUID,
+    user_id: UUID | None,
+) -> KnowledgeNode:
+    await session.execute(
+        text("select pg_advisory_xact_lock(hashtext(:lock_key))"),
+        {"lock_key": f"{workspace_id}:project-information-root"},
+    )
+    result = await session.execute(
+        select(KnowledgeNode)
+        .where(
+            KnowledgeNode.workspace_id == workspace_id,
+            KnowledgeNode.system_key == PROJECT_INFORMATION_ROOT_SYSTEM_KEY,
+        )
+        .limit(1)
+    )
+    root = result.scalar_one_or_none()
+    if root is None:
+        root = await DocsGraphService(session).create_node(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            title="案件情報",
+            system_key=PROJECT_INFORMATION_ROOT_SYSTEM_KEY,
+            body_json={"format": "project_information_collection"},
+            sort_order=1,
+        )
+    root.title = "案件情報"
+    root.body_text = root.title
+    root.parent_id = None
+    root.root_page_id = root.id
+    root.project_id = None
+    root.archived_at = None
+    root.updated_by = user_id
+    await _upsert_search_index(session, root)
+    await session.flush()
+    return root
 
 
 def _revision(
@@ -98,12 +125,28 @@ async def ensure_project_information_doc(
 ) -> KnowledgeNode:
     """Ensure the single canonical Docs node for a project information page."""
 
+    if is_default_inbox_project(project):
+        raise ValueError("Inboxは案件情報Docsの保存先にできません。実案件を指定してください。")
+
     workspace = await ensure_docs_workspace(session, owner_user_id=user_id)
+    root = await ensure_project_information_root(
+        session,
+        workspace_id=workspace.id,
+        user_id=user_id,
+    )
+    await session.execute(
+        text("select pg_advisory_xact_lock(hashtext(:lock_key))"),
+        {"lock_key": f"{workspace.id}:project-information:{project.id}"},
+    )
 
     node = None
     if project.knowledge_node_id:
         node = await session.get(KnowledgeNode, project.knowledge_node_id)
-        if node and (node.project_id != project.id or node.archived_at is not None):
+        if node and (
+            node.workspace_id != workspace.id
+            or node.project_id != project.id
+            or node.archived_at is not None
+        ):
             node = None
 
     tag_result = await session.execute(
@@ -139,7 +182,11 @@ async def ensure_project_information_doc(
 
     if node is None and project.knowledge_node_id:
         node = await session.get(KnowledgeNode, project.knowledge_node_id)
-        if node and (node.project_id != project.id or node.archived_at is not None):
+        if node and (
+            node.workspace_id != workspace.id
+            or node.project_id != project.id
+            or node.archived_at is not None
+        ):
             node = None
 
     if node is None:
@@ -162,12 +209,16 @@ async def ensure_project_information_doc(
 
     created = False
     if node is None:
+        node_title = project.name
         node = KnowledgeNode(
             workspace_id=workspace.id,
+            parent_id=root.id,
+            root_page_id=root.id,
             project_id=project.id,
-            title=f"{project.name} 案件情報",
+            system_key=f"project_information:{project.id}",
+            title=node_title,
             body_json=_project_information_body_json(),
-            body_text="",
+            body_text=node_title,
             node_type="node",
             sort_order=0,
             created_by=user_id,
@@ -177,9 +228,31 @@ async def ensure_project_information_doc(
         await session.flush()
         created = True
 
-    if node.workspace_id != workspace.id:
-        node.workspace_id = workspace.id
-        node.updated_at = datetime.utcnow()
+    legacy_title = f"{project.name} 案件情報"
+    if not (node.title or "").strip() or node.title.strip() == legacy_title:
+        node.title = project.name
+    previous_root_id = node.id if node.root_page_id in {None, node.id} else None
+    node.parent_id = root.id
+    node.root_page_id = root.id
+    node.project_id = project.id
+    node.system_key = f"project_information:{project.id}"
+    if previous_root_id is not None:
+        descendants = await session.scalars(
+            select(KnowledgeNode).where(
+                KnowledgeNode.workspace_id == workspace.id,
+                KnowledgeNode.project_id == project.id,
+                KnowledgeNode.root_page_id == previous_root_id,
+                KnowledgeNode.id != node.id,
+            )
+        )
+        for descendant in descendants:
+            descendant.root_page_id = root.id
+            descendant.updated_by = user_id
+
+    legacy_root_body = ""
+    if (node.body_text or "").strip() not in {"", node.title.strip()}:
+        legacy_root_body = node.body_text
+    node.body_text = node.title.strip()
 
     if node.workspace_id != supertag.workspace_id:
         tag_result = await session.execute(
@@ -246,12 +319,14 @@ async def ensure_project_information_doc(
         node.body_json = _project_information_body_json()
 
     service = DocsGraphService(session)
-    await service.ensure_child_sections(
-        parent=node,
-        titles=PROJECT_INFORMATION_SECTIONS,
-        user_id=user_id,
-        body_by_title=_initial_project_information_sections(project) if created else None,
-    )
+    if legacy_root_body:
+        await service.append_to_section(
+            parent=node,
+            section_title="概要",
+            text=legacy_root_body,
+            operation="append",
+            user_id=user_id,
+        )
     await service.upsert_search_index(node)
     await session.flush()
     return node
@@ -274,6 +349,7 @@ async def update_project_information_doc(
     service = DocsGraphService(session)
     if title is not None and str(title).strip():
         node.title = str(title).strip()[:500]
+        node.body_text = node.title
 
     if section_heading and (body_text is not None or append_text is not None):
         await service.append_to_section(
@@ -284,7 +360,13 @@ async def update_project_information_doc(
             user_id=user_id,
         )
     elif body_text is not None:
-        node.body_text = _clean_markdown(body_text)
+        await service.append_to_section(
+            parent=node,
+            section_title="概要",
+            text=_clean_markdown(body_text),
+            operation="replace",
+            user_id=user_id,
+        )
     elif append_text is not None:
         await service.append_to_section(
             parent=node,

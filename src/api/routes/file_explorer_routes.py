@@ -1,6 +1,8 @@
 """ファイラー・ファイルエクスプローラー系ルート (server.py から移設)"""
 
+import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import quote
@@ -8,6 +10,7 @@ from urllib.parse import quote
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from ..router_helpers import cookie_auth_dependency
 
@@ -114,6 +117,30 @@ logger = logging.getLogger(__name__)
 def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None:
     """filer / explorer / bookmark / editor 系ルートを登録する"""
     require_auth = cookie_auth_dependency(server._enforce_cookie_auth)
+    video_thumbnail_slots = asyncio.Semaphore(3)
+    image_thumbnail_slots = asyncio.Semaphore(4)
+    video_thumbnail_flights: dict[str, asyncio.Task[Path | None]] = {}
+    video_thumbnail_flights_lock = asyncio.Lock()
+
+    async def generate_video_thumbnail(path: str) -> Path | None:
+        key = os.path.normcase(str(Path(path).resolve(strict=False)))
+
+        async def run_and_release() -> Path | None:
+            try:
+                async with video_thumbnail_slots:
+                    return await run_in_threadpool(get_video_thumbnail_path, path)
+            finally:
+                current_task = asyncio.current_task()
+                async with video_thumbnail_flights_lock:
+                    if video_thumbnail_flights.get(key) is current_task:
+                        video_thumbnail_flights.pop(key, None)
+
+        async with video_thumbnail_flights_lock:
+            task = video_thumbnail_flights.get(key)
+            if task is None:
+                task = asyncio.create_task(run_and_release())
+                video_thumbnail_flights[key] = task
+        return await asyncio.shield(task)
 
     async def require_admin_filer_access(request: Request) -> None:
         if not await server._is_admin_user(request):
@@ -200,7 +227,7 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
             )
         await require_admin_filer_access(request)
 
-        thumbnail_path = get_video_thumbnail_path(path)
+        thumbnail_path = await generate_video_thumbnail(path)
         if thumbnail_path is None:
             raise HTTPException(
                 status_code=404, detail="Video thumbnail not available"
@@ -479,7 +506,7 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
         if file_path is None:
             raise HTTPException(status_code=404, detail="File not found")
 
-        thumbnail_path = get_video_thumbnail_path(str(file_path))
+        thumbnail_path = await generate_video_thumbnail(str(file_path))
         if thumbnail_path is None:
             raise HTTPException(
                 status_code=404, detail="Video thumbnail not available"
@@ -491,7 +518,7 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
             filename=thumbnail_path.name,
         )
 
-    async def _serve_image_thumbnail(file_path: Path, size: int) -> Response:
+    def _build_image_thumbnail(file_path: Path, size: int) -> Response:
         """画像を指定サイズで縮小したサムネイルを返す。
         Pillow 未導入時は原本を FileResponse で返却する。"""
         size = max(32, min(1024, size))
@@ -532,6 +559,11 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
                 media_type=mime_type,
                 filename=file_path.name,
             )
+
+    async def _serve_image_thumbnail(file_path: Path, size: int) -> Response:
+        # Pillowのdecode/resize/encodeは同期CPU処理なのでASGI event loop外で実行する。
+        async with image_thumbnail_slots:
+            return await run_in_threadpool(_build_image_thumbnail, file_path, size)
 
     @app.get("/api/explorer/image-thumbnail")
     async def explorer_image_thumbnail(

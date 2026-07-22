@@ -1,4 +1,10 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Alert, Platform, ScrollView, StyleSheet, View } from "react-native";
 import * as DocumentPicker from "expo-document-picker";
 import {
@@ -53,10 +59,10 @@ import {
 } from "../../../stores/task-completion-undo";
 
 const STATUS_OPTIONS = [
-  { value: "open", label: "Open", color: "#89b4fa" },
-  { value: "in_progress", label: "In Progress", color: "#f38ba8" },
-  { value: "closed", label: "Closed", color: "#a6e3a1" },
-  { value: "cancelled", label: "Cancelled", color: "#a6adc8" },
+  { value: "open", label: "未着手", color: "#89b4fa" },
+  { value: "in_progress", label: "進行中", color: "#f38ba8" },
+  { value: "closed", label: "完了", color: "#a6e3a1" },
+  { value: "cancelled", label: "キャンセル", color: "#a6adc8" },
 ];
 
 const STATUS_SHORTCUT_KEYS: Record<string, string> = {
@@ -64,14 +70,6 @@ const STATUS_SHORTCUT_KEYS: Record<string, string> = {
   s: "in_progress",
   x: "open",
 };
-
-const PRIORITY_OPTIONS = [
-  { value: "urgent", label: "Urgent", color: "#f38ba8" },
-  { value: "high", label: "High", color: "#fab387" },
-  { value: "normal", label: "Normal", color: "#89b4fa" },
-  { value: "low", label: "Low", color: "#a6adc8" },
-  { value: "none", label: "None", color: "#a6adc8" },
-];
 
 const REMINDER_PRESETS = [
   { value: 5, label: "5分前" },
@@ -81,7 +79,6 @@ const REMINDER_PRESETS = [
   { value: 1440, label: "1日前" },
 ];
 
-const TASK_SCHEDULE_ESTIMATE_MODE_KEY = "schedule_estimate_mode";
 const TASK_AUTOSAVE_DEBOUNCE_MS = 900;
 
 const DISALLOWED_PLACEHOLDER_TITLES = new Set([
@@ -116,39 +113,6 @@ function shouldPrepareTaskForAgent(
   return status === "pending" || status === "failed";
 }
 
-function inferScheduleEstimateMode(
-  estimatedHours: number | null | undefined,
-  metadata: Record<string, unknown> | null | undefined,
-): "auto" | "manual" {
-  const rawMode =
-    metadata &&
-    typeof metadata === "object" &&
-    !Array.isArray(metadata) &&
-    metadata[TASK_SCHEDULE_ESTIMATE_MODE_KEY];
-  return rawMode === "auto" || rawMode === "manual"
-    ? rawMode
-    : estimatedHours == null
-      ? "auto"
-      : "manual";
-}
-
-function computeEstimatedHoursFromSchedule(
-  startAt: string | null | undefined,
-  endAt: string | null | undefined,
-): number | null {
-  if (!startAt || !endAt) return null;
-  const start = new Date(startAt);
-  const end = new Date(endAt);
-  if (
-    Number.isNaN(start.getTime()) ||
-    Number.isNaN(end.getTime()) ||
-    end <= start
-  ) {
-    return null;
-  }
-  return Math.round(((end.getTime() - start.getTime()) / 3600000) * 100) / 100;
-}
-
 function formatTaskDateInput(
   value: string | null | undefined,
   allDay: boolean | null | undefined,
@@ -157,43 +121,23 @@ function formatTaskDateInput(
   return format(new Date(value), allDay ? "yyyy-MM-dd" : "yyyy-MM-dd'T'HH:mm");
 }
 
-function normalizeTaskMetadataWithEstimateMode(
-  metadata: Record<string, unknown> | null | undefined,
-  estimateMode: "auto" | "manual",
-): Record<string, unknown> {
-  const nextMetadata =
-    metadata && typeof metadata === "object" && !Array.isArray(metadata)
-      ? { ...metadata }
-      : {};
-  nextMetadata[TASK_SCHEDULE_ESTIMATE_MODE_KEY] = estimateMode;
-  return nextMetadata;
-}
-
 function serializeTaskDraft(data: Record<string, unknown>): string {
   return JSON.stringify(data);
 }
 
 function buildTaskSavedDraft(task: Task): Record<string, unknown> {
-  const estimateMode = inferScheduleEstimateMode(
-    task.estimated_hours ?? null,
-    task.metadata,
-  );
   const startAt = formatTaskDateInput(task.start_at, task.all_day);
   const endAt = formatTaskDateInput(task.end_at, task.all_day);
   return {
     title: task.title.trim(),
     description: task.description?.trim() || null,
     status: task.status,
-    priority: task.priority,
     start_at: toTaskWallClockIso(startAt),
     end_at: toTaskWallClockIso(endAt),
     all_day:
       Boolean(task.all_day) ||
       isTaskDateOnlyInput(startAt) ||
       isTaskDateOnlyInput(endAt),
-    estimated_hours:
-      typeof task.estimated_hours === "number" ? task.estimated_hours : null,
-    metadata: normalizeTaskMetadataWithEstimateMode(task.metadata, estimateMode),
     notifications_enabled: task.notifications_enabled ?? true,
     reminder_offsets: task.reminder_offsets ?? [],
     tag_ids: (task.tags ?? []).map((tag) => tag.id),
@@ -209,23 +153,19 @@ export default function TaskDetailScreen() {
   const [task, setTask] = useState<Task | null>(null);
   const [activeEntry, setActiveEntry] = useState<TimeEntry | null>(null);
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
   const [autosaving, setAutosaving] = useState(false);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [taskMenuVisible, setTaskMenuVisible] = useState(false);
   const [statusMenuVisible, setStatusMenuVisible] = useState(false);
-  const [priorityMenuVisible, setPriorityMenuVisible] = useState(false);
   const [projectMenuVisible, setProjectMenuVisible] = useState(false);
+  const [tagMenuVisible, setTagMenuVisible] = useState(false);
   const [timerElapsed, setTimerElapsed] = useState(0);
 
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [status, setStatus] = useState("open");
-  const [priority, setPriority] = useState("normal");
   const [startAt, setStartAt] = useState("");
   const [endAt, setEndAt] = useState("");
-  const [estimatedHours, setEstimatedHours] = useState("");
-  const [estimateMode, setEstimateMode] = useState<"auto" | "manual">("auto");
   const [allDay, setAllDay] = useState(false);
   const [notificationsEnabled, setNotificationsEnabled] = useState(true);
   const [reminderOffsets, setReminderOffsets] = useState<number[]>([]);
@@ -241,10 +181,10 @@ export default function TaskDetailScreen() {
   const [attachmentSaving, setAttachmentSaving] = useState(false);
   const [titleError, setTitleError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const [descriptionSelection, setDescriptionSelection] = useState({
-    start: 0,
-    end: 0,
-  });
+  const [activeInfoTab, setActiveInfoTab] = useState<
+    "comments" | "attachments"
+  >("comments");
+  const [showHistoryDialog, setShowHistoryDialog] = useState(false);
   const [launchingAgent, setLaunchingAgent] = useState(false);
   const [triagingAgent, setTriagingAgent] = useState(false);
   const completionRefreshToken = useTaskCompletionUndoStore(
@@ -254,61 +194,85 @@ export default function TaskDetailScreen() {
   const saveTaskDraftRef = useRef<(() => Promise<Task | null>) | null>(null);
   const shouldFlushAutosaveRef = useRef(false);
   const isMountedRef = useRef(true);
+  const userEditedDuringRefreshRef = useRef(false);
+  const loadTaskRequestRef = useRef(0);
 
   useEffect(() => {
     return () => {
       isMountedRef.current = false;
+      loadTaskRequestRef.current += 1;
     };
+  }, []);
+
+  const applyLoadedTask = useCallback((nextTask: Task | null) => {
+    setTask(nextTask);
+    if (!nextTask) return;
+    setTitle(nextTask.title);
+    setDescription(nextTask.description || "");
+    setStatus(nextTask.status);
+    setStartAt(formatTaskDateInput(nextTask.start_at, nextTask.all_day));
+    setEndAt(formatTaskDateInput(nextTask.end_at, nextTask.all_day));
+    setAllDay(Boolean(nextTask.all_day));
+    setReminderOffsets(nextTask.reminder_offsets ?? []);
+    setSelectedTagIds((nextTask.tags ?? []).map((tag) => tag.id));
+    setNotificationsEnabled(nextTask.notifications_enabled ?? true);
+    setTitleError(null);
+    setSaveError(null);
+    setSubtaskDraft("");
+    setCommentDraft("");
   }, []);
 
   const loadTask = useCallback(async () => {
     if (!taskId) return;
+    const requestId = ++loadTaskRequestRef.current;
+    const isCurrentRequest = () =>
+      isMountedRef.current && requestId === loadTaskRequestRef.current;
+    userEditedDuringRefreshRef.current = false;
     setLoading(true);
     try {
-      const nextTask = await tasksRepo.get(taskId);
-      const nextActiveEntry = await timeEntriesRepo.getActive(taskId);
-      setTask(nextTask);
-      setActiveEntry(nextActiveEntry);
-      if (isAuthenticated && online) {
-        try {
-          setAttachments(await taskApi.listAttachments(taskId));
-        } catch {
-          setAttachments([]);
+      const localTask = await tasksRepo.getLocal(taskId);
+      if (!isCurrentRequest()) return;
+      applyLoadedTask(localTask);
+      if (localTask) setLoading(false);
+
+      const remoteTaskPromise = tasksRepo.get(taskId).then((remoteTask) => {
+        if (!isCurrentRequest()) return;
+        if (userEditedDuringRefreshRef.current) {
+          setTask(remoteTask);
+          return;
         }
-      } else {
-        setAttachments([]);
-      }
-      if (nextTask) {
-        setTitle(nextTask.title);
-        setDescription(nextTask.description || "");
-        setDescriptionSelection({
-          start: (nextTask.description || "").length,
-          end: (nextTask.description || "").length,
+        applyLoadedTask(remoteTask);
+      });
+      const timerPromise = timeEntriesRepo
+        .getActive(taskId)
+        .then((entry) => {
+          if (isCurrentRequest()) setActiveEntry(entry);
+        })
+        .catch(() => {
+          if (isCurrentRequest()) setActiveEntry(null);
         });
-        setStatus(nextTask.status);
-        setPriority(nextTask.priority);
-        setStartAt(formatTaskDateInput(nextTask.start_at, nextTask.all_day));
-        setEndAt(formatTaskDateInput(nextTask.end_at, nextTask.all_day));
-        setEstimatedHours(nextTask.estimated_hours?.toString() || "");
-        setAllDay(Boolean(nextTask.all_day));
-        setReminderOffsets(nextTask.reminder_offsets ?? []);
-        setSelectedTagIds((nextTask.tags ?? []).map((tag) => tag.id));
-        setEstimateMode(
-          inferScheduleEstimateMode(
-            nextTask.estimated_hours ?? null,
-            nextTask.metadata,
-          ),
-        );
-        setNotificationsEnabled(nextTask.notifications_enabled ?? true);
-        setTitleError(null);
-        setSaveError(null);
-        setSubtaskDraft("");
-        setCommentDraft("");
-      }
+      const attachmentPromise =
+        isAuthenticated && online
+          ? taskApi
+              .listAttachments(taskId)
+              .then((nextAttachments) => {
+                if (isCurrentRequest()) setAttachments(nextAttachments);
+              })
+              .catch(() => {
+                if (isCurrentRequest()) setAttachments([]);
+              })
+          : Promise.resolve().then(() => {
+              if (isCurrentRequest()) setAttachments([]);
+            });
+      await Promise.allSettled([
+        remoteTaskPromise,
+        timerPromise,
+        attachmentPromise,
+      ]);
     } finally {
-      setLoading(false);
+      if (isCurrentRequest()) setLoading(false);
     }
-  }, [isAuthenticated, online, taskId]);
+  }, [applyLoadedTask, isAuthenticated, online, taskId]);
 
   useEffect(() => {
     void loadTask();
@@ -356,31 +320,16 @@ export default function TaskDetailScreen() {
     return () => clearInterval(interval);
   }, [activeEntry?.started_at]);
 
-  useEffect(() => {
-    if (estimateMode !== "auto") return;
-    const nextEstimated = computeEstimatedHoursFromSchedule(
-      toTaskWallClockIso(startAt),
-      toTaskWallClockIso(endAt),
-    );
-    setEstimatedHours(nextEstimated != null ? String(nextEstimated) : "");
-  }, [endAt, estimateMode, startAt]);
-
   const draftPayload = useMemo<Record<string, unknown> | null>(() => {
     if (!task) return null;
     return {
       title: title.trim(),
       description: description.trim() || null,
       status,
-      priority,
       start_at: toTaskWallClockIso(startAt),
       end_at: toTaskWallClockIso(endAt),
       all_day:
         allDay || isTaskDateOnlyInput(startAt) || isTaskDateOnlyInput(endAt),
-      estimated_hours: estimatedHours ? parseFloat(estimatedHours) : null,
-      metadata: normalizeTaskMetadataWithEstimateMode(
-        task.metadata,
-        estimateMode,
-      ),
       notifications_enabled: notificationsEnabled,
       reminder_offsets: reminderOffsets,
       tag_ids: selectedTagIds,
@@ -389,10 +338,7 @@ export default function TaskDetailScreen() {
     allDay,
     description,
     endAt,
-    estimatedHours,
-    estimateMode,
     notificationsEnabled,
-    priority,
     reminderOffsets,
     selectedTagIds,
     startAt,
@@ -412,6 +358,9 @@ export default function TaskDetailScreen() {
   const hasUnsavedDraft = Boolean(
     task && draftPayload && draftSignature !== savedSignature,
   );
+  useEffect(() => {
+    if (hasUnsavedDraft) userEditedDuringRefreshRef.current = true;
+  }, [hasUnsavedDraft]);
   const hasValidAutosaveTitle =
     Boolean(title.trim()) && !DISALLOWED_PLACEHOLDER_TITLES.has(title.trim());
 
@@ -419,11 +368,6 @@ export default function TaskDetailScreen() {
     () => STATUS_OPTIONS.find((item) => item.value === status),
     [status],
   );
-  const priorityOption = useMemo(
-    () => PRIORITY_OPTIONS.find((item) => item.value === priority),
-    [priority],
-  );
-
   useEffect(() => {
     if (Platform.OS !== "web" || !statusMenuVisible) return;
     const handleStatusShortcut = (event: KeyboardEvent) => {
@@ -443,118 +387,77 @@ export default function TaskDetailScreen() {
       document.removeEventListener("keydown", handleStatusShortcut, true);
   }, [statusMenuVisible]);
 
-  const applyDescriptionShortcut = useCallback(
-    (type: "heading" | "bold" | "list" | "link" | "code") => {
-      const start = descriptionSelection.start;
-      const end = descriptionSelection.end;
-      const selected = description.slice(start, end);
-      let nextValue = description;
-      let nextSelection = { start, end };
-
-      if (type === "heading") {
-        const prefix = selected.startsWith("# ") ? "" : "# ";
-        nextValue = `${description.slice(0, start)}${prefix}${selected}${description.slice(end)}`;
-        nextSelection = {
-          start: start + prefix.length,
-          end: end + prefix.length,
-        };
-      } else if (type === "bold") {
-        nextValue = `${description.slice(0, start)}**${selected || "text"}**${description.slice(end)}`;
-        const cursorBase = start + 2;
-        nextSelection = selected
-          ? { start: cursorBase, end: cursorBase + selected.length }
-          : { start: cursorBase, end: cursorBase + 4 };
-      } else if (type === "list") {
-        const body = selected || "item";
-        nextValue = `${description.slice(0, start)}- ${body}${description.slice(end)}`;
-        nextSelection = { start: start + 2, end: start + 2 + body.length };
-      } else if (type === "link") {
-        const body = selected || "label";
-        nextValue = `${description.slice(0, start)}[${body}](url)${description.slice(end)}`;
-        nextSelection = { start: start + 1, end: start + 1 + body.length };
-      } else {
-        const body = selected || "code";
-        nextValue = `${description.slice(0, start)}\`\`\`\n${body}\n\`\`\`${description.slice(end)}`;
-        nextSelection = { start: start + 4, end: start + 4 + body.length };
+  const saveTaskDraft = useCallback(
+    async (options?: { navigateAfter?: boolean; showErrors?: boolean }) => {
+      const normalizedTitle = title.trim();
+      const showErrors = options?.showErrors ?? false;
+      if (!taskId || !task || !draftPayload) {
+        return null;
+      }
+      if (!normalizedTitle) {
+        if (showErrors) setTitleError("タイトルを入力してください。");
+        return null;
+      }
+      if (DISALLOWED_PLACEHOLDER_TITLES.has(normalizedTitle)) {
+        if (showErrors) setTitleError("仮タイトルは使用できません。");
+        return null;
+      }
+      if (!options?.navigateAfter && draftSignature === savedSignature) {
+        return task;
       }
 
-      setDescription(nextValue);
-      setDescriptionSelection(nextSelection);
-    },
-    [description, descriptionSelection],
-  );
-
-  const saveTaskDraft = useCallback(async (options?: {
-    navigateAfter?: boolean;
-    showErrors?: boolean;
-    manual?: boolean;
-  }) => {
-    const normalizedTitle = title.trim();
-    const showErrors = options?.showErrors ?? false;
-    if (!taskId || !task || !draftPayload) {
-      return null;
-    }
-    if (!normalizedTitle) {
-      if (showErrors) setTitleError("Title is required.");
-      return null;
-    }
-    if (DISALLOWED_PLACEHOLDER_TITLES.has(normalizedTitle)) {
-      if (showErrors) setTitleError("Untitled tasks are not allowed.");
-      return null;
-    }
-    if (!options?.navigateAfter && draftSignature === savedSignature) {
-      return task;
-    }
-
-    if (isMountedRef.current) {
-      if (options?.manual) setSaving(true);
-      else setAutosaving(true);
-      setSaveError(null);
-    }
-    try {
-      const previousTask = task;
-      const updated = await tasksRepo.update(taskId, draftPayload);
       if (isMountedRef.current) {
-        setTask(updated);
-        setTitleError(null);
+        setAutosaving(true);
+        setSaveError(null);
       }
-      shouldFlushAutosaveRef.current = false;
-      if (isTaskCompletionTransition(previousTask.status, status)) {
-        enqueueTaskCompletionUndoBatch({
-          entries: [createTaskCompletionUndoEntry(previousTask)],
-        });
-      }
-      if (options?.navigateAfter) {
-        goBackOrReplace(router, "/(tabs)/tasks");
-      }
-      return updated;
-    } catch (error) {
-      if (isMountedRef.current) {
-        if (showErrors || options?.manual) {
-          setSaveError(
-            error instanceof Error ? error.message : "保存に失敗しました",
-          );
-        } else {
-          setSaveError("自動保存に失敗しました。接続状態を確認してください。");
+      try {
+        const previousTask = task;
+        const updated = await tasksRepo.update(taskId, draftPayload);
+        if (isMountedRef.current) {
+          setTask(updated);
+          setTitleError(null);
+        }
+        shouldFlushAutosaveRef.current = false;
+        if (isTaskCompletionTransition(previousTask.status, status)) {
+          enqueueTaskCompletionUndoBatch({
+            entries: [createTaskCompletionUndoEntry(previousTask)],
+          });
+        }
+        if (options?.navigateAfter) {
+          goBackOrReplace(router, "/(tabs)/tasks");
+        }
+        return updated;
+      } catch (error) {
+        if (isMountedRef.current) {
+          if (showErrors) {
+            setSaveError(
+              error instanceof Error ? error.message : "保存に失敗しました",
+            );
+          } else {
+            setSaveError(
+              "自動保存に失敗しました。接続状態を確認してください。",
+            );
+          }
+        }
+        return null;
+      } finally {
+        if (isMountedRef.current) {
+          setAutosaving(false);
         }
       }
-      return null;
-    } finally {
-      if (isMountedRef.current) {
-        if (options?.manual) setSaving(false);
-        else setAutosaving(false);
-      }
-    }
-  }, [
-    draftPayload,
-    draftSignature,
-    router,
-    savedSignature,
-    status,
-    task,
-    taskId,
-    title,
-  ]);
+    },
+    [
+      draftPayload,
+      draftSignature,
+
+      router,
+      savedSignature,
+      status,
+      task,
+      taskId,
+      title,
+    ],
+  );
 
   useEffect(() => {
     saveTaskDraftRef.current = () => saveTaskDraft({ showErrors: false });
@@ -595,14 +498,6 @@ export default function TaskDetailScreen() {
       };
     }, []),
   );
-
-  const handleSave = () => {
-    void saveTaskDraft({
-      navigateAfter: true,
-      showErrors: true,
-      manual: true,
-    });
-  };
 
   const handleDelete = async () => {
     if (!taskId) return;
@@ -788,7 +683,7 @@ export default function TaskDetailScreen() {
       !normalizedTitle ||
       DISALLOWED_PLACEHOLDER_TITLES.has(normalizedTitle)
     ) {
-      setTitleError("Untitled tasks are not allowed.");
+      setTitleError("仮タイトルは使用できません。");
       return;
     }
 
@@ -805,12 +700,10 @@ export default function TaskDetailScreen() {
       title: normalizedTitle,
       description: description.trim() || null,
       status,
-      priority,
       start_at: toTaskWallClockIso(startAt),
       end_at: toTaskWallClockIso(endAt),
       all_day:
         allDay || isTaskDateOnlyInput(startAt) || isTaskDateOnlyInput(endAt),
-      estimated_hours: estimatedHours ? parseFloat(estimatedHours) : null,
       notifications_enabled: notificationsEnabled,
       reminder_offsets: reminderOffsets,
       tags: availableTags.filter((tag) => selectedTagIds.includes(tag.id)),
@@ -870,11 +763,9 @@ export default function TaskDetailScreen() {
   }, [
     description,
     endAt,
-    estimatedHours,
     isAuthenticated,
     notificationsEnabled,
     online,
-    priority,
     router,
     startAt,
     status,
@@ -886,7 +777,10 @@ export default function TaskDetailScreen() {
   const handleRunAgentTriage = useCallback(async () => {
     if (!taskId || triagingAgent) return;
     if (!isAuthenticated || !online) {
-      Alert.alert("Agent triage", "Sign in and go online to triage this task.");
+      Alert.alert(
+        "エージェント事前確認",
+        "ログインしてオンラインにすると実行できます。",
+      );
       return;
     }
     setTriagingAgent(true);
@@ -906,7 +800,7 @@ export default function TaskDetailScreen() {
       await loadTask();
     } catch (error) {
       setSaveError(
-        error instanceof Error ? error.message : "Agent triage failed",
+        error instanceof Error ? error.message : "事前確認に失敗しました",
       );
     } finally {
       setTriagingAgent(false);
@@ -917,6 +811,23 @@ export default function TaskDetailScreen() {
     (project) => project.id === task?.project_id,
   );
   const comments: TaskComment[] = task?.comments ?? [];
+  const selectedTags = [
+    ...(task?.tags ?? []),
+    ...availableTags.filter((tag) => selectedTagIds.includes(tag.id)),
+  ].filter(
+    (tag, index, all) =>
+      selectedTagIds.includes(tag.id) &&
+      all.findIndex((candidate) => candidate.id === tag.id) === index,
+  );
+  const assigneeLabel = task?.assignees?.length
+    ? task.assignees
+        .map((item) => item.display_name || item.username || "")
+        .filter(Boolean)
+        .join(", ")
+    : "未設定";
+  const completedSubtasks = (task?.subtasks ?? []).filter(
+    (item) => item.status === "closed",
+  ).length;
   const triageStatus =
     typeof task?.metadata?.agent_triage_status === "string"
       ? task.metadata.agent_triage_status
@@ -948,55 +859,39 @@ export default function TaskDetailScreen() {
   if (!task) {
     return (
       <View style={styles.center}>
-        <Text style={styles.errorText}>Task not found.</Text>
+        <Text style={styles.errorText}>タスクが見つかりません。</Text>
       </View>
     );
   }
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      <Surface style={styles.timerBar} elevation={0}>
-        <View style={styles.timerRow}>
-          <IconButton
-            icon={activeEntry ? "stop-circle" : "play-circle"}
-            iconColor={activeEntry ? "#f38ba8" : "#a6e3a1"}
-            size={32}
-            onPress={handleTimerToggle}
-          />
-          <View>
-            <Text style={styles.timerLabel}>
-              {activeEntry ? "Running" : "Tracked"}
-            </Text>
-            <Text style={styles.timerValue}>
-              {activeEntry
-                ? formatDuration(timerElapsed)
-                : formatDuration(task.total_time_seconds || 0)}
-            </Text>
-          </View>
-          {task.estimated_hours ? (
-            <Text style={styles.estimateLabel}>
-              Estimate {task.estimated_hours}h
-            </Text>
-          ) : null}
-        </View>
-      </Surface>
-
-      <View style={styles.agentActionRow}>
-        <Button
-          mode="contained"
-          onPress={() => void handleRunWithAgent()}
-          loading={launchingAgent}
-          disabled={
-            launchingAgent ||
-            !isAuthenticated ||
-            !online ||
-            !title.trim() ||
-            DISALLOWED_PLACEHOLDER_TITLES.has(title.trim())
-          }
-          style={styles.agentButton}
-        >
-          Run with agent
-        </Button>
+    <ScrollView
+      style={styles.container}
+      contentContainerStyle={styles.content}
+      keyboardShouldPersistTaps="handled"
+    >
+      <View style={styles.redesignTitleRow}>
+        <IconButton
+          icon={status === "closed" ? "check-circle" : "circle-outline"}
+          iconColor={status === "closed" ? "#a6e3a1" : "#89b4fa"}
+          size={32}
+          onPress={() => setStatus(status === "closed" ? "open" : "closed")}
+          style={styles.redesignCompleteButton}
+        />
+        <TextInput
+          value={title}
+          onChangeText={(value) => {
+            setTitle(value);
+            if (titleError) setTitleError(null);
+          }}
+          mode="flat"
+          placeholder="タスク名"
+          style={styles.redesignTitleInput}
+          contentStyle={styles.redesignTitleInputContent}
+          underlineColor="transparent"
+          activeUnderlineColor="#89b4fa"
+          error={!!titleError}
+        />
         <Menu
           visible={taskMenuVisible}
           onDismiss={() => setTaskMenuVisible(false)}
@@ -1005,14 +900,21 @@ export default function TaskDetailScreen() {
               icon="dots-horizontal"
               iconColor="#cdd6f4"
               size={22}
-              style={styles.taskMenuButton}
               onPress={() => setTaskMenuVisible(true)}
             />
           }
           contentStyle={styles.menuContent}
         >
           <Menu.Item
-            title={triagingAgent ? "Preparing..." : "Prepare for Agent"}
+            title="履歴"
+            leadingIcon="history"
+            onPress={() => {
+              setTaskMenuVisible(false);
+              setShowHistoryDialog(true);
+            }}
+          />
+          <Menu.Item
+            title={triagingAgent ? "準備中..." : "エージェント用に準備"}
             leadingIcon="robot-outline"
             disabled={triagingAgent || !isAuthenticated || !online}
             onPress={() => {
@@ -1020,53 +922,33 @@ export default function TaskDetailScreen() {
               void handleRunAgentTriage();
             }}
           />
+          <Divider />
+          <Menu.Item
+            title="タスクを削除"
+            leadingIcon="delete-outline"
+            titleStyle={{ color: "#f38ba8" }}
+            onPress={() => {
+              setTaskMenuVisible(false);
+              setShowDeleteDialog(true);
+            }}
+          />
         </Menu>
       </View>
-
-      {shouldShowTriageCard ? (
-        <Surface style={styles.triageCard}>
-          <View style={styles.sectionHeaderRow}>
-            <View>
-              <Text style={styles.triageTitle}>Agent triage</Text>
-              <Text style={styles.triageStatus}>{triageStatus}</Text>
-            </View>
-          </View>
-          {triageHasSummary ? (
-            <Text style={styles.triageSummary}>{triageSummary}</Text>
-          ) : null}
-          {triageQuestions.map((question) => (
-            <Text key={question} style={styles.triageQuestion}>
-              - {question}
-            </Text>
-          ))}
-        </Surface>
-      ) : null}
-
-      <TextInput
-        label="Title"
-        value={title}
-        onChangeText={(value) => {
-          setTitle(value);
-          if (titleError) setTitleError(null);
-        }}
-        mode="outlined"
-        style={styles.input}
-        error={!!titleError}
-      />
       {titleError ? <Text style={styles.errorText}>{titleError}</Text> : null}
 
-      <View style={styles.row}>
-        <Text style={styles.label}>Project</Text>
+      <View style={styles.redesignAttributeRow}>
         <Menu
           visible={projectMenuVisible}
           onDismiss={() => setProjectMenuVisible(false)}
           anchor={
             <Chip
+              icon="folder-outline"
+              compact
               onPress={() => setProjectMenuVisible(true)}
-              style={styles.selectChip}
+              style={styles.redesignAttributeChip}
               textStyle={{ color: currentProject?.color || "#cdd6f4" }}
             >
-              {currentProject?.name || task.project_name || "Move"}
+              {currentProject?.name || task.project_name || "Project"}
             </Chip>
           }
           contentStyle={styles.menuContent}
@@ -1080,72 +962,17 @@ export default function TaskDetailScreen() {
             />
           ))}
         </Menu>
-      </View>
-
-      <TextInput
-        label="Description"
-        value={description}
-        onChangeText={setDescription}
-        mode="outlined"
-        style={styles.input}
-        multiline
-        numberOfLines={4}
-        selection={descriptionSelection}
-        onSelectionChange={(event) =>
-          setDescriptionSelection(event.nativeEvent.selection)
-        }
-      />
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        style={styles.shortcutRow}
-      >
-        <Chip
-          compact
-          style={styles.shortcutChip}
-          onPress={() => applyDescriptionShortcut("heading")}
-        >
-          #
-        </Chip>
-        <Chip
-          compact
-          style={styles.shortcutChip}
-          onPress={() => applyDescriptionShortcut("bold")}
-        >
-          Bold
-        </Chip>
-        <Chip
-          compact
-          style={styles.shortcutChip}
-          onPress={() => applyDescriptionShortcut("list")}
-        >
-          List
-        </Chip>
-        <Chip
-          compact
-          style={styles.shortcutChip}
-          onPress={() => applyDescriptionShortcut("link")}
-        >
-          Link
-        </Chip>
-        <Chip
-          compact
-          style={styles.shortcutChip}
-          onPress={() => applyDescriptionShortcut("code")}
-        >
-          Code
-        </Chip>
-      </ScrollView>
-
-      <View style={styles.row}>
-        <Text style={styles.label}>Status</Text>
         <Menu
           visible={statusMenuVisible}
           onDismiss={() => setStatusMenuVisible(false)}
           anchor={
             <Chip
+              compact
               onPress={() => setStatusMenuVisible(true)}
-              style={[styles.selectChip, { borderColor: statusOption?.color }]}
+              style={[
+                styles.redesignAttributeChip,
+                { borderColor: statusOption?.color },
+              ]}
               textStyle={{ color: statusOption?.color }}
             >
               {statusOption?.label || status}
@@ -1165,239 +992,113 @@ export default function TaskDetailScreen() {
             />
           ))}
         </Menu>
-      </View>
-      <View style={styles.statusQuickRow}>
-        {STATUS_OPTIONS.map((item) => (
-          <Chip
-            key={item.value}
-            compact
-            selected={status === item.value}
-            onPress={() => setStatus(item.value)}
-            style={[
-              styles.statusQuickChip,
-              status === item.value && { borderColor: item.color },
-            ]}
-            textStyle={[
-              styles.statusQuickChipText,
-              status === item.value && { color: item.color, fontWeight: "700" },
-            ]}
-          >
-            {item.label}
-          </Chip>
-        ))}
+        <Chip
+          compact
+          icon="account-outline"
+          style={styles.redesignAttributeChip}
+        >
+          {assigneeLabel}
+        </Chip>
       </View>
 
-      <View style={styles.row}>
-        <Text style={styles.label}>Priority</Text>
+      <View style={styles.redesignDateRow}>
+        <TextInput
+          label="Start Date"
+          value={startAt}
+          onChangeText={setStartAt}
+          mode="outlined"
+          dense
+          style={styles.redesignDateInput}
+          placeholder="yyyy-MM-ddTHH:mm"
+          right={startAt ? <TextInput.Icon icon="close" onPress={() => setStartAt("")} /> : undefined}
+        />
+        <TextInput
+          label="Due Date"
+          value={endAt}
+          onChangeText={setEndAt}
+          mode="outlined"
+          dense
+          style={styles.redesignDateInput}
+          placeholder="yyyy-MM-ddTHH:mm"
+          right={endAt ? <TextInput.Icon icon="close" onPress={() => setEndAt("")} /> : undefined}
+        />
+      </View>
+
+      <View style={styles.redesignImportantTags}>
+        {selectedTags.map((tag) => (
+          <Chip
+            key={tag.id}
+            compact
+            style={[
+              styles.redesignImportantTagChip,
+              { backgroundColor: tag.color || "#45475a" },
+            ]}
+            textStyle={styles.redesignImportantTagText}
+            onPress={() => setTagMenuVisible(true)}
+          >
+            {tag.name}
+          </Chip>
+        ))}
         <Menu
-          visible={priorityMenuVisible}
-          onDismiss={() => setPriorityMenuVisible(false)}
+          visible={tagMenuVisible}
+          onDismiss={() => setTagMenuVisible(false)}
           anchor={
             <Chip
-              onPress={() => setPriorityMenuVisible(true)}
-              style={[
-                styles.selectChip,
-                { borderColor: priorityOption?.color },
-              ]}
-              textStyle={{ color: priorityOption?.color }}
+              compact
+              icon="plus"
+              style={styles.redesignAddTagChip}
+              textStyle={styles.redesignAddTagText}
+              onPress={() => setTagMenuVisible(true)}
             >
-              {priorityOption?.label || priority}
+              {selectedTags.length ? "タグを編集" : "タグを追加"}
             </Chip>
           }
           contentStyle={styles.menuContent}
         >
-          {PRIORITY_OPTIONS.map((item) => (
-            <Menu.Item
-              key={item.value}
-              title={item.label}
-              titleStyle={{ color: item.color }}
-              onPress={() => {
-                setPriority(item.value);
-                setPriorityMenuVisible(false);
-              }}
-            />
-          ))}
+          {availableTags.length === 0 ? (
+            <Menu.Item title="利用できるタグがありません" disabled />
+          ) : (
+            availableTags.map((tag) => (
+              <Menu.Item
+                key={tag.id}
+                title={tag.name}
+                leadingIcon={
+                  selectedTagIds.includes(tag.id)
+                    ? "check-circle"
+                    : "circle-outline"
+                }
+                onPress={() => toggleTag(tag.id)}
+              />
+            ))
+          )}
         </Menu>
       </View>
 
-      <Divider style={styles.divider} />
-
-      <Text style={[styles.label, styles.sectionLabel]}>Schedule</Text>
-      <TextInput
-        label="Start"
-        value={startAt}
-        onChangeText={setStartAt}
-        mode="outlined"
-        style={styles.input}
-        placeholder="yyyy-MM-ddTHH:mm"
-        right={
-          startAt ? (
-            <TextInput.Icon icon="close" onPress={() => setStartAt("")} />
-          ) : undefined
-        }
-      />
-      <TextInput
-        label="Due"
-        value={endAt}
-        onChangeText={setEndAt}
-        mode="outlined"
-        style={styles.input}
-        placeholder="yyyy-MM-ddTHH:mm"
-        right={
-          endAt ? (
-            <TextInput.Icon icon="close" onPress={() => setEndAt("")} />
-          ) : undefined
-        }
-      />
-      <TextInput
-        label="Estimate Hours"
-        value={estimatedHours}
-        onChangeText={(value) => {
-          setEstimateMode("manual");
-          setEstimatedHours(value);
-        }}
-        mode="outlined"
-        style={styles.input}
-        keyboardType="decimal-pad"
-        right={
-          estimatedHours ? (
-            <TextInput.Icon
-              icon="close"
-              onPress={() => {
-                setEstimateMode("manual");
-                setEstimatedHours("");
-              }}
-            />
-          ) : undefined
-        }
-      />
-      <View style={styles.row}>
-        <Text style={styles.label}>All Day</Text>
-        <Switch value={allDay} onValueChange={setAllDay} />
-      </View>
-      <Text style={[styles.label, styles.sectionLabel]}>Reminders</Text>
-      <View style={styles.tagRow}>
-        {REMINDER_PRESETS.map((preset) => (
-          <Chip
-            key={preset.value}
-            compact
-            selected={reminderOffsets.includes(preset.value)}
-            disabled={!notificationsEnabled}
-            onPress={() => toggleReminder(preset.value)}
-            style={styles.tagChip}
-            textStyle={styles.tagText}
-          >
-            {preset.label}
-          </Chip>
-        ))}
-      </View>
-
-      <View style={styles.row}>
-        <Text style={styles.label}>Task Notifications</Text>
-        <Switch
-          value={notificationsEnabled}
-          onValueChange={setNotificationsEnabled}
-        />
-      </View>
-      <Divider style={styles.divider} />
-      <Text style={[styles.label, styles.sectionLabel]}>Tags</Text>
-      <View style={styles.tagRow}>
-        {availableTags.length === 0 ? (
-          <Text style={styles.calendarHint}>
-            タグなし / オフラインでは取得できません
-          </Text>
-        ) : (
-          availableTags.map((tag) => (
-            <Chip
-              key={tag.id}
-              compact
-              selected={selectedTagIds.includes(tag.id)}
-              onPress={() => toggleTag(tag.id)}
-              style={[
-                styles.tagChip,
-                selectedTagIds.includes(tag.id)
-                  ? { backgroundColor: tag.color || "#45475a" }
-                  : {
-                      backgroundColor: "#181825",
-                      borderColor: tag.color || "#45475a",
-                    },
-              ]}
-              textStyle={styles.tagText}
-            >
-              {tag.name}
-            </Chip>
-          ))
-        )}
-      </View>
-      <View style={styles.inlineFormRow}>
+      <Surface style={styles.redesignSectionCard} elevation={0}>
+        <Text style={styles.redesignSectionTitle}>説明</Text>
         <TextInput
-          value={newTagDraft}
-          onChangeText={setNewTagDraft}
-          mode="outlined"
-          dense
-          placeholder="新規タグ"
-          style={styles.inlineFormInput}
-          autoCorrect={false}
+          value={description}
+          onChangeText={setDescription}
+          mode="flat"
+          style={styles.redesignDescriptionInput}
+          contentStyle={styles.redesignDescriptionContent}
+          multiline
+          numberOfLines={5}
+          placeholder="説明を追加"
+          underlineColor="transparent"
+          activeUnderlineColor="#89b4fa"
         />
-        <Button
-          mode="outlined"
-          onPress={() => void handleCreateTag()}
-          disabled={!newTagDraft.trim() || tagBusy}
-          loading={tagBusy}
-        >
-          追加
-        </Button>
-      </View>
+      </Surface>
 
-      <Divider style={styles.divider} />
-
-      {task.created_at ? (
-        <View style={styles.metaRow}>
-          <Text style={styles.metaLabel}>Created</Text>
-          <Text style={styles.metaValue}>
-            {format(new Date(task.created_at), "yyyy/MM/dd HH:mm")}
+      <Surface style={styles.redesignSectionCard} elevation={0}>
+        <View style={styles.sectionHeaderRow}>
+          <Text style={styles.redesignSectionTitle}>サブタスク</Text>
+          <Text style={styles.redesignSectionCount}>
+            {completedSubtasks}/{(task.subtasks ?? []).length}
           </Text>
         </View>
-      ) : null}
-      {task.completed_at ? (
-        <View style={styles.metaRow}>
-          <Text style={styles.metaLabel}>Closed</Text>
-          <Text style={styles.metaValue}>
-            {format(new Date(task.completed_at), "yyyy/MM/dd HH:mm")}
-          </Text>
-        </View>
-      ) : null}
-      {task.total_time_seconds ? (
-        <View style={styles.metaRow}>
-          <Text style={styles.metaLabel}>Tracked Total</Text>
-          <Text style={styles.metaValue}>
-            {formatDuration(task.total_time_seconds)}
-          </Text>
-        </View>
-      ) : null}
-      {task.assignees?.length ? (
-        <View style={styles.metaRow}>
-          <Text style={styles.metaLabel}>Assignees</Text>
-          <Text style={styles.metaValue}>
-            {task.assignees
-              .map((item) => item.display_name || item.username || "")
-              .join(", ")}
-          </Text>
-        </View>
-      ) : null}
-
-      <Divider style={styles.divider} />
-      <Text style={[styles.label, styles.sectionLabel]}>
-        Subtasks (
-        {
-          (task.subtasks ?? []).filter((item) => item.status === "closed")
-            .length
-        }
-        /{(task.subtasks ?? []).length})
-      </Text>
-      {(task.subtasks ?? []).map((subtask) => (
-        <Surface key={subtask.id} style={styles.subtaskCard}>
-          <View style={styles.subtaskRow}>
+        {(task.subtasks ?? []).map((subtask) => (
+          <View key={subtask.id} style={styles.redesignSubtaskRow}>
             <IconButton
               icon={
                 subtask.status === "closed" ? "check-circle" : "circle-outline"
@@ -1415,133 +1116,302 @@ export default function TaskDetailScreen() {
                 }
                 await loadTask();
               }}
-              style={{ margin: 0 }}
+              style={styles.redesignSubtaskButton}
             />
             <Text
               style={[
                 styles.subtaskTitle,
                 subtask.status === "closed" ? styles.subtaskDone : null,
               ]}
+              numberOfLines={2}
             >
               {subtask.title}
             </Text>
           </View>
-        </Surface>
-      ))}
-      <View style={styles.inlineFormRow}>
-        <TextInput
-          value={subtaskDraft}
-          onChangeText={setSubtaskDraft}
-          mode="outlined"
-          dense
-          placeholder="サブタスクを追加"
-          style={styles.inlineFormInput}
-        />
-        <Button
-          mode="outlined"
-          onPress={() => void handleAddSubtask()}
-          disabled={!subtaskDraft.trim() || subtaskSaving}
-          loading={subtaskSaving}
-        >
-          追加
-        </Button>
-      </View>
+        ))}
+        <View style={styles.inlineFormRow}>
+          <TextInput
+            value={subtaskDraft}
+            onChangeText={setSubtaskDraft}
+            mode="flat"
+            dense
+            placeholder="サブタスクを追加"
+            style={styles.inlineFormInput}
+          />
+          <IconButton
+            icon="plus"
+            iconColor="#89b4fa"
+            onPress={() => void handleAddSubtask()}
+            disabled={!subtaskDraft.trim() || subtaskSaving}
+          />
+        </View>
+      </Surface>
 
-      <Divider style={styles.divider} />
-      <View style={styles.sectionHeaderRow}>
-        <Text style={[styles.label, styles.sectionLabel]}>Attachments</Text>
-        <Button
-          mode="outlined"
+      <View style={styles.redesignTabRow}>
+        <Chip
           compact
-          onPress={() => void handleUploadAttachment()}
-          disabled={attachmentSaving}
-          loading={attachmentSaving}
+          selected={activeInfoTab === "comments"}
+          onPress={() => setActiveInfoTab("comments")}
+          style={styles.redesignTabChip}
         >
-          添付
-        </Button>
+          コメント {comments.length}
+        </Chip>
+        <Chip
+          compact
+          selected={activeInfoTab === "attachments"}
+          onPress={() => setActiveInfoTab("attachments")}
+          style={styles.redesignTabChip}
+        >
+          添付 {attachments.length}
+        </Chip>
       </View>
-      {attachments.length === 0 ? (
-        <Text style={styles.calendarHint}>添付ファイルはまだありません</Text>
-      ) : (
-        attachments.map((attachment) => (
-          <Surface key={attachment.id} style={styles.attachmentCard}>
-            <View style={styles.attachmentInfo}>
-              <Text style={styles.attachmentName} numberOfLines={1}>
-                {attachment.display_name}
+
+      <Surface style={styles.redesignSectionCard} elevation={0}>
+        {activeInfoTab === "comments" ? (
+          <View>
+            {comments.length === 0 ? (
+              <Text style={styles.redesignEmptyText}>
+                コメントはまだありません
               </Text>
-              <Text style={styles.attachmentMeta}>
-                {attachment.kind === "image" ? "image" : "file"} /{" "}
-                {formatBytes(attachment.size_bytes)}
-              </Text>
+            ) : (
+              comments.map((comment) => (
+                <View key={comment.id} style={styles.commentCard}>
+                  <Text style={styles.commentText}>{comment.content}</Text>
+                  <Text style={styles.commentMeta}>
+                    {comment.display_name || comment.username || "user"}
+                    {comment.created_at
+                      ? ` / ${format(new Date(comment.created_at), "yyyy/MM/dd HH:mm")}`
+                      : ""}
+                  </Text>
+                </View>
+              ))
+            )}
+            <View style={styles.redesignCommentComposer}>
+              <TextInput
+                value={commentDraft}
+                onChangeText={setCommentDraft}
+                mode="flat"
+                multiline
+                placeholder="コメントを入力"
+                style={styles.redesignCommentInput}
+              />
+              <IconButton
+                icon="send"
+                iconColor="#89b4fa"
+                onPress={() => void handleSendComment()}
+                disabled={!commentDraft.trim() || commentSaving}
+              />
             </View>
-            <IconButton
-              icon="delete-outline"
-              iconColor="#f38ba8"
-              size={20}
-              onPress={() => void handleDeleteAttachment(attachment.id)}
-            />
-          </Surface>
-        ))
-      )}
+          </View>
+        ) : null}
 
-      <Divider style={styles.divider} />
-      <Text style={[styles.label, styles.sectionLabel]}>Comments</Text>
-      {comments.length === 0 ? (
-        <Text style={styles.calendarHint}>コメントはまだありません</Text>
-      ) : (
-        comments.map((comment) => (
-          <Surface key={comment.id} style={styles.commentCard}>
-            <Text style={styles.commentText}>{comment.content}</Text>
-            <Text style={styles.commentMeta}>
-              {comment.display_name || comment.username || "user"}
-              {comment.created_at
-                ? ` / ${format(new Date(comment.created_at), "yyyy/MM/dd HH:mm")}`
-                : ""}
+        {activeInfoTab === "attachments" ? (
+          <View>
+            <View style={styles.sectionHeaderRow}>
+              <Text style={styles.redesignSectionTitle}>添付ファイル</Text>
+              <Button
+                mode="text"
+                compact
+                icon="paperclip"
+                onPress={() => void handleUploadAttachment()}
+                disabled={attachmentSaving}
+                loading={attachmentSaving}
+              >
+                追加
+              </Button>
+            </View>
+            {attachments.length === 0 ? (
+              <Text style={styles.redesignEmptyText}>
+                添付ファイルはまだありません
+              </Text>
+            ) : (
+              attachments.map((attachment) => (
+                <View key={attachment.id} style={styles.attachmentCard}>
+                  <View style={styles.attachmentInfo}>
+                    <Text style={styles.attachmentName} numberOfLines={1}>
+                      {attachment.display_name}
+                    </Text>
+                    <Text style={styles.attachmentMeta}>
+                      {attachment.kind === "image" ? "画像" : "ファイル"} /{" "}
+                      {formatBytes(attachment.size_bytes)}
+                    </Text>
+                  </View>
+                  <IconButton
+                    icon="delete-outline"
+                    iconColor="#f38ba8"
+                    size={20}
+                    onPress={() => void handleDeleteAttachment(attachment.id)}
+                  />
+                </View>
+              ))
+            )}
+          </View>
+        ) : null}
+      </Surface>
+
+      <Surface style={styles.redesignDetailsCard} elevation={0}>
+        <View style={styles.redesignDetailsContent}>
+            <Text style={styles.redesignSectionTitle}>タグ・通知</Text>
+            <View style={styles.redesignSettingRow}>
+              <Text style={styles.redesignSettingLabel}>終日</Text>
+              <Switch value={allDay} onValueChange={setAllDay} />
+            </View>
+            <Divider style={styles.redesignDetailsDivider} />
+            <Text style={styles.redesignSettingHeading}>タグ</Text>
+            <View style={styles.tagRow}>
+              {availableTags.map((tag) => (
+                <Chip
+                  key={tag.id}
+                  compact
+                  selected={selectedTagIds.includes(tag.id)}
+                  onPress={() => toggleTag(tag.id)}
+                  style={[
+                    styles.tagChip,
+                    selectedTagIds.includes(tag.id)
+                      ? { backgroundColor: tag.color || "#45475a" }
+                      : { borderColor: tag.color || "#45475a" },
+                  ]}
+                  textStyle={styles.tagText}
+                >
+                  {tag.name}
+                </Chip>
+              ))}
+            </View>
+            <View style={styles.inlineFormRow}>
+              <TextInput
+                value={newTagDraft}
+                onChangeText={setNewTagDraft}
+                mode="outlined"
+                dense
+                placeholder="新規タグ"
+                style={styles.inlineFormInput}
+              />
+              <Button
+                mode="outlined"
+                compact
+                onPress={() => void handleCreateTag()}
+                disabled={!newTagDraft.trim() || tagBusy}
+                loading={tagBusy}
+              >
+                追加
+              </Button>
+            </View>
+            <Divider style={styles.redesignDetailsDivider} />
+            <View style={styles.redesignSettingRow}>
+              <Text style={styles.redesignSettingLabel}>通知</Text>
+              <Switch
+                value={notificationsEnabled}
+                onValueChange={setNotificationsEnabled}
+              />
+            </View>
+            <Text style={styles.redesignSettingHeading}>リマインダー</Text>
+            <View style={styles.tagRow}>
+              {REMINDER_PRESETS.map((preset) => (
+                <Chip
+                  key={preset.value}
+                  compact
+                  selected={reminderOffsets.includes(preset.value)}
+                  disabled={!notificationsEnabled}
+                  onPress={() => toggleReminder(preset.value)}
+                  style={styles.tagChip}
+                  textStyle={styles.tagText}
+                >
+                  {preset.label}
+                </Chip>
+              ))}
+            </View>
+          </View>
+      </Surface>
+
+      {shouldShowTriageCard ? (
+        <Surface style={styles.triageCard} elevation={0}>
+          <Text style={styles.triageTitle}>エージェント事前確認</Text>
+          <Text style={styles.triageStatus}>{triageStatus}</Text>
+          {triageHasSummary ? (
+            <Text style={styles.triageSummary}>{triageSummary}</Text>
+          ) : null}
+          {triageQuestions.map((question) => (
+            <Text key={question} style={styles.triageQuestion}>
+              - {question}
             </Text>
-          </Surface>
-        ))
-      )}
-      <TextInput
-        value={commentDraft}
-        onChangeText={setCommentDraft}
-        mode="outlined"
-        multiline
-        numberOfLines={2}
-        placeholder="コメントを入力..."
-        style={styles.input}
-      />
-      <Button
-        mode="outlined"
-        onPress={() => void handleSendComment()}
-        disabled={!commentDraft.trim() || commentSaving}
-        loading={commentSaving}
-        style={styles.commentButton}
-      >
-        コメント送信
-      </Button>
+          ))}
+        </Surface>
+      ) : null}
 
-      <Divider style={styles.divider} />
-
-      <Button
-        mode="contained"
-        onPress={handleSave}
-        loading={saving || autosaving}
-        style={styles.saveButton}
-      >
-        Save
-      </Button>
-      <Button
-        mode="outlined"
-        onPress={() => setShowDeleteDialog(true)}
-        textColor="#f38ba8"
-        style={styles.deleteButton}
-      >
-        Delete
-      </Button>
+      <Surface style={styles.redesignBottomActions} elevation={0}>
+        <View style={styles.redesignSaveAndTimerRow}>
+          <Text style={styles.autosaveStatus}>
+            {autosaving
+              ? "保存中…"
+              : hasUnsavedDraft
+                ? "変更は自動保存されます"
+                : "保存済み"}
+          </Text>
+          <Button
+            mode="text"
+            compact
+            icon={activeEntry ? "stop-circle" : "play-circle"}
+            textColor={activeEntry ? "#f38ba8" : "#a6e3a1"}
+            onPress={() => void handleTimerToggle()}
+          >
+            {activeEntry
+              ? formatDuration(timerElapsed)
+              : formatDuration(task.total_time_seconds || 0)}
+          </Button>
+        </View>
+        <Button
+          mode="contained"
+          icon="robot-outline"
+          onPress={() => void handleRunWithAgent()}
+          loading={launchingAgent}
+          disabled={
+            launchingAgent ||
+            !isAuthenticated ||
+            !online ||
+            !title.trim() ||
+            DISALLOWED_PLACEHOLDER_TITLES.has(title.trim())
+          }
+          style={styles.agentButton}
+        >
+          エージェントで実行
+        </Button>
+      </Surface>
 
       <Portal>
+        <Dialog
+          visible={showHistoryDialog}
+          onDismiss={() => setShowHistoryDialog(false)}
+          style={styles.dialog}
+        >
+          <Dialog.Title style={styles.dialogTitle}>履歴</Dialog.Title>
+          <Dialog.Content>
+            {task.completed_at ? (
+              <View style={styles.redesignHistoryRow}>
+                <Text style={styles.redesignHistoryLabel}>完了</Text>
+                <Text style={styles.redesignHistoryValue}>
+                  {format(new Date(task.completed_at), "yyyy/MM/dd HH:mm")}
+                </Text>
+              </View>
+            ) : null}
+            {task.created_at ? (
+              <View style={styles.redesignHistoryRow}>
+                <Text style={styles.redesignHistoryLabel}>作成</Text>
+                <Text style={styles.redesignHistoryValue}>
+                  {format(new Date(task.created_at), "yyyy/MM/dd HH:mm")}
+                </Text>
+              </View>
+            ) : null}
+            {!task.created_at && !task.completed_at ? (
+              <Text style={styles.redesignEmptyText}>履歴はまだありません</Text>
+            ) : null}
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button onPress={() => setShowHistoryDialog(false)}>閉じる</Button>
+          </Dialog.Actions>
+        </Dialog>
         <Snackbar
           visible={!!saveError}
+
           onDismiss={() => setSaveError(null)}
           duration={4000}
           style={styles.snackbar}
@@ -1553,19 +1423,21 @@ export default function TaskDetailScreen() {
           onDismiss={() => setShowDeleteDialog(false)}
           style={styles.dialog}
         >
-          <Dialog.Title style={styles.dialogTitle}>Delete Task</Dialog.Title>
+          <Dialog.Title style={styles.dialogTitle}>タスクを削除</Dialog.Title>
           <Dialog.Content>
-            <Text style={styles.dialogText}>Delete "{task.title}"?</Text>
+            <Text style={styles.dialogText}>
+              「{task.title}」を削除しますか？
+            </Text>
           </Dialog.Content>
           <Dialog.Actions>
             <Button
               onPress={() => setShowDeleteDialog(false)}
               textColor="#a6adc8"
             >
-              Cancel
+              キャンセル
             </Button>
             <Button onPress={handleDelete} textColor="#f38ba8">
-              Delete
+              削除
             </Button>
           </Dialog.Actions>
         </Dialog>
@@ -1577,6 +1449,26 @@ export default function TaskDetailScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b" },
   content: { padding: 16, paddingBottom: 40 },
+  groupHeading: {
+    color: "#cdd6f4",
+    fontSize: 18,
+    fontWeight: "700",
+    marginBottom: 10,
+    marginTop: 4,
+  },
+  primaryCard: {
+    backgroundColor: "#1e1e2e",
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 20,
+  },
+  primaryTitleRow: { flexDirection: "row", alignItems: "center", gap: 4 },
+  primaryTitleInput: { flex: 1, marginBottom: 12 },
+  autosaveStatus: {
+    color: "#9399b2",
+    fontSize: 12,
+    textAlign: "right",
+  },
   center: {
     flex: 1,
     justifyContent: "center",
@@ -1710,4 +1602,154 @@ const styles = StyleSheet.create({
   dialogTitle: { color: "#cdd6f4" },
   dialogText: { color: "#a6adc8" },
   snackbar: { backgroundColor: "#313244" },
+  redesignTitleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 6,
+  },
+  redesignCompleteButton: { margin: 0, marginRight: 2 },
+  redesignTitleInput: {
+    flex: 1,
+    backgroundColor: "transparent",
+    minHeight: 54,
+  },
+  redesignTitleInputContent: {
+    color: "#f5f5f7",
+    fontSize: 23,
+    fontWeight: "700",
+    paddingHorizontal: 4,
+  },
+  redesignAttributeRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 7,
+    marginBottom: 9,
+  },
+  redesignDateRow: {
+    flexDirection: "row",
+    gap: 8,
+    marginBottom: 9,
+  },
+  redesignDateInput: {
+    flex: 1,
+    minWidth: 0,
+    backgroundColor: "#181825",
+  },
+  redesignAttributeChip: {
+    backgroundColor: "#181825",
+    borderWidth: 1,
+    borderColor: "#313244",
+  },
+  redesignImportantTags: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+    marginBottom: 16,
+  },
+  redesignImportantTagChip: { height: 29 },
+  redesignImportantTagText: { color: "#f5f5f7", fontSize: 12 },
+  redesignAddTagChip: {
+    height: 29,
+    backgroundColor: "transparent",
+    borderWidth: 1,
+    borderColor: "#585b70",
+  },
+  redesignAddTagText: { color: "#a6adc8", fontSize: 12 },
+  redesignSectionCard: {
+    backgroundColor: "#1e1e2e",
+    borderRadius: 14,
+    padding: 13,
+    marginBottom: 12,
+  },
+  redesignSectionTitle: {
+    color: "#cdd6f4",
+    fontSize: 15,
+    fontWeight: "700",
+  },
+  redesignSectionCount: { color: "#9399b2", fontSize: 13 },
+  redesignDescriptionInput: {
+    backgroundColor: "#181825",
+    borderRadius: 10,
+    marginTop: 9,
+    minHeight: 126,
+  },
+  redesignDescriptionContent: {
+    color: "#cdd6f4",
+    fontSize: 15,
+    lineHeight: 21,
+    paddingHorizontal: 10,
+    paddingTop: 8,
+  },
+  redesignSubtaskRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    minHeight: 36,
+  },
+  redesignSubtaskButton: { margin: 0 },
+  redesignTabRow: {
+    flexDirection: "row",
+    gap: 7,
+    marginBottom: 9,
+  },
+  redesignTabChip: { flex: 1, backgroundColor: "#181825" },
+  redesignHistoryRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    paddingVertical: 7,
+  },
+  redesignHistoryLabel: { color: "#a6adc8", fontSize: 13 },
+  redesignHistoryValue: { color: "#cdd6f4", fontSize: 13 },
+  redesignEmptyText: {
+    color: "#9399b2",
+    fontSize: 13,
+    paddingVertical: 8,
+  },
+  redesignCommentComposer: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    marginTop: 8,
+  },
+  redesignCommentInput: {
+    flex: 1,
+    backgroundColor: "#181825",
+    borderRadius: 10,
+  },
+  redesignDetailsCard: {
+    backgroundColor: "#1e1e2e",
+    borderRadius: 14,
+    marginBottom: 12,
+    overflow: "hidden",
+  },
+  redesignDetailsButtonContent: { justifyContent: "flex-start" },
+  redesignDetailsContent: { padding: 13, paddingTop: 4 },
+  redesignSettingRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    minHeight: 44,
+  },
+  redesignSettingLabel: { color: "#a6adc8", fontSize: 14 },
+  redesignSettingValue: { color: "#cdd6f4", fontSize: 14 },
+  redesignSettingHeading: {
+    color: "#cdd6f4",
+    fontSize: 14,
+    fontWeight: "600",
+    marginBottom: 9,
+  },
+  redesignDetailsDivider: {
+    backgroundColor: "#313244",
+    marginVertical: 12,
+  },
+  redesignBottomActions: {
+    backgroundColor: "#1e1e2e",
+    borderRadius: 14,
+    padding: 12,
+    marginBottom: 8,
+  },
+  redesignSaveAndTimerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 6,
+  },
 });

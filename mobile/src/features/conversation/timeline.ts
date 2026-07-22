@@ -79,7 +79,6 @@ export function buildJobEvent(job: ConversationJob): ConversationEvent {
 
 export function buildSyncEvent(args: {
   pendingMessages: number;
-  disconnected: boolean;
 }): ConversationEvent | null {
   if (args.pendingMessages > 0) {
     return {
@@ -88,16 +87,6 @@ export function buildSyncEvent(args: {
       title: "未送信キュー",
       description: `${args.pendingMessages} 件のメッセージがローカルに残っています。接続後に再送できます。`,
       severity: "warning",
-    };
-  }
-  if (args.disconnected) {
-    return {
-      id: "sync-rest-dispatch",
-      kind: "sync",
-      title: "REST dispatch",
-      description:
-        "WebSocket は未接続です。送信は REST で行い、保存済みメッセージを遅延再取得します。",
-      severity: "info",
     };
   }
   return null;
@@ -135,7 +124,6 @@ export function buildTimeline(args: {
   activityMessage: string | null;
   streamContent: string;
   pendingMessages: number;
-  disconnected: boolean;
 }): TimelineItem[] {
   const items: TimelineItem[] = args.messages.map((message) => ({
     id: message.id,
@@ -145,7 +133,6 @@ export function buildTimeline(args: {
   const events = [
     buildSyncEvent({
       pendingMessages: args.pendingMessages,
-      disconnected: args.disconnected,
     }),
     buildProgressEvent(args.activityMessage),
     buildToolEvent(args.activeTool),

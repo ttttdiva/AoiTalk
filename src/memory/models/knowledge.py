@@ -19,7 +19,7 @@ from sqlalchemy import (
     text,
     Date,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import CIDR, UUID
 from sqlalchemy.orm import relationship
 
 from .base import Base, _encrypted_json_property, _encrypted_text_property
@@ -431,7 +431,11 @@ class KnowledgeNode(Base):
     parent_id = Column(UUID(as_uuid=True), ForeignKey("knowledge_nodes.id", ondelete="CASCADE"))
     root_page_id = Column(UUID(as_uuid=True), ForeignKey("knowledge_nodes.id", ondelete="SET NULL"))
     project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL"))
-    title = Column(String(500), nullable=False)
+    system_key = Column(Text)
+    title = Column(Text, nullable=False)
+    # Web drizzle スキーマと serializeNode が持つ別名配列。DB 列は既存（alembic 済み）で、
+    # ここは pull シリアライズ用の ORM ミラー。モバイルは read-only 表示に使う。
+    aliases = Column(JSON, default=list, nullable=True)
     description = Column(Text, default="", nullable=False)
     _body_json = Column("body_json", JSON, default=dict, nullable=False)
     body_json = _encrypted_json_property("_body_json", "knowledge_nodes.body_json")
@@ -450,6 +454,11 @@ class KnowledgeNode(Base):
     archived_at = Column(DateTime)
 
     __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "system_key",
+            name="uq_knowledge_nodes_workspace_system_key",
+        ),
         Index("ix_knowledge_nodes_workspace", "workspace_id"),
         Index("ix_knowledge_nodes_workspace_parent_sort", "workspace_id", "parent_id", "sort_order"),
         Index("ix_knowledge_nodes_workspace_project", "workspace_id", "project_id"),
@@ -518,6 +527,8 @@ class KnowledgeNodeSupertag(Base):
         primary_key=True,
     )
     created_at = Column(DateTime, default=datetime.utcnow)
+    # 同じ関連キーを再作成した場合も、サーバー側の版を比較できるようにする。
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
 
     __table_args__ = (
@@ -735,7 +746,7 @@ class KnowledgeRevision(Base):
         ForeignKey("knowledge_nodes.id", ondelete="CASCADE"),
         nullable=False,
     )
-    title = Column(String(500), nullable=False)
+    title = Column(Text, nullable=False)
     _body_json = Column("body_json", JSON, default=dict, nullable=False)
     body_json = _encrypted_json_property("_body_json", "knowledge_revisions.body_json")
     _body_text = Column("body_text", Text, default="", nullable=False)
@@ -838,7 +849,7 @@ class KnowledgeImportItem(Base):
     )
     node_id = Column(UUID(as_uuid=True), ForeignKey("knowledge_nodes.id", ondelete="SET NULL"))
     source_ref = Column(Text, nullable=False)
-    title = Column(String(500), nullable=False)
+    title = Column(Text, nullable=False)
     item_type = Column(String(40), default="page", nullable=False)
     status = Column(String(20), default="proposed", nullable=False)
     preview_json = Column(JSON, default=dict, nullable=False)

@@ -5,6 +5,11 @@ import { useExplorer } from "@/contexts/explorer-context";
 import type { ExplorerDirectory, ExplorerFile } from "@/lib/explorer-api";
 import { explorerMove } from "@/lib/explorer-api";
 import {
+  sortExplorerDirectories,
+  sortExplorerFiles,
+  type SortKey,
+} from "@/lib/explorer-sort";
+import {
   Folder,
   Image as ImageIcon,
   Film,
@@ -43,9 +48,6 @@ function fileTypeIcon(file: ExplorerFile) {
 }
 
 const DND_MIME = "application/x-explorer-paths";
-
-type SortKey = "name" | "size" | "date";
-type SortDir = "asc" | "desc";
 
 interface FileListProps {
   onFileClick: (file: ExplorerFile) => void;
@@ -87,25 +89,27 @@ export function FileList({ onFileClick, onContextMenu }: FileListProps) {
     navigate,
     selectedItems,
     focusedItemPath,
+    clipboard,
     selectItem,
     toggleSelect,
     selectRange,
     refresh,
+    sortKey,
+    sortDir,
+    setSort,
+    isHydrusMode,
   } = useExplorer();
-  const [sortKey, setSortKey] = useState<SortKey>("name");
-  const [sortDir, setSortDir] = useState<SortDir>("asc");
   const [dropTarget, setDropTarget] = useState<string | null>(null);
 
   const toggleSort = useCallback(
     (key: SortKey) => {
       if (sortKey === key) {
-        setSortDir((dir) => (dir === "asc" ? "desc" : "asc"));
+        setSort(key, sortDir === "asc" ? "desc" : "asc");
       } else {
-        setSortKey(key);
-        setSortDir("asc");
+        setSort(key, "asc");
       }
     },
-    [sortKey],
+    [sortKey, sortDir, setSort],
   );
 
   const handleClick = (
@@ -185,24 +189,14 @@ export function FileList({ onFileClick, onContextMenu }: FileListProps) {
 
   if (!browseData) return null;
 
-  const sortedDirs = [...browseData.directories].sort((a, b) => {
-    const mul = sortDir === "asc" ? 1 : -1;
-    if (sortKey === "name") return mul * a.name.localeCompare(b.name);
-    if (sortKey === "date") {
-      return mul * (a.modified_at || "").localeCompare(b.modified_at || "");
-    }
-    return 0;
-  });
-
-  const sortedFiles = [...browseData.files].sort((a, b) => {
-    const mul = sortDir === "asc" ? 1 : -1;
-    if (sortKey === "name") return mul * a.name.localeCompare(b.name);
-    if (sortKey === "size") return mul * ((a.size || 0) - (b.size || 0));
-    if (sortKey === "date") {
-      return mul * (a.modified_at || "").localeCompare(b.modified_at || "");
-    }
-    return 0;
-  });
+  // Hydrus は検索時に Hydrus 側で全件ソート済みのため、1ページ分だけを
+  // フロント側で並べ替えると全体の順序が壊れる。API 応答順のまま描画する。
+  const sortedDirs = isHydrusMode
+    ? browseData.directories
+    : sortExplorerDirectories(browseData.directories, sortKey, sortDir);
+  const sortedFiles = isHydrusMode
+    ? browseData.files
+    : sortExplorerFiles(browseData.files, sortKey, sortDir);
   const orderedPaths = [
     ...sortedDirs.map((dir) => dir.path),
     ...sortedFiles.map((file) => file.path),
@@ -244,9 +238,12 @@ export function FileList({ onFileClick, onContextMenu }: FileListProps) {
               data-explorer-item-path={dir.path}
               draggable
               className={cn(
-                "cursor-pointer hover:bg-muted",
+                "cursor-pointer transition-opacity hover:bg-muted",
                 selectedItems.has(dir.path) && "bg-accent",
                 focusedItemPath === dir.path && "outline outline-2 outline-primary/45",
+                clipboard?.operation === "cut" &&
+                  clipboard.paths.includes(dir.path) &&
+                  "opacity-50",
                 dropTarget === dir.path &&
                   "ring-2 ring-blue-400 bg-blue-500/10",
               )}
@@ -284,9 +281,12 @@ export function FileList({ onFileClick, onContextMenu }: FileListProps) {
               data-explorer-item-path={file.path}
               draggable={!isRecordTableFile(file)}
               className={cn(
-                "cursor-pointer hover:bg-muted",
+                "cursor-pointer transition-opacity hover:bg-muted",
                 selectedItems.has(file.path) && "bg-accent",
                 focusedItemPath === file.path && "outline outline-2 outline-primary/45",
+                clipboard?.operation === "cut" &&
+                  clipboard.paths.includes(file.path) &&
+                  "opacity-50",
               )}
               onClick={(e) => handleClick(e, file)}
               onDoubleClick={() => handleDoubleClick(file, false)}

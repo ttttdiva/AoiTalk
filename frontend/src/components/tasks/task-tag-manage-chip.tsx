@@ -17,6 +17,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { type Space, type Tag } from "@/lib/task-api";
+import { useConfirm } from "@/hooks/use-confirm";
 
 const TAG_COLORS = [
   "#6E3FC6",
@@ -57,6 +58,7 @@ export function TaskTagManageChip({
   onDelete,
   onCopyToSpace,
 }: TaskTagManageChipProps) {
+  const confirm = useConfirm();
   const [open, setOpen] = useState(false);
   const [editName, setEditName] = useState(tag.name);
   const [copySpaceId, setCopySpaceId] = useState("");
@@ -116,9 +118,10 @@ export function TaskTagManageChip({
   }, [copySpaceId, onCopyToSpace, tag.id]);
 
   const handleDelete = useCallback(async () => {
-    const confirmed = window.confirm(
-      `"${tag.name}" を削除します。関連タスクからも外れます。`,
-    );
+    const confirmed = await confirm({
+      description: `"${tag.name}" を削除します。関連タスクからも外れます。`,
+      destructive: true,
+    });
     if (!confirmed) return;
     setDeleting(true);
     try {
@@ -127,7 +130,7 @@ export function TaskTagManageChip({
     } finally {
       setDeleting(false);
     }
-  }, [onDelete, tag.id, tag.name]);
+  }, [onDelete, tag.id, tag.name, confirm]);
 
   return (
     <Popover open={open} onOpenChange={setOpen}>

@@ -14,14 +14,19 @@ import subprocess
 import asyncio
 import concurrent.futures
 import aiohttp
-from typing import Optional, List, Dict, Any, Union, Generator
+from typing import Optional, List, Dict, Any, Union, Generator, TYPE_CHECKING
 from pathlib import Path
+
+if TYPE_CHECKING:
+    # 型注釈（文字列フォワードリファレンス）用。
+    from ..tools.registry import ToolRegistry
 
 from openai import OpenAI
 
 from ..config import Config
 from ..memory.history import HistoryManager
 from ..services.project_context import (
+    format_project_context_for_chat_prompt,
     ProjectContextResolver,
     reset_runtime_project_context,
     set_runtime_project_context,
@@ -52,6 +57,13 @@ from .tool_policy import (
     set_current_user_input,
 )
 from .provider_capabilities import ProviderCapabilities
+from .conversation_context import (
+    build_prompt_messages,
+    normalize_usage,
+    persist_usage_sync,
+    stable_cache_key,
+)
+from .openai_compatible_local_profiles import openai_compatible_server_profile
 from .multimodal import openai_content_parts
 
 logger = logging.getLogger(__name__)
@@ -87,6 +99,9 @@ class SGLangServerManager:
         self.max_model_len = sglang_config.get('max_model_len')  # None = auto
         self.dtype = sglang_config.get('dtype', 'auto')
         self.auto_start = sglang_config.get('auto_start', True)
+        cache_config = sglang_config.get("cache", {}) or {}
+        self.cache_enabled = bool(cache_config.get("enabled", True)) if isinstance(cache_config, dict) else True
+        self.cache_extra_args = list(cache_config.get("extra_args", []) or []) if isinstance(cache_config, dict) else []
 
         # Health check settings
         self.startup_timeout = sglang_config.get('startup_timeout', 300)  # 5 minutes
@@ -262,6 +277,12 @@ class SGLangServerManager:
         if self.max_model_len:
             cmd.extend(["--max-model-len", str(self.max_model_len)])
 
+        # Keep Radix Cache enabled by default.  Version-specific flags are
+        # opt-in through extra_args so AoiTalk does not guess unsupported CLI
+        # options for a particular SGLang release.
+        if self.cache_enabled:
+            cmd.extend(str(arg) for arg in self.cache_extra_args)
+
         # Add trust-remote-code for HuggingFace models
         cmd.append("--trust-remote-code")
 
@@ -390,6 +411,12 @@ class SGLangClient:
 
         # Thinking mode (Qwen3 specific)
         self._thinking_mode = False  # Default: fast mode
+        self.server_profile = openai_compatible_server_profile(
+            config, base_url=self.base_url, provider="sglang"
+        )
+        self._last_model_transcript: list[dict[str, Any]] = []
+        self._last_usage: dict[str, Any] = {}
+        self._last_tool_loop_messages: list[dict[str, Any]] = []
 
         logger.info(f"[SGLangClient] 初期化完了")
         logger.info(f"[SGLangClient] Base URL: {self.base_url}")
@@ -531,7 +558,51 @@ class SGLangClient:
             sanitized = {k: str(v) for k, v in metadata.items() if v is not None}
             self.session_metadata = {**self.session_metadata, **sanitized}
 
-    def _build_messages(self, user_input: str) -> List[Dict[str, str]]:
+    def get_generation_metadata(self) -> Dict[str, Any]:
+        return {
+            "model_transcript": [dict(item) for item in self._last_model_transcript],
+            "cache_usage": dict(self._last_usage),
+            "cache_diagnostics": {
+                "provider": "sglang",
+                "model": self.model_name,
+                "cache_provider": "sglang",
+                "cache_mode": "radix",
+                "cache_supported": True,
+                "cache_active": self._last_usage.get("cache_active"),
+                "cache_configured": True,
+                "metrics_source": "sglang_response_or_server_metrics",
+                "cache_key": getattr(self, "_cache_key", None),
+                "session_affinity": self.server_profile.get("supports_session_affinity"),
+            },
+        }
+
+    def _capture_usage(self, response: Any) -> None:
+        raw = getattr(response, "usage", None)
+        if raw is None and isinstance(response, dict):
+            raw = response.get("usage")
+        self._last_usage = {
+            key: value
+            for key, value in normalize_usage(raw, provider="sglang").items()
+            if value is not None
+        }
+
+    def _record_model_transcript(self, messages: List[Dict[str, Any]], response_text: str) -> None:
+        source_messages = self._last_tool_loop_messages or messages
+        self._last_model_transcript = [
+            dict(message)
+            for message in source_messages
+            if message.get("role") in {"user", "assistant", "tool"}
+        ]
+        if response_text:
+            self._last_model_transcript.append({"role": "assistant", "content": response_text})
+        self.history_manager.set_model_messages(self._last_model_transcript)
+
+    def _build_messages(
+        self,
+        user_input: str,
+        *,
+        dynamic_context: Optional[list[tuple[str, str]]] = None,
+    ) -> List[Dict[str, Any]]:
         """Build messages list for API call
 
         Args:
@@ -540,24 +611,17 @@ class SGLangClient:
         Returns:
             List of message dicts for OpenAI API
         """
-        messages = [
-            {"role": "system", "content": self.system_prompt}
-        ]
-
-        # Add conversation history
-        history = self.history_manager.get_all()
+        history = self.history_manager.get_model_messages()
         context_window = self.history_manager.context_window_size
-
-        for msg in history[-(context_window * 2):]:
-            messages.append({
-                "role": msg["role"],
-                "content": msg["content"]
-            })
-
-        # Add current user message
-        messages.append({"role": "user", "content": user_input})
-
-        return messages
+        return [
+            {"role": "system", "content": self.system_prompt},
+            *build_prompt_messages(
+                history[-(context_window * 2):],
+                summary=self.history_manager.summary,
+                current_user_input=user_input,
+                dynamic_context=dynamic_context or [],
+            ),
+        ]
 
     def _run_async_sync(self, coro):
         try:
@@ -672,18 +736,28 @@ class SGLangClient:
             get_client_generation_policy(self)
         )
         try:
+            self._last_tool_loop_messages = []
             project_context = self._resolve_project_context_sync()
             project_token = set_runtime_project_context(project_context)
             tool_hint_context = self._build_tool_hint_context(
                 user_input
             )
-            model_user_input = compose_tool_hint_user_message(
-                user_input,
-                tool_hint_context,
-            )
+            dynamic_context: list[tuple[str, str]] = []
+            if project_context:
+                dynamic_context.append(
+                    (
+                        "Current Project Context",
+                        format_project_context_for_chat_prompt(project_context),
+                    )
+                )
+            if tool_hint_context:
+                dynamic_context.append(("Current tool hints", tool_hint_context))
 
             # Build messages
-            messages = self._build_messages(model_user_input)
+            messages = self._build_messages(
+                user_input,
+                dynamic_context=dynamic_context,
+            )
             if image_data and messages:
                 messages[-1]["content"] = openai_content_parts(
                     str(messages[-1].get("content") or ""),
@@ -706,6 +780,19 @@ class SGLangClient:
             # Build tools from unified registry
             registry = self._tool_registry
             api_tools = OpenAIAPIAdapter.convert_all(registry.get_all()) if len(registry) > 0 else None
+            self._cache_key = stable_cache_key(
+                user_id=self.session_user_id,
+                session_id=self.current_session_id,
+                project_id=self.current_project_id,
+                character=self.character_name,
+                model=self.model_name,
+                system_prompt=self.system_prompt,
+                tool_schemas=api_tools or [],
+                provider="sglang",
+                branch_fingerprint=str(getattr(self, "current_edit_message_id", None) or "default-branch"),
+                summary_version=int(getattr(self.history_manager, "summary_version", 0) or 0),
+                server_instance=str(self.session_metadata.get("server_instance") or "default-instance"),
+            )
 
             # Make API call
             if stream:
@@ -722,6 +809,19 @@ class SGLangClient:
                 if api_tools:
                     api_kwargs["tools"] = api_tools
                     api_kwargs["tool_choice"] = "auto"
+                self._cache_key = stable_cache_key(
+                    user_id=self.session_user_id,
+                    session_id=self.current_session_id,
+                    project_id=self.current_project_id,
+                    character=self.character_name,
+                    model=self.model_name,
+                    system_prompt=self.system_prompt,
+                    tool_schemas=api_tools or [],
+                    provider="sglang",
+                    branch_fingerprint=str(getattr(self, "current_edit_message_id", None) or "default-branch"),
+                    summary_version=int(getattr(self.history_manager, "summary_version", 0) or 0),
+                    server_instance=str(self.session_metadata.get("server_instance") or "default-instance"),
+                )
 
                 # Try with extra_body first, fallback without if model doesn't support it
                 try:
@@ -734,6 +834,14 @@ class SGLangClient:
                         response = self.client.chat.completions.create(**api_kwargs)
                     else:
                         raise
+
+                self._capture_usage(response)
+                persist_usage_sync(
+                    self,
+                    provider="sglang",
+                    model=self.model_name,
+                    usage=self._last_usage,
+                )
 
                 choice = response.choices[0]
 
@@ -774,6 +882,7 @@ class SGLangClient:
                     user_input=user_input,
                     initial_response=response_text,
                 )
+                self._record_model_transcript(messages, response_text)
                 # Add to history
                 self.history_manager.add_message("user", user_input)
                 self.history_manager.add_message("assistant", response_text)
@@ -823,6 +932,9 @@ class SGLangClient:
             config=self.config,
             user_input=user_input,
         )
+        self._last_tool_loop_messages = [
+            dict(message) for message in getattr(result, "messages", [])
+        ]
         return guard_tool_execution_claims(result.final_output, result.tool_calls)
 
     def _run_agentic_review_once(
@@ -935,8 +1047,17 @@ class SGLangClient:
                     content = chunk.choices[0].delta.content
                     full_response += content
                     yield content
+                self._capture_usage(chunk)
 
             # Add to history after streaming is complete
+            self._record_model_transcript(messages, full_response)
+            persist_usage_sync(
+                self,
+                provider="sglang",
+                model=self.model_name,
+                usage=self._last_usage,
+                is_streaming=True,
+            )
             self.history_manager.add_message("user", user_input)
             self.history_manager.add_message("assistant", full_response)
 

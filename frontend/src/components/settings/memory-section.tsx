@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useCallback } from "react";
+import useSWR from "swr";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -22,9 +23,31 @@ import {
   Loader2,
 } from "lucide-react";
 import { memoryApi, type DreamingMemory } from "@/lib/ecc-api";
+import { useConfirm } from "@/hooks/use-confirm";
 
 export function MemorySection() {
-  const [memories, setMemories] = useState<DreamingMemory[]>([]);
+  const confirm = useConfirm();
+  // サーバー状態（メモリ一覧）は SWR で管理する。取得タイミングは従来どおり
+  // 呼び出し側（トグル/更新ボタン/保存・削除後）の fetchMemories で駆動するため、
+  // SWR の自動 revalidation は全て無効化する。
+  const { data: memories = [], mutate: mutateMemories } = useSWR<DreamingMemory[]>(
+    "settings/dreaming-memories",
+    async () => {
+      try {
+        return (await memoryApi.list()).memories || [];
+      } catch {
+        return [];
+      }
+    },
+    {
+      revalidateOnMount: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+      keepPreviousData: true,
+      dedupingInterval: 0,
+    },
+  );
   const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [editMemory, setEditMemory] = useState<DreamingMemory | null>(null);
@@ -38,14 +61,11 @@ export function MemorySection() {
   const fetchMemories = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await memoryApi.list();
-      setMemories(data.memories || []);
-    } catch {
-      setMemories([]);
+      await mutateMemories();
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [mutateMemories]);
 
   const handleToggle = useCallback(() => {
     setExpanded((prev) => {
@@ -98,7 +118,12 @@ export function MemorySection() {
   // 削除
   const handleDelete = useCallback(
     async (mem: DreamingMemory) => {
-      if (!window.confirm(`「${mem.content.slice(0, 30)}...」を削除しますか？`))
+      if (
+        !(await confirm({
+          description: `「${mem.content.slice(0, 30)}...」を削除しますか？`,
+          destructive: true,
+        }))
+      )
         return;
       setDeleting(mem.id);
       try {
@@ -110,12 +135,17 @@ export function MemorySection() {
         setDeleting(null);
       }
     },
-    [fetchMemories],
+    [fetchMemories, confirm],
   );
 
   // 全削除
   const handleDeleteAll = useCallback(async () => {
-    if (!window.confirm("全てのメモリを削除しますか？この操作は取り消せません。"))
+    if (
+      !(await confirm({
+        description: "全てのメモリを削除しますか？この操作は取り消せません。",
+        destructive: true,
+      }))
+    )
       return;
     try {
       await memoryApi.deleteAll();
@@ -123,7 +153,7 @@ export function MemorySection() {
     } catch {
       // ignore
     }
-  }, [fetchMemories]);
+  }, [fetchMemories, confirm]);
 
   // トグル
   return (

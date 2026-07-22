@@ -12,12 +12,14 @@ export {
   conversationsRepo,
   flushPendingConversation,
   flushPendingConversations,
+  getPromotedConversationSessionId,
 } from "./conversations";
 export {
   timeEntriesRepo,
   buildTimeReportFromEntries,
   calculateTimeEntryDuration,
 } from "./timeEntries";
-export { enqueueOutbox } from "./outbox";
+export { enqueueOutbox, listOutboxConflicts } from "./outbox";
 export * from "./records";
+export * from "./docs";
 export type { SyncAction, OutboxEnqueue } from "./types";

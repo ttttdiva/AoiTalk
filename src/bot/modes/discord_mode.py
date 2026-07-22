@@ -452,53 +452,50 @@ class DiscordMode(BaseAssistant):
                 import openai
                 client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
                 
-                # メッセージを構築
-                messages = [
-                    {
-                        "role": "system",
-                        "content": self.character_config.get('personality', {}).get('details', 'あなたは親切なAIアシスタントです。')
-                    }
-                ]
-                
+                # システム指示（Responses APIのinstructionsへ）
+                instructions = self.character_config.get('personality', {}).get('details', 'あなたは親切なAIアシスタントです。')
+
+                # 入力メッセージを構築
+                input_messages = []
+
                 # 会話履歴を追加（テキストのみ）
                 history_manager = context.get('history_manager')
                 if history_manager:
                     for msg in history_manager.get_context(10):  # 最近の10件
                         if msg['role'] in ['user', 'assistant']:
-                            messages.append({
+                            input_messages.append({
                                 "role": msg['role'],
                                 "content": msg['content']
                             })
-                
-                # 画像データをOpenAI形式に変換
+
+                # 画像データをResponses API形式に変換
                 openai_images = []
                 for img_data in images_data:
                     base64_image = base64.b64encode(img_data['data']).decode('utf-8')
                     openai_images.append({
-                        'type': 'image_url',
-                        'image_url': {
-                            'url': f"data:{img_data['mime_type']};base64,{base64_image}"
-                        }
+                        'type': 'input_image',
+                        'image_url': f"data:{img_data['mime_type']};base64,{base64_image}"
                     })
-                
+
                 # 現在のメッセージを追加（画像付き）
                 user_message = {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": text}
+                        {"type": "input_text", "text": text}
                     ]
                 }
                 user_message["content"].extend(openai_images)
-                messages.append(user_message)
-                
+                input_messages.append(user_message)
+
                 # GPT-4oで応答生成
-                response = client.chat.completions.create(
+                response = client.responses.create(
                     model=vision_model, # configから取得したモデル名を使用
-                    messages=messages,
-                    max_tokens=1000
+                    instructions=instructions,
+                    input=input_messages,
+                    max_output_tokens=1000
                 )
-                
-                return response.choices[0].message.content
+
+                return getattr(response, "output_text", "") or None
             
         except Exception as e:
             logger.error(f"Error generating response with images: {e}", exc_info=True)

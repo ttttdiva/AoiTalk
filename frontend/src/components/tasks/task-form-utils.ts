@@ -1,6 +1,9 @@
 import {
   getTaskCommandVariants,
+  normalizeCommandValue,
+  resolveCommandCandidate,
   type CommandCandidate,
+  type CommandCandidateSelection,
   type ValuePreviewFn,
 } from "@/components/tasks/slash-command-input";
 import { formatTaskDateLabel } from "@/lib/task-date-label";
@@ -73,6 +76,30 @@ const WEEKDAY_ALIASES: Record<string, number> = {
   sat: 6,
 };
 
+const DATE_KEYWORD_ALIASES: Record<string, string[]> = {
+  today: ["today", "tod"],
+  tomorrow: ["tomorrow", "tomo", "tom"],
+  sunday: ["sunday", "sun"],
+  monday: ["monday", "mon"],
+  tuesday: ["tuesday", "tues", "tue"],
+  wednesday: ["wednesday", "wed"],
+  thursday: ["thursday", "thurs", "thur", "thu"],
+  friday: ["friday", "fri"],
+  saturday: ["saturday", "sat"],
+};
+
+function resolveDateKeyword(input: string): string | null {
+  const query = normalizeCommandValue(input);
+  if (!query) return null;
+  const entries = Object.entries(DATE_KEYWORD_ALIASES);
+  const exact = entries.filter(([, aliases]) => aliases.includes(query));
+  if (exact.length === 1) return exact[0][0];
+  const prefixes = entries.filter(([, aliases]) =>
+    aliases.some((alias) => alias.startsWith(query)),
+  );
+  return prefixes.length === 1 ? prefixes[0][0] : null;
+}
+
 const WEEKDAY_LABELS = [
   "Sunday",
   "Monday",
@@ -84,13 +111,26 @@ const WEEKDAY_LABELS = [
 ];
 
 export function parseFlexibleDate(raw: string): string | null {
-  const lower = raw
-    .toLowerCase()
+  let lower = raw
     .trim()
+    .toLowerCase()
     .replace(/,\s*/g, " ")
     .replace(/\s+/g, " ");
   if (!lower) return null;
   const now = new Date();
+
+  const keywordMatch = lower.match(
+    /^(next\s+)?([a-z]+)(?:\s+(\d{1,2}:\d{2}))?$/,
+  );
+  if (keywordMatch) {
+    const keyword = resolveDateKeyword(keywordMatch[2]);
+    const next = !!keywordMatch[1];
+    if (keyword && (!next || Object.hasOwn(WEEKDAY_ALIASES, keyword))) {
+      lower = `${next ? "next " : ""}${keyword}${
+        keywordMatch[3] ? ` ${keywordMatch[3]}` : ""
+      }`;
+    }
+  }
 
   if (lower === "today" || lower === "tod") {
     const d = new Date(now);
@@ -260,6 +300,44 @@ export function normalizeStatus(raw: string): string {
   return map[raw.toLowerCase()] || raw;
 }
 
+const STATUS_ALIASES: Record<string, string[]> = {
+  open: ["open", "todo", "new"],
+  in_progress: ["in_progress", "in", "progress", "ip", "wip"],
+  on_hold: ["on_hold", "hold", "pending", "pause", "paused"],
+  review: ["review", "reviewing", "check"],
+  closed: ["closed", "done", "completed", "complete", "close"],
+};
+
+function resolveAliasedValue(
+  raw: string,
+  aliasesByValue: Record<string, string[]>,
+): string | null {
+  const query = normalizeCommandValue(raw).replace(/ /g, "_");
+  if (!query) return null;
+  const entries = Object.entries(aliasesByValue);
+  const exact = entries.filter(([, aliases]) => aliases.includes(query));
+  if (exact.length === 1) return exact[0][0];
+  const prefixes = entries.filter(([, aliases]) =>
+    aliases.some((alias) => alias.startsWith(query)),
+  );
+  return prefixes.length === 1 ? prefixes[0][0] : null;
+}
+
+export function resolveTaskStatus(raw: string): string | null {
+  return resolveAliasedValue(raw, STATUS_ALIASES);
+}
+
+const PRIORITY_VALUES = ["urgent", "high", "medium", "low", "none"];
+
+export function resolveTaskPriority(raw: string): string | null {
+  const query = normalizeCommandValue(raw);
+  if (!query) return null;
+  const exact = PRIORITY_VALUES.find((value) => value === query);
+  if (exact) return exact;
+  const prefixes = PRIORITY_VALUES.filter((value) => value.startsWith(query));
+  return prefixes.length === 1 ? prefixes[0] : null;
+}
+
 export function normalizeTaskTitle(value: string): string | null {
   const title = value.trim();
   if (!title) return null;
@@ -280,7 +358,11 @@ export interface SlashCommandPatches {
 
 export function parseSlashCommands(
   input: string,
-  options?: { preserveTrailingSpace?: boolean },
+  options?: {
+    preserveTrailingSpace?: boolean;
+    projects?: Project[];
+    selection?: CommandCandidateSelection;
+  },
 ): {
   title: string;
   patches: SlashCommandPatches;
@@ -309,11 +391,13 @@ export function parseSlashCommands(
           patches.endAtDateOnly = !hasExplicitTime(rawVal);
         }
       }
-      dateCommandRanges.push({
-        start: match.index,
-        end: match.index + match[0].length,
-        hasLeadingSpace: !!match[1],
-      });
+      if (parsed) {
+        dateCommandRanges.push({
+          start: match.index,
+          end: match.index + match[0].length,
+          hasLeadingSpace: !!match[1],
+        });
+      }
     }
   }
   if (dateCommandRanges.length > 0) {
@@ -322,18 +406,24 @@ export function parseSlashCommands(
 
   const statusMatch = title.match(buildSlashCommandRegex("/status"));
   if (statusMatch) {
-    patches.status = normalizeStatus(statusMatch[2].trim());
-    title = normalizeTitle(
-      title.replace(statusMatch[0], statusMatch[1] ? " " : ""),
-    );
+    const resolved = resolveTaskStatus(statusMatch[2]);
+    if (resolved) {
+      patches.status = resolved;
+      title = normalizeTitle(
+        title.replace(statusMatch[0], statusMatch[1] ? " " : ""),
+      );
+    }
   }
 
   const priorityMatch = title.match(buildSlashCommandRegex("/priority"));
   if (priorityMatch) {
-    patches.priority = priorityMatch[2].trim().toLowerCase();
-    title = normalizeTitle(
-      title.replace(priorityMatch[0], priorityMatch[1] ? " " : ""),
-    );
+    const resolved = resolveTaskPriority(priorityMatch[2]);
+    if (resolved) {
+      patches.priority = resolved;
+      title = normalizeTitle(
+        title.replace(priorityMatch[0], priorityMatch[1] ? " " : ""),
+      );
+    }
   }
 
   const tagNames: string[] = [];
@@ -348,10 +438,19 @@ export function parseSlashCommands(
 
   const moveMatch = title.match(buildSlashCommandRegex("/m"));
   if (moveMatch) {
-    patches.moveToProject = moveMatch[2].trim();
-    title = normalizeTitle(
-      title.replace(moveMatch[0], moveMatch[1] ? " " : ""),
-    );
+    const selectedProjectId =
+      options?.selection?.command === "/m"
+        ? options.selection.candidate.projectId
+        : undefined;
+    const project = selectedProjectId
+      ? options?.projects?.find((item) => item.id === selectedProjectId)
+      : findTaskProjectMoveTarget(options?.projects, moveMatch[2]);
+    if (project) {
+      patches.moveToProject = project.id;
+      title = normalizeTitle(
+        title.replace(moveMatch[0], moveMatch[1] ? " " : ""),
+      );
+    }
   }
 
   return { title: normalizeTitle(title), patches };
@@ -397,25 +496,32 @@ function resolveKeywordPrefix(input: string): string | null {
 }
 
 function getDateKeywordCompletion(rawValue: string): string | null {
-  const trimmed = rawValue.trim();
-  const lower = trimmed.toLowerCase();
+  const lower = normalizeCommandValue(rawValue);
 
-  if (!trimmed) return null;
+  if (!lower) return null;
 
-  const withTimeMatch = lower.match(/^(next\s+)?([a-z]+)(?:\s+(\d{1,2}:\d{2}))?$/);
+  const withTimeMatch = lower.match(
+    /^(next\s+)?([a-z]+)(?:\s+(\d{1,2}:\d{2}))?$/,
+  );
   if (!withTimeMatch) return null;
 
   const nextPrefix = withTimeMatch[1] ? "Next " : "";
   const keywordLabel = resolveKeywordPrefix(withTimeMatch[2]);
   if (!keywordLabel) return null;
 
-  if (withTimeMatch[1] && keywordLabel !== "Today" && keywordLabel !== "Tomorrow") {
+  if (
+    withTimeMatch[1] &&
+    keywordLabel !== "Today" &&
+    keywordLabel !== "Tomorrow"
+  ) {
     const base = `${nextPrefix}${keywordLabel}`;
     return withTimeMatch[3] ? `${base} ${withTimeMatch[3]}` : base;
   }
   if (withTimeMatch[1]) return null;
 
-  return withTimeMatch[3] ? `${keywordLabel} ${withTimeMatch[3]}` : keywordLabel;
+  return withTimeMatch[3]
+    ? `${keywordLabel} ${withTimeMatch[3]}`
+    : keywordLabel;
 }
 
 export const taskValuePreview: ValuePreviewFn = (command, rawValue) => {
@@ -435,12 +541,12 @@ export const taskValuePreview: ValuePreviewFn = (command, rawValue) => {
         : null;
     }
     case "/status": {
-      const normalized = normalizeStatus(val);
-      return STATUS_LABELS[normalized] || normalized;
+      const normalized = resolveTaskStatus(val);
+      return normalized ? STATUS_LABELS[normalized] : null;
     }
     case "/priority": {
-      const lower = val.toLowerCase();
-      return PRIORITY_LABELS[lower] || null;
+      const resolved = resolveTaskPriority(val);
+      return resolved ? PRIORITY_LABELS[resolved] : null;
     }
     case "/t":
       return `🏷️ ${val}`;
@@ -562,10 +668,12 @@ export function buildManualEstimateTaskPatch({
 
 export function buildTaskCommandCandidates({
   projects,
+  projectSpaceNames,
   tags,
   selectedTagIds,
 }: {
   projects?: Project[];
+  projectSpaceNames?: ReadonlyMap<string, string>;
   tags: Tag[];
   selectedTagIds: string[];
 }): Record<string, CommandCandidate[]> | undefined {
@@ -573,16 +681,31 @@ export function buildTaskCommandCandidates({
 
   if (projects && projects.length > 0) {
     result["/m"] = projects.flatMap((project): CommandCandidate[] => {
+      if (project.can_write === false) return [];
       const aliasHint =
         project.aliases && project.aliases.length > 0
           ? ` (${project.aliases.join(", ")})`
           : "";
+      const spaceName = project.space_id
+        ? projectSpaceNames?.get(project.space_id)
+        : undefined;
+      const projectLabel = spaceName
+        ? `${spaceName} / ${project.name}`
+        : project.name;
+      const keywords = [project.name, project.slug, ...(project.aliases || [])];
       const aliasItems = (project.aliases || []).map((alias) => ({
         value: alias,
-        label: `${alias} → ${project.name}`,
+        label: `${projectLabel} (${alias})`,
+        projectId: project.id,
+        keywords,
       }));
       return [
-        { value: project.name, label: project.name + aliasHint },
+        {
+          value: project.name,
+          label: projectLabel + aliasHint,
+          projectId: project.id,
+          keywords,
+        },
         ...aliasItems,
       ];
     });
@@ -598,11 +721,27 @@ export function buildTaskCommandCandidates({
   }
 
   result["/status"] = [
-    { value: "open", label: "open (未着手)" },
-    { value: "in_progress", label: "in_progress (進行中)" },
-    { value: "on_hold", label: "on_hold (保留)" },
-    { value: "review", label: "review (確認待ち)" },
-    { value: "closed", label: "closed (完了)" },
+    { value: "open", label: "open (未着手)", keywords: STATUS_ALIASES.open },
+    {
+      value: "in_progress",
+      label: "in_progress (進行中)",
+      keywords: STATUS_ALIASES.in_progress,
+    },
+    {
+      value: "on_hold",
+      label: "on_hold (保留)",
+      keywords: STATUS_ALIASES.on_hold,
+    },
+    {
+      value: "review",
+      label: "review (確認待ち)",
+      keywords: STATUS_ALIASES.review,
+    },
+    {
+      value: "closed",
+      label: "closed (完了)",
+      keywords: STATUS_ALIASES.closed,
+    },
   ];
 
   result["/priority"] = [
@@ -620,24 +759,19 @@ export function findTaskProjectMoveTarget(
   rawValue: string,
 ): Project | undefined {
   if (!projects || projects.length === 0) return undefined;
-  const query = rawValue.trim().toLowerCase();
-  if (!query) return undefined;
-  const isExactMatch = (project: Project) =>
-    project.name.toLowerCase() === query ||
-    project.slug.toLowerCase() === query ||
-    (project.aliases || []).some((alias) => alias.toLowerCase() === query);
-  const exact = projects.find(isExactMatch);
-  if (exact) return exact;
-
-  return projects.find(
-    (project) =>
-      project.name.toLowerCase().startsWith(query) ||
-      project.slug.toLowerCase().startsWith(query) ||
-      (project.aliases || []).some((alias) => {
-        const normalized = alias.toLowerCase();
-        return normalized === query || normalized.startsWith(query);
+  const candidates = projects
+    .filter((project) => project.can_write !== false)
+    .map(
+      (project): CommandCandidate => ({
+        value: project.name,
+        projectId: project.id,
+        keywords: [project.name, project.slug, ...(project.aliases || [])],
       }),
-  );
+    );
+  const resolved = resolveCommandCandidate(candidates, rawValue);
+  return resolved?.projectId
+    ? projects.find((project) => project.id === resolved.projectId)
+    : undefined;
 }
 
 export interface TaskSlashCommandFormPatch {
@@ -657,15 +791,19 @@ export function buildTaskSlashCommandFormPatch({
   currentEndAt,
   projects,
   preserveTrailingSpace = false,
+  selection,
 }: {
   text: string;
   currentStartAt: string | null | undefined;
   currentEndAt: string | null | undefined;
   projects?: Project[];
   preserveTrailingSpace?: boolean;
+  selection?: CommandCandidateSelection;
 }): TaskSlashCommandFormPatch {
   const { title, patches } = parseSlashCommands(text, {
     preserveTrailingSpace,
+    projects,
+    selection,
   });
   const resolvedStartAt = patches.startAt || currentStartAt || null;
   const resolvedEndAt = patches.endAt
@@ -690,9 +828,7 @@ export function buildTaskSlashCommandFormPatch({
         ? !hasNonMidnightTime(resolvedStartAt) &&
           !hasNonMidnightTime(resolvedEndAt)
         : undefined,
-    targetProjectId: patches.moveToProject
-      ? findTaskProjectMoveTarget(projects, patches.moveToProject)?.id
-      : undefined,
+    targetProjectId: patches.moveToProject,
     tagNames: patches.tagNames,
   };
 }

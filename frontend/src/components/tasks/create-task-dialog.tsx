@@ -2,7 +2,10 @@
 
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { Button } from "@/components/ui/button";
-import { SlashCommandInput } from "@/components/tasks/slash-command-input";
+import {
+  SlashCommandInput,
+  type CommandCandidateSelection,
+} from "@/components/tasks/slash-command-input";
 import { TaskDescriptionEditor } from "@/components/editor/task-description-editor";
 import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -310,7 +313,13 @@ export function CreateTaskDialog({
 
   // タイトルからスラッシュコマンドを抽出してフォームに反映（共通処理）
   const applySlashPatches = useCallback(
-    (text: string, options?: { preserveTrailingSpace?: boolean }): string => {
+    (
+      text: string,
+      options?: {
+        preserveTrailingSpace?: boolean;
+        selection?: CommandCandidateSelection;
+      },
+    ): string => {
       if (!text.includes("/")) return text;
       const patch = buildTaskSlashCommandFormPatch({
         text,
@@ -318,6 +327,7 @@ export function CreateTaskDialog({
         currentEndAt: endAt || null,
         projects,
         preserveTrailingSpace: options?.preserveTrailingSpace,
+        selection: options?.selection,
       });
       if (patch.startAt !== undefined) setStartAt(patch.startAt);
       if (patch.endAt !== undefined) setEndAt(patch.endAt);
@@ -399,8 +409,11 @@ export function CreateTaskDialog({
   // Enter時: パースしてタイトル返す（フォーカス維持）
   // パース後にスペースを残し、次のスラッシュコマンドを即座に入力可能にする
   const handleParseSlash = useCallback(
-    (text: string): string => {
-      return applySlashPatches(text, { preserveTrailingSpace: true });
+    (text: string, selection?: CommandCandidateSelection): string => {
+      return applySlashPatches(text, {
+        preserveTrailingSpace: true,
+        selection,
+      });
     },
     [applySlashPatches],
   );

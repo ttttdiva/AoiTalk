@@ -122,7 +122,7 @@ if not exist "venv\Scripts\python.exe" (
 )
 call venv\Scripts\activate
 python -m pip install --upgrade pip
-pip install -e ".[audio,windows,test,irodori]"
+pip install -e ".[audio,windows,test,irodori,yomi-linter]"
 if errorlevel 1 (
     echo [エラー] Python依存パッケージのインストールに失敗しました。
     pause

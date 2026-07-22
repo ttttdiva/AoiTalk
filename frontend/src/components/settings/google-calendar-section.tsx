@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import useSWR from "swr";
 import { Calendar, ChevronDown, ChevronUp, Loader2, Link2, Unplug } from "lucide-react";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -23,7 +24,30 @@ import {
 
 export function GoogleCalendarSection() {
   const [expanded, setExpanded] = useState(false);
-  const [settings, setSettings] = useState<GoogleCalendarSettings | null>(null);
+  // Google Calendar設定（サーバー状態）は SWR で管理。取得タイミングは従来どおり
+  // 呼び出し側（トグル/接続コールバック）で駆動するため自動 revalidation は無効化する。
+  // 取得失敗時は従来同様に直前値を保持する。
+  const settingsRef = useRef<GoogleCalendarSettings | null>(null);
+  const { data: settings = null, mutate: mutateGcal } = useSWR<GoogleCalendarSettings | null>(
+    "settings/google-calendar",
+    async () => {
+      try {
+        return await getGoogleCalendarSettings();
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "Failed to load");
+        return settingsRef.current;
+      }
+    },
+    {
+      revalidateOnMount: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+      keepPreviousData: true,
+      dedupingInterval: 0,
+    },
+  );
+  settingsRef.current = settings;
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [connecting, setConnecting] = useState(false);
@@ -33,13 +57,11 @@ export function GoogleCalendarSection() {
   const loadSettings = useCallback(async () => {
     setLoading(true);
     try {
-      setSettings(await getGoogleCalendarSettings());
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Failed to load");
+      await mutateGcal();
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [mutateGcal]);
 
   useEffect(() => {
     if (expanded && !settings) void loadSettings();
@@ -90,22 +112,23 @@ export function GoogleCalendarSection() {
   const handleDisconnect = useCallback(async () => {
     setDisconnecting(true);
     try {
-      setSettings(await disconnectGoogleCalendar());
+      await mutateGcal(await disconnectGoogleCalendar(), { revalidate: false });
       toast.success("Google Calendar disconnected");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Disconnect failed");
     } finally {
       setDisconnecting(false);
     }
-  }, []);
+  }, [mutateGcal]);
 
   const handleActionChange = useCallback(
     async (value: "open_template" | "create_event" | null) => {
       if (value !== "open_template" && value !== "create_event") return;
       setSaving(true);
       try {
-        setSettings(
+        await mutateGcal(
           await updateGoogleCalendarSettings({ default_action: value }),
+          { revalidate: false },
         );
         toast.success("Google Calendar settings saved");
       } catch (error) {
@@ -114,7 +137,7 @@ export function GoogleCalendarSection() {
         setSaving(false);
       }
     },
-    [],
+    [mutateGcal],
   );
 
   const handleReminderMinutesSave = useCallback(async () => {
@@ -122,10 +145,11 @@ export function GoogleCalendarSection() {
     if (!Number.isFinite(minutes) || minutes < 0) return;
     setSaving(true);
     try {
-      setSettings(
+      await mutateGcal(
         await updateGoogleCalendarSettings({
           default_event_reminder_minutes: Math.floor(minutes),
         }),
+        { revalidate: false },
       );
       toast.success("Google Calendar settings saved");
     } catch (error) {
@@ -133,7 +157,7 @@ export function GoogleCalendarSection() {
     } finally {
       setSaving(false);
     }
-  }, [reminderMinutes]);
+  }, [reminderMinutes, mutateGcal]);
 
   return (
     <Card size="sm">

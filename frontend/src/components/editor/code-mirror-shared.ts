@@ -21,7 +21,7 @@ import {
   syntaxHighlighting,
 } from "@codemirror/language";
 import { searchKeymap } from "@codemirror/search";
-import { EditorState, type Extension } from "@codemirror/state";
+import { EditorSelection, EditorState, type Extension } from "@codemirror/state";
 import {
   crosshairCursor,
   drawSelection,
@@ -105,13 +105,19 @@ export const selectNextOccurrenceKeymap = keymap.of([
 
       const selectedText = state.sliceDoc(selection.from, selection.to);
       if (!selectedText) return true;
-      const afterSelection = state.sliceDoc(selection.to);
+      const searchFrom = Math.max(...state.selection.ranges.map((range) => range.to));
+      const afterSelection = state.sliceDoc(searchFrom);
       const nextIndex = afterSelection.indexOf(selectedText);
       if (nextIndex < 0) return true;
 
-      const from = selection.to + nextIndex;
+      const from = searchFrom + nextIndex;
       const to = from + selectedText.length;
-      view.dispatch({ selection: { anchor: from, head: to } });
+      view.dispatch({
+        selection: EditorSelection.create(
+          [...state.selection.ranges, EditorSelection.range(from, to)],
+          state.selection.ranges.length,
+        ),
+      });
       return true;
     },
   },
@@ -204,28 +210,20 @@ export function textEditorTheme(options?: {
   fontSize?: number;
   fontFamily?: string;
   compact?: boolean;
-  surface?: "solid" | "glass";
 }) {
   const minHeight = options?.minHeight ?? 120;
   const maxHeight = options?.maxHeight;
   const fontSize = options?.fontSize ?? 13;
   const fontFamily = options?.fontFamily ?? "inherit";
   const padding = options?.compact ? "6px 10px" : "8px 12px";
-  const surface = options?.surface ?? "solid";
   const rootStyles: Record<string, string> = {
     minHeight: `${minHeight}px`,
     fontSize: `${fontSize}px`,
     border: "1px solid var(--input, var(--border, #333))",
     borderRadius: "0.5rem",
-    background:
-      surface === "glass"
-        ? "color-mix(in oklab, var(--background, #0f172a) 72%, transparent)"
-        : "var(--background, #0f172a)",
-    boxShadow:
-      surface === "glass"
-        ? "inset 0 1px color-mix(in oklab, var(--foreground, #e5e7eb) 16%, transparent)"
-        : "none",
-    backdropFilter: surface === "glass" ? "blur(18px)" : "none",
+    // 編集面はカード面（ライト=白 / ダーク=#12233D 系）を使う
+    background: "var(--card, #12233d)",
+    boxShadow: "none",
     overflow: "hidden",
   };
   const scrollerStyles: Record<string, string> = {

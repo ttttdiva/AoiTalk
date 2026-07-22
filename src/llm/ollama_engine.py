@@ -13,6 +13,7 @@ from openai import OpenAI
 from ..config import Config
 from ..memory.history import HistoryManager
 from ..services.project_context import (
+    format_project_context_for_chat_prompt,
     ProjectContextResolver,
     reset_runtime_project_context,
     set_runtime_project_context,
@@ -45,6 +46,13 @@ from .provider_mode_adapters import (
     ollama_mode_options_for_model,
     ollama_reasoning_effort_for_mode,
 )
+from .conversation_context import (
+    build_prompt_messages,
+    normalize_usage,
+    persist_usage_sync,
+    stable_cache_key,
+)
+from .openai_compatible_local_profiles import openai_compatible_server_profile
 from .runtime_tool_registry import build_runtime_tool_registry
 from .tool_policy import (
     project_progress_review_active,
@@ -95,6 +103,9 @@ class OllamaClient:
         self.model_name = model or DEFAULT_OLLAMA_MODEL
         self.api_key = api_key or DEFAULT_OLLAMA_API_KEY
         self.client = OpenAI(base_url=self.base_url, api_key=self.api_key)
+        self.server_profile = openai_compatible_server_profile(
+            config, base_url=self.base_url, provider="ollama"
+        )
         self.capabilities = ProviderCapabilities(
             supports_stream=True,
             supports_tools=True,
@@ -127,6 +138,11 @@ class OllamaClient:
         self.generation_policy = DEFAULT_GENERATION_POLICY
         self.current_edit_message_id: Optional[str] = None
         self._current_llm_mode = "fast"
+        self._last_model_transcript: list[dict[str, Any]] = []
+        self._last_usage: dict[str, Any] = {}
+        self._last_tool_loop_messages: list[dict[str, Any]] = []
+        self.keep_alive = _config_get(config, "ollama.keep_alive", None)
+        self.cache_prompt = bool(_config_get(config, "ollama.cache_prompt", True))
 
         self.system_prompt = self._build_system_prompt()
 
@@ -140,6 +156,46 @@ class OllamaClient:
             return self.session_user_id
         metadata_user_id = self.session_metadata.get("user_id")
         return str(metadata_user_id) if metadata_user_id else "default_user"
+
+    def get_generation_metadata(self) -> Dict[str, Any]:
+        return {
+            "model_transcript": [dict(item) for item in self._last_model_transcript],
+            "cache_usage": dict(self._last_usage),
+            "cache_diagnostics": {
+                "provider": "ollama",
+                "model": self.model_name,
+                "cache_provider": "ollama",
+                "cache_mode": "cache_prompt" if self.cache_prompt else "disabled",
+                "cache_supported": True,
+                "cache_active": self._last_usage.get("cache_active"),
+                "cache_configured": self.cache_prompt,
+                "keep_alive": self.keep_alive,
+                "metrics_source": "ollama_openai_compatible_response",
+                "cache_key": getattr(self, "_cache_key", None),
+            },
+        }
+
+    def _capture_usage(self, response: Any) -> None:
+        raw = getattr(response, "usage", None)
+        if raw is None and isinstance(response, dict):
+            raw = response.get("usage")
+        self._last_usage = {
+            key: value
+            for key, value in normalize_usage(raw, provider="ollama").items()
+            if value is not None
+        }
+
+    def _record_model_transcript(self, messages: List[Dict[str, Any]], response_text: str) -> None:
+        source_messages = self._last_tool_loop_messages or messages
+        self._last_model_transcript = [
+            dict(message)
+            for message in source_messages
+            if message.get("role") in {"user", "assistant", "tool"}
+        ]
+        if response_text:
+            self._last_model_transcript.append({"role": "assistant", "content": response_text})
+        if callable(getattr(self.history_manager, "set_model_messages", None)):
+            self.history_manager.set_model_messages(self._last_model_transcript)
 
     def _build_system_prompt(self) -> str:
         if not self.config:
@@ -210,18 +266,37 @@ class OllamaClient:
             self.session_metadata = {**self.session_metadata, **sanitized}
         self.system_prompt = self._build_system_prompt()
 
-    def _build_messages(self, user_input: str) -> List[Dict[str, str]]:
-        messages = [{"role": "system", "content": self.system_prompt}]
-        context_window = self.history_manager.context_window_size
-        for msg in self.history_manager.get_all()[-(context_window * 2) :]:
-            messages.append(
-                {
-                    "role": msg["role"],
-                    "content": msg["content"],
-                }
-            )
-        messages.append({"role": "user", "content": user_input})
-        return messages
+    def _build_messages(
+        self,
+        user_input: str,
+        *,
+        dynamic_context: Optional[list[tuple[str, str]]] = None,
+    ) -> List[Dict[str, Any]]:
+        context_window = getattr(self.history_manager, "context_window_size", 10)
+        history = self._history_messages_for_prompt()[-(context_window * 2) :]
+        return [
+            {"role": "system", "content": getattr(self, "system_prompt", "")},
+            *build_prompt_messages(
+                history,
+                summary=getattr(self.history_manager, "summary", ""),
+                current_user_input=user_input,
+                dynamic_context=dynamic_context or [],
+            ),
+        ]
+
+    def _history_messages_for_prompt(self) -> list[dict[str, Any]]:
+        get_model_messages = getattr(self.history_manager, "get_model_messages", None)
+        if callable(get_model_messages):
+            return [dict(message) for message in get_model_messages()]
+        get_all = getattr(self.history_manager, "get_all", None)
+        if callable(get_all):
+            return [dict(message) for message in get_all()]
+        legacy_messages = getattr(self.history_manager, "messages", [])
+        return [
+            {"role": item[0], "content": item[1]}
+            for item in legacy_messages
+            if isinstance(item, (tuple, list)) and len(item) >= 2
+        ]
 
     def _build_json_tool_user_message(self, user_input: str) -> str:
         return "\n".join(
@@ -243,22 +318,26 @@ class OllamaClient:
 
     def _build_json_tool_loop_messages(self, user_input: str) -> List[Dict[str, str]]:
         system_prompt = build_json_tool_loop_system_prompt(
-            self.system_prompt,
+            getattr(self, "system_prompt", ""),
             self._tool_registry,
         )
         messages = [{"role": "system", "content": system_prompt}]
-        context_window = self.history_manager.context_window_size
-        for msg in self.history_manager.get_all()[-(context_window * 2) :]:
-            messages.append(
-                {
-                    "role": msg["role"],
-                    "content": msg["content"],
-                }
-            )
-        messages.append(
-            {"role": "user", "content": self._build_json_tool_user_message(user_input)}
-        )
-        return messages
+        context_window = getattr(self.history_manager, "context_window_size", 10)
+        history = self._history_messages_for_prompt()
+        tool_hint_context = self._build_tool_hint_context(user_input)
+        return [
+            *messages,
+            *build_prompt_messages(
+                history[-(context_window * 2) :],
+                summary=getattr(self.history_manager, "summary", ""),
+                current_user_input=self._build_json_tool_user_message(user_input),
+                dynamic_context=(
+                    [("Current tool hints", tool_hint_context)]
+                    if tool_hint_context
+                    else []
+                ),
+            ),
+        ]
 
     def _build_api_kwargs(
         self,
@@ -285,6 +364,20 @@ class OllamaClient:
                 self._tool_registry.get_all()
             )
             api_kwargs["tool_choice"] = "auto"
+
+        self._cache_key = stable_cache_key(
+            user_id=self._get_session_user_id(),
+            session_id=getattr(self, "current_session_id", None),
+            project_id=self.current_project_id,
+            character=self.character_name,
+            model=self.model_name,
+            system_prompt=self.system_prompt,
+            tool_schemas=api_kwargs.get("tools", []),
+            provider="ollama",
+            branch_fingerprint=str(getattr(self, "current_edit_message_id", None) or "default-branch"),
+            summary_version=int(getattr(self.history_manager, "summary_version", 0) or 0),
+            server_instance=str(self.session_metadata.get("server_instance") or "default-instance"),
+        )
 
         return api_kwargs
 
@@ -394,16 +487,22 @@ class OllamaClient:
         policy = get_client_generation_policy(self)
         generation_policy_token = set_current_generation_policy(policy)
         try:
+            self._last_tool_loop_messages = []
             project_context = self._resolve_project_context_sync()
             project_token = set_runtime_project_context(project_context)
-            model_user_input = user_input
             tool_hint_context = self._build_tool_hint_context(
                 user_input
             )
-            model_user_input = compose_tool_hint_user_message(
-                user_input,
-                tool_hint_context,
-            )
+            dynamic_context: list[tuple[str, str]] = []
+            if project_context:
+                dynamic_context.append(
+                    (
+                        "Current Project Context",
+                        format_project_context_for_chat_prompt(project_context),
+                    )
+                )
+            if tool_hint_context:
+                dynamic_context.append(("Current tool hints", tool_hint_context))
 
             if (
                 policy.discretionary_tool_loop_enabled
@@ -412,7 +511,7 @@ class OllamaClient:
                 and not self._native_tool_calling_enabled
             ):
                 response_text = self._generate_with_json_tool_loop(
-                    model_user_input,
+                    user_input,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     original_request=user_input,
@@ -426,7 +525,7 @@ class OllamaClient:
                         original_request=user_input,
                     ),
                     context=render_messages_for_review(
-                        [{"role": "user", "content": model_user_input}]
+                        self._build_messages(user_input, dynamic_context=dynamic_context)
                     ),
                     user_input=user_input,
                     initial_response=response_text,
@@ -435,7 +534,10 @@ class OllamaClient:
                 self.history_manager.add_message("assistant", response_text)
                 return response_text
 
-            messages = self._build_messages(model_user_input)
+            messages = self._build_messages(
+                user_input,
+                dynamic_context=dynamic_context,
+            )
             if image_data and messages:
                 messages[-1]["content"] = openai_content_parts(
                     str(messages[-1].get("content") or ""),
@@ -452,6 +554,13 @@ class OllamaClient:
                 return self._stream_response(api_kwargs, user_input)
 
             response = self._create_completion_with_tool_fallback(api_kwargs)
+            self._capture_usage(response)
+            persist_usage_sync(
+                self,
+                provider="ollama",
+                model=self.model_name,
+                usage=self._last_usage,
+            )
             choice = response.choices[0]
             if getattr(choice.message, "tool_calls", None):
                 response_text = self._handle_tool_calls(
@@ -487,6 +596,7 @@ class OllamaClient:
                 user_input=user_input,
                 initial_response=response_text,
             )
+            self._record_model_transcript(messages, response_text)
             self.history_manager.add_message("user", user_input)
             self.history_manager.add_message("assistant", response_text)
             return response_text
@@ -622,6 +732,9 @@ class OllamaClient:
             config=self.config,
             user_input=user_input,
         )
+        self._last_tool_loop_messages = [
+            dict(message) for message in getattr(result, "messages", [])
+        ]
         return guard_tool_execution_claims(result.final_output, result.tool_calls)
 
     def _stream_response(
@@ -641,16 +754,27 @@ class OllamaClient:
                     content = chunk.choices[0].delta.content
                     full_response += content
                     yield content
+                self._capture_usage(chunk)
         except Exception as exc:
             logger.error("[OllamaClient] streaming failed: %s", exc, exc_info=True)
             full_response = self._get_fallback_response()
             yield full_response
         finally:
+            self._record_model_transcript(
+                list(stream_kwargs.get("messages") or []), full_response
+            )
+            persist_usage_sync(
+                self,
+                provider="ollama",
+                model=self.model_name,
+                usage=self._last_usage,
+                is_streaming=True,
+            )
             self.history_manager.add_message("user", user_input)
             self.history_manager.add_message("assistant", full_response)
 
     def _get_fallback_response(self) -> str:
-        if self.config:
+        if getattr(self, "config", None):
             try:
                 character_config = self.config.get_character_config(self.character_name)
                 personality = character_config.get("personality", {})

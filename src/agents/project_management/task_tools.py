@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from ...tools.core import tool
+from ...services.agent_run_service import get_current_agent_run_id
 
 from ...task_time import DEFAULT_TASK_TIMEZONE
 from .common import (
@@ -85,6 +86,9 @@ def build_task_tools() -> list:
         from ...memory.database import get_database_manager
         from ...services.task_management_service import TaskManagementService
 
+        # _run_asyncは別スレッドを使うため、境界を越える前に明示的に捕捉する。
+        agent_run_id = get_current_agent_run_id()
+
         async def _create():
             db = get_database_manager()
             session = await db.get_session()
@@ -117,6 +121,7 @@ def build_task_tools() -> list:
                     recurrence_rrule=recurrence_rrule or None,
                     recurrence_timezone=recurrence_timezone
                     or DEFAULT_TASK_TIMEZONE,
+                    agent_run_id=agent_run_id,
                 )
                 return task
             finally:

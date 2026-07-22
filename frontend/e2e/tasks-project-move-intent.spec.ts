@@ -71,6 +71,156 @@ test.describe("タスクのプロジェクト移動", () => {
     });
   });
 
+  test("タスクコマンドから別スペースの同名プロジェクトへ移動できる", async ({
+    page,
+  }) => {
+    const crossSpaceProjects = [
+      {
+        ...projects[0],
+        id: "project-source",
+        name: "Shared Project",
+        slug: "source-shared-project",
+        space_id: "space-source",
+      },
+      {
+        ...projects[1],
+        id: "project-target",
+        name: "Shared Project",
+        slug: "target-shared-project",
+        space_id: "space-target",
+      },
+      {
+        ...projects[1],
+        id: "project-read-only",
+        name: "Read Only Project",
+        slug: "read-only-project",
+        space_id: "space-target",
+        can_write: false,
+      },
+    ];
+    const spaces = [
+      { id: "space-source", name: "Source Space", color: "#2563eb" },
+      { id: "space-target", name: "Target Space", color: "#16a34a" },
+    ];
+    let currentTasks = [task("task-a", "project-1", "Cross-space move", 0)].map(
+      (item) => ({
+        ...item,
+        project_id: "project-source",
+        project_name: "Shared Project",
+      }),
+    );
+    const patchPayloads: Record<string, unknown>[] = [];
+
+    await page.route("**/api/**", async (route) => {
+      const url = new URL(route.request().url());
+      const method = route.request().method();
+
+      if (url.pathname === "/api/auth/status") {
+        await route.fulfill({
+          json: {
+            authenticated: true,
+            user: { id: "user-1", username: "tester", role: "admin" },
+          },
+        });
+        return;
+      }
+      if (url.pathname === "/api/projects") {
+        await route.fulfill({
+          json: {
+            projects: crossSpaceProjects,
+            total: crossSpaceProjects.length,
+          },
+        });
+        return;
+      }
+      if (url.pathname === "/api/spaces") {
+        await route.fulfill({ json: { spaces, total: spaces.length } });
+        return;
+      }
+      if (url.pathname === "/api/tasks/task-a" && method === "PATCH") {
+        const body = route.request().postDataJSON() as Record<string, unknown>;
+        patchPayloads.push(body);
+        const moved = {
+          ...currentTasks[0],
+          project_id: body.project_id,
+          sort_order: 0,
+        };
+        currentTasks = [];
+        await route.fulfill({ json: moved });
+        return;
+      }
+      if (url.pathname === "/api/tasks") {
+        await route.fulfill({ json: currentTasks });
+        return;
+      }
+      if (
+        url.pathname.startsWith("/api/projects/") &&
+        url.pathname.endsWith("/tags")
+      ) {
+        await route.fulfill({ json: [] });
+        return;
+      }
+      if (url.pathname === "/api/conversations") {
+        await route.fulfill({ json: { conversations: [], total: 0 } });
+        return;
+      }
+      if (url.pathname === "/api/notifications") {
+        await route.fulfill({ json: [] });
+        return;
+      }
+      if (url.pathname === "/api/python-proxy/health") {
+        await route.fulfill({ status: 503, json: { ok: false } });
+        return;
+      }
+      if (url.pathname.endsWith("/explorer/list")) {
+        await route.fulfill({
+          json: {
+            success: true,
+            current_path: "",
+            parent_path: null,
+            can_go_up: false,
+            directories: [],
+            files: [],
+            total_items: 0,
+          },
+        });
+        return;
+      }
+      await route.fulfill({ json: {} });
+    });
+
+    await page.goto("/tasks");
+    await page.evaluate(() => {
+      localStorage.setItem("selectedSpaceId", "space-source");
+      localStorage.setItem("selectedProjectId", "project-source");
+    });
+    await page.reload();
+    const taskRow = page.getByTestId("task-row-task-a");
+    await expect(taskRow).toBeVisible();
+    await taskRow.focus();
+    await page.keyboard.press("/");
+    await expect(page.getByText("タスクコマンド")).toBeVisible();
+
+    const commandInput = page.getByPlaceholder("/ でコマンド一覧");
+    await commandInput.fill("/m ");
+    await expect(page.getByText("Source Space / Shared Project")).toBeVisible();
+    await expect(page.getByText("Target Space / Shared Project")).toBeVisible();
+    await expect(page.getByText("Target Space / Read Only Project")).toHaveCount(
+      0,
+    );
+    await page.getByText("Target Space / Shared Project").click();
+
+    await expect.poll(() => patchPayloads).toHaveLength(1);
+    expect(patchPayloads[0]).toMatchObject({
+      project_id: "project-target",
+      project_move_intent: true,
+    });
+    await expect(page.getByText("Cross-space move")).toHaveCount(0);
+    await expect
+      .poll(() => page.evaluate(() => localStorage.getItem("selectedSpaceId")))
+      .toBe("space-source");
+  });
+
   test("一覧の明示的なプロジェクト変更だけ移動意図を送る", async ({ page }) => {
     let tasks = [
       task("task-a", "project-1", "Move me", 0),

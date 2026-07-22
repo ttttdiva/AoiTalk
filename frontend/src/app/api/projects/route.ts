@@ -5,6 +5,7 @@ import { and, eq, inArray, isNull } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
 import { ensureUserInboxSetup } from "@/lib/server/inbox-project";
 import { canWriteSpace } from "@/lib/server/space-access";
+import { canWriteMembership } from "@/lib/server/task-route-utils";
 
 function toSlug(name: string): string {
   return name
@@ -88,6 +89,7 @@ function normalizeAliases(value: unknown): string[] {
 
 function serializeProject(
   row: Record<string, unknown>,
+  canWrite?: boolean,
 ): Record<string, unknown> {
   const result = toSnake(row);
   const metadata = parseProjectMetadata(result.metadata);
@@ -96,6 +98,7 @@ function serializeProject(
   result.metadata = metadata;
   result.aliases = aliases;
   result.color = color;
+  if (canWrite !== undefined) result.can_write = canWrite;
   return result;
 }
 
@@ -112,7 +115,7 @@ export async function GET() {
   }
 
   const memberships = await db
-    .select({ projectId: projectMembers.projectId })
+    .select({ projectId: projectMembers.projectId, role: projectMembers.role })
     .from(projectMembers)
     .where(eq(projectMembers.userId, user.id));
 
@@ -120,14 +123,23 @@ export async function GET() {
     return NextResponse.json({ projects: [], total: 0 });
   }
 
-  const projectIds = memberships.map((m) => m.projectId);
+  const projectIds = memberships.map((membership) => membership.projectId);
+  const membershipByProjectId = new Map(
+    memberships.map((membership) => [membership.projectId, membership]),
+  );
   const rows = await db
     .select()
     .from(projects)
     .where(and(inArray(projects.id, projectIds), isNull(projects.deletedAt)));
 
-  const result = rows.map((r) =>
-    serializeProject(r as unknown as Record<string, unknown>),
+  const result = rows.map((row) =>
+    serializeProject(
+      row as unknown as Record<string, unknown>,
+      canWriteMembership(
+        user,
+        membershipByProjectId.get(row.id) ?? null,
+      ),
+    ),
   );
   return NextResponse.json({ projects: result, total: result.length });
 }
@@ -196,6 +208,9 @@ export async function POST(request: NextRequest) {
 
   return NextResponse.json({
     success: true,
-    project: serializeProject(project as unknown as Record<string, unknown>),
+    project: serializeProject(
+      project as unknown as Record<string, unknown>,
+      true,
+    ),
   });
 }

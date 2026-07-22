@@ -50,6 +50,7 @@ import {
   type PrivateMessage,
   type Room,
 } from "@/lib/trpg-room-utils";
+import { useConfirm } from "@/hooks/use-confirm";
 import { LogLine } from "@/components/trpg/log-line";
 import { ParticipantsPanel } from "@/components/trpg/participants-panel";
 import { DisclosurePanel } from "@/components/trpg/disclosure-panel";
@@ -66,6 +67,7 @@ import { useCocActions } from "@/components/trpg/hooks/use-coc-actions";
 // ─── Main Page ───
 
 export default function TRPGRoomPage() {
+  const confirm = useConfirm();
   const params = useParams<{ roomId: string }>();
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -237,7 +239,7 @@ export default function TRPGRoomPage() {
   // ── 退出 ──
   const handleLeave = useCallback(async () => {
     if (!room) return;
-    if (!confirm("ルームを退出しますか？")) return;
+    if (!(await confirm({ description: "ルームを退出しますか？" }))) return;
     if (!myParticipantId) {
       window.localStorage.removeItem(`trpg-participant-${room.id}`);
       router.push("/trpg");
@@ -253,7 +255,7 @@ export default function TRPGRoomPage() {
       console.error(e);
       alert("退出に失敗しました");
     }
-  }, [room, myParticipantId, router]);
+  }, [room, myParticipantId, router, confirm]);
 
   // ── 行動宣言 ──
   const handleSubmitAction = useCallback(async () => {
@@ -363,7 +365,7 @@ export default function TRPGRoomPage() {
 
   const handleCompleteRoom = useCallback(async () => {
     if (!room) return;
-    if (!confirm("セッションを終了しますか？")) return;
+    if (!(await confirm({ description: "セッションを終了しますか？" }))) return;
     setSessionBusy(true);
     try {
       const completedRoom = await py<Room>(
@@ -380,7 +382,7 @@ export default function TRPGRoomPage() {
     } finally {
       setSessionBusy(false);
     }
-  }, [room]);
+  }, [room, confirm]);
 
   // ── ターン進行 ──
   const handleAdvanceTurn = useCallback(async () => {

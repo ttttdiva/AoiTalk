@@ -24,6 +24,7 @@ from ..models.ecc_models import (
     ScenarioPlaySession,
 )
 from .trpg_play_service import TRPGPlayError, _append_log_internal
+from ..utils.uuid_utils import parse_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -41,15 +42,6 @@ def _clip(value: Any, limit: int = 1200) -> str:
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + "..."
-
-
-def _parse_uuid(value: Any) -> Optional[uuid.UUID]:
-    if value is None:
-        return None
-    try:
-        return uuid.UUID(str(value))
-    except (TypeError, ValueError):
-        return None
 
 
 def _utcnow() -> datetime:
@@ -147,7 +139,7 @@ async def schedule_ai_npc_strategy(
     trigger: str = "manual",
 ) -> Dict[str, Any]:
     """Persist an AI NPC strategy phase schedule into a room shared_state."""
-    room_uid = _parse_uuid(room_id)
+    room_uid = parse_uuid(room_id)
     if room_uid is None:
         raise TRPGPlayError(f"無効なルームID: {room_id}", status_code=400)
 
@@ -732,7 +724,7 @@ async def process_ai_npc_reactions(
     Internal thoughts are persisted only in ScenarioParticipant.private_state.
     Public logs are appended only when the NPC chooses a public action.
     """
-    room_uid = _parse_uuid(room_id)
+    room_uid = parse_uuid(room_id)
     if room_uid is None:
         raise TRPGPlayError(f"無効なルームID: {room_id}", status_code=400)
 
@@ -868,7 +860,7 @@ async def process_due_ai_npc_strategy(
     force: bool = False,
 ) -> Dict[str, Any]:
     """Process a scheduled AI NPC strategy phase if its due time has arrived."""
-    room_uid = _parse_uuid(room_id)
+    room_uid = parse_uuid(room_id)
     if room_uid is None:
         raise TRPGPlayError(f"無効なルームID: {room_id}", status_code=400)
 

@@ -331,16 +331,14 @@ class DeepResearchLLMAdapter:
         from openai import AsyncOpenAI
 
         client = AsyncOpenAI(api_key=api_key)
-        response = await client.chat.completions.create(
+        response = await client.responses.create(
             model=_config_get(self.config, "llm_model", "gpt-4o"),
-            messages=[
-                {"role": "system", "content": "You write concise, citation-grounded research reports."},
-                {"role": "user", "content": prompt},
-            ],
+            instructions="You write concise, citation-grounded research reports.",
+            input=prompt,
             temperature=0.2,
-            max_tokens=max_tokens,
+            max_output_tokens=max_tokens,
         )
-        return response.choices[0].message.content or ""
+        return getattr(response, "output_text", "") or ""
 
     async def _generate_openai_compatible(
         self,

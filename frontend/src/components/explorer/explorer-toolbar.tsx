@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import { useExplorer } from "@/contexts/explorer-context";
 import {
   ExplorerUploadError,
@@ -12,23 +12,25 @@ import { Button } from "@/components/ui/button";
 import {
   RefreshCw,
   FolderPlus,
-  Table2,
   Upload,
   Star,
   StarOff,
   LayoutGrid,
   List,
+  Plus,
 } from "lucide-react";
 import { toast } from "sonner";
+import { hfUploadFiles } from "@/lib/hf-api";
+import { parseHfPath } from "@/lib/hf/virtual-path";
 
 interface ExplorerToolbarProps {
   onNewFolder: () => void;
-  onNewRecordTable?: () => void;
+  onAddHfReference?: () => void;
 }
 
 export function ExplorerToolbar({
   onNewFolder,
-  onNewRecordTable,
+  onAddHfReference,
 }: ExplorerToolbarProps) {
   const {
     currentPath,
@@ -38,19 +40,26 @@ export function ExplorerToolbar({
     bookmarks,
     refreshBookmarks,
     isAbsoluteFilerPath,
-    filerTab,
-    contextRootPath,
+    isHfMode,
   } = useExplorer();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
 
   const isBookmarked = bookmarks.some((b) => b.path === currentPath);
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
-    if (!files || files.length === 0) return;
+    if (!files || files.length === 0 || uploading) return;
+    setUploading(true);
     try {
-      const result = await explorerUpload(currentPath, files);
-      toast.success(`${result.successCount}件アップロードしました`);
+      const result = isHfMode
+        ? await hfUploadFiles(currentPath, files)
+        : await explorerUpload(currentPath, files);
+      if (result.failureCount > 0) {
+        toast.warning(`${result.successCount}件成功、${result.failureCount}件失敗しました`);
+      } else {
+        toast.success(`${result.successCount}件アップロードしました`);
+      }
       await refresh();
     } catch (error) {
       if (error instanceof ExplorerUploadError) {
@@ -62,10 +71,14 @@ export function ExplorerToolbar({
             : error.message,
         );
       } else {
-        toast.error("アップロードに失敗しました");
+        toast.error(
+          error instanceof Error ? error.message : "アップロードに失敗しました",
+        );
       }
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
     }
-    if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
   const toggleBookmark = async () => {
@@ -83,19 +96,26 @@ export function ExplorerToolbar({
   };
 
   // 絶対パス閲覧時はwrite操作を無効化
-  const canWrite = !isAbsoluteFilerPath;
-  const canCreateRecordTable =
-    canWrite &&
-    filerTab === "workspace" &&
-    !!contextRootPath &&
-    currentPath === contextRootPath &&
-    !!onNewRecordTable;
-
+  const hfPath = isHfMode ? parseHfPath(currentPath) : null;
+  const canWrite = !isAbsoluteFilerPath && !isHfMode;
+  const canUploadToHf = Boolean(
+    isHfMode && hfPath?.kind === "repo" && hfPath.accountId,
+  );
   return (
     <div className="flex items-center gap-1 border-b px-2 py-1">
       <Button variant="ghost" size="icon-sm" onClick={refresh} title="更新">
         <RefreshCw className="size-3.5" />
       </Button>
+      {isHfMode && onAddHfReference && (
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          onClick={onAddHfReference}
+          title="HF参照を追加"
+        >
+          <Plus className="size-3.5" />
+        </Button>
+      )}
       {canWrite && (
         <>
           <Button
@@ -106,21 +126,36 @@ export function ExplorerToolbar({
           >
             <FolderPlus className="size-3.5" />
           </Button>
-          {canCreateRecordTable && (
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              onClick={onNewRecordTable}
-              title="新規DBテーブル"
-            >
-              <Table2 className="size-3.5" />
-            </Button>
-          )}
           <Button
             variant="ghost"
             size="icon-sm"
             onClick={() => fileInputRef.current?.click()}
+            disabled={uploading}
             title="アップロード"
+          >
+            <Upload className="size-3.5" />
+          </Button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={handleUpload}
+          />
+        </>
+      )}
+      {isHfMode && (
+        <>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={!canUploadToHf || uploading}
+            title={
+              canUploadToHf
+                ? "現在のHFディレクトリへアップロード"
+                : "書き込み用アカウントに紐づくHFリポジトリで利用できます"
+            }
           >
             <Upload className="size-3.5" />
           </Button>

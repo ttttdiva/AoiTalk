@@ -14,4 +14,5 @@ export interface OutboxEnqueue {
   entityId: string;
   payload: unknown;
   baseUpdatedAt?: string | null;
+  basePayload?: unknown;
 }

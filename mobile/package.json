@@ -10,6 +10,7 @@
     "web": "expo start --web",
     "lint": "eslint src --ext .ts,.tsx",
     "typecheck": "tsc --noEmit",
+    "test": "jest --runInBand",
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
@@ -42,8 +43,10 @@
     "react-dom": "19.1.0",
     "react-native": "0.81.5",
     "react-native-calendars": "^1.1314.0",
+    "react-native-keyboard-controller": "1.18.5",
     "react-native-markdown-display": "^7.0.2",
     "react-native-paper": "^5.12.0",
+    "react-native-reanimated": "~4.1.1",
     "react-native-safe-area-context": "~5.6.2",
     "react-native-screens": "~4.16.0",
     "react-native-vector-icons": "^10.0.0",
@@ -51,10 +54,24 @@
     "zustand": "^5.0.0"
   },
   "devDependencies": {
+    "@testing-library/react-native": "^14.0.1",
+    "@types/jest": "^29.5.14",
     "@types/react": "~19.1.10",
     "drizzle-kit": "^0.28.0",
     "eslint": "^10.2.1",
+    "jest-expo": "~54.0.17",
+    "react-test-renderer": "^19.1.0",
     "typescript": "^5.3.0",
     "typescript-eslint": "^8.59.1"
+  },
+  "jest": {
+    "preset": "jest-expo",
+    "setupFiles": [
+      "<rootDir>/jest.setup.js"
+    ],
+    "testMatch": [
+      "**/__tests__/**/*.test.ts",
+      "**/__tests__/**/*.test.tsx"
+    ]
   }
 }

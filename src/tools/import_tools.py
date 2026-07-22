@@ -35,16 +35,14 @@ async def _llm_extract(prompt: str, text: str) -> str:
         raise RuntimeError("OPENAI_API_KEY が設定されていません")
 
     client = AsyncOpenAI(api_key=api_key)
-    response = await client.chat.completions.create(
+    response = await client.responses.create(
         model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": text[:8000]},
-        ],
+        instructions=prompt,
+        input=text[:8000],
         temperature=0.1,
-        response_format={"type": "json_object"},
+        text={"format": {"type": "json_object"}},
     )
-    return response.choices[0].message.content
+    return getattr(response, "output_text", "") or ""
 
 
 # ────────────────────────────────────────────

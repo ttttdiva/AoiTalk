@@ -6,10 +6,12 @@ from .base import CLIBackendBase
 from .antigravity import AntigravityCLIBackend
 from .claude import ClaudeCLIBackend
 from .codex import CodexCLIBackend
+from .grok import GrokCLIBackend
 
 __all__ = [
     'CLIBackendBase',
     'AntigravityCLIBackend',
     'ClaudeCLIBackend',
     'CodexCLIBackend',
+    'GrokCLIBackend',
 ]

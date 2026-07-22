@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { db } from "@/db";
 import {
   knowledgeFields,
@@ -21,6 +21,8 @@ import {
   serializeNodeSupertag,
 } from "@/lib/server/knowledge-docs-utils";
 import { listDocsTaskSyntheticFieldValues } from "@/lib/server/docs-task-binding";
+import { resolveDocsTagFilters } from "@/lib/docs-query-utils";
+import { docsRelativeDateRange } from "@/lib/docs-relative-date";
 
 type FieldFilter = {
   field_id?: unknown;
@@ -35,6 +37,8 @@ const TASK_SYSTEM_KEYS = [
   "task_priority",
   "task_project",
 ] as const;
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function cleanStringArray(value: unknown): string[] {
   return Array.isArray(value)
@@ -55,6 +59,10 @@ function queryLimit(body: Record<string, unknown>, query: Record<string, unknown
 function queryCursor(body: Record<string, unknown>) {
   const raw = Number(body.cursor ?? 0);
   return Number.isFinite(raw) ? Math.max(0, Math.floor(raw)) : 0;
+}
+
+function isUuid(value: string) {
+  return UUID_RE.test(value);
 }
 
 function collectDescendantTagIds(tags: Array<typeof knowledgeSupertags.$inferSelect>, tagId: string) {
@@ -113,6 +121,17 @@ function fieldFilterCondition(filter: FieldFilter) {
   }
   const comparable = fieldComparableValueSql();
   const expected = String(filter.value ?? "");
+  const dateRange = docsRelativeDateRange(filter.value);
+  if (dateRange === false) return sql`false`;
+  if (dateRange) {
+    return sql`exists (
+      select 1 from knowledge_field_values docs_fv
+      where docs_fv.node_id = ${knowledgeNodes.id}
+        and docs_fv.field_id = ${fieldId}::uuid
+        and left(${comparable}, 10) >= ${dateRange.start}
+        and left(${comparable}, 10) < ${dateRange.end}
+    )`;
+  }
   const valueCondition =
     op === "is_set"
       ? sql`true`
@@ -157,6 +176,13 @@ function taskMatchesSystemFieldFilters(
     const op = typeof filter.op === "string" ? filter.op : "=";
     const actual = taskComparableValue(task, systemKey);
     const expected = String(filter.value ?? "");
+    const dateRange = docsRelativeDateRange(filter.value);
+    if (dateRange === false) return false;
+    if (dateRange) {
+      const actualDate = actual.slice(0, 10);
+      if (!actualDate || actualDate < dateRange.start || actualDate >= dateRange.end) return false;
+      continue;
+    }
     if (op === "is_set") {
       if (!actual) return false;
       continue;
@@ -198,6 +224,7 @@ function serializeVirtualTaskNode(
     parent_id: null,
     root_page_id: null,
     project_id: task.projectId,
+    system_key: null,
     title: task.title,
     description: task.description ?? "",
     body_json: {
@@ -275,8 +302,15 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ detail: "Projectへの読み取り権限がありません" }, { status: 403 });
     }
   }
+  const readableProjectIds = projectId ? [projectId] : await getReadableProjectIds(user.id);
 
   const clauses = clausesFromQuery(queryJson);
+  const allTags = await db
+    .select()
+    .from(knowledgeSupertags)
+    .where(eq(knowledgeSupertags.workspaceId, workspace.id));
+  const tagIdBySystemKey = new Map(allTags.filter((tag) => tag.systemKey).map((tag) => [tag.systemKey as string, tag.id]));
+  const tagIdByName = new Map(allTags.map((tag) => [tag.name.toLowerCase(), tag.id]));
   const textClause = clauses.find((clause) => typeof clause.text === "string" || typeof clause.q === "string");
   const q =
     typeof body.q === "string"
@@ -286,15 +320,22 @@ export async function POST(request: NextRequest) {
         : typeof textClause?.q === "string"
           ? textClause.q.trim()
           : "";
-  const tagFilters = [
-    ...cleanStringArray(body.supertag_ids).map((tagId) => ({ tagId, includeDescendants: true })),
-    ...clauses
-      .map((clause) => ({
-        tagId: clause.tag,
-        includeDescendants: clause.include_descendants !== false,
-      }))
-      .filter((item): item is { tagId: string; includeDescendants: boolean } => typeof item.tagId === "string"),
-  ];
+  const { tagFilters, unresolvedTagConditions } = resolveDocsTagFilters({
+    explicitSupertagIds: cleanStringArray(body.supertag_ids),
+    clauses,
+    tagIdSet: new Set(allTags.map((tag) => tag.id)),
+    tagIdBySystemKey,
+    tagIdByName,
+  });
+  if (unresolvedTagConditions.length > 0) {
+    return NextResponse.json({
+      nodes: [],
+      node_supertags: [],
+      field_values: [],
+      next_cursor: null,
+      unresolved_tag_conditions: unresolvedTagConditions,
+    });
+  }
   const supertagIds = Array.from(new Set(tagFilters.map((item) => item.tagId)));
   const mode = body.supertag_mode === "or" ? "or" : "and";
   const astFieldFilters: FieldFilter[] = clauses
@@ -314,16 +355,34 @@ export async function POST(request: NextRequest) {
   const cursor = queryCursor(body);
   const sort = typeof body.sort === "string" ? body.sort : typeof queryJson.sort === "string" ? queryJson.sort : "updated_desc";
   const sortFieldId = typeof queryJson.sort_field_id === "string" ? queryJson.sort_field_id : null;
+  const includeVirtualTasks = body.include_virtual_tasks === true || queryJson.include_virtual_tasks === true;
 
-  const taskSystemFields = await db
+  const allFields = await db
     .select()
     .from(knowledgeFields)
-    .where(
-      and(
-        eq(knowledgeFields.workspaceId, workspace.id),
-        inArray(knowledgeFields.systemKey, [...TASK_SYSTEM_KEYS]),
-      ),
-    );
+    .where(eq(knowledgeFields.workspaceId, workspace.id));
+  const fieldsById = new Map(allFields.map((field) => [field.id, field]));
+  const fieldsBySystemKey = new Map(allFields.filter((field) => field.systemKey).map((field) => [field.systemKey as string, field]));
+  const fieldsByName = new Map(allFields.map((field) => [field.name.toLowerCase(), field]));
+  const resolvedFieldFilters: FieldFilter[] = [];
+  for (const filter of fieldFilters) {
+    if (typeof filter.field_id !== "string") {
+      resolvedFieldFilters.push(filter);
+      continue;
+    }
+    const rawFieldId = filter.field_id;
+    const resolved = isUuid(rawFieldId)
+      ? rawFieldId
+      : fieldsBySystemKey.get(rawFieldId)?.id ?? fieldsByName.get(rawFieldId.toLowerCase())?.id ?? null;
+    if (!resolved) {
+      return NextResponse.json({ detail: `Unknown docs field: ${rawFieldId}` }, { status: 400 });
+    }
+    if (!fieldsById.has(resolved)) {
+      return NextResponse.json({ detail: `Unknown docs field: ${rawFieldId}` }, { status: 400 });
+    }
+    resolvedFieldFilters.push({ ...filter, field_id: resolved });
+  }
+  const taskSystemFields = allFields.filter((field) => field.systemKey && (TASK_SYSTEM_KEYS as readonly string[]).includes(field.systemKey));
   const taskFieldSystemKeyById = new Map(
     taskSystemFields
       .filter((field) => !!field.systemKey)
@@ -334,23 +393,16 @@ export async function POST(request: NextRequest) {
       .filter((field) => !!field.systemKey)
       .map((field) => [field.systemKey as string, field]),
   );
-  const taskFieldFilters = fieldFilters.filter(
+  const taskFieldFilters = resolvedFieldFilters.filter(
     (filter) =>
       typeof filter.field_id === "string" &&
       taskFieldSystemKeyById.has(filter.field_id),
   );
-  const docsFieldFilters = fieldFilters.filter(
+  const docsFieldFilters = resolvedFieldFilters.filter(
     (filter) =>
       typeof filter.field_id !== "string" ||
       !taskFieldSystemKeyById.has(filter.field_id),
   );
-
-  const allTags = supertagIds.length > 0
-    ? await db
-        .select()
-        .from(knowledgeSupertags)
-        .where(eq(knowledgeSupertags.workspaceId, workspace.id))
-    : [];
   const acceptedTagSets = supertagIds.map((tagId) => {
     const filter = tagFilters.find((item) => item.tagId === tagId);
     return Array.from(filter?.includeDescendants === false ? new Set([tagId]) : collectDescendantTagIds(allTags, tagId));
@@ -367,11 +419,27 @@ export async function POST(request: NextRequest) {
   const includesTaskTag = acceptedTagSets.some((set) =>
     set.some((tagId) => taskTagIds.has(tagId)),
   );
+  const storedTaskFieldConditions = taskFieldFilters.map(fieldFilterCondition).filter(Boolean);
+  const taskCandidateCondition = includesTaskTag && storedTaskFieldConditions.length > 0
+    ? or(
+        and(...storedTaskFieldConditions),
+        sql`exists (
+          select 1 from tasks linked_task
+          where linked_task.knowledge_node_id = ${knowledgeNodes.id}
+            and linked_task.deleted_at is null
+            and linked_task.archived_at is null
+        )`,
+      )
+    : undefined;
 
   const conditions = [
     eq(knowledgeNodes.workspaceId, workspace.id),
     isNull(knowledgeNodes.archivedAt),
-    projectId ? eq(knowledgeNodes.projectId, projectId) : undefined,
+    projectId
+      ? eq(knowledgeNodes.projectId, projectId)
+      : readableProjectIds.length > 0
+        ? or(isNull(knowledgeNodes.projectId), inArray(knowledgeNodes.projectId, readableProjectIds))
+        : isNull(knowledgeNodes.projectId),
     q
       ? sql`exists (
           select 1 from knowledge_search_index docs_ksi
@@ -382,6 +450,7 @@ export async function POST(request: NextRequest) {
       : undefined,
     ...tagConditions,
     ...fieldConditions,
+    taskCandidateCondition,
   ].filter(Boolean);
 
   let nodes = await db
@@ -416,13 +485,17 @@ export async function POST(request: NextRequest) {
         .map((task) => task.knowledgeNodeId)
         .filter((nodeId): nodeId is string => typeof nodeId === "string"),
     );
-    nodes = nodes.filter((node) => matchingNodeIds.has(node.id));
+    const linkedNodeIds = new Set(
+      linkedTasks
+        .map((task) => task.knowledgeNodeId)
+        .filter((nodeId): nodeId is string => typeof nodeId === "string"),
+    );
+    nodes = nodes.filter((node) => !linkedNodeIds.has(node.id) || matchingNodeIds.has(node.id));
   }
 
-  const readableTaskProjectIds =
-    includesTaskTag && !projectId ? await getReadableProjectIds(user.id) : [];
+  const readableTaskProjectIds = includesTaskTag && !projectId ? readableProjectIds : [];
   const virtualTasks =
-    includesTaskTag && (projectId || readableTaskProjectIds.length > 0)
+    includeVirtualTasks && includesTaskTag && (projectId || readableTaskProjectIds.length > 0)
       ? (
           await db
             .select()

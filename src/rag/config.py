@@ -154,7 +154,8 @@ class SourceConfig:
 @dataclass
 class RagConfig:
     """Main RAG configuration."""
-    enabled: bool = False
+    docs_enabled: bool = True  # Docs graph (KnowledgeNode) semantic index; on unless disabled
+    docs_collection_name: str = "aoitalk_docs"
     qdrant: QdrantConfig = field(default_factory=QdrantConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     reranker: RerankerConfig = field(default_factory=RerankerConfig)
@@ -166,7 +167,8 @@ class RagConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'RagConfig':
         return cls(
-            enabled=data.get('enabled', False),
+            docs_enabled=data.get('docs_enabled', True),
+            docs_collection_name=data.get('docs_collection_name', 'aoitalk_docs'),
             qdrant=QdrantConfig.from_dict(data.get('qdrant', {})),
             embedding=EmbeddingConfig.from_dict(data.get('embedding', {})),
             reranker=RerankerConfig.from_dict(data.get('reranker', {})),

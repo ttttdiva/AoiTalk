@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Optional
+from typing import Dict, Iterable, Optional
 
 from ..config import Config
-from .tool_policy import is_memory_search_enabled
+from ..services.agent_team_service import agent_team_member_for, config_get
+from .tool_policy import is_knowledge_search_enabled, is_memory_search_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,8 @@ def build_unified_instructions(
     rp_settings: Optional[Dict] = None,
     custom_instructions: Optional[str] = None,
     include_static_tool_reference: bool = True,
+    project_agents_instructions: Optional[str] = None,
+    available_tool_names: Optional[Iterable[str]] = None,
 ) -> str:
     """Build the shared system prompt for LLM clients.
 
@@ -56,23 +59,24 @@ def build_unified_instructions(
                 character_name,
                 config,
                 include_static_tool_reference=include_static_tool_reference,
+                available_tool_names=available_tool_names,
             )
     else:
         instructions = _build_assistant_prompt(
             character_name,
             config,
             include_static_tool_reference=include_static_tool_reference,
+            available_tool_names=available_tool_names,
         )
 
+    sections = [instructions]
     extra = str(custom_instructions or "").strip()
-    if not extra:
-        return instructions
-
-    return (
-        f"{instructions}\n\n"
-        "ユーザー別の追加指示:\n"
-        f"{extra}"
-    )
+    if extra:
+        sections.append(f"ユーザー別の追加指示:\n{extra}")
+    project_extra = str(project_agents_instructions or "").strip()
+    if project_extra:
+        sections.append(f"プロジェクト固有のエージェント指示 (.agents/AGENTS.md):\n{project_extra}")
+    return "\n\n".join(sections)
 
 
 def _build_assistant_prompt(
@@ -80,6 +84,7 @@ def _build_assistant_prompt(
     config: Optional[Config] = None,
     *,
     include_static_tool_reference: bool = True,
+    available_tool_names: Optional[Iterable[str]] = None,
 ) -> str:
     """従来のアシスタント用システムプロンプトを構築する。"""
     if config:
@@ -109,25 +114,109 @@ def _build_assistant_prompt(
 - 引数が不要な場合は次の形式で出力してください。
 [TOOL_CALL: tool_name()]
 - ツールを使う必要がない場合は、そのまま通常回答してください。
-{_build_static_tool_reference_section(config) if include_static_tool_reference else ""}
+{_build_static_tool_reference_section(config, available_tool_names) if include_static_tool_reference else ""}
 """
     return instructions.strip()
 
 
-def _build_static_tool_reference_section(config: Optional[Config]) -> str:
+def _build_static_tool_reference_section(
+    config: Optional[Config],
+    available_tool_names: Optional[Iterable[str]] = None,
+) -> str:
     return f"""
 利用できる主なツール:
-- 公開Webや最新情報が必要な場合は `web_search` を使ってください。X/Twitter上の情報が必要な場合は `grok_x_search`、Knowledge Source内の情報が必要な場合は `knowledge_search` を使ってください。
-- 過去会話、以前話した内容、ユーザーが覚えているか確認している内容は `search_memory` を使って確認してください。
+- {_web_search_tool_line(config)}
+- AoiTalk内部のDocs(ノート・案件情報・タスクを木構造で持つアウトライナー)を扱うには専用ツールを使ってください。検索は `docs_search`(まず広く検索し、必要なら言い換えて再検索。ヒットの詳細は `docs_read` で開く)、タグ/フィールド条件での構造化クエリは `docs_query`、作成は `docs_create_nodes`、更新(タイトル・説明・フィールド・タグをまとめて)は `docs_update_node`、移動は `docs_move_node`、アーカイブは `docs_archive_node`。本文は個々の子ノードのタイトルに分けて持たせ、1ノード=1事項を保ってください。
+- 動的コンテキストの「## Agent Memory」ブロックには、このProject専用のエージェントメモリ索引ノード(`node id` とエントリ一覧のアウトライン)が添えられます。ユーザーから訂正・指摘を受けた時(特に2回目)や、コード・DBから導出できない知見・落とし穴・ユーザーの作業嗜好を得た時は、索引ノード直下に `docs_create_nodes` で「1エントリ=1子ノード」を追加してください。既存エントリの修正・統合は `docs_update_node` で行い、長い詳細はエントリのさらに子ノードへ分けてください。
+- 索引が肥大化したら古い項目を統合・削除して圧縮し、子ノードの詳細が必要な時だけ `docs_read` で開いてください。
+- コード・DB・Docsから導出できること、秘密情報(パスワード・トークン等)、このセッション限りの一時情報はメモリに書かないでください。
+- {_search_usage_tool_line(config)}
+- ユーザーの好み・名前・過去の決定・以前の作業内容など、現在の会話に無い文脈が必要になったら `search_memory` で過去会話を検索してください。自動で添えられた過去会話の抜粋で足りない場合も `search_memory` で掘り下げてください。
 - 「検索して」「search it」など短い追撃は、直前の会話から検索対象を解決する必要があります。
 - 案件情報や進捗の確認・更新には `get_project_progress`、`list_project_information`、`list_record_tables`、`list_tasks`、`list_calendar`、`get_time_report`、`organize_project_information_from_folder` を使ってください。
 - 案件情報、進捗、タスク、予定、作業時間、案件内DB、record table を必要に応じて確認してください。
 - 実行時に渡されるProject文脈で対象Projectが一意に分かるならIDを聞き返さないでください。
 - ユーザーがProjectを指定していない限り、現在のProject文脈へ勝手に寄せないでください。
 - ワークスペースやファイル確認は `find_workspace_items`、`read_workspace_file`、`search_files`、`list_directory` を使ってください。
-- 一般的な補助処理は `utility_assistant`、画像や音声などのメディア処理は `media_assistant`、Spotify操作は `spotify_assistant`、TRPG/シナリオ支援は `scenario_assistant`、文章作成支援は `writing_assistant`、取り込み処理は `import_assistant`、明示されたスキル実行は `invoke_skill` を使ってください。
+{_specialist_tool_reference_line(config, available_tool_names)}
 {_memory_search_disabled_notice(config)}
 """.rstrip()
+
+
+def _specialist_tool_reference_line(
+    config: Optional[Config],
+    available_tool_names: Optional[Iterable[str]],
+) -> str:
+    available = (
+        _configured_specialist_tool_names(config)
+        if available_tool_names is None
+        else set(available_tool_names)
+    )
+    references = (
+        ("utility_assistant", "一般的な補助処理"),
+        ("media_assistant", "画像や音声などのメディア処理"),
+        ("spotify_assistant", "Spotify操作"),
+        ("scenario_assistant", "TRPG/シナリオ支援"),
+        ("writing_assistant", "文章作成支援"),
+        ("import_assistant", "取り込み処理"),
+        ("invoke_skill", "明示されたスキル実行"),
+    )
+    enabled = [
+        f"{purpose}は `{tool_name}`"
+        for tool_name, purpose in references
+        if available is None or tool_name in available
+    ]
+    if not enabled:
+        return ""
+    return f"- {'、'.join(enabled)} を使ってください。"
+
+
+def _configured_specialist_tool_names(config: Optional[Config]) -> Optional[set[str]]:
+    if config is None:
+        return None
+    if not config_get(config, "use_tools", True):
+        return set()
+
+    names = {
+        f"{member_key}_assistant"
+        for member_key in ("utility", "media", "scenario", "writing", "import")
+        if agent_team_member_for(config, member_key) is not None
+    }
+    if (
+        agent_team_member_for(config, "spotify") is not None
+        and bool(config_get(config, "spotify.enabled", True))
+    ):
+        names.add("spotify_assistant")
+    if bool(config_get(config, "skills.enabled", True)):
+        names.add("invoke_skill")
+    return names
+
+
+def _web_search_tool_line(config: Optional[Config]) -> str:
+    if is_knowledge_search_enabled(config):
+        return (
+            "公開Webや最新情報が必要な場合は `web_search` を使ってください。"
+            "X/Twitter上の情報が必要な場合は `grok_x_search`、"
+            "外部の参照ファイル(登録済みKnowledge Source)内の情報が必要な場合は "
+            "`knowledge_search` を使ってください。"
+        )
+    return (
+        "公開Webや最新情報が必要な場合は `web_search` を使ってください。"
+        "X/Twitter上の情報が必要な場合は `grok_x_search` を使ってください。"
+    )
+
+
+def _search_usage_tool_line(config: Optional[Config]) -> str:
+    if is_knowledge_search_enabled(config):
+        return (
+            "3つの検索の使い分け: `docs_search`=内部Docs、"
+            "`knowledge_search`=外部の参照ファイル、`search_memory`=過去の会話。"
+            "目的に合ったものを選んでください。"
+        )
+    return (
+        "2つの検索の使い分け: `docs_search`=内部Docs、"
+        "`search_memory`=過去の会話。目的に合ったものを選んでください。"
+    )
 
 
 def _memory_search_disabled_notice(config: Optional[Config]) -> str:

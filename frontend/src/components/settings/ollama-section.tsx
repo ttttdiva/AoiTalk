@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import useSWR from "swr";
 import {
   Bot,
   ChevronDown,
@@ -16,6 +17,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { formatBytes } from "@/lib/utils";
 
 interface OllamaStatus {
   available: boolean;
@@ -70,25 +72,38 @@ async function pyFetch<T = unknown>(path: string, init?: RequestInit): Promise<T
   return res.json();
 }
 
-function formatBytes(value?: number): string {
-  if (!value || value <= 0) return "-";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let size = value;
-  let unit = 0;
-  while (size >= 1024 && unit < units.length - 1) {
-    size /= 1024;
-    unit += 1;
-  }
-  return `${size.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
-}
-
 function modelName(model: OllamaModel): string {
   return model.name || model.model || "";
 }
 
 export function OllamaSection() {
   const [expanded, setExpanded] = useState(false);
-  const [data, setData] = useState<OllamaModelsResponse | null>(null);
+  // Ollamaモデル一覧（サーバー状態）は SWR で管理。取得タイミングは従来どおり
+  // 呼び出し側（トグル/更新/pull完了後）で駆動するため自動 revalidation は無効化する。
+  // 取得失敗時は従来同様に直前値を保持する。
+  const dataRef = useRef<OllamaModelsResponse | null>(null);
+  const { data = null, mutate: mutateModels } = useSWR<OllamaModelsResponse | null>(
+    "settings/ollama-models",
+    async () => {
+      try {
+        return await pyFetch<OllamaModelsResponse>("/ollama/models");
+      } catch (error) {
+        toast.error(
+          error instanceof Error ? error.message : "Failed to load Ollama models",
+        );
+        return dataRef.current;
+      }
+    },
+    {
+      revalidateOnMount: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+      keepPreviousData: true,
+      dedupingInterval: 0,
+    },
+  );
+  dataRef.current = data;
   const [modelInput, setModelInput] = useState("gemma4:e4b");
   const [loading, setLoading] = useState(false);
   const [pulling, setPulling] = useState(false);
@@ -102,15 +117,11 @@ export function OllamaSection() {
   const loadModels = useCallback(async () => {
     setLoading(true);
     try {
-      setData(await pyFetch<OllamaModelsResponse>("/ollama/models"));
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : "Failed to load Ollama models",
-      );
+      await mutateModels();
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [mutateModels]);
 
   useEffect(() => {
     if (expanded && !data) void loadModels();

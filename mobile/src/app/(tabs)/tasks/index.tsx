@@ -57,24 +57,16 @@ import {
   isTaskCompletionTransition,
   useTaskCompletionUndoStore,
 } from "../../../stores/task-completion-undo";
+import { ScreenHeader } from "../../../components/screen-header";
 
 const STATUS_COLORS: Record<string, string> = {
-  open: "#89b4fa",
+  todo: "#a6adc8",
+  open: "#a6adc8",
   in_progress: "#f38ba8",
+  on_hold: "#f5c2e7",
+  review: "#89dceb",
   closed: "#a6e3a1",
   cancelled: "#a6adc8",
-};
-const STATUS_LABELS: Record<string, string> = {
-  open: "未着手",
-  in_progress: "進行中",
-  closed: "完了",
-  cancelled: "キャンセル",
-};
-const PRIORITY_COLORS: Record<string, string> = {
-  urgent: "#f38ba8",
-  high: "#fab387",
-  normal: "#89b4fa",
-  low: "#a6adc8",
 };
 const FILTERS = ["all", "open", "in_progress", "closed"] as const;
 const FILTER_LABELS: Record<string, string> = {
@@ -86,6 +78,8 @@ const FILTER_LABELS: Record<string, string> = {
 const STATUS_OPTIONS = [
   { value: "open", label: "未着手", icon: "circle-outline" },
   { value: "in_progress", label: "進行中", icon: "progress-clock" },
+  { value: "on_hold", label: "保留", icon: "pause-circle-outline" },
+  { value: "review", label: "レビュー待ち", icon: "file-check-outline" },
   { value: "closed", label: "完了", icon: "check-circle" },
   { value: "cancelled", label: "取消", icon: "close-circle-outline" },
 ];
@@ -151,7 +145,8 @@ type TaskCommandDialogProps = {
   onChange: () => void;
 };
 
-function TaskCreateDialog({
+// 旧ダイアログは移行中の互換参照として残す。作成導線は create route のみを使う。
+function _TaskCreateDialog({
   visible,
   selectedProjectId,
   selectedSpaceId,
@@ -386,7 +381,10 @@ function TaskCreateDialog({
                 />
               ))}
               {scopedProjects.length === 0 ? (
-                <Menu.Item title="このスペースにプロジェクトがありません" disabled />
+                <Menu.Item
+                  title="このスペースにプロジェクトがありません"
+                  disabled
+                />
               ) : null}
             </Menu>
           </View>
@@ -651,7 +649,7 @@ function TaskCommandDialog({
           onSubmitEditing={() => onSubmit(draft)}
         />
         <Text style={styles.commandHint}>
-          利用可能: /status open|in|in_progress|closed|cancelled
+          利用可能: /status open|in|in_progress|on_hold|review|closed|cancelled
         </Text>
         {error ? <Text style={styles.commandError}>{error}</Text> : null}
       </Dialog.Content>
@@ -682,6 +680,9 @@ function normalizeTaskCommandStatus(raw: string): string | null {
     progress: "in_progress",
     ip: "in_progress",
     wip: "in_progress",
+    on_hold: "on_hold",
+    hold: "on_hold",
+    review: "review",
     done: "closed",
     complete: "closed",
     completed: "closed",
@@ -729,9 +730,6 @@ export default function TaskListScreen() {
   const [bulkBusy, setBulkBusy] = useState(false);
   const [scopeMenuVisible, setScopeMenuVisible] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
-
-  // 作成フォーム
-  const [showCreate, setShowCreate] = useState(false);
   const completionRefreshToken = useTaskCompletionUndoStore(
     (state) => state.refreshToken,
   );
@@ -754,21 +752,27 @@ export default function TaskListScreen() {
   const dragCurrentOrderRef = useRef<string[]>([]);
   const dragActiveRef = useRef(false);
   const dragSaveBusyRef = useRef(false);
+  const loadRequestRef = useRef(0);
 
   const loadTasks = useCallback(async () => {
+    const requestId = ++loadRequestRef.current;
     try {
       const list = selectedProjectId
         ? await tasksRepo.list(selectedProjectId)
         : await tasksRepo.listByScope(
             selectedSpaceId ? { space_id: selectedSpaceId } : {},
           );
-      setTasks(list);
-      setLoadError(null);
+      if (requestId === loadRequestRef.current) {
+        setTasks(list);
+        setLoadError(null);
+      }
     } catch (error) {
-      setTasks([]);
-      setLoadError(
-        error instanceof Error ? error.message : "タスク取得に失敗しました",
-      );
+      if (requestId === loadRequestRef.current) {
+        setTasks([]);
+        setLoadError(
+          error instanceof Error ? error.message : "タスク取得に失敗しました",
+        );
+      }
     }
   }, [authScope, selectedProjectId, selectedSpaceId]);
 
@@ -800,12 +804,17 @@ export default function TaskListScreen() {
   };
 
   const filteredTasks = useMemo(() => {
+    const topLevelTasks = tasks.filter((task) => !task.parent_task_id);
     let result =
       filter === "all"
-        ? tasks.filter((task) => !COMPLETED_TASK_STATUSES.has(task.status))
+        ? topLevelTasks.filter(
+            (task) => !COMPLETED_TASK_STATUSES.has(task.status),
+          )
         : filter === "closed"
-          ? tasks.filter((task) => COMPLETED_TASK_STATUSES.has(task.status))
-          : tasks.filter((task) => task.status === filter);
+          ? topLevelTasks.filter((task) =>
+              COMPLETED_TASK_STATUSES.has(task.status),
+            )
+          : topLevelTasks.filter((task) => task.status === filter);
 
     if (!showFuture) {
       result = result.filter((task) => !isFutureTask(task));
@@ -830,6 +839,13 @@ export default function TaskListScreen() {
     : selectedSpace
       ? `スペース: ${selectedSpace.name}`
       : "すべてのスペース";
+  const displayConditionLabel = [
+    selectedProject?.name ?? selectedSpace?.name ?? "全体",
+    filter !== "all" ? FILTER_LABELS[filter] : null,
+    showFuture ? "未来含む" : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
   useEffect(() => {
     tasksRef.current = tasks;
@@ -1047,22 +1063,6 @@ export default function TaskListScreen() {
     });
   }, []);
 
-  const handleCreate = useCallback(
-    async (data: Record<string, unknown>) => {
-      try {
-        await tasksRepo.create(data);
-        setShowCreate(false);
-        await loadTasks();
-      } catch (error) {
-        setActionMessage(
-          error instanceof Error ? error.message : "タスク作成に失敗しました",
-        );
-        throw error;
-      }
-    },
-    [loadTasks],
-  );
-
   const updateTaskStatus = useCallback(
     async (task: Task, next: string) => {
       if (task.status === next || statusBusyIds.has(task.id)) return;
@@ -1119,11 +1119,6 @@ export default function TaskListScreen() {
     },
     [updateTaskStatus],
   );
-
-  const handleStatusToggle = (task: Task) => {
-    const next = task.status === "closed" ? "open" : "closed";
-    void updateTaskStatus(task, next);
-  };
 
   const handleBulkStatusToggle = async () => {
     if (!selectedTasks.length) return;
@@ -1284,17 +1279,43 @@ export default function TaskListScreen() {
         onLayout={(event) => handleTaskRowLayout(item.id, event)}
       >
         <View style={styles.taskRow}>
-          <IconButton
-            icon={item.status === "closed" ? "check-circle" : "circle-outline"}
-            iconColor={STATUS_COLORS[item.status] || "#a6adc8"}
-            size={24}
-            mode="contained-tonal"
-            disabled={statusBusyIds.has(item.id)}
-            onPress={() => handleStatusToggle(item)}
-            onLongPress={() => toggleSelection(item.id)}
-            style={styles.statusButton}
-            accessibilityLabel={`${item.title}を完了/未完了に切り替え`}
-          />
+          <Menu
+            visible={statusMenuTaskId === item.id}
+            onDismiss={() => setStatusMenuTaskId(null)}
+            anchor={
+              <IconButton
+                icon={
+                  STATUS_OPTIONS.find((option) => option.value === item.status)
+                    ?.icon || "circle-outline"
+                }
+                iconColor={STATUS_COLORS[item.status] || "#a6adc8"}
+                size={24}
+                mode="contained-tonal"
+                disabled={statusBusyIds.has(item.id)}
+                onPress={() => setStatusMenuTaskId(item.id)}
+                onLongPress={() => toggleSelection(item.id)}
+                style={styles.statusButton}
+                accessibilityLabel={`${item.title}のステータスを選択`}
+              />
+            }
+            contentStyle={styles.menuContent}
+          >
+            {STATUS_OPTIONS.map((option) => (
+              <Menu.Item
+                key={option.value}
+                title={option.label}
+                leadingIcon={
+                  item.status === option.value ? "check" : option.icon
+                }
+                disabled={
+                  item.status === option.value || statusBusyIds.has(item.id)
+                }
+                onPress={() =>
+                  void updateTaskStatusFromMenu(item, option.value)
+                }
+              />
+            ))}
+          </Menu>
           <Pressable
             style={({ pressed }) => [
               styles.taskContent,
@@ -1306,16 +1327,32 @@ export default function TaskListScreen() {
             }
             delayLongPress={280}
           >
-            <View style={styles.taskTitleRow}>
+            <View style={styles.compactMainRow}>
               <Text
                 style={[
                   styles.taskTitle,
                   item.status === "closed" && styles.taskTitleDone,
                 ]}
-                numberOfLines={2}
+                numberOfLines={1}
               >
                 {item.title}
               </Text>
+              {item.tags?.slice(0, 2).map((tag) => (
+                <View
+                  key={tag.id}
+                  style={[
+                    styles.compactTag,
+                    { backgroundColor: tag.color || "#45475a" },
+                  ]}
+                >
+                  <Text style={styles.compactTagText} numberOfLines={1}>
+                    {tag.name}
+                  </Text>
+                </View>
+              ))}
+              {(item.tags?.length ?? 0) > 2 ? (
+                <Text style={styles.moreTagsText}>+{item.tags.length - 2}</Text>
+              ) : null}
               {selected ? (
                 <Chip
                   compact
@@ -1326,88 +1363,26 @@ export default function TaskListScreen() {
                 </Chip>
               ) : null}
             </View>
-            <View style={styles.taskMeta}>
-              <View
-                style={[
-                  styles.priorityDot,
-                  {
-                    backgroundColor:
-                      PRIORITY_COLORS[item.priority] || "#a6adc8",
-                  },
-                ]}
-              />
-              <Menu
-                visible={statusMenuTaskId === item.id}
-                onDismiss={() => setStatusMenuTaskId(null)}
-                anchor={
-                  <Chip
-                    compact
-                    icon={
-                      STATUS_OPTIONS.find(
-                        (option) => option.value === item.status,
-                      )?.icon || "circle-outline"
-                    }
-                    disabled={selected || statusBusyIds.has(item.id)}
-                    onPress={() => setStatusMenuTaskId(item.id)}
-                    style={styles.currentStatusChip}
-                    textStyle={[
-                      styles.currentStatusChipText,
-                      { color: STATUS_COLORS[item.status] || "#a6adc8" },
-                    ]}
-                  >
-                    {STATUS_LABELS[item.status] || item.status}
-                  </Chip>
-                }
-              >
-                {STATUS_OPTIONS.map((option) => (
-                  <Menu.Item
-                    key={option.value}
-                    leadingIcon={option.icon}
-                    title={option.label}
-                    disabled={
-                      item.status === option.value || statusBusyIds.has(item.id)
-                    }
-                    onPress={() =>
-                      void updateTaskStatusFromMenu(item, option.value)
-                    }
-                  />
-                ))}
-              </Menu>
-              {item.start_at ? (
-                <Text style={styles.dueDate}>
-                  開始{" "}
-                  {formatTaskDateLabel(item.start_at, {
-                    allDay: item.all_day,
-                    absoluteStyle: "short",
-                  })}
-                </Text>
-              ) : null}
-              {item.active_time_entry ? (
-                <Chip
-                  compact
-                  style={styles.timerChip}
-                  textStyle={styles.timerChipText}
-                >
-                  ⏱ 計測中
-                </Chip>
-              ) : null}
-            </View>
-            {!selectedProjectId && item.project_name ? (
-              <Text style={styles.projectText}>{item.project_name}</Text>
-            ) : null}
-            {item.tags && item.tags.length > 0 ? (
-              <View style={styles.tagRow}>
-                {item.tags.map((tag) => (
-                  <View
-                    key={tag.id}
-                    style={[
-                      styles.tagDot,
-                      { backgroundColor: tag.color || "#45475a" },
-                    ]}
-                  >
-                    <Text style={styles.tagDotText}>{tag.name}</Text>
-                  </View>
-                ))}
+            {item.start_at ||
+            (!selectedProjectId && item.project_name) ||
+            item.active_time_entry ? (
+              <View style={styles.compactMetaRow}>
+                {item.start_at ? (
+                  <Text style={styles.dueDate} numberOfLines={1}>
+                    {formatTaskDateLabel(item.start_at, {
+                      allDay: item.all_day,
+                      absoluteStyle: "short",
+                    })}
+                  </Text>
+                ) : null}
+                {!selectedProjectId && item.project_name ? (
+                  <Text style={styles.projectText} numberOfLines={1}>
+                    {item.project_name}
+                  </Text>
+                ) : null}
+                {item.active_time_entry ? (
+                  <Text style={styles.compactTimerText}>● 計測中</Text>
+                ) : null}
               </View>
             ) : null}
           </Pressable>
@@ -1427,69 +1402,94 @@ export default function TaskListScreen() {
         void finishTaskDrag();
       }}
     >
-      <Surface style={styles.header} elevation={1}>
-        <View style={styles.headerTop}>
-          <View style={styles.headerCopy}>
-            <Text variant="titleLarge" style={styles.headerTitle}>
-              タスク
-            </Text>
-            <Text style={styles.headerSubtext}>{scopeLabel}</Text>
-          </View>
+      <ScreenHeader
+        title="タスク"
+        subtitle={scopeLabel}
+        right={
           <Menu
             visible={scopeMenuVisible}
             onDismiss={() => setScopeMenuVisible(false)}
             anchor={
               <Chip
                 compact
+                icon="tune-variant"
                 onPress={() => {
                   setScopeMenuVisible(true);
                   void refreshProjects();
                 }}
-                style={styles.projectChip}
+                style={styles.displayConditionChip}
                 textStyle={styles.projectChipText}
               >
-                表示範囲
+                {displayConditionLabel}
               </Chip>
             }
             contentStyle={styles.menuContent}
           >
+            <Menu.Item title="Project" disabled />
             <Menu.Item
-              title="すべてのスペース"
+              title="全体"
               leadingIcon={
                 !selectedProjectId && !selectedSpaceId ? "check" : undefined
               }
               onPress={() => {
-                setScopeMenuVisible(false);
                 setSelectedProjectId(null);
+                setSelectedSpaceId("");
+                setScopeMenuVisible(false);
               }}
             />
             {spaces.map((space) => (
               <Menu.Item
-                key={space.id}
-                title={`スペース: ${space.name}`}
-                leadingIcon={space.id === selectedSpaceId ? "check" : undefined}
+                key={`space-${space.id}`}
+                title={`Space: ${space.name}`}
+                leadingIcon={
+                  !selectedProjectId && space.id === selectedSpaceId
+                    ? "check"
+                    : undefined
+                }
                 onPress={() => {
-                  setScopeMenuVisible(false);
+                  setSelectedProjectId(null);
                   setSelectedSpaceId(space.id);
+                  setScopeMenuVisible(false);
                 }}
               />
             ))}
             {projects.map((project) => (
               <Menu.Item
-                key={project.id}
-                title={`プロジェクト: ${project.name}`}
+                key={`project-${project.id}`}
+                title={`Project: ${project.name}`}
                 leadingIcon={
                   project.id === selectedProjectId ? "check" : undefined
                 }
                 onPress={() => {
-                  setScopeMenuVisible(false);
                   setSelectedProjectId(project.id);
+                  setScopeMenuVisible(false);
                 }}
               />
             ))}
+            <Menu.Item title="状態" disabled />
+            {FILTERS.map((item) => (
+              <Menu.Item
+                key={`filter-${item}`}
+                title={FILTER_LABELS[item]}
+                leadingIcon={filter === item ? "check" : undefined}
+                onPress={() => {
+                  setFilter(item);
+                  setScopeMenuVisible(false);
+                }}
+              />
+            ))}
+            <Menu.Item
+              title="未来のタスクも表示"
+              leadingIcon={showFuture ? "check" : undefined}
+              onPress={() => {
+                setShowFuture((value) => !value);
+                setScopeMenuVisible(false);
+              }}
+            />
           </Menu>
-        </View>
-
+        }
+      />
+      <Surface style={styles.header} elevation={1}>
         <TextInput
           value={search}
           onChangeText={setSearch}
@@ -1499,39 +1499,6 @@ export default function TaskListScreen() {
           style={styles.searchInput}
           left={<TextInput.Icon icon="magnify" />}
         />
-
-        <View style={styles.filterRow}>
-          {FILTERS.map((item) => (
-            <Chip
-              key={item}
-              selected={filter === item}
-              onPress={() => setFilter(item)}
-              compact
-              style={[
-                styles.filterChip,
-                filter === item && styles.filterChipActive,
-              ]}
-              textStyle={[
-                styles.filterChipText,
-                filter === item && styles.filterChipTextActive,
-              ]}
-            >
-              {FILTER_LABELS[item]}
-            </Chip>
-          ))}
-          <Chip
-            selected={showFuture}
-            onPress={() => setShowFuture((value) => !value)}
-            compact
-            style={[styles.filterChip, showFuture && styles.filterChipActive]}
-            textStyle={[
-              styles.filterChipText,
-              showFuture && styles.filterChipTextActive,
-            ]}
-          >
-            未来も表示
-          </Chip>
-        </View>
 
         {selectedIds.size > 0 ? (
           <View style={styles.bulkBar}>
@@ -1625,19 +1592,19 @@ export default function TaskListScreen() {
       <FAB
         icon="plus"
         style={styles.fab}
-        onPress={() => setShowCreate(true)}
+        onPress={() =>
+          router.push({
+            pathname: "/(tabs)/tasks/create",
+            params: {
+              ...(selectedProjectId ? { projectId: selectedProjectId } : {}),
+              ...(selectedSpaceId ? { spaceId: selectedSpaceId } : {}),
+            },
+          })
+        }
         color="#cdd6f4"
       />
 
       <Portal>
-        <TaskCreateDialog
-          visible={showCreate}
-          selectedProjectId={selectedProjectId}
-          selectedSpaceId={selectedSpaceId}
-          projects={projects}
-          onDismiss={() => setShowCreate(false)}
-          onSubmit={handleCreate}
-        />
         <Snackbar
           visible={!!actionMessage}
           onDismiss={() => setActionMessage(null)}
@@ -1665,21 +1632,15 @@ export default function TaskListScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b" },
   header: {
-    padding: 16,
-    paddingTop: 56,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
     backgroundColor: "#1e1e2e",
-    gap: 12,
+    gap: 7,
   },
-  headerTop: {
-    flexDirection: "row",
-    alignItems: "flex-start",
-    justifyContent: "space-between",
-    gap: 12,
-  },
-  headerCopy: { flex: 1 },
-  headerTitle: { color: "#cdd6f4", fontWeight: "bold" },
-  headerSubtext: { color: "#a6adc8", marginTop: 2 },
+  displayConditionChip: { backgroundColor: "#313244", maxWidth: 190 },
   projectChip: { backgroundColor: "#313244" },
+  scopeChip: { backgroundColor: "#181825" },
+  scopeActions: { flexDirection: "row", alignItems: "center", gap: 6 },
   projectChipText: { color: "#cdd6f4" },
   searchInput: { backgroundColor: "transparent" },
   filterRow: { flexDirection: "row", gap: 8, flexWrap: "wrap" },
@@ -1690,13 +1651,13 @@ const styles = StyleSheet.create({
   bulkBar: { gap: 10 },
   bulkText: { color: "#cdd6f4", fontSize: 13, fontWeight: "600" },
   bulkActions: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  hintText: { color: "#9399b2", fontSize: 12 },
+  hintText: { color: "#9399b2", fontSize: 11 },
   listFrame: { flex: 1 },
-  listContent: { padding: 8 },
+  listContent: { padding: 6, paddingBottom: 84 },
   taskCard: {
     backgroundColor: "#1e1e2e",
-    borderRadius: 10,
-    marginHorizontal: 4,
+    borderRadius: 8,
+    marginHorizontal: 2,
     borderWidth: 1,
     borderColor: "transparent",
   },
@@ -1712,9 +1673,15 @@ const styles = StyleSheet.create({
   taskCardDropTarget: {
     borderColor: "#89b4fa",
   },
-  taskRow: { flexDirection: "row", alignItems: "flex-start", padding: 8 },
-  statusButton: { margin: 0, marginRight: 4, backgroundColor: "#313244" },
-  taskContent: { flex: 1, paddingVertical: 4 },
+  taskRow: { flexDirection: "row", alignItems: "center", padding: 4 },
+  statusButton: {
+    margin: 0,
+    marginRight: 2,
+    backgroundColor: "transparent",
+    width: 36,
+    height: 36,
+  },
+  taskContent: { flex: 1, paddingVertical: 2, paddingRight: 5 },
   taskContentPressed: { opacity: 0.75 },
   taskTitleRow: {
     flexDirection: "row",
@@ -1722,12 +1689,11 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     gap: 8,
   },
-  taskTitle: { color: "#cdd6f4", fontSize: 15, marginBottom: 6, flex: 1 },
+  taskTitle: { color: "#cdd6f4", fontSize: 14, flex: 1, minWidth: 48 },
   taskTitleDone: { textDecorationLine: "line-through", color: "#a6adc8" },
   selectedChip: { backgroundColor: "#7c3aed", height: 22 },
   selectedChipText: { color: "#f5e9ff", fontSize: 10 },
   taskMeta: { flexDirection: "row", alignItems: "center", gap: 8 },
-  priorityDot: { width: 8, height: 8, borderRadius: 4 },
   currentStatusChip: { backgroundColor: "#181825", height: 28 },
   currentStatusChipText: { fontSize: 11, fontWeight: "700" },
   dueDate: { color: "#a6adc8", fontSize: 11 },
@@ -1737,6 +1703,27 @@ const styles = StyleSheet.create({
   tagRow: { flexDirection: "row", flexWrap: "wrap", gap: 4, marginTop: 6 },
   tagDot: { paddingHorizontal: 8, paddingVertical: 2, borderRadius: 4 },
   tagDotText: { color: "#cdd6f4", fontSize: 10 },
+  compactMainRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    minHeight: 26,
+  },
+  compactTag: {
+    maxWidth: 72,
+    paddingHorizontal: 6,
+    paddingVertical: 1,
+    borderRadius: 5,
+  },
+  compactTagText: { color: "#f5f5f7", fontSize: 9 },
+  moreTagsText: { color: "#9399b2", fontSize: 9 },
+  compactMetaRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    minHeight: 16,
+  },
+  compactTimerText: { color: "#f9e2af", fontSize: 10 },
   fab: {
     position: "absolute",
     right: 16,

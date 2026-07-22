@@ -5,6 +5,10 @@ import { createPortal } from "react-dom";
 import { Hash, Pencil, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
+import {
+  MenuMnemonicButton,
+  MenuMnemonicSurface,
+} from "@/components/ui/menu-mnemonic";
 import { useContextMenuPosition } from "@/hooks/use-context-menu-position";
 import type { ConversationSession } from "@/lib/chat-api";
 
@@ -100,42 +104,41 @@ export function ChatSessionContextMenu({
   };
 
   return createPortal(
-    <div
+    <MenuMnemonicSurface
       ref={ref}
       className="fixed z-50 min-w-48 rounded-md border bg-popover p-1 text-popover-foreground shadow-md"
       style={style}
-      role="menu"
       onContextMenu={(event) => event.preventDefault()}
     >
-      <button
+      <MenuMnemonicButton
         type="button"
+        mnemonic="E"
         className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default"
-        role="menuitem"
         onClick={handleRename}
       >
         <Pencil className="size-4" />
         タイトルを編集
-      </button>
-      <button
+      </MenuMnemonicButton>
+      <MenuMnemonicButton
         type="button"
+        mnemonic="C"
         className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default"
-        role="menuitem"
         onClick={handleCopySessionId}
       >
         <Hash className="size-4" />
         セッションIDをコピー
-      </button>
+      </MenuMnemonicButton>
       <div className="my-1 h-px bg-border" />
-      <button
+      <MenuMnemonicButton
         type="button"
+        mnemonic="D"
         className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm text-destructive hover:bg-destructive/10 cursor-default"
-        role="menuitem"
         onClick={handleDelete}
       >
         <Trash2 className="size-4" />
         削除
-      </button>
-    </div>,
+      </MenuMnemonicButton>
+    </MenuMnemonicSurface>,
     document.body,
   );
 }

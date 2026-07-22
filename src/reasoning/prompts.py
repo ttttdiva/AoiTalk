@@ -62,7 +62,7 @@ Task type: {task_type}
 {available_tools_with_descriptions}
 
 Selection rules:
-- 情報検索には `search_memory`、`knowledge_search`、またはWeb検索を使う。
+- 情報検索には `search_memory` またはWeb検索を使う。
 - タスク/TODO、案件情報Docs、内部 WBS.dbtable、
   follow-up planning には `list_project_information`、`list_record_tables`、
   `get_upcoming_wbs_tasks`、`create_record_table`、`append_record_rows`、

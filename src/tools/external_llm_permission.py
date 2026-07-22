@@ -85,11 +85,9 @@ PROJECT_MANAGEMENT_MUTATION_TOOLS = {
 }
 
 DOCS_MUTATION_TOOLS = {
+    "docs_ensure_inbox",
     "docs_create_nodes",
     "docs_update_node",
-    "docs_set_fields",
-    "docs_add_tag",
-    "docs_remove_tag",
     "docs_move_node",
     "docs_archive_node",
 }
@@ -414,6 +412,17 @@ class ExternalLLMPermissionManager:
             ),
             "upload_user_file": lambda args: f"ユーザーファイル保存: {args.get('filename', '')}",
             "delete_user_file": lambda args: f"ユーザーファイル削除: {args.get('filename', '')}",
+            "docs_create_nodes": lambda args: (
+                f"Docsノード作成: 親「{args.get('parent', 'today')}」配下"
+            ),
+            "docs_ensure_inbox": lambda args: "Docs Inboxを作成または確認",
+            "docs_update_node": lambda args: (
+                f"Docsノード更新: {args.get('title') or args.get('node_id', '')}"
+            ),
+            "docs_move_node": lambda args: (
+                f"Docsノード移動: {args.get('node_id', '')} -> {args.get('new_parent', '')}"
+            ),
+            "docs_archive_node": lambda args: f"Docsノードのアーカイブ: {args.get('node_id', '')}",
         }
         
         generator = descriptions.get(tool_name)

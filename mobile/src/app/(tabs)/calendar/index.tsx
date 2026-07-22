@@ -36,6 +36,7 @@ import {
   RemoteTaskDialog,
   type RemoteTaskDialogTarget,
 } from "../../../components/remote-task-dialog";
+import { ScreenHeader } from "../../../components/screen-header";
 
 LocaleConfig.locales["ja"] = {
   monthNames: [
@@ -477,18 +478,14 @@ export default function CalendarScreen() {
 
   return (
     <View style={styles.container}>
-      <Surface style={styles.header} elevation={1}>
-        <View style={styles.headerRow}>
-          <View style={styles.titleBlock}>
-            <Text variant="titleLarge" style={styles.headerTitle}>
-              カレンダー
-            </Text>
-            <Text style={styles.scopeText}>
-              {selectedProject?.name ||
-                selectedSpace?.name ||
-                "すべてのプロジェクト"}
-            </Text>
-          </View>
+      <ScreenHeader
+        title="カレンダー"
+        subtitle={
+          selectedProject?.name ||
+          selectedSpace?.name ||
+          "すべてのプロジェクト"
+        }
+        right={
           <Menu
             visible={scopeMenuVisible}
             onDismiss={() => setScopeMenuVisible(false)}
@@ -541,7 +538,9 @@ export default function CalendarScreen() {
               />
             ))}
           </Menu>
-        </View>
+        }
+      />
+      <Surface style={styles.header} elevation={1}>
         <View style={styles.toggleRow}>
           <View style={styles.toggleItem}>
             <Text style={styles.toggleLabel}>完了を表示</Text>
@@ -701,22 +700,14 @@ export default function CalendarScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b" },
   header: {
-    paddingTop: 48,
+    paddingTop: 4,
     paddingBottom: 8,
     paddingHorizontal: 16,
     backgroundColor: "#1e1e2e",
   },
-  headerRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-  },
-  titleBlock: { flex: 1, paddingRight: 12 },
-  headerTitle: { color: "#cdd6f4", fontWeight: "bold" },
-  scopeText: { color: "#a6adc8", fontSize: 12, marginTop: 2 },
   scopeButton: { borderColor: "#45475a" },
   scopeButtonContent: { height: 34 },
-  toggleRow: { marginTop: 8, gap: 8 },
+  toggleRow: { gap: 8 },
   toggleItem: {
     flexDirection: "row",
     alignItems: "center",

@@ -121,11 +121,11 @@ JSON以外の説明は不要です。"""
                 # 直接APIを呼び出す
                 import openai
                 client = openai.OpenAI()
-                completion = client.chat.completions.create(
+                completion = client.responses.create(
                     model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": prompt}]
+                    input=prompt
                 )
-                response = completion.choices[0].message.content
+                response = getattr(completion, "output_text", "") or None
             
             if not response:
                 return None

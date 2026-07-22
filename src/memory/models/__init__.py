@@ -58,6 +58,7 @@ from .tasks import (
     TaskAssignee,
     TaskComment,
     TaskAttachment,
+    TaskReference,
     TaskActivity,
     TaskDependency,
     TaskRecurrenceRule,
@@ -98,6 +99,13 @@ from .knowledge import (
 from .remote import (
     RemoteServerProfile,
 )
+from .free_team import (
+    FreeTeamCandidateModel,
+    FreeTeamCredentialProfile,
+    FreeTeamQuotaPool,
+    FreeTeamReservation,
+)
+from .yomi import YomiDictionaryEntry, YomiDictionarySync, YomiUnresolvedCandidate
 
 configure_mappers()
 
@@ -116,6 +124,10 @@ __all__ = [
     "ConversationSession",
     "Feedback",
     "FileExplorerBookmark",
+    "FreeTeamCandidateModel",
+    "FreeTeamCredentialProfile",
+    "FreeTeamQuotaPool",
+    "FreeTeamReservation",
     "GoogleCalendarConnection",
     "KnowledgeAnnotation",
     "KnowledgeAiSuggestion",
@@ -164,6 +176,7 @@ __all__ = [
     "TaskActivity",
     "TaskAssignee",
     "TaskAttachment",
+    "TaskReference",
     "TaskComment",
     "TaskDependency",
     "TaskEvent",
@@ -174,4 +187,7 @@ __all__ = [
     "TimeEntry",
     "User",
     "WebUILoginLog",
+    "YomiDictionaryEntry",
+    "YomiDictionarySync",
+    "YomiUnresolvedCandidate",
 ]

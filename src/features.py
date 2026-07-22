@@ -48,6 +48,25 @@ class Features:
         # 会社版は外向きの外部サーバー接続をしない（逆方向接続の禁止）
         "remote_server_view": False,
     }
+
+    @classmethod
+    def profile_name(cls) -> str:
+        """Return the effective AoiTalk profile used by all feature/capability checks.
+
+        Enterprise publish historically set ``AIVTUBER_ENV`` while feature flags
+        only inspected ``AOITALK_PROFILE``.  Treat the publish environment as a
+        profile fallback so an Enterprise build cannot accidentally advertise or
+        enable the personal outbound-connection UI.
+        """
+        return (
+            os.getenv("AOITALK_PROFILE")
+            or os.getenv("AIVTUBER_ENV")
+            or "personal"
+        ).strip().lower()
+
+    @classmethod
+    def is_enterprise(cls) -> bool:
+        return cls.profile_name() == "enterprise"
     
     _profile_cache: Optional[Dict[str, bool]] = None
     _initialized: bool = False
@@ -58,7 +77,7 @@ class Features:
         if cls._profile_cache is not None:
             return cls._profile_cache
         
-        profile_name = os.getenv("AOITALK_PROFILE", "").lower()
+        profile_name = cls.profile_name()
         
         if profile_name == "enterprise":
             cls._profile_cache = cls.ENTERPRISE_DEFAULTS.copy()
@@ -105,6 +124,12 @@ class Features:
         Returns:
             True if the feature is enabled
         """
+        # Enterprise is deliberately allowed to receive inbound server-to-server
+        # traffic, but it must never gain the outbound remote-server UI through an
+        # environment override.
+        if feature == "remote_server_view" and cls.is_enterprise():
+            return False
+
         # 1. Check environment variable first (highest priority)
         env_key = f"FEATURE_{feature.upper()}"
         env_value = os.getenv(env_key)

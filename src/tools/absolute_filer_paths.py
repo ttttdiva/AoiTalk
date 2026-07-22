@@ -14,6 +14,7 @@ import struct
 import logging
 import subprocess
 import hashlib
+import tempfile
 from pathlib import Path
 from typing import Optional, Dict, Any
 from datetime import datetime
@@ -291,48 +292,42 @@ def generate_video_thumbnail(video_path: Path, force: bool = False) -> Optional[
     # Ensure cache directory exists
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     
+    temp_file = tempfile.NamedTemporaryFile(
+        prefix=f".{cache_path.stem}.",
+        suffix=".tmp.jpg",
+        dir=cache_path.parent,
+        delete=False,
+    )
+    temp_path = Path(temp_file.name)
+    temp_file.close()
+
     try:
-        # Use FFmpeg to extract a frame at 1 second (or 10% of video)
-        # -ss 1: seek to 1 second
-        # -vframes 1: extract 1 frame
-        # -vf scale=480:-1: scale to 480px width, maintain aspect ratio
-        result = subprocess.run(
-            [
-                'ffmpeg', '-y',
-                '-ss', '1',
-                '-i', str(video_path),
-                '-vframes', '1',
-                '-vf', 'scale=480:-1',
-                '-q:v', '2',
-                str(cache_path)
-            ],
-            capture_output=True,
-            timeout=30
-        )
-        
-        if result.returncode == 0 and cache_path.exists():
-            logger.debug(f"Generated thumbnail for {video_path}")
-            return cache_path
-        else:
-            # Try at 0 seconds for very short videos
+        # 一意な一時JPEGへ生成し、成功後だけcache pathへ原子的に公開する。
+        for seek_position in ('1', '0'):
             result = subprocess.run(
                 [
                     'ffmpeg', '-y',
-                    '-ss', '0',
+                    '-ss', seek_position,
                     '-i', str(video_path),
                     '-vframes', '1',
                     '-vf', 'scale=480:-1',
                     '-q:v', '2',
-                    str(cache_path)
+                    str(temp_path)
                 ],
                 capture_output=True,
                 timeout=30
             )
-            if result.returncode == 0 and cache_path.exists():
-                logger.debug(f"Generated thumbnail for {video_path} (at 0s)")
+            if (
+                result.returncode == 0
+                and temp_path.exists()
+                and temp_path.stat().st_size
+            ):
+                os.replace(temp_path, cache_path)
+                suffix = "" if seek_position == '1' else " (at 0s)"
+                logger.debug(f"Generated thumbnail for {video_path}{suffix}")
                 return cache_path
-            logger.warning(f"FFmpeg failed to generate thumbnail for {video_path}")
-            return None
+        logger.warning(f"FFmpeg failed to generate thumbnail for {video_path}")
+        return None
             
     except subprocess.TimeoutExpired:
         logger.warning(f"Thumbnail generation timed out for {video_path}")
@@ -343,6 +338,8 @@ def generate_video_thumbnail(video_path: Path, force: bool = False) -> Optional[
     except Exception as e:
         logger.error(f"Failed to generate thumbnail for {video_path}: {e}")
         return None
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def get_video_thumbnail_path(video_path: str) -> Optional[Path]:

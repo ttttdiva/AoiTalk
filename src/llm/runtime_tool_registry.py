@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 from typing import Any
+from uuid import UUID, uuid4
 
 from ..services.project_context import get_runtime_project_context
 from ..skills.executor import invoke_skill
 from ..tools.app_factory import create_instant_app_package, set_app_factory_tool_config
-from ..tools.core import ToolDefinition, ensure_tool_definitions, tool as tool_decorator
+from ..tools.core import ToolDefinition, ToolParam, ensure_tool_definitions, tool as tool_decorator
 from ..tools.registry import ToolRegistry
 from ..services.advanced_reasoning_service import advanced_reasoning_enabled
 from ..services.agent_run_service import AgentRunService, get_current_agent_run_id
@@ -17,6 +18,7 @@ from ..services.agent_team_service import (
     SCALABLE_MEMBER_KEYS,
     agent_team_clamp_instances,
     agent_team_delegate_member,
+    agent_team_delegation_enabled,
     agent_team_enabled,
     agent_team_member_for,
     agent_team_scalable_members,
@@ -28,6 +30,7 @@ from .tool_policy import (
     check_tool_call_allowed,
     format_blocked_tool_result,
     get_current_user_input,
+    is_knowledge_search_enabled,
     is_memory_search_enabled,
 )
 from .specialist_delegate import (
@@ -103,13 +106,6 @@ def _search_x_enabled(config: Any) -> bool:
     )
 
 
-def _search_knowledge_enabled(config: Any) -> bool:
-    search_config = _config_get(config, "search", {}) or {}
-    if not isinstance(search_config, dict):
-        return False
-    return bool(search_config.get("knowledge_enabled", False))
-
-
 def _register_tool_definition(
     registry: ToolRegistry,
     tool_def: ToolDefinition,
@@ -171,7 +167,7 @@ def _register_search_direct_tools(
             or registered
         )
 
-    if _search_knowledge_enabled(config):
+    if is_knowledge_search_enabled(config):
         from ..tools.knowledge import knowledge_read, knowledge_search, knowledge_status
 
         for tool_def in ensure_tool_definitions(
@@ -408,33 +404,78 @@ def _register_agent_team_delegate_tool(
 ) -> None:
     if "agent_team_delegate" in registry:
         return
-    if not agent_team_enabled(config) or not agent_team_scalable_members(config):
+    active = agent_team_scalable_members(config)
+    if not agent_team_enabled(config) or not active:
         return
+    role_text = ", ".join(str(item["member_key"]) for item in active)
+    auto_role_text = ", ".join(
+        str(item["member_key"])
+        for item in active
+        if str(item.get("group_id") or "") == "auto"
+    )
 
-    async def agent_team_delegate(role: str, task: str, instances: int = 1) -> str:
-        """Delegate work to scalable Agent Team teammates.
+    async def agent_team_delegate(
+        role: str,
+        task: str,
+        instances: int = 1,
+        group: str = "",
+        tools_required: bool = True,
+    ) -> str:
+        """Delegate work to enabled scalable Agent Team teammates.
 
         Args:
-            role: One of architect, explorer, implementer, reviewer.
+            role: An enabled role listed in this tool description.
             task: The bounded assignment for the teammate(s).
             instances: How many same-role teammates to run. Clamped by the role max.
+            group: For an auto-group role, the main agent must choose heavy or light for this call.
+            tools_required: False only when the assignment is fully self-contained and must not call tools.
         """
         decision = check_tool_call_allowed(
             "agent_team_delegate",
             user_input=get_current_user_input(),
-            tool_args={"role": role, "task": task, "instances": instances},
+            tool_args={
+                "role": role,
+                "task": task,
+                "instances": instances,
+                "group": group,
+                "tools_required": tools_required,
+            },
             config=config,
         )
         if not decision.allowed:
             print(f"[ToolPolicy] blocked agent_team_delegate: {decision.reason}")
             return format_blocked_tool_result("agent_team_delegate", decision)
 
-        member = agent_team_delegate_member(config, role)
-        if not member:
+        configured_member = agent_team_delegate_member(config, role)
+        if not configured_member:
             enabled_roles = ", ".join(
                 item["member_key"] for item in agent_team_scalable_members(config)
             )
             return f"Agent Team role is not available: {role}. Enabled roles: {enabled_roles}"
+
+        configured_group_id = str(
+            configured_member.get("configured_group_id")
+            or configured_member.get("group_id")
+            or ""
+        ).strip()
+        selected_group_id = str(group or "").strip().lower()
+        if configured_group_id == "auto":
+            if selected_group_id not in {"heavy", "light"}:
+                return (
+                    f"Agent Team role {role} uses automatic grouping. "
+                    "Choose group=heavy or group=light for this delegation."
+                )
+        else:
+            # 固定所属では呼び出し側の指定より保存済みgroupを常に優先する。
+            selected_group_id = ""
+
+        member = agent_team_delegate_member(
+            config,
+            role,
+            delegation_group_id=selected_group_id or None,
+        )
+        if not member:
+            return f"Agent Team role is not available: {role}"
 
         member_key = str(member.get("member_key") or role)
         if member_key not in SCALABLE_MEMBER_KEYS:
@@ -448,8 +489,12 @@ def _register_agent_team_delegate_tool(
         label = str(member.get("label") or member_key)
         provider = str(member.get("provider") or "").strip()
         model = str(member.get("model") or "").strip()
+        mode = str(member.get("mode") or member.get("reasoning_effort") or "").strip()
+        effective_group_id = str(member.get("group_id") or configured_group_id).strip()
         parent_agent_run_id = get_current_agent_run_id()
         agent_run_service = AgentRunService() if parent_agent_run_id else None
+        delegation_id = str(uuid4())
+        instance_route_metadata: dict[int, dict[str, Any]] = {}
 
         def _instance_payload(index: int) -> dict[str, Any]:
             instance_label = f"{label}-{index}"
@@ -458,14 +503,22 @@ def _register_agent_team_delegate_tool(
                 "actor_key": member_key,
                 "agent_member_key": member_key,
                 "agent_instance_key": f"{member_key}-{index}",
+                "delegation_id": delegation_id,
+                "operation_id": f"agent:{delegation_id}:{index}",
                 "actor_label": instance_label,
                 "agent_label": instance_label,
                 "provider": provider or None,
                 "model": model or None,
+                "mode": mode or None,
+                "reasoning_effort": mode or None,
+                "group_id": effective_group_id or None,
+                "configured_group_id": configured_group_id or None,
                 "role": member_key,
                 "instance_index": index,
                 "instance_count": count,
                 "task": task,
+                "routing_profile": member.get("routing_profile_id"),
+                "pool": member.get("pool_id"),
             }
 
         async def _record_instance_event(
@@ -505,6 +558,8 @@ def _register_agent_team_delegate_tool(
                 config,
                 member_key=member_key,
                 display_name=f"{label}-{index}",
+                group_id=selected_group_id or None,
+                tool_required=bool(tools_required),
             )
             scoped_task = (
                 f"You are {label}-{index} in the Agent Team.\n"
@@ -513,7 +568,14 @@ def _register_agent_team_delegate_tool(
                 "Coordinate by keeping your scope independent and returning a concise result.\n\n"
                 f"Assignment:\n{task}"
             )
-            return await runner.run_async(scoped_task, project_context=project_context)
+            try:
+                return await runner.run_async(
+                    scoped_task, project_context=project_context
+                )
+            finally:
+                instance_route_metadata[index] = dict(
+                    getattr(runner, "route_metadata", {}) or {}
+                )
 
         import asyncio
 
@@ -528,7 +590,10 @@ def _register_agent_team_delegate_tool(
                     index,
                     status="failed",
                     message=f"{label}-{index} の実行に失敗しました",
-                    extra={"error": str(result)},
+                    extra={
+                        "error": str(result),
+                        **instance_route_metadata.get(index, {}),
+                    },
                 )
             else:
                 await _record_instance_event(
@@ -536,7 +601,10 @@ def _register_agent_team_delegate_tool(
                     index,
                     status="succeeded",
                     message=f"{label}-{index} が完了しました",
-                    extra={"result_preview": str(result)[:1200]},
+                    extra={
+                        "result_preview": str(result)[:1200],
+                        **instance_route_metadata.get(index, {}),
+                    },
                 )
 
         failures = [result for result in results if isinstance(result, Exception)]
@@ -551,9 +619,32 @@ def _register_agent_team_delegate_tool(
             for index, result in enumerate(successful_results)
         )
 
+    agent_team_delegate.__doc__ = (agent_team_delegate.__doc__ or "") + f"\nEnabled roles: {role_text}."
+    if auto_role_text:
+        agent_team_delegate.__doc__ += (
+            f"\nRoles requiring the main agent to choose group=heavy or group=light: "
+            f"{auto_role_text}."
+        )
+    definition = tool_decorator(agent_team_delegate)
+    description = f"{definition.description} Enabled roles: {role_text}."
+    if auto_role_text:
+        description += (
+            " The main agent must choose group=heavy or group=light on every call "
+            f"for these automatic-group roles: {auto_role_text}."
+        )
+    definition = replace(
+        definition,
+        description=description,
+        parameters=[
+            replace(param, enum=["heavy", "light"])
+            if param.name == "group"
+            else param
+            for param in definition.parameters
+        ],
+    )
     registry.register(
         replace(
-            tool_decorator(agent_team_delegate),
+            definition,
             owner="agent_team",
             risk="medium",
             side_effect="none",
@@ -562,7 +653,47 @@ def _register_agent_team_delegate_tool(
     )
 
 
-def build_runtime_tool_registry(config: Any) -> ToolRegistry:
+def _register_project_workspace_tools(registry: ToolRegistry, project_context: dict[str, Any] | None) -> None:
+    context = project_context or get_runtime_project_context() or {}
+    project_id = str(context.get("id") or "")
+    if not project_id:
+        return
+    from ..services.project_workspace_cleanup import get_project_workspace_path
+    from ..services.workspace_git_service import WorkspaceGitService
+
+    git = WorkspaceGitService()
+    if not git.available:
+        return
+    registry.register(ToolDefinition(
+        name="workspace_history", description="プロジェクトworkspaceのローカル版管理履歴を参照する",
+        function=lambda path=None, limit=20: git.history(project_id, path=path, limit=limit),
+        parameters=[ToolParam("path", "string", required=False), ToolParam("limit", "integer", required=False, default=20)],
+        owner="workspace", risk="low", side_effect="none",
+    ))
+    registry.register(ToolDefinition(
+        name="workspace_diff", description="プロジェクトworkspaceの2つの版の差分を参照する",
+        function=lambda rev_a, rev_b, path=None: git.diff(project_id, rev_a, rev_b, path=path),
+        parameters=[ToolParam("rev_a", "string"), ToolParam("rev_b", "string"), ToolParam("path", "string", required=False)],
+        owner="workspace", risk="low", side_effect="none",
+    ))
+    registry.register(ToolDefinition(
+        name="workspace_restore", description="指定した版からworkspaceのファイルを復元する",
+        function=lambda path, rev: git.restore(project_id, path, rev),
+        parameters=[ToolParam("path", "string"), ToolParam("rev", "string")], owner="workspace",
+        risk="high", side_effect="filesystem", requires_approval=True, supports_parallel=False,
+    ))
+
+    metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
+    enabled = bool(context.get("workspace_tools_enabled", metadata.get("workspace_tools_enabled", False)))
+    if not enabled:
+        return
+    from ..services.workspace_tool_runner import load_workspace_tool_manifests, manifest_to_tool
+    workspace = get_project_workspace_path(UUID(project_id))
+    for manifest in load_workspace_tool_manifests(workspace):
+        registry.register(manifest_to_tool(manifest))
+
+
+def build_runtime_tool_registry(config: Any, project_context: dict[str, Any] | None = None) -> ToolRegistry:
     """Build the root runtime registry with direct tools and high-level delegates."""
     registry = ToolRegistry()
 
@@ -577,9 +708,14 @@ def build_runtime_tool_registry(config: Any) -> ToolRegistry:
         registry.register(create_instant_app_package)
 
     if not config:
+        _register_project_workspace_tools(registry, project_context)
         return registry
 
-    if advanced_reasoning_enabled(config):
+    # Agent Team（汎用作業系）の公開スイッチ。OFF時はロール委譲と
+    # 高度推論を隠す。単独で動く専門エージェントは個別設定に従う。
+    delegation_on = agent_team_delegation_enabled(config)
+
+    if delegation_on and advanced_reasoning_enabled(config):
         if "advanced_reasoning_assistant" not in registry:
             def advanced_reasoning_assistant(request: str, redacted_request: str = "") -> str:
                 """Delegate tool-free hard reasoning to the configured external model.
@@ -622,7 +758,8 @@ def build_runtime_tool_registry(config: Any) -> ToolRegistry:
             )
             registry.register(tool_decorator(advanced_reasoning_assistant))
 
-    _register_agent_team_delegate_tool(registry, config=config)
+    if delegation_on:
+        _register_agent_team_delegate_tool(registry, config=config)
 
     if _agent_enabled(config, "search", True):
         _register_search_direct_tools(registry, config=config)
@@ -724,4 +861,5 @@ def build_runtime_tool_registry(config: Any) -> ToolRegistry:
             "キャラクターエージェントツールの登録に失敗しました", exc_info=True
         )
 
+    _register_project_workspace_tools(registry, project_context)
     return registry

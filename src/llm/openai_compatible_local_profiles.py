@@ -21,6 +21,15 @@ MLX_LM_MODEL_IDS = (
 
 _EXO_MODEL_SET = {model.casefold() for model in EXO_MODEL_IDS}
 _MLX_LM_MODEL_SET = {model.casefold() for model in MLX_LM_MODEL_IDS}
+SUPPORTED_SERVER_PROFILES = (
+    "auto",
+    "sglang",
+    "vllm",
+    "llama.cpp",
+    "ollama",
+    "lm-studio",
+    "custom",
+)
 
 
 def is_macos(platform_name: Optional[str] = None) -> bool:
@@ -189,3 +198,79 @@ def macos_openai_compatible_local_model_options(
             "source_label": "macOS/MLX",
         },
     ]
+
+
+def openai_compatible_server_profile(
+    config: Any = None,
+    *,
+    base_url: str = "",
+    provider: str = "openai_compatible_local",
+) -> Dict[str, Any]:
+    """Resolve a conservative server profile.
+
+    ``auto`` only detects a provider; it never sends server-specific cache
+    parameters.  Such parameters are sent only for an explicit profile.
+    """
+    configured = str(
+        _config_get(config, "openai_compatible_local.server_profile", "auto") or "auto"
+    ).strip().lower()
+    aliases = {"llamacpp": "llama.cpp", "llama-cpp": "llama.cpp", "lmstudio": "lm-studio"}
+    configured = aliases.get(configured, configured)
+    if configured not in SUPPORTED_SERVER_PROFILES:
+        configured = "auto"
+
+    url = (base_url or "").casefold()
+    if configured == "auto":
+        if provider == "sglang" or ":30000" in url or "sglang" in url:
+            name = "sglang"
+        elif provider == "ollama" or ":11434" in url or "ollama" in url:
+            name = "ollama"
+        elif "vllm" in url:
+            name = "vllm"
+        elif "llama" in url or "llama.cpp" in url:
+            name = "llama.cpp"
+        elif "lmstudio" in url or "lm-studio" in url:
+            name = "lm-studio"
+        else:
+            name = "auto"
+    else:
+        name = configured
+
+    cache_mode = {
+        "sglang": "radix",
+        "vllm": "automatic_prefix_caching",
+        "llama.cpp": "slot_kv_cache",
+        "ollama": "cache_prompt",
+        "lm-studio": "server-managed",
+        "custom": "custom",
+        "auto": "unknown",
+    }[name]
+    cache_config = _config_get(config, "openai_compatible_local.cache", {}) or {}
+    configured_cache_mode = (
+        str(cache_config.get("mode", "auto") or "auto").strip().lower()
+        if isinstance(cache_config, dict)
+        else "auto"
+    )
+    if configured_cache_mode not in {"", "auto"}:
+        cache_mode = configured_cache_mode
+    cache_supported = name != "auto" and configured_cache_mode not in {
+        "disabled",
+        "off",
+        "none",
+    }
+    extra_body = cache_config.get("extra_body", {}) if isinstance(cache_config, dict) else {}
+    return {
+        "name": name,
+        "cache_mode": cache_mode,
+        "cache_supported": cache_supported,
+        "request_extra_body": dict(extra_body) if isinstance(extra_body, dict) else {},
+        "metrics_source": {
+            "sglang": "server_metrics_if_available",
+            "vllm": "server_metrics_if_available",
+            "llama.cpp": "response_timings",
+            "ollama": "ollama_native_or_openai_compatible_response",
+        }.get(name, "response_usage"),
+        "supports_keep_alive": name == "ollama",
+        "supports_session_affinity": name in {"sglang", "vllm", "llama.cpp"},
+        "capability_detection": configured == "auto",
+    }

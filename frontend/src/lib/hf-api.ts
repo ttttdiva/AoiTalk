@@ -34,12 +34,34 @@ export interface HfFileEntry {
   lfs?: { oid: string; size: number; pointerSize: number };
 }
 
+export type HfReferenceAddResponse =
+  | {
+      kind: "account";
+      account: { id: string; username: string; label: string };
+    }
+  | {
+      kind: "repository";
+      repositories: Array<{
+        repoId: string;
+        repoType: RepoType;
+        accountId?: string;
+        path: string;
+      }>;
+    };
+
 // ─── Helpers ───
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, { credentials: "include", ...init });
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    throw new Error(`${res.status}: ${t || res.statusText}`);
+    let detail = t || res.statusText;
+    try {
+      const body = JSON.parse(t) as { detail?: unknown };
+      if (typeof body.detail === "string") detail = body.detail;
+    } catch {
+      // use raw response
+    }
+    throw new Error(detail || `HTTP ${res.status}`);
   }
   return (await res.json()) as T;
 }
@@ -47,6 +69,39 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
 // ─── Huggingface ───
 export async function hfListAccounts(): Promise<{ accounts: HfAccount[] }> {
   return jsonFetch("/api/huggingface/accounts");
+}
+
+export async function hfAddReference(value: string): Promise<HfReferenceAddResponse> {
+  return jsonFetch("/api/huggingface/references", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ value }),
+  });
+}
+
+export async function hfUploadFiles(
+  path: string,
+  files: FileList | File[] | Array<{ file: File; relativePath?: string }>,
+): Promise<{
+  success: boolean;
+  successCount: number;
+  failureCount: number;
+  failures: Array<{ name: string; error: string }>;
+}> {
+  const form = new FormData();
+  form.set("path", path);
+  const entries = Array.from(
+    files as ArrayLike<File | { file: File; relativePath?: string }>,
+  );
+  for (const entry of entries) {
+    const file = entry instanceof File ? entry : entry.file;
+    const relativePath = entry instanceof File
+      ? file.webkitRelativePath || file.name
+      : entry.relativePath || file.name;
+    form.append("files", file);
+    form.append("filePaths", relativePath);
+  }
+  return jsonFetch("/api/huggingface/upload", { method: "POST", body: form });
 }
 
 export async function hfListRepos(
@@ -183,6 +238,7 @@ export async function hydrusSearch(params: {
   perPage?: number;
   fileSortType?: number;
   fileSortAsc?: boolean;
+  signal?: AbortSignal;
 }): Promise<HydrusSearchResponse> {
   const qs = new URLSearchParams();
   qs.set("tags", JSON.stringify(params.tags));
@@ -192,17 +248,18 @@ export async function hydrusSearch(params: {
     qs.set("file_sort_type", String(params.fileSortType));
   if (params.fileSortAsc != null)
     qs.set("file_sort_asc", String(params.fileSortAsc));
-  return hydrusFetch(`/hydrus/search?${qs}`);
+  return hydrusFetch(`/hydrus/search?${qs}`, { signal: params.signal });
 }
 
 export async function hydrusGetMetadata(
   fileIds: number[],
   onlyBasic: boolean = false,
+  signal?: AbortSignal,
 ): Promise<{ metadata: HydrusFileMetadata[] }> {
   const qs = new URLSearchParams();
   qs.set("file_ids", JSON.stringify(fileIds));
   qs.set("only_basic", onlyBasic ? "true" : "false");
-  return hydrusFetch(`/hydrus/metadata?${qs}`);
+  return hydrusFetch(`/hydrus/metadata?${qs}`, { signal });
 }
 
 export async function hydrusSearchTags(

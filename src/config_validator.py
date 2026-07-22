@@ -61,7 +61,7 @@ class Config(BaseModel):
     default_character: str
     llm_model: str
     llm_provider: str = Field(
-        pattern="^(openai|openrouter|gemini|antigravity-cli|claude-cli|codex-cli|ollama|sglang|openai_compatible_local)$"
+        pattern="^(openai|openrouter|kimi|gemini|antigravity-cli|claude-cli|codex-cli|grok-cli|ollama|sglang|openai_compatible_local)$"
     )
     device_index: int = Field(0, ge=0)
 

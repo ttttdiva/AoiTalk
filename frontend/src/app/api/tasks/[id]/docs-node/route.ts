@@ -11,8 +11,6 @@ import { getSession } from "@/lib/auth";
 import {
   appendKnowledgeRevision,
   cleanOptionalString,
-  encryptNodeBodyJson,
-  encryptNodeBodyText,
   ensureDocsWorkspace,
   ensureProjectWritable,
   serializeNode,
@@ -20,6 +18,11 @@ import {
   upsertKnowledgeSearchIndex,
 } from "@/lib/server/knowledge-docs-utils";
 import { fetchPythonApi } from "@/lib/server/python-api-proxy";
+import { insertDocsNode, updateDocsNode } from "@/lib/server/docs-node-writer";
+import {
+  ensureProjectInformationHierarchyNode,
+  isDefaultInboxProject,
+} from "@/lib/server/project-information-hierarchy";
 
 async function assertPythonOk(response: Response, action: string) {
   if (response.ok) return;
@@ -55,6 +58,17 @@ export async function POST(
   }
 
   const workspace = await ensureDocsWorkspace(user);
+  if (isDefaultInboxProject(projectAccess.project)) {
+    return NextResponse.json(
+      { detail: "Inboxタスクは案件情報Docsへ変換できません。実案件へ移してから実行してください" },
+      { status: 409 },
+    );
+  }
+  const projectNode = await ensureProjectInformationHierarchyNode({
+    workspaceId: workspace.id,
+    userId: user.id,
+    project: projectAccess.project,
+  });
 
   if (task.knowledgeNodeId) {
     const [linkedNode] = await db
@@ -69,7 +83,13 @@ export async function POST(
       )
       .limit(1);
     if (linkedNode) {
-      return NextResponse.json({ node: serializeNode(linkedNode), created: false });
+      const repaired = await updateDocsNode(db, linkedNode.id, {
+        parentId: projectNode.id,
+        rootPageId: projectNode.rootPageId ?? projectNode.id,
+        updatedBy: user.id,
+        updatedAt: new Date(),
+      });
+      return NextResponse.json({ node: serializeNode(repaired), created: false });
     }
   }
 
@@ -90,7 +110,8 @@ export async function POST(
     );
   }
 
-  const parentId = projectAccess.project.knowledgeNodeId ?? null;
+  const parentId = projectNode.id;
+  const rootPageId = projectNode.rootPageId ?? projectNode.id;
   const bodyText = cleanOptionalString(task.description, 200000) ?? "";
   const node = await db.transaction(async (tx) => {
     const [maxRow] = await tx
@@ -103,20 +124,17 @@ export async function POST(
         ),
       );
 
-    const [created] = await tx
-      .insert(knowledgeNodes)
-      .values({
+    const created = await insertDocsNode(tx, {
         workspaceId: workspace.id,
         parentId,
-        rootPageId: parentId,
+        rootPageId,
         projectId: task.projectId,
         title: task.title,
         description: task.description ?? "",
-        bodyText: encryptNodeBodyText(bodyText),
-        bodyJson: encryptNodeBodyJson({
+        bodyJson: {
           format: "task_note",
           task_id: task.id,
-        }),
+        },
         nodeType: "node",
         displayProps: { show_checkbox: true },
         queryJson: null,
@@ -124,26 +142,32 @@ export async function POST(
         sortOrder: (maxRow?.maxSort ?? 0) + 1,
         createdBy: user.id,
         updatedBy: user.id,
-      })
-      .returning();
+      });
 
-    const finalNode = created.rootPageId
-      ? created
-      : (
-          await tx
-            .update(knowledgeNodes)
-            .set({ rootPageId: created.id, updatedAt: new Date(), updatedBy: user.id })
-            .where(eq(knowledgeNodes.id, created.id))
-            .returning()
-        )[0];
+    const finalNode = created;
 
     await tx.insert(knowledgeNodeSupertags).values({
       nodeId: finalNode.id,
       supertagId: taskTag.id,
       createdBy: user.id,
     });
-    await upsertKnowledgeSearchIndex(tx, finalNode, bodyText);
-    await syncKnowledgeNodeReferenceEdges(tx, { ...finalNode, bodyText }, user.id);
+    await upsertKnowledgeSearchIndex(tx, finalNode, finalNode.title);
+    if (bodyText) {
+      const detailNode = await insertDocsNode(tx, {
+        workspaceId: workspace.id,
+        parentId: finalNode.id,
+        rootPageId: finalNode.rootPageId ?? finalNode.id,
+        projectId: task.projectId,
+        title: bodyText,
+        bodyJson: { format: "doc_block", block_type: "paragraph" },
+        nodeType: "node",
+        sortOrder: 1,
+        createdBy: user.id,
+        updatedBy: user.id,
+      });
+      await upsertKnowledgeSearchIndex(tx, detailNode, detailNode.title);
+    }
+    await syncKnowledgeNodeReferenceEdges(tx, finalNode, user.id);
     await appendKnowledgeRevision(tx, finalNode, user.id, "タスクをDocsノート化");
     return finalNode;
   });

@@ -103,7 +103,7 @@ async def record_failure_event(
     _RECENT_FAILURES[key] = now
 
     try:
-        from src.api.feedback import FeedbackRequest, save_feedback_async
+        from src.services.feedback_store import FeedbackRequest, save_feedback_async
 
         await save_feedback_async(
             FeedbackRequest(

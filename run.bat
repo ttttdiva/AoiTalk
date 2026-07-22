@@ -2,6 +2,13 @@
 chcp 65001 >nul
 title AoiTalk
 cd /d %~dp0
+if not defined AOITALK_PROFILE set "AOITALK_PROFILE=personal"
+if not defined AIVTUBER_ENV set "AIVTUBER_ENV=personal"
+if not defined AOITALK_WEB_PORT set "AOITALK_WEB_PORT=3000"
+if not defined AOITALK_NEXT_PORT set "AOITALK_NEXT_PORT=3002"
+if not defined AOITALK_CADDY_PORT set "AOITALK_CADDY_PORT=6002"
+if not defined AOITALK_CADDY_FASTAPI_PORT set "AOITALK_CADDY_FASTAPI_PORT=%AOITALK_WEB_PORT%"
+if not defined AOITALK_CADDY_NEXT_PORT set "AOITALK_CADDY_NEXT_PORT=%AOITALK_NEXT_PORT%"
 set "AOITALK_PYTHON=%~dp0venv\Scripts\python.exe"
 if not exist "%AOITALK_PYTHON%" (
     echo Python virtual environment not found: %AOITALK_PYTHON%

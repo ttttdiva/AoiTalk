@@ -71,7 +71,46 @@ class CLIBackendBase(ABC):
     def __init__(self):
         """Initialize CLI backend"""
         self.provider_name = self.get_provider_name()
+        self._last_usage: Optional[Dict[str, int]] = None
         logger.info(f"[{self.provider_name}] Backend initialized")
+
+    def set_last_usage(self, usage: Any) -> None:
+        """CLIの構造化usageを共通形式へ正規化する。"""
+        if not isinstance(usage, dict):
+            return
+
+        def _token_count(*keys: str) -> int:
+            for key in keys:
+                value = usage.get(key)
+                if value is None:
+                    continue
+                try:
+                    return max(0, int(value))
+                except (TypeError, ValueError):
+                    continue
+            return 0
+
+        input_tokens = _token_count("input_tokens", "prompt_tokens")
+        output_tokens = _token_count("output_tokens", "completion_tokens")
+        cache_read = _token_count(
+            "cache_read_input_tokens", "cached_input_tokens", "cached_tokens"
+        )
+        cache_creation = _token_count("cache_creation_input_tokens")
+        # Anthropic CLIではcache read/createがinput_tokensと別枠。
+        if "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage:
+            input_tokens += cache_read + cache_creation
+        cached_tokens = cache_read
+        if input_tokens or output_tokens:
+            self._last_usage = {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cached_tokens": cached_tokens,
+            }
+
+    def consume_last_usage(self) -> Optional[Dict[str, int]]:
+        usage = self._last_usage
+        self._last_usage = None
+        return usage
 
     @abstractmethod
     def get_cli_command(self, prompt: str) -> List[str]:
@@ -123,6 +162,14 @@ class CLIBackendBase(ABC):
     def get_subprocess_env(self) -> Optional[Dict[str, str]]:
         """Return environment overrides for CLI subprocesses."""
         return None
+
+    def get_cwd_args(self, cwd: Optional[Path]) -> List[str]:
+        """Return provider-specific working-directory arguments.
+
+        Most CLIs inherit the subprocess working directory.  A provider may
+        additionally require its explicit ``--cwd`` option for headless mode.
+        """
+        return []
 
     def handle_stream_output_line(
         self,
@@ -178,6 +225,7 @@ class CLIBackendBase(ABC):
         Returns:
             (success: bool, output: str)
         """
+        self._last_usage = None
         direct_prompt_max_length = getattr(
             self,
             "direct_prompt_max_length",
@@ -213,6 +261,9 @@ class CLIBackendBase(ABC):
             stdin_input = None
 
         # MCP config等の追加引数
+        cwd_args = self.get_cwd_args(cwd)
+        if cwd_args:
+            cmd.extend(cwd_args)
         if extra_args:
             cmd.extend(extra_args)
 

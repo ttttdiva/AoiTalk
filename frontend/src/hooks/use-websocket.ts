@@ -12,6 +12,8 @@ import {
   isWebSocketMessageForSession,
 } from "@/lib/chat-websocket-events";
 import { getToolLabel, normalizeToolName } from "@/lib/tool-labels";
+import { isOversizedMailAttachment } from "@/lib/chat-attachment-validation";
+import { toast } from "sonner";
 
 type WSMessage = {
   type: string;
@@ -130,6 +132,10 @@ function isAudioFile(file: File): boolean {
   return file.type.startsWith("audio/") || /\.(wav|mp3|m4a|flac|ogg|webm)$/i.test(file.name);
 }
 
+function isMailFile(file: File): boolean {
+  return /\.(msg|eml)$/i.test(file.name);
+}
+
 async function fileToAttachmentContext(file: File): Promise<string> {
   if (isImageFile(file)) {
     return `[添付画像: ${file.name}]`;
@@ -197,7 +203,14 @@ export function useWebSocket(sessionId: string | null) {
     }
 
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.hostname}:3000/ws?session_id=${sessionId}`;
+    const configuredWebSocketPort =
+      process.env.NEXT_PUBLIC_AOITALK_WS_PORT?.trim();
+    const websocketAuthority = configuredWebSocketPort
+      ? `${window.location.hostname}:${configuredWebSocketPort}`
+      : window.location.protocol === "https:"
+        ? window.location.host
+        : `${window.location.hostname}:3000`;
+    const wsUrl = `${protocol}//${websocketAuthority}/ws?session_id=${sessionId}`;
     let cancelled = false;
     let reconnectAttempt = 0;
 
@@ -332,8 +345,14 @@ export function useWebSocket(sessionId: string | null) {
       targetSessionId?: string | null,
       clientMessageId?: string,
       commandCapabilities?: ChatCommandCapability[],
+      toolsRequired?: boolean,
     ) => {
-      if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+      const ws = wsRef.current;
+      if (ws?.readyState !== WebSocket.OPEN) return Promise.resolve(false);
+      if (files?.some(isOversizedMailAttachment)) {
+        toast.error("メールファイルは 10 MB までです");
+        return Promise.resolve(false);
+      }
       setActiveAgentRunId(null);
 
       const buildPayload = async () => {
@@ -341,6 +360,9 @@ export function useWebSocket(sessionId: string | null) {
         if (clientMessageId) data.client_message_id = clientMessageId;
         if (commandCapabilities && commandCapabilities.length > 0) {
           data.command_capabilities = commandCapabilities;
+        }
+        if (typeof toolsRequired === "boolean") {
+          data.tools_required = toolsRequired;
         }
         if (projectId) data.project_id = projectId;
         data.include_project_context = includeProjectContext === true;
@@ -360,6 +382,14 @@ export function useWebSocket(sessionId: string | null) {
           const audioFile = files.find(isAudioFile);
           if (audioFile) {
             data.audio = await fileToMediaPayload(audioFile);
+          }
+          const mailPayloads = await Promise.all(
+            files.map(async (file, index) =>
+              isMailFile(file) ? { index, payload: await fileToMediaPayload(file) } : null,
+            ),
+          );
+          for (const item of mailPayloads) {
+            if (item) attachments[item.index].data_url = item.payload.data;
           }
 
           if (projectId) {
@@ -413,10 +443,17 @@ export function useWebSocket(sessionId: string | null) {
           data.response_model = responseModel;
         }
 
-        wsRef.current?.send(JSON.stringify({ type: "user_message", data }));
+        if (wsRef.current !== ws || ws.readyState !== WebSocket.OPEN) {
+          return false;
+        }
+        ws.send(JSON.stringify({ type: "user_message", data }));
+        return true;
       };
 
-      buildPayload().catch(console.error);
+      return buildPayload().catch((error) => {
+        console.error(error);
+        return false;
+      });
     },
     []
   );

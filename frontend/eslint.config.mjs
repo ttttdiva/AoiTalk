@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // OpenAPI から自動生成する型定義（手編集禁止・lint 対象外）
+    "src/lib/api-types.gen.ts",
   ]),
 ]);
 

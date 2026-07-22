@@ -84,7 +84,7 @@ Use your tools to:
 - start, stop, and log timers
 - inspect list and calendar views
 - report tracked time by project/day/user/task
-- keep record tables visible as .dbtable items in the project workspace filer
+- keep legacy project record tables available through project information without presenting them as workspace files
 - render Mermaid diagrams (system overview, WBS tree, record-table relations) from stored project data
 
 Response format rules:

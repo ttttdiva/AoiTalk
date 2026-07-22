@@ -297,6 +297,141 @@ const DDL: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_scenario_episodes_scenario_id ON scenario_episodes(scenario_id);`,
   `CREATE INDEX IF NOT EXISTS idx_scenario_episodes_updated_at ON scenario_episodes(updated_at);`,
 
+  // ---------- Docs（アウトライン型ナレッジ） ----------
+  `CREATE TABLE IF NOT EXISTS knowledge_nodes (
+     id TEXT PRIMARY KEY,
+     workspace_id TEXT,
+     parent_id TEXT,
+     root_page_id TEXT,
+     project_id TEXT,
+     system_key TEXT,
+     title TEXT NOT NULL,
+     aliases TEXT,
+     description TEXT,
+     body_json TEXT,
+     body_text TEXT,
+     node_type TEXT NOT NULL DEFAULT 'node',
+     display_props TEXT,
+     query_json TEXT,
+     view_json TEXT,
+     day_date TEXT,
+     sort_order REAL,
+     created_by TEXT,
+     updated_by TEXT,
+      created_at TEXT,
+      updated_at TEXT,
+      server_updated_at TEXT,
+      dirty INTEGER NOT NULL DEFAULT 0,
+      conflict_payload TEXT,
+      archived_at TEXT
+   );`,
+  `CREATE INDEX IF NOT EXISTS idx_knodes_parent ON knowledge_nodes(parent_id, sort_order);`,
+  `CREATE INDEX IF NOT EXISTS idx_knodes_root ON knowledge_nodes(root_page_id);`,
+  `CREATE INDEX IF NOT EXISTS idx_knodes_updated_at ON knowledge_nodes(updated_at);`,
+  `CREATE INDEX IF NOT EXISTS idx_knodes_day ON knowledge_nodes(day_date);`,
+
+  `CREATE TABLE IF NOT EXISTS knowledge_supertags (
+     id TEXT PRIMARY KEY,
+     workspace_id TEXT,
+     parent_supertag_id TEXT,
+     system_key TEXT,
+     name TEXT NOT NULL,
+     base_type TEXT,
+     description TEXT,
+     icon TEXT,
+     color TEXT,
+     template_json TEXT,
+     pinned_field_ids TEXT,
+     config_json TEXT,
+     title_template TEXT,
+     ai_instructions TEXT,
+      created_at TEXT,
+      updated_at TEXT,
+      server_updated_at TEXT,
+      dirty INTEGER NOT NULL DEFAULT 0,
+      conflict_payload TEXT
+   );`,
+
+  `CREATE TABLE IF NOT EXISTS knowledge_node_supertags (
+      node_id TEXT NOT NULL,
+      supertag_id TEXT NOT NULL,
+      created_at TEXT,
+      updated_at TEXT,
+      server_updated_at TEXT,
+      dirty INTEGER NOT NULL DEFAULT 0,
+      conflict_payload TEXT,
+      created_by TEXT,
+     PRIMARY KEY (node_id, supertag_id)
+   );`,
+  `CREATE INDEX IF NOT EXISTS idx_knst_node ON knowledge_node_supertags(node_id);`,
+
+  `CREATE TABLE IF NOT EXISTS knowledge_fields (
+     id TEXT PRIMARY KEY,
+     workspace_id TEXT,
+     supertag_id TEXT,
+     system_key TEXT,
+     name TEXT NOT NULL,
+     field_type TEXT NOT NULL DEFAULT 'text',
+     required INTEGER,
+     options_json TEXT,
+     default_value_json TEXT,
+     sort_order REAL,
+     created_at TEXT,
+     updated_at TEXT
+   );`,
+  `CREATE INDEX IF NOT EXISTS idx_kfields_supertag ON knowledge_fields(supertag_id);`,
+
+  `CREATE TABLE IF NOT EXISTS knowledge_supertag_fields (
+     supertag_id TEXT NOT NULL,
+     field_id TEXT NOT NULL,
+     sort_order REAL,
+     required INTEGER,
+     show_in_template INTEGER,
+     optional INTEGER,
+     created_at TEXT,
+     PRIMARY KEY (supertag_id, field_id)
+   );`,
+
+  `CREATE TABLE IF NOT EXISTS knowledge_field_values (
+     node_id TEXT NOT NULL,
+     field_id TEXT NOT NULL,
+     value_json TEXT,
+     value_text TEXT,
+     value_number REAL,
+     value_datetime TEXT,
+      target_node_id TEXT,
+      updated_at TEXT,
+      server_updated_at TEXT,
+      dirty INTEGER NOT NULL DEFAULT 0,
+      conflict_payload TEXT,
+      updated_by TEXT,
+     PRIMARY KEY (node_id, field_id)
+   );`,
+  `CREATE INDEX IF NOT EXISTS idx_kfv_node ON knowledge_field_values(node_id);`,
+
+  `CREATE TABLE IF NOT EXISTS knowledge_node_placements (
+     id TEXT PRIMARY KEY,
+     node_id TEXT NOT NULL,
+     parent_node_id TEXT NOT NULL,
+     sort_order REAL,
+     collapsed INTEGER,
+     created_by TEXT,
+     created_at TEXT
+   );`,
+  `CREATE INDEX IF NOT EXISTS idx_knp_parent ON knowledge_node_placements(parent_node_id);`,
+
+  `CREATE TABLE IF NOT EXISTS knowledge_edges (
+     id TEXT PRIMARY KEY,
+     source_node_id TEXT NOT NULL,
+     target_node_id TEXT NOT NULL,
+     relation_type TEXT,
+     confidence REAL,
+     created_by TEXT,
+     created_at TEXT
+   );`,
+  `CREATE INDEX IF NOT EXISTS idx_kedge_source ON knowledge_edges(source_node_id);`,
+  `CREATE INDEX IF NOT EXISTS idx_kedge_target ON knowledge_edges(target_node_id);`,
+
   `CREATE TABLE IF NOT EXISTS outbox (
      op_id TEXT PRIMARY KEY,
      created_at INTEGER NOT NULL,
@@ -305,6 +440,8 @@ const DDL: string[] = [
      entity_id TEXT NOT NULL,
      payload TEXT NOT NULL,
      base_updated_at TEXT,
+     base_payload TEXT,
+     conflict_payload TEXT,
      retry_count INTEGER NOT NULL DEFAULT 0,
      last_error TEXT
    );`,
@@ -359,6 +496,90 @@ export function ensureSchema(): void {
       "parent_task_id",
       "ALTER TABLE tasks ADD COLUMN parent_task_id TEXT;",
     );
+    const docsColumns: Array<[string, string, string]> = [
+      ["knowledge_nodes", "server_updated_at", "ALTER TABLE knowledge_nodes ADD COLUMN server_updated_at TEXT;"],
+      ["knowledge_nodes", "dirty", "ALTER TABLE knowledge_nodes ADD COLUMN dirty INTEGER NOT NULL DEFAULT 0;"],
+      ["knowledge_nodes", "conflict_payload", "ALTER TABLE knowledge_nodes ADD COLUMN conflict_payload TEXT;"],
+      ["knowledge_supertags", "server_updated_at", "ALTER TABLE knowledge_supertags ADD COLUMN server_updated_at TEXT;"],
+      ["knowledge_supertags", "dirty", "ALTER TABLE knowledge_supertags ADD COLUMN dirty INTEGER NOT NULL DEFAULT 0;"],
+      ["knowledge_supertags", "conflict_payload", "ALTER TABLE knowledge_supertags ADD COLUMN conflict_payload TEXT;"],
+      ["knowledge_node_supertags", "updated_at", "ALTER TABLE knowledge_node_supertags ADD COLUMN updated_at TEXT;"],
+      ["knowledge_node_supertags", "server_updated_at", "ALTER TABLE knowledge_node_supertags ADD COLUMN server_updated_at TEXT;"],
+      ["knowledge_node_supertags", "dirty", "ALTER TABLE knowledge_node_supertags ADD COLUMN dirty INTEGER NOT NULL DEFAULT 0;"],
+      ["knowledge_node_supertags", "conflict_payload", "ALTER TABLE knowledge_node_supertags ADD COLUMN conflict_payload TEXT;"],
+      ["knowledge_field_values", "server_updated_at", "ALTER TABLE knowledge_field_values ADD COLUMN server_updated_at TEXT;"],
+      ["knowledge_field_values", "dirty", "ALTER TABLE knowledge_field_values ADD COLUMN dirty INTEGER NOT NULL DEFAULT 0;"],
+      ["knowledge_field_values", "conflict_payload", "ALTER TABLE knowledge_field_values ADD COLUMN conflict_payload TEXT;"],
+      ["outbox", "base_payload", "ALTER TABLE outbox ADD COLUMN base_payload TEXT;"],
+      ["outbox", "conflict_payload", "ALTER TABLE outbox ADD COLUMN conflict_payload TEXT;"],
+    ];
+    for (const [tableName, columnName, ddl] of docsColumns) {
+      ensureColumn(tableName, columnName, ddl);
+    }
+    // 既存outboxがある行は、ローカル編集時刻ではなくoutboxに保存された
+    // サーバー基準版を引き継ぐ。create（base null）は null のままにし、
+    // 未同期編集を端末時計の値でサーバー版と誤認しない。
+    db.execSync(`
+      UPDATE knowledge_nodes
+      SET server_updated_at = (
+        SELECT base_updated_at FROM outbox
+        WHERE table_name = 'knowledge_nodes'
+          AND entity_id = knowledge_nodes.id
+        ORDER BY created_at LIMIT 1
+      ), dirty = 1
+      WHERE EXISTS (
+        SELECT 1 FROM outbox
+        WHERE table_name = 'knowledge_nodes' AND entity_id = knowledge_nodes.id
+      );
+    `);
+    db.execSync(`
+      UPDATE knowledge_supertags
+      SET server_updated_at = (
+        SELECT base_updated_at FROM outbox
+        WHERE table_name = 'knowledge_supertags'
+          AND entity_id = knowledge_supertags.id
+        ORDER BY created_at LIMIT 1
+      ), dirty = 1
+      WHERE EXISTS (
+        SELECT 1 FROM outbox
+        WHERE table_name = 'knowledge_supertags' AND entity_id = knowledge_supertags.id
+      );
+    `);
+    db.execSync("UPDATE knowledge_node_supertags SET updated_at = COALESCE(updated_at, created_at) WHERE updated_at IS NULL;");
+    db.execSync(`
+      UPDATE knowledge_node_supertags
+      SET server_updated_at = (
+        SELECT base_updated_at FROM outbox
+        WHERE table_name = 'knowledge_node_supertags'
+          AND entity_id = knowledge_node_supertags.node_id || ':' || knowledge_node_supertags.supertag_id
+        ORDER BY created_at LIMIT 1
+      ), dirty = 1
+      WHERE EXISTS (
+        SELECT 1 FROM outbox
+        WHERE table_name = 'knowledge_node_supertags'
+          AND entity_id = knowledge_node_supertags.node_id || ':' || knowledge_node_supertags.supertag_id
+      );
+    `);
+    db.execSync(`
+      UPDATE knowledge_field_values
+      SET server_updated_at = (
+        SELECT base_updated_at FROM outbox
+        WHERE table_name = 'knowledge_field_values'
+          AND entity_id = knowledge_field_values.node_id || ':' || knowledge_field_values.field_id
+        ORDER BY created_at LIMIT 1
+      ), dirty = 1
+      WHERE EXISTS (
+        SELECT 1 FROM outbox
+        WHERE table_name = 'knowledge_field_values'
+          AND entity_id = knowledge_field_values.node_id || ':' || knowledge_field_values.field_id
+      );
+    `);
+    // outbox がない既存行だけは、従来の updated_at を最後に観測した
+    // サーバー版として引き継ぐ。既存outboxの行は上の値を保持する。
+    db.execSync("UPDATE knowledge_nodes SET server_updated_at = updated_at WHERE server_updated_at IS NULL AND NOT EXISTS (SELECT 1 FROM outbox WHERE table_name = 'knowledge_nodes' AND entity_id = knowledge_nodes.id);");
+    db.execSync("UPDATE knowledge_supertags SET server_updated_at = updated_at WHERE server_updated_at IS NULL AND NOT EXISTS (SELECT 1 FROM outbox WHERE table_name = 'knowledge_supertags' AND entity_id = knowledge_supertags.id);");
+    db.execSync("UPDATE knowledge_node_supertags SET server_updated_at = updated_at WHERE server_updated_at IS NULL AND NOT EXISTS (SELECT 1 FROM outbox WHERE table_name = 'knowledge_node_supertags' AND entity_id = knowledge_node_supertags.node_id || ':' || knowledge_node_supertags.supertag_id);");
+    db.execSync("UPDATE knowledge_field_values SET server_updated_at = updated_at WHERE server_updated_at IS NULL AND NOT EXISTS (SELECT 1 FROM outbox WHERE table_name = 'knowledge_field_values' AND entity_id = knowledge_field_values.node_id || ':' || knowledge_field_values.field_id);");
     db.execSync("UPDATE tasks SET status = 'closed' WHERE status = 'done';");
     db.execSync(
       "UPDATE task_occurrences SET status = 'closed' WHERE status = 'done';",

@@ -1,75 +1,29 @@
-# Irodori Character Voice integration memo
+# Irodori キャラクター音声設定
 
-Updated: 2026-05-15
+Updated: 2026-07-18
 
-## Conclusion
+AoiTalkのIrodoriエンジンは `Aratako/Irodori-TTS-600M-v3-VoiceDesign` 専用です。画像から別checkpointを選ぶ実験的なCharacter Voice providerや外部サービスは統合していません。
 
-Treat image-to-voice as a separate experimental feature from Irodori v3. The
-current public Character Voice project is based on Irodori-TTS v2 variants, not
-v3, and it conditions speech on character images through image-derived features.
+キャラクターごとの音声は、既存の次の情報を単一モデルへ渡して設定します。
 
-Use a feature flag and local-service-first design. Do not send character images
-to an external API unless the user explicitly configures that endpoint.
+- `voice_name`: `config/irodori_refs/` から同名の参照音声を検索する名前
+- `ref_wav`: 参照音声ファイル
+- `ref_latent`: 事前encode済み参照latent
+- `caption`: 声質、感情、話し方の説明
+- `no_ref`: 参照条件を使用しない明示指定
+- `seconds`: 必要な場合だけ指定する固定出力時間
+- `duration_scale`: Duration Predictorの予測時間に対する倍率
 
-## Source findings
+`ref_wav` / `ref_latent` と `caption` は同時に利用できます。参照音声は話者性、captionは声質や演技の方向づけに使用するため、互いに矛盾しない内容を指定してください。
 
-- `p1atdev/Irodori-Character-Voice` generates speech conditioned on character
-  images, unlike standard Irodori-TTS reference-audio or VoiceDesign caption
-  conditioning.
-- The public variants are `v2-Tagger` and `v2-SigLIP`, both based on
-  `Irodori-TTS-500M-v2`.
-- The project provides a Gradio app and CLI. The Gradio app runs on port `7862`
-  in the documented example, and CLI inference accepts `--character-image`.
-- Generated wav files are saved under `gradio_outputs_character/` in the demo.
+```yaml
+voice:
+  engine: irodori_tts
+  voice_name: narrator
+  parameters:
+    ref_wav: config/irodori_refs/narrator.wav
+    caption: 落ち着いた低めの声で、丁寧に説明する
+    duration_scale: 1.0
+```
 
-References:
-
-- https://character-voice-control.p1atdev.workers.dev/ja/
-- https://github.com/p1atdev/Irodori-Character-Voice
-- https://huggingface.co/p1atdev/Irodori-TTS-500M-v2-Character-Voice-Tagger
-- https://huggingface.co/p1atdev/Irodori-TTS-500M-v2-Character-Voice-SigLIP
-
-## Proposed AoiTalk flow
-
-Feature flag: `experimental_character_voice`.
-
-UI placement:
-
-- Character settings or voice preset settings.
-- Label: `画像から声候補を生成`.
-- Inputs: character image, preview text, model variant (`Tagger` or `SigLIP`).
-- Optional later inputs: seed, steps, guidance settings.
-
-Backend/provider shape:
-
-- provider: `irodori_character_voice`
-- execution mode: local service or CLI wrapper
-- default checkpoint: `p1atdev/Irodori-TTS-500M-v2-Character-Voice-Tagger`
-- optional checkpoint: `p1atdev/Irodori-TTS-500M-v2-Character-Voice-SigLIP`
-
-Persisted result:
-
-- generated wav path
-- source image file id/path
-- model variant
-- checkpoint
-- seed when available
-- preview text
-- created_at
-
-Save the result as a reusable voice preset candidate, not as a task attachment.
-
-## Failure handling
-
-Generation failures should call the automatic failure recorder with:
-
-- source: `backend`
-- operation: `irodori_character_voice_generate`
-- project_id when available
-- input_summary containing model variant, checkpoint, image file name, and
-  preview text length only
-
-## Next execution unit
-
-Add a disabled experimental provider skeleton and settings UI copy, then wire it
-to a local service/CLI only after a reproducible local smoke test exists.
+参照なしのVoice Designでは `no_ref: true` と `caption` を指定します。

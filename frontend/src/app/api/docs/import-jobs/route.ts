@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { and, desc, eq } from "drizzle-orm";
 import { db } from "@/db";
 import { knowledgeImportItems, knowledgeImportJobs } from "@/db/schema";
 import { getSession } from "@/lib/auth";
@@ -12,6 +13,42 @@ import {
   serializeImportItem,
   serializeImportJob,
 } from "@/lib/server/knowledge-docs-utils";
+import { DOCS_NODE_TITLE_MAX } from "@/lib/server/docs-node-writer";
+
+/**
+ * インポートジョブ一覧の取得。
+ * `?source_type=` で取り込み元を絞り込める。
+ */
+export async function GET(request: NextRequest) {
+  const user = await getSession();
+  if (!user) {
+    return NextResponse.json({ detail: "認証が必要です" }, { status: 401 });
+  }
+
+  const workspace = await ensureDocsWorkspace(user);
+  const sourceType = cleanOptionalString(
+    request.nextUrl.searchParams.get("source_type"),
+    40,
+  );
+
+  const jobs = await db
+    .select()
+    .from(knowledgeImportJobs)
+    .where(
+      sourceType
+        ? and(
+            eq(knowledgeImportJobs.workspaceId, workspace.id),
+            eq(knowledgeImportJobs.sourceType, sourceType),
+          )
+        : eq(knowledgeImportJobs.workspaceId, workspace.id),
+    )
+    .orderBy(desc(knowledgeImportJobs.createdAt))
+    .limit(100);
+
+  return NextResponse.json({
+    import_jobs: jobs.map(serializeImportJob),
+  });
+}
 
 export async function POST(request: NextRequest) {
   const user = await getSession();
@@ -60,7 +97,9 @@ export async function POST(request: NextRequest) {
           sourceRef:
             cleanOptionalString(record.source_ref, 2000) ??
             `${sourceType}:${index + 1}`,
-          title: cleanString(record.title, `Import item ${index + 1}`, 500),
+          title: typeof record.title === "string" && record.title.trim()
+            ? record.title.slice(0, DOCS_NODE_TITLE_MAX)
+            : `Import item ${index + 1}`,
           itemType: cleanString(record.item_type, "page", 40),
           status: normalizeImportStatus(record.status),
           previewJson: normalizeJsonObject(record.preview_json),

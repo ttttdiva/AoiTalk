@@ -71,6 +71,8 @@ class ClaudeCLIBackend(CLIBackendBase):
         output = raw_output.strip()
         try:
             data = json.loads(output)
+            if isinstance(data, dict):
+                self.set_last_usage(data.get("usage"))
             if isinstance(data, dict) and "result" in data:
                 return data["result"]
         except (json.JSONDecodeError, TypeError):

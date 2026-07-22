@@ -109,13 +109,13 @@ function LoginForm() {
 
 export default function LoginPage() {
   return (
-    <Card className="w-full border-white/65 bg-white/66 shadow-[inset_0_1px_rgba(255,255,255,0.82),0_26px_70px_-40px_rgba(4,80,106,0.75)] backdrop-blur-2xl dark:border-white/12 dark:bg-card/75 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12),0_26px_70px_-40px_rgba(0,0,0,0.9)]">
+    <Card className="w-full border border-border bg-card shadow-sm">
       <CardHeader className="items-center gap-3">
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
           src="/images/ui/brand-orb.png"
           alt=""
-          className="size-14 rounded-full object-cover shadow-[0_18px_34px_-22px_rgba(4,80,106,0.9)] ring-1 ring-white/75"
+          className="size-14 rounded-full object-cover ring-1 ring-border"
         />
         <CardTitle className="text-center text-2xl tracking-tight">
           AoiTalk

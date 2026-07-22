@@ -1,11 +1,13 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import type React from "react";
+import { toast } from "sonner";
 
 import {
   taskApi,
   type Project,
+  type Space,
   type Tag,
   type Task,
 } from "@/lib/task-api";
@@ -28,6 +30,13 @@ import {
 import type { FetchDataOptions } from "@/components/tasks/hooks/use-tasks-data";
 import type { UndoEntry } from "@/components/tasks/hooks/use-task-undo";
 
+// ダイアログのクローズ（終了アニメーション）が完了するまでの猶予。
+// base-ui のダイアログは終了アニメーション中に一覧（tasks prop）が再レンダリング
+// されるとアニメーションが再起動し、窓がアンマウントされず閉じない不具合が起きる。
+// そのため、楽観的更新・保存・再取得といった一覧を書き換える処理は、この時間だけ
+// 遅らせてクローズを妨げないようにする。dialog.tsx の duration-100 より十分長く取る。
+const TASK_COMMAND_CLOSE_DEFER_MS = 220;
+
 /**
  * フォーカス行に対するタスクコマンドダイアログ（`/` ショートカット）をまとめたフック。
  */
@@ -36,6 +45,7 @@ export function useTaskCommandDialog({
   tags,
   setTags,
   projects,
+  spaces,
   selectedProjectId,
   fetchData,
   focusTaskById,
@@ -48,6 +58,7 @@ export function useTaskCommandDialog({
   tags: Tag[];
   setTags: React.Dispatch<React.SetStateAction<Tag[]>>;
   projects: Project[];
+  spaces: Space[];
   selectedProjectId: string | null;
   fetchData: (options?: FetchDataOptions) => Promise<void>;
   focusTaskById: (taskId: string | null) => void;
@@ -65,6 +76,8 @@ export function useTaskCommandDialog({
   );
   const [taskCommandError, setTaskCommandError] = useState<string | null>(null);
   const [taskCommandLoading, setTaskCommandLoading] = useState(false);
+  // バックグラウンド保存の同時実行数。連発時は最後の1件完了時だけ再取得する。
+  const pendingSavesRef = useRef(0);
   const taskCommandTask = useMemo(
     () => tasks.find((item) => item.id === taskCommandTaskId) ?? null,
     [taskCommandTaskId, tasks],
@@ -75,10 +88,11 @@ export function useTaskCommandDialog({
     for (const tag of taskCommandTask?.tags || []) mergedTags.set(tag.id, tag);
     return buildTaskCommandCandidates({
       projects,
+      projectSpaceNames: new Map(spaces.map((space) => [space.id, space.name])),
       tags: Array.from(mergedTags.values()),
       selectedTagIds: (taskCommandTask?.tags || []).map((tag) => tag.id),
     });
-  }, [projects, tags, taskCommandTask]);
+  }, [projects, spaces, tags, taskCommandTask]);
 
   const closeTaskCommandDialog = useCallback(() => {
     setTaskCommandOpen(false);
@@ -96,7 +110,7 @@ export function useTaskCommandDialog({
   }, []);
 
   const handleTaskCommandSubmit = useCallback(
-    async (raw: string) => {
+    async (raw: string, selectedTargetProjectId?: string) => {
       const task = tasks.find((item) => item.id === taskCommandTaskId);
       if (!task) {
         setTaskCommandError("対象タスクが見つかりません。");
@@ -153,45 +167,18 @@ export function useTaskCommandDialog({
         updates.all_day = patch.allDay;
         previous.all_day = task.all_day;
       }
-      if (patch.targetProjectId) {
-        updates.project_id = patch.targetProjectId;
+      const targetProjectId = selectedTargetProjectId || patch.targetProjectId;
+      if (targetProjectId) {
+        updates.project_id = targetProjectId;
         previous.project_id = task.project_id;
       }
-      if (patch.tagNames && patch.tagNames.length > 0) {
-        const tagProjectId =
-          typeof updates.project_id === "string"
-            ? updates.project_id
-            : task.project_id;
-        let availableTags = [
-          ...tags,
-          ...(task.tags || []).filter(
-            (tag) => !tags.some((current) => current.id === tag.id),
-          ),
-        ];
-        if (tagProjectId !== selectedProjectId) {
-          try {
-            availableTags = await taskApi.listTags(tagProjectId);
-          } catch (err) {
-            console.error("タスクコマンド用タグ取得に失敗しました", err);
-          }
-        }
-        const { tagIds, createdTags } = await resolveTaskTagIds({
-          tagNames: patch.tagNames,
-          currentTagIds:
-            tagProjectId === task.project_id
-              ? (task.tags || []).map((tag) => tag.id)
-              : [],
-          availableTags,
-          createTag: (name) => taskApi.createTag(tagProjectId, { name }),
-        });
-        updates.tag_ids = tagIds;
-        previous.tag_ids = (task.tags || []).map((tag) => tag.id);
-        if (tagProjectId === selectedProjectId && createdTags.length > 0) {
-          setTags((prev) => [...prev, ...createdTags]);
-        }
-      }
 
-      if (Object.keys(updates).length === 0) {
+      const tagNames =
+        patch.tagNames && patch.tagNames.length > 0 ? patch.tagNames : null;
+
+      // タグ以外の更新もタグ変更も無ければ有効なコマンドではない。
+      // ここまでの検証はクライアント側で完結する（サーバー往復なし）。
+      if (Object.keys(updates).length === 0 && !tagNames) {
         setTaskCommandError("有効なスラッシュコマンドを入力してください。");
         return raw;
       }
@@ -200,34 +187,99 @@ export function useTaskCommandDialog({
         typeof updates.status === "string" &&
         isTaskCompletionTransition(task.status, updates.status);
 
-      setTaskCommandLoading(true);
+      // Undo登録・クローズ・フォーカス復帰までを同期的に済ませる。
+      // ここではタスク一覧（tasks）は書き換えない。クローズと同一コミットで
+      // 一覧が変わると base-ui の終了アニメーションが再起動し窓が閉じないため。
       setTaskCommandError(null);
-      try {
-        if (!willComplete) {
-          pushUndo({
-            type: "update",
-            taskId: task.id,
-            previous,
-          });
-        }
-        applyTaskPatchLocally(task.id, updates as Partial<Task>);
-        const updated = await saveTaskUpdate(task.id, updates, task.project_id);
-        upsertTaskLocally(updated);
-        await fetchData();
-        if (willComplete) {
-          queueTaskCompletionUndo([task]);
-        }
-        closeTaskCommandDialog();
-        focusTaskById(task.id);
-        return "";
-      } catch (err) {
-        console.error("タスクコマンド実行失敗:", err);
-        setTaskCommandError("タスクコマンドの実行に失敗しました。");
-        await fetchData();
-        return raw;
-      } finally {
-        setTaskCommandLoading(false);
+      if (tagNames) {
+        previous.tag_ids = (task.tags || []).map((tag) => tag.id);
       }
+      if (!willComplete) {
+        pushUndo({
+          type: "update",
+          taskId: task.id,
+          previous,
+        });
+      }
+
+      const targetTask = task;
+      const targetTaskId = task.id;
+      // サーバー応答を待たずに即座に窓を閉じる（高レイテンシ環境でも連発可能に）。
+      closeTaskCommandDialog();
+      focusTaskById(targetTaskId);
+
+      // 楽観的更新・タグ解決・保存・再取得は、窓のクローズアニメーションが
+      // 終わってから実行する。ユーザー要件どおり処理は後回しにして、
+      // 窓の即時クローズと連続コマンド入力を最優先する。
+      pendingSavesRef.current += 1;
+      window.setTimeout(() => {
+        void (async () => {
+          try {
+            if (Object.keys(updates).length > 0) {
+              applyTaskPatchLocally(targetTaskId, updates as Partial<Task>);
+            }
+            if (tagNames) {
+              const tagProjectId =
+                typeof updates.project_id === "string"
+                  ? updates.project_id
+                  : targetTask.project_id;
+              let availableTags = [
+                ...tags,
+                ...(targetTask.tags || []).filter(
+                  (tag) => !tags.some((current) => current.id === tag.id),
+                ),
+              ];
+              if (tagProjectId !== selectedProjectId) {
+                try {
+                  availableTags = await taskApi.listTags(tagProjectId);
+                } catch (err) {
+                  console.error("タスクコマンド用タグ取得に失敗しました", err);
+                }
+              }
+              const { tagIds, createdTags } = await resolveTaskTagIds({
+                tagNames,
+                currentTagIds:
+                  tagProjectId === targetTask.project_id
+                    ? (targetTask.tags || []).map((tag) => tag.id)
+                    : [],
+                availableTags,
+                createTag: (name) => taskApi.createTag(tagProjectId, { name }),
+              });
+              updates.tag_ids = tagIds;
+              if (tagProjectId === selectedProjectId && createdTags.length > 0) {
+                setTags((prev) => [...prev, ...createdTags]);
+              }
+              applyTaskPatchLocally(targetTaskId, {
+                tag_ids: tagIds,
+              } as Partial<Task>);
+            }
+
+            const updated = await saveTaskUpdate(
+              targetTaskId,
+              updates,
+              targetTask.project_id,
+            );
+            upsertTaskLocally(updated);
+            // 完了遷移の Undo は保存成功後にだけ提示する（従来と同じタイミング）。
+            // 失敗時に「完了しました」トーストを誤表示しないため。
+            if (willComplete) {
+              queueTaskCompletionUndo([targetTask]);
+            }
+          } catch (err) {
+            console.error("タスクコマンド実行失敗:", err);
+            toast.error("タスクコマンドの実行に失敗しました。");
+          } finally {
+            pendingSavesRef.current -= 1;
+            // 連発時は最後の保存完了時だけ全件再取得し、サーバー状態と整合させる。
+            // 失敗時はこの再取得が楽観的更新のロールバックを兼ねる。
+            if (pendingSavesRef.current === 0) {
+              await fetchData();
+            }
+          }
+        })();
+      }, TASK_COMMAND_CLOSE_DEFER_MS);
+
+      return "";
     },
     [
       applyTaskPatchLocally,

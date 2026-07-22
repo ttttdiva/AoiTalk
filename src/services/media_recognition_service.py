@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 import tempfile
 import time
@@ -47,6 +48,26 @@ class MediaRecognitionService:
     def __init__(self, config: Any):
         self.config = config
 
+    def _main_route(self) -> dict[str, Any]:
+        provider = str(config_get(self.config, "llm_provider", "") or "").strip().lower()
+        model = str(config_get(self.config, "llm_model", "") or "").strip()
+        return {"provider": provider, "model": model}
+
+    def _class_route(self, route_class: str) -> dict[str, Any]:
+        route = dict(config_get(self.config, f"model_routing.classes.{route_class}", {}) or {})
+        # Older configurations represented image inheritance as empty provider/model.
+        if route.get("inherit") or (
+            route_class == "vision"
+            and not str(route.get("provider") or "").strip()
+            and not str(route.get("model") or "").strip()
+        ):
+            return {**route, **self._main_route()}
+        return route
+
+    def _speech_model(self) -> str:
+        engine = str(config_get(self.config, "speech_recognition.current_engine", "whisper") or "whisper")
+        return str(config_get(self.config, f"speech_recognition.engines.{engine}.model", engine) or engine)
+
     async def recognize_images(
         self,
         user_text: str,
@@ -70,7 +91,7 @@ class MediaRecognitionService:
         if cached:
             return cached
 
-        audio_class = config_get(self.config, "model_routing.classes.audio", {}) or {}
+        audio_class = self._class_route("audio")
         engine = str(audio_class.get("engine") or "speech_recognition").strip()
         provider = str(audio_class.get("provider") or "").strip().lower()
         model = str(audio_class.get("model") or "").strip()
@@ -86,16 +107,18 @@ class MediaRecognitionService:
                     name=name,
                     sha256=sha,
                     provider="speech_recognition",
-                    model=str(config_get(self.config, "speech_recognition.current_engine", "whisper")),
+                    model=self._speech_model(),
                     engine=engine,
                     result=text or "",
                     duration_ms=self._elapsed_ms(started),
                 )
             else:
-                if provider in {"claude", "grok", "codex-cli", "claude-cli", "antigravity-cli"}:
+                if provider in {"claude", "grok", "kimi", "codex-cli", "claude-cli", "grok-cli"}:
                     raise RuntimeError(f"音声入力に非対応のプロバイダです: {provider}")
                 text = await asyncio.wait_for(
-                    self._recognize_audio_with_llm(user_text, audio, audio_class),
+                    self._recognize_cli_media("audio", user_text, audio, audio_class)
+                    if provider == "antigravity-cli"
+                    else self._recognize_audio_with_llm(user_text, audio, audio_class),
                     timeout=180,
                 )
                 result = RecognitionResult(
@@ -133,13 +156,18 @@ class MediaRecognitionService:
         if cached:
             return cached
 
-        vision = config_get(self.config, "model_routing.classes.vision", {}) or {}
+        vision = self._class_route("vision")
         provider = str(vision.get("provider") or "").strip().lower()
         model = str(vision.get("model") or "").strip()
         try:
             if not provider or not model:
                 raise RuntimeError("画像認識モデルが未設定です")
-            if provider in {"openai", "openrouter", "grok", "sglang", "openai_compatible_local", "ollama"}:
+            if provider in {"codex-cli", "antigravity-cli"}:
+                text = await asyncio.wait_for(
+                    self._recognize_cli_media("image", user_text, image, vision),
+                    timeout=60,
+                )
+            elif provider in {"openai", "openrouter", "kimi", "grok", "sglang", "openai_compatible_local", "ollama"}:
                 text = await asyncio.wait_for(
                     self._recognize_openai_compatible_image(user_text, image, vision),
                     timeout=60,
@@ -179,6 +207,44 @@ class MediaRecognitionService:
             self._cache_put(sha, result)
         return result
 
+    async def _recognize_cli_media(
+        self,
+        kind: str,
+        user_text: str,
+        media: dict[str, Any],
+        route: dict[str, Any],
+    ) -> str:
+        provider = str(route.get("provider") or "").strip().lower()
+        model = str(route.get("model") or "").strip()
+        if provider == "codex-cli":
+            from src.llm.cli_backends.codex import CodexCLIBackend
+            backend = CodexCLIBackend(model=model)
+        elif provider == "antigravity-cli":
+            from src.llm.cli_backends.antigravity import AntigravityCLIBackend
+            backend = AntigravityCLIBackend(model=model)
+        else:
+            raise RuntimeError(f"{kind}入力に非対応のCLIプロバイダです: {provider}")
+        attachment = (
+            backend.prepare_image_attachment(media)
+            if kind == "image"
+            else getattr(backend, "prepare_audio_attachment", lambda _media: None)(media)
+        )
+        if not attachment:
+            raise RuntimeError(f"{backend.get_provider_name()} は{kind}入力に対応していません")
+        suffix, cleanup = attachment
+        prompt = (
+            f"{MEDIA_RECOGNITION_SYSTEM_PROMPT}\n\n"
+            f"{user_text or ('添付画像を解析してください。' if kind == 'image' else '添付音声を文字起こししてください。')}"
+            f"{suffix}"
+        )
+        try:
+            success, output = await asyncio.to_thread(backend.execute_prompt, prompt)
+        finally:
+            cleanup()
+        if not success or not str(output or "").strip():
+            raise RuntimeError(str(output or f"{backend.get_provider_name()} returned no output"))
+        return str(output).strip()
+
     def _build_openai_image_messages(self, user_text: str, image: dict[str, Any]) -> list[dict[str, Any]]:
         return [
             {"role": "system", "content": MEDIA_RECOGNITION_SYSTEM_PROMPT},
@@ -213,12 +279,17 @@ class MediaRecognitionService:
         route: dict[str, Any],
     ) -> str:
         client = self._openai_client_for_route(route)
-        response = await client.chat.completions.create(
+        kwargs: dict[str, Any] = dict(
             model=str(route.get("model")),
             messages=self._build_openai_image_messages(user_text, image),
-            temperature=0,
-            max_tokens=1600,
         )
+        if str(route.get("provider") or "").lower() == "kimi" and str(route.get("model")) == "kimi-k3":
+            kwargs["reasoning_effort"] = "max"
+            kwargs["max_completion_tokens"] = 1600
+        else:
+            kwargs["temperature"] = 0
+            kwargs["max_tokens"] = 1600
+        response = await client.chat.completions.create(**kwargs)
         return str(response.choices[0].message.content or "")
 
     async def _recognize_audio_with_llm(
@@ -398,6 +469,13 @@ class MediaRecognitionService:
         if provider == "openrouter":
             base_url = base_url or str(config_get(self.config, "openrouter.base_url", "https://openrouter.ai/api/v1"))
             api_key = api_key or str(config_get(self.config, "openrouter_api_key", "") or "")
+        elif provider == "kimi":
+            base_url = base_url or str(
+                config_get(self.config, "kimi_base_url", "")
+                or os.getenv("MOONSHOT_BASE_URL")
+                or config_get(self.config, "kimi.base_url", "https://api.moonshot.ai/v1")
+            )
+            api_key = api_key or str(config_get(self.config, "kimi_api_key", "") or os.getenv("MOONSHOT_API_KEY", ""))
         elif provider == "grok":
             base_url = base_url or "https://api.x.ai/v1"
             api_key = api_key or str(config_get(self.config, "xai_api_key", "") or "")

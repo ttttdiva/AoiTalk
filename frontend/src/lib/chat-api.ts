@@ -5,6 +5,19 @@
 
 import type { ChatCommandCapability } from "@/lib/chat-commands";
 export type { ChatCommandCapability } from "@/lib/chat-commands";
+import type { components } from "@/lib/api-types.gen";
+
+// ─── OpenAPI 生成型ユーティリティ ───
+// FastAPI の OpenAPI スキーマから openapi-typescript が生成した型。
+// backend の Pydantic モデルを唯一の正とするため、`/api/python-proxy/...`
+// 経由（= FastAPI 直）のリクエストボディはここから型を引く。
+// （`/api/conversations/...` 等の Next.js BFF 経由は OpenAPI 対象外なので触らない）
+type Schemas = components["schemas"];
+
+// openapi-typescript は Pydantic のサーバー側デフォルト値を持つフィールドを
+// required として出力する。クライアント送信では省略可能なため、指定キーを任意化する。
+type OptionalizeDefaults<T, K extends keyof T> = Omit<T, K> &
+  Partial<Pick<T, K>>;
 
 // ─── 型定義 ───
 
@@ -53,6 +66,7 @@ export type ChatAttachmentMetadata = {
   mime_type?: string;
   upload_failed?: boolean;
   error?: string;
+  data_url?: string;
 };
 
 export type ConversationMessageMetadata = Record<string, unknown> & {
@@ -79,6 +93,57 @@ export type ChatGenerationMetrics = {
   prompt_ms?: number;
 };
 
+export type ContextMeasurement =
+  | "measured"
+  | "tokenizer_estimate"
+  | "character_estimate"
+  | "estimated"
+  | "approximate"
+  | "unavailable"
+  | "unknown";
+
+export type ContextSnapshotCategory = {
+  id?: string;
+  category?: string;
+  label: string;
+  tokens?: number | null;
+  percentage?: number | null;
+  status?: "active" | "deferred";
+  measurement?: ContextMeasurement;
+  source?: string | null;
+  preview?: string | null;
+};
+
+export type ContextRequestSnapshot = {
+  id?: string;
+  request_index?: number;
+  request_kind?: string;
+  captured_at?: string | null;
+  created_at?: string | null;
+  input_tokens?: number | null;
+  context_window_tokens?: number | null;
+  remaining_tokens?: number | null;
+  percentage?: number | null;
+  usage_percent?: number | null;
+  provider?: string | null;
+  model?: string | null;
+  measurement?: ContextMeasurement;
+  categories?: ContextSnapshotCategory[];
+  components?: ContextSnapshotCategory[];
+};
+
+export type ContextSnapshot = ContextRequestSnapshot & {
+  message_id?: string;
+  session_id?: string;
+  requests?: ContextRequestSnapshot[];
+};
+
+export type ContextSnapshotResponse = {
+  success: boolean;
+  status: "available" | "unavailable" | "missing" | string;
+  snapshot?: ContextSnapshot | null;
+};
+
 export type ChatToolResultMetadata = {
   tool?: string;
   query?: string | null;
@@ -102,10 +167,9 @@ export type ConversationMessage = {
   is_active_branch: boolean;
 };
 
-export type ChatResponseModelSelection = {
-  provider: string;
-  model: string;
-};
+// FastAPI の ResponseModelSelection（{provider, model}）と構造一致するため
+// 生成型へ委譲する。
+export type ChatResponseModelSelection = Schemas["ResponseModelSelection"];
 
 export type ChatResponseModelOption = ChatResponseModelSelection & {
   label: string;
@@ -123,6 +187,8 @@ export type LlmCatalogModelOption = {
   source_label?: string;
   provider_configured?: boolean;
   custom_current?: boolean;
+  selection_kind?: "static" | "routing_profile";
+  routing_profile_id?: string;
 };
 
 export type LlmCatalogProvider = {
@@ -133,6 +199,7 @@ export type LlmCatalogProvider = {
   settings?: {
     api_key_configured?: boolean;
   };
+  selection_kind?: "static" | "routing_profile";
 };
 
 export type LlmModelCatalogResponse = {
@@ -181,13 +248,22 @@ export type AgentRunTimelineItem = {
   provider?: string | null;
   model?: string | null;
   mode?: string | null;
+  group_id?: string | null;
+  routing_profile?: string | null;
+  pool?: string | null;
+  credential_profile?: string | null;
+  candidate?: string | null;
+  quota_pool_ids?: string[];
+  fallback_count?: number;
   action: string;
   message?: string | null;
   tool_name?: string | null;
   raw_tool_name?: string | null;
   tool_call_id?: string | null;
   arguments?: Record<string, unknown>;
+  result?: string | null;
   result_preview?: string | null;
+  error?: string | null;
   success?: boolean;
   mutation_confirmed?: boolean;
   duration_ms?: number | null;
@@ -195,15 +271,6 @@ export type AgentRunTimelineItem = {
   created_at?: string | null;
   started_at?: string | null;
   ended_at?: string | null;
-};
-
-export type AgentRunTimelineColumn = {
-  key: string;
-  label: string;
-  actor_type?: string | null;
-  provider?: string | null;
-  model?: string | null;
-  items: AgentRunTimelineItem[];
 };
 
 export type AgentRun = {
@@ -228,7 +295,6 @@ export type AgentRun = {
   ended_at?: string | null;
   last_event_at?: string | null;
   timeline?: AgentRunTimelineItem[];
-  timeline_columns?: AgentRunTimelineColumn[];
 };
 
 export type ScenarioLogType = "writing" | "roleplay" | "trpg";
@@ -394,6 +460,99 @@ export function getLlmModelCatalog() {
 // ─── API関数 ───
 
 export const chatApi = {
+  /** ヘッダーで現在選択されているキャラクターを取得 */
+  getCurrentCharacterName: async () => {
+    const data = await request<{
+      current?: unknown;
+      characters?: unknown;
+    }>("/api/python-proxy/characters", {
+      cache: "no-store",
+      timeoutMs: 5000,
+    });
+    const current = typeof data.current === "string" ? data.current.trim() : "";
+    const characters = Array.isArray(data.characters)
+      ? data.characters.filter(
+          (value): value is string =>
+            typeof value === "string" && value.trim().length > 0,
+        )
+      : [];
+    if (!current) {
+      throw new Error("現在のキャラクターを取得できませんでした");
+    }
+    if (characters.length === 0 || characters.includes(current)) return current;
+
+    // /api/characters は表示名だけを返す旧互換APIのため、current が
+    // canonical slug（例: kotonoha_aoi）になっている場合は詳細一覧で
+    // 解決してからセッション作成へ渡す。
+    const catalog = await request<{
+      characters?: Array<{
+        slug?: unknown;
+        name?: unknown;
+        recognition_aliases?: unknown;
+      }>;
+    }>("/api/python-proxy/characters/manage?enabled_only=true", {
+      cache: "no-store",
+      timeoutMs: 5000,
+    });
+    const key = current.toLocaleLowerCase();
+    const match = (Array.isArray(catalog.characters)
+      ? catalog.characters
+      : []
+    ).find((character) => {
+      const candidates = [
+        character.slug,
+        character.name,
+        ...(Array.isArray(character.recognition_aliases)
+          ? character.recognition_aliases
+          : []),
+      ];
+      return candidates.some(
+        (candidate) =>
+          typeof candidate === "string" &&
+          candidate.trim().toLocaleLowerCase() === key,
+      );
+    });
+    const slug = typeof match?.slug === "string" ? match.slug.trim() : "";
+    if (slug) return slug;
+    throw new Error("現在のキャラクターを解決できませんでした");
+  },
+
+  /** セッションのキャラクター種別（assistant / roleplay 等）を取得 */
+  getCharacterType: async (characterName: string) => {
+    const catalog = await request<{
+      characters?: Array<{
+        slug?: unknown;
+        name?: unknown;
+        character_type?: unknown;
+        recognition_aliases?: unknown;
+      }>;
+    }>("/api/python-proxy/characters/manage?enabled_only=true", {
+      cache: "no-store",
+      timeoutMs: 5000,
+    });
+    const key = characterName.trim().toLocaleLowerCase();
+    const match = (Array.isArray(catalog.characters)
+      ? catalog.characters
+      : []
+    ).find((character) => {
+      const candidates = [
+        character.slug,
+        character.name,
+        ...(Array.isArray(character.recognition_aliases)
+          ? character.recognition_aliases
+          : []),
+      ];
+      return candidates.some(
+        (candidate) =>
+          typeof candidate === "string" &&
+          candidate.trim().toLocaleLowerCase() === key,
+      );
+    });
+    return typeof match?.character_type === "string"
+      ? match.character_type
+      : null;
+  },
+
   /** セッション一覧取得 */
   listSessions: (projectId?: string) =>
     request<{ conversations: ConversationSession[] }>(
@@ -447,6 +606,17 @@ export const chatApi = {
       },
     ),
 
+  getContextSnapshot: (sessionId: string) =>
+    request<ContextSnapshotResponse>(
+      `/api/python-proxy/conversations/${sessionId}/context-snapshot`,
+      {
+        cache: "no-store",
+        headers: { "Cache-Control": "no-cache" },
+        retries: 1,
+        retryDelayMs: 300,
+      },
+    ),
+
   /** セッションにメッセージを追加 */
   addMessage: (
     sessionId: string,
@@ -476,21 +646,15 @@ export const chatApi = {
       },
     ),
 
-  /** セッション削除 */
+  /** メッセージをディスパッチ（FastAPI: POST /api/conversations/{id}/dispatch） */
   dispatchMessage: (
     sessionId: string,
-    data: {
-      message: string;
-      project_id?: string;
-      generation_profile?: string;
-      include_project_context?: boolean;
-      edit_message_id?: string;
-      response_model?: ChatResponseModelSelection;
-      client_message_id?: string;
-      command_capabilities?: ChatCommandCapability[];
-      skip_user_persistence?: boolean;
-      persisted_user_message_id?: string;
-    },
+    // 生成型 ConversationDispatchRequest を正とする。default 値を持つ
+    // include_project_context / skip_user_persistence はクライアントでは任意化。
+    data: OptionalizeDefaults<
+      Schemas["ConversationDispatchRequest"],
+      "include_project_context" | "skip_user_persistence"
+    >,
   ) =>
     request<{
       success: boolean;
@@ -535,14 +699,16 @@ export const chatApi = {
       },
     ),
 
-  steerGeneration: (sessionId: string, message: string) =>
-    request<{ success: boolean; queued: boolean; session_id: string }>(
+  steerGeneration: (sessionId: string, message: string) => {
+    const body: Schemas["UserMessage"] = { message };
+    return request<{ success: boolean; queued: boolean; session_id: string }>(
       `/api/python-proxy/conversations/${sessionId}/generation/steer`,
       {
         method: "POST",
-        body: JSON.stringify({ message }),
+        body: JSON.stringify(body),
       },
-    ),
+    );
+  },
 
   deleteSession: (sessionId: string) =>
     request<void>(`/api/conversations/${sessionId}`, {
@@ -571,15 +737,17 @@ export const chatApi = {
   // ─── ブランチング関連API ───
 
   /** メッセージ編集（新ブランチ作成） */
-  editMessage: (sessionId: string, messageId: string, content: string) =>
-    request<{ message: ConversationMessage }>(
+  editMessage: (sessionId: string, messageId: string, content: string) => {
+    const body: Schemas["EditMessageRequest"] = { content };
+    return request<{ message: ConversationMessage }>(
       `/api/python-proxy/conversations/${sessionId}/messages/${messageId}`,
       {
         method: "PUT",
-        body: JSON.stringify({ content }),
+        body: JSON.stringify(body),
         signal: AbortSignal.timeout(15000),
       },
-    ),
+    );
+  },
 
   /** メッセージのブランチ一覧取得（兄弟ブランチ） */
   getMessageBranches: (sessionId: string, messageId: string) =>
@@ -588,14 +756,16 @@ export const chatApi = {
     ),
 
   /** ブランチ切替 */
-  switchBranch: (sessionId: string, messageId: string, branchIndex: number) =>
-    request<{ success: boolean }>(
+  switchBranch: (sessionId: string, messageId: string, branchIndex: number) => {
+    const body: Schemas["SwitchBranchRequest"] = { branch_index: branchIndex };
+    return request<{ success: boolean }>(
       `/api/python-proxy/conversations/${sessionId}/messages/${messageId}/switch-branch`,
       {
         method: "POST",
-        body: JSON.stringify({ branch_index: branchIndex }),
+        body: JSON.stringify(body),
       },
-    ),
+    );
+  },
 
   /** アクティブメッセージパス取得 */
   getActiveMessages: (sessionId: string) =>
@@ -611,8 +781,14 @@ export const chatApi = {
     projectId?: string,
     userIds?: string[],
     agentIds?: string[],
-  ) =>
-    request<{
+  ) => {
+    const body: Schemas["CreateGroupSessionRequest"] = {
+      character_names: characterNames,
+      user_ids: userIds ?? [],
+      agent_ids: agentIds ?? [],
+      project_id: projectId,
+    };
+    return request<{
       session: ConversationSession;
       first_messages?: Array<{
         character_slug: string;
@@ -621,17 +797,17 @@ export const chatApi = {
       }>;
     }>("/api/python-proxy/conversations/group", {
       method: "POST",
-      body: JSON.stringify({
-        character_names: characterNames,
-        user_ids: userIds ?? [],
-        agent_ids: agentIds ?? [],
-        project_id: projectId,
-      }),
-    }),
+      body: JSON.stringify(body),
+    });
+  },
 
   /** グループ応答 */
-  groupRespond: (sessionId: string, message: string, strategy?: string) =>
-    request<{
+  groupRespond: (sessionId: string, message: string, strategy?: string) => {
+    const body: OptionalizeDefaults<
+      Schemas["GroupRespondRequest"],
+      "strategy"
+    > = { message, strategy };
+    return request<{
       responses: Array<{
         character_slug: string;
         character_name: string;
@@ -639,9 +815,10 @@ export const chatApi = {
       }>;
     }>(`/api/python-proxy/conversations/${sessionId}/group-respond`, {
       method: "POST",
-      body: JSON.stringify({ message, strategy }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(30000),
-    }),
+    });
+  },
 
   // ─── RPスライダー関連API ───
 

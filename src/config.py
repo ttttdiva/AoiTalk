@@ -15,6 +15,7 @@ from .app_config_store import (
     update_app_config_key_sync,
 )
 from .security.field_crypto import redact_secret_value
+from .tts.irodori_config import normalize_irodori_settings
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,8 @@ class Config:
         'openrouter_base_url': 'OPENROUTER_BASE_URL',
         'openrouter_site_url': 'OPENROUTER_SITE_URL',
         'openrouter_app_name': 'OPENROUTER_APP_NAME',
+        'kimi_api_key': 'MOONSHOT_API_KEY',
+        'kimi_base_url': 'MOONSHOT_BASE_URL',
         'discord_bot_token': 'DISCORD_BOT_TOKEN',
         'gemini_api_key': 'GEMINI_API_KEY',
         'ollama_api_key': 'OLLAMA_API_KEY',
@@ -189,6 +192,9 @@ class Config:
         """環境変数をconfig辞書にマージ"""
         for config_key, env_var in self.ENV_MAPPINGS.items():
             value = os.getenv(env_var, '')
+            # Web設定へ保存したKimi接続情報は、空の.env項目で消さない。
+            if config_key.startswith('kimi_') and not value:
+                continue
             if value and config_key.endswith('_path'):
                 value = self._expand_path_vars(value)
             config[config_key] = value
@@ -205,6 +211,8 @@ class Config:
             
             # フォールバックパスの設定
             self._set_fallback_paths(config, engine)
+
+        normalize_irodori_settings(config['tts_settings']['irodori_tts'])
     
     def _set_fallback_paths(self, config: Dict[str, Any], engine: str) -> None:
         """TTSエンジンのフォールバックパスを設定"""
@@ -327,6 +335,8 @@ class Config:
             issues['warnings'].append('OpenAI APIキーが設定されていません')
         if provider == 'openrouter' and not self.config.get('openrouter_api_key'):
             issues['warnings'].append('OpenRouter APIキーが設定されていません')
+        if provider == 'kimi' and not self.config.get('kimi_api_key'):
+            issues['warnings'].append('Kimi APIキーが設定されていません')
 
         return issues
         

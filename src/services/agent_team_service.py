@@ -9,6 +9,7 @@ from typing import Any
 AGENT_TEAM_PROVIDERS = {
     "openai",
     "openrouter",
+    "kimi",
     "gemini",
     "ollama",
     "openai_compatible_local",
@@ -16,6 +17,7 @@ AGENT_TEAM_PROVIDERS = {
     "antigravity-cli",
     "claude-cli",
     "codex-cli",
+    "grok-cli",
 }
 
 MODEL_ROUTE_CLASS_BY_ROUTE = {
@@ -29,6 +31,13 @@ MODEL_ROUTE_CLASS_BY_ROUTE = {
     "spotify": "light",
     "import": "light",
 }
+
+BUILTIN_AGENT_TEAM_MODEL_GROUPS = {
+    "heavy": {"name": "高負荷", "effort_policy": "same"},
+    "light": {"name": "軽量", "effort_policy": "lower"},
+}
+RESERVED_AGENT_TEAM_MODEL_GROUP_IDS = {"heavy", "light", "auto"}
+AUTO_AGENT_TEAM_GROUP_ID = "auto"
 
 MODEL_ROUTING_PROVIDERS = AGENT_TEAM_PROVIDERS | {
     "claude",
@@ -63,10 +72,12 @@ AGENT_TEAM_MEMBER_KEYS = SCALABLE_MEMBER_KEYS | SINGLETON_MEMBER_KEYS
 AGENT_TEAM_EXTERNAL_APPROVAL_PROVIDERS = {
     "openai",
     "openrouter",
+    "kimi",
     "gemini",
     "antigravity-cli",
     "claude-cli",
     "codex-cli",
+    "grok-cli",
 }
 
 AGENT_TEAM_MEMBER_LABELS = {
@@ -222,7 +233,7 @@ AGENT_TEAM_DEFAULT_ROLES: dict[str, dict[str, Any]] = {
 }
 
 
-def config_get(config: Any, key: str, default: Any = None) -> Any:
+def _raw_config_get(config: Any, key: str, default: Any = None) -> Any:
     if isinstance(config, dict):
         value: Any = config
         for part in key.split("."):
@@ -233,6 +244,53 @@ def config_get(config: Any, key: str, default: Any = None) -> Any:
     if hasattr(config, "get"):
         return config.get(key, default)
     return default
+
+
+def config_get(config: Any, key: str, default: Any = None) -> Any:
+    """無料Team選択中だけ専用Agent Team overlayを合成して読む。"""
+
+    if key.startswith("agent_team."):
+        provider = str(_raw_config_get(config, "llm_provider", "") or "").lower()
+        model = str(_raw_config_get(config, "llm_model", "") or "").lower()
+        if provider == "routing-profile" and model == "free-team":
+            from .free_team_defaults import free_team_profile_template
+
+            profile = free_team_profile_template()
+            stored = _raw_config_get(config, "routing_profiles.free-team", {}) or {}
+            if isinstance(stored, dict):
+                stored_team = stored.get("agent_team")
+                profile.update(
+                    {key: value for key, value in stored.items() if key != "agent_team"}
+                )
+                if isinstance(stored_team, dict):
+                    merged_team = dict(profile.get("agent_team") or {})
+                    for section in ("model_groups", "members"):
+                        stored_section = stored_team.get(section)
+                        if isinstance(stored_section, dict):
+                            merged_team[section] = {
+                                **dict(merged_team.get(section) or {}),
+                                **stored_section,
+                            }
+                    merged_team.update(
+                        {
+                            key: value
+                            for key, value in stored_team.items()
+                            if key not in {"model_groups", "members"}
+                        }
+                    )
+                    profile["agent_team"] = merged_team
+            if not bool(profile.get("enabled", True)):
+                return _raw_config_get(config, key, default)
+            if key == "agent_team.delegation_enabled":
+                return bool(profile.get("agent_team_enabled", True))
+            overlay = profile.get("agent_team") or {}
+            value: Any = overlay
+            for part in key.removeprefix("agent_team.").split("."):
+                if not isinstance(value, dict) or part not in value:
+                    return _raw_config_get(config, key, default)
+                value = value[part]
+            return value
+    return _raw_config_get(config, key, default)
 
 
 def config_set(config: Any, key: str, value: Any) -> None:
@@ -261,12 +319,52 @@ def _route_from_model_routing(config: Any, route: str) -> dict[str, Any] | None:
     return raw if isinstance(raw, dict) else None
 
 
-def _class_route_from_model_routing(config: Any, route: str) -> dict[str, Any] | None:
-    route_class = MODEL_ROUTE_CLASS_BY_ROUTE.get(_clean_member_key(route))
-    if not route_class:
+def _group_route_by_id(config: Any, group_id: str) -> dict[str, Any] | None:
+    """Resolve a group_id from the single Agent Team model-group store."""
+    group_id = str(group_id or "").strip()
+    if not group_id:
         return None
-    raw = config_get(config, f"model_routing.classes.{route_class}", None)
-    return raw if isinstance(raw, dict) else None
+    raw = config_get(config, f"agent_team.model_groups.{group_id}", None)
+    if isinstance(raw, dict):
+        return raw
+    return None
+
+
+def agent_team_member_configured_group_id(config: Any, member_key: str) -> str:
+    """Return the persisted group ID, preserving explicit main inheritance."""
+    key = _clean_member_key(member_key)
+    member = config_get(config, f"agent_team.members.{key}", {}) or {}
+    if isinstance(member, dict) and "group_id" in member:
+        return str(member.get("group_id") or "").strip()
+    return MODEL_ROUTE_CLASS_BY_ROUTE.get(key, "")
+
+
+def agent_team_member_group_id(
+    config: Any,
+    member_key: str,
+    *,
+    delegation_group_id: str | None = None,
+) -> str:
+    """Return the effective group ID for a concrete execution."""
+    configured = agent_team_member_configured_group_id(config, member_key)
+    if configured != AUTO_AGENT_TEAM_GROUP_ID:
+        return configured
+    selected = str(delegation_group_id or "").strip()
+    return selected if selected in BUILTIN_AGENT_TEAM_MODEL_GROUPS else ""
+
+
+def _model_group_route(
+    config: Any,
+    route: str,
+    *,
+    delegation_group_id: str | None = None,
+) -> dict[str, Any] | None:
+    group_id = agent_team_member_group_id(
+        config,
+        route,
+        delegation_group_id=delegation_group_id,
+    )
+    return _group_route_by_id(config, group_id) if group_id else None
 
 
 def _main_route(config: Any) -> dict[str, Any]:
@@ -277,12 +375,14 @@ def _main_route(config: Any) -> dict[str, Any]:
             "openai": ("openai.model",),
             "gemini": ("gemini.model",),
             "openrouter": ("openrouter.model",),
+            "kimi": ("kimi.model",),
             "ollama": ("ollama.model",),
             "sglang": ("sglang.model",),
             "openai_compatible_local": ("openai_compatible_local.model",),
             "codex-cli": ("codex_cli.model",),
             "claude-cli": ("claude_cli.model",),
             "antigravity-cli": ("antigravity_cli.model",),
+            "grok-cli": ("grok_cli.model",),
         }
         for key in provider_model_keys.get(provider, ()):
             model = str(config_get(config, key, "") or "").strip()
@@ -297,15 +397,16 @@ def _provider_configured(config: Any, provider: str, route: dict[str, Any], *, m
         return False
     if main:
         return True
-    if provider in {"codex-cli", "claude-cli", "antigravity-cli"}:
+    if provider in {"codex-cli", "claude-cli", "antigravity-cli", "grok-cli"}:
         return True
     if str(route.get("api_key") or "").strip() or str(route.get("base_url") or "").strip():
         return True
-    if provider in {"openai", "gemini", "openrouter", "grok", "claude"}:
+    if provider in {"openai", "gemini", "openrouter", "kimi", "grok", "claude"}:
         env_names = {
             "openai": ("OPENAI_API_KEY", "openai_api_key"),
             "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY", "gemini_api_key"),
             "openrouter": ("OPENROUTER_API_KEY", "openrouter_api_key"),
+            "kimi": ("MOONSHOT_API_KEY", "kimi_api_key"),
             "grok": ("XAI_API_KEY", "xai_api_key", "grok_api_key"),
             "claude": ("ANTHROPIC_API_KEY", "anthropic_api_key"),
         }.get(provider, ())
@@ -324,7 +425,7 @@ def _provider_configured(config: Any, provider: str, route: dict[str, Any], *, m
     return False
 
 
-def _normalize_route_target(config: Any, raw: dict[str, Any] | None, *, route: str, main: bool = False) -> dict[str, str] | None:
+def _normalize_route_target(config: Any, raw: dict[str, Any] | None, *, route: str, main: bool = False) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
     provider = str(raw.get("provider") or "").strip().lower()
@@ -332,7 +433,41 @@ def _normalize_route_target(config: Any, raw: dict[str, Any] | None, *, route: s
     if route == "agent_harness":
         provider = provider or "codex-cli"
         model = model or "gpt-5-codex"
-    if provider not in MODEL_ROUTING_PROVIDERS or not model:
+    static_target = provider in MODEL_ROUTING_PROVIDERS and bool(model)
+    if not static_target:
+        target_type = str(raw.get("target_type") or "").strip().lower()
+        if target_type == "pool" or (
+            provider == "routing-profile" and model == "free-team"
+        ):
+            pool_id = str(raw.get("pool_id") or "").strip()
+            if not pool_id:
+                pool_id = str(
+                    config_get(
+                        config,
+                        "routing_profiles.free-team.main_pool_id",
+                        "coordinator",
+                    )
+                    or "coordinator"
+                )
+            result = {
+                "kind": "pool",
+                "provider": "routing-profile",
+                "model": "free-team",
+                "routing_profile_id": str(
+                    raw.get("routing_profile_id") or "free-team"
+                ),
+                "pool_id": pool_id,
+            }
+            effort_policy = str(raw.get("effort_policy") or "").strip()
+            effort = str(
+                raw.get("effort") or raw.get("reasoning_effort") or ""
+            ).strip()
+            if effort_policy:
+                result["effort_policy"] = effort_policy
+            if effort:
+                result["effort"] = effort
+                result["reasoning_effort"] = effort
+            return result
         return None
     if route == "agent_harness" and provider not in AGENT_HARNESS_PROVIDERS:
         return None
@@ -353,33 +488,73 @@ def _normalize_route_target(config: Any, raw: dict[str, Any] | None, *, route: s
     return result
 
 
-def resolve_model_route(config: Any, route: str) -> dict[str, str] | None:
-    """Resolve one model route by override, class target, then main model."""
+def _merge_route_layer(
+    base: dict[str, Any],
+    layer: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Overlay one route while treating blank target fields as inheritance."""
+    merged = dict(base)
+    for field, value in (layer or {}).items():
+        if field in {"provider", "model", "runner"} and not str(value or "").strip():
+            continue
+        merged[field] = value
+    return merged
+
+
+def resolve_model_route(
+    config: Any,
+    route: str,
+    *,
+    delegation_group_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Resolve one route by member override, selected/fixed group, then main."""
     key = _clean_member_key(route)
     if key not in AGENT_TEAM_MEMBER_KEYS:
         return None
+    member = config_get(config, f"agent_team.members.{key}", {}) or {}
+    member_override = member.get("override") if isinstance(member, dict) else None
     if key == "agent_harness":
         return _normalize_route_target(
             config,
-            _route_from_model_routing(config, key) or {"provider": "codex-cli", "model": "gpt-5-codex", "runner": "codex_exec"},
+            member_override or _route_from_model_routing(config, key) or {"provider": "codex-cli", "model": "gpt-5-codex", "runner": "codex_exec"},
             route=key,
         )
-    for raw, is_main in (
-        (_route_from_model_routing(config, key), False),
-        (_class_route_from_model_routing(config, key), False),
-        (_main_route(config), True),
-    ):
+    main_route = _main_route(config)
+    group_route = _model_group_route(
+        config,
+        key,
+        delegation_group_id=delegation_group_id,
+    ) or {}
+    legacy_or_override = member_override if isinstance(member_override, dict) else (_route_from_model_routing(config, key) or {})
+    merged_group = _merge_route_layer(main_route, group_route)
+    merged_override = _merge_route_layer(merged_group, legacy_or_override)
+    for raw, is_main in ((merged_override, not bool(group_route or legacy_or_override)), (merged_group, not bool(group_route)), (main_route, True)):
         target = _normalize_route_target(config, raw, route=key, main=is_main)
         if target is not None:
             return target
     return None
 
 
-def model_route_is_explicit(config: Any, route: str) -> bool:
+def model_route_is_explicit(
+    config: Any,
+    route: str,
+    *,
+    delegation_group_id: str | None = None,
+) -> bool:
     """Return whether a route resolved from model_routing rather than main defaults."""
     key = _clean_member_key(route)
     if key not in AGENT_TEAM_MEMBER_KEYS:
         return False
+    member = agent_team_member_configured(config, key)
+    if isinstance(member.get("override"), dict) and any(member["override"].get(field) for field in ("provider", "model", "effort_policy")):
+        return True
+    group_id = agent_team_member_group_id(
+        config,
+        key,
+        delegation_group_id=delegation_group_id,
+    )
+    if group_id and isinstance(_group_route_by_id(config, group_id), dict):
+        return True
     override_target = _normalize_route_target(
         config,
         _route_from_model_routing(config, key),
@@ -387,12 +562,16 @@ def model_route_is_explicit(config: Any, route: str) -> bool:
     )
     if override_target is not None:
         return True
-    class_target = _normalize_route_target(
+    group_target = _normalize_route_target(
         config,
-        _class_route_from_model_routing(config, key),
+        _model_group_route(
+            config,
+            key,
+            delegation_group_id=delegation_group_id,
+        ),
         route=key,
     )
-    return class_target is not None
+    return group_target is not None
 
 
 def _default_member_settings(member_key: str) -> dict[str, Any]:
@@ -470,7 +649,17 @@ def _normalize_roster_item(raw: dict[str, Any], fallback_key: str | None = None)
 
 
 def agent_team_enabled(config: Any) -> bool:
-    return True
+    return agent_team_delegation_enabled(config)
+
+
+def agent_team_delegation_enabled(config: Any) -> bool:
+    """委譲ツール（作業系サブエージェント）の公開スイッチ。デフォルトOFF。"""
+    return _normalize_bool(config_get(config, "agent_team.delegation_enabled", False), False)
+
+
+def agent_team_member_configured(config: Any, member_key: str) -> dict[str, Any]:
+    raw = config_get(config, f"agent_team.members.{_clean_member_key(member_key)}", {}) or {}
+    return raw if isinstance(raw, dict) else {}
 
 
 def agent_team_confirm_prompt(config: Any) -> bool:
@@ -485,10 +674,15 @@ def agent_team_roster(config: Any) -> list[dict[str, Any]]:
     roster: list[dict[str, Any]] = []
     for member_key in sorted(AGENT_TEAM_MEMBER_KEYS):
         defaults = _default_member_settings(member_key)
-        override = _route_from_model_routing(config, member_key) or {}
+        member_config = agent_team_member_configured(config, member_key)
+        override = {
+            **member_config,
+            **(member_config.get("override") or _route_from_model_routing(config, member_key) or {}),
+        }
         target = resolve_model_route(config, member_key)
         item = _normalize_roster_item({**defaults, **override}, member_key)
-        item["enabled"] = target is not None
+        item["enabled"] = _normalize_bool(member_config.get("enabled"), defaults.get("enabled", False))
+        item["group_id"] = agent_team_member_configured_group_id(config, member_key)
         if target:
             item.update(target)
         if member_key in SCALABLE_MEMBER_KEYS:
@@ -518,7 +712,7 @@ def agent_team_member_declared(config: Any, member_key: str) -> bool:
     key = _clean_member_key(member_key)
     if key not in AGENT_TEAM_MEMBER_KEYS:
         return False
-    return resolve_model_route(config, key) is not None
+    return bool(agent_team_member_configured(config, key))
 
 
 def agent_team_member_settings(config: Any, member_key: str) -> dict[str, Any]:
@@ -535,18 +729,37 @@ def agent_team_member_enabled(config: Any, member_key: str) -> bool:
     key = _clean_member_key(member_key)
     if key not in AGENT_TEAM_MEMBER_KEYS:
         return False
-    return resolve_model_route(config, key) is not None
+    configured = _normalize_bool(
+        agent_team_member_configured(config, key).get("enabled"),
+        _default_member_settings(key).get("enabled", False),
+    )
+    if key in SPECIALIST_MEMBER_KEYS:
+        return configured
+    return agent_team_delegation_enabled(config) and configured
 
 
-def agent_team_member_for(config: Any, member_key: str) -> dict[str, str] | None:
+def agent_team_member_for(
+    config: Any,
+    member_key: str,
+    *,
+    delegation_group_id: str | None = None,
+) -> dict[str, str] | None:
     """Return a validated provider/model target for one Agent Team member."""
     key = _clean_member_key(member_key)
     if key not in AGENT_TEAM_MEMBER_KEYS:
         return None
-    return resolve_model_route(config, key)
+    if not agent_team_member_enabled(config, key):
+        return None
+    return resolve_model_route(
+        config,
+        key,
+        delegation_group_id=delegation_group_id,
+    )
 
 
 def agent_team_active_roster(config: Any) -> list[dict[str, Any]]:
+    if not agent_team_delegation_enabled(config):
+        return []
     return [item for item in agent_team_roster(config) if item.get("enabled")]
 
 
@@ -558,7 +771,12 @@ def agent_team_scalable_members(config: Any) -> list[dict[str, Any]]:
     ]
 
 
-def agent_team_delegate_member(config: Any, role: str) -> dict[str, Any] | None:
+def agent_team_delegate_member(
+    config: Any,
+    role: str,
+    *,
+    delegation_group_id: str | None = None,
+) -> dict[str, Any] | None:
     clean_role = _clean_member_key(role)
     if clean_role not in AGENT_TEAM_MEMBER_KEYS:
         alias = {
@@ -572,7 +790,32 @@ def agent_team_delegate_member(config: Any, role: str) -> dict[str, Any] | None:
         return None
     if not agent_team_member_enabled(config, clean_role):
         return None
-    return agent_team_member_settings(config, clean_role)
+    member = agent_team_member_settings(config, clean_role)
+    configured_group_id = agent_team_member_configured_group_id(config, clean_role)
+    effective_group_id = agent_team_member_group_id(
+        config,
+        clean_role,
+        delegation_group_id=delegation_group_id,
+    )
+    target = resolve_model_route(
+        config,
+        clean_role,
+        delegation_group_id=delegation_group_id,
+    )
+    if target:
+        member.update(target)
+        mode = resolve_agent_team_member_mode(
+            config,
+            member_key=clean_role,
+            provider=str(target.get("provider") or ""),
+            model=str(target.get("model") or ""),
+            delegation_group_id=delegation_group_id,
+        )
+        member["mode"] = mode
+        member["reasoning_effort"] = mode
+    member["configured_group_id"] = configured_group_id
+    member["group_id"] = effective_group_id or configured_group_id
+    return member
 
 
 def agent_team_clamp_instances(config: Any, role: str, requested: Any) -> int:
@@ -621,6 +864,7 @@ def resolve_agent_team_member_mode(
     member_key: str,
     provider: str,
     model: str,
+    delegation_group_id: str | None = None,
 ) -> str:
     from .llm_model_catalog import default_llm_mode_for_options, reasoning_effort_options_for_model
 
@@ -628,6 +872,37 @@ def resolve_agent_team_member_mode(
     if not options:
         return ""
 
+    member = agent_team_member_configured(config, member_key)
+    override = member.get("override") if isinstance(member.get("override"), dict) else {}
+    group = _model_group_route(
+        config,
+        member_key,
+        delegation_group_id=delegation_group_id,
+    ) or {}
+    if not member and not group:
+        mode = agent_team_member_mode(config, member_key)
+        return mode if mode in options else default_llm_mode_for_options(options)
+    policy_source = override if override.get("effort_policy") else group
+    policy = str(policy_source.get("effort_policy") or "same").strip().lower()
+    if policy in {"default", "none"}:
+        return ""
+    if policy == "explicit":
+        selected = str(policy_source.get("effort") or policy_source.get("reasoning_effort") or "").strip()
+        return selected if selected in options else ""
+    main = _main_route(config)
+    main_key = {"openai": "openai.reasoning_effort", "kimi": "kimi.reasoning_effort", "codex-cli": "codex_cli.reasoning_effort", "claude-cli": "claude_cli.reasoning_effort"}.get(main.get("provider", ""), "")
+    main_mode_value = (
+        config_get(config, main_key, "")
+        if main_key
+        else config_get(config, "llm_runtime_mode", "")
+    )
+    main_mode = str(main_mode_value or "").strip()
+    if main_mode not in options:
+        main_mode = default_llm_mode_for_options(options)
+    if policy == "lower":
+        return options[max(0, options.index(main_mode) - 1)] if main_mode in options else ""
+    if policy == "same":
+        return main_mode if main_mode in options else ""
     mode = agent_team_member_mode(config, member_key)
     if mode not in options:
         mode = default_llm_mode_for_options(options)
@@ -641,34 +916,35 @@ def apply_agent_team_member_mode(
     provider: str,
     model: str,
     client: Any = None,
+    delegation_group_id: str | None = None,
 ) -> str:
     mode = resolve_agent_team_member_mode(
         config,
         member_key=member_key,
         provider=provider,
         model=model,
+        delegation_group_id=delegation_group_id,
     )
-    if not mode:
-        return ""
-
-    provider_id = str(provider or "").strip().lower()
-    if provider_id == "openai":
-        config_set(config, "openai.reasoning_effort", mode)
-    elif provider_id == "codex-cli":
-        config_set(config, "codex_cli.reasoning_effort", mode)
-    elif provider_id == "claude-cli":
-        config_set(config, "claude_cli.reasoning_effort", mode)
-    elif client is not None and hasattr(client, "set_llm_mode"):
+    if mode and client is not None and hasattr(client, "set_llm_mode"):
         client.set_llm_mode(mode)
     return mode
 
 
 def agent_team_members_by_provider(config: Any) -> dict[str, list[dict[str, str]]]:
     result: dict[str, list[dict[str, str]]] = {}
-    overrides = config_get(config, "model_routing.overrides", {}) or {}
-    if not isinstance(overrides, dict):
-        return result
-    for member_key, member in overrides.items():
+    configured: dict[str, Any] = {}
+    legacy = config_get(config, "model_routing.overrides", {}) or {}
+    if isinstance(legacy, dict):
+        configured.update(legacy)
+    members = config_get(config, "agent_team.members", {}) or {}
+    if isinstance(members, dict):
+        for key, member in members.items():
+            if isinstance(member, dict) and isinstance(member.get("override"), dict):
+                configured[str(key)] = member["override"]
+    groups = config_get(config, "agent_team.model_groups", {}) or {}
+    if isinstance(groups, dict):
+        configured.update({f"group:{key}": value for key, value in groups.items()})
+    for member_key, member in configured.items():
         if not isinstance(member, dict):
             continue
         provider = str(member.get("provider") or "").strip()

@@ -1,7 +1,13 @@
 "use client";
 
-import { useState, useEffect, useCallback, type ReactNode } from "react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  type ReactNode,
+} from "react";
+import useSWR from "swr";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
@@ -10,8 +16,10 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Separator } from "@/components/ui/separator";
 import { LongTextEditor } from "@/components/editor/long-text-editor";
 import { Button } from "@/components/ui/button";
+import { useConfirm } from "@/hooks/use-confirm";
 import {
   Bell,
+  AudioLines,
   Bug,
   CalendarDays,
   ChevronDown,
@@ -35,6 +43,7 @@ import { LoginHistorySection } from "@/components/settings/login-history-section
 import { FeedbackSection } from "@/components/settings/feedback-section";
 import { SkillsSection } from "@/components/settings/skills-section";
 import { KnowledgeSourcesSection } from "@/components/settings/knowledge-sources-section";
+import { ClipIngestTargetsSection } from "@/components/settings/clip-ingest-targets-section";
 import { UserExportSection } from "@/components/settings/user-export-section";
 import { CharactersSection } from "@/components/settings/characters-section";
 import { McpSection } from "@/components/settings/mcp-section";
@@ -50,6 +59,9 @@ import { LlmModelSection } from "@/components/settings/llm-model-section";
 import { SearchSettingsSection } from "@/components/settings/search-settings-section";
 import { SpotifySection } from "@/components/settings/spotify-section";
 import { EditorSettingsSection } from "@/components/settings/editor-settings-section";
+import { YomiLinterSection } from "@/components/settings/yomi-linter-section";
+import { NavigationTabsSection } from "@/components/settings/navigation-tabs-section";
+import { SettingsDisclosure } from "@/components/settings/settings-disclosure";
 import { getTaskNotificationsDefaultEnabled } from "@/lib/user-settings";
 import { useUserSettings } from "@/contexts/user-settings-context";
 import { serializeAudioPlayerSettings } from "@/lib/audio-player-settings";
@@ -243,43 +255,6 @@ function SettingsGroup({
   );
 }
 
-function SettingsDisclosure({
-  title,
-  icon,
-  summary,
-  children,
-}: {
-  title: string;
-  icon?: ReactNode;
-  summary?: ReactNode;
-  children: ReactNode;
-}) {
-  const [open, setOpen] = useState(false);
-
-  return (
-    <Card size="sm">
-      <CardHeader
-        className="cursor-pointer select-none"
-        onClick={() => setOpen((v) => !v)}
-      >
-        <CardTitle className="flex items-center justify-between gap-3 text-sm">
-          <span className="flex min-w-0 items-center gap-2">
-            {icon}
-            <span>{title}</span>
-            {summary}
-          </span>
-          {open ? (
-            <ChevronUp className="size-4 shrink-0" />
-          ) : (
-            <ChevronDown className="size-4 shrink-0" />
-          )}
-        </CardTitle>
-      </CardHeader>
-      {open && <CardContent className="space-y-3">{children}</CardContent>}
-    </Card>
-  );
-}
-
 function QuickSettings() {
   const { settings, patch } = useUserSettings();
   const [editing, setEditing] = useState(false);
@@ -321,10 +296,8 @@ function QuickSettings() {
   );
 
   return (
-    <Card size="sm">
-      <CardHeader>
-        <CardTitle className="flex items-center justify-between gap-3 text-sm">
-          <span>よく使う設定</span>
+    <SettingsDisclosure title="よく使う設定">
+        <div className="flex justify-end">
           <Button
             type="button"
             variant="outline"
@@ -334,9 +307,7 @@ function QuickSettings() {
             <SlidersHorizontal className="mr-1 size-3" />
             {editing ? "完了" : "編集"}
           </Button>
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-3">
+        </div>
         {selectedItems.length > 0 ? (
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {selectedItems.map(({ id, href, label, icon: Icon }) => (
@@ -440,8 +411,7 @@ function QuickSettings() {
             </div>
           </div>
         )}
-      </CardContent>
-    </Card>
+    </SettingsDisclosure>
   );
 }
 
@@ -457,14 +427,7 @@ function ToolPermissionsCard({
   const agents = settings?.agents;
 
   return (
-    <Card size="sm">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-sm">
-          <ShieldCheck className="size-4" />
-          ツール権限
-        </CardTitle>
-      </CardHeader>
-      <CardContent>
+    <SettingsDisclosure title="ツール権限" icon={<ShieldCheck className="size-4" />}>
         {loading ? (
           <div className="space-y-3">
             {Array.from({ length: 2 }).map((_, i) => (
@@ -507,8 +470,7 @@ function ToolPermissionsCard({
             ツール権限を取得できませんでした
           </p>
         )}
-      </CardContent>
-    </Card>
+    </SettingsDisclosure>
   );
 }
 
@@ -522,19 +484,15 @@ function McpEnableCard({
   onToggle: (enabled: boolean) => void;
 }) {
   return (
-    <Card size="sm">
-      <CardHeader>
-        <CardTitle className="flex items-center justify-between gap-3 text-sm">
-          <span className="flex items-center gap-2">
-            <Plug className="size-4" />
-            MCP
-          </span>
+    <SettingsDisclosure
+      title="MCP"
+      icon={<Plug className="size-4" />}
+      summary={
           <Badge variant={enabled ? "default" : "secondary"}>
             {enabled === null ? "未取得" : enabled ? "ON" : "OFF"}
           </Badge>
-        </CardTitle>
-      </CardHeader>
-      <CardContent>
+      }
+    >
         {loading ? (
           <Skeleton className="h-10 w-full rounded" />
         ) : (
@@ -554,8 +512,7 @@ function McpEnableCard({
             />
           </div>
         )}
-      </CardContent>
-    </Card>
+    </SettingsDisclosure>
   );
 }
 
@@ -654,12 +611,65 @@ function AudioPlayerSettingsCard() {
   );
 }
 
+// SWR共通オプション。取得タイミングは従来どおり呼び出し側（fetchAll / fetchCrawlers /
+// 各操作後）で駆動するため、自動 revalidation は全て無効化する。
+const SETTINGS_SWR_OPTIONS = {
+  revalidateOnMount: false,
+  revalidateOnFocus: false,
+  revalidateOnReconnect: false,
+  revalidateIfStale: false,
+  keepPreviousData: true,
+  dedupingInterval: 0,
+} as const;
+
 export default function SettingsPage() {
+  const confirm = useConfirm();
   const [loading, setLoading] = useState(true);
-  const [settings, setSettings] = useState<SettingsResponse | null>(null);
-  const [crawlers, setCrawlers] = useState<CrawlerInfo[] | null>(null);
-  const [mobileCommands, setMobileCommands] =
-    useState<MobileCommandsResponse | null>(null);
+  // 独立したサーバー状態（settings / mobileCommands / crawlers）は SWR で管理する。
+  // currentUser は編集ドラフトの初期値を供給し、各保存操作で楽観的に patch される
+  // ハイブリッド状態のため従来の useState のまま扱う。
+  const settingsRef = useRef<SettingsResponse | null>(null);
+  const { data: settings = null, mutate: mutateSettings } = useSWR<SettingsResponse | null>(
+    "settings/page-settings",
+    async () => {
+      try {
+        const raw = (await pyFetch<SettingsResponse>("/settings")) as Record<
+          string,
+          unknown
+        >;
+        return (raw.settings ?? raw) as SettingsResponse;
+      } catch {
+        return settingsRef.current;
+      }
+    },
+    SETTINGS_SWR_OPTIONS,
+  );
+  settingsRef.current = settings;
+  const { data: mobileCommands = null, mutate: mutateMobileCommands } =
+    useSWR<MobileCommandsResponse | null>(
+      "settings/mobile-commands",
+      async () => {
+        try {
+          return await pyFetch<MobileCommandsResponse>("/mobile/commands");
+        } catch {
+          return null;
+        }
+      },
+      SETTINGS_SWR_OPTIONS,
+    );
+  const { data: crawlers = null, mutate: mutateCrawlers } = useSWR<
+    CrawlerInfo[] | null
+  >(
+    "settings/crawler-status",
+    async () => {
+      try {
+        return (await pyFetch<CrawlerStatusResponse>("/crawler/status")).crawlers;
+      } catch {
+        return [];
+      }
+    },
+    SETTINGS_SWR_OPTIONS,
+  );
   const [runningCommandId, setRunningCommandId] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<AuthStatus["user"] | null>(
     null,
@@ -687,18 +697,14 @@ export default function SettingsPage() {
   const fetchAll = useCallback(async () => {
     setLoading(true);
     try {
+      // settings / mobileCommands は SWR fetcher が取得と失敗時フォールバックを担う。
+      // authStatus は currentUser とドラフト初期値の供給のため従来どおり直接取得する。
       const results = await Promise.allSettled([
-        pyFetch<SettingsResponse>("/settings"),
-        pyFetch<MobileCommandsResponse>("/mobile/commands"),
+        mutateSettings(),
+        mutateMobileCommands(),
         apiFetch<AuthStatus>("/api/auth/status"),
       ]);
 
-      if (results[0].status === "fulfilled") {
-        const raw = results[0].value as Record<string, unknown>;
-        setSettings((raw.settings ?? raw) as SettingsResponse);
-      }
-      if (results[1].status === "fulfilled")
-        setMobileCommands(results[1].value);
       if (results[2].status === "fulfilled" && results[2].value.authenticated) {
         const u = results[2].value.user || null;
         setCurrentUser(u);
@@ -727,17 +733,13 @@ export default function SettingsPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [mutateSettings, mutateMobileCommands]);
 
   const fetchCrawlers = useCallback(async () => {
-    try {
-      setCrawlers(null);
-      const res = await pyFetch<CrawlerStatusResponse>("/crawler/status");
-      setCrawlers(res.crawlers);
-    } catch {
-      setCrawlers([]);
-    }
-  }, []);
+    // 取得前に一旦未取得状態（null）へ戻してから再取得する（従来挙動を維持）。
+    await mutateCrawlers(null, { revalidate: false });
+    await mutateCrawlers();
+  }, [mutateCrawlers]);
 
   useEffect(() => {
     fetchAll();
@@ -747,7 +749,9 @@ export default function SettingsPage() {
     async (commandId: string, requiresConfirmation?: boolean) => {
       if (
         requiresConfirmation &&
-        !window.confirm(`コマンド「${commandId}」を実行しますか？`)
+        !(await confirm({
+          description: `コマンド「${commandId}」を実行しますか？`,
+        }))
       ) {
         return;
       }
@@ -763,7 +767,7 @@ export default function SettingsPage() {
         setRunningCommandId(null);
       }
     },
-    [],
+    [confirm],
   );
 
   const handleAgentToggle = useCallback(
@@ -778,7 +782,8 @@ export default function SettingsPage() {
             value: enabled,
           }),
         });
-        setSettings((prev) => {
+        // 楽観的更新：保存成功後は再取得せずローカルキャッシュの agents を更新する。
+        await mutateSettings((prev) => {
           if (!prev?.agents) return prev;
           return {
             ...prev,
@@ -787,12 +792,12 @@ export default function SettingsPage() {
               [agentKey]: { ...prev.agents[agentKey], enabled },
             },
           };
-        });
+        }, { revalidate: false });
       } catch (err) {
         console.error("エージェント設定変更失敗:", err);
       }
     },
-    [],
+    [mutateSettings],
   );
 
   const handleTaskNotificationMinutesSave = useCallback(async () => {
@@ -973,10 +978,19 @@ export default function SettingsPage() {
       </SettingsGroup>
 
       <SettingsGroup
+        id="tts-yomi"
+        title="音声・読み"
+        icon={<AudioLines className="size-4" />}
+      >
+        <YomiLinterSection />
+      </SettingsGroup>
+
+      <SettingsGroup
         id="input"
         title="入力・操作"
         icon={<Keyboard className="size-4" />}
       >
+        <NavigationTabsSection />
         <EditorSettingsSection />
         <AudioPlayerSettingsCard />
         <SnippetsSection />
@@ -1035,14 +1049,10 @@ export default function SettingsPage() {
           )}
         </SettingsDisclosure>
         {currentUser?.role === "admin" && (
-          <Card size="sm">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-sm">
-                <Keyboard className="size-4" />
-                ショートカット
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
+          <SettingsDisclosure
+            title="ショートカット"
+            icon={<Keyboard className="size-4" />}
+          >
               <div className="flex items-center gap-2">
                 <Checkbox
                   id="restart-shortcut"
@@ -1066,8 +1076,7 @@ export default function SettingsPage() {
                   Alt+Shift+R でバックエンドを即時再起動
                 </Label>
               </div>
-            </CardContent>
-          </Card>
+          </SettingsDisclosure>
         )}
       </SettingsGroup>
 
@@ -1076,11 +1085,15 @@ export default function SettingsPage() {
         title="通知・予定"
         icon={<Bell className="size-4" />}
       >
-        <Card size="sm">
-          <CardHeader>
-            <CardTitle className="text-sm">タスク通知</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
+        <SettingsDisclosure
+          title="タスク通知"
+          icon={<Bell className="size-4" />}
+          summary={
+            <Badge variant={taskNotificationsDefaultEnabled ? "default" : "secondary"}>
+              {taskNotificationsDefaultEnabled ? "ON" : "OFF"}
+            </Badge>
+          }
+        >
             <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2">
               <div className="space-y-1">
                 <Label
@@ -1142,8 +1155,7 @@ export default function SettingsPage() {
                 個別タスクで通知オフにしていない場合の既定値です。
               </p>
             </div>
-          </CardContent>
-        </Card>
+        </SettingsDisclosure>
         <GoogleCalendarSection />
         <RemoteServerSection />
       </SettingsGroup>
@@ -1154,6 +1166,7 @@ export default function SettingsPage() {
         icon={<Search className="size-4" />}
       >
         <SearchSettingsSection />
+        <ClipIngestTargetsSection />
         <KnowledgeSourcesSection />
         <SettingsDisclosure
           title="クローラーステータス"
@@ -1298,6 +1311,9 @@ export default function SettingsPage() {
         {currentUser && (
           <LoginHistorySection isAdmin={currentUser.role === "admin"} />
         )}
+        {currentUser && (
+          <CostDashboardSection isAdmin={currentUser.role === "admin"} />
+        )}
       </SettingsGroup>
 
       {currentUser?.role === "admin" && (
@@ -1308,7 +1324,6 @@ export default function SettingsPage() {
         >
           <UserManagementConsole currentUser={currentUser} />
           <UserExportSection />
-          <CostDashboardSection />
           <SkillsSection />
           <HeartbeatsSection />
         </SettingsGroup>

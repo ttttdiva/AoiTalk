@@ -48,6 +48,7 @@ export function SubtaskRow({
   handleTaskDateChange,
   applyTaskPatchLocally,
   requestRecurringDelete,
+  readOnly = false,
 }: {
   sub: Task;
   parentTask: Task;
@@ -71,12 +72,13 @@ export function SubtaskRow({
   ) => Promise<void>;
   applyTaskPatchLocally: (taskId: string, patch: Partial<Task>) => void;
   requestRecurringDelete?: (task: Task) => boolean;
+  readOnly?: boolean;
 }) {
   return (
     <tr
       key={sub.id}
       data-testid={`task-row-${sub.id}`}
-      draggable
+      draggable={!readOnly}
       onDragStart={(e) => onDragStart(e, sub.id)}
       onDragOver={(e) => onDragOver(e, sub.id)}
       onDragLeave={onDragLeave}
@@ -86,7 +88,9 @@ export function SubtaskRow({
       onClick={() => {
         openTask(sub);
       }}
-      onContextMenu={(e) => onContextMenu(e, sub)}
+      onContextMenu={(e) => {
+        if (!readOnly) onContextMenu(e, sub);
+      }}
       className={cn(
         "group relative border-b border-border/30 cursor-pointer transition-colors hover:bg-accent/60 hover:shadow-sm bg-muted/10",
         draggingIds.includes(sub.id) && "opacity-40",
@@ -110,6 +114,7 @@ export function SubtaskRow({
         <div className="flex items-center gap-0.5 pl-4">
           <CornerDownRight className="size-3 text-muted-foreground shrink-0" />
           <Checkbox
+            disabled={readOnly}
             checked={sub.status === "closed"}
             onCheckedChange={async (checked) => {
               try {
@@ -151,39 +156,47 @@ export function SubtaskRow({
         colSpan={2}
         onClick={(e) => e.stopPropagation()}
       >
-        <TaskRowDatePicker
-          taskId={sub.id}
-          startAt={toLocalDateTimeInputValue(getTaskDisplayStartAt(sub), {
-            allDay: getTaskDisplayAllDay(sub),
-          })}
-          endAt={toLocalDateTimeInputValue(getTaskDisplayEndAt(sub), {
-            allDay: getTaskDisplayAllDay(sub),
-          })}
-          onRangeChange={({ startAt, endAt }) =>
-            handleTaskDateChange(sub, {
-              start_at: startAt,
-              end_at: endAt,
-            })
-          }
-          onRecurrenceChange={(hasRecurrence) =>
-            applyTaskPatchLocally(sub.id, {
-              has_recurrence: hasRecurrence,
-            })
-          }
-          allDay={getTaskDisplayAllDay(sub)}
-          startPlaceholder="Start Date"
-          endPlaceholder="Due Date"
-          startButtonClassName={dateButtonColor(
-            getTaskDisplayStartAt(sub),
-            sub,
-            "start",
-          )}
-          endButtonClassName={dateButtonColor(
-            getTaskDisplayEndAt(sub),
-            sub,
-            "end",
-          )}
-        />
+        {readOnly ? (
+          <span className="text-muted-foreground">
+            {getTaskDisplayStartAt(sub) || getTaskDisplayEndAt(sub)
+              ? `${getTaskDisplayStartAt(sub) ?? "-"} / ${getTaskDisplayEndAt(sub) ?? "-"}`
+              : "-"}
+          </span>
+        ) : (
+          <TaskRowDatePicker
+            taskId={sub.id}
+            startAt={toLocalDateTimeInputValue(getTaskDisplayStartAt(sub), {
+              allDay: getTaskDisplayAllDay(sub),
+            })}
+            endAt={toLocalDateTimeInputValue(getTaskDisplayEndAt(sub), {
+              allDay: getTaskDisplayAllDay(sub),
+            })}
+            onRangeChange={({ startAt, endAt }) =>
+              handleTaskDateChange(sub, {
+                start_at: startAt,
+                end_at: endAt,
+              })
+            }
+            onRecurrenceChange={(hasRecurrence) =>
+              applyTaskPatchLocally(sub.id, {
+                has_recurrence: hasRecurrence,
+              })
+            }
+            allDay={getTaskDisplayAllDay(sub)}
+            startPlaceholder="Start Date"
+            endPlaceholder="Due Date"
+            startButtonClassName={dateButtonColor(
+              getTaskDisplayStartAt(sub),
+              sub,
+              "start",
+            )}
+            endButtonClassName={dateButtonColor(
+              getTaskDisplayEndAt(sub),
+              sub,
+              "end",
+            )}
+          />
+        )}
       </td>
       {/* 記録時間（サブタスクでは空） */}
       <td className="py-1.5 px-2"></td>
@@ -193,6 +206,7 @@ export function SubtaskRow({
           size="icon-xs"
           onClick={(e) => {
             e.stopPropagation();
+            if (readOnly) return;
             if (requestRecurringDelete?.(sub)) return;
             pushUndo({
               type: "recreate",
@@ -201,6 +215,7 @@ export function SubtaskRow({
             taskApi.deleteTask(sub.id).then(() => fetchData());
           }}
           className="shrink-0 text-muted-foreground hover:text-red-500"
+          disabled={readOnly}
         >
           <Trash2 className="size-3" />
         </Button>

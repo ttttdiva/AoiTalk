@@ -3,6 +3,14 @@
  * All endpoints proxy through /api/python-proxy/ → Python FastAPI
  */
 
+import {
+  getRemoteWorkspaceContent,
+  getRemoteWorkspaceInfo,
+  getRemoteWorkspacePreview,
+  remoteWorkspaceDownloadUrl,
+  searchRemoteWorkspace,
+} from "@/lib/remote-servers";
+
 // ─── Types ───
 
 export interface ExplorerDirectory {
@@ -339,7 +347,17 @@ export async function explorerUpload(
 }
 
 export function explorerDownloadUrl(path: string): string {
+  const remote = parseRemoteWorkspacePath(path);
+  if (remote) {
+    return remoteWorkspaceDownloadUrl(remote.profileId, remote.projectId, remote.relativePath);
+  }
   return `/api/python-proxy/explorer/download?path=${encodeURIComponent(path)}`;
+}
+
+function parseRemoteWorkspacePath(path: string): { profileId: string; projectId: string; relativePath: string } | null {
+  const match = path.match(/^remote:\/\/([^/]+)\/([^/]+)(?:\/(.*))?$/);
+  if (!match) return null;
+  return { profileId: match[1], projectId: match[2], relativePath: match[3] ?? "" };
 }
 
 function downloadFilenameFromDisposition(
@@ -360,6 +378,28 @@ function downloadFilenameFromDisposition(
 }
 
 export async function explorerDownloadPaths(paths: string[]): Promise<void> {
+  const remote = paths.length === 1 ? parseRemoteWorkspacePath(paths[0]) : null;
+  if (remote) {
+    const res = await fetch(
+      remoteWorkspaceDownloadUrl(remote.profileId, remote.projectId, remote.relativePath),
+      { credentials: "include", cache: "no-store" },
+    );
+    if (!res.ok) throw new Error(extractApiErrorMessage(res.status, await res.text()));
+    const blob = await res.blob();
+    const filename = downloadFilenameFromDisposition(
+      res.headers.get("Content-Disposition"),
+      remote.relativePath.split("/").pop() || "download",
+    );
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    return;
+  }
   const res = await fetch("/api/python-proxy/explorer/download", {
     method: "POST",
     credentials: "include",
@@ -438,10 +478,18 @@ export async function explorerDelete(path: string) {
 }
 
 export async function explorerInfo(path: string): Promise<FileInfo> {
+  const remote = parseRemoteWorkspacePath(path);
+  if (remote) {
+    return getRemoteWorkspaceInfo(remote.profileId, remote.projectId, remote.relativePath) as unknown as Promise<FileInfo>;
+  }
   return pyFetch(`/explorer/info?path=${encodeURIComponent(path)}`);
 }
 
 export async function explorerPreview(path: string): Promise<FilePreview> {
+  const remote = parseRemoteWorkspacePath(path);
+  if (remote) {
+    return getRemoteWorkspacePreview(remote.profileId, remote.projectId, remote.relativePath) as unknown as Promise<FilePreview>;
+  }
   return pyFetch(`/explorer/preview?path=${encodeURIComponent(path)}`);
 }
 
@@ -478,6 +526,10 @@ export interface FullContentResponse {
 export async function explorerFullContent(
   path: string,
 ): Promise<FullContentResponse> {
+  const remote = parseRemoteWorkspacePath(path);
+  if (remote) {
+    return getRemoteWorkspaceContent(remote.profileId, remote.projectId, remote.relativePath) as unknown as Promise<FullContentResponse>;
+  }
   return pyFetch(`/explorer/content?path=${encodeURIComponent(path)}`);
 }
 
@@ -509,6 +561,23 @@ export async function explorerSearch(
   root?: string,
   limit?: number,
 ): Promise<ExplorerSearchResponse> {
+  const remote = parseRemoteWorkspacePath(root ?? "");
+  if (remote) {
+    const results = await searchRemoteWorkspace(
+      remote.profileId,
+      remote.projectId,
+      query,
+      remote.relativePath,
+      limit ?? 50,
+    );
+    return {
+      success: true,
+      results: results as unknown as SearchResult[],
+      total: results.length,
+      query,
+      root_path: root,
+    };
+  }
   const params = new URLSearchParams({ q: query });
   if (root) params.set("root", root);
   if (limit) params.set("limit", String(limit));

@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import useSWR from "swr";
 import { ChevronDown, ChevronUp, Music2 } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
@@ -29,25 +30,54 @@ async function pyFetch<T = unknown>(path: string, init?: RequestInit): Promise<T
   return res.json();
 }
 
+interface SpotifyState {
+  enabled: boolean | null;
+  agentEnabled: boolean | null;
+}
+
+const INITIAL_SPOTIFY_STATE: SpotifyState = { enabled: null, agentEnabled: null };
+
 export function SpotifySection() {
   const [expanded, setExpanded] = useState(false);
-  const [enabled, setEnabled] = useState<boolean | null>(null);
-  const [agentEnabled, setAgentEnabled] = useState<boolean | null>(null);
+  // Spotify設定（サーバー状態）は SWR で管理。取得タイミングは従来どおりマウント時に
+  // 駆動するため自動 revalidation は無効化する。取得失敗時は従来同様に直前値を保持する。
+  const stateRef = useRef<SpotifyState>(INITIAL_SPOTIFY_STATE);
+  const { data = INITIAL_SPOTIFY_STATE, mutate: mutateSpotify } = useSWR<SpotifyState>(
+    "settings/spotify",
+    async () => {
+      try {
+        const payload = await pyFetch<SettingsPayload>("/settings");
+        return {
+          enabled: payload.settings?.spotify?.enabled ?? true,
+          agentEnabled: payload.settings?.agents?.spotify?.enabled ?? false,
+        };
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "Spotify設定を取得できませんでした");
+        return stateRef.current;
+      }
+    },
+    {
+      revalidateOnMount: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+      keepPreviousData: true,
+      dedupingInterval: 0,
+    },
+  );
+  stateRef.current = data;
+  const { enabled, agentEnabled } = data;
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
 
   const loadSettings = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await pyFetch<SettingsPayload>("/settings");
-      setEnabled(data.settings?.spotify?.enabled ?? true);
-      setAgentEnabled(data.settings?.agents?.spotify?.enabled ?? false);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Spotify設定を取得できませんでした");
+      await mutateSpotify();
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [mutateSpotify]);
 
   useEffect(() => {
     void loadSettings();
@@ -57,8 +87,14 @@ export function SpotifySection() {
     key: "spotify.enabled" | "agents.spotify.enabled",
     value: boolean,
   ) => {
-    if (key === "spotify.enabled") setEnabled(value);
-    else setAgentEnabled(value);
+    // 楽観的更新：保存中はローカルキャッシュを即時反映する。
+    await mutateSpotify(
+      (current = INITIAL_SPOTIFY_STATE) =>
+        key === "spotify.enabled"
+          ? { ...current, enabled: value }
+          : { ...current, agentEnabled: value },
+      { revalidate: false },
+    );
     setSaving(true);
     try {
       await pyFetch("/settings", {
@@ -68,11 +104,11 @@ export function SpotifySection() {
       toast.success("Spotify設定を保存しました");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Spotify設定を保存できませんでした");
-      void loadSettings();
+      void mutateSpotify();
     } finally {
       setSaving(false);
     }
-  }, [loadSettings]);
+  }, [mutateSpotify]);
 
   return (
     <Card size="sm">

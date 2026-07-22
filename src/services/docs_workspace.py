@@ -83,6 +83,31 @@ DEFAULT_DOCS_SUPERTAGS: list[dict[str, Any]] = [
         "ai_instructions": "案件の恒久情報を構造化して保つ。",
     },
     {
+        "name": "メール",
+        "system_key": "email",
+        "base_type": "email",
+        "description": "プロジェクトへ取り込んだメールの恒久記録",
+        "icon": "mail",
+        "color": "#0284c7",
+        "pinned_field_names": ["メール日時", "From", "Message-ID"],
+        "fields": [
+            {"name": "件名", "system_key": "email_subject", "field_type": "text"},
+            {"name": "メール日時", "system_key": "email_date", "field_type": "text"},
+            {"name": "From", "system_key": "email_from", "field_type": "text"},
+            {"name": "To", "system_key": "email_to", "field_type": "long_text"},
+            {"name": "CC", "system_key": "email_cc", "field_type": "long_text"},
+            {"name": "BCC", "system_key": "email_bcc", "field_type": "long_text"},
+            {"name": "Message-ID", "system_key": "email_message_id", "field_type": "text"},
+            {"name": "In-Reply-To", "system_key": "email_in_reply_to", "field_type": "text"},
+            {"name": "References", "system_key": "email_references", "field_type": "long_text"},
+            {"name": "本文", "system_key": "email_body", "field_type": "long_text"},
+            {"name": "元ファイル名", "system_key": "email_source_filename", "field_type": "text"},
+            {"name": "元ファイルのプロジェクト内パス", "system_key": "email_source_path", "field_type": "text"},
+            {"name": "重複判定キー", "system_key": "email_dedupe_key", "field_type": "text"},
+        ],
+        "ai_instructions": "1メール=1ノード。ヘッダー、本文、原本パスを保持し、同一プロジェクト内の質問へ根拠として使う。",
+    },
+    {
         "name": "Day",
         "system_key": "day",
         "base_type": "day",
@@ -152,7 +177,7 @@ async def seed_default_docs_supertags(session: AsyncSession, workspace: Knowledg
                 color=spec.get("color"),
                 template_json={},
                 pinned_field_ids=[],
-                config_json={},
+                config_json=spec.get("config_json") or {},
                 ai_instructions=spec.get("ai_instructions"),
             )
             session.add(tag)
@@ -173,6 +198,17 @@ async def seed_default_docs_supertags(session: AsyncSession, workspace: Knowledg
                 value = spec.get(key)
                 if value and getattr(tag, attr) != value:
                     setattr(tag, attr, value)
+                    changed = True
+            # config_json.tools を spec と同期する(既存キーは温存しマージ)。
+            spec_config = spec.get("config_json")
+            if spec_config is not None:
+                current_config = tag.config_json if isinstance(tag.config_json, dict) else {}
+                desired_config = {**current_config}
+                spec_tools = spec_config.get("tools")
+                if spec_tools is not None and current_config.get("tools") != spec_tools:
+                    desired_config["tools"] = spec_tools
+                if desired_config != current_config:
+                    tag.config_json = desired_config
                     changed = True
             if changed:
                 await session.flush()

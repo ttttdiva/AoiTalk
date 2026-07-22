@@ -14,6 +14,7 @@ from .models import (
     Project, ProjectMember, ProjectJoinRequest, User, Space, Tag, TaskTag,
     ConversationSession, LocalTask, Task, TaskAssignee, TaskComment, TaskActivity,
     TaskDependency, TaskRecurrenceRule, TaskOccurrence, TimeEntry,
+    TaskReference,
     ProjectNotificationSetting, NotificationDelivery, KnowledgeSourcePermission,
     KnowledgeSource, ProjectContextPack, ContextMemory, RecordAttachment,
     RecordEvent, RecordField, RecordRow, RecordTable, RecordView,
@@ -498,6 +499,7 @@ class ProjectRepository:
             await session.execute(delete(TaskActivity).where(TaskActivity.task_id.in_(task_ids)))
             await session.execute(delete(TaskComment).where(TaskComment.task_id.in_(task_ids)))
             await session.execute(delete(TaskAssignee).where(TaskAssignee.task_id.in_(task_ids)))
+            await session.execute(delete(TaskReference).where(TaskReference.task_id.in_(task_ids)))
 
         record_table_ids_result = await session.execute(
             select(RecordTable.id).where(RecordTable.project_id == project_id)

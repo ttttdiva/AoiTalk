@@ -1,6 +1,8 @@
 # Irodori-TTS
 
-AoiTalk の参照音声系ローカル TTS は Irodori-TTS に一本化されています。Qwen3-TTS の voice embedding (`cache/qwen3_voices/*.pkl`) は使用しません。
+AoiTalk の Irodori-TTS エンジンは、内蔵推論runtimeと次の単一モデルを使用します。外部TTSサーバーや別モデルへの切り替えは行いません。
+
+`Aratako/Irodori-TTS-600M-v3-VoiceDesign`
 
 ## セットアップ
 
@@ -9,59 +11,55 @@ pip install -e ".[audio,irodori]"
 pip install --no-deps "dacvae @ git+https://github.com/facebookresearch/dacvae" descript-audiotools argbind julius pystoi torch-stoi flatten-dict markdown2 randomname importlib-resources
 ```
 
-AoiTalk は Irodori-TTS の推論 runtime を `src/vendor/irodori_tts/` に同梱して使います。外部の `D:/tool/Irodori-TTS` などのローカル clone は参照しません。
+推論runtimeは `src/vendor/irodori_tts/` に同梱されています。外部のIrodori-TTS cloneは参照しません。SilentCipherも `irodori` extraから導入され、生成音声へ不可聴ウォーターマークを付与します。利用できない場合はruntimeが警告を出します。
 
-`dacvae` / `descript-audiotools` は upstream の依存 metadata が AoiTalk の `qdrant-client` と protobuf 範囲で衝突するため、setup スクリプトでは Irodori 実行に必要なパッケージだけを `--no-deps` で追加します。
-
-## 高速化設定
-
-Irodori-TTS は既定で Sway Sampling を使います。
+## 設定
 
 ```yaml
 tts_settings:
   irodori_tts:
+    hf_checkpoint: Aratako/Irodori-TTS-600M-v3-VoiceDesign
+    codec_repo: Aratako/Semantic-DACVAE-Japanese-32dim
+    cache_dir: cache/irodori_tts
     num_steps: 6
     t_schedule_mode: sway
     sway_coeff: -1.0
+    duration_scale: 1.0
 ```
 
-品質確認や比較のために従来の線形 schedule を使う場合は `t_schedule_mode: linear` を指定します。
+モデルの `model.safetensors`、tokenizer、codecは初回合成時にHugging Faceから自動取得されます。取得済みファイルは `cache_dir` 配下とHugging Face cacheから再利用されるため、手動配置は不要です。
 
-## 重みの取得
+## 条件の組み合わせ
 
-ユーザーが手動で重みを探す必要はありません。初回合成時に以下を自動取得します。
+1つのモデルで次の4モードを利用できます。
 
-- `Aratako/Irodori-TTS-500M-v2`
-- `Aratako/Irodori-TTS-500M-v2-VoiceDesign`
-- `Aratako/Semantic-DACVAE-Japanese-32dim`
+- テキストのみ: 参照音声とcaptionを指定しない
+- テキスト＋参照音声: `ref_wav` または `ref_latent` を指定する
+- テキスト＋caption: `caption` を指定し、参照がなければ `no_ref` として扱う
+- テキスト＋参照音声＋caption: 参照と `caption` の両方を指定する
 
-取得済みファイルは `tts_settings.irodori_tts.cache_dir` と Hugging Face のキャッシュに保存されます。
+captionは声質、感情、話し方を記述します。参照音声とcaptionを同時に指定した場合も両方がモデルへ渡されます。入力テキスト内の絵文字は削除されず、スタイルや非言語表現の条件として利用されます。
 
-## 参照音声
-
-参照音声は `config/irodori_refs/` に置きます。
-
-```text
-config/irodori_refs/
-  ずんだもん.wav
-  ずんだもん.txt
-```
-
-キャラクターの `voice.voice_name` が `ずんだもん` の場合、`config/irodori_refs/ずんだもん.wav` を自動で探します。明示的に指定する場合は DB のキャラクター音声設定に `ref_wav` を入れます。
+参照音声は `config/irodori_refs/` に置けます。`voice_name` と同名の音声ファイルは自動検出されます。
 
 ```yaml
 voice:
   engine: irodori_tts
   voice_name: ずんだもん
-  ref_wav: config/irodori_refs/ずんだもん.wav
+  parameters:
+    ref_wav: config/irodori_refs/ずんだもん.wav
+    caption: 明るく親しみやすい声で、少し嬉しそうに話す
 ```
 
-参照音声なしで生成する場合は `no_ref: true` を指定します。VoiceDesign を使う場合は `voice_design: true` と `caption` を指定します。
+参照音声を使わないことを明示する場合は `no_ref: true` を指定します。
+
+## 出力時間
+
+`seconds` を指定しない既定動作では、v3 Duration Predictorがテキスト、参照音声、captionの条件から出力時間を予測します。予測時間だけを調整する場合は `duration_scale`、秒数を固定する必要がある場合に限り `seconds` を明示します。
 
 ```yaml
 voice:
   engine: irodori_tts
-  no_ref: true
-  voice_design: true
-  caption: 落ち着いた女性の声で、やわらかく自然に読み上げる
+  parameters:
+    duration_scale: 1.1
 ```

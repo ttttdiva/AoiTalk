@@ -3,7 +3,9 @@ setlocal
 
 set PROJECT_DIR=%~dp0..
 set MOBILE_DIR=%PROJECT_DIR%\mobile
-set ANDROID_DIR=%MOBILE_DIR%\android
+set SHORT_BUILD_ROOT=C:\tmp\aoitalk-mobile-build
+set KC_STAGE=C:\tmp\k
+set ANDROID_DIR=%SHORT_BUILD_ROOT%\android
 set APK_NAME=aoitalk-mobile.apk
 set RELEASE_REPO=ttttdiva/AoiTalk
 
@@ -43,13 +45,58 @@ if %ERRORLEVEL% EQU 0 (
 )
 
 if not exist "C:\tmp" mkdir "C:\tmp"
-echo [INFO] Running local Expo prebuild for Android...
-pushd "%MOBILE_DIR%"
-call npx expo prebuild --platform android --clean
+echo [INFO] Preparing a short-path Android build workspace...
+powershell -NoProfile -Command ^
+  "$path = [System.IO.Path]::GetFullPath('%SHORT_BUILD_ROOT%');" ^
+  "if ($path -ne 'C:\tmp\aoitalk-mobile-build') { throw 'Unexpected short build path: ' + $path };" ^
+  "if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force };" ^
+  "New-Item -ItemType Directory -Path $path -Force | Out-Null"
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
+robocopy "%MOBILE_DIR%" "%SHORT_BUILD_ROOT%" /E /XD node_modules android .expo >nul
+if %ERRORLEVEL% GEQ 8 (
+  echo [ERROR] Failed to copy the mobile workspace to %SHORT_BUILD_ROOT%.
+  exit /b %ERRORLEVEL%
+)
+
+echo [INFO] Installing dependencies in the short-path workspace...
+pushd "%SHORT_BUILD_ROOT%"
+call npm ci
+set INSTALL_RESULT=%ERRORLEVEL%
 popd
+if %INSTALL_RESULT% NEQ 0 exit /b %INSTALL_RESULT%
+
+echo [INFO] Running Expo prebuild for Android...
+pushd "%SHORT_BUILD_ROOT%"
+call npx expo prebuild --platform android --clean
+set PREBUILD_RESULT=%ERRORLEVEL%
+popd
+if %PREBUILD_RESULT% NEQ 0 exit /b %PREBUILD_RESULT%
 
 echo [INFO] Applying stable Gradle settings...
+powershell -NoProfile -Command ^
+  "$stage = [System.IO.Path]::GetFullPath('%KC_STAGE%');" ^
+  "if ($stage -ne 'C:\tmp\k') { throw 'Unexpected keyboard-controller stage path: ' + $stage };" ^
+  "if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }"
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
+powershell -NoProfile -Command ^
+  "$path = '%SHORT_BUILD_ROOT%\node_modules\@react-native\gradle-plugin\react-native-gradle-plugin\src\main\kotlin\com\facebook\react\tasks\GenerateAutolinkingNewArchitecturesFileTask.kt';" ^
+  "$content = Get-Content -LiteralPath $path -Raw;" ^
+  "$content = $content.Replace('${libraryName}_autolinked_build', '${libraryName.take(12)}_autolinked_build');" ^
+  "[System.IO.File]::WriteAllText($path, $content, [System.Text.UTF8Encoding]::new($false))"
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
+powershell -NoProfile -Command ^
+  "$path = '%SHORT_BUILD_ROOT%\node_modules\react-native-keyboard-controller\android\src\main\jni\CMakeLists.txt';" ^
+  "$content = Get-Content -LiteralPath $path -Raw;" ^
+  "$needle = 'file(GLOB LIB_CODEGEN_SRCS CONFIGURE_DEPENDS ${LIB_ANDROID_GENERATED_JNI_DIR}/*.cpp ${LIB_ANDROID_GENERATED_COMPONENTS_DIR}/*.cpp)';" ^
+  "$block = $needle + \"`r`n`r`n\" + 'file(GLOB LIB_CUSTOM_HEADERS CONFIGURE_DEPENDS ${LIB_COMMON_COMPONENTS_DIR}/*.h)' + \"`r`n\" + 'file(GLOB LIB_CODEGEN_HEADERS CONFIGURE_DEPENDS ${LIB_ANDROID_GENERATED_JNI_DIR}/*.h ${LIB_ANDROID_GENERATED_COMPONENTS_DIR}/*.h)' + \"`r`n\" + 'file(MAKE_DIRECTORY C:/tmp/k/custom C:/tmp/k/codegen)' + \"`r`n\" + 'file(COPY ${LIB_CUSTOM_SRCS} ${LIB_CUSTOM_HEADERS} DESTINATION C:/tmp/k/custom)' + \"`r`n\" + 'file(COPY ${LIB_CODEGEN_SRCS} ${LIB_CODEGEN_HEADERS} DESTINATION C:/tmp/k/codegen)' + \"`r`n\" + 'file(GLOB LIB_CUSTOM_SRCS CONFIGURE_DEPENDS C:/tmp/k/custom/*.cpp)' + \"`r`n\" + 'file(GLOB LIB_CODEGEN_SRCS CONFIGURE_DEPENDS C:/tmp/k/codegen/*.cpp)';" ^
+  "if (-not $content.Contains($needle)) { throw 'Keyboard-controller CMake marker was not found' };" ^
+  "$content = $content.Replace($needle, $block);" ^
+  "[System.IO.File]::WriteAllText($path, $content, [System.Text.UTF8Encoding]::new($false))"
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
 powershell -NoProfile -Command ^
   "$path = '%ANDROID_DIR%\gradle.properties';" ^
   "$content = Get-Content -Path $path -Raw;" ^
@@ -66,10 +113,20 @@ powershell -NoProfile -Command ^
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
 pushd "%ANDROID_DIR%"
-call gradlew.bat assembleRelease --no-daemon -PreactNativeArchitectures=arm64-v8a,x86_64
+call .\gradlew.bat --stop
+call .\gradlew.bat assembleRelease --no-daemon --max-workers=1 -Pkotlin.incremental=false -PreactNativeArchitectures=arm64-v8a,x86_64
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 copy /Y "app\build\outputs\apk\release\app-release.apk" "%PROJECT_DIR%\%APK_NAME%" >nul
 popd
+
+powershell -NoProfile -Command ^
+  "$stage = [System.IO.Path]::GetFullPath('%KC_STAGE%');" ^
+  "if ($stage -ne 'C:\tmp\k') { throw 'Unexpected keyboard-controller stage path: ' + $stage };" ^
+  "if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }; " ^
+  "$path = [System.IO.Path]::GetFullPath('%SHORT_BUILD_ROOT%');" ^
+  "if ($path -ne 'C:\tmp\aoitalk-mobile-build') { throw 'Unexpected short build path: ' + $path };" ^
+  "if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }"
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
 if "%RELEASE_EXISTS%"=="1" (
   gh release upload "v%VERSION%" "%APK_NAME%" --clobber --repo %RELEASE_REPO%
@@ -78,13 +135,13 @@ if "%RELEASE_EXISTS%"=="1" (
 )
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
-for /f "delims=" %%S in ('gh api repos/%RELEASE_REPO%/contents/latest.json --jq ".sha" 2^>nul') do set FILE_SHA=%%S
-for /f "delims=" %%B in ('powershell -NoProfile -Command "$json = @{mobile=@{version='%VERSION%';url='https://github.com/%RELEASE_REPO%/releases/download/v%VERSION%/%APK_NAME%';notes='v%VERSION% リリース';date='%TODAY%'}} | ConvertTo-Json -Depth 3; [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))"') do set B64=%%B
-
-if "%FILE_SHA%"=="" (
-  gh api repos/%RELEASE_REPO%/contents/latest.json --method PUT --field message="latest.json を v%VERSION% に更新" --field "content=%B64%"
+rem 日本語 notes を cmd 経由で渡すと codepage 不一致で文字化けするため、
+rem latest.json の生成と更新は UTF-8 (BOM付き) の PowerShell script に委譲する。
+rem NOTES_FILE 環境変数に UTF-8 テキストファイルを指定すると notes を差し替えられる。
+if defined NOTES_FILE (
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_DIR%\scripts\publish_latest_json.ps1" -Version "%VERSION%" -Repo "%RELEASE_REPO%" -ApkName "%APK_NAME%" -Today "%TODAY%" -NotesFile "%NOTES_FILE%"
 ) else (
-  gh api repos/%RELEASE_REPO%/contents/latest.json --method PUT --field message="latest.json を v%VERSION% に更新" --field "content=%B64%" --field "sha=%FILE_SHA%"
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_DIR%\scripts\publish_latest_json.ps1" -Version "%VERSION%" -Repo "%RELEASE_REPO%" -ApkName "%APK_NAME%" -Today "%TODAY%"
 )
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 

@@ -1,6 +1,14 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import useSWR from "swr";
 import { toast } from "sonner";
 import {
   CheckCircle2,
@@ -148,7 +156,30 @@ export function UserManagementConsole({
 }: {
   currentUser: CurrentUser;
 }) {
-  const [users, setUsers] = useState<ManagedUser[]>([]);
+  // ユーザー一覧（サーバー状態）は SWR で管理。取得タイミングは従来どおり
+  // 呼び出し側（展開/更新/各操作後）で駆動するため自動 revalidation は無効化する。
+  // 取得失敗時は従来同様に直前値を保持する。
+  const usersRef = useRef<ManagedUser[]>([]);
+  const { data: users = [], mutate: mutateUsers } = useSWR<ManagedUser[]>(
+    "settings/managed-users",
+    async () => {
+      try {
+        return await apiFetch<ManagedUser[]>("/api/users");
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "ユーザー一覧の取得に失敗しました");
+        return usersRef.current;
+      }
+    },
+    {
+      revalidateOnMount: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+      keepPreviousData: true,
+      dedupingInterval: 0,
+    },
+  );
+  usersRef.current = users;
   const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busyUserId, setBusyUserId] = useState<string | null>(null);
@@ -244,14 +275,11 @@ export function UserManagementConsole({
   const loadUsers = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await apiFetch<ManagedUser[]>("/api/users");
-      setUsers(data);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "ユーザー一覧の取得に失敗しました");
+      await mutateUsers();
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [mutateUsers]);
 
   useEffect(() => {
     if (expanded && users.length === 0) void loadUsers();
@@ -265,8 +293,9 @@ export function UserManagementConsole({
           method: "PATCH",
           body: JSON.stringify(body),
         });
-        setUsers((prev) =>
-          prev.map((item) => (item.id === updated.id ? updated : item)),
+        await mutateUsers(
+          (prev = []) => prev.map((item) => (item.id === updated.id ? updated : item)),
+          { revalidate: false },
         );
         if (selectedUserId === updated.id) setSelectedUserId(updated.id);
         toast.success("ユーザーを更新しました");
@@ -277,7 +306,7 @@ export function UserManagementConsole({
         setBusyUserId(null);
       }
     },
-    [selectedUserId],
+    [selectedUserId, mutateUsers],
   );
 
   const canDeactivate = (user: ManagedUser) => {
@@ -316,7 +345,7 @@ export function UserManagementConsole({
           require_password_change: createForm.require_password_change,
         }),
       });
-      setUsers((prev) => [created, ...prev]);
+      await mutateUsers((prev = []) => [created, ...prev], { revalidate: false });
       setCreateOpen(false);
       setCreateForm({
         username: "",
@@ -357,8 +386,9 @@ export function UserManagementConsole({
       const updated = await apiFetch<ManagedUser>(`/api/users/${deleteUser.id}`, {
         method: "DELETE",
       });
-      setUsers((prev) =>
-        prev.map((item) => (item.id === updated.id ? updated : item)),
+      await mutateUsers(
+        (prev = []) => prev.map((item) => (item.id === updated.id ? updated : item)),
+        { revalidate: false },
       );
       if (selectedUserId === updated.id) setSelectedUserId(null);
       setDeleteUser(null);
@@ -395,7 +425,9 @@ export function UserManagementConsole({
             : "";
         throw new Error(`${detail.detail || res.statusText}${blockerText}`);
       }
-      setUsers((prev) => prev.filter((item) => item.id !== purgeUser.id));
+      await mutateUsers((prev = []) => prev.filter((item) => item.id !== purgeUser.id), {
+        revalidate: false,
+      });
       if (selectedUserId === purgeUser.id) setSelectedUserId(null);
       setPurgeUser(null);
       setPurgeConfirm("");
@@ -453,15 +485,19 @@ export function UserManagementConsole({
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="w-56">
           <DropdownMenuLabel>{user.username}</DropdownMenuLabel>
-          <DropdownMenuItem onClick={() => setSelectedUserId(user.id)}>
+          <DropdownMenuItem
+            mnemonic="O"
+            onClick={() => setSelectedUserId(user.id)}
+          >
             <Shield className="size-4" />
             詳細を開く
           </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => openEdit(user)}>
+          <DropdownMenuItem mnemonic="E" onClick={() => openEdit(user)}>
             <Edit3 className="size-4" />
             編集
           </DropdownMenuItem>
           <DropdownMenuItem
+            mnemonic="P"
             disabled={user.status !== "active"}
             onClick={() => {
               setResetUser(user);
@@ -474,6 +510,7 @@ export function UserManagementConsole({
           <DropdownMenuSeparator />
           {user.status === "active" ? (
             <DropdownMenuItem
+              mnemonic="D"
               disabled={!canDeactivate(user)}
               title={disabledReason}
               onClick={() => void updateUser(user, { is_active: false })}
@@ -483,6 +520,7 @@ export function UserManagementConsole({
             </DropdownMenuItem>
           ) : (
             <DropdownMenuItem
+              mnemonic="R"
               disabled={user.status === "deleted" && isSelf}
               onClick={() => void updateUser(user, { is_active: true })}
             >
@@ -491,6 +529,7 @@ export function UserManagementConsole({
             </DropdownMenuItem>
           )}
           <DropdownMenuItem
+            mnemonic="X"
             disabled={!canDeactivate(user) || user.status === "deleted"}
             title={disabledReason}
             variant="destructive"

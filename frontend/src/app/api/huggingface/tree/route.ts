@@ -23,7 +23,7 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ detail: "repoType 不正" }, { status: 400 });
   }
 
-  const resolved = resolveToken(accountId);
+  const resolved = accountId ? resolveToken(accountId) : null;
   const token = resolved?.token ?? getFallbackToken();
 
   try {

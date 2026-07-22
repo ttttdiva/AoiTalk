@@ -305,7 +305,12 @@ export async function GET(request: NextRequest) {
   const taskRows = await db
     .select()
     .from(tasks)
-    .where(and(inArray(tasks.projectId, readableProjectIds), isNull(tasks.deletedAt)))
+    .where(
+      and(
+        inArray(tasks.projectId, readableProjectIds),
+        isNull(tasks.deletedAt),
+      ),
+    )
     .orderBy(
       sql`${tasks.sortOrder} asc nulls last`,
       tasks.projectId,
@@ -321,7 +326,7 @@ export async function GET(request: NextRequest) {
   const taskIds = taskRows.map((t) => t.id);
   const projectIds = [...new Set(taskRows.map((t) => t.projectId))];
 
-  const projectRows = await db
+  const projectRowsQuery = db
     .select({
       id: projects.id,
       name: projects.name,
@@ -330,8 +335,7 @@ export async function GET(request: NextRequest) {
     .from(projects)
     .where(inArray(projects.id, projectIds));
 
-  // assignees
-  const assigneeRows = await db
+  const assigneeRowsQuery = db
     .select({
       id: taskAssignees.id,
       taskId: taskAssignees.taskId,
@@ -346,7 +350,7 @@ export async function GET(request: NextRequest) {
     .where(inArray(taskAssignees.taskId, taskIds));
 
   // tags
-  const tagRows = await db
+  const tagRowsQuery = db
     .select({
       taskId: taskTags.taskId,
       id: tags.id,
@@ -361,7 +365,7 @@ export async function GET(request: NextRequest) {
     .where(inArray(taskTags.taskId, taskIds));
 
   // active time entries
-  const activeEntries = await db
+  const activeEntriesQuery = db
     .select()
     .from(timeEntries)
     .where(
@@ -373,7 +377,7 @@ export async function GET(request: NextRequest) {
     );
 
   // 完了済み time entries の合計（タスクごと）
-  const totalTimeRows = await db
+  const totalTimeRowsQuery = db
     .select({
       taskId: timeEntries.taskId,
       totalSeconds: sql<number>`coalesce(sum(greatest(extract(epoch from (${timeEntries.endedAt} - ${timeEntries.startedAt})), 0))::int, 0)`,
@@ -385,10 +389,25 @@ export async function GET(request: NextRequest) {
     .groupBy(timeEntries.taskId);
 
   // 繰り返し設定を持つタスクID
-  const recurrenceRows = await db
+  const recurrenceRowsQuery = db
     .select()
     .from(taskRecurrenceRules)
     .where(inArray(taskRecurrenceRules.taskId, taskIds));
+  const [
+    projectRows,
+    assigneeRows,
+    tagRows,
+    activeEntries,
+    totalTimeRows,
+    recurrenceRows,
+  ] = await Promise.all([
+    projectRowsQuery,
+    assigneeRowsQuery,
+    tagRowsQuery,
+    activeEntriesQuery,
+    totalTimeRowsQuery,
+    recurrenceRowsQuery,
+  ]);
   const recurrenceTaskIds = new Set(recurrenceRows.map((r) => r.taskId));
   const effectiveOccurrences = await resolveTaskListEffectiveOccurrences(
     taskRows,

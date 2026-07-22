@@ -6,6 +6,8 @@ import { ExplorerUploadError, explorerUpload } from "@/lib/explorer-api";
 import { getDroppedExplorerFiles } from "@/lib/file-drop";
 import { Upload } from "lucide-react";
 import { toast } from "sonner";
+import { hfUploadFiles } from "@/lib/hf-api";
+import { parseHfPath } from "@/lib/hf/virtual-path";
 
 interface UploadZoneProps {
   children: React.ReactNode;
@@ -13,10 +15,14 @@ interface UploadZoneProps {
 }
 
 export function UploadZone({ children, onContextMenu }: UploadZoneProps) {
-  const { currentPath, refresh } = useExplorer();
+  const { currentPath, refresh, isHfMode, isHydrusMode } = useExplorer();
   const [isDragging, setIsDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
   const dragCounterRef = useRef(0);
+  const hfPath = isHfMode ? parseHfPath(currentPath) : null;
+  const uploadEnabled =
+    !isHydrusMode &&
+    (!isHfMode || Boolean(hfPath?.kind === "repo" && hfPath.accountId));
 
   const handleDragEnter = useCallback((e: React.DragEvent) => {
     // 内部D&D（ファイル移動）の場合はアップロードUIを出さない
@@ -25,9 +31,9 @@ export function UploadZone({ children, onContextMenu }: UploadZoneProps) {
     e.stopPropagation();
     dragCounterRef.current++;
     if (dragCounterRef.current === 1) {
-      setIsDragging(true);
+      setIsDragging(uploadEnabled);
     }
-  }, []);
+  }, [uploadEnabled]);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     // 内部D&D（ファイル移動）の場合はアップロードUIを出さない
@@ -57,11 +63,25 @@ export function UploadZone({ children, onContextMenu }: UploadZoneProps) {
 
       const files = await getDroppedExplorerFiles(e.dataTransfer);
       if (!files || files.length === 0) return;
+      if (!uploadEnabled) {
+        toast.info(
+          isHydrusMode
+            ? "Hydrusへのアップロードは対応していません"
+            : "書き込み用アカウントに紐づくHFリポジトリで利用できます",
+        );
+        return;
+      }
 
       setUploading(true);
       try {
-        const result = await explorerUpload(currentPath, files);
-        toast.success(`${result.successCount}件アップロードしました`);
+        const result = isHfMode
+          ? await hfUploadFiles(currentPath, files)
+          : await explorerUpload(currentPath, files);
+        if (result.failureCount > 0) {
+          toast.warning(`${result.successCount}件成功、${result.failureCount}件失敗しました`);
+        } else {
+          toast.success(`${result.successCount}件アップロードしました`);
+        }
         await refresh();
       } catch (error) {
         if (error instanceof ExplorerUploadError) {
@@ -73,13 +93,15 @@ export function UploadZone({ children, onContextMenu }: UploadZoneProps) {
               : error.message,
           );
         } else {
-          toast.error("アップロードに失敗しました");
+          toast.error(
+            error instanceof Error ? error.message : "アップロードに失敗しました",
+          );
         }
       } finally {
         setUploading(false);
       }
     },
-    [currentPath, refresh],
+    [currentPath, isHfMode, isHydrusMode, refresh, uploadEnabled],
   );
 
   return (

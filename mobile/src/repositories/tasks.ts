@@ -24,6 +24,39 @@ import type { Task as ApiTask } from "../types/api";
 import { enqueueOutbox, randomId } from "./outbox";
 
 type DbTask = typeof schema.tasks.$inferSelect;
+const CACHED_TAGS_KEY = "mobile_cached_tags";
+
+function taskMetadataWithCachedTags(
+  task: Record<string, unknown>,
+): Record<string, unknown> {
+  const metadata =
+    task.metadata &&
+    typeof task.metadata === "object" &&
+    !Array.isArray(task.metadata)
+      ? (task.metadata as Record<string, unknown>)
+      : {};
+  return {
+    ...metadata,
+    [CACHED_TAGS_KEY]: Array.isArray(task.tags) ? task.tags : [],
+  };
+}
+
+function cachedTaskTags(metadata: unknown): ApiTask["tags"] {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return [];
+  }
+  const tags = (metadata as Record<string, unknown>)[CACHED_TAGS_KEY];
+  if (!Array.isArray(tags)) return [];
+  return tags.filter(
+    (tag): tag is NonNullable<ApiTask["tags"]>[number] =>
+      Boolean(
+        tag &&
+          typeof tag === "object" &&
+          typeof (tag as Record<string, unknown>).id === "string" &&
+          typeof (tag as Record<string, unknown>).name === "string",
+      ),
+  );
+}
 
 function extractProjectColor(projectMetadata: unknown): string | null {
   if (
@@ -54,6 +87,7 @@ function toApiShape(
   projectName?: string | null,
   projectColor?: string | null,
 ): ApiTask {
+  const metadata = (row.taskMetadata as Record<string, unknown> | null) ?? {};
   return {
     id: row.id,
     project_id: row.projectId,
@@ -75,10 +109,10 @@ function toApiShape(
     parent_task_id: row.parentTaskId ?? null,
     created_at: row.createdAt ?? "",
     updated_at: row.updatedAt ?? "",
-    metadata: (row.taskMetadata as Record<string, unknown> | null) ?? {},
+    metadata,
     assignees: [],
     recurrence_rule: null,
-    tags: [],
+    tags: cachedTaskTags(metadata),
     sort_order: row.sortOrder ?? undefined,
   } as unknown as ApiTask;
 }
@@ -110,7 +144,7 @@ export async function applyRemoteTasks(list: ApiTask[]): Promise<void> {
         archivedAt: (anyT.archived_at as string | null) ?? null,
         estimatedHours: (anyT.estimated_hours as number | null) ?? null,
         parentTaskId: (anyT.parent_task_id as string | null) ?? null,
-        taskMetadata: (anyT.metadata as unknown) ?? null,
+        taskMetadata: taskMetadataWithCachedTags(anyT),
         sortOrder: (anyT.sort_order as number | null) ?? null,
         createdAt: (anyT.created_at as string | null) ?? now,
         updatedAt: (anyT.updated_at as string | null) ?? now,
@@ -134,7 +168,7 @@ export async function applyRemoteTasks(list: ApiTask[]): Promise<void> {
           archivedAt: (anyT.archived_at as string | null) ?? null,
           estimatedHours: (anyT.estimated_hours as number | null) ?? null,
           parentTaskId: (anyT.parent_task_id as string | null) ?? null,
-          taskMetadata: (anyT.metadata as unknown) ?? null,
+          taskMetadata: taskMetadataWithCachedTags(anyT),
           sortOrder: (anyT.sort_order as number | null) ?? null,
           updatedAt: (anyT.updated_at as string | null) ?? now,
           deletedAt: null,
@@ -164,6 +198,8 @@ function buildLocalTask(
   id = randomId(),
 ): ApiTask {
   const now = new Date().toISOString();
+  const metadata =
+    (data.metadata as Record<string, unknown> | undefined) ?? {};
   const nextStatus = normalizeTaskStatus(data.status ?? "open");
   const completedAt =
     data.completed_at !== undefined
@@ -192,10 +228,22 @@ function buildLocalTask(
     parent_task_id: (data.parent_task_id as string | null) ?? null,
     created_at: now,
     updated_at: now,
-    metadata: (data.metadata as Record<string, unknown> | undefined) ?? {},
+    metadata,
     assignees: [],
-    tags: [],
+    tags: cachedTaskTags(metadata),
+    sort_order:
+      typeof data.sort_order === "number" ? data.sort_order : undefined,
   };
+}
+
+async function nextTopSortOrder(): Promise<number> {
+  // Server contract: top-level tasks share the readable ALL scope order.
+  const local = await tasksRepo.listLocal(null);
+  const orders = local
+    .filter((task) => !task.parent_task_id)
+    .map((task) => task.sort_order)
+    .filter((value): value is number => typeof value === "number");
+  return orders.length > 0 ? Math.min(...orders) - 1 : 0;
 }
 
 function localUpdatePatch(data: Record<string, unknown>) {
@@ -232,6 +280,10 @@ function localUpdatePatch(data: Record<string, unknown>) {
   }
   if ("parent_task_id" in data) {
     patch.parentTaskId = (data.parent_task_id as string | null) ?? null;
+  }
+  if ("sort_order" in data) {
+    patch.sortOrder =
+      typeof data.sort_order === "number" ? data.sort_order : null;
   }
   if ("metadata" in data) patch.taskMetadata = data.metadata as unknown;
   return patch;
@@ -282,9 +334,22 @@ export const tasksRepo = {
             ? b.sort_order
             : Number.POSITIVE_INFINITY;
         if (aSort !== bSort) return aSort - bSort;
-        return String(b.updated_at ?? "").localeCompare(
-          String(a.updated_at ?? ""),
+        const projectOrder = String(a.project_id ?? "").localeCompare(
+          String(b.project_id ?? ""),
         );
+        if (projectOrder !== 0) return projectOrder;
+        const aParent = a.parent_task_id;
+        const bParent = b.parent_task_id;
+        if (aParent == null && bParent != null) return -1;
+        if (aParent != null && bParent == null) return 1;
+        const parentOrder = String(aParent ?? "").localeCompare(
+          String(bParent ?? ""),
+        );
+        if (parentOrder !== 0) return parentOrder;
+        const createdOrder = String(a.created_at ?? "").localeCompare(
+          String(b.created_at ?? ""),
+        );
+        return createdOrder !== 0 ? createdOrder : a.id.localeCompare(b.id);
       });
   },
 
@@ -358,7 +423,7 @@ export const tasksRepo = {
     return list;
   },
 
-  async get(taskId: string): Promise<ApiTask | null> {
+  async getLocal(taskId: string): Promise<ApiTask | null> {
     const db = getDb();
     const rows = await db
       .select({
@@ -369,13 +434,17 @@ export const tasksRepo = {
       .from(schema.tasks)
       .leftJoin(schema.projects, eq(schema.tasks.projectId, schema.projects.id))
       .where(and(eq(schema.tasks.id, taskId), isNull(schema.tasks.deletedAt)));
-    const local = rows[0]
+    return rows[0]
       ? toApiShape(
           rows[0].task,
           rows[0].projectName,
           extractProjectColor(rows[0].projectMetadata),
         )
       : null;
+  },
+
+  async get(taskId: string): Promise<ApiTask | null> {
+    const local = await this.getLocal(taskId);
     if (await canUseServer()) {
       try {
         const remote = await taskApi.getTask(taskId);
@@ -390,17 +459,42 @@ export const tasksRepo = {
 
   async create(data: Record<string, unknown>): Promise<ApiTask> {
     const hasToken = Boolean(await getToken());
+    const sortOrder =
+      typeof data.sort_order === "number"
+        ? data.sort_order
+        : await nextTopSortOrder();
+    const createData: Record<string, unknown> = {
+      ...data,
+      sort_order: sortOrder,
+    };
+    let serverError: unknown = null;
     if (await canUseServer()) {
       try {
-        const created = await taskApi.createTask(data);
+        const created = await taskApi.createTask(createData);
         await applyRemoteTasks([created]);
         return created;
-      } catch {
+      } catch (error) {
+        serverError = error;
         // Fall back to local-first below.
       }
     }
 
-    const local = buildLocalTask(data);
+    const existingMetadata =
+      createData.metadata &&
+      typeof createData.metadata === "object" &&
+      !Array.isArray(createData.metadata)
+        ? (createData.metadata as Record<string, unknown>)
+        : {};
+    const local = buildLocalTask({
+      ...createData,
+      metadata: {
+        ...existingMetadata,
+        mobile_sync_status: hasToken ? "pending" : "local_only",
+        ...(serverError instanceof Error
+          ? { mobile_sync_error: serverError.message }
+          : {}),
+      },
+    });
     await applyRemoteTasks([local]);
     if (hasToken) {
       await enqueueOutbox({

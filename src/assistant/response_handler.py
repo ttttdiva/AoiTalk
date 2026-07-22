@@ -7,6 +7,11 @@ import inspect
 import time
 from typing import Optional, Set, Dict, Any
 from src.tools.keyword.character_manager import get_character_manager
+from src.llm.generation_error import (
+    GenerationFailure,
+    classify_generation_error,
+    empty_response_failure,
+)
 
 
 class ResponseHandler:
@@ -32,6 +37,12 @@ class ResponseHandler:
         self.is_generating = False
         self.active_tasks: Set[asyncio.Task] = set()
         self.task_counter = 0
+
+        # 直近の応答生成失敗の分類結果（呼び出し元がユーザー向け文言と技術詳細の
+        # 両方を回収できるように公開する）。成功時は None。
+        # 例外failureは classify_generation_error による分類結果、
+        # 純粋な空応答は kind=EMPTY_RESPONSE の分類結果で区別する。
+        self.last_generation_failure: Optional[GenerationFailure] = None
         
         # Resource locks for parallel processing
         if tts_manager and player:
@@ -216,10 +227,29 @@ class ResponseHandler:
         steering_callback=None,
     ) -> Optional[str]:
         """Generate response without TTS/playback"""
-        try:
-            self.is_generating = True
-            current_task = asyncio.current_task()
+        streamed_final_response: Optional[str] = None
 
+        async def capture_stream_callback(event_type: str, data: Any) -> None:
+            nonlocal streamed_final_response
+            if event_type == "stream_end" and isinstance(data, dict):
+                content = str(data.get("content") or "").strip()
+                if content:
+                    streamed_final_response = content
+            if stream_callback is not None:
+                callback_result = stream_callback(event_type, data)
+                if inspect.isawaitable(callback_result):
+                    await callback_result
+
+        async def run_generation_attempt() -> Optional[str]:
+            """LLM生成を1回実行し、応答文字列（空なら None）を返す。
+
+            戻り値が空でも配信済みの最終ストリーム応答があればそれを回収する。
+            例外はここでは握り潰さず呼び出し側へ送出する。
+            """
+            nonlocal streamed_final_response
+            streamed_final_response = None
+
+            current_task = asyncio.current_task()
             if current_task and current_task.cancelled():
                 print(f"[{task_id}] 応答生成前にキャンセル検出")
                 return None
@@ -239,23 +269,93 @@ class ResponseHandler:
                     if accepts_kwargs or "image_data" in parameters:
                         call_kwargs["image_data"] = image_data
                     if accepts_kwargs or "stream_callback" in parameters:
-                        call_kwargs["stream_callback"] = stream_callback
+                        call_kwargs["stream_callback"] = (
+                            capture_stream_callback if stream_callback is not None else None
+                        )
                     if accepts_kwargs or "steering_callback" in parameters:
                         call_kwargs["steering_callback"] = steering_callback
                 except (TypeError, ValueError):
                     call_kwargs = {
                         "image_data": image_data,
-                        "stream_callback": stream_callback,
+                        "stream_callback": (
+                            capture_stream_callback if stream_callback is not None else None
+                        ),
                     }
-                response = await async_generate(text, **call_kwargs)
+                attempt_response = await async_generate(text, **call_kwargs)
             else:
-                response = await asyncio.to_thread(
+                attempt_response = await asyncio.to_thread(
                     self.llm_client.generate_response,
                     text,
                     image_data=image_data,
                 )
 
+            if not attempt_response and streamed_final_response:
+                print(
+                    f"[{task_id}] LLM戻り値が空のため、配信済みの最終応答を回収しました"
+                )
+                attempt_response = streamed_final_response
+
+            return attempt_response
+
+        try:
+            self.is_generating = True
+            self.last_generation_failure = None
+
+            # 1回目の生成。例外は捕捉して分類し、ユーザー向け文言と技術詳細の
+            # 両方を保持する（文字列へ潰さない）。
+            try:
+                response = await run_generation_attempt()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                failure = classify_generation_error(e)
+                print(
+                    f"[{task_id}] 応答生成エラー[{failure.kind}]: "
+                    f"{failure.technical_detail}"
+                )
+                import traceback
+                traceback.print_exc()
+                self.last_generation_failure = failure
+                if streamed_final_response:
+                    print(f"[{task_id}] 配信済みの最終応答を例外後に回収しました")
+                    response = streamed_final_response
+                    self.last_generation_failure = None
+                else:
+                    response = None
+
+            # プロジェクトコンテキスト起因の失敗フォールバック:
+            # include_project_context が有効な状態で失敗した場合、コンテキストなしで1回だけ再試行する。
+            if not response and self._project_context_enabled():
+                print(
+                    f"[{task_id}] プロジェクトコンテキスト有効時に生成失敗。"
+                    f"コンテキストなしで再試行します"
+                )
+                self._set_project_context_enabled(False)
+                try:
+                    retry_response = await run_generation_attempt()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    failure = classify_generation_error(e)
+                    print(
+                        f"[{task_id}] 再試行の応答生成エラー[{failure.kind}]: "
+                        f"{failure.technical_detail}"
+                    )
+                    import traceback
+                    traceback.print_exc()
+                    self.last_generation_failure = failure
+                    retry_response = streamed_final_response or None
+                if retry_response:
+                    print(
+                        f"[{task_id}] プロジェクトコンテキストなしで再試行して成功"
+                    )
+                    self.last_generation_failure = None
+                    response = retry_response
+
             if not response:
+                # 例外が記録されていなければ純粋な空応答として区別する。
+                if self.last_generation_failure is None:
+                    self.last_generation_failure = empty_response_failure()
                 print(f"[{task_id}] 応答生成失敗")
                 return None
 
@@ -279,11 +379,19 @@ class ResponseHandler:
         except asyncio.CancelledError:
             print(f"[{task_id}] 応答生成がキャンセルされました")
             raise
-        except Exception as e:
-            print(f"[{task_id}] 応答生成エラー: {type(e).__name__}: {e}")
-            return None
         finally:
             self.is_generating = False
+
+    def _project_context_enabled(self) -> bool:
+        """現在の LLM クライアントでプロジェクトコンテキスト注入が有効かどうか。"""
+        return bool(getattr(self.llm_client, "current_include_project_context", None))
+
+    def _set_project_context_enabled(self, enabled: bool) -> None:
+        """LLM クライアントのプロジェクトコンテキスト注入フラグを切り替える。"""
+        if self.llm_client is not None and hasattr(
+            self.llm_client, "current_include_project_context"
+        ):
+            self.llm_client.current_include_project_context = enabled
 
     def _schedule_deferred_project_fact_reflection(
         self,

@@ -37,6 +37,10 @@ import {
   type Task,
 } from "@/lib/task-api";
 import { TaskDetailModal } from "@/components/tasks/task-detail-modal";
+import {
+  RemoteTaskDialog,
+  type RemoteTaskDialogTarget,
+} from "@/components/tasks/remote-task-dialog";
 import { RecurringDeleteDialog } from "@/components/tasks/task-detail/recurring-delete-dialog";
 import { TagPill } from "@/components/tasks/tag-pill";
 import {
@@ -59,10 +63,8 @@ import {
   dateButtonColor,
   formatDuration,
   formatElapsed,
-  getStatusShortcutTarget,
   getTaskDateView,
   getTaskOccurrenceContext,
-  handleStatusShortcutCapture,
   isFutureTask,
   isOverdue,
   PRIORITY_COLORS,
@@ -93,14 +95,27 @@ import {
 } from "@/components/tasks/task-list-rows";
 
 export default function TasksPage() {
-  const { projects, selectedProjectId, setSelectedProjectId, selectedSpaceId } =
-    useProject();
+  const {
+    projects,
+    allProjects,
+    spaces,
+    selectedProjectId,
+    selectedProject,
+    setSelectedProjectId,
+    selectedSpaceId,
+    refreshProjects,
+    projectsLoading,
+    projectsLoadError,
+    initialLoadComplete,
+  } = useProject();
+  const remoteReadOnly = selectedProject?.source === "remote";
   const {
     tasks,
     setTasks,
     tags,
     setTags,
     loading,
+    loadError,
     fetchData,
     hasLoadedTasksRef,
     upsertTaskLocally,
@@ -109,7 +124,7 @@ export default function TasksPage() {
     applyTaskPatchesLocally,
     applyTopLevelReorderLocally,
     applyAllTopLevelReorderLocally,
-  } = useTasksData(selectedProjectId);
+  } = useTasksData(selectedProjectId, selectedProject, selectedSpaceId);
   const [filter, setFilter] = useState<FilterTab>("all");
   const [showClosed, setShowClosed] = useState(false);
   const [customFilter, setCustomFilter] = useState<FilterConfig>(EMPTY_FILTER);
@@ -152,6 +167,9 @@ export default function TasksPage() {
     () => new Set(projects.map((project) => project.id)),
     [projects],
   );
+  const retryInitialData = useCallback(() => {
+    void Promise.all([fetchData({ forceLoading: true }), refreshProjects()]);
+  }, [fetchData, refreshProjects]);
 
   // filteredTasks を ref で保持（Shift+クリック範囲選択・DnD 用）
   const filteredTasksRef = useRef<Task[]>([]);
@@ -196,6 +214,28 @@ export default function TasksPage() {
     occurrenceContext: RecurringOccurrenceContext;
   } | null>(null);
   const [draftTask, setDraftTask] = useState<Partial<Task> | null>(null);
+  const selectedRemoteTask = selectedTaskId
+    ? tasks.find(
+        (task) => task.id === selectedTaskId && task.source === "remote",
+      )
+    : null;
+  const remoteDialogTarget: RemoteTaskDialogTarget | null =
+    selectedRemoteTask &&
+    selectedRemoteTask.remote_server_id &&
+    selectedRemoteTask.resource_id
+      ? {
+          profileId: selectedRemoteTask.remote_server_id,
+          profileName: selectedRemoteTask.remote_server_name ?? "Remote",
+          profileColor: selectedRemoteTask.remote_server_color,
+          baseUrl: selectedRemoteTask.remote_server_base_url ?? "",
+          taskId: selectedRemoteTask.resource_id,
+          title: selectedRemoteTask.title,
+          status: selectedRemoteTask.status,
+          priority: selectedRemoteTask.priority,
+          startAt: selectedRemoteTask.start_at,
+          endAt: selectedRemoteTask.end_at,
+        }
+      : null;
   const requestRecurringDelete = useCallback((task: Task): boolean => {
     if (!task.has_recurrence) return false;
     const occurrenceContext = getTaskOccurrenceContext(task);
@@ -211,6 +251,10 @@ export default function TasksPage() {
   const handleRecurringDelete = useCallback(
     async (mode: "single" | "future") => {
       if (!pendingRecurringDelete) return;
+      if (remoteReadOnly) {
+        toast.error("Enterprise参照は読み取り専用です");
+        return;
+      }
       const { task, occurrenceContext } = pendingRecurringDelete;
       try {
         await taskApi.deleteOccurrence(task.id, {
@@ -227,7 +271,7 @@ export default function TasksPage() {
         console.error("繰り返しタスク削除失敗:", err);
       }
     },
-    [clearSelection, fetchData, pendingRecurringDelete],
+    [clearSelection, fetchData, pendingRecurringDelete, remoteReadOnly],
   );
   const openTaskById = useCallback(
     (
@@ -286,6 +330,10 @@ export default function TasksPage() {
   // タスク作成
   const handleCreateNewTask = useCallback(async () => {
     if (!selectedProjectId) return;
+    if (remoteReadOnly) {
+      toast.error("Enterprise参照は読み取り専用です");
+      return;
+    }
     setSelectedTaskId(null);
     setSelectedOccurrenceContext(null);
     setDraftTask({
@@ -293,7 +341,12 @@ export default function TasksPage() {
       title: "",
       notifications_enabled: taskNotificationsDefaultEnabled,
     });
-  }, [selectedProjectId, projectTab, taskNotificationsDefaultEnabled]);
+  }, [
+    projectTab,
+    remoteReadOnly,
+    selectedProjectId,
+    taskNotificationsDefaultEnabled,
+  ]);
 
   // コマンドパレットからの ?detail= / ?new=1 パラメータで各ダイアログを開く
   useEffect(() => {
@@ -344,6 +397,10 @@ export default function TasksPage() {
       task: Task,
       changes: { start_at?: string | null; end_at?: string | null },
     ) => {
+      if (remoteReadOnly) {
+        toast.error("Enterprise参照は読み取り専用です");
+        return;
+      }
       const dateView = getTaskDateView(task);
       const updates = buildTaskDateUpdate(dateView, changes);
       if (task.has_recurrence && task.effective_occurrence_start_at) {
@@ -360,8 +417,9 @@ export default function TasksPage() {
             ? updates.start_at
             : task.effective_occurrence_start_at;
         if (!nextStartAt) return;
-        const nextEndAt =
-          hasEndUpdate ? updates.end_at : (task.effective_occurrence_end_at ?? null);
+        const nextEndAt = hasEndUpdate
+          ? updates.end_at
+          : (task.effective_occurrence_end_at ?? null);
         applyTaskPatchLocally(task.id, {
           effective_start_at: nextStartAt,
           effective_end_at: nextEndAt,
@@ -402,12 +460,13 @@ export default function TasksPage() {
         await fetchData();
       }
     },
-    [applyTaskPatchLocally, fetchData, pushUndo, snapshotTask],
+    [applyTaskPatchLocally, fetchData, pushUndo, remoteReadOnly, snapshotTask],
   );
 
   useEffect(() => {
-    fetchData();
-  }, [fetchData]);
+    if (!initialLoadComplete) return;
+    fetchData({ forceLoading: true });
+  }, [fetchData, initialLoadComplete]);
 
   // グローバルタスク作成からのリフレッシュ通知
   useEffect(() => {
@@ -420,6 +479,10 @@ export default function TasksPage() {
   const handleTimer = useCallback(
     async (task: Task, e: React.MouseEvent) => {
       e.stopPropagation();
+      if (remoteReadOnly) {
+        toast.error("Enterprise参照ではタイマーを操作できません");
+        return;
+      }
       setTimerLoading(task.id);
       try {
         if (task.active_time_entry) {
@@ -456,7 +519,7 @@ export default function TasksPage() {
         setTimerLoading(null);
       }
     },
-    [fetchData, setTasks],
+    [fetchData, remoteReadOnly, setTasks],
   );
 
   // 他画面（ヘッダー/モーダル）でタイマーが変わったら一覧も再取得
@@ -471,6 +534,10 @@ export default function TasksPage() {
   // フォーカス中タスクのタイマー開始
   const handleFocusedTaskTimerStart = useCallback(async () => {
     if (!focusedTaskId) return;
+    if (remoteReadOnly) {
+      toast.error("Enterprise参照ではタイマーを操作できません");
+      return;
+    }
     const task = tasks.find((item) => item.id === focusedTaskId);
     if (!task || task.active_time_entry) return;
 
@@ -493,7 +560,7 @@ export default function TasksPage() {
     } finally {
       setTimerLoading(null);
     }
-  }, [fetchData, focusedTaskId, setTasks, tasks]);
+  }, [fetchData, focusedTaskId, remoteReadOnly, setTasks, tasks]);
 
   // 経過時間リアルタイム表示
   const [now, setNow] = useState(() => Date.now());
@@ -634,7 +701,8 @@ export default function TasksPage() {
     tasks,
     tags,
     setTags,
-    projects,
+    projects: allProjects.filter((project) => !project.is_completed),
+    spaces,
     selectedProjectId,
     fetchData,
     focusTaskById,
@@ -655,6 +723,10 @@ export default function TasksPage() {
   const handleSubtaskAdd = useCallback(
     async (parentTask: Task) => {
       if (!subtaskAddTitle.trim()) return;
+      if (remoteReadOnly) {
+        toast.error("Enterprise参照は読み取り専用です");
+        return;
+      }
       setSubtaskAddCreating(true);
       try {
         const created = await taskApi.createTask({
@@ -671,7 +743,7 @@ export default function TasksPage() {
         setSubtaskAddCreating(false);
       }
     },
-    [subtaskAddTitle, fetchData, upsertTaskLocally],
+    [fetchData, remoteReadOnly, subtaskAddTitle, upsertTaskLocally],
   );
 
   // サブタスクマップ（parent_task_id → サブタスク配列）
@@ -783,6 +855,7 @@ export default function TasksPage() {
     setBulkLoading,
     lastClickedIndexRef,
     prevShiftRangeRef,
+    readOnly: remoteReadOnly,
   });
 
   // 一括操作
@@ -811,44 +884,6 @@ export default function TasksPage() {
     filteredTasksRef,
     requestRecurringDelete,
   });
-
-  // ステータスメニュー表示中のショートカットキー
-  useEffect(() => {
-    if (!bulkStatusMenuOpen && !rowStatusMenuTaskId) return;
-
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const target = getStatusShortcutTarget(e.key);
-      if (!target) return;
-
-      e.preventDefault();
-      e.stopPropagation();
-      e.stopImmediatePropagation();
-
-      if (rowStatusMenuTaskId) {
-        const task = tasks.find((item) => item.id === rowStatusMenuTaskId);
-        closeRowStatusMenuAndRefocusTask(rowStatusMenuTaskId);
-        if (task) {
-          void handleRowStatusChange(task, target);
-        }
-        return;
-      }
-
-      if (bulkStatusMenuOpen) {
-        setBulkStatusMenuOpen(false);
-        void handleBulkStatusChange(target);
-      }
-    };
-
-    window.addEventListener("keydown", handleKeyDown, true);
-    return () => window.removeEventListener("keydown", handleKeyDown, true);
-  }, [
-    bulkStatusMenuOpen,
-    closeRowStatusMenuAndRefocusTask,
-    handleBulkStatusChange,
-    handleRowStatusChange,
-    rowStatusMenuTaskId,
-    tasks,
-  ]);
 
   useEffect(() => {
     if (filteredTasks.length === 0) {
@@ -888,6 +923,7 @@ export default function TasksPage() {
     handleClipboardPaste,
     clipboardRef,
     searchInputRef,
+    readOnly: remoteReadOnly,
   });
 
   return (
@@ -948,6 +984,7 @@ export default function TasksPage() {
       {/* フィルタ + トグル */}
       <TaskListToolbar
         selectedIds={selectedIds}
+        readOnly={remoteReadOnly}
         bulkLoading={bulkLoading}
         bulkStatusMenuOpen={bulkStatusMenuOpen}
         setBulkStatusMenuOpen={setBulkStatusMenuOpen}
@@ -976,11 +1013,40 @@ export default function TasksPage() {
 
       {/* タスクテーブル */}
       <ScrollArea className="min-h-0 flex-1">
-        {loading ? (
+        {(loadError || projectsLoadError) &&
+        tasks.length > 0 &&
+        projects.length > 0 ? (
+          <div
+            className="mb-3 flex items-center justify-between rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100"
+            role="alert"
+          >
+            <span>
+              最新の一覧を取得できませんでした。前回のデータを表示しています。
+            </span>
+            <Button variant="outline" size="sm" onClick={retryInitialData}>
+              再試行
+            </Button>
+          </div>
+        ) : null}
+        {loading || (projectsLoading && projects.length === 0) ? (
           <div className="space-y-2">
             {Array.from({ length: 5 }).map((_, i) => (
               <Skeleton key={i} className="h-10 w-full rounded" />
             ))}
+          </div>
+        ) : (loadError || projectsLoadError) &&
+          (tasks.length === 0 || projects.length === 0) ? (
+          <div
+            className="flex flex-col items-center justify-center gap-3 py-16 text-muted-foreground"
+            role="alert"
+          >
+            <p className="text-sm">タスクを取得できませんでした</p>
+            <p className="text-xs">
+              通信状態を確認して、もう一度お試しください。
+            </p>
+            <Button variant="outline" size="sm" onClick={retryInitialData}>
+              再試行
+            </Button>
           </div>
         ) : filteredTasks.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">
@@ -997,6 +1063,7 @@ export default function TasksPage() {
                       selectedIds.size === filteredTasks.length
                     }
                     onCheckedChange={toggleSelectAll}
+                    disabled={remoteReadOnly}
                     className="size-3.5"
                     title="全選択"
                   />
@@ -1034,7 +1101,7 @@ export default function TasksPage() {
                         taskRowRefs.current[task.id] = node;
                       }}
                       data-testid={`task-row-${task.id}`}
-                      draggable
+                      draggable={!remoteReadOnly}
                       tabIndex={focusedTaskId === task.id ? 0 : -1}
                       onFocus={() => setFocusedTaskId(task.id)}
                       onDragStart={(e) => handleDragStart(e, task.id)}
@@ -1042,7 +1109,9 @@ export default function TasksPage() {
                       onDragLeave={handleDragLeave}
                       onDrop={(e) => handleDrop(e, task.id)}
                       onDragEnd={handleDragEnd}
-                      onContextMenu={(e) => handleContextMenu(e, task)}
+                      onContextMenu={(e) => {
+                        if (!remoteReadOnly) handleContextMenu(e, task);
+                      }}
                       onMouseEnter={() => setHoveredGroupId(task.id)}
                       onClick={() => {
                         focusTaskById(task.id);
@@ -1065,14 +1134,11 @@ export default function TasksPage() {
                         onClick={(e) => e.stopPropagation()}
                       >
                         <Checkbox
+                          disabled={remoteReadOnly}
                           checked={selectedIds.has(task.id)}
                           onClick={(e) => {
                             e.stopPropagation();
-                            handleCheckboxClick(
-                              task.id,
-                              taskIndex,
-                              e.shiftKey,
-                            );
+                            handleCheckboxClick(task.id, taskIndex, e.shiftKey);
                           }}
                           onCheckedChange={() => {
                             /* tdのonClickで処理 */
@@ -1117,50 +1183,55 @@ export default function TasksPage() {
                           ) : (
                             <span className="w-5" />
                           )}
-                          <DropdownMenu
-                            open={rowStatusMenuTaskId === task.id}
-                            onOpenChange={(open) =>
-                              handleRowStatusMenuOpenChange(task.id, open)
-                            }
-                            onOpenChangeComplete={(open) =>
-                              handleRowStatusMenuOpenChangeComplete(
-                                task.id,
-                                open,
-                              )
-                            }
-                          >
-                            <DropdownMenuTrigger
-                              onClick={(e) => e.stopPropagation()}
+                          {remoteReadOnly ? (
+                            <span
                               className={cn(
-                                "size-4 shrink-0 rounded-full border-2 transition-colors hover:ring-2 hover:ring-offset-1 hover:ring-primary/30 cursor-pointer",
+                                "size-4 shrink-0 rounded-full border-2",
                                 STATUS_DOT_COLORS[task.status] ||
                                   STATUS_DOT_COLORS.open,
                               )}
                               title={STATUS_LABELS[task.status]}
                             />
-                            <DropdownMenuContent
-                              align="start"
-                              className="min-w-36"
-                              finalFocus={() =>
-                                resolveRowStatusMenuFinalFocus(task.id)
+                          ) : (
+                            <DropdownMenu
+                              open={rowStatusMenuTaskId === task.id}
+                              onOpenChange={(open) =>
+                                handleRowStatusMenuOpenChange(task.id, open)
                               }
-                              onKeyDownCapture={(e) =>
-                                handleStatusShortcutCapture(e, (target) => {
-                                  closeRowStatusMenuAndRefocusTask(task.id);
-                                  void handleRowStatusChange(task, target);
-                                })
+                              onOpenChangeComplete={(open) =>
+                                handleRowStatusMenuOpenChangeComplete(
+                                  task.id,
+                                  open,
+                                )
                               }
                             >
-                              <TaskStatusMenuItems
-                                currentStatus={task.status}
-                                onSelect={async (status, e) => {
-                                  e.stopPropagation();
-                                  closeRowStatusMenuAndRefocusTask(task.id);
-                                  await handleRowStatusChange(task, status);
-                                }}
+                              <DropdownMenuTrigger
+                                onClick={(e) => e.stopPropagation()}
+                                className={cn(
+                                  "size-4 shrink-0 rounded-full border-2 transition-colors hover:ring-2 hover:ring-offset-1 hover:ring-primary/30 cursor-pointer",
+                                  STATUS_DOT_COLORS[task.status] ||
+                                    STATUS_DOT_COLORS.open,
+                                )}
+                                title={STATUS_LABELS[task.status]}
                               />
-                            </DropdownMenuContent>
-                          </DropdownMenu>
+                              <DropdownMenuContent
+                                align="start"
+                                className="min-w-36"
+                                finalFocus={() =>
+                                  resolveRowStatusMenuFinalFocus(task.id)
+                                }
+                              >
+                                <TaskStatusMenuItems
+                                  currentStatus={task.status}
+                                  onSelect={async (status, e) => {
+                                    e.stopPropagation();
+                                    closeRowStatusMenuAndRefocusTask(task.id);
+                                    await handleRowStatusChange(task, status);
+                                  }}
+                                />
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                          )}
                         </div>
                       </td>
 
@@ -1242,9 +1313,14 @@ export default function TasksPage() {
                         >
                           <select
                             value={task.project_id}
+                            disabled={remoteReadOnly}
                             onChange={async (e) => {
                               const newProjectId = e.target.value;
                               if (newProjectId === task.project_id) return;
+                              if (remoteReadOnly) {
+                                toast.error("Enterprise参照は読み取り専用です");
+                                return;
+                              }
                               try {
                                 pushUndo({
                                   type: "update",
@@ -1286,43 +1362,52 @@ export default function TasksPage() {
                               aria-label="繰り返しタスク"
                             />
                           )}
-                          <TaskRowDatePicker
-                            taskId={task.id}
-                            startAt={toLocalDateTimeInputValue(
-                              getTaskDisplayStartAt(task),
-                              { allDay: getTaskDisplayAllDay(task) },
-                            )}
-                            endAt={toLocalDateTimeInputValue(
-                              getTaskDisplayEndAt(task),
-                              {
-                                allDay: getTaskDisplayAllDay(task),
-                              },
-                            )}
-                            onRangeChange={({ startAt, endAt }) =>
-                              handleTaskDateChange(task, {
-                                start_at: startAt,
-                                end_at: endAt,
-                              })
-                            }
-                            onRecurrenceChange={(hasRecurrence) =>
-                              applyTaskPatchLocally(task.id, {
-                                has_recurrence: hasRecurrence,
-                              })
-                            }
-                            allDay={getTaskDisplayAllDay(task)}
-                            startPlaceholder="Start Date"
-                            endPlaceholder="Due Date"
-                            startButtonClassName={dateButtonColor(
-                              getTaskDisplayStartAt(task),
-                              task,
-                              "start",
-                            )}
-                            endButtonClassName={dateButtonColor(
-                              getTaskDisplayEndAt(task),
-                              task,
-                              "end",
-                            )}
-                          />
+                          {remoteReadOnly ? (
+                            <span className="text-xs text-muted-foreground">
+                              {getTaskDisplayStartAt(task) ||
+                              getTaskDisplayEndAt(task)
+                                ? `${getTaskDisplayStartAt(task) ?? "-"} / ${getTaskDisplayEndAt(task) ?? "-"}`
+                                : "-"}
+                            </span>
+                          ) : (
+                            <TaskRowDatePicker
+                              taskId={task.id}
+                              startAt={toLocalDateTimeInputValue(
+                                getTaskDisplayStartAt(task),
+                                { allDay: getTaskDisplayAllDay(task) },
+                              )}
+                              endAt={toLocalDateTimeInputValue(
+                                getTaskDisplayEndAt(task),
+                                {
+                                  allDay: getTaskDisplayAllDay(task),
+                                },
+                              )}
+                              onRangeChange={({ startAt, endAt }) =>
+                                handleTaskDateChange(task, {
+                                  start_at: startAt,
+                                  end_at: endAt,
+                                })
+                              }
+                              onRecurrenceChange={(hasRecurrence) =>
+                                applyTaskPatchLocally(task.id, {
+                                  has_recurrence: hasRecurrence,
+                                })
+                              }
+                              allDay={getTaskDisplayAllDay(task)}
+                              startPlaceholder="Start Date"
+                              endPlaceholder="Due Date"
+                              startButtonClassName={dateButtonColor(
+                                getTaskDisplayStartAt(task),
+                                task,
+                                "start",
+                              )}
+                              endButtonClassName={dateButtonColor(
+                                getTaskDisplayEndAt(task),
+                                task,
+                                "end",
+                              )}
+                            />
+                          )}
                         </div>
                       </td>
 
@@ -1340,22 +1425,24 @@ export default function TasksPage() {
 
                       {/* タイマーボタン */}
                       <td className="py-2 pr-2">
-                        <Button
-                          variant="ghost"
-                          size="icon-xs"
-                          onClick={(e) => handleTimer(task, e)}
-                          disabled={timerLoading === task.id}
-                          className={cn(
-                            "shrink-0",
-                            task.active_time_entry && "text-green-600",
-                          )}
-                        >
-                          {task.active_time_entry ? (
-                            <Square className="size-3" />
-                          ) : (
-                            <Play className="size-3" />
-                          )}
-                        </Button>
+                        {!remoteReadOnly && (
+                          <Button
+                            variant="ghost"
+                            size="icon-xs"
+                            onClick={(e) => handleTimer(task, e)}
+                            disabled={timerLoading === task.id}
+                            className={cn(
+                              "shrink-0",
+                              task.active_time_entry && "text-green-600",
+                            )}
+                          >
+                            {task.active_time_entry ? (
+                              <Square className="size-3" />
+                            ) : (
+                              <Play className="size-3" />
+                            )}
+                          </Button>
+                        )}
                       </td>
                     </tr>
 
@@ -1383,11 +1470,13 @@ export default function TasksPage() {
                           handleTaskDateChange={handleTaskDateChange}
                           applyTaskPatchLocally={applyTaskPatchLocally}
                           requestRecurringDelete={requestRecurringDelete}
+                          readOnly={remoteReadOnly}
                         />
                       ))}
 
                     {/* サブタスク追加行 — 既にサブタスクがあり、かつグループに hover 中 or 入力中のみ表示 */}
                     {isExpanded &&
+                      !remoteReadOnly &&
                       hasSubtasks &&
                       (hoveredGroupId === task.id ||
                         subtaskAddParentId === task.id) && (
@@ -1408,72 +1497,92 @@ export default function TasksPage() {
                 );
               })}
               {/* インラインQuickAdd行 */}
-              <QuickAddRow
-                colSpan={projectTab === "all" ? 7 : 6}
-                projectTab={projectTab}
-                selectedProjectId={selectedProjectId}
-                upsertTaskLocally={upsertTaskLocally}
-                fetchData={fetchData}
-              />
+              {!remoteReadOnly && (
+                <QuickAddRow
+                  colSpan={projectTab === "all" ? 7 : 6}
+                  projectTab={projectTab}
+                  selectedProjectId={selectedProjectId}
+                  upsertTaskLocally={upsertTaskLocally}
+                  fetchData={fetchData}
+                />
+              )}
             </tbody>
           </table>
         )}
       </ScrollArea>
 
-      <TaskCommandDialog
-        open={taskCommandOpen}
-        onClose={closeTaskCommandDialog}
-        taskCommandTaskId={taskCommandTaskId}
-        tasks={tasks}
-        value={taskCommandValue}
-        onValueChange={setTaskCommandValue}
-        error={taskCommandError}
-        onErrorClear={() => setTaskCommandError(null)}
-        loading={taskCommandLoading}
-        commandCandidates={taskCommandCandidates}
-        onSubmit={handleTaskCommandSubmit}
-      />
+      {!remoteReadOnly && (
+        <TaskCommandDialog
+          open={taskCommandOpen}
+          onClose={closeTaskCommandDialog}
+          taskCommandTaskId={taskCommandTaskId}
+          tasks={tasks}
+          value={taskCommandValue}
+          onValueChange={setTaskCommandValue}
+          error={taskCommandError}
+          onErrorClear={() => setTaskCommandError(null)}
+          loading={taskCommandLoading}
+          commandCandidates={taskCommandCandidates}
+          onSubmit={handleTaskCommandSubmit}
+        />
+      )}
 
       {/* タスク詳細モーダル */}
-      <TaskDetailModal
-        taskId={selectedTaskId}
-        draftTask={draftTask}
-        open={!!selectedTaskId || !!draftTask}
-        onOpenChange={(open) => {
-          if (open) return;
-          setSelectedTaskId(null);
-          setSelectedOccurrenceContext(null);
-          setDraftTask(null);
-        }}
-        onTaskUpdated={() => fetchData({ forceLoading: false })}
-        occurrenceContext={selectedOccurrenceContext}
-      />
-      <RecurringDeleteDialog
-        open={!!pendingRecurringDelete}
-        onOpenChange={(open) => {
-          if (!open) setPendingRecurringDelete(null);
-        }}
-        onDeleteSingle={() => void handleRecurringDelete("single")}
-        onDeleteFuture={() => void handleRecurringDelete("future")}
-      />
+      {!remoteReadOnly && (
+        <TaskDetailModal
+          taskId={selectedTaskId}
+          draftTask={draftTask}
+          open={!!selectedTaskId || !!draftTask}
+          onOpenChange={(open) => {
+            if (open) return;
+            setSelectedTaskId(null);
+            setSelectedOccurrenceContext(null);
+            setDraftTask(null);
+          }}
+          onTaskUpdated={() => fetchData({ forceLoading: false })}
+          occurrenceContext={selectedOccurrenceContext}
+        />
+      )}
+      {remoteReadOnly && (
+        <RemoteTaskDialog
+          target={remoteDialogTarget}
+          onClose={() => {
+            setSelectedTaskId(null);
+            setSelectedOccurrenceContext(null);
+          }}
+          onUpdated={() => fetchData({ forceLoading: false })}
+        />
+      )}
+      {!remoteReadOnly && (
+        <RecurringDeleteDialog
+          open={!!pendingRecurringDelete}
+          onOpenChange={(open) => {
+            if (!open) setPendingRecurringDelete(null);
+          }}
+          onDeleteSingle={() => void handleRecurringDelete("single")}
+          onDeleteFuture={() => void handleRecurringDelete("future")}
+        />
+      )}
 
       {/* 右クリックコンテキストメニュー */}
-      <TaskListContextMenu
-        contextMenu={contextMenu}
-        contextMenuRef={contextMenuRef}
-        contextMenuStyle={contextMenuStyle}
-        contextSubmenuClassName={contextSubmenuClassName}
-        statusSubmenuOpen={statusSubmenuOpen}
-        setStatusSubmenuOpen={setStatusSubmenuOpen}
-        prioritySubmenuOpen={prioritySubmenuOpen}
-        setPrioritySubmenuOpen={setPrioritySubmenuOpen}
-        onStatusChange={handleContextStatusChange}
-        onPriorityChange={handleContextPriorityChange}
-        onTimer={handleContextTimer}
-        onDuplicate={handleDuplicate}
-        onCopyTaskId={handleCopyTaskId}
-        onDelete={handleContextDelete}
-      />
+      {!remoteReadOnly && (
+        <TaskListContextMenu
+          contextMenu={contextMenu}
+          contextMenuRef={contextMenuRef}
+          contextMenuStyle={contextMenuStyle}
+          contextSubmenuClassName={contextSubmenuClassName}
+          statusSubmenuOpen={statusSubmenuOpen}
+          setStatusSubmenuOpen={setStatusSubmenuOpen}
+          prioritySubmenuOpen={prioritySubmenuOpen}
+          setPrioritySubmenuOpen={setPrioritySubmenuOpen}
+          onStatusChange={handleContextStatusChange}
+          onPriorityChange={handleContextPriorityChange}
+          onTimer={handleContextTimer}
+          onDuplicate={handleDuplicate}
+          onCopyTaskId={handleCopyTaskId}
+          onDelete={handleContextDelete}
+        />
+      )}
     </div>
   );
 }

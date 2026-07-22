@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import useSWR from "swr";
 import { useExplorer } from "@/contexts/explorer-context";
 import {
   gitStatus,
@@ -25,10 +26,22 @@ interface GitPanelProps {
   onOpenChange: (open: boolean) => void;
 }
 
+const EMPTY_LOGS: GitLogEntry[] = [];
+
+// Git ステータス・ログの SWR 共通オプション。
+// パネルを開いた時・コミット直後の再取得は従来どおり呼び出し側で駆動するため、
+// SWR の自動 revalidation は全て無効化して表示挙動を不変に保つ。
+const GIT_SWR_OPTIONS = {
+  revalidateOnMount: false,
+  revalidateOnFocus: false,
+  revalidateOnReconnect: false,
+  revalidateIfStale: false,
+  keepPreviousData: true,
+  dedupingInterval: 0,
+} as const;
+
 export function GitPanel({ open, onOpenChange }: GitPanelProps) {
   const { storageCtx } = useExplorer();
-  const [status, setStatus] = useState<GitStatusResponse | null>(null);
-  const [logs, setLogs] = useState<GitLogEntry[]>([]);
   const [commitMsg, setCommitMsg] = useState("");
   const [committing, setCommitting] = useState(false);
   const [commitResult, setCommitResult] = useState<string | null>(null);
@@ -36,30 +49,46 @@ export function GitPanel({ open, onOpenChange }: GitPanelProps) {
   const ctxType = storageCtx?.type || "personal";
   const ctxId = storageCtx?.id || undefined;
 
-  const fetchStatus = useCallback(async () => {
+  // 取得失敗時は従来同様に null / 空配列扱いにするため、fetcher 内で例外を握りつぶす。
+  const statusFetcher = useCallback(async (): Promise<GitStatusResponse | null> => {
     try {
-      const data = await gitStatus(ctxType, ctxId);
-      setStatus(data);
+      return await gitStatus(ctxType, ctxId);
     } catch {
-      setStatus(null);
+      return null;
     }
   }, [ctxType, ctxId]);
 
-  const fetchLogs = useCallback(async () => {
+  const logsFetcher = useCallback(async (): Promise<GitLogEntry[]> => {
     try {
-      const data = await gitLog(ctxType, ctxId);
-      setLogs(data.commits);
+      return (await gitLog(ctxType, ctxId)).commits;
     } catch {
-      setLogs([]);
+      return EMPTY_LOGS;
     }
   }, [ctxType, ctxId]);
 
+  const { data: statusData, mutate: mutateStatus } =
+    useSWR<GitStatusResponse | null>(
+      ["git/status", ctxType, ctxId],
+      statusFetcher,
+      GIT_SWR_OPTIONS,
+    );
+  const { data: logsData, mutate: mutateLogs } = useSWR<GitLogEntry[]>(
+    ["git/log", ctxType, ctxId],
+    logsFetcher,
+    GIT_SWR_OPTIONS,
+  );
+  const status = statusData ?? null;
+  const logs = logsData ?? EMPTY_LOGS;
+
+  // パネルを開いた時、および storageCtx 変更時（開いている間）に再取得する。
+  // 従来の fetchStatus/fetchLogs を deps に含めた useEffect と同じ発火条件。
   useEffect(() => {
     if (open) {
-      fetchStatus();
-      fetchLogs();
+      void mutateStatus();
+      void mutateLogs();
     }
-  }, [open, fetchStatus, fetchLogs]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, ctxType, ctxId]);
 
   const handleCommit = async () => {
     if (!commitMsg.trim()) return;
@@ -73,8 +102,8 @@ export function GitPanel({ open, onOpenChange }: GitPanelProps) {
           : `エラー: ${res.message}`
       );
       setCommitMsg("");
-      fetchStatus();
-      fetchLogs();
+      void mutateStatus();
+      void mutateLogs();
     } catch {
       setCommitResult("コミットに失敗しました");
     } finally {

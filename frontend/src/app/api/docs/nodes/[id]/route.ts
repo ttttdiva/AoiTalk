@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "@/db";
 import { knowledgeNodes } from "@/db/schema";
 import { getSession } from "@/lib/auth";
@@ -7,10 +7,6 @@ import { normalizeDocsNodeType } from "@/lib/docs-model";
 import {
   appendKnowledgeRevision,
   cleanOptionalString,
-  cleanString,
-  decryptNodeBodyText,
-  encryptNodeBodyJson,
-  encryptNodeBodyText,
   ensureProjectWritable,
   getKnowledgeDisplayDescendantIds,
   getKnowledgeNodeDescendantIds,
@@ -24,6 +20,8 @@ import {
   syncDocsTaskTitle,
   unlinkDocsTaskBinding,
 } from "@/lib/server/docs-task-binding";
+import { DOCS_NODE_TITLE_MAX, updateDocsNode, updateDocsNodesByIds, type DocsNodeWriterUpdate } from "@/lib/server/docs-node-writer";
+import { isDefaultInboxProject } from "@/lib/server/project-information-hierarchy";
 
 export async function PATCH(
   request: NextRequest,
@@ -41,24 +39,39 @@ export async function PATCH(
   }
 
   const body = await request.json().catch(() => ({}));
-  const updates: Partial<typeof knowledgeNodes.$inferInsert> = {
+  const updates: DocsNodeWriterUpdate = {
     updatedBy: user.id,
     updatedAt: new Date(),
   };
-  let bodyTextPlain = decryptNodeBodyText(access.node.bodyText ?? "");
 
   if ("title" in body) {
-    updates.title = cleanString(body.title, access.node.title, 500);
+    // 空タイトルはアウトライナーの正式な paragraph/heading 行として保存できる。
+    // 型が不正な場合だけ旧値へ戻し、明示された空文字は削除しない。
+    updates.title = typeof body.title === "string"
+      ? body.title.slice(0, DOCS_NODE_TITLE_MAX)
+      : access.node.title;
+  }
+  if ("aliases" in body) {
+    const aliases: string[] = Array.isArray(body.aliases)
+      ? Array.from(new Set<string>(
+          body.aliases
+            .filter((item: unknown): item is string => typeof item === "string")
+            .map((item: string) => item.trim())
+            .filter(Boolean),
+        )).slice(0, 20)
+      : [];
+    updates.aliases = aliases;
   }
   if ("description" in body) {
     updates.description = cleanOptionalString(body.description, 200000) ?? "";
   }
-  if ("body_text" in body) {
-    bodyTextPlain = cleanOptionalString(body.body_text, 200000) ?? "";
-    updates.bodyText = encryptNodeBodyText(bodyTextPlain);
+  if ("body_text" in body && !("title" in body)) {
+    updates.title = typeof body.body_text === "string"
+      ? body.body_text.slice(0, DOCS_NODE_TITLE_MAX)
+      : updates.title ?? access.node.title;
   }
   if ("body_json" in body) {
-    updates.bodyJson = encryptNodeBodyJson(normalizeJsonObject(body.body_json));
+    updates.bodyJson = normalizeJsonObject(body.body_json);
   }
   const nextNodeType = "node_type" in body
     ? normalizeDocsNodeType(body.node_type)
@@ -95,6 +108,12 @@ export async function PATCH(
         return NextResponse.json(
           { detail: "Projectへの書き込み権限がありません" },
           { status: 403 },
+        );
+      }
+      if (isDefaultInboxProject(projectAccess.project)) {
+        return NextResponse.json(
+          { detail: "InboxはDocsの案件保存先ではありません" },
+          { status: 409 },
         );
       }
     }
@@ -148,6 +167,18 @@ export async function PATCH(
             { status: 403 },
           );
         }
+        if (isDefaultInboxProject(projectAccess.project)) {
+          return NextResponse.json(
+            { detail: "InboxはDocsの案件保存先ではありません" },
+            { status: 409 },
+          );
+        }
+        if (updates.projectId && updates.projectId !== parent.projectId) {
+          return NextResponse.json(
+            { detail: "親nodeと異なるProjectには関連付けられません" },
+            { status: 400 },
+          );
+        }
       }
       updates.parentId = parent.id;
       updates.rootPageId = parent.rootPageId ?? parent.id;
@@ -155,20 +186,60 @@ export async function PATCH(
         updates.projectId = parent.projectId;
       }
     } else {
+      const effectiveProjectId = updates.projectId === undefined
+        ? access.node.projectId
+        : updates.projectId;
+      if (effectiveProjectId) {
+        return NextResponse.json(
+          { detail: "案件nodeをDocsルートへ移動できません" },
+          { status: 400 },
+        );
+      }
       updates.parentId = null;
       updates.rootPageId = access.node.id;
     }
   }
 
+  if ("project_id" in body && !("parent_id" in body) && access.node.parentId) {
+    const [currentParent] = await db
+      .select()
+      .from(knowledgeNodes)
+      .where(
+        and(
+          eq(knowledgeNodes.id, access.node.parentId),
+          eq(knowledgeNodes.workspaceId, access.workspace.id),
+        ),
+      )
+      .limit(1);
+    if (currentParent?.projectId) {
+      if (updates.projectId && updates.projectId !== currentParent.projectId) {
+        return NextResponse.json(
+          { detail: "親nodeと異なるProjectには関連付けられません" },
+          { status: 400 },
+        );
+      }
+      updates.projectId = currentParent.projectId;
+    }
+  }
+
+  const effectiveProjectId = updates.projectId === undefined
+    ? access.node.projectId
+    : updates.projectId;
+  const effectiveParentId = updates.parentId === undefined
+    ? access.node.parentId
+    : updates.parentId;
+  if (effectiveProjectId && !effectiveParentId) {
+    return NextResponse.json(
+      { detail: "案件nodeをDocsルートにはできません" },
+      { status: 400 },
+    );
+  }
+
   const updated = await db.transaction(async (tx) => {
-    const [row] = await tx
-      .update(knowledgeNodes)
-      .set(updates)
-      .where(eq(knowledgeNodes.id, id))
-      .returning();
+    const row = await updateDocsNode(tx, id, updates);
 
     if ("parent_id" in body && descendantIds.length > 0) {
-      const descendantUpdates: Partial<typeof knowledgeNodes.$inferInsert> = {
+      const descendantUpdates: DocsNodeWriterUpdate = {
         rootPageId: row.rootPageId,
         updatedBy: user.id,
         updatedAt: new Date(),
@@ -176,19 +247,18 @@ export async function PATCH(
       if (updates.projectId !== undefined) {
         descendantUpdates.projectId = row.projectId;
       }
-      await tx
-        .update(knowledgeNodes)
-        .set(descendantUpdates)
-        .where(inArray(knowledgeNodes.id, descendantIds));
+      await updateDocsNodesByIds(tx, descendantIds, descendantUpdates);
     }
 
-    await upsertKnowledgeSearchIndex(tx, row, bodyTextPlain);
-    await syncKnowledgeNodeReferenceEdges(tx, { ...row, bodyText: bodyTextPlain }, user.id);
+    await upsertKnowledgeSearchIndex(tx, row, row.title);
+    await syncKnowledgeNodeReferenceEdges(tx, row, user.id);
     await appendKnowledgeRevision(tx, row, user.id, "nodeを更新");
     return row;
   });
 
-  if ("title" in body && updated.title !== access.node.title) {
+  // task側は空タイトルを受け付けないため、空行のDocs正本保存を
+  // task同期の502で失敗扱いにしない。次の非空タイトル確定時に同期する。
+  if ("title" in body && updated.title !== access.node.title && updated.title.trim()) {
     try {
       await syncDocsTaskTitle({
         user,
@@ -226,11 +296,11 @@ export async function DELETE(
     return NextResponse.json({ ok: true });
   }
 
-  const [updated] = await db
-    .update(knowledgeNodes)
-    .set({ archivedAt: new Date(), updatedBy: user.id, updatedAt: new Date() })
-    .where(eq(knowledgeNodes.id, id))
-    .returning();
+  const updated = await updateDocsNode(db, id, {
+    archivedAt: new Date(),
+    updatedBy: user.id,
+    updatedAt: new Date(),
+  });
 
   await appendKnowledgeRevision(db, updated, user.id, "nodeをアーカイブ");
 

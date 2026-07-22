@@ -72,9 +72,10 @@ if ($Stop) {
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $defaultAiRoot = Join-Path ([System.IO.Path]::GetPathRoot($projectRoot)) "AI"
+$defaultHotLlmRoot = Join-Path $defaultAiRoot "models\Hot\llm"
 
 if (-not $ModelPath) {
-    $ModelPath = Join-Path $defaultAiRoot "models\qwopus\models\Qwopus3.6-35B-A3B-v1-Q4_K_M.gguf"
+    $ModelPath = Join-Path $defaultHotLlmRoot "qwopus\models\Qwopus3.6-35B-A3B-v1-Q4_K_M.gguf"
 }
 if (-not $LlamaServerExe) { $LlamaServerExe = "llama-server" }
 if (-not $LogRoot) { $LogRoot = Join-Path $env:LOCALAPPDATA "AoiTalk\logs\qwopus" }

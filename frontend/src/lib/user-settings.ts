@@ -9,6 +9,14 @@ export type EditorLinkDefaultDisplayMode = "embed" | "link";
 export const DEFAULT_EDITOR_LINK_DISPLAY_MODE: EditorLinkDefaultDisplayMode =
   "embed";
 export const DEFAULT_TASK_NOTIFICATIONS_ENABLED = true;
+export const DEFAULT_REMOTE_SERVER_CONNECTION_ENABLED = false;
+export const DEFAULT_SCENARIO_TAB_VISIBLE = false; // public-publish-default: false
+export const DEFAULT_TRPG_TAB_VISIBLE = false; // public-publish-default: false
+
+export type AppNavigationVisibility = {
+  scenarios: boolean;
+  trpg: boolean;
+};
 
 export function normalizeEditorLinkDefaultDisplayMode(
   value: unknown,
@@ -37,6 +45,42 @@ export function getTaskNotificationsDefaultEnabled(
   return typeof settings?.task_notifications_default_enabled === "boolean"
     ? settings.task_notifications_default_enabled
     : DEFAULT_TASK_NOTIFICATIONS_ENABLED;
+}
+
+export function getRemoteServerConnectionEnabled(
+  settings: UserSettings | null | undefined,
+): boolean {
+  return settings?.remote_server_connection_enabled === true
+    ? true
+    : DEFAULT_REMOTE_SERVER_CONNECTION_ENABLED;
+}
+
+export function getAppNavigationVisibility(
+  settings: UserSettings | null | undefined,
+): AppNavigationVisibility {
+  const navigationTabs = settings?.navigation_tabs;
+  if (
+    typeof navigationTabs !== "object" ||
+    navigationTabs === null ||
+    Array.isArray(navigationTabs)
+  ) {
+    return {
+      scenarios: DEFAULT_SCENARIO_TAB_VISIBLE,
+      trpg: DEFAULT_TRPG_TAB_VISIBLE,
+    };
+  }
+
+  const values = navigationTabs as Record<string, unknown>;
+  return {
+    scenarios:
+      typeof values.scenarios === "boolean"
+        ? values.scenarios
+        : DEFAULT_SCENARIO_TAB_VISIBLE,
+    trpg:
+      typeof values.trpg === "boolean"
+        ? values.trpg
+        : DEFAULT_TRPG_TAB_VISIBLE,
+  };
 }
 
 export function getAudioPlayerSettings(

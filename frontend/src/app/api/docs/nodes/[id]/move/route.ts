@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { and, eq, inArray, max } from "drizzle-orm";
+import { and, eq, max } from "drizzle-orm";
 import { db } from "@/db";
 import { knowledgeNodePlacements, knowledgeNodes } from "@/db/schema";
 import { getSession } from "@/lib/auth";
@@ -11,6 +11,9 @@ import {
   requireDocsNode,
   serializeNode,
 } from "@/lib/server/knowledge-docs-utils";
+import { updateDocsNode, updateDocsNodesByIds } from "@/lib/server/docs-node-writer";
+import { getWritableProject } from "@/lib/server/project-access";
+import { isDefaultInboxProject } from "@/lib/server/project-information-hierarchy";
 
 export async function POST(
   request: NextRequest,
@@ -48,6 +51,21 @@ export async function POST(
   if (!parent) {
     return NextResponse.json({ detail: "移動先nodeが見つかりません" }, { status: 404 });
   }
+  if (parent.projectId) {
+    const projectAccess = await getWritableProject(parent.projectId, user);
+    if (!projectAccess) {
+      return NextResponse.json(
+        { detail: "移動先Projectへの書き込み権限がありません" },
+        { status: 403 },
+      );
+    }
+    if (isDefaultInboxProject(projectAccess.project)) {
+      return NextResponse.json(
+        { detail: "InboxはDocsの案件保存先ではありません" },
+        { status: 409 },
+      );
+    }
+  }
 
   const [maxRow] = await db
     .select({ maxSort: max(knowledgeNodes.sortOrder) })
@@ -57,18 +75,14 @@ export async function POST(
   const leaveReference = body.leave_reference === true;
 
   const updated = await db.transaction(async (tx) => {
-    const [row] = await tx
-      .update(knowledgeNodes)
-      .set({
+    const row = await updateDocsNode(tx, access.node.id, {
         parentId: parent.id,
         rootPageId: parent.rootPageId ?? parent.id,
-        projectId: parent.projectId ?? access.node.projectId,
+        projectId: parent.projectId,
         sortOrder: typeof body.sort_order === "number" ? body.sort_order : (maxRow?.maxSort ?? 0) + 1,
         updatedBy: user.id,
         updatedAt: new Date(),
-      })
-      .where(eq(knowledgeNodes.id, access.node.id))
-      .returning();
+      });
     if (leaveReference && oldParentId) {
       await tx
         .insert(knowledgeNodePlacements)
@@ -82,15 +96,12 @@ export async function POST(
         .onConflictDoNothing();
     }
     if (descendantIds.length > 0) {
-      await tx
-        .update(knowledgeNodes)
-        .set({
+      await updateDocsNodesByIds(tx, descendantIds, {
           rootPageId: row.rootPageId,
           projectId: row.projectId,
           updatedBy: user.id,
           updatedAt: new Date(),
-        })
-        .where(inArray(knowledgeNodes.id, descendantIds));
+        });
     }
     await appendKnowledgeRevision(tx, row, user.id, leaveReference ? "nodeを参照を残して移動" : "nodeを移動");
     return row;

@@ -9,14 +9,13 @@ import {
 import { getSession } from "@/lib/auth";
 import {
   appendKnowledgeRevision,
-  encryptNodeBodyJson,
-  encryptNodeBodyText,
   ensureDocsWorkspace,
   serializeNode,
   serializeNodeSupertag,
   serializeSupertag,
   upsertKnowledgeSearchIndex,
 } from "@/lib/server/knowledge-docs-utils";
+import { insertDocsNode, updateDocsNode } from "@/lib/server/docs-node-writer";
 
 function isoDateInTokyo(date = new Date()) {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -65,24 +64,20 @@ async function ensureSystemNode(workspaceId: string, title: string, parentId: st
     .orderBy(asc(knowledgeNodes.createdAt))
     .limit(1);
   if (existing) return existing;
-  const [created] = await db
-    .insert(knowledgeNodes)
-    .values({
+  const created = await insertDocsNode(db, {
       workspaceId,
       parentId,
       rootPageId: parentId,
       title,
       description: "",
-      bodyJson: encryptNodeBodyJson({ inline: [{ type: "text", text: title }] }),
-      bodyText: encryptNodeBodyText(title),
+      bodyJson: { inline: [{ type: "text", text: title }] },
       nodeType: "system",
       displayProps: {},
       viewJson: {},
       sortOrder,
       createdBy: userId,
       updatedBy: userId,
-    })
-    .returning();
+    });
   return created;
 }
 
@@ -146,18 +141,12 @@ export async function GET(request: NextRequest) {
   if (existingDay) {
     const normalizedDay =
       existingDay.parentId !== weekRoot.id || existingDay.rootPageId !== dailyRoot.id
-        ? (
-            await db
-              .update(knowledgeNodes)
-              .set({
-                parentId: weekRoot.id,
-                rootPageId: dailyRoot.id,
-                updatedBy: user.id,
-                updatedAt: new Date(),
-              })
-              .where(eq(knowledgeNodes.id, existingDay.id))
-              .returning()
-          )[0] ?? existingDay
+        ? await updateDocsNode(db, existingDay.id, {
+            parentId: weekRoot.id,
+            rootPageId: dailyRoot.id,
+            updatedBy: user.id,
+            updatedAt: new Date(),
+          }) ?? existingDay
         : existingDay;
     const tags = await db
       .select()
@@ -175,25 +164,21 @@ export async function GET(request: NextRequest) {
     .from(knowledgeNodes)
     .where(eq(knowledgeNodes.parentId, weekRoot.id));
   const node = await db.transaction(async (tx) => {
-    const [created] = await tx
-      .insert(knowledgeNodes)
-      .values({
-        workspaceId: workspace.id,
-        parentId: weekRoot.id,
-        rootPageId: dailyRoot.id,
-        title,
-        description: "",
-        bodyJson: encryptNodeBodyJson({ inline: [{ type: "text", text: title }] }),
-        bodyText: encryptNodeBodyText(title),
-        nodeType: "day",
-        displayProps: {},
-        viewJson: { view: "outline" },
-        dayDate: today,
-        sortOrder: (maxRow?.maxSort ?? 0) + 1,
-        createdBy: user.id,
-        updatedBy: user.id,
-      })
-      .returning();
+    const created = await insertDocsNode(tx, {
+      workspaceId: workspace.id,
+      parentId: weekRoot.id,
+      rootPageId: dailyRoot.id,
+      title,
+      description: "",
+      bodyJson: { inline: [{ type: "text", text: title }] },
+      nodeType: "day",
+      displayProps: {},
+      viewJson: { view: "outline" },
+      dayDate: today,
+      sortOrder: (maxRow?.maxSort ?? 0) + 1,
+      createdBy: user.id,
+      updatedBy: user.id,
+    });
     await tx.insert(knowledgeNodeSupertags).values({
       nodeId: created.id,
       supertagId: dayTag.id,

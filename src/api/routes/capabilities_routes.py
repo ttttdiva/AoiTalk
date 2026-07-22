@@ -40,8 +40,27 @@ def register_capabilities_routes(app: FastAPI, server: "WebChatServer") -> None:
     @app.get("/api/capabilities")
     async def get_capabilities(request: Request, _: None = Depends(require_auth)):
         """サーバーの version / profile / features と認証ユーザーを返す。"""
-        profile = os.getenv("AOITALK_PROFILE", "").lower() or "personal"
+        profile = (
+            Features.profile_name()
+            if Features is not None
+            else (os.getenv("AOITALK_PROFILE") or os.getenv("AIVTUBER_ENV") or "personal").lower()
+        )
         features = Features.get_all() if Features is not None else {}
+
+        # Keep this separate from the outbound ``remote_server_view`` flag.
+        # Enterprise must reject configuring another AoiTalk as an outbound
+        # destination while still being reachable by an original AoiTalk.
+        resources = {
+            "spaces": {"read": True, "write": profile != "enterprise"},
+            "projects": {"read": True, "write": profile != "enterprise"},
+            "tasks": {"read": True, "write": profile != "enterprise"},
+            "task_occurrences": {"read": True, "write": profile != "enterprise"},
+            "reports": {"read": True, "write": False},
+            "workspace_files": {"read": True, "write": False},
+            "docs": {"read": True, "write": False},
+            "remote_task_patch": {"read": False, "write": True},
+            "remote_task_comments": {"read": False, "write": True},
+        }
 
         user_summary = None
         try:
@@ -60,6 +79,7 @@ def register_capabilities_routes(app: FastAPI, server: "WebChatServer") -> None:
                 "version": APP_VERSION,
                 "profile": profile,
                 "features": features,
+                "resources": resources,
                 "server_time": datetime.utcnow().isoformat() + "Z",
                 "user": user_summary,
             }

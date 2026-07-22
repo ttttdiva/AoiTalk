@@ -15,8 +15,6 @@ import {
   appendKnowledgeRevision,
   cleanOptionalString,
   deriveKnowledgeBlockTitle,
-  encryptNodeBodyJson,
-  encryptNodeBodyText,
   ensureDocsWorkspace,
   ensureProjectWritable,
   listDocsState,
@@ -39,11 +37,18 @@ import {
   syncKnowledgeNodeReferenceEdges,
   upsertKnowledgeSearchIndex,
 } from "@/lib/server/knowledge-docs-utils";
+import { DOCS_NODE_TITLE_MAX, insertDocsNode, updateDocsNode } from "@/lib/server/docs-node-writer";
+import {
+  ensureProjectInformationHierarchyNode,
+  isDefaultInboxProject,
+} from "@/lib/server/project-information-hierarchy";
 
 function serializeDocsState(state: NonNullable<Awaited<ReturnType<typeof listDocsState>>>) {
   return {
     workspace: serializeWorkspace(state.workspace),
     nodes: state.nodes.map(serializeNode),
+    has_children_ids: state.hasChildrenIds,
+    loaded_children_parent_ids: state.loadedChildrenParentIds,
     supertags: state.supertags.map(serializeSupertag),
     node_supertags: state.nodeSupertags.map(serializeNodeSupertag),
     supertag_fields: state.supertagFields.map(serializeSupertagField),
@@ -88,15 +93,17 @@ export async function POST(request: NextRequest) {
 
   const body = await request.json().catch(() => ({}));
   const workspace = await ensureDocsWorkspace(user);
-  const bodyText = cleanOptionalString(body.body_text, 200000) ?? "";
+  const bodyText = typeof body.body_text === "string"
+    ? body.body_text.slice(0, 200000)
+    : "";
   const bodyJson = normalizeJsonObject(body.body_json);
   const nodeType = normalizeDocsNodeType(body.node_type);
   const title =
     typeof body.title === "string"
-      ? body.title.trim().slice(0, 500)
+      ? body.title.slice(0, DOCS_NODE_TITLE_MAX)
       : deriveKnowledgeBlockTitle(bodyText);
   const requestedId = cleanOptionalString(body.id, 80);
-  const parentId = cleanOptionalString(body.parent_id, 80);
+  let parentId = cleanOptionalString(body.parent_id, 80);
   const projectId = cleanOptionalString(body.project_id, 80);
   const requestedSortOrder =
     typeof body.sort_order === "number" && Number.isFinite(body.sort_order)
@@ -107,6 +114,20 @@ export async function POST(request: NextRequest) {
     const access = await ensureProjectWritable(projectId, user);
     if (!access) {
       return NextResponse.json({ detail: "Projectへの書き込み権限がありません" }, { status: 403 });
+    }
+    if (isDefaultInboxProject(access.project)) {
+      return NextResponse.json(
+        { detail: "Inboxは案件情報Docsの保存先ではありません" },
+        { status: 409 },
+      );
+    }
+    if (!parentId) {
+      const projectNode = await ensureProjectInformationHierarchyNode({
+        workspaceId: workspace.id,
+        userId: user.id,
+        project: access.project,
+      });
+      parentId = projectNode.id;
     }
   }
 
@@ -133,6 +154,18 @@ export async function POST(request: NextRequest) {
     if (!access) {
       return NextResponse.json({ detail: "親nodeのProject書き込み権限がありません" }, { status: 403 });
     }
+    if (isDefaultInboxProject(access.project)) {
+      return NextResponse.json(
+        { detail: "InboxはDocsの案件保存先ではありません" },
+        { status: 409 },
+      );
+    }
+    if (projectId && projectId !== parent.projectId) {
+      return NextResponse.json(
+        { detail: "親nodeと異なるProjectには関連付けられません" },
+        { status: 400 },
+      );
+    }
   }
 
   const requestedSupertagIds = Array.isArray(body.supertag_ids)
@@ -154,42 +187,32 @@ export async function POST(request: NextRequest) {
       );
     const sortOrder = requestedSortOrder ?? (maxRow?.maxSort ?? 0) + 1;
 
-    const [node] = await tx
-      .insert(knowledgeNodes)
-      .values({
-        id: requestedId ?? undefined,
-        workspaceId: workspace.id,
-        parentId,
-        rootPageId: parent?.rootPageId ?? parent?.id ?? null,
-        projectId: projectId ?? parent?.projectId ?? null,
-        title,
-        description: cleanOptionalString(body.description, 200000) ?? "",
-        bodyJson: encryptNodeBodyJson(bodyJson),
-        bodyText: encryptNodeBodyText(bodyText),
-        nodeType,
-        displayProps: normalizeJsonObject(body.display_props),
-        queryJson: nodeType === "search" ? normalizeJsonObject(body.query_json) : null,
-        viewJson: normalizeJsonObject(body.view_json),
-        dayDate: cleanOptionalString(body.day_date, 40) ?? null,
-        sortOrder,
-        createdBy: user.id,
-        updatedBy: user.id,
-      })
-      .returning();
+    const node = await insertDocsNode(tx, {
+      id: requestedId ?? undefined,
+      workspaceId: workspace.id,
+      parentId,
+      rootPageId: parent?.rootPageId ?? parent?.id ?? null,
+      projectId: projectId ?? parent?.projectId ?? null,
+      title,
+      description: cleanOptionalString(body.description, 200000) ?? "",
+      bodyJson,
+      nodeType,
+      displayProps: normalizeJsonObject(body.display_props),
+      queryJson: nodeType === "search" ? normalizeJsonObject(body.query_json) : null,
+      viewJson: normalizeJsonObject(body.view_json),
+      dayDate: cleanOptionalString(body.day_date, 40) ?? null,
+      sortOrder,
+      createdBy: user.id,
+      updatedBy: user.id,
+    });
 
     const finalRootPageId = !node.parentId ? node.id : node.rootPageId;
     const finalNode =
       finalRootPageId !== node.rootPageId
-        ? (
-            await tx
-              .update(knowledgeNodes)
-              .set({ rootPageId: finalRootPageId, updatedBy: user.id, updatedAt: new Date() })
-              .where(eq(knowledgeNodes.id, node.id))
-              .returning()
-          )[0]
+        ? await updateDocsNode(tx, node.id, { rootPageId: finalRootPageId, updatedBy: user.id, updatedAt: new Date() })
         : node;
 
-    await upsertKnowledgeSearchIndex(tx, finalNode, bodyText);
+    await upsertKnowledgeSearchIndex(tx, finalNode, finalNode.title);
     await appendKnowledgeRevision(tx, finalNode, user.id, "nodeを作成");
 
     if (requestedSupertagIds.length > 0) {
@@ -253,7 +276,7 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    await syncKnowledgeNodeReferenceEdges(tx, { ...finalNode, bodyText }, user.id);
+    await syncKnowledgeNodeReferenceEdges(tx, finalNode, user.id);
 
     return finalNode;
   });

@@ -32,12 +32,13 @@ export async function createSessionToken(userId = "user-1") {
 }
 
 export async function addAuthCookie(page: Page, userId = "user-1") {
+  const host = process.env.PLAYWRIGHT_HOST ?? "127.0.0.1";
+  const port = process.env.PLAYWRIGHT_PORT ?? "3002";
   await page.context().addCookies([
     {
       name: "aoitalk_session",
       value: await createSessionToken(userId),
-      domain: "127.0.0.1",
-      path: "/",
+      url: `http://${host}:${port}`,
     },
   ]);
 }

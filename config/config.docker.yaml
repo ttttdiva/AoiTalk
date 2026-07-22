@@ -132,7 +132,6 @@ use_tools: true
 
 # Knowledge Index backend設定 (Docker Compose サービス名を使用)
 rag:
-  enabled: true
   qdrant:
     host: qdrant  # docker-composeサービス名
     port: 6333

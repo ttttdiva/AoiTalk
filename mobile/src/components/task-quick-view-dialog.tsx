@@ -269,12 +269,6 @@ export function TaskQuickViewDialog({
                 {activeEntry ? "Running" : "Tracked"}{" "}
                 {formatDuration(trackedTotal)}
               </Text>
-              {task.estimated_hours ? (
-                <Text style={styles.metaText}>
-                  Estimate {task.estimated_hours}h
-                </Text>
-              ) : null}
-
               {entryFocus ? (
                 <>
                   <Divider style={styles.divider} />

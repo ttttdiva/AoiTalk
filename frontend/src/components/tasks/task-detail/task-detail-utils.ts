@@ -71,13 +71,6 @@ export async function fetchCurrentOccurrenceContext(
   return current ? occurrenceToContext(current) : null;
 }
 
-export function formatBytes(value: number | null | undefined): string {
-  const bytes = Number(value || 0);
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
 export function shouldPrepareTaskForAgent(
   metadata: Record<string, unknown> | null | undefined,
 ): boolean {
@@ -156,6 +149,43 @@ export function isEditableTarget(target: EventTarget | null): boolean {
     element.tagName === "SELECT" ||
     element.isContentEditable
   );
+}
+
+export function deriveTaskTriageView(task: Task | null): {
+  triageStatus: string;
+  triageSummary: string;
+  triageHasSummary: boolean;
+  triageQuestions: string[];
+  shouldShowTriageCard: boolean;
+} {
+  const triageMetadata =
+    task?.metadata && typeof task.metadata === "object" ? task.metadata : {};
+  const triageStatus =
+    typeof triageMetadata.agent_triage_status === "string"
+      ? triageMetadata.agent_triage_status
+      : "pending";
+  const triageSummary =
+    typeof triageMetadata.agent_triage_summary === "string"
+      ? triageMetadata.agent_triage_summary
+      : "";
+  const triageHasSummary = triageSummary.trim().length > 0;
+  const triageQuestions = Array.isArray(triageMetadata.agent_triage_questions)
+    ? triageMetadata.agent_triage_questions.filter(
+        (item): item is string => typeof item === "string",
+      )
+    : [];
+  const shouldShowTriageCard =
+    triageHasSummary ||
+    triageQuestions.length > 0 ||
+    triageStatus === "needs_user" ||
+    triageStatus === "failed";
+  return {
+    triageStatus,
+    triageSummary,
+    triageHasSummary,
+    triageQuestions,
+    shouldShowTriageCard,
+  };
 }
 
 export const STATUS_DOT_COLORS: Record<string, string> = {

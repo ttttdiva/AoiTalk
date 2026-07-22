@@ -7,8 +7,12 @@ from typing import TYPE_CHECKING, Any, Dict
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from ...assistant.chat_attachment_utils import sanitize_chat_attachments
 from ...llm.generation_policy import resolve_generation_profile
-from ...llm.tool_policy import sanitize_command_capabilities
+from ...llm.tool_policy import (
+    command_capabilities_for_current_turn_text,
+    sanitize_command_capabilities,
+)
 from ...memory.conversation_repository import ConversationRepository
 from ...services.agent_run_service import AgentRunService
 from ..router_helpers import cookie_auth_dependency
@@ -127,6 +131,39 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
             edit_message_id=payload.edit_message_id,
             command_capabilities=payload.command_capabilities,
         )
+        command_capabilities = command_capabilities_for_current_turn_text(
+            message,
+            command_capabilities,
+        )
+        if "docs_ingest" in command_capabilities:
+            lines = message.strip().splitlines()
+            clip_body = (
+                "\n".join(lines[1:]).strip()
+                if lines and lines[0].strip().casefold() == "/clip"
+                else message.strip()
+            )
+            if not clip_body:
+                raise HTTPException(
+                    status_code=400,
+                    detail="取り込む情報を入力してください",
+                )
+        if "work_intake" in command_capabilities:
+            lines = message.strip().splitlines()
+            inbox_body = (
+                "\n".join(lines[1:]).strip()
+                if lines and lines[0].strip().casefold() == "/inbox"
+                else message.strip()
+            )
+            mail_attachments = [
+                item
+                for item in (payload.attachments or [])
+                if str(item.get("name") or "").casefold().endswith((".msg", ".eml"))
+            ]
+            if not inbox_body and not mail_attachments:
+                raise HTTPException(
+                    status_code=400,
+                    detail="処理するテキストまたはメールを入力してください",
+                )
         include_project_context = effective_include_project_context(
             message=message,
             requested=payload.include_project_context,
@@ -163,7 +200,10 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
                 if payload.client_message_id:
                     metadata["client_message_id"] = payload.client_message_id
                 if payload.attachments:
-                    metadata["attachments"] = payload.attachments
+                    metadata["attachments"] = sanitize_chat_attachments(
+                        payload.attachments,
+                        include_binary=False,
+                    )
                 if command_capabilities:
                     metadata["command_capabilities"] = list(command_capabilities)
 
@@ -208,6 +248,7 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
                         payload.include_project_context
                     ),
                     "command_capabilities": list(command_capabilities),
+                    "tools_required": payload.tools_required,
                     "edit_message_id": payload.edit_message_id,
                     "response_model": response_model,
                     "attachment_count": len(payload.attachments or []),
@@ -240,6 +281,7 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
                 "response_model": response_model,
                 "client_message_id": payload.client_message_id,
                 "command_capabilities": list(command_capabilities),
+                "tools_required": payload.tools_required,
                 "skip_user_persistence": skip_user_persistence,
                 "persisted_user_message_id": persisted_user_message_id,
                 "attachments": payload.attachments or [],

@@ -294,7 +294,7 @@ export default function ScenariosPage() {
               <Loader2 className="size-5 animate-spin text-muted-foreground" />
             </div>
           ) : scenarios.length === 0 ? (
-            <div className="mx-auto flex max-w-xl flex-col items-center overflow-hidden rounded-2xl border border-white/65 bg-white/56 text-center text-sm text-muted-foreground shadow-[inset_0_1px_rgba(255,255,255,0.76),0_24px_64px_-46px_rgba(6,81,110,0.75)] backdrop-blur-xl dark:border-white/12 dark:bg-card/75 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12),0_24px_64px_-46px_rgba(0,0,0,0.9)]">
+            <div className="mx-auto flex max-w-xl flex-col items-center overflow-hidden rounded-2xl border border-border bg-card text-center text-sm text-muted-foreground">
               <img
                 src="/images/ui/scene-portal.png"
                 alt=""
@@ -309,7 +309,7 @@ export default function ScenariosPage() {
               {scenarios.map((scenario) => (
                 <Card
                   key={scenario.id}
-                  className="cursor-pointer overflow-hidden border-white/65 bg-white/58 shadow-[inset_0_1px_rgba(255,255,255,0.76),0_18px_48px_-42px_rgba(6,81,110,0.72)] backdrop-blur-xl transition hover:border-primary/70 hover:bg-white/72 dark:border-white/12 dark:bg-card/75 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12),0_18px_48px_-42px_rgba(0,0,0,0.9)] dark:hover:bg-card/90"
+                  className="cursor-pointer overflow-hidden transition hover:border-primary/70 hover:bg-accent"
                   onClick={() => openEditor(scenario)}
                 >
                   <img

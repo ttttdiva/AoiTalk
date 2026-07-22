@@ -14,10 +14,13 @@ import {
   Trash2,
 } from "lucide-react";
 
+import {
+  MenuMnemonicButton,
+  MenuMnemonicSurface,
+} from "@/components/ui/menu-mnemonic";
 import type { Task } from "@/lib/task-api";
 import { cn } from "@/lib/utils";
 import {
-  handleStatusShortcutCapture,
   PRIORITY_COLORS,
   PRIORITY_LABELS,
   STATUS_DOT_COLORS,
@@ -62,7 +65,7 @@ export function TaskListContextMenu({
   if (!contextMenu || typeof document === "undefined") return null;
 
   return createPortal(
-    <div
+    <MenuMnemonicSurface
       ref={contextMenuRef}
       className="fixed z-50 min-w-48 rounded-md border bg-popover p-1 text-popover-foreground shadow-md"
       style={contextMenuStyle}
@@ -74,28 +77,24 @@ export function TaskListContextMenu({
         onMouseEnter={() => setStatusSubmenuOpen(true)}
         onMouseLeave={() => setStatusSubmenuOpen(false)}
       >
-        <button className="flex w-full items-center justify-between rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default">
+        <MenuMnemonicButton
+          className="flex w-full items-center justify-between rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default"
+          onClick={() => setStatusSubmenuOpen(true)}
+        >
           <span className="flex items-center gap-2">
             <RefreshCw className="size-4" />
             ステータス変更
           </span>
           <ChevronRight className="size-4" />
-        </button>
+        </MenuMnemonicButton>
         {statusSubmenuOpen && (
-          <div
-            className={contextSubmenuClassName}
-            onKeyDownCapture={(e) =>
-              handleStatusShortcutCapture(e, (target) => {
-                if (!contextMenu.task) return;
-                onStatusChange(target);
-              })
-            }
-          >
+          <MenuMnemonicSurface className={contextSubmenuClassName}>
             {(
               ["open", "in_progress", "on_hold", "review", "closed"] as const
             ).map((status) => (
-              <button
+              <MenuMnemonicButton
                 key={status}
+                mnemonic={STATUS_KEY_HINTS[status]}
                 className={cn(
                   "flex w-full items-center justify-between gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default",
                   contextMenu.task.status === status && "font-bold",
@@ -111,14 +110,9 @@ export function TaskListContextMenu({
                   />
                   {STATUS_LABELS[status]}
                 </span>
-                {STATUS_KEY_HINTS[status] && (
-                  <kbd className="text-[10px] text-muted-foreground opacity-60">
-                    {STATUS_KEY_HINTS[status]}
-                  </kbd>
-                )}
-              </button>
+              </MenuMnemonicButton>
             ))}
-          </div>
+          </MenuMnemonicSurface>
         )}
       </div>
 
@@ -128,19 +122,32 @@ export function TaskListContextMenu({
         onMouseEnter={() => setPrioritySubmenuOpen(true)}
         onMouseLeave={() => setPrioritySubmenuOpen(false)}
       >
-        <button className="flex w-full items-center justify-between rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default">
+        <MenuMnemonicButton
+          className="flex w-full items-center justify-between rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default"
+          mnemonic="P"
+          onClick={() => setPrioritySubmenuOpen(true)}
+        >
           <span className="flex items-center gap-2">
             <Flag className="size-4" />
             優先度変更
           </span>
           <ChevronRight className="size-4" />
-        </button>
+        </MenuMnemonicButton>
         {prioritySubmenuOpen && (
-          <div className={contextSubmenuClassName}>
+          <MenuMnemonicSurface className={contextSubmenuClassName}>
             {(["urgent", "high", "medium", "low", "none"] as const).map(
               (priority) => (
-                <button
+                <MenuMnemonicButton
                   key={priority}
+                  mnemonic={
+                    {
+                      urgent: "U",
+                      high: "H",
+                      medium: "M",
+                      low: "L",
+                      none: "N",
+                    }[priority]
+                  }
                   className={cn(
                     "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default",
                     contextMenu.task.priority === priority && "font-bold",
@@ -154,10 +161,10 @@ export function TaskListContextMenu({
                     )}
                   />
                   {PRIORITY_LABELS[priority]}
-                </button>
+                </MenuMnemonicButton>
               ),
             )}
-          </div>
+          </MenuMnemonicSurface>
         )}
       </div>
 
@@ -165,8 +172,9 @@ export function TaskListContextMenu({
       <div className="my-1 h-px bg-border" />
 
       {/* タイマー開始/停止 */}
-      <button
+      <MenuMnemonicButton
         className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default"
+        mnemonic="T"
         onClick={onTimer}
       >
         {contextMenu.task.active_time_entry ? (
@@ -180,38 +188,41 @@ export function TaskListContextMenu({
             タイマー開始
           </>
         )}
-      </button>
+      </MenuMnemonicButton>
 
       {/* 複製 */}
-      <button
+      <MenuMnemonicButton
         className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default"
+        mnemonic="C"
         onClick={onDuplicate}
       >
         <Copy className="size-4" />
         複製
-      </button>
+      </MenuMnemonicButton>
 
       {/* タスクIDコピー */}
-      <button
+      <MenuMnemonicButton
         className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default"
+        mnemonic="I"
         onClick={onCopyTaskId}
       >
         <Hash className="size-4" />
         タスクIDをコピー
-      </button>
+      </MenuMnemonicButton>
 
       {/* 区切り線 */}
       <div className="my-1 h-px bg-border" />
 
       {/* 削除 */}
-      <button
+      <MenuMnemonicButton
         className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm text-red-600 hover:bg-red-100 dark:text-red-400 dark:hover:bg-red-900/30 cursor-default"
+        mnemonic="D"
         onClick={onDelete}
       >
         <Trash2 className="size-4" />
         削除
-      </button>
-    </div>,
+      </MenuMnemonicButton>
+    </MenuMnemonicSurface>,
     document.body,
   );
 }

@@ -17,9 +17,20 @@ class SkillRegistry:
     def __init__(self):
         self._skills: Dict[str, SkillDefinition] = {}
         self._alias_map: Dict[str, str] = {}  # alias(小文字) -> skill name
+        self._project_skills: Dict[str, Dict[str, SkillDefinition]] = {}
+        self._project_aliases: Dict[str, Dict[str, str]] = {}
 
-    def register(self, skill: SkillDefinition) -> None:
+    def register(self, skill: SkillDefinition, project_id: str | None = None) -> None:
         """スキルを登録"""
+        if project_id is not None:
+            key = str(project_id)
+            skills = self._project_skills.setdefault(key, {})
+            aliases = self._project_aliases.setdefault(key, {})
+            skills[skill.name] = skill
+            aliases[skill.name.lower()] = skill.name
+            for alias in skill.aliases:
+                aliases[alias.lower()] = skill.name
+            return
         self._skills[skill.name] = skill
         # エイリアスマップ構築（名前自体もエイリアス）
         self._alias_map[skill.name.lower()] = skill.name
@@ -36,29 +47,46 @@ class SkillRegistry:
         self._alias_map = {k: v for k, v in self._alias_map.items() if v != name}
         return True
 
-    def get(self, name: str) -> Optional[SkillDefinition]:
+    def replace_project_skills(self, project_id: str, skills: List[SkillDefinition]) -> None:
+        self._project_skills.pop(str(project_id), None)
+        self._project_aliases.pop(str(project_id), None)
+        for skill in skills:
+            self.register(skill, project_id=str(project_id))
+
+    def get(self, name: str, project_id: str | None = None) -> Optional[SkillDefinition]:
         """名前でスキル取得"""
+        if project_id is not None:
+            skill = self._project_skills.get(str(project_id), {}).get(name)
+            if skill:
+                return skill
         return self._skills.get(name)
 
-    def get_by_alias(self, alias: str) -> Optional[SkillDefinition]:
+    def get_by_alias(self, alias: str, project_id: str | None = None) -> Optional[SkillDefinition]:
         """エイリアスでスキル取得"""
+        if project_id is not None:
+            project_name = self._project_aliases.get(str(project_id), {}).get(alias.lower())
+            if project_name:
+                return self._project_skills[str(project_id)].get(project_name)
         skill_name = self._alias_map.get(alias.lower())
         if skill_name:
             return self._skills.get(skill_name)
         return None
 
-    def get_all(self) -> List[SkillDefinition]:
+    def get_all(self, project_id: str | None = None) -> List[SkillDefinition]:
         """全スキルを取得"""
-        return list(self._skills.values())
+        merged = dict(self._skills)
+        if project_id is not None:
+            merged.update(self._project_skills.get(str(project_id), {}))
+        return list(merged.values())
 
-    def get_names(self) -> List[str]:
+    def get_names(self, project_id: str | None = None) -> List[str]:
         """全スキル名を取得"""
-        return list(self._skills.keys())
+        return [skill.name for skill in self.get_all(project_id)]
 
-    def get_auto_skills(self) -> List[SkillDefinition]:
+    def get_auto_skills(self, project_id: str | None = None) -> List[SkillDefinition]:
         """LLM自動呼び出し可能なスキルを取得"""
         return [
-            s for s in self._skills.values()
+            s for s in self.get_all(project_id)
             if s.trigger_mode in (SkillTriggerMode.AUTO, SkillTriggerMode.BOTH)
         ]
 

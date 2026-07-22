@@ -22,7 +22,7 @@ export type DocsTaskSyntheticFieldValue = {
   valueNumber: number | null;
   valueDatetime: Date | null;
   targetNodeId: string | null;
-  updatedAt: Date | null;
+  updatedAt: Date;
   updatedBy: string | null;
 };
 
@@ -124,7 +124,7 @@ export async function applyDocsTaskFieldProxies(options: {
   requestedValues: unknown[];
 }): Promise<Set<string>> {
   const systemFieldIds = new Set<string>();
-  const patch: Record<string, unknown> = {};
+  const patch: Partial<typeof tasks.$inferInsert> = {};
 
   for (const item of options.requestedValues) {
     if (!item || typeof item !== "object") continue;
@@ -134,11 +134,12 @@ export async function applyDocsTaskFieldProxies(options: {
     if (!field?.systemKey) continue;
     systemFieldIds.add(fieldId);
     const value = fieldValueText(record.value);
-    if (field.systemKey === "task_status") patch.status = value;
-    if (field.systemKey === "task_due") patch.end_at = value;
-    if (field.systemKey === "task_start") patch.start_at = value;
-    if (field.systemKey === "task_priority") patch.priority = value;
-    if (field.systemKey === "task_project") patch.project_id = value;
+    // status / priority は NOT NULL 列のため、値が無い場合は更新対象にしない
+    if (field.systemKey === "task_status" && value !== null) patch.status = value;
+    if (field.systemKey === "task_due") patch.endAt = value;
+    if (field.systemKey === "task_start") patch.startAt = value;
+    if (field.systemKey === "task_priority" && value !== null) patch.priority = value;
+    if (field.systemKey === "task_project" && value) patch.projectId = value;
   }
 
   if (Object.keys(patch).length === 0) return systemFieldIds;
@@ -150,13 +151,10 @@ export async function applyDocsTaskFieldProxies(options: {
     .limit(1);
   if (!linkedTask) return systemFieldIds;
 
-  const response = await fetchPythonApi(`/api/tasks/${linkedTask.id}`, {
-    method: "PATCH",
-    user: options.user,
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(patch),
-  });
-  await assertPythonOk(response, "Docs task field proxy");
+  await db
+    .update(tasks)
+    .set({ ...patch, updatedAt: new Date() })
+    .where(eq(tasks.id, linkedTask.id));
   return systemFieldIds;
 }
 
@@ -190,16 +188,17 @@ export async function listDocsTaskSyntheticFieldValues(options: {
     const field = taskFields.get(systemKey);
     if (!field || value === null || value === undefined || value === "") return;
     const isDate = systemKey === "task_due" || systemKey === "task_start";
-    const updatedAtDate = updatedAt ? new Date(updatedAt) : null;
+    const dateText = isDate ? String(value).slice(0, 10) : null;
+    const updatedAtDate = updatedAt ? new Date(updatedAt) : new Date();
     values.push({
       nodeId,
       fieldId: field.id,
       valueJson: null,
-      valueText: isDate || systemKey === "task_project" ? null : String(value),
+      valueText: isDate ? dateText : systemKey === "task_project" ? null : String(value),
       valueNumber: null,
       valueDatetime: isDate ? new Date(value) : null,
       targetNodeId: systemKey === "task_project" ? String(value) : null,
-      updatedAt: updatedAtDate && Number.isFinite(updatedAtDate.getTime()) ? updatedAtDate : null,
+      updatedAt: Number.isFinite(updatedAtDate.getTime()) ? updatedAtDate : new Date(),
       updatedBy: updatedBy ?? null,
     });
   };

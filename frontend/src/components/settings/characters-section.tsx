@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState, useCallback } from "react";
+import useSWR from "swr";
 import { useRouter } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -29,6 +30,7 @@ import {
   MessageCircle,
 } from "lucide-react";
 import { Checkbox } from "@/components/ui/checkbox";
+import { useConfirm } from "@/hooks/use-confirm";
 import { getLlmModelCatalog } from "@/lib/chat-api";
 import type {
   LlmCatalogModelOption,
@@ -102,6 +104,7 @@ function buildCharacterModelOptions(
   };
 
   for (const provider of providers) {
+    if (provider.selection_kind === "routing_profile") continue;
     const configuredModel = provider.configured_model?.trim();
     if (configuredModel) {
       add(
@@ -230,9 +233,36 @@ const EMPTY_CHAR: Character = {
   image_gen_interval: 5,
 };
 
+const EMPTY_MODEL_PROVIDERS: LlmCatalogProvider[] = [];
+
 export function CharactersSection() {
+  const confirm = useConfirm();
   const router = useRouter();
-  const [characters, setCharacters] = useState<Character[]>([]);
+  // キャラクター一覧（サーバー状態）は SWR で管理。取得タイミングは従来どおり
+  // 呼び出し側（トグル/更新/保存・削除・トグル・インポート後）で駆動するため
+  // 自動 revalidation は無効化する。
+  const { data: characters = [], mutate: mutateCharacters } = useSWR<Character[]>(
+    "settings/characters",
+    async () => {
+      try {
+        return (
+          await pyFetch<{ success: boolean; characters: Character[] }>(
+            "/characters/manage",
+          )
+        ).characters || [];
+      } catch {
+        return [];
+      }
+    },
+    {
+      revalidateOnMount: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+      keepPreviousData: true,
+      dedupingInterval: 0,
+    },
+  );
   const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [editChar, setEditChar] = useState<Character | null>(null);
@@ -247,7 +277,26 @@ export function CharactersSection() {
   const [form, setForm] = useState<Character>({ ...EMPTY_CHAR });
   const [aliasInput, setAliasInput] = useState("");
   const [greetingInput, setGreetingInput] = useState("");
-  const [modelProviders, setModelProviders] = useState<LlmCatalogProvider[]>([]);
+  // モデルカタログ（サーバー状態）も SWR で管理。従来どおりマウント時に取得する。
+  const { data: modelProviders = EMPTY_MODEL_PROVIDERS, mutate: mutateModelProviders } =
+    useSWR<LlmCatalogProvider[]>(
+      "settings/character-model-catalog",
+      async () => {
+        try {
+          return (await getLlmModelCatalog()).providers;
+        } catch {
+          return EMPTY_MODEL_PROVIDERS;
+        }
+      },
+      {
+        revalidateOnMount: false,
+        revalidateOnFocus: false,
+        revalidateOnReconnect: false,
+        revalidateIfStale: false,
+        keepPreviousData: true,
+        dedupingInterval: 0,
+      },
+    );
 
   const enabledCount = characters.filter((c) => c.is_enabled).length;
   const modelOptions = useMemo(
@@ -256,32 +305,17 @@ export function CharactersSection() {
   );
 
   useEffect(() => {
-    let cancelled = false;
-    getLlmModelCatalog()
-      .then((catalog) => {
-        if (!cancelled) setModelProviders(catalog.providers);
-      })
-      .catch(() => {
-        if (!cancelled) setModelProviders([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    void mutateModelProviders();
+  }, [mutateModelProviders]);
 
   const fetchCharacters = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await pyFetch<{ success: boolean; characters: Character[] }>(
-        "/characters/manage",
-      );
-      setCharacters(data.characters || []);
-    } catch {
-      setCharacters([]);
+      await mutateCharacters();
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [mutateCharacters]);
 
   const handleToggle = useCallback(() => {
     if (!expanded && characters.length === 0) fetchCharacters();
@@ -338,7 +372,12 @@ export function CharactersSection() {
 
   const handleDelete = useCallback(
     async (char: Character) => {
-      if (!window.confirm(`キャラクター「${char.name}」を削除しますか？`))
+      if (
+        !(await confirm({
+          description: `キャラクター「${char.name}」を削除しますか？`,
+          destructive: true,
+        }))
+      )
         return;
       setDeleting(char.id);
       try {
@@ -352,7 +391,7 @@ export function CharactersSection() {
         setDeleting(null);
       }
     },
-    [fetchCharacters],
+    [fetchCharacters, confirm],
   );
 
   const handleToggleEnabled = useCallback(

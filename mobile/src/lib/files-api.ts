@@ -1,6 +1,7 @@
 import * as FileSystem from "expo-file-system/legacy";
+import { Directory } from "expo-file-system";
 import { fetchApi, getBaseUrl } from "./api-client";
-import { getToken } from "./auth";
+import { getToken, getTokenAuthScope } from "./auth";
 
 export type FilesSource = "local" | "server";
 export type FilesScope = "workspace" | "user";
@@ -30,6 +31,16 @@ export type FilesBookmark = {
   sort_order?: number;
   created_at?: string;
   updated_at?: string;
+};
+
+export type FilesEntryMetadata = {
+  size?: number;
+  modifiedAt?: string | null;
+};
+
+export type FilesMediaSource = {
+  uri: string;
+  headers?: Record<string, string>;
 };
 
 export type FilesMediaKind =
@@ -111,6 +122,29 @@ const AUDIO_EXTENSIONS = new Set([
   ".opus",
   ".wma",
 ]);
+const metadataCache = new Map<string, FilesEntryMetadata>();
+const metadataInFlight = new Map<string, Promise<FilesEntryMetadata>>();
+const thumbnailCache = new Map<string, Promise<FilesMediaSource>>();
+
+export function clearFilesApiCaches(): void {
+  metadataCache.clear();
+  metadataInFlight.clear();
+  thumbnailCache.clear();
+}
+
+export function filesThumbnailCacheKey(
+  entry: FilesEntry,
+  size: number,
+  token: string | null,
+): string {
+  return JSON.stringify([
+    getTokenAuthScope(token),
+    token ?? "",
+    entry.source,
+    entry.path,
+    size,
+  ]);
+}
 
 function getLocalRootUri(scope: FilesScope = "workspace"): string {
   const baseDir = FileSystem.documentDirectory || FileSystem.cacheDirectory;
@@ -213,26 +247,23 @@ async function listLocalDirectory(
 }> {
   const rootUri = await ensureLocalWorkspace(scope);
   const currentPath = path || rootUri;
-  const names = await FileSystem.readDirectoryAsync(currentPath);
+  const children = new Directory(currentPath).list();
   const parentPath = getLocalParentDirectory(currentPath);
 
-  const entries = await Promise.all(
-    names.map(async (name) => {
-      const filePath = joinLocalUri(currentPath, name);
-      const info = await FileSystem.getInfoAsync(filePath);
-      const fileEntry: FilesEntry = {
-        name,
-        path: filePath,
-        type: info.isDirectory ? "directory" : "file",
-        size: info.exists && !info.isDirectory ? info.size : undefined,
-        modifiedAt: info.exists ? toIsoString(info.modificationTime) : null,
-        mimeType: info.isDirectory ? undefined : inferMimeType(name),
-        extension: getExtension(name),
-        source: "local",
-      };
-      return fileEntry;
-    }),
-  );
+  // Directory.list() は種類を含む一覧を一度のnative呼び出しで返す。
+  // 全項目への getInfoAsync() は行わず、サイズ等は表示中の行から遅延取得する。
+  const entries: FilesEntry[] = children.map((child) => {
+    const isDirectory = child instanceof Directory;
+    return {
+      name: child.name,
+      path: child.uri,
+      type: isDirectory ? "directory" : "file",
+      modifiedAt: null,
+      mimeType: isDirectory ? undefined : inferMimeType(child.name),
+      extension: getExtension(child.name),
+      source: "local",
+    };
+  });
 
   entries.sort((a, b) => {
     if (a.type !== b.type) {
@@ -623,21 +654,22 @@ function hashPath(value: string): string {
   return hash.toString(16);
 }
 
-function cacheNameFor(entry: FilesEntry): string {
+function cacheNameFor(entry: FilesEntry, authScope: string): string {
   const ext = entry.extension || getExtension(entry.name) || ".bin";
   const safeExt = ext.startsWith(".") ? ext : `.${ext}`;
-  return `filer-${hashPath(`${entry.source}:${entry.path}`)}${safeExt}`;
+  return `filer-${hashPath(`${authScope}:${entry.source}:${entry.path}`)}${safeExt}`;
 }
 
 async function downloadServerMediaToCache(entry: FilesEntry): Promise<string> {
   const cacheRoot = FileSystem.cacheDirectory;
   if (!cacheRoot) throw new Error("メディアキャッシュを利用できません");
-  const targetUri = `${cacheRoot}${cacheNameFor(entry)}`;
+  const token = await getToken();
+  const targetUri = `${cacheRoot}${cacheNameFor(entry, getTokenAuthScope(token))}`;
   const info = await FileSystem.getInfoAsync(targetUri);
   if (info.exists) return targetUri;
 
   const url = await getServerMediaUrl(entry.path);
-  const headers = await getAuthHeaders();
+  const headers = token ? { Authorization: `Bearer ${token}` } : undefined;
   const result = await FileSystem.downloadAsync(url, targetUri, headers ? { headers } : undefined);
   return result.uri;
 }
@@ -765,16 +797,68 @@ export const filesApi = {
     }
   },
 
-  async getMediaSource(entry: FilesEntry, options?: { thumbnail?: boolean; size?: number }) {
-    const kind = getFilesMediaKind(entry);
-    if (entry.source === "local") {
-      return { uri: entry.path };
+  getMetadata(entry: FilesEntry): Promise<FilesEntryMetadata> {
+    if (entry.source !== "local" || entry.type === "directory") {
+      return Promise.resolve({ size: entry.size, modifiedAt: entry.modifiedAt });
     }
-    const headers = await getAuthHeaders();
-    const uri = options?.thumbnail
-      ? await getServerThumbnailUrl(entry.path, kind, options.size)
-      : await getServerMediaUrl(entry.path);
-    return headers ? { uri, headers } : { uri };
+    const key = `${entry.source}:${entry.path}`;
+    const cached = metadataCache.get(key);
+    if (cached) return Promise.resolve(cached);
+    const running = metadataInFlight.get(key);
+    if (running) return running;
+
+    const flight = FileSystem.getInfoAsync(entry.path)
+      .then((info) => {
+        const metadata = {
+          size: info.exists && !info.isDirectory ? info.size : undefined,
+          modifiedAt: info.exists ? toIsoString(info.modificationTime) : null,
+        };
+        metadataCache.set(key, metadata);
+        return metadata;
+      })
+      .finally(() => {
+        if (metadataInFlight.get(key) === flight) metadataInFlight.delete(key);
+      });
+    metadataInFlight.set(key, flight);
+    return flight;
+  },
+
+  getMediaSource(
+    entry: FilesEntry,
+    options?: { thumbnail?: boolean; size?: number },
+  ): Promise<FilesMediaSource> {
+    const kind = getFilesMediaKind(entry);
+    if (!options?.thumbnail) {
+      return (async () => {
+        if (entry.source === "local") return { uri: entry.path };
+        const headers = await getAuthHeaders();
+        const uri = await getServerMediaUrl(entry.path);
+        return headers ? { uri, headers } : { uri };
+      })();
+    }
+
+    // 元画像を一覧へ渡すとAndroidがタブ遷移直後にフル画像をdecodeするため、
+    // ローカルは軽量アイコンを使う。サーバーthumbnail要求はlocation単位で共有する。
+    if (entry.source === "local") {
+      return Promise.reject(new Error("ローカル一覧では元画像をサムネイルに使用しません"));
+    }
+    return (async () => {
+      const token = await getToken();
+      // token本体もkeyに含め、同一userのrefresh後に古いAuthorizationを再利用しない。
+      const key = filesThumbnailCacheKey(entry, options.size ?? 320, token);
+      const cached = thumbnailCache.get(key);
+      if (cached) return cached;
+      const flight = (async () => {
+        const headers = token ? { Authorization: `Bearer ${token}` } : undefined;
+        const uri = await getServerThumbnailUrl(entry.path, kind, options.size);
+        return headers ? { uri, headers } : { uri };
+      })().catch((error) => {
+        if (thumbnailCache.get(key) === flight) thumbnailCache.delete(key);
+        throw error;
+      });
+      thumbnailCache.set(key, flight);
+      return flight;
+    })();
   },
 
   async getPlayableUri(entry: FilesEntry) {

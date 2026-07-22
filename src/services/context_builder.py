@@ -81,39 +81,53 @@ class ContextBundle:
     memory_context_block: str = ""
     project_context_block: str = ""
     project_information_block: str = ""
+    agent_memory_block: str = ""
     project_pack_block: str = ""
     task_context_block: str = ""
     session_context_block: str = ""
     debug: Dict[str, Any] = field(default_factory=dict)
     max_chars: int = 12000
 
-    def render_for_prompt(self, max_chars: Optional[int] = None) -> str:
+    def render_with_trace(self, max_chars: Optional[int] = None) -> tuple[str, list[dict[str, Any]]]:
         limit = max_chars or self.max_chars
         blocks = [
-            self.project_context_block,
-            self.project_information_block,
-            self.memory_context_block,
-            self.project_pack_block,
-            self.task_context_block,
-            self.session_context_block,
+            ("project_context", "Project context", "ContextBundle.project_context_block", self.project_context_block),
+            ("project_information", "Project information / Docs", "ContextBundle.project_information_block", self.project_information_block),
+            ("agent_memory", "Agent Memory", "ContextBundle.agent_memory_block", self.agent_memory_block),
+            ("context_memory", "Context memory", "ContextBundle.memory_context_block", self.memory_context_block),
+            ("project_context_pack", "Project context pack", "ContextBundle.project_pack_block", self.project_pack_block),
+            ("active_task_context", "Active task context", "ContextBundle.task_context_block", self.task_context_block),
+            ("session_summary", "Session summary", "ContextBundle.session_context_block", self.session_context_block),
         ]
         seen: set[str] = set()
         rendered: list[str] = []
+        trace: list[dict[str, Any]] = []
         total = 0
-        for block in blocks:
+        for category, label, source, block in blocks:
             block = (block or "").strip()
-            if not block or block in seen:
+            if not block:
+                continue
+            if block in seen:
+                trace.append({"category": category, "label": label, "source": source, "text": "", "status": "deferred", "preview": "重複のため未送信"})
                 continue
             seen.add(block)
             next_total = total + len(block) + (2 if rendered else 0)
             if next_total > limit:
                 remaining = limit - total - (2 if rendered else 0)
                 if remaining > 80:
-                    rendered.append(_clip_text(block, remaining))
+                    clipped = _clip_text(block, remaining)
+                    rendered.append(clipped)
+                    trace.append({"category": category, "label": label, "source": source, "text": clipped, "status": "active", "preview": "上限に合わせて切り詰めて送信"})
+                else:
+                    trace.append({"category": category, "label": label, "source": source, "text": "", "status": "deferred", "preview": "コンテキスト予算超過のため未送信"})
                 break
             rendered.append(block)
+            trace.append({"category": category, "label": label, "source": source, "text": block, "status": "active", "preview": "モデルへ送信済み"})
             total = next_total
-        return "\n\n".join(rendered)
+        return "\n\n".join(rendered), trace
+
+    def render_for_prompt(self, max_chars: Optional[int] = None) -> str:
+        return self.render_with_trace(max_chars)[0]
 
 
 class ContextBuilder:
@@ -144,6 +158,7 @@ class ContextBuilder:
         project_context: Optional[dict[str, Any]] = None,
         include_project_context: bool = True,
         include_project_information: bool = True,
+        include_agent_memory: bool = True,
         include_project_pack: bool = True,
         include_task_context: bool = True,
         project_context_mode: str = "full",
@@ -201,6 +216,7 @@ class ContextBuilder:
                 try:
                     bundle.project_information_block = await self._build_project_information_block(
                         project_id=project_id,
+                        user_id=user_id,
                     )
                     debug["project_information_context"] = bool(
                         bundle.project_information_block
@@ -219,6 +235,16 @@ class ContextBuilder:
                 except Exception as exc:
                     logger.warning("[ContextBuilder] project context pack failed: %s", exc)
                     debug["errors"]["project_context_pack"] = str(exc)
+
+        if include_agent_memory and project_id:
+            try:
+                bundle.agent_memory_block = await self._build_agent_memory_block(
+                    project_id=project_id,
+                )
+                debug["agent_memory_context"] = bool(bundle.agent_memory_block)
+            except Exception as exc:
+                logger.warning("[ContextBuilder] agent memory failed: %s", exc)
+                debug["errors"]["agent_memory"] = str(exc)
 
         if include_task_context:
             try:
@@ -319,10 +345,162 @@ class ContextBuilder:
                 lines.append(f"  {task.description.strip()[:500]}")
         return "\n".join(lines)
 
+    async def _build_agent_memory_block(
+        self,
+        *,
+        project_id: str,
+        agent_memory_chars: int = 4000,
+    ) -> str:
+        """プロジェクト毎のエージェントメモリ索引ノードのアウトラインを注入する。
+
+        索引ノード（system_key="agent_memory:<project_id>"）を ensure し、
+        その直下の子ノード群（1エントリ=1子ノード）を浅いアウトラインで描画する。
+        DB接続やensureに失敗してもチャットを壊さず空ブロックへ落とす。
+        """
+        project_uuid = _coerce_uuid(project_id)
+        if not project_uuid:
+            return ""
+
+        from ..memory.models import Project
+        from .agent_memory_docs import (
+            AGENT_MEMORY_AI_INSTRUCTIONS,
+            ensure_agent_memory_doc,
+            get_agent_memory_doc,
+        )
+
+        async with await get_db_session() as session:
+            node = await get_agent_memory_doc(session, project_uuid)
+            if node is None:
+                project = await session.get(Project, project_uuid)
+                if project is None:
+                    return ""
+                node = await ensure_agent_memory_doc(session, project)
+                await session.commit()
+
+            node_id = node.id
+            node_title = (node.title or "(untitled)").strip()
+            # 索引ノードは project_id を持つため DocsGraphService.outline_lines は
+            # scope が project_id 一致となり、案件情報等プロジェクト全ノード(LIMIT 500)を
+            # 引いてしまう。500超のプロジェクトではメモリの子が取得対象から漏れて静かに
+            # 消え得るため、索引ノードの子孫だけを parent_id で辿って直接構築する。
+            outline_lines = await self._agent_memory_outline_lines(
+                session, node, depth=2
+            )
+
+        outline_text = "\n".join(outline_lines).strip()
+        truncated = False
+        if len(outline_text) > max(1, agent_memory_chars):
+            outline_text = _clip_text(outline_text, max(1, agent_memory_chars)).rstrip()
+            truncated = True
+
+        lines = [
+            "## Agent Memory (project-scoped, agent-maintained)",
+            (
+                "プロジェクト毎の恒久メモリ（Claude CodeのMEMORY.md相当）。"
+                "訂正・導出不能な知見・作業上の嗜好のみをここへ保存する。"
+            ),
+            f"- Memory Index Node: {node_title} (ref=@docs:{node_id})",
+            (
+                "- 書込単位: 索引ノード直下に「1エントリ=1子ノード」を docs_create_nodes で追加し、"
+                "既存エントリの修正は docs_update_node で行う"
+                "（索引ノード本文はタイトルミラー固定のため本文へは書き込まない）。"
+            ),
+            "- 詳細は各エントリの子ノードにある。必要なら docs_read で該当ノードを読む。",
+            "- 上限接近時は古い項目を統合・圧縮する。秘密情報（パスワード/トークン）は保存禁止。",
+        ]
+        if AGENT_MEMORY_AI_INSTRUCTIONS.strip():
+            lines.append(
+                "- 保存基準: " + _clip_text(AGENT_MEMORY_AI_INSTRUCTIONS.strip(), 420)
+            )
+        lines.append("### Memory Entries Outline")
+        if outline_text:
+            lines.append(outline_text)
+            if truncated:
+                lines.append("...(truncated; 全量は docs_read で索引ノードを読む)")
+        else:
+            lines.append("(まだ記憶はありません)")
+
+        return "\n".join(lines)
+
+    async def _agent_memory_outline_lines(
+        self,
+        session: Any,
+        root: Any,
+        *,
+        depth: int = 2,
+    ) -> list[str]:
+        """索引ノードのサブツリーだけを浅いアウトラインとして構築する。
+
+        ``DocsGraphService.outline_lines`` はプロジェクト全ノードを引くため、
+        ここでは ``parent_id`` を階層ごとに辿って索引ノードの子孫だけを取得し、
+        同一フォーマット（``短縮ID タイトル #タグ`` + タブインデント、短縮IDは
+        UUID 先頭8hex）で組み立てる。``docs_update_node`` / ``docs_read`` の
+        ``resolve_node`` が 8-12hex プレフィックスで解決できる表記を保つ。
+        """
+        from ..memory.models import (
+            KnowledgeNode,
+            KnowledgeNodeSupertag,
+            KnowledgeSupertag,
+        )
+
+        max_depth = max(0, min(int(depth or 2), 8))
+        nodes: list[Any] = [root]
+        children_map: dict[Any, list[Any]] = {}
+        frontier: list[Any] = [root.id]
+        current_depth = 0
+        while current_depth < max_depth and frontier:
+            level_result = await session.execute(
+                select(KnowledgeNode)
+                .where(
+                    KnowledgeNode.workspace_id == root.workspace_id,
+                    KnowledgeNode.parent_id.in_(frontier),
+                    KnowledgeNode.archived_at.is_(None),
+                )
+                .order_by(KnowledgeNode.sort_order, KnowledgeNode.created_at)
+                .limit(500)
+            )
+            level_nodes = list(level_result.scalars().unique().all())
+            for child in level_nodes:
+                children_map.setdefault(child.parent_id, []).append(child)
+            nodes.extend(level_nodes)
+            frontier = [child.id for child in level_nodes]
+            current_depth += 1
+
+        tags_by_node: dict[Any, list[str]] = {}
+        if nodes:
+            tag_rows = await session.execute(
+                select(KnowledgeNodeSupertag.node_id, KnowledgeSupertag.name)
+                .join(
+                    KnowledgeSupertag,
+                    KnowledgeNodeSupertag.supertag_id == KnowledgeSupertag.id,
+                )
+                .where(
+                    KnowledgeNodeSupertag.node_id.in_([node.id for node in nodes])
+                )
+            )
+            for node_id, tag_name in tag_rows.all():
+                tags_by_node.setdefault(node_id, []).append(tag_name)
+
+        lines: list[str] = []
+
+        def visit(node: Any, node_depth: int) -> None:
+            if node_depth > max_depth:
+                return
+            tags = " ".join(f"#{name}" for name in tags_by_node.get(node.id, []))
+            suffix = f" {tags}" if tags else ""
+            indent = "\t" * node_depth
+            lines.append(f"{indent}{str(node.id)[:8]} {node.title}{suffix}")
+            for child in children_map.get(node.id, []):
+                visit(child, node_depth + 1)
+
+        visit(root, 0)
+        return lines
+
     async def _build_project_information_block(
         self,
         *,
         project_id: str,
+        user_id: str,
         max_record_tables: int = 6,
         max_related_nodes: int = 24,
         max_qas: int = 10,
@@ -340,6 +518,7 @@ class ContextBuilder:
             KnowledgeNodeSupertag,
             KnowledgeRevision,
             KnowledgeSupertag,
+            KnowledgeWorkspace,
             Project,
             ProjectQaEntry,
             RecordTable,
@@ -347,6 +526,14 @@ class ContextBuilder:
 
         async with await get_db_session() as session:
             project = await session.get(Project, project_uuid)
+            user_uuid = _coerce_uuid(user_id)
+            workspace_id = None
+            if user_uuid:
+                workspace_id = await session.scalar(
+                    select(KnowledgeWorkspace.id)
+                    .where(KnowledgeWorkspace.owner_user_id == user_uuid)
+                    .limit(1)
+                )
             tables_result = await session.execute(
                 select(RecordTable)
                 .where(
@@ -372,12 +559,17 @@ class ContextBuilder:
             qa_entries = list(qa_result.scalars().all())
 
             canonical_node: Any = None
-            if project and project.knowledge_node_id:
+            if project and project.knowledge_node_id and workspace_id:
                 candidate = await session.get(KnowledgeNode, project.knowledge_node_id)
-                if candidate and candidate.project_id == project_uuid and not candidate.archived_at:
+                if (
+                    candidate
+                    and candidate.workspace_id == workspace_id
+                    and candidate.project_id == project_uuid
+                    and not candidate.archived_at
+                ):
                     canonical_node = candidate
 
-            if canonical_node is None:
+            if canonical_node is None and workspace_id:
                 canonical_result = await session.execute(
                     select(KnowledgeNode)
                     .join(
@@ -389,6 +581,7 @@ class ContextBuilder:
                         KnowledgeNodeSupertag.supertag_id == KnowledgeSupertag.id,
                     )
                     .where(
+                        KnowledgeNode.workspace_id == workspace_id,
                         KnowledgeNode.project_id == project_uuid,
                         KnowledgeNode.archived_at.is_(None),
                         KnowledgeSupertag.base_type == "project_information",
@@ -398,16 +591,19 @@ class ContextBuilder:
                 )
                 canonical_node = canonical_result.scalar_one_or_none()
 
-            related_result = await session.execute(
-                select(KnowledgeNode)
-                .where(
-                    KnowledgeNode.project_id == project_uuid,
-                    KnowledgeNode.archived_at.is_(None),
+            docs_nodes: list[Any] = []
+            if workspace_id:
+                related_result = await session.execute(
+                    select(KnowledgeNode)
+                    .where(
+                        KnowledgeNode.workspace_id == workspace_id,
+                        KnowledgeNode.project_id == project_uuid,
+                        KnowledgeNode.archived_at.is_(None),
+                    )
+                    .order_by(KnowledgeNode.updated_at.desc())
+                    .limit(max(1, max_related_nodes + 1))
                 )
-                .order_by(KnowledgeNode.updated_at.desc())
-                .limit(max(1, max_related_nodes + 1))
-            )
-            docs_nodes = list(related_result.scalars().all())
+                docs_nodes = list(related_result.scalars().all())
             if canonical_node and all(node.id != canonical_node.id for node in docs_nodes):
                 docs_nodes.insert(0, canonical_node)
 
@@ -416,14 +612,12 @@ class ContextBuilder:
                 child_result = await session.execute(
                     select(KnowledgeNode)
                     .where(
+                        KnowledgeNode.workspace_id == workspace_id,
+                        KnowledgeNode.project_id == project_uuid,
                         KnowledgeNode.archived_at.is_(None),
-                        or_(
-                            KnowledgeNode.parent_id == canonical_node.id,
-                            KnowledgeNode.root_page_id == canonical_node.id,
-                        ),
                     )
                     .order_by(KnowledgeNode.sort_order, KnowledgeNode.created_at)
-                    .limit(120)
+                    .limit(500)
                 )
                 child_nodes = list(child_result.scalars().all())
 

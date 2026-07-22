@@ -11,7 +11,6 @@ import {
   users,
   timeEntries,
   projects,
-  knowledgeNodes,
 } from "@/db/schema";
 import { eq, desc, inArray, sql, isNull, and, max } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
@@ -49,6 +48,7 @@ import {
   appendKnowledgeRevision,
   upsertKnowledgeSearchIndex,
 } from "@/lib/server/knowledge-docs-utils";
+import { updateDocsNode } from "@/lib/server/docs-node-writer";
 
 async function hasWritableProjectAccess(
   user: SessionUser,
@@ -576,26 +576,16 @@ export async function PATCH(
     updated.knowledgeNodeId &&
     updated.title !== priorTask.title
   ) {
-    const [linkedNode] = await db
-      .update(knowledgeNodes)
-      .set({
+    const linkedNode = await updateDocsNode(db, updated.knowledgeNodeId, {
         title: updated.title,
         updatedBy: user.id,
         updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(knowledgeNodes.id, updated.knowledgeNodeId),
-          isNull(knowledgeNodes.archivedAt),
-        ),
-      )
-      .returning();
+      });
     if (linkedNode) {
       await upsertKnowledgeSearchIndex(
         db,
         linkedNode,
-        decryptTextIfNeeded(linkedNode.bodyText ?? "", "knowledge_nodes.body_text") ??
-          "",
+        linkedNode.title,
       );
       await appendKnowledgeRevision(
         db,

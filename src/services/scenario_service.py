@@ -30,6 +30,7 @@ from ..models.ecc_models import (
 )
 from .trpg_coc import normalize_coc_state
 from .trpg_rules import COC6_RULESET_TAG, COC7_RULESET_TAG, COC_RULESET_TAG
+from ..utils.uuid_utils import parse_uuid, parse_uuid_strict
 
 logger = logging.getLogger(__name__)
 
@@ -119,15 +120,6 @@ class TRPGScenarioDocumentNotFoundError(ScenarioError):
 # ────────────────────────────────────────────
 
 
-def _parse_uuid(value: Any) -> Optional[uuid.UUID]:
-    if value is None:
-        return None
-    try:
-        return uuid.UUID(str(value))
-    except (ValueError, AttributeError):
-        return None
-
-
 def _dt_iso(value: Any) -> Optional[str]:
     return value.isoformat() if value else None
 
@@ -168,13 +160,6 @@ async def _latest_play_log_at(
 
 def _scenario_log_sort_key(item: Dict[str, Any]) -> str:
     return str(item.get("updated_at") or item.get("created_at") or "")
-
-
-def _parse_uuid_strict(value: str) -> uuid.UUID:
-    try:
-        return uuid.UUID(str(value))
-    except (ValueError, AttributeError):
-        raise ScenarioError(f"無効なUUID形式です: {value}")
 
 
 # ────────────────────────────────────────────
@@ -550,7 +535,7 @@ async def create_scenario(data: dict) -> dict:
                 setattr(scenario, key, data[key])
         scenario.title = data["title"]
         if "created_by" in data and data["created_by"]:
-            scenario.created_by = _parse_uuid(data["created_by"])
+            scenario.created_by = parse_uuid(data["created_by"])
 
         session.add(scenario)
         await session.commit()
@@ -562,7 +547,7 @@ async def create_scenario(data: dict) -> dict:
 
 async def get_scenario(scenario_id: str, include_children: bool = True) -> dict:
     """シナリオを取得する（キャラクター・シーン含む）。"""
-    uid = _parse_uuid_strict(scenario_id)
+    uid = parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         if include_children:
@@ -608,7 +593,7 @@ async def get_scenario(scenario_id: str, include_children: bool = True) -> dict:
 
 async def update_scenario(scenario_id: str, data: dict) -> dict:
     """シナリオを更新する。"""
-    uid = _parse_uuid_strict(scenario_id)
+    uid = parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         scenario = await session.get(Scenario, uid)
@@ -630,7 +615,7 @@ async def update_scenario(scenario_id: str, data: dict) -> dict:
 
 async def delete_scenario(scenario_id: str) -> bool:
     """シナリオを削除する（CASCADE で子テーブルも削除）。"""
-    uid = _parse_uuid_strict(scenario_id)
+    uid = parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         scenario = await session.get(Scenario, uid)
@@ -670,7 +655,7 @@ def _normalize_document_payload(data: dict) -> dict:
 
 
 async def list_trpg_documents(scenario_id: str) -> List[dict]:
-    scenario_uid = _parse_uuid_strict(scenario_id)
+    scenario_uid = parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
     async with await get_db_session() as session:
         scenario = await session.get(Scenario, scenario_uid)
         if scenario is None:
@@ -684,8 +669,8 @@ async def list_trpg_documents(scenario_id: str) -> List[dict]:
 
 
 async def upsert_trpg_document(scenario_id: str, data: dict) -> dict:
-    scenario_uid = _parse_uuid_strict(scenario_id)
-    document_uid = _parse_uuid(data.get("id"))
+    scenario_uid = parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
+    document_uid = parse_uuid(data.get("id"))
     payload = _normalize_document_payload(data)
     async with await get_db_session() as session:
         scenario = await session.get(Scenario, scenario_uid)
@@ -728,8 +713,8 @@ async def upsert_trpg_document(scenario_id: str, data: dict) -> dict:
 
 
 async def delete_trpg_document(scenario_id: str, document_id: str) -> bool:
-    scenario_uid = _parse_uuid_strict(scenario_id)
-    document_uid = _parse_uuid_strict(document_id)
+    scenario_uid = parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
+    document_uid = parse_uuid_strict(document_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
     async with await get_db_session() as session:
         document = await session.get(TRPGScenarioDocument, document_uid)
         if document is None or document.scenario_id != scenario_uid:
@@ -792,7 +777,7 @@ def _normalize_character_payload(data: dict) -> dict:
 
 async def add_scenario_character(scenario_id: str, data: dict) -> dict:
     """シナリオにキャラクターを追加する。"""
-    scenario_uid = _parse_uuid_strict(scenario_id)
+    scenario_uid = parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
     data = _normalize_character_payload(data)
 
     if not data.get("name"):
@@ -812,7 +797,7 @@ async def add_scenario_character(scenario_id: str, data: dict) -> dict:
             if key in data:
                 val = data[key]
                 if key == "character_id" and val:
-                    val = _parse_uuid(val)
+                    val = parse_uuid(val)
                 setattr(char, key, val)
         char.name = data["name"]
 
@@ -826,8 +811,8 @@ async def add_scenario_character(scenario_id: str, data: dict) -> dict:
 
 async def update_scenario_character(scenario_id: str, char_id: str, data: dict) -> dict:
     """シナリオキャラクターを更新する。"""
-    _parse_uuid_strict(scenario_id)
-    char_uid = _parse_uuid_strict(char_id)
+    parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
+    char_uid = parse_uuid_strict(char_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
     data = _normalize_character_payload(data)
 
     async with await get_db_session() as session:
@@ -839,7 +824,7 @@ async def update_scenario_character(scenario_id: str, char_id: str, data: dict) 
             if key in data:
                 val = data[key]
                 if key == "character_id" and val:
-                    val = _parse_uuid(val)
+                    val = parse_uuid(val)
                 setattr(char, key, val)
 
         await session.commit()
@@ -851,8 +836,8 @@ async def update_scenario_character(scenario_id: str, char_id: str, data: dict) 
 
 async def delete_scenario_character(scenario_id: str, char_id: str) -> bool:
     """シナリオキャラクターを削除する。"""
-    _parse_uuid_strict(scenario_id)
-    char_uid = _parse_uuid_strict(char_id)
+    parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
+    char_uid = parse_uuid_strict(char_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         char = await session.get(ScenarioCharacter, char_uid)
@@ -899,7 +884,7 @@ def _normalize_scene_payload(data: dict) -> dict:
 
 async def add_scenario_scene(scenario_id: str, data: dict) -> dict:
     """シナリオにシーンを追加する。"""
-    scenario_uid = _parse_uuid_strict(scenario_id)
+    scenario_uid = parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
     data = _normalize_scene_payload(data)
 
     if not data.get("title"):
@@ -918,7 +903,7 @@ async def add_scenario_scene(scenario_id: str, data: dict) -> dict:
             if key in data:
                 val = data[key]
                 if key == "episode_id" and val:
-                    val = _parse_uuid(val)
+                    val = parse_uuid(val)
                 setattr(scene, key, val)
         scene.title = data["title"]
 
@@ -932,8 +917,8 @@ async def add_scenario_scene(scenario_id: str, data: dict) -> dict:
 
 async def update_scenario_scene(scenario_id: str, scene_id: str, data: dict) -> dict:
     """シナリオシーンを更新する。"""
-    _parse_uuid_strict(scenario_id)
-    scene_uid = _parse_uuid_strict(scene_id)
+    parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
+    scene_uid = parse_uuid_strict(scene_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
     data = _normalize_scene_payload(data)
 
     async with await get_db_session() as session:
@@ -945,7 +930,7 @@ async def update_scenario_scene(scenario_id: str, scene_id: str, data: dict) -> 
             if key in data:
                 val = data[key]
                 if key == "episode_id" and val:
-                    val = _parse_uuid(val)
+                    val = parse_uuid(val)
                 setattr(scene, key, val)
 
         await session.commit()
@@ -957,8 +942,8 @@ async def update_scenario_scene(scenario_id: str, scene_id: str, data: dict) -> 
 
 async def delete_scenario_scene(scenario_id: str, scene_id: str) -> bool:
     """シナリオシーンを削除する。"""
-    _parse_uuid_strict(scenario_id)
-    scene_uid = _parse_uuid_strict(scene_id)
+    parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
+    scene_uid = parse_uuid_strict(scene_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         scene = await session.get(ScenarioScene, scene_uid)
@@ -988,7 +973,7 @@ async def start_play_session(
 
     ConversationSession と ScenarioPlaySession を同時に作成する。
     """
-    scenario_uid = _parse_uuid_strict(scenario_id)
+    scenario_uid = parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         # シナリオ取得（シーン含む）
@@ -1046,7 +1031,7 @@ async def start_play_session(
 
 async def get_play_session(session_id: str) -> dict:
     """プレイセッションを取得する。"""
-    uid = _parse_uuid_strict(session_id)
+    uid = parse_uuid_strict(session_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         play_session = await session.get(ScenarioPlaySession, uid)
@@ -1058,7 +1043,7 @@ async def get_play_session(session_id: str) -> dict:
 
 async def get_play_session_by_conversation_id(conv_session_id: str) -> Optional[dict]:
     """会話セッションIDから対応するプレイセッションを取得する。"""
-    uid = _parse_uuid_strict(conv_session_id)
+    uid = parse_uuid_strict(conv_session_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         from sqlalchemy import select
@@ -1089,7 +1074,7 @@ async def get_play_session_by_conversation_id(conv_session_id: str) -> Optional[
 
 async def update_play_state(session_id: str, updates: dict) -> dict:
     """プレイセッションの状態を更新する。"""
-    uid = _parse_uuid_strict(session_id)
+    uid = parse_uuid_strict(session_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         play_session = await session.get(ScenarioPlaySession, uid)
@@ -1097,7 +1082,7 @@ async def update_play_state(session_id: str, updates: dict) -> dict:
             raise PlaySessionNotFoundError(session_id)
 
         if "current_scene_id" in updates:
-            scene_uid = _parse_uuid(updates["current_scene_id"])
+            scene_uid = parse_uuid(updates["current_scene_id"])
             play_session.current_scene_id = scene_uid
 
         if "player_state" in updates:
@@ -1150,7 +1135,7 @@ def _normalize_episode_payload(data: dict) -> dict:
 
 async def list_episodes(scenario_id: str) -> List[dict]:
     """シナリオのエピソード一覧を取得する。"""
-    scenario_uid = _parse_uuid_strict(scenario_id)
+    scenario_uid = parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         stmt = (
@@ -1164,7 +1149,7 @@ async def list_episodes(scenario_id: str) -> List[dict]:
 
 async def create_episode(scenario_id: str, data: dict) -> dict:
     """エピソードを新規作成する。"""
-    scenario_uid = _parse_uuid_strict(scenario_id)
+    scenario_uid = parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
     data = _normalize_episode_payload(data)
 
     if not data.get("title"):
@@ -1194,7 +1179,7 @@ async def create_episode(scenario_id: str, data: dict) -> dict:
 
 async def update_episode(episode_id: str, data: dict) -> dict:
     """エピソードを更新する。"""
-    uid = _parse_uuid_strict(episode_id)
+    uid = parse_uuid_strict(episode_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
     data = _normalize_episode_payload(data)
 
     async with await get_db_session() as session:
@@ -1216,7 +1201,7 @@ async def update_episode(episode_id: str, data: dict) -> dict:
 
 async def delete_episode(episode_id: str) -> bool:
     """エピソードを削除する。"""
-    uid = _parse_uuid_strict(episode_id)
+    uid = parse_uuid_strict(episode_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         episode = await session.get(ScenarioEpisode, uid)
@@ -1235,7 +1220,7 @@ async def delete_episode(episode_id: str) -> bool:
 
 async def reorder_episodes(scenario_id: str, episode_ids: List[str]) -> List[dict]:
     """エピソードの並び順を更新する。"""
-    scenario_uid = _parse_uuid_strict(scenario_id)
+    scenario_uid = parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         scenario = await session.get(Scenario, scenario_uid)
@@ -1243,7 +1228,7 @@ async def reorder_episodes(scenario_id: str, episode_ids: List[str]) -> List[dic
             raise ScenarioNotFoundError(scenario_id)
 
         for idx, eid in enumerate(episode_ids):
-            uid = _parse_uuid_strict(eid)
+            uid = parse_uuid_strict(eid, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
             episode = await session.get(ScenarioEpisode, uid)
             if episode is not None and episode.scenario_id == scenario_uid:
                 episode.sort_order = idx
@@ -1271,7 +1256,7 @@ async def list_canon_entries(
     category: Optional[str] = None,
 ) -> List[dict]:
     """シナリオのCanonエントリ一覧を取得する。"""
-    scenario_uid = _parse_uuid_strict(scenario_id)
+    scenario_uid = parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         stmt = (
@@ -1288,7 +1273,7 @@ async def list_canon_entries(
 
 async def create_canon_entry(scenario_id: str, data: dict) -> dict:
     """Canonエントリを作成する。"""
-    scenario_uid = _parse_uuid_strict(scenario_id)
+    scenario_uid = parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     if not data.get("category"):
         raise ScenarioError("カテゴリは必須です")
@@ -1307,7 +1292,7 @@ async def create_canon_entry(scenario_id: str, data: dict) -> dict:
             fact=data["fact"],
         )
         if data.get("source_scene_id"):
-            entry.source_scene_id = _parse_uuid(data["source_scene_id"])
+            entry.source_scene_id = parse_uuid(data["source_scene_id"])
 
         session.add(entry)
         await session.commit()
@@ -1319,7 +1304,7 @@ async def create_canon_entry(scenario_id: str, data: dict) -> dict:
 
 async def update_canon_entry(entry_id: str, data: dict) -> dict:
     """Canonエントリを更新する。"""
-    uid = _parse_uuid_strict(entry_id)
+    uid = parse_uuid_strict(entry_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         entry = await session.get(ScenarioCanonEntry, uid)
@@ -1330,7 +1315,7 @@ async def update_canon_entry(entry_id: str, data: dict) -> dict:
             if key in data:
                 val = data[key]
                 if key == "source_scene_id" and val:
-                    val = _parse_uuid(val)
+                    val = parse_uuid(val)
                 setattr(entry, key, val)
 
         await session.commit()
@@ -1342,7 +1327,7 @@ async def update_canon_entry(entry_id: str, data: dict) -> dict:
 
 async def delete_canon_entry(entry_id: str) -> bool:
     """Canonエントリを削除する。"""
-    uid = _parse_uuid_strict(entry_id)
+    uid = parse_uuid_strict(entry_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         entry = await session.get(ScenarioCanonEntry, uid)
@@ -1369,7 +1354,7 @@ async def start_writing_session(
     user_id: str = "default_user",
 ) -> dict:
     """執筆セッションを開始する。ConversationSessionも同時に作成する。"""
-    scenario_uid = _parse_uuid_strict(scenario_id)
+    scenario_uid = parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         scenario = await session.get(Scenario, scenario_uid)
@@ -1380,7 +1365,7 @@ async def start_writing_session(
         target_label = "フリー"
         if data.get("target_scene_id"):
             scene = await session.get(
-                ScenarioScene, _parse_uuid(data["target_scene_id"])
+                ScenarioScene, parse_uuid(data["target_scene_id"])
             )
             if scene:
                 target_label = scene.title
@@ -1401,9 +1386,9 @@ async def start_writing_session(
             conversation_session_id=conv_session.id,
         )
         if data.get("target_episode_id"):
-            ws.target_episode_id = _parse_uuid(data["target_episode_id"])
+            ws.target_episode_id = parse_uuid(data["target_episode_id"])
         if data.get("target_scene_id"):
-            ws.target_scene_id = _parse_uuid(data["target_scene_id"])
+            ws.target_scene_id = parse_uuid(data["target_scene_id"])
         if data.get("writing_prompt"):
             ws.writing_prompt = data["writing_prompt"]
 
@@ -1424,7 +1409,7 @@ async def start_writing_session(
 
 async def get_writing_session(session_id: str) -> dict:
     """執筆セッションを取得する。"""
-    uid = _parse_uuid_strict(session_id)
+    uid = parse_uuid_strict(session_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         ws = await session.get(ScenarioWritingSession, uid)
@@ -1436,7 +1421,7 @@ async def get_writing_session(session_id: str) -> dict:
 
 async def get_writing_session_by_conversation(conv_session_id: str) -> Optional[dict]:
     """会話セッションIDから対応する執筆セッションを取得する。"""
-    uid = _parse_uuid_strict(conv_session_id)
+    uid = parse_uuid_strict(conv_session_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         stmt = select(ScenarioWritingSession).where(
@@ -1458,7 +1443,7 @@ async def get_writing_session_by_conversation(conv_session_id: str) -> Optional[
 
 async def list_scenario_logs(scenario_id: str) -> Dict[str, Any]:
     """シナリオに紐づく執筆・ロールプレイ・TRPGログを共通形式で返す。"""
-    scenario_uid = _parse_uuid_strict(scenario_id)
+    scenario_uid = parse_uuid_strict(scenario_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         scenario = await session.get(Scenario, scenario_uid)
@@ -1539,7 +1524,7 @@ async def list_scenario_logs(scenario_id: str) -> Dict[str, Any]:
         )
         for conv in roleplay_result.scalars().all():
             character_id = conv.character_name.removeprefix(roleplay_prefix)
-            character = _parse_uuid(character_id)
+            character = parse_uuid(character_id)
             char = await session.get(ScenarioCharacter, character) if character else None
             target_label = char.name if char else "キャラクター"
             message_count = await _count_conversation_messages(session, conv.id)
@@ -1614,7 +1599,7 @@ async def get_scenario_log_context_by_conversation(
     conv_session_id: str,
 ) -> Optional[Dict[str, Any]]:
     """会話セッションIDがシナリオ由来なら、そのシナリオのログ一覧を返す。"""
-    uid = _parse_uuid_strict(conv_session_id)
+    uid = parse_uuid_strict(conv_session_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         writing_result = await session.execute(
@@ -1659,7 +1644,7 @@ async def get_scenario_log_context_by_conversation(
 
 async def update_writing_session(session_id: str, data: dict) -> dict:
     """執筆セッションを更新する。"""
-    uid = _parse_uuid_strict(session_id)
+    uid = parse_uuid_strict(session_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     _WS_UPDATABLE = {"writing_prompt", "status"}
 
@@ -1673,9 +1658,9 @@ async def update_writing_session(session_id: str, data: dict) -> dict:
                 setattr(ws, key, data[key])
 
         if "target_episode_id" in data:
-            ws.target_episode_id = _parse_uuid(data["target_episode_id"])
+            ws.target_episode_id = parse_uuid(data["target_episode_id"])
         if "target_scene_id" in data:
-            ws.target_scene_id = _parse_uuid(data["target_scene_id"])
+            ws.target_scene_id = parse_uuid(data["target_scene_id"])
 
         ws.updated_at = datetime.utcnow()
         await session.commit()
@@ -1696,7 +1681,7 @@ async def save_scene_content(
     create_version: bool = True,
 ) -> dict:
     """シーンの本文を保存する。旧バージョンをcontent_versionsに追加。"""
-    uid = _parse_uuid_strict(scene_id)
+    uid = parse_uuid_strict(scene_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         scene = await session.get(ScenarioScene, uid)
@@ -1726,7 +1711,7 @@ async def save_scene_content(
 
 async def get_scene_content(scene_id: str) -> dict:
     """シーンの本文とバージョン履歴を取得する。"""
-    uid = _parse_uuid_strict(scene_id)
+    uid = parse_uuid_strict(scene_id, lambda v: ScenarioError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         scene = await session.get(ScenarioScene, uid)

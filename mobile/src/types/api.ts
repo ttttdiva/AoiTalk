@@ -613,3 +613,143 @@ export interface ManagedCharacter {
   avatar_image_path?: string | null;
   updated_at?: string | null;
 }
+
+// ========== Docs（アウトライン型ナレッジ） ==========
+//
+// 詳細設計書 1.4 / 2.9 の JSON スキーマに対応。サーバ（docs_sync.py）の
+// serialize* と同一キー名・同一意味で往復する。body_json / body_text は
+// 復号済み平文。このセクションは mobile-data の単独所有（mobile-ui は import のみ）。
+
+/** ノード種別。page/block/object はサーバ側で node に正規化される。 */
+export type DocsNodeType = "node" | "search" | "day" | "system";
+
+/** フィールド型（Web docs-model.ts の 11 種と一致）。 */
+export type DocsFieldType =
+  | "text"
+  | "long_text"
+  | "options"
+  | "options_from_supertag"
+  | "number"
+  | "date"
+  | "checkbox"
+  | "url"
+  | "email"
+  | "user"
+  | "reference";
+
+export interface DocsNode {
+  id: string;
+  workspace_id: string | null;
+  parent_id: string | null;
+  root_page_id: string | null;
+  project_id: string | null;
+  system_key: string | null;
+  title: string;
+  aliases: string[];
+  description: string | null;
+  body_json: Record<string, unknown> | null;
+  body_text: string | null;
+  node_type: DocsNodeType;
+  display_props: Record<string, unknown> | null;
+  query_json: Record<string, unknown> | null;
+  view_json: Record<string, unknown> | null;
+  day_date: string | null;
+  sort_order: number | null;
+  created_by: string | null;
+  updated_by: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  archived_at: string | null;
+}
+
+export interface DocsSupertag {
+  id: string;
+  workspace_id: string | null;
+  parent_supertag_id: string | null;
+  system_key: string | null;
+  name: string;
+  base_type: string | null;
+  description: string | null;
+  icon: string | null;
+  color: string | null;
+  template_json: Record<string, unknown> | null;
+  pinned_field_ids: string[];
+  config_json: Record<string, unknown> | null;
+  title_template: string | null;
+  ai_instructions: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface DocsField {
+  id: string;
+  workspace_id: string | null;
+  supertag_id: string | null;
+  system_key: string | null;
+  name: string;
+  field_type: DocsFieldType;
+  required: boolean;
+  options_json: Record<string, unknown> | null;
+  default_value_json: unknown;
+  sort_order: number | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface DocsSupertagField {
+  supertag_id: string;
+  field_id: string;
+  sort_order: number | null;
+  required: boolean;
+  show_in_template: boolean;
+  optional: boolean;
+  created_at: string | null;
+}
+
+export interface DocsNodeSupertag {
+  node_id: string;
+  supertag_id: string;
+  created_at: string | null;
+  updated_at?: string | null;
+  created_by: string | null;
+}
+
+export interface DocsFieldValue {
+  node_id: string;
+  field_id: string;
+  value_json: unknown;
+  value_text: string | null;
+  value_number: number | null;
+  value_datetime: string | null;
+  target_node_id: string | null;
+  updated_at: string | null;
+  updated_by: string | null;
+}
+
+export interface DocsNodePlacement {
+  id: string;
+  node_id: string;
+  parent_node_id: string;
+  sort_order: number | null;
+  collapsed: boolean;
+  created_by: string | null;
+  created_at: string | null;
+}
+
+export interface DocsEdge {
+  id: string;
+  source_node_id: string;
+  target_node_id: string;
+  relation_type: string | null;
+  confidence: number | null;
+  created_by: string | null;
+  created_at: string | null;
+}
+
+export interface DocsSearchHit {
+  id: string;
+  title: string;
+  tags: string[];
+  project_id: string | null;
+  parent_title: string | null;
+}

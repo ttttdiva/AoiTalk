@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getSession } from "@/lib/auth";
 import { listAccounts } from "@/lib/hf/account";
+import { listReferenceRepos } from "@/lib/hf/env-store";
 
 export async function GET() {
   const user = await getSession();
@@ -14,5 +15,5 @@ export async function GET() {
     label: a.label,
     source: a.source,
   }));
-  return NextResponse.json({ accounts });
+  return NextResponse.json({ accounts, references: listReferenceRepos() });
 }

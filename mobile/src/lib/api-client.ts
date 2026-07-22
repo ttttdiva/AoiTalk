@@ -76,10 +76,11 @@ export async function tryRefreshToken(): Promise<boolean> {
 }
 
 /** 汎用API呼び出し */
-export async function fetchApi<T>(
+async function fetchApiInternal<T>(
   path: string,
-  options: RequestInit = {},
-  timeout: number = API_TIMEOUT
+  options: RequestInit,
+  timeout: number,
+  allowRefresh: boolean,
 ): Promise<T> {
   const token = await getToken();
   const baseUrl = await getBaseUrl();
@@ -100,12 +101,15 @@ export async function fetchApi<T>(
     });
 
     if (res.status === 401) {
+      if (!allowRefresh) {
+        throw new AuthError();
+      }
       const refreshed = await tryRefreshToken();
       if (!refreshed) {
         throw new AuthError();
       }
-      // リトライ
-      return fetchApi(path, options, timeout);
+      // refresh後も401なら再帰せず、認証エラーとして呼び出し元へ返す。
+      return fetchApiInternal(path, options, timeout, false);
     }
 
     if (!res.ok) {
@@ -120,6 +124,14 @@ export async function fetchApi<T>(
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+export async function fetchApi<T>(
+  path: string,
+  options: RequestInit = {},
+  timeout: number = API_TIMEOUT,
+): Promise<T> {
+  return fetchApiInternal(path, options, timeout, true);
 }
 
 export { AuthError };

@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import useSWR from "swr";
 import {
   Dialog,
   DialogContent,
@@ -39,6 +40,17 @@ interface GroupChatDialogProps {
   projectId?: string;
 }
 
+// SWR キャッシュキー。グループチャット作成ダイアログの参加候補は一意なので固定文字列。
+const GROUP_CHAT_PARTICIPANTS_SWR_KEY = "chat/group-chat-participants";
+
+type GroupChatParticipants = {
+  characters: CharacterInfo[];
+  users: UserInfo[];
+};
+
+const EMPTY_CHARACTERS: CharacterInfo[] = [];
+const EMPTY_USERS: UserInfo[] = [];
+
 async function pyFetch<T = unknown>(
   path: string,
   init?: RequestInit,
@@ -52,38 +64,60 @@ async function pyFetch<T = unknown>(
   return res.json();
 }
 
+// 参加候補（有効なキャラクター + 招待可能ユーザー）を取得する。
+// 各リクエストは個別に catch して空配列へフォールバックする（旧実装の挙動を踏襲）。
+async function fetchGroupChatParticipants(): Promise<GroupChatParticipants> {
+  const [characterData, userData] = await Promise.all([
+    pyFetch<{ success: boolean; characters: CharacterInfo[] }>(
+      "/characters/manage",
+    ).catch(() => ({ success: false, characters: [] })),
+    pyFetch<{ users: UserInfo[] }>("/conversations/participants/users").catch(
+      () => ({ users: [] }),
+    ),
+  ]);
+  return {
+    characters: (characterData.characters || []).filter((c) => c.is_enabled),
+    users: userData.users || [],
+  };
+}
+
 export function GroupChatDialog({
   open,
   onOpenChange,
   onCreateGroup,
   projectId,
 }: GroupChatDialogProps) {
-  const [characters, setCharacters] = useState<CharacterInfo[]>([]);
-  const [users, setUsers] = useState<UserInfo[]>([]);
   const [selectedSlugs, setSelectedSlugs] = useState<Set<string>>(new Set());
   const [selectedUsers, setSelectedUsers] = useState<Set<string>>(new Set());
-  const [loading, setLoading] = useState(false);
   const [creating, setCreating] = useState(false);
+
+  // 取得・キャッシュ・重複排除は SWR に委譲する。自動 revalidation は全て無効化し、
+  // 従来どおり「ダイアログを開くたびに再取得」する挙動は下の useEffect の mutate で駆動する。
+  const { data, isValidating, mutate } = useSWR<GroupChatParticipants>(
+    GROUP_CHAT_PARTICIPANTS_SWR_KEY,
+    fetchGroupChatParticipants,
+    {
+      revalidateOnMount: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+      keepPreviousData: true,
+      dedupingInterval: 0,
+    },
+  );
+
+  const characters = data?.characters ?? EMPTY_CHARACTERS;
+  const users = data?.users ?? EMPTY_USERS;
+  // 取得中はローディング表示。開くたびに mutate で再取得するため isValidating を使う
+  // （初回・再開いずれも取得完了までスピナーを出す従来挙動を維持）。
+  const loading = isValidating;
 
   useEffect(() => {
     if (!open) return;
-    setLoading(true);
-    Promise.all([
-      pyFetch<{ success: boolean; characters: CharacterInfo[] }>(
-        "/characters/manage",
-      ).catch(() => ({ success: false, characters: [] })),
-      pyFetch<{ users: UserInfo[] }>("/conversations/participants/users").catch(
-        () => ({ users: [] }),
-      ),
-    ])
-      .then(([characterData, userData]) => {
-        setCharacters((characterData.characters || []).filter((c) => c.is_enabled));
-        setUsers(userData.users || []);
-      })
-      .finally(() => setLoading(false));
+    void mutate();
     setSelectedSlugs(new Set());
     setSelectedUsers(new Set());
-  }, [open]);
+  }, [open, mutate]);
 
   const toggleCharacter = useCallback((slug: string) => {
     setSelectedSlugs((prev) => {

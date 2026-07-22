@@ -188,6 +188,9 @@ class Task(Base):
     attachments = relationship(
         "TaskAttachment", back_populates="task", cascade="all, delete-orphan"
     )
+    references = relationship(
+        "TaskReference", back_populates="task", cascade="all, delete-orphan"
+    )
     activities = relationship(
         "TaskActivity", back_populates="task", cascade="all, delete-orphan"
     )
@@ -381,6 +384,60 @@ class TaskAttachment(Base):
             "created_by": str(self.created_by) if self.created_by else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "metadata": self.attachment_metadata or {},
+        }
+
+
+class TaskReference(Base):
+    """汎用のタスク参照。アップロードファイルは TaskAttachment が管理する。"""
+
+    __tablename__ = "task_references"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id = Column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id = Column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    reference_type = Column(String(80), nullable=False)
+    relation_type = Column(String(32), nullable=False, default="related")
+    target_id = Column(Text, nullable=True)
+    target_path = Column(Text, nullable=True)
+    target_url = Column(Text, nullable=True)
+    display_name = Column(String(500), nullable=False)
+    dedupe_key = Column(String(1200), nullable=False)
+    reference_metadata = Column("metadata", JSON, default=dict)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    task = relationship("Task", back_populates="references")
+    project = relationship("Project")
+    creator = relationship("User", foreign_keys=[created_by])
+
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "reference_type",
+            "relation_type",
+            "dedupe_key",
+            name="uq_task_references_target",
+        ),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": str(self.id),
+            "task_id": str(self.task_id),
+            "project_id": str(self.project_id),
+            "reference_type": self.reference_type,
+            "relation_type": self.relation_type,
+            "target_id": self.target_id,
+            "target_path": self.target_path,
+            "target_url": self.target_url,
+            "display_name": self.display_name,
+            "metadata": self.reference_metadata or {},
+            "created_by": str(self.created_by) if self.created_by else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
 

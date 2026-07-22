@@ -16,14 +16,17 @@ import {
   getConfiguredDirectMobileLlmSettings,
   getConfiguredFallbackMobileLlmSettings,
   getMobileLlmSettings,
+  getDirectMobileLlmSettings,
   isDirectProvider,
+  KIMI_ASSISTANT_PAYLOAD_METADATA_KEY,
   type MobileLlmSettings,
 } from "../../lib/mobile-llm";
 import {
   conversationsRepo,
   flushPendingConversation,
+  getPromotedConversationSessionId,
 } from "../../repositories";
-import { useNetworkStore } from "../../stores/network";
+import { isServerKnownUnreachable, useNetworkStore } from "../../stores/network";
 import { deepResearchApi, type DeepResearchJob } from "../../lib/deep-research-api";
 import {
   buildCommandRegistry,
@@ -45,12 +48,22 @@ import type {
   PermissionRequest,
   SendConversationCommand,
 } from "./models";
+import {
+  sanitizeChatCommandCapabilities,
+  type SkillSlashCommand,
+} from "./chat-commands";
+import {
+  describeFallbackFailure,
+  errorTextOf,
+  isLikelyConnectivityFailure,
+} from "./fallback-error";
 
 type ControllerArgs = {
   sessionId?: string | null;
   isAuthenticated: boolean;
   userRole?: string | null;
   selectedProjectId?: string | null;
+  onSessionPromoted?: (sessionId: string) => void;
 };
 
 function deepResearchToConversationJob(job: DeepResearchJob): ConversationJob {
@@ -123,7 +136,12 @@ function parseLlmModePayload(value: unknown): LlmModeResponse | null {
   };
 }
 
-const API_KEY_REQUIRED_PROVIDERS = new Set(["openai", "gemini", "openrouter"]);
+const API_KEY_REQUIRED_PROVIDERS = new Set([
+  "openai",
+  "gemini",
+  "kimi",
+  "openrouter",
+]);
 
 function modelLabel(model: LlmCatalogModelOption | undefined, fallback: string) {
   const label = model?.label?.trim();
@@ -223,8 +241,15 @@ export function useConversationController(
   switchBranch: (message: ConversationMessage, nextIndex: number) => Promise<void>;
   changeLlmMode: (mode: string) => Promise<void>;
   refreshLlmMode: () => Promise<void>;
+  refreshSkillCommands: () => Promise<void>;
 } {
-  const { sessionId, isAuthenticated, selectedProjectId, userRole } = args;
+  const {
+    sessionId,
+    isAuthenticated,
+    selectedProjectId,
+    userRole,
+    onSessionPromoted,
+  } = args;
   const network = useNetworkStore();
   const [session, setSession] = useState<ConversationSession | null>(null);
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
@@ -245,6 +270,7 @@ export function useConversationController(
   >([]);
   const [responseModelOptionsLoading, setResponseModelOptionsLoading] =
     useState(false);
+  const [skillCommands, setSkillCommands] = useState<SkillSlashCommand[]>([]);
   const [branchSelections, setBranchSelections] = useState<Record<string, number>>({});
   const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
   const [jobs, setJobs] = useState<ConversationJob[]>([]);
@@ -252,6 +278,25 @@ export function useConversationController(
   const wsRef = useRef<ChatWebSocket>(new ChatWebSocket());
   const streamBufferRef = useRef("");
   const jobPollersRef = useRef<Record<string, ReturnType<typeof setInterval>>>({});
+  const mountedRef = useRef(true);
+  const loadRequestRef = useRef(0);
+  const scheduledRefreshCancelRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      loadRequestRef.current += 1;
+      scheduledRefreshCancelRef.current?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      scheduledRefreshCancelRef.current?.();
+      scheduledRefreshCancelRef.current = null;
+    };
+  }, [sessionId]);
 
   const sessionKind = useMemo(() => inferSessionKind(session), [session]);
   const transportState = buildTransportState({
@@ -327,13 +372,11 @@ export function useConversationController(
         activityMessage,
         streamContent,
         pendingMessages,
-        disconnected: isAuthenticated && !isConnected,
       }),
     [
       activeTool,
       activityMessage,
       isAuthenticated,
-      isConnected,
       jobs,
       pendingMessages,
       pendingPermissions,
@@ -344,6 +387,9 @@ export function useConversationController(
 
   const load = useCallback(async () => {
     if (!sessionId) return;
+    const requestId = ++loadRequestRef.current;
+    const isCurrentRequest = () =>
+      mountedRef.current && requestId === loadRequestRef.current;
     setLoading(true);
     setError(null);
     try {
@@ -351,44 +397,101 @@ export function useConversationController(
         conversationsRepo.getSessionLocal(sessionId),
         conversationsRepo.listMessagesLocal(sessionId),
       ]);
+      if (!isCurrentRequest()) return;
       setSession(localSession);
       setMessages(localMessages);
-      if (isAuthenticated) {
+
+      const hasLocalData = Boolean(localSession) || localMessages.length > 0;
+      if (hasLocalData || !isAuthenticated) {
+        setLoading(false);
+      }
+      if (!isAuthenticated) return;
+
+      const refreshRemote = async () => {
         try {
           const remote = await chatApi.resumeSession(sessionId);
-          await conversationsRepo.saveLocalMessages(sessionId, remote.messages);
+          if (!isCurrentRequest()) return;
           setSession(remote.session);
-          setMessages(remote.messages);
+          setMessages((current) => {
+            const remoteIds = new Set(remote.messages.map((message) => message.id));
+            const localPending = current.filter(
+              (message) =>
+                !remoteIds.has(message.id) &&
+                (Boolean(message.metadata?.local_only) ||
+                  Boolean(message.metadata?.pending)),
+            );
+            return [...remote.messages, ...localPending].sort((left, right) =>
+              String(left.created_at ?? "").localeCompare(
+                String(right.created_at ?? ""),
+              ),
+            );
+          });
           setLastRefreshAt(new Date().toISOString());
+          setLoading(false);
+          void conversationsRepo
+            .saveLocalMessages(sessionId, remote.messages)
+            .catch(() => undefined);
         } catch {
-          if (!localSession && localMessages.length === 0) {
-            throw new Error("会話セッションを表示できませんでした。");
+          if (!isCurrentRequest()) return;
+          if (!hasLocalData) {
+            setError("会話セッションを表示できませんでした。");
           }
+          setLoading(false);
         }
+      };
+
+      if (hasLocalData) {
+        void refreshRemote();
+      } else {
+        await refreshRemote();
       }
     } catch (loadError) {
+      if (!isCurrentRequest()) return;
       setError(loadError instanceof Error ? loadError.message : "会話を読み込めませんでした。");
-    } finally {
       setLoading(false);
     }
   }, [isAuthenticated, sessionId]);
 
   const refreshFromServer = useCallback(async () => {
+    const requestId = loadRequestRef.current;
+    const isCurrentRequest = () =>
+      mountedRef.current && requestId === loadRequestRef.current;
     if (!sessionId || !isAuthenticated) {
-      if (sessionId) setMessages(await conversationsRepo.listMessagesLocal(sessionId));
+      if (sessionId) {
+        const localMessages = await conversationsRepo.listMessagesLocal(sessionId);
+        if (isCurrentRequest()) setMessages(localMessages);
+      }
       return;
     }
     const fresh = await conversationsRepo.refreshMessages(sessionId);
-    setMessages(fresh);
+    if (!isCurrentRequest()) return;
+    setMessages((current) => {
+      const freshIds = new Set(fresh.map((message) => message.id));
+      const localPending = current.filter(
+        (message) =>
+          !freshIds.has(message.id) &&
+          (Boolean(message.metadata?.local_only) ||
+            Boolean(message.metadata?.pending)),
+      );
+      return [...fresh, ...localPending].sort((left, right) =>
+        String(left.created_at ?? "").localeCompare(
+          String(right.created_at ?? ""),
+        ),
+      );
+    });
     const localSession = await conversationsRepo.getSessionLocal(sessionId);
+    if (!isCurrentRequest()) return;
     setSession(localSession);
     setLastRefreshAt(new Date().toISOString());
   }, [isAuthenticated, sessionId]);
 
   const scheduleRefresh = useCallback(() => {
-    return nextRefreshTimers(() => {
+    scheduledRefreshCancelRef.current?.();
+    const cancel = nextRefreshTimers(() => {
       void refreshFromServer().finally(() => setIsWaiting(false));
     });
+    scheduledRefreshCancelRef.current = cancel;
+    return cancel;
   }, [refreshFromServer]);
 
   const applyLlmMode = useCallback((result: LlmModeResponse) => {
@@ -444,19 +547,72 @@ export function useConversationController(
     [applyLlmMode],
   );
 
+  const refreshSkillCommands = useCallback(async () => {
+    if (!isAuthenticated) {
+      setSkillCommands([]);
+      return;
+    }
+    try {
+      setSkillCommands(await chatApi.listSkillSlashCommands(selectedProjectId));
+    } catch {
+      setSkillCommands([]);
+    }
+  }, [isAuthenticated, selectedProjectId]);
+
   const sendConversationCommand = useCallback(
     async (command: SendConversationCommand) => {
       if (!sessionId) return;
       const text = command.message.trim();
       if (!text || isStreaming) return;
+      const requestedTarget = command.target ?? { kind: "server" as const };
+      const forceServer = command.target?.kind === "server";
+      const requiresServerRuntime =
+        (requestedTarget.kind === "server" && Boolean(requestedTarget.responseModel)) ||
+        Boolean(command.commandCapabilities?.length) ||
+        text.startsWith("/");
+      const requiresServerFeature =
+        Boolean(command.commandCapabilities?.length) || text.startsWith("/");
+      if (requestedTarget.kind === "direct" && requiresServerFeature) {
+        setError("組み込みコマンドとSkillsはServerモデルで実行してください。");
+        return;
+      }
+      if (requiresServerRuntime && !isAuthenticated) {
+        setError("組み込みコマンド、Skills、モデル指定はログイン中のみ利用できます。");
+        return;
+      }
+
+      let directSettings: MobileLlmSettings | null = null;
+      let fallbackFromServer = false;
+      const serverKnownUnreachable =
+        requestedTarget.kind === "server" &&
+        !requiresServerFeature &&
+        isServerKnownUnreachable();
+      if (requestedTarget.kind === "direct") {
+        directSettings = await getDirectMobileLlmSettings(requestedTarget.selection);
+      } else if (serverKnownUnreachable) {
+        directSettings = await getConfiguredFallbackMobileLlmSettings("server");
+        fallbackFromServer = Boolean(directSettings);
+      }
 
       setError(null);
       setIsWaiting(true);
+      const usesDirect = Boolean(directSettings);
       const localMessage = await conversationsRepo.appendLocalMessage(sessionId, "user", text, {
         local_only: true,
-        pending: isAuthenticated,
+        pending: isAuthenticated && !usesDirect,
         anonymous_only: !isAuthenticated,
-        message_state: isAuthenticated ? "queued" : "local-draft",
+        message_state: usesDirect
+          ? "direct-running"
+          : isAuthenticated
+            ? "queued"
+            : "local-draft",
+        delivery_route: usesDirect ? "direct" : "server",
+        ...(command.commandCapabilities?.length
+          ? { command_capabilities: command.commandCapabilities }
+          : {}),
+        ...(requestedTarget.kind === "server" && requestedTarget.responseModel
+          ? { response_model: requestedTarget.responseModel }
+          : {}),
       });
       setMessages((prev) => [...prev, localMessage]);
 
@@ -468,12 +624,17 @@ export function useConversationController(
         const assistantMessage = await conversationsRepo.appendLocalMessage(
           sessionId,
           "assistant",
-          reply,
+          reply.content,
           {
             local_only: true,
             direct_cloud: true,
             provider: directSettings.provider,
             model: directSettings.model,
+            ...(reply.assistantPayload
+              ? {
+                  [KIMI_ASSISTANT_PAYLOAD_METADATA_KEY]: reply.assistantPayload,
+                }
+              : {}),
             ...metadata,
           },
         );
@@ -485,6 +646,79 @@ export function useConversationController(
         });
         setMessages((prev) => [...prev, assistantMessage]);
       };
+
+      const errorText = errorTextOf;
+      const combinedFallbackError = describeFallbackFailure;
+
+      if (directSettings) {
+        setIsStreaming(true);
+        try {
+          await appendDirectReply(directSettings, {
+            ...(requestedTarget.kind === "direct" ? { direct_selected: true } : {}),
+            ...(fallbackFromServer ? { fallback_from_server: true } : {}),
+          });
+        } catch (directError) {
+          const failedMetadata = {
+            pending: fallbackFromServer,
+            message_state: fallbackFromServer ? "queued" : "direct-failed",
+            delivery_route: fallbackFromServer ? "server" : "direct",
+            direct_error: errorText(directError, "Direct応答に失敗しました。"),
+          };
+          await conversationsRepo.mergeMessageMetadata(
+            localMessage.id,
+            failedMetadata,
+          );
+          setMessages((prev) =>
+            prev.map((message) =>
+              message.id === localMessage.id
+                ? { ...message, metadata: { ...message.metadata, ...failedMetadata } }
+                : message,
+            ),
+          );
+          setError(errorText(directError, "Direct応答に失敗しました。"));
+        } finally {
+          setIsStreaming(false);
+          setIsWaiting(false);
+        }
+        return;
+      }
+
+      if (serverKnownUnreachable) {
+        setError("Serverに接続できません。Directモデルを選ぶか、フォールバックモデルを設定してください。");
+        setIsWaiting(false);
+        return;
+      }
+
+      if (
+        isAuthenticated &&
+        requestedTarget.kind === "server" &&
+        !session?.user_id
+      ) {
+        try {
+          const remoteSessionId = await flushPendingConversation(sessionId);
+          if (remoteSessionId === sessionId) {
+            throw new Error("ローカルチャットをServerへ接続できませんでした。");
+          }
+          onSessionPromoted?.(remoteSessionId);
+        } catch (promotionError) {
+          if (isLikelyConnectivityFailure(promotionError)) {
+            useNetworkStore.getState().setServerReachable(false);
+          }
+          setError(
+            errorText(
+              promotionError,
+              "ローカルチャットをServerへ接続できませんでした。",
+            ),
+          );
+          const promotedSessionId =
+            await getPromotedConversationSessionId(sessionId).catch(() => null);
+          if (promotedSessionId) {
+            onSessionPromoted?.(promotedSessionId);
+          }
+          setIsWaiting(false);
+        }
+        return;
+      }
 
       if (!isAuthenticated) {
         const settings = await getMobileLlmSettings();
@@ -500,18 +734,17 @@ export function useConversationController(
               ? await getConfiguredFallbackMobileLlmSettings(settings.provider)
               : null;
             if (!fallback) {
-              setError(
-                directError instanceof Error
-                  ? directError.message
-                  : "メッセージ送信に失敗しました。",
-              );
+              setError(errorText(directError, "メッセージ送信に失敗しました。"));
               return;
             }
-            await appendDirectReply(fallback, {
-              fallback_from_direct: true,
-              main_error:
-                directError instanceof Error ? directError.message : "direct failed",
-            });
+            try {
+              await appendDirectReply(fallback, {
+                fallback_from_direct: true,
+                main_error: errorText(directError, "direct failed"),
+              });
+            } catch (fallbackError) {
+              setError(combinedFallbackError(directError, fallbackError));
+            }
           } finally {
             setIsStreaming(false);
             setIsWaiting(false);
@@ -523,7 +756,11 @@ export function useConversationController(
       }
 
       const settings = await getMobileLlmSettings();
-      if (isDirectProvider(settings.provider)) {
+      if (
+        isDirectProvider(settings.provider) &&
+        !requiresServerRuntime &&
+        !forceServer
+      ) {
         setIsStreaming(true);
         try {
           await appendDirectReply(settings);
@@ -532,18 +769,17 @@ export function useConversationController(
             settings.provider,
           );
           if (fallback) {
-            await appendDirectReply(fallback, {
-              fallback_from_direct: true,
-              main_error:
-                directError instanceof Error ? directError.message : "direct failed",
-            });
+            try {
+              await appendDirectReply(fallback, {
+                fallback_from_direct: true,
+                main_error: errorText(directError, "direct failed"),
+              });
+            } catch (fallbackError) {
+              setError(combinedFallbackError(directError, fallbackError));
+            }
             return;
           }
-          setError(
-            directError instanceof Error
-              ? directError.message
-              : "メッセージ送信に失敗しました。",
-          );
+          setError(errorText(directError, "メッセージ送信に失敗しました。"));
         } finally {
           setIsStreaming(false);
           setIsWaiting(false);
@@ -559,33 +795,38 @@ export function useConversationController(
             command.includeProjectContext ?? Boolean(command.projectId ?? selectedProjectId),
           agent_mode: command.agentMode ?? "confirm",
           edit_message_id: command.editMessageId,
-          response_model: command.responseModel,
+          response_model:
+            requestedTarget.kind === "server"
+              ? requestedTarget.responseModel
+              : undefined,
+          command_capabilities: command.commandCapabilities,
         });
         await conversationsRepo.markPendingMessageQueued(localMessage.id);
         scheduleRefresh();
       } catch (dispatchError) {
-        const fallback = await getConfiguredFallbackMobileLlmSettings(
-          settings.provider,
-        );
-        if (fallback) {
-          setIsStreaming(true);
-          try {
-            await appendDirectReply(fallback, {
-              fallback_from_server: true,
-              server_error:
-                dispatchError instanceof Error ? dispatchError.message : "dispatch failed",
-            });
-            return;
-          } finally {
-            setIsStreaming(false);
-            setIsWaiting(false);
-          }
+        if (isLikelyConnectivityFailure(dispatchError)) {
+          useNetworkStore.getState().setServerReachable(false);
         }
-        setError(
-          dispatchError instanceof Error
-            ? dispatchError.message
-            : "メッセージ送信に失敗しました。",
+        const failedMetadata = {
+          pending: false,
+          message_state: "delivery-unknown",
+          delivery_error: errorText(
+            dispatchError,
+            "メッセージ送信に失敗しました。",
+          ),
+        };
+        await conversationsRepo.mergeMessageMetadata(
+          localMessage.id,
+          failedMetadata,
         );
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.id === localMessage.id
+              ? { ...message, metadata: { ...message.metadata, ...failedMetadata } }
+              : message,
+          ),
+        );
+        setError(errorText(dispatchError, "メッセージ送信に失敗しました。"));
         setIsWaiting(false);
       }
     },
@@ -593,8 +834,10 @@ export function useConversationController(
       isAuthenticated,
       isStreaming,
       messages,
+      onSessionPromoted,
       scheduleRefresh,
       selectedProjectId,
+      session?.user_id,
       sessionId,
     ],
   );
@@ -602,11 +845,26 @@ export function useConversationController(
   const retryPendingMessage = useCallback(
     async (message: ConversationMessage) => {
       if (!sessionId || !isAuthenticated) return;
+      const storedResponseModel = message.metadata?.response_model;
+      const responseModel =
+        storedResponseModel &&
+        typeof storedResponseModel === "object" &&
+        typeof (storedResponseModel as Record<string, unknown>).provider === "string" &&
+        typeof (storedResponseModel as Record<string, unknown>).model === "string"
+          ? {
+              provider: (storedResponseModel as Record<string, string>).provider,
+              model: (storedResponseModel as Record<string, string>).model,
+            }
+          : undefined;
       await chatApi.dispatchMessage(sessionId, {
         message: message.content,
         project_id: selectedProjectId ?? undefined,
         include_project_context: Boolean(selectedProjectId),
         agent_mode: "confirm",
+        command_capabilities: sanitizeChatCommandCapabilities(
+          message.metadata?.command_capabilities,
+        ),
+        response_model: responseModel,
       });
       await conversationsRepo.markPendingMessageQueued(message.id);
       await refreshFromServer();
@@ -705,7 +963,7 @@ export function useConversationController(
           includeProjectContext: Boolean(selectedProjectId),
           agentMode: "confirm",
           editMessageId: message.id,
-          responseModel,
+          target: { kind: "server", responseModel },
         });
         return;
       }
@@ -721,7 +979,7 @@ export function useConversationController(
           includeProjectContext: Boolean(selectedProjectId),
           agentMode: "confirm",
           editMessageId: source.id,
-          responseModel,
+          target: { kind: "server", responseModel },
         });
       }
     },
@@ -774,7 +1032,38 @@ export function useConversationController(
   }, [refreshResponseModelOptions]);
 
   useEffect(() => {
-    if (!sessionId || !isAuthenticated) {
+    void refreshSkillCommands();
+  }, [refreshSkillCommands]);
+
+  useEffect(() => {
+    if (
+      !sessionId ||
+      !session ||
+      session.user_id ||
+      !isAuthenticated ||
+      !network.online ||
+      !network.serverReachable
+    ) {
+      return;
+    }
+    void flushPendingConversation(sessionId)
+      .then((remoteSessionId) => {
+        if (remoteSessionId !== sessionId) {
+          onSessionPromoted?.(remoteSessionId);
+        }
+      })
+      .catch(() => undefined);
+  }, [
+    isAuthenticated,
+    network.online,
+    network.serverReachable,
+    onSessionPromoted,
+    session,
+    sessionId,
+  ]);
+
+  useEffect(() => {
+    if (!sessionId || !isAuthenticated || !session?.user_id) {
       setIsConnected(false);
       return;
     }
@@ -786,6 +1075,7 @@ export function useConversationController(
         void flushPendingConversation(sessionId)
           .then((remoteSessionId) => {
             if (remoteSessionId === sessionId) return refreshFromServer();
+            onSessionPromoted?.(remoteSessionId);
             return undefined;
           })
           .catch(() => undefined);
@@ -876,7 +1166,14 @@ export function useConversationController(
     });
     void ws.connect(sessionId);
     return () => ws.disconnect();
-  }, [applyLlmMode, isAuthenticated, refreshFromServer, sessionId]);
+  }, [
+    applyLlmMode,
+    isAuthenticated,
+    onSessionPromoted,
+    refreshFromServer,
+    session?.user_id,
+    sessionId,
+  ]);
 
   useEffect(() => {
     return () => {
@@ -905,6 +1202,7 @@ export function useConversationController(
     llmModeKind,
     responseModelOptions,
     responseModelOptionsLoading,
+    skillCommands,
     branchSelections,
     load,
     refreshFromServer,
@@ -918,5 +1216,6 @@ export function useConversationController(
     switchBranch,
     changeLlmMode,
     refreshLlmMode,
+    refreshSkillCommands,
   };
 }

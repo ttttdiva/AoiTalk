@@ -28,7 +28,7 @@ class ReasoningPlanner:
         self.step_patterns = {
             'search': {
                 'keywords': ['検索', '調べ', '探す', '確認', '取得'],
-                'tools': ['web_search', 'grok_x_search', 'search_memory', 'knowledge_search']
+                'tools': ['web_search', 'grok_x_search', 'search_memory']
             },
             'create': {
                 'keywords': ['作成', '登録', '追加', '生成', '保存'],
@@ -36,7 +36,7 @@ class ReasoningPlanner:
             },
             'analyze': {
                 'keywords': ['分析', '解析', '評価', '判定', '比較'],
-                'tools': ['search_memory', 'knowledge_search', 'utility_assistant']
+                'tools': ['search_memory', 'utility_assistant']
             },
             'fetch': {
                 'keywords': ['取得', '読み込み', 'ダウンロード', 'アクセス'],
@@ -197,7 +197,6 @@ class ReasoningPlanner:
         # 実際の実装では各ツールの説明を動的に取得
         tool_descriptions = {
             'search_memory': '過去の会話履歴や記憶を検索',
-            'knowledge_search': 'Knowledge Workspaceの文書や資料を検索',
             'WebSearch': 'インターネットから最新情報を検索',
             'web_search': 'General web search for fresh information',
             'grok_x_search': 'Fresh X/Twitter search via Grok',

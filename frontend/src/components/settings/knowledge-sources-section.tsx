@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
+import useSWR from "swr";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -79,9 +80,54 @@ const STATUS_LABELS: Record<string, { label: string; variant: "default" | "secon
 export function KnowledgeSourcesSection() {
   const { selectedProject, selectedProjectId } = useProject();
   const [expanded, setExpanded] = useState(false);
-  const [sources, setSources] = useState<KnowledgeSource[]>([]);
+  // ナレッジソース一覧と検索有効フラグ（サーバー状態）は SWR で管理。取得タイミングは
+  // 従来どおり呼び出し側（展開/各操作後）で駆動するため自動 revalidation は無効化する。
+  const { data: sources = [], mutate: mutateSources } = useSWR<KnowledgeSource[]>(
+    "settings/knowledge-sources",
+    async () => {
+      try {
+        return (await pyFetch<{ sources: KnowledgeSource[] }>("/knowledge/sources"))
+          .sources || [];
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "ナレッジソースを取得できませんでした");
+        return [];
+      }
+    },
+    {
+      revalidateOnMount: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+      keepPreviousData: true,
+      dedupingInterval: 0,
+    },
+  );
+  const knowledgeEnabledRef = useRef(false);
+  const { data: knowledgeEnabled = false, mutate: mutateKnowledgeEnabled } = useSWR<boolean>(
+    "settings/knowledge-enabled",
+    async () => {
+      try {
+        const data = await pyFetch<SettingsPayload>("/settings");
+        return (
+          data.settings?.search?.knowledge_enabled ??
+          data.settings?.knowledge?.enabled ??
+          false
+        );
+      } catch {
+        return knowledgeEnabledRef.current;
+      }
+    },
+    {
+      revalidateOnMount: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+      keepPreviousData: true,
+      dedupingInterval: 0,
+    },
+  );
+  knowledgeEnabledRef.current = knowledgeEnabled;
   const [loading, setLoading] = useState(false);
-  const [knowledgeEnabled, setKnowledgeEnabled] = useState(false);
   const [savingEnabled, setSavingEnabled] = useState(false);
   const [creating, setCreating] = useState(false);
   const [busySourceId, setBusySourceId] = useState<string | null>(null);
@@ -95,42 +141,28 @@ export function KnowledgeSourcesSection() {
   const [creatingGrowi, setCreatingGrowi] = useState(false);
   const [testingGrowi, setTestingGrowi] = useState(false);
 
-  const fetchSettings = useCallback(async () => {
-    const data = await pyFetch<SettingsPayload>("/settings");
-    setKnowledgeEnabled(
-      data.settings?.search?.knowledge_enabled ??
-        data.settings?.knowledge?.enabled ??
-        false,
-    );
-  }, []);
-
   const fetchSources = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await pyFetch<{ sources: KnowledgeSource[] }>(
-        "/knowledge/sources",
-      );
-      setSources(data.sources || []);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "ナレッジソースを取得できませんでした");
-      setSources([]);
+      await mutateSources();
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [mutateSources]);
 
   const handleExpand = useCallback(() => {
     const next = !expanded;
     setExpanded(next);
     if (next) {
-      void fetchSettings();
+      void mutateKnowledgeEnabled();
       void fetchSources();
     }
-  }, [expanded, fetchSettings, fetchSources]);
+  }, [expanded, mutateKnowledgeEnabled, fetchSources]);
 
   const handleEnabledChange = useCallback(
     async (enabled: boolean) => {
-      setKnowledgeEnabled(enabled);
+      // 楽観的更新：切替後はローカルキャッシュを即時反映する。
+      await mutateKnowledgeEnabled(enabled, { revalidate: false });
       setSavingEnabled(true);
       try {
         await pyFetch("/settings", {
@@ -143,12 +175,12 @@ export function KnowledgeSourcesSection() {
         toast.success("Knowledge検索設定を保存しました");
       } catch (error) {
         toast.error(error instanceof Error ? error.message : "設定を保存できませんでした");
-        void fetchSettings();
+        void mutateKnowledgeEnabled();
       } finally {
         setSavingEnabled(false);
       }
     },
-    [fetchSettings],
+    [mutateKnowledgeEnabled],
   );
 
   const handleCreate = useCallback(async () => {

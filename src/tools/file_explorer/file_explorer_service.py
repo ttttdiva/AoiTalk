@@ -6,21 +6,50 @@ Replaces the old user_files and integrates document handling.
 """
 
 import base64
+import bz2
+import gzip
 import io
+import lzma
 import mimetypes
 import os
 import re
 import shutil
 import stat
+import tarfile
 import zipfile
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 
+import py7zr
+from py7zr.io import Py7zIO, WriterFactory
+
 # Constants
 MAX_FILE_SIZE_MB = 100
 SHORTCUT_EXTENSION = ".lnk"
 BLOCKED_EXTENSIONS = {".exe", ".bat", ".cmd", ".sh", ".ps1", ".vbs", ".scr", ".com"}
+ARCHIVE_SUFFIXES = (
+    ".tar.bz2",
+    ".tar.gz",
+    ".tar.xz",
+    ".tbz2",
+    ".tgz",
+    ".txz",
+    ".7z",
+    ".tar",
+    ".zip",
+    ".bz2",
+    ".gz",
+    ".xz",
+)
+WINDOWS_RESERVED_NAMES = {
+    "aux",
+    "con",
+    "nul",
+    "prn",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+}
 TEXT_EXTENSIONS = {
     ".txt",
     ".md",
@@ -235,6 +264,11 @@ def _resolve_path(relative_path: str, is_admin: bool = False) -> Tuple[Path, boo
         Tuple of (resolved_path, is_valid)
     """
     root = get_root_dir()
+
+    # Git internals are never exposed through the filer, including admin mode.
+    normalized_parts = [part.casefold() for part in relative_path.replace("\\", "/").split("/")]
+    if ".git" in normalized_parts:
+        return root, False
 
     if not relative_path or relative_path == "/":
         return root, True
@@ -702,22 +736,16 @@ def download_file(
     try:
         if target.is_dir():
             buffer = io.BytesIO()
-            archive_name = f"{target.name or 'workspace'}.zip"
+            archive_root_name = target.name or "workspace"
+            archive_name = f"{archive_root_name}.zip"
             with zipfile.ZipFile(
                 buffer, mode="w", compression=zipfile.ZIP_DEFLATED
             ) as archive:
-                for file_path in sorted(
-                    (
-                        p
-                        for p in target.rglob("*")
-                        if p.is_file() and not p.is_symlink()
-                    ),
-                    key=lambda p: str(p).lower(),
-                ):
-                    archive.write(
-                        file_path,
-                        str(file_path.relative_to(target)).replace("\\", "/"),
-                    )
+                _write_directory_contents_to_archive(
+                    archive,
+                    target,
+                    empty_root_name=archive_root_name,
+                )
             return buffer.getvalue(), archive_name, "application/zip"
 
         if not target.is_file():
@@ -738,27 +766,62 @@ def _selected_archive_name(resolved_items: List[Path]) -> str:
     return "archive.zip"
 
 
+def _write_directory_contents_to_archive(
+    archive: zipfile.ZipFile,
+    source: Path,
+    root_name: str = "",
+    empty_root_name: Optional[str] = None,
+) -> None:
+    """Write a directory tree while preserving empty directories."""
+    wrote_entry = False
+    for child in sorted(source.rglob("*"), key=lambda p: str(p).lower()):
+        if child.is_symlink():
+            continue
+        rel = child.relative_to(source)
+        arcname = (
+            PurePosixPath(root_name, *rel.parts).as_posix()
+            if root_name
+            else PurePosixPath(*rel.parts).as_posix()
+        )
+        if child.is_dir():
+            # ZIPには空ディレクトリを明示的なエントリとして保存する。
+            if not any(child.iterdir()):
+                archive.writestr(f"{arcname}/", b"")
+                wrote_entry = True
+        elif child.is_file():
+            archive.write(child, arcname)
+            wrote_entry = True
+
+    if not wrote_entry and empty_root_name:
+        archive.writestr(f"{empty_root_name}/", b"")
+
+
 def _write_selected_items_to_archive(
     archive: zipfile.ZipFile, resolved_items: List[Path]
 ) -> None:
+    used_root_names: set[str] = set()
     for source in resolved_items:
         if source.is_symlink():
             continue
+        root_name = source.name
+        suffix = 2
+        while root_name.casefold() in used_root_names:
+            if source.is_file():
+                root_name = f"{source.stem} ({suffix}){source.suffix}"
+            else:
+                root_name = f"{source.name} ({suffix})"
+            suffix += 1
+        used_root_names.add(root_name.casefold())
         if source.is_file():
-            archive.write(source, source.name)
+            archive.write(source, root_name)
             continue
 
-        for child in sorted(source.rglob("*"), key=lambda p: str(p).lower()):
-            if child.is_symlink():
-                continue
-            rel = child.relative_to(source)
-            arcname = PurePosixPath(source.name, *rel.parts).as_posix()
-            if child.is_dir():
-                # Preserve empty directories.
-                if not any(child.iterdir()):
-                    archive.writestr(f"{arcname}/", b"")
-            elif child.is_file():
-                archive.write(child, arcname)
+        _write_directory_contents_to_archive(
+            archive,
+            source,
+            root_name=root_name,
+            empty_root_name=root_name,
+        )
 
 
 def _resolve_selected_items(
@@ -768,6 +831,7 @@ def _resolve_selected_items(
         return [], "対象が選択されていません"
 
     root = get_root_dir()
+
     resolved_items: List[Path] = []
     for raw_path in paths:
         target, valid = _resolve_path(raw_path, is_admin=is_admin)
@@ -851,20 +915,220 @@ def archive_items(
         return {"success": False, "error": f"圧縮に失敗: {str(e)}"}
 
 
-def _safe_zip_member_parts(name: str) -> Optional[Tuple[str, ...]]:
+def _safe_archive_member_parts(name: str) -> Optional[Tuple[str, ...]]:
     raw_name = name.replace("\\", "/")
     if not raw_name or raw_name.startswith("/") or re.match(r"^[A-Za-z]:", raw_name):
         return None
     parts = PurePosixPath(raw_name).parts
-    if not parts or any(part in {"", ".", ".."} for part in parts):
+    if not parts or any(
+        part in {"", ".", ".."}
+        or part.casefold() == ".git"
+        or ":" in part
+        or part.endswith((" ", "."))
+        or part.split(".", 1)[0].casefold() in WINDOWS_RESERVED_NAMES
+        for part in parts
+    ):
         return None
     return tuple(parts)
+
+
+def _archive_format(path: Path) -> Optional[str]:
+    name = path.name.casefold()
+    if name.endswith(".zip"):
+        return "zip"
+    if name.endswith(".7z"):
+        return "7z"
+    if name.endswith(
+        (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar")
+    ):
+        return "tar"
+    if name.endswith(".gz"):
+        return "gz"
+    if name.endswith(".bz2"):
+        return "bz2"
+    if name.endswith(".xz"):
+        return "xz"
+    return None
+
+
+def _archive_stem(path: Path) -> str:
+    name = path.name
+    lower_name = name.casefold()
+    for suffix in ARCHIVE_SUFFIXES:
+        if lower_name.endswith(suffix):
+            return name[: -len(suffix)] or "archive"
+    return path.stem or "archive"
+
+
+def _safe_archive_target(extract_root: Path, name: str, *, is_dir: bool) -> Path:
+    parts = _safe_archive_member_parts(name)
+    if parts is None:
+        raise ValueError("安全でないパスを含む圧縮ファイルです")
+
+    target_path = extract_root.joinpath(*parts)
+    try:
+        target_path.resolve().relative_to(extract_root.resolve())
+    except ValueError as exc:
+        raise ValueError("安全でないパスを含む圧縮ファイルです") from exc
+
+    if not is_dir and _is_blocked(target_path.name):
+        raise ValueError(
+            f"ブロックされた拡張子を含む圧縮ファイルです: {target_path.name}"
+        )
+    return target_path
+
+
+def _extract_zip_archive(archive_path: Path, extract_root: Path) -> None:
+    with zipfile.ZipFile(archive_path, mode="r") as archive:
+        planned: List[Tuple[zipfile.ZipInfo, Path, bool]] = []
+        for member in archive.infolist():
+            if member.flag_bits & 0x1:
+                raise ValueError("パスワード付き圧縮ファイルには対応していません")
+            is_dir = member.is_dir() or member.filename.endswith(("/", "\\"))
+            unix_mode = member.external_attr >> 16
+            file_type = stat.S_IFMT(unix_mode)
+            if stat.S_ISLNK(unix_mode) or (
+                file_type not in {0, stat.S_IFREG, stat.S_IFDIR}
+            ):
+                raise ValueError(
+                    "リンクまたは特殊ファイルを含む圧縮ファイルは展開できません"
+                )
+            target_path = _safe_archive_target(
+                extract_root, member.filename, is_dir=is_dir
+            )
+            planned.append((member, target_path, is_dir))
+
+        extract_root.mkdir(parents=True, exist_ok=False)
+        for member, target_path, is_dir in planned:
+            if is_dir:
+                target_path.mkdir(parents=True, exist_ok=True)
+                continue
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(member, "r") as src, target_path.open("wb") as out:
+                shutil.copyfileobj(src, out)
+
+
+def _extract_tar_archive(archive_path: Path, extract_root: Path) -> None:
+    with tarfile.open(archive_path, mode="r:*") as archive:
+        planned: List[Tuple[tarfile.TarInfo, Path, bool]] = []
+        for member in archive.getmembers():
+            if not (member.isdir() or member.isreg()):
+                raise ValueError(
+                    "リンクまたは特殊ファイルを含む圧縮ファイルは展開できません"
+                )
+            if member.isdir() and member.name.replace("\\", "/").rstrip("/") == ".":
+                continue
+            target_path = _safe_archive_target(
+                extract_root, member.name, is_dir=member.isdir()
+            )
+            planned.append((member, target_path, member.isdir()))
+
+        extract_root.mkdir(parents=True, exist_ok=False)
+        for member, target_path, is_dir in planned:
+            if is_dir:
+                target_path.mkdir(parents=True, exist_ok=True)
+                continue
+            source = archive.extractfile(member)
+            if source is None:
+                raise ValueError(
+                    f"圧縮ファイル内のデータを読み取れません: {member.name}"
+                )
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            with source, target_path.open("wb") as out:
+                shutil.copyfileobj(source, out)
+
+
+def _extract_7z_archive(archive_path: Path, extract_root: Path) -> None:
+    with py7zr.SevenZipFile(archive_path, mode="r") as archive:
+        if archive.needs_password():
+            raise ValueError("パスワード付き圧縮ファイルには対応していません")
+        file_targets: Dict[str, Path] = {}
+        directory_targets: List[Path] = []
+        for member in archive.list():
+            if member.is_symlink or not (member.is_directory or member.is_file):
+                raise ValueError(
+                    "リンクまたは特殊ファイルを含む圧縮ファイルは展開できません"
+                )
+            target_path = _safe_archive_target(
+                extract_root, member.filename, is_dir=member.is_directory
+            )
+            if member.is_directory:
+                directory_targets.append(target_path)
+            else:
+                if member.filename in file_targets:
+                    raise ValueError("同じパスが重複する圧縮ファイルは展開できません")
+                file_targets[member.filename] = target_path
+        extract_root.mkdir(parents=True, exist_ok=False)
+        for target_path in directory_targets:
+            target_path.mkdir(parents=True, exist_ok=True)
+        writer_factory = _SevenZipWriterFactory(file_targets)
+        try:
+            archive.extractall(factory=writer_factory)
+        finally:
+            writer_factory.close()
+
+
+class _SevenZipFileWriter(Py7zIO):
+    def __init__(self, target_path: Path):
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = target_path.open("w+b")
+
+    def write(self, data: bytes | bytearray) -> int:
+        return self._file.write(data)
+
+    def read(self, size: Optional[int] = None) -> bytes:
+        return self._file.read(-1 if size is None else size)
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        return self._file.seek(offset, whence)
+
+    def flush(self) -> None:
+        self._file.flush()
+
+    def size(self) -> int:
+        position = self._file.tell()
+        self._file.seek(0, os.SEEK_END)
+        size = self._file.tell()
+        self._file.seek(position)
+        return size
+
+    def close(self) -> None:
+        self._file.close()
+
+
+class _SevenZipWriterFactory(WriterFactory):
+    def __init__(self, targets: Dict[str, Path]):
+        self._targets = targets
+        self._writers: List[_SevenZipFileWriter] = []
+
+    def create(self, filename: str) -> Py7zIO:
+        target_path = self._targets.get(filename)
+        if target_path is None:
+            raise ValueError(f"未検証のパスは展開できません: {filename}")
+        writer = _SevenZipFileWriter(target_path)
+        self._writers.append(writer)
+        return writer
+
+    def close(self) -> None:
+        for writer in self._writers:
+            writer.close()
+
+
+def _extract_single_stream(
+    archive_path: Path, extract_root: Path, archive_format: str
+) -> None:
+    output_name = _archive_stem(archive_path)
+    target_path = _safe_archive_target(extract_root, output_name, is_dir=False)
+    opener = {"gz": gzip.open, "bz2": bz2.open, "xz": lzma.open}[archive_format]
+    extract_root.mkdir(parents=True, exist_ok=False)
+    with opener(archive_path, "rb") as source, target_path.open("wb") as out:
+        shutil.copyfileobj(source, out)
 
 
 def extract_archives(
     paths: List[str], dest_path: str = "", is_admin: bool = False
 ) -> Dict[str, Any]:
-    """Extract selected zip archives into folders under dest_path."""
+    """Extract supported archives into folders under dest_path."""
     if not paths:
         return {"success": False, "error": "展開対象が選択されていません"}
 
@@ -875,58 +1139,48 @@ def extract_archives(
         return {"success": False, "error": "展開先ディレクトリが見つかりません"}
 
     root = get_root_dir()
-    archives: List[Path] = []
+    archives: List[Tuple[Path, str]] = []
     for raw_path in paths:
         target, valid = _resolve_path(raw_path, is_admin=is_admin)
         if not valid or not target.exists() or not target.is_file():
-            return {"success": False, "error": f"ZIPファイルが見つかりません: {raw_path}"}
-        if target.suffix.lower() != ".zip" or not zipfile.is_zipfile(target):
-            return {"success": False, "error": f"ZIPファイルではありません: {target.name}"}
-        archives.append(target)
+            return {
+                "success": False,
+                "error": f"圧縮ファイルが見つかりません: {raw_path}",
+            }
+        archive_format = _archive_format(target)
+        if archive_format is None:
+            return {
+                "success": False,
+                "error": f"対応していない圧縮形式です: {target.name}",
+            }
+        if archive_format == "zip" and not zipfile.is_zipfile(target):
+            return {
+                "success": False,
+                "error": f"正しいZIPファイルではありません: {target.name}",
+            }
+        if archive_format == "tar" and not tarfile.is_tarfile(target):
+            return {
+                "success": False,
+                "error": f"正しいTARファイルではありません: {target.name}",
+            }
+        archives.append((target, archive_format))
 
     extracted: List[Dict[str, str]] = []
     created_roots: List[Path] = []
     try:
-        for archive_path in archives:
+        for archive_path, archive_format in archives:
             extract_root = _next_available_path(
-                dest, _sanitize_name(archive_path.stem or "archive")
+                dest, _sanitize_name(_archive_stem(archive_path))
             )
-            extract_root_resolved = extract_root.resolve()
-
-            with zipfile.ZipFile(archive_path, mode="r") as archive:
-                members = archive.infolist()
-                planned: List[Tuple[zipfile.ZipInfo, Path, bool]] = []
-                for member in members:
-                    parts = _safe_zip_member_parts(member.filename)
-                    if parts is None:
-                        raise ValueError(
-                            f"安全でないパスを含むZIPです: {archive_path.name}"
-                        )
-                    target_path = extract_root.joinpath(*parts)
-                    target_resolved = target_path.resolve()
-                    try:
-                        target_resolved.relative_to(extract_root_resolved)
-                    except ValueError:
-                        raise ValueError(
-                            f"安全でないパスを含むZIPです: {archive_path.name}"
-                        )
-
-                    is_dir = member.is_dir() or member.filename.endswith(("/", "\\"))
-                    if not is_dir and _is_blocked(target_path.name):
-                        raise ValueError(
-                            f"ブロックされた拡張子を含むZIPです: {target_path.name}"
-                        )
-                    planned.append((member, target_path, is_dir))
-
-                extract_root.mkdir(parents=True, exist_ok=False)
-                created_roots.append(extract_root)
-                for member, target_path, is_dir in planned:
-                    if is_dir:
-                        target_path.mkdir(parents=True, exist_ok=True)
-                        continue
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                    with archive.open(member, "r") as src, target_path.open("wb") as out:
-                        shutil.copyfileobj(src, out)
+            created_roots.append(extract_root)
+            if archive_format == "zip":
+                _extract_zip_archive(archive_path, extract_root)
+            elif archive_format == "tar":
+                _extract_tar_archive(archive_path, extract_root)
+            elif archive_format == "7z":
+                _extract_7z_archive(archive_path, extract_root)
+            else:
+                _extract_single_stream(archive_path, extract_root, archive_format)
 
             extracted.append(
                 {
@@ -938,7 +1192,7 @@ def extract_archives(
 
         return {
             "success": True,
-            "message": f"{len(extracted)}件のZIPを展開しました",
+            "message": f"{len(extracted)}件の圧縮ファイルを展開しました",
             "extracted": extracted,
         }
     except ValueError as e:
@@ -1000,6 +1254,8 @@ def rename_item(path: str, new_name: str, is_admin: bool = False) -> Dict[str, A
         return {"success": False, "error": f"「{safe_name}」は既に存在します"}
 
     try:
+        from ...services.workspace_git_service import checkpoint_before_destructive_path
+        checkpoint_before_destructive_path(target)
         target.rename(new_path)
         rel_path = _format_path_for_response(new_path, root)
 
@@ -1045,6 +1301,8 @@ def move_item(src_path: str, dest_path: str, is_admin: bool = False) -> Dict[str
         return {"success": False, "error": f"移動先に「{src.name}」が既に存在します"}
 
     try:
+        from ...services.workspace_git_service import checkpoint_before_destructive_path
+        checkpoint_before_destructive_path(src)
         shutil.move(str(src), str(new_path))
         rel_path = _format_path_for_response(new_path, root)
 
@@ -1131,6 +1389,8 @@ def delete_item(path: str, is_admin: bool = False) -> Dict[str, Any]:
         return {"success": False, "error": "ルートディレクトリは削除できません"}
 
     try:
+        from ...services.workspace_git_service import checkpoint_before_destructive_path
+        checkpoint_before_destructive_path(target)
         name = target.name
         if target.is_symlink() or target.is_file():
             target.unlink()

@@ -10,8 +10,8 @@
 import React, { useEffect } from "react";
 import type { Project, Space } from "../types/api";
 import { useProjectStore } from "../stores/project";
-import { useAuth } from "./AuthContext";
 import { runSync } from "../sync/engine";
+import { useAuth } from "./AuthContext";
 
 interface ProjectContextValue {
   spaces: Space[];

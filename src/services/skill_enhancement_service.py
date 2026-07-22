@@ -24,6 +24,7 @@ from ..models.ecc_models import SkillCategory, SkillChain, SkillPreset
 from ..skills.loader import SKILLS_DIR, save_skill_to_yaml
 from ..skills.models import SkillDefinition, SkillTriggerMode
 from ..skills.registry import get_skill_registry, register_skill
+from ..utils.uuid_utils import parse_uuid, parse_uuid_strict
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +110,7 @@ class SkillEnhancementService:
         Raises:
             ValueError: UUID が無効、またはカテゴリが見つからない場合。
         """
-        uid = _parse_uuid_strict(cat_id)
+        uid = parse_uuid_strict(cat_id, lambda v: ValueError(f"無効なUUID形式です: {v}"))
 
         async with await get_db_session() as session:  # type: AsyncSession
             category = await session.get(SkillCategory, uid)
@@ -163,7 +164,7 @@ class SkillEnhancementService:
         Raises:
             ValueError: UUID が無効、またはプリセットが見つからない場合。
         """
-        uid = _parse_uuid_strict(preset_id)
+        uid = parse_uuid_strict(preset_id, lambda v: ValueError(f"無効なUUID形式です: {v}"))
 
         async with await get_db_session() as session:  # type: AsyncSession
             preset = await session.get(SkillPreset, uid)
@@ -246,7 +247,7 @@ class SkillEnhancementService:
                 display_name=display_name,
                 description=data.get("description", ""),
                 steps=steps,
-                created_by=_parse_uuid(data.get("created_by")),
+                created_by=parse_uuid(data.get("created_by")),
             )
             session.add(chain)
             await session.commit()
@@ -281,7 +282,7 @@ class SkillEnhancementService:
         Raises:
             ValueError: UUID が無効、またはチェーンが見つからない場合。
         """
-        uid = _parse_uuid_strict(chain_id)
+        uid = parse_uuid_strict(chain_id, lambda v: ValueError(f"無効なUUID形式です: {v}"))
 
         async with await get_db_session() as session:  # type: AsyncSession
             chain = await session.get(SkillChain, uid)
@@ -323,7 +324,7 @@ class SkillEnhancementService:
         Raises:
             ValueError: UUID が無効、またはチェーンが見つからない場合。
         """
-        uid = _parse_uuid_strict(chain_id)
+        uid = parse_uuid_strict(chain_id, lambda v: ValueError(f"無効なUUID形式です: {v}"))
 
         async with await get_db_session() as session:  # type: AsyncSession
             chain = await session.get(SkillChain, uid)
@@ -367,7 +368,7 @@ class SkillEnhancementService:
                 - step_results: 各ステップの結果リスト
                 - success: 全ステップが成功したか
         """
-        uid = _parse_uuid_strict(chain_id)
+        uid = parse_uuid_strict(chain_id, lambda v: ValueError(f"無効なUUID形式です: {v}"))
 
         async with await get_db_session() as session:  # type: AsyncSession
             chain = await session.get(SkillChain, uid)
@@ -584,19 +585,3 @@ class SkillEnhancementService:
 # ユーティリティ
 # ────────────────────────────────────────────
 
-def _parse_uuid(value: Any) -> Optional[uuid.UUID]:
-    """値を UUID に変換する。None や無効値は None を返す。"""
-    if value is None:
-        return None
-    try:
-        return uuid.UUID(str(value))
-    except (ValueError, AttributeError):
-        return None
-
-
-def _parse_uuid_strict(value: str) -> uuid.UUID:
-    """値を UUID に変換する。無効な場合は ValueError を送出する。"""
-    try:
-        return uuid.UUID(str(value))
-    except (ValueError, AttributeError):
-        raise ValueError(f"無効なUUID形式です: {value}")

@@ -34,10 +34,7 @@ import {
 import { TaskStatusMenuItems } from "@/components/tasks/task-status-menu-items";
 import type { Project, Tag } from "@/lib/task-api";
 import { cn } from "@/lib/utils";
-import {
-  handleStatusShortcutCapture,
-  type FilterTab,
-} from "@/lib/tasks-page-utils";
+import type { FilterTab } from "@/lib/tasks-page-utils";
 
 /**
  * タスク一覧のフィルタ・トグル群と、選択中の一括操作バー。
@@ -52,6 +49,7 @@ export function TaskListToolbar({
   onBulkMove,
   onBulkDelete,
   clearSelection,
+  readOnly = false,
   projects,
   tags,
   filter,
@@ -78,6 +76,7 @@ export function TaskListToolbar({
   onBulkMove: (projectId: string) => void;
   onBulkDelete: () => void;
   clearSelection: () => void;
+  readOnly?: boolean;
   projects: Project[];
   tags: Tag[];
   filter: FilterTab;
@@ -97,7 +96,7 @@ export function TaskListToolbar({
 }) {
   return (
     <div className="flex items-center gap-4 flex-wrap">
-      {selectedIds.size > 0 ? (
+      {selectedIds.size > 0 && !readOnly ? (
         <>
           <span className="text-sm font-medium text-primary">
             {selectedIds.size}件選択
@@ -113,15 +112,12 @@ export function TaskListToolbar({
               <DropdownMenuContent
                 align="start"
                 className="min-w-36"
-                onKeyDownCapture={(e) =>
-                  handleStatusShortcutCapture(e, (target) => {
-                    setBulkStatusMenuOpen(false);
-                    onBulkStatusChange(target);
-                  })
-                }
               >
                 <TaskStatusMenuItems
-                  onSelect={(status) => onBulkStatusChange(status)}
+                  onSelect={(status) => {
+                    setBulkStatusMenuOpen(false);
+                    onBulkStatusChange(status);
+                  }}
                 />
               </DropdownMenuContent>
             </DropdownMenu>

@@ -10,7 +10,7 @@ import {
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { cn } from "@/lib/utils";
+import { cn, formatBytes } from "@/lib/utils";
 
 type TemporaryFilesPanelProps = {
   files: File[];
@@ -20,12 +20,6 @@ type TemporaryFilesPanelProps = {
   onClearFiles: () => void;
   className?: string;
 };
-
-function formatFileSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
 
 function isImageFile(file: File) {
   return file.type.startsWith("image/");
@@ -54,7 +48,7 @@ export function TemporaryFilesPanel({
   return (
     <aside
       className={cn(
-        "absolute inset-y-0 right-0 z-30 hidden w-72 flex-col border-l bg-background/95 shadow-xl backdrop-blur xl:flex",
+        "absolute inset-y-0 right-0 z-30 hidden w-72 flex-col border-l border-border bg-card shadow-xl xl:flex",
         className,
       )}
     >
@@ -127,7 +121,7 @@ export function TemporaryFilesPanel({
                     {file.name}
                   </div>
                   <div className="mt-0.5 text-[11px] text-muted-foreground">
-                    {formatFileSize(file.size)}
+                    {formatBytes(file.size)}
                   </div>
                 </div>
                 <Button

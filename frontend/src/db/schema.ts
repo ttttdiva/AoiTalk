@@ -7,10 +7,12 @@ import {
   timestamp,
   date,
   json,
+  jsonb,
   integer,
   doublePrecision,
   primaryKey,
   unique,
+  index,
   type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { DEFAULT_TASK_TIMEZONE } from "../lib/task-time";
@@ -74,11 +76,12 @@ export const projects = pgTable("projects", {
   storageQuotaMb: integer("storage_quota_mb"),
   storageUsedMb: doublePrecision("storage_used_mb"),
   estimatedHours: doublePrecision("estimated_hours"),
-  isCompleted: boolean("is_completed").default(false),
+  isCompleted: boolean("is_completed").default(false).notNull(),
   createdAt: timestamp("created_at"),
   updatedAt: timestamp("updated_at"),
   deletedAt: timestamp("deleted_at"),
   projectMetadata: json("project_metadata"),
+  aliases: json("aliases").default([]),
 });
 
 export const projectMembers = pgTable("project_members", {
@@ -111,24 +114,24 @@ export const projectQaEntries = pgTable("project_qa_entries", {
   question: text("question").notNull(),
   answer: text("answer"),
   normalizedQuestionHash: varchar("normalized_question_hash", { length: 128 }),
-  status: varchar("status", { length: 32 }).default("unanswered"),
-  reviewState: varchar("review_state", { length: 32 }).default("candidate"),
-  confidence: doublePrecision("confidence").default(1),
-  askedCount: integer("asked_count").default(1),
+  status: varchar("status", { length: 32 }).default("unanswered").notNull(),
+  reviewState: varchar("review_state", { length: 32 }).default("candidate").notNull(),
+  confidence: doublePrecision("confidence").default(1).notNull(),
+  askedCount: integer("asked_count").default(1).notNull(),
   sourceSessionId: uuid("source_session_id").references(
     (): AnyPgColumn => conversationSessions.id,
     { onDelete: "set null" },
   ),
-  sourceMessageIds: json("source_message_ids").default([]),
-  sourceAgentRunIds: json("source_agent_run_ids").default([]),
-  sourceToolCallIds: json("source_tool_call_ids").default([]),
-  answerSourceRefs: json("answer_source_refs").default([]),
+  sourceMessageIds: json("source_message_ids").default([]).notNull(),
+  sourceAgentRunIds: json("source_agent_run_ids").default([]).notNull(),
+  sourceToolCallIds: json("source_tool_call_ids").default([]).notNull(),
+  answerSourceRefs: json("answer_source_refs").default([]).notNull(),
   createdBy: uuid("created_by").references(() => users.id),
   updatedBy: uuid("updated_by").references(() => users.id),
-  createdByAgent: boolean("created_by_agent").default(false),
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
-  lastAskedAt: timestamp("last_asked_at").defaultNow(),
+  createdByAgent: boolean("created_by_agent").default(false).notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  lastAskedAt: timestamp("last_asked_at").defaultNow().notNull(),
   deletedAt: timestamp("deleted_at"),
 });
 
@@ -263,19 +266,19 @@ export const tasks = pgTable("tasks", {
   ).unique(),
   title: varchar("title").notNull(),
   description: text("description"),
-  status: varchar("status").default("todo"),
+  status: varchar("status").default("todo").notNull(),
   priority: varchar("priority").default("medium"),
   startAt: timestamp("start_at", { mode: "string" }),
   endAt: timestamp("end_at", { mode: "string" }),
-  allDay: boolean("all_day").default(false),
+  allDay: boolean("all_day").default(false).notNull(),
   reminderOffsets: json("reminder_offsets"),
-  notificationsEnabled: boolean("notifications_enabled").default(true),
-  source: varchar("source").default("local"),
+  notificationsEnabled: boolean("notifications_enabled").default(true).notNull(),
+  source: varchar("source").default("local").notNull(),
   createdBy: uuid("created_by"),
   completedAt: timestamp("completed_at", { mode: "string" }),
   archivedAt: timestamp("archived_at", { mode: "string" }),
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
   deletedAt: timestamp("deleted_at", { mode: "string" }),
   taskMetadata: json("task_metadata"),
   estimatedHours: doublePrecision("estimated_hours"),
@@ -295,8 +298,8 @@ export const taskAssignees = pgTable("task_assignees", {
   userId: uuid("user_id")
     .references(() => users.id, { onDelete: "cascade" })
     .notNull(),
-  isPrimary: boolean("is_primary").default(false),
-  assignedAt: timestamp("assigned_at").defaultNow(),
+  isPrimary: boolean("is_primary").default(false).notNull(),
+  assignedAt: timestamp("assigned_at").defaultNow().notNull(),
   assignedBy: uuid("assigned_by"),
 });
 
@@ -310,7 +313,7 @@ export const tags = pgTable("tags", {
   name: varchar("name").notNull(),
   color: varchar("color"),
   createdBy: uuid("created_by"),
-  createdAt: timestamp("created_at").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
 export const taskTags = pgTable(
@@ -337,8 +340,8 @@ export const taskComments = pgTable("task_comments", {
     .references(() => users.id)
     .notNull(),
   content: text("content").notNull(),
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 
 export const taskAttachments = pgTable("task_attachments", {
@@ -354,12 +357,51 @@ export const taskAttachments = pgTable("task_attachments", {
   filePath: text("file_path").notNull(),
   displayName: varchar("display_name").notNull(),
   mimeType: varchar("mime_type"),
-  sizeBytes: integer("size_bytes").default(0),
-  kind: varchar("kind").default("file"),
+  sizeBytes: integer("size_bytes").default(0).notNull(),
+  kind: varchar("kind").default("file").notNull(),
   createdBy: uuid("created_by").references(() => users.id),
-  createdAt: timestamp("created_at").defaultNow(),
-  attachmentMetadata: json("metadata").default({}),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  attachmentMetadata: jsonb("metadata").default({}),
 });
+
+/** ファイル以外も含むタスク参照。task_attachmentsとは責務を分ける。 */
+export const taskReferences = pgTable(
+  "task_references",
+  {
+    id: uuid("id")
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+    taskId: uuid("task_id")
+      .references(() => tasks.id, { onDelete: "cascade" })
+      .notNull(),
+    projectId: uuid("project_id")
+      .references(() => projects.id, { onDelete: "cascade" })
+      .notNull(),
+    referenceType: varchar("reference_type", { length: 80 }).notNull(),
+    relationType: varchar("relation_type", { length: 32 })
+      .default("related")
+      .notNull(),
+    targetId: text("target_id"),
+    targetPath: text("target_path"),
+    targetUrl: text("target_url"),
+    displayName: varchar("display_name", { length: 500 }).notNull(),
+    dedupeKey: varchar("dedupe_key", { length: 1200 }).notNull(),
+    referenceMetadata: jsonb("metadata").default({}),
+    createdBy: uuid("created_by").references(() => users.id),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    unique("uq_task_references_target").on(
+      table.taskId,
+      table.referenceType,
+      table.relationType,
+      table.dedupeKey,
+    ),
+    index("ix_task_references_task_id").on(table.taskId),
+    index("ix_task_references_project_id").on(table.projectId),
+    index("ix_task_references_created_by").on(table.createdBy),
+  ],
+);
 
 export const taskRecurrenceRules = pgTable("task_recurrence_rules", {
   id: uuid("id")
@@ -370,8 +412,8 @@ export const taskRecurrenceRules = pgTable("task_recurrence_rules", {
     .unique()
     .notNull(),
   rrule: text("rrule").notNull(),
-  timezone: varchar("timezone").default(DEFAULT_TASK_TIMEZONE),
-  horizonDays: integer("horizon_days").default(90),
+  timezone: varchar("timezone").default(DEFAULT_TASK_TIMEZONE).notNull(),
+  horizonDays: integer("horizon_days").default(90).notNull(),
   triggerStatus: varchar("trigger_status").default("closed"),
   createNew: boolean("create_new").default(false),
   recurForever: boolean("recur_forever").default(true),
@@ -380,8 +422,8 @@ export const taskRecurrenceRules = pgTable("task_recurrence_rules", {
   endDate: timestamp("end_date", { mode: "string" }),
   skipWeekend: boolean("skip_weekend").default(false).notNull(),
   skipHoliday: boolean("skip_holiday").default(false).notNull(),
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 
 export const taskOccurrences = pgTable("task_occurrences", {
@@ -393,13 +435,14 @@ export const taskOccurrences = pgTable("task_occurrences", {
     .notNull(),
   startAt: timestamp("start_at", { mode: "string" }).notNull(),
   endAt: timestamp("end_at", { mode: "string" }).notNull(),
-  status: varchar("status").default("todo"),
-  allDay: boolean("all_day").default(false),
+  status: varchar("status").default("todo").notNull(),
+  allDay: boolean("all_day").default(false).notNull(),
   reminderOffsets: json("reminder_offsets"),
-  sourceKind: varchar("source_kind").default("task_schedule"),
-  isGenerated: boolean("is_generated").default(false),
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
+  sourceKind: varchar("source_kind").default("task_schedule").notNull(),
+  isGenerated: boolean("is_generated").default(false).notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  deletedAt: timestamp("deleted_at", { mode: "string" }),
 });
 
 export const timeEntries = pgTable("time_entries", {
@@ -415,11 +458,12 @@ export const timeEntries = pgTable("time_entries", {
     .notNull(),
   startedAt: timestamp("started_at", { mode: "string" }).notNull(),
   endedAt: timestamp("ended_at", { mode: "string" }),
-  source: varchar("source").default("manual"),
+  source: varchar("source").default("manual").notNull(),
   note: text("note"),
-  createdAt: timestamp("created_at", { mode: "string" }).defaultNow(),
-  updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow(),
+  createdAt: timestamp("created_at", { mode: "string" }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { mode: "string" }).defaultNow().notNull(),
   entryMetadata: json("entry_metadata"),
+  deletedAt: timestamp("deleted_at", { mode: "string" }),
 });
 
 // ─── 会話管理 ───
@@ -441,6 +485,7 @@ export const conversationSessions = pgTable("conversation_sessions", {
   projectId: uuid("project_id").references(() => projects.id),
   isGroupChat: boolean("is_group_chat").default(false),
   groupCharacterNames: json("group_character_names"),
+  rpSettings: json("rp_settings").default({}),
 });
 
 export const conversationParticipants = pgTable("conversation_participants", {
@@ -479,6 +524,8 @@ export const conversationMessages = pgTable("conversation_messages", {
   parentMessageId: uuid("parent_message_id"),
   branchIndex: integer("branch_index").default(0),
   isActiveBranch: boolean("is_active_branch").default(true),
+  updatedAt: timestamp("updated_at"),
+  deletedAt: timestamp("deleted_at"),
 });
 
 export const conversationArchives = pgTable("conversation_archives", {
@@ -523,7 +570,7 @@ export const taskActivities = pgTable("task_activities", {
   userId: uuid("user_id").references(() => users.id),
   activityType: varchar("activity_type", { length: 64 }).notNull(),
   payload: json("payload"),
-  createdAt: timestamp("created_at").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
 // ─── タスク依存関係 ───
@@ -538,7 +585,7 @@ export const taskDependencies = pgTable("task_dependencies", {
   dependsOnTaskId: uuid("depends_on_task_id")
     .references(() => tasks.id)
     .notNull(),
-  createdAt: timestamp("created_at").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
 // ─── フィードバック ───
@@ -555,7 +602,7 @@ export const feedback = pgTable("feedback", {
   resolvedAt: timestamp("resolved_at"),
   resolvedBy: varchar("resolved_by", { length: 100 }),
   createdAt: timestamp("created_at").defaultNow(),
-  feedbackMetadata: json("feedback_metadata"),
+  feedbackMetadata: jsonb("feedback_metadata"),
 });
 
 // ─── Knowledge Workspace ───
@@ -567,18 +614,19 @@ export const knowledgeSources = pgTable("knowledge_sources", {
   name: varchar("name", { length: 200 }).notNull(),
   description: text("description"),
   rootPath: text("root_path").notNull(),
-  sourceType: varchar("source_type", { length: 40 }).default("local_dir"),
+  sourceType: varchar("source_type", { length: 40 }).default("local_dir").notNull(),
   ownerUserId: uuid("owner_user_id").references(() => users.id),
   accessPolicy: json("access_policy"),
   includePatterns: json("include_patterns"),
   excludePatterns: json("exclude_patterns"),
-  syncMode: varchar("sync_mode", { length: 20 }).default("manual"),
-  writePolicy: varchar("write_policy", { length: 40 }).default("propose_patch"),
+  syncMode: varchar("sync_mode", { length: 20 }).default("manual").notNull(),
+  writePolicy: varchar("write_policy", { length: 40 }).default("propose_patch").notNull(),
   status: varchar("status", { length: 20 }),
   documentCount: integer("document_count"),
   chunkCount: integer("chunk_count"),
   lastSyncedAt: timestamp("last_synced_at"),
   errorMessage: text("error_message"),
+  growiApiToken: text("growi_api_token"),
   createdAt: timestamp("created_at").defaultNow(),
   updatedAt: timestamp("updated_at").defaultNow(),
 });
@@ -594,7 +642,7 @@ export const knowledgeSourcePermissions = pgTable("knowledge_source_permissions"
   projectId: uuid("project_id").references(() => projects.id, {
     onDelete: "cascade",
   }),
-  permission: varchar("permission", { length: 20 }).default("read"),
+  permission: varchar("permission", { length: 20 }).default("read").notNull(),
   createdAt: timestamp("created_at").defaultNow(),
   createdBy: uuid("created_by").references(() => users.id),
 });
@@ -650,7 +698,7 @@ export const knowledgeLinks = pgTable("knowledge_links", {
     .references(() => knowledgeDocuments.id, { onDelete: "cascade" })
     .notNull(),
   targetPathOrUrl: text("target_path_or_url").notNull(),
-  linkType: varchar("link_type", { length: 20 }),
+  linkType: varchar("link_type", { length: 20 }).notNull(),
   resolvedDocumentId: uuid("resolved_document_id").references(
     (): AnyPgColumn => knowledgeDocuments.id,
   ),
@@ -667,8 +715,8 @@ export const knowledgeAnnotations = pgTable("knowledge_annotations", {
   annotationType: varchar("annotation_type", { length: 40 }).notNull(),
   contentJson: json("content_json"),
   confidence: doublePrecision("confidence"),
-  source: varchar("source", { length: 20 }),
-  status: varchar("status", { length: 20 }),
+  source: varchar("source", { length: 20 }).notNull(),
+  status: varchar("status", { length: 20 }).notNull(),
   actorUserId: uuid("actor_user_id").references(() => users.id),
   createdAt: timestamp("created_at").defaultNow(),
   updatedAt: timestamp("updated_at").defaultNow(),
@@ -685,7 +733,7 @@ export const knowledgeEditEvents = pgTable("knowledge_edit_events", {
   operation: varchar("operation", { length: 40 }).notNull(),
   diff: text("diff").notNull(),
   reason: text("reason"),
-  status: varchar("status", { length: 20 }),
+  status: varchar("status", { length: 20 }).notNull(),
   preHash: varchar("pre_hash", { length: 64 }),
   postHash: varchar("post_hash", { length: 64 }),
   createdAt: timestamp("created_at").defaultNow(),
@@ -703,9 +751,9 @@ export const knowledgeWorkspaces = pgTable("knowledge_workspaces", {
   ownerUserId: uuid("owner_user_id").references(() => users.id, {
     onDelete: "set null",
   }),
-  settingsJson: json("settings_json").default({}),
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
+  settingsJson: json("settings_json").default({}).notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
 }, (table) => [
   unique("uq_knowledge_workspaces_owner_user").on(table.ownerUserId),
 ]);
@@ -727,22 +775,31 @@ export const knowledgeNodes = pgTable("knowledge_nodes", {
   projectId: uuid("project_id").references(() => projects.id, {
     onDelete: "set null",
   }),
-  title: varchar("title", { length: 500 }).notNull(),
-  description: text("description").default(""),
-  bodyJson: json("body_json").default({}),
-  bodyText: text("body_text").default(""),
-  nodeType: varchar("node_type", { length: 40 }).default("node"),
-  displayProps: json("display_props").default({}),
+  systemKey: text("system_key"),
+  title: text("title").notNull(),
+  aliases: json("aliases").$type<string[]>().default([]),
+  description: text("description").default("").notNull(),
+  bodyJson: json("body_json").default({}).notNull(),
+  bodyText: text("body_text").default("").notNull(),
+  nodeType: varchar("node_type", { length: 40 }).default("node").notNull(),
+  displayProps: json("display_props").default({}).notNull(),
   queryJson: json("query_json"),
-  viewJson: json("view_json").default({}),
+  viewJson: json("view_json").default({}).notNull(),
   dayDate: date("day_date"),
-  sortOrder: doublePrecision("sort_order").default(0),
+  sortOrder: doublePrecision("sort_order").default(0).notNull(),
   createdBy: uuid("created_by").references(() => users.id),
   updatedBy: uuid("updated_by").references(() => users.id),
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
   archivedAt: timestamp("archived_at"),
-});
+}, (table) => [
+  unique("uq_knowledge_nodes_workspace_system_key").on(table.workspaceId, table.systemKey),
+  index("ix_knowledge_nodes_workspace").on(table.workspaceId),
+  index("ix_knowledge_nodes_workspace_parent_sort").on(table.workspaceId, table.parentId, table.sortOrder),
+  index("ix_knowledge_nodes_workspace_project").on(table.workspaceId, table.projectId),
+  index("ix_knowledge_nodes_root_page").on(table.rootPageId),
+  index("ix_knowledge_nodes_archived_at").on(table.archivedAt),
+]);
 
 export const knowledgeSupertags = pgTable("knowledge_supertags", {
   id: uuid("id")
@@ -757,17 +814,17 @@ export const knowledgeSupertags = pgTable("knowledge_supertags", {
   ),
   systemKey: text("system_key"),
   name: varchar("name", { length: 120 }).notNull(),
-  baseType: varchar("base_type", { length: 40 }).default("note"),
+  baseType: varchar("base_type", { length: 40 }).default("note").notNull(),
   description: text("description"),
   icon: varchar("icon", { length: 64 }),
   color: varchar("color", { length: 32 }),
-  templateJson: json("template_json").default({}),
-  pinnedFieldIds: json("pinned_field_ids").default([]),
-  configJson: json("config_json").default({}),
+  templateJson: json("template_json").default({}).notNull(),
+  pinnedFieldIds: json("pinned_field_ids").default([]).notNull(),
+  configJson: json("config_json").default({}).notNull(),
   titleTemplate: text("title_template"),
   aiInstructions: text("ai_instructions"),
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
 }, (table) => [
   unique("uq_knowledge_supertags_workspace_system_key").on(table.workspaceId, table.systemKey),
 ]);
@@ -781,7 +838,8 @@ export const knowledgeNodeSupertags = pgTable(
     supertagId: uuid("supertag_id")
       .references(() => knowledgeSupertags.id, { onDelete: "cascade" })
       .notNull(),
-    createdAt: timestamp("created_at").defaultNow(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
     createdBy: uuid("created_by").references(() => users.id),
   },
   (table) => [primaryKey({ columns: [table.nodeId, table.supertagId] })],
@@ -799,13 +857,13 @@ export const knowledgeFields = pgTable("knowledge_fields", {
     .notNull(),
   systemKey: text("system_key"),
   name: varchar("name", { length: 120 }).notNull(),
-  fieldType: varchar("field_type", { length: 40 }).default("text"),
-  required: boolean("required").default(false),
-  optionsJson: json("options_json").default({}),
+  fieldType: varchar("field_type", { length: 40 }).default("text").notNull(),
+  required: boolean("required").default(false).notNull(),
+  optionsJson: json("options_json").default({}).notNull(),
   defaultValueJson: json("default_value_json"),
-  sortOrder: doublePrecision("sort_order").default(0),
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
+  sortOrder: doublePrecision("sort_order").default(0).notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 
 export const knowledgeFieldValues = pgTable(
@@ -825,7 +883,7 @@ export const knowledgeFieldValues = pgTable(
       (): AnyPgColumn => knowledgeNodes.id,
       { onDelete: "set null" },
     ),
-    updatedAt: timestamp("updated_at").defaultNow(),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
     updatedBy: uuid("updated_by").references(() => users.id),
   },
   (table) => [primaryKey({ columns: [table.nodeId, table.fieldId] })],
@@ -841,10 +899,10 @@ export const knowledgeEdges = pgTable("knowledge_edges", {
   targetNodeId: uuid("target_node_id")
     .references(() => knowledgeNodes.id, { onDelete: "cascade" })
     .notNull(),
-  relationType: varchar("relation_type", { length: 80 }).default("related_to"),
-  confidence: doublePrecision("confidence").default(1),
+  relationType: varchar("relation_type", { length: 80 }).default("related_to").notNull(),
+  confidence: doublePrecision("confidence").default(1).notNull(),
   createdBy: uuid("created_by").references(() => users.id),
-  createdAt: timestamp("created_at").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
 export const knowledgeSearchIndex = pgTable("knowledge_search_index", {
@@ -859,7 +917,7 @@ export const knowledgeSearchIndex = pgTable("knowledge_search_index", {
   }),
   titleText: text("title_text").default("").notNull(),
   bodyTextPlain: text("body_text_plain").default("").notNull(),
-  updatedAt: timestamp("updated_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 
 export const knowledgeSupertagFields = pgTable(
@@ -871,11 +929,11 @@ export const knowledgeSupertagFields = pgTable(
     fieldId: uuid("field_id")
       .references(() => knowledgeFields.id, { onDelete: "cascade" })
       .notNull(),
-    sortOrder: doublePrecision("sort_order").default(0),
-    required: boolean("required").default(false),
-    showInTemplate: boolean("show_in_template").default(true),
-    optional: boolean("optional").default(false),
-    createdAt: timestamp("created_at").defaultNow(),
+    sortOrder: doublePrecision("sort_order").default(0).notNull(),
+    required: boolean("required").default(false).notNull(),
+    showInTemplate: boolean("show_in_template").default(true).notNull(),
+    optional: boolean("optional").default(false).notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
   },
   (table) => [primaryKey({ columns: [table.supertagId, table.fieldId] })],
 );
@@ -892,12 +950,15 @@ export const knowledgeNodePlacements = pgTable(
     parentNodeId: uuid("parent_node_id")
       .references((): AnyPgColumn => knowledgeNodes.id, { onDelete: "cascade" })
       .notNull(),
-    sortOrder: doublePrecision("sort_order").default(0),
-    collapsed: boolean("collapsed").default(false),
+    sortOrder: doublePrecision("sort_order").default(0).notNull(),
+    collapsed: boolean("collapsed").default(false).notNull(),
     createdBy: uuid("created_by").references(() => users.id),
-    createdAt: timestamp("created_at").defaultNow(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
   },
-  (table) => [unique("uq_knowledge_node_placement_parent").on(table.nodeId, table.parentNodeId)],
+  (table) => [
+    unique("uq_knowledge_node_placement_parent").on(table.nodeId, table.parentNodeId),
+    index("ix_knowledge_node_placements_parent").on(table.parentNodeId, table.sortOrder),
+  ],
 );
 
 export const knowledgeSavedViews = pgTable("knowledge_saved_views", {
@@ -911,12 +972,12 @@ export const knowledgeSavedViews = pgTable("knowledge_saved_views", {
     onDelete: "set null",
   }),
   name: varchar("name", { length: 200 }).notNull(),
-  layout: varchar("layout", { length: 40 }).default("table"),
-  configJson: json("config_json").default({}),
-  sortOrder: doublePrecision("sort_order").default(0),
+  layout: varchar("layout", { length: 40 }).default("table").notNull(),
+  configJson: json("config_json").default({}).notNull(),
+  sortOrder: doublePrecision("sort_order").default(0).notNull(),
   createdBy: uuid("created_by").references(() => users.id),
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 
 export const knowledgeRevisions = pgTable("knowledge_revisions", {
@@ -926,13 +987,13 @@ export const knowledgeRevisions = pgTable("knowledge_revisions", {
   nodeId: uuid("node_id")
     .references(() => knowledgeNodes.id, { onDelete: "cascade" })
     .notNull(),
-  title: varchar("title", { length: 500 }).notNull(),
-  bodyJson: json("body_json").default({}),
-  bodyText: text("body_text").default(""),
+  title: text("title").notNull(),
+  bodyJson: json("body_json").default({}).notNull(),
+  bodyText: text("body_text").default("").notNull(),
   changeSummary: text("change_summary"),
-  sourceRefsJson: json("source_refs_json").default([]),
+  sourceRefsJson: json("source_refs_json").default([]).notNull(),
   createdBy: uuid("created_by").references(() => users.id),
-  createdAt: timestamp("created_at").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
 export const knowledgeAiSuggestions = pgTable("knowledge_ai_suggestions", {
@@ -946,12 +1007,12 @@ export const knowledgeAiSuggestions = pgTable("knowledge_ai_suggestions", {
     onDelete: "cascade",
   }),
   suggestionType: varchar("suggestion_type", { length: 80 }).notNull(),
-  payloadJson: json("payload_json").default({}),
-  status: varchar("status", { length: 20 }).default("proposed"),
+  payloadJson: json("payload_json").default({}).notNull(),
+  status: varchar("status", { length: 20 }).default("proposed").notNull(),
   confidence: doublePrecision("confidence"),
   createdBy: uuid("created_by").references(() => users.id),
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 
 export const knowledgeAttachments = pgTable("knowledge_attachments", {
@@ -965,9 +1026,9 @@ export const knowledgeAttachments = pgTable("knowledge_attachments", {
   filePath: text("file_path").notNull(),
   mimeType: varchar("mime_type", { length: 120 }),
   sizeBytes: integer("size_bytes"),
-  attachmentMetadata: json("attachment_metadata").default({}),
+  attachmentMetadata: json("attachment_metadata").default({}).notNull(),
   createdBy: uuid("created_by").references(() => users.id),
-  createdAt: timestamp("created_at").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
 export const knowledgeImportJobs = pgTable("knowledge_import_jobs", {
@@ -982,12 +1043,12 @@ export const knowledgeImportJobs = pgTable("knowledge_import_jobs", {
   }),
   sourceType: varchar("source_type", { length: 40 }).notNull(),
   sourceName: text("source_name").notNull(),
-  status: varchar("status", { length: 20 }).default("proposed"),
-  optionsJson: json("options_json").default({}),
-  summaryJson: json("summary_json").default({}),
+  status: varchar("status", { length: 20 }).default("proposed").notNull(),
+  optionsJson: json("options_json").default({}).notNull(),
+  summaryJson: json("summary_json").default({}).notNull(),
   createdBy: uuid("created_by").references(() => users.id),
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 
 export const knowledgeImportItems = pgTable("knowledge_import_items", {
@@ -1001,12 +1062,12 @@ export const knowledgeImportItems = pgTable("knowledge_import_items", {
     onDelete: "set null",
   }),
   sourceRef: text("source_ref").notNull(),
-  title: varchar("title", { length: 500 }).notNull(),
-  itemType: varchar("item_type", { length: 40 }).default("page"),
-  status: varchar("status", { length: 20 }).default("proposed"),
-  previewJson: json("preview_json").default({}),
+  title: text("title").notNull(),
+  itemType: varchar("item_type", { length: 40 }).default("page").notNull(),
+  status: varchar("status", { length: 20 }).default("proposed").notNull(),
+  previewJson: json("preview_json").default({}).notNull(),
   errorMessage: text("error_message"),
-  createdAt: timestamp("created_at").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
 // ─── ログイン履歴 ───
@@ -1046,8 +1107,8 @@ export const notificationDeliveries = pgTable("notification_deliveries", {
   scheduledFor: timestamp("scheduled_for").notNull(),
   deliveredAt: timestamp("delivered_at"),
   readAt: timestamp("read_at"),
-  status: varchar("status").default("pending"),
+  status: varchar("status").default("pending").notNull(),
   payload: json("payload"),
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });

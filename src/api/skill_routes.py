@@ -5,6 +5,7 @@ Skills API Routes
 """
 import logging
 from typing import Optional, List
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
@@ -38,7 +39,7 @@ class UpdateSkillRequest(BaseModel):
     parameters: Optional[dict] = None
 
 
-def create_skill_router(require_auth) -> APIRouter:
+def create_skill_router(require_auth, get_current_user=None) -> APIRouter:
     """スキルAPI ルーターを作成
 
     Args:
@@ -49,25 +50,58 @@ def create_skill_router(require_auth) -> APIRouter:
     """
     router = APIRouter(prefix="/api/skills", tags=["skills"])
 
+    async def authorize_project(request: Request, project_id: Optional[str]) -> None:
+        """Validate membership before reading any project workspace files."""
+        if not project_id:
+            return
+        try:
+            UUID(project_id)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=404, detail="プロジェクトが見つかりません")
+        user = None
+        if get_current_user is not None:
+            user = await get_current_user(request)
+        if not user:
+            state_user = getattr(request.state, "user", None)
+            user = state_user if isinstance(state_user, dict) else None
+        user_id = (user or {}).get("user_id") or (user or {}).get("id")
+        if not user_id:
+            raise HTTPException(status_code=403, detail="プロジェクトへのアクセス権がありません")
+        from ..services.project_context import ProjectContextResolver
+        context = await ProjectContextResolver().get_project_context(project_id, user_id=str(user_id))
+        if context is None:
+            # Do not reveal whether the project exists to a non-member.
+            raise HTTPException(status_code=404, detail="プロジェクトが見つかりません")
+
     @router.get("")
-    async def list_skills(request: Request, _=Depends(require_auth)):
+    async def list_skills(request: Request, project_id: Optional[str] = None, _=Depends(require_auth)):
         """全スキル一覧を取得"""
         try:
+            await authorize_project(request, project_id)
             from ..skills.registry import get_skill_registry
+            from ..skills.loader import load_project_skills
             registry = get_skill_registry()
-            skills = [s.to_dict() for s in registry.get_all()]
+            if project_id:
+                load_project_skills(project_id)
+            skills = [s.to_dict() for s in registry.get_all(project_id)]
             return JSONResponse(content={"success": True, "skills": skills})
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"スキル一覧取得エラー: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
     @router.get("/{name}")
-    async def get_skill(name: str, request: Request, _=Depends(require_auth)):
+    async def get_skill(name: str, request: Request, project_id: Optional[str] = None, _=Depends(require_auth)):
         """スキル詳細を取得"""
         try:
+            await authorize_project(request, project_id)
             from ..skills.registry import get_skill_registry
+            from ..skills.loader import load_project_skills
             registry = get_skill_registry()
-            skill = registry.get_by_alias(name) or registry.get(name)
+            if project_id:
+                load_project_skills(project_id)
+            skill = registry.get_by_alias(name, project_id) or registry.get(name, project_id)
             if not skill:
                 raise HTTPException(status_code=404, detail=f"スキル '{name}' が見つかりません")
             return JSONResponse(content={"success": True, "skill": skill.to_dict()})
@@ -185,13 +219,17 @@ def create_skill_router(require_auth) -> APIRouter:
             raise HTTPException(status_code=500, detail=str(e))
 
     @router.post("/{name}/test")
-    async def test_skill(name: str, request: Request, _=Depends(require_auth)):
+    async def test_skill(name: str, request: Request, project_id: Optional[str] = None, _=Depends(require_auth)):
         """スキルのプロンプトテンプレートをテストレンダリング"""
         try:
+            await authorize_project(request, project_id)
             from ..skills.registry import get_skill_registry
 
+            from ..skills.loader import load_project_skills
             registry = get_skill_registry()
-            skill = registry.get_by_alias(name) or registry.get(name)
+            if project_id:
+                load_project_skills(project_id)
+            skill = registry.get_by_alias(name, project_id) or registry.get(name, project_id)
             if not skill:
                 raise HTTPException(status_code=404, detail=f"スキル '{name}' が見つかりません")
 

@@ -19,7 +19,6 @@ from .tool_policy import (
     PROJECT_MANAGEMENT_READ_TOOL_NAMES,
     SEARCH_TOOL_NAMES,
     looks_like_filesystem_request,
-    looks_like_memory_request,
     looks_like_project_management_request,
     looks_like_search_request,
     project_management_required_mutation_tools,
@@ -27,6 +26,8 @@ from .tool_policy import (
 
 
 ENTRY_TOOL_NAMES: tuple[str, ...] = (
+    "agent_team_delegate",
+    "advanced_reasoning_assistant",
     "utility_assistant",
     "media_assistant",
     "scenario_assistant",
@@ -97,8 +98,9 @@ def select_cli_context_tools(
 
     add_names(ENTRY_TOOL_NAMES, "入口")
 
-    if looks_like_memory_request(request):
-        add_names(DIRECT_MEMORY_TOOL_HINT_NAMES, "過去会話")
+    # search_memory は読み取り専用の深掘りツール。キーワード一致に依らず、
+    # registry に存在すれば常に提示してモデルが必要な時に呼べるようにする。
+    add_names(DIRECT_MEMORY_TOOL_HINT_NAMES, "記憶")
 
     if looks_like_search_request(request):
         search_names = [

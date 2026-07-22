@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useState } from "react";
+import useSWR from "swr";
 import {
   Activity,
   ChevronDown,
@@ -26,6 +27,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { LongTextEditor } from "@/components/editor/long-text-editor";
 import { Skeleton } from "@/components/ui/skeleton";
+import { useConfirm } from "@/hooks/use-confirm";
 
 interface Heartbeat {
   name: string;
@@ -128,8 +130,29 @@ function buildPayload(form: HeartbeatForm, includeName: boolean) {
 }
 
 export function HeartbeatsSection() {
+  const confirm = useConfirm();
   const [expanded, setExpanded] = useState(false);
-  const [heartbeats, setHeartbeats] = useState<Heartbeat[]>([]);
+  // Heartbeat一覧（サーバー状態）は SWR で管理。取得タイミングは従来どおり
+  // 呼び出し側（トグル/更新/保存・削除・トリガー後）で駆動するため自動 revalidation は無効化する。
+  const { data: heartbeats = [], mutate: mutateHeartbeats } = useSWR<Heartbeat[]>(
+    "settings/heartbeats",
+    async () => {
+      try {
+        return (await pyFetch<{ heartbeats: Heartbeat[] }>("/heartbeats")).heartbeats || [];
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "Failed to load heartbeats");
+        return [];
+      }
+    },
+    {
+      revalidateOnMount: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+      keepPreviousData: true,
+      dedupingInterval: 0,
+    },
+  );
   const [loading, setLoading] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
   const [isNew, setIsNew] = useState(false);
@@ -140,15 +163,11 @@ export function HeartbeatsSection() {
   const loadHeartbeats = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await pyFetch<{ heartbeats: Heartbeat[] }>("/heartbeats");
-      setHeartbeats(data.heartbeats || []);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Failed to load heartbeats");
-      setHeartbeats([]);
+      await mutateHeartbeats();
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [mutateHeartbeats]);
 
   const handleToggle = useCallback(() => {
     if (!expanded && heartbeats.length === 0) void loadHeartbeats();
@@ -194,7 +213,13 @@ export function HeartbeatsSection() {
 
   const handleDelete = useCallback(
     async (name: string) => {
-      if (!window.confirm(`Delete heartbeat "${name}"?`)) return;
+      if (
+        !(await confirm({
+          description: `Delete heartbeat "${name}"?`,
+          destructive: true,
+        }))
+      )
+        return;
       setBusyName(name);
       try {
         await pyFetch(`/heartbeats/${encodeURIComponent(name)}`, { method: "DELETE" });
@@ -206,7 +231,7 @@ export function HeartbeatsSection() {
         setBusyName(null);
       }
     },
-    [loadHeartbeats],
+    [loadHeartbeats, confirm],
   );
 
   const handleTrigger = useCallback(

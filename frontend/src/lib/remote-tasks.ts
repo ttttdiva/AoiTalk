@@ -5,12 +5,14 @@
  */
 
 import type { Task } from "@/lib/task-api";
+import { decorateRemoteTask } from "@/lib/remote-resource";
 
 export type RemoteTask = Task & {
   /** 由来サーバーの識別用（表示・操作の出し分けに使う）。 */
   remote_server_id: string;
   remote_server_name: string;
   remote_server_color?: string | null;
+  remote_server_base_url?: string;
 };
 
 async function proxy<T>(path: string, init?: RequestInit): Promise<T> {
@@ -49,6 +51,24 @@ export async function listRemoteTasks(
   if (Array.isArray(payload)) return payload;
   if (payload && Array.isArray(payload.tasks)) return payload.tasks;
   return [];
+}
+
+export function toRemoteTask(
+  profile: {
+    id: string;
+    name: string;
+    display_color?: string | null;
+    base_url?: string;
+  },
+  task: Task,
+): RemoteTask {
+  return decorateRemoteTask(
+    profile.id,
+    profile.name,
+    profile.display_color,
+    profile.base_url,
+    task,
+  ) as RemoteTask;
 }
 
 export async function patchRemoteTask(

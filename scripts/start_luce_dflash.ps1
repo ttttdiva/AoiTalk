@@ -59,7 +59,10 @@ function Stop-DFlash {
 }
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$defaultAiRoot = Join-Path ([System.IO.Path]::GetPathRoot($projectRoot)) "AI"
+$driveRoot = [System.IO.Path]::GetPathRoot($projectRoot)
+$defaultAiRoot = Join-Path $driveRoot "AI"
+$defaultDevRoot = Join-Path $driveRoot "Dev"
+$defaultHotLlmRoot = Join-Path $defaultAiRoot "models\Hot\llm"
 $repoEnv = Join-Path $projectRoot ".env"
 $hfHome = Load-DotEnvValue -Path $repoEnv -Key "HF_HOME"
 $hfCache = Load-DotEnvValue -Path $repoEnv -Key "HF_HUB_CACHE"
@@ -74,12 +77,12 @@ if ($Stop) {
     exit 0
 }
 
-if (-not $RepoRoot) { $RepoRoot = Join-Path $defaultAiRoot "lucebox-hub\dflash" }
+if (-not $RepoRoot) { $RepoRoot = Join-Path $defaultDevRoot "67_lucebox-hub\dflash" }
 if (-not $TargetModel) {
-    $TargetModel = Join-Path $defaultAiRoot "models\luce-dflash\models\Qwen3.6-27B-Q4_K_M.gguf"
+    $TargetModel = Join-Path $defaultHotLlmRoot "luce-dflash\models\Qwen3.6-27B-Q4_K_M.gguf"
 }
 if (-not $DraftModel) {
-    $DraftModel = Join-Path $defaultAiRoot "models\luce-dflash\models\draft\dflash-draft-3.6-q8_0.gguf"
+    $DraftModel = Join-Path $defaultHotLlmRoot "luce-dflash\models\draft\dflash-draft-3.6-q8_0.gguf"
 }
 if (-not $PythonExe) { $PythonExe = Join-Path $projectRoot "venv\Scripts\python.exe" }
 if (-not $CudaRoot) { throw "Pass -CudaRoot or set CUDA_PATH." }

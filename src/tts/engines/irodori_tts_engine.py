@@ -13,18 +13,18 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
+from ..irodori_config import IRODORI_TTS_CHECKPOINT
+
 
 class IrodoriTTSEngine:
     """Irodori-TTS adapter returning WAV bytes for AoiTalk playback."""
 
-    DEFAULT_CHECKPOINT = "Aratako/Irodori-TTS-500M-v2"
-    DEFAULT_VOICE_DESIGN_CHECKPOINT = "Aratako/Irodori-TTS-500M-v2-VoiceDesign"
+    DEFAULT_CHECKPOINT = IRODORI_TTS_CHECKPOINT
     DEFAULT_CODEC_REPO = "Aratako/Semantic-DACVAE-Japanese-32dim"
 
     def __init__(
         self,
         hf_checkpoint: Optional[str] = None,
-        voice_design_checkpoint: Optional[str] = None,
         codec_repo: Optional[str] = None,
         refs_dir: Optional[str] = None,
         cache_dir: Optional[str] = None,
@@ -36,9 +36,10 @@ class IrodoriTTSEngine:
         num_steps: int = 6,
         t_schedule_mode: str = "sway",
         sway_coeff: float = -1.0,
-        seconds: float = 30.0,
+        seconds: Optional[float] = None,
+        duration_scale: float = 1.0,
         max_ref_seconds: Optional[float] = 30.0,
-        ref_normalize_db: Optional[float] = None,
+        ref_normalize_db: Optional[float] = -16.0,
         ref_ensure_max: bool = True,
         cfg_scale_text: float = 3.0,
         cfg_scale_caption: float = 3.0,
@@ -47,11 +48,20 @@ class IrodoriTTSEngine:
     ):
         root = Path(__file__).resolve().parents[3]
         self.repo_root = root
-        self.hf_checkpoint = hf_checkpoint or self.DEFAULT_CHECKPOINT
-        self.voice_design_checkpoint = (
-            voice_design_checkpoint or self.DEFAULT_VOICE_DESIGN_CHECKPOINT
-        )
-        self.codec_repo = codec_repo or self.DEFAULT_CODEC_REPO
+        requested_checkpoint = str(hf_checkpoint or self.DEFAULT_CHECKPOINT).strip()
+        if requested_checkpoint != self.DEFAULT_CHECKPOINT:
+            print(
+                "[Irodori-TTS] Configured checkpoint is no longer supported; "
+                f"using {self.DEFAULT_CHECKPOINT} instead of {requested_checkpoint}"
+            )
+        self.hf_checkpoint = self.DEFAULT_CHECKPOINT
+        requested_codec = str(codec_repo or self.DEFAULT_CODEC_REPO).strip()
+        if requested_codec != self.DEFAULT_CODEC_REPO:
+            print(
+                "[Irodori-TTS] Configured codec is not supported by the v3 model; "
+                f"using {self.DEFAULT_CODEC_REPO} instead of {requested_codec}"
+            )
+        self.codec_repo = self.DEFAULT_CODEC_REPO
         self.refs_dir = self._resolve_path(refs_dir or "config/irodori_refs")
         self.cache_dir = self._resolve_path(cache_dir or "cache/irodori_tts")
         self.use_gpu = bool(use_gpu)
@@ -62,7 +72,8 @@ class IrodoriTTSEngine:
         self.num_steps = int(num_steps)
         self.t_schedule_mode = str(t_schedule_mode)
         self.sway_coeff = float(sway_coeff)
-        self.seconds = float(seconds)
+        self.seconds = None if seconds is None else float(seconds)
+        self.duration_scale = float(duration_scale)
         self.max_ref_seconds = max_ref_seconds
         self.ref_normalize_db = ref_normalize_db
         self.ref_ensure_max = bool(ref_ensure_max)
@@ -157,11 +168,19 @@ class IrodoriTTSEngine:
             symbols = self._runtime_symbols
             if symbols is None:
                 raise RuntimeError("Irodori runtime symbols are not loaded")
-            resolved = symbols["hf_hub_download"](
-                repo_id=checkpoint_key,
-                filename="model.safetensors",
-                cache_dir=str(self.cache_dir / "hf"),
-            )
+            download_cache = self.cache_dir / "hf"
+            try:
+                resolved = symbols["hf_hub_download"](
+                    repo_id=checkpoint_key,
+                    filename="model.safetensors",
+                    cache_dir=str(download_cache),
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Irodori-TTS checkpoint download failed: "
+                    f"repo={checkpoint_key}, file=model.safetensors, "
+                    f"cache_dir={download_cache}, cause={exc}"
+                ) from exc
             print(f"[Irodori-TTS] checkpoint: hf://{checkpoint_key} -> {resolved}")
 
         self._checkpoint_paths[checkpoint_key] = resolved
@@ -228,7 +247,6 @@ class IrodoriTTSEngine:
         ref_latent: Optional[str] = None,
         caption: Optional[str] = None,
         no_ref: Optional[bool] = None,
-        voice_design: bool = False,
         **kwargs,
     ) -> Optional[bytes]:
         if not text or not text.strip():
@@ -239,23 +257,30 @@ class IrodoriTTSEngine:
         if symbols is None:
             return None
 
-        use_voice_design = bool(voice_design)
-        checkpoint = (
-            self.voice_design_checkpoint if use_voice_design else self.hf_checkpoint
-        )
-        checkpoint_path = self._resolve_checkpoint(checkpoint)
+        checkpoint_path = self._resolve_checkpoint(self.hf_checkpoint)
         runtime_key = self._build_runtime_key(checkpoint_path)
         runtime, reloaded = symbols["get_cached_runtime"](runtime_key)
         if reloaded:
             print("[Irodori-TTS] Loaded runtime")
 
-        resolved_ref_wav = self._find_reference_wav(ref_wav, voice_name, character_name)
+        if bool(no_ref) and (ref_wav or ref_latent):
+            raise ValueError("no_ref cannot be combined with ref_wav or ref_latent")
+
+        resolved_ref_wav = None
+        if not bool(no_ref):
+            resolved_ref_wav = self._find_reference_wav(
+                ref_wav, voice_name, character_name
+            )
         resolved_ref_latent = str(self._resolve_path(ref_latent)) if ref_latent else None
+        if resolved_ref_wav and resolved_ref_latent:
+            raise ValueError("ref_wav and ref_latent are mutually exclusive")
         should_use_no_ref = bool(no_ref)
         if not resolved_ref_wav and not resolved_ref_latent:
             should_use_no_ref = True
 
         SamplingRequest = symbols["SamplingRequest"]
+        requested_seconds = kwargs.get("seconds", self.seconds)
+        requested_duration_scale = kwargs.get("duration_scale", self.duration_scale)
         result = runtime.synthesize(
             SamplingRequest(
                 text=str(text),
@@ -268,7 +293,10 @@ class IrodoriTTSEngine:
                     kwargs.get("t_schedule_mode", self.t_schedule_mode)
                 ),
                 sway_coeff=float(kwargs.get("sway_coeff", self.sway_coeff)),
-                seconds=float(kwargs.get("seconds", self.seconds)),
+                seconds=(
+                    None if requested_seconds is None else float(requested_seconds)
+                ),
+                duration_scale=float(requested_duration_scale),
                 max_ref_seconds=self.max_ref_seconds,
                 ref_normalize_db=kwargs.get(
                     "ref_normalize_db", self.ref_normalize_db

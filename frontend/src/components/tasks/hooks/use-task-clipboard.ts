@@ -24,6 +24,7 @@ export function useTaskClipboard({
   setBulkLoading,
   lastClickedIndexRef,
   prevShiftRangeRef,
+  readOnly = false,
 }: {
   tasks: Task[];
   focusedTaskId: string | null;
@@ -34,6 +35,7 @@ export function useTaskClipboard({
   setBulkLoading: React.Dispatch<React.SetStateAction<boolean>>;
   lastClickedIndexRef: React.RefObject<number | null>;
   prevShiftRangeRef: React.RefObject<Set<string>>;
+  readOnly?: boolean;
 }) {
   const clipboardRef = useRef<TaskClipboard>({ tasks: [], mode: "copy" });
   const [cutTaskIds, setCutTaskIds] = useState<Set<string>>(new Set());
@@ -49,6 +51,7 @@ export function useTaskClipboard({
 
   const handleClipboardStore = useCallback(
     (mode: ClipboardMode) => {
+      if (readOnly && mode === "cut") return;
       const targetTasks = getKeyboardSelectionTasks();
       if (targetTasks.length === 0) return;
 
@@ -62,10 +65,11 @@ export function useTaskClipboard({
       const copiedText = targetTasks.map((task) => task.title).join("\n");
       void navigator.clipboard.writeText(copiedText).catch(() => {});
     },
-    [getKeyboardSelectionTasks],
+    [getKeyboardSelectionTasks, readOnly],
   );
 
   const handleClipboardPaste = useCallback(async () => {
+    if (readOnly) return;
     const clipboard = clipboardRef.current;
     if (!clipboard.tasks.length || !focusedTaskId) return;
 
@@ -167,6 +171,7 @@ export function useTaskClipboard({
     setBulkLoading,
     setSelectedIds,
     tasks,
+    readOnly,
   ]);
 
   return {

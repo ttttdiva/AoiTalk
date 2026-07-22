@@ -1398,6 +1398,19 @@ class TokenUsage(Base):
     output_tokens = Column(Integer, default=0)
     total_tokens = Column(Integer, default=0)
     cached_tokens = Column(Integer, default=0)
+    reasoning_tokens = Column(Integer, default=0)
+    cache_read_tokens = Column(Integer, default=0)
+    cache_write_tokens = Column(Integer, default=0)
+    prompt_eval_tokens = Column(Integer, default=0)
+    prompt_eval_ms = Column(Integer, default=0)
+    cache_hit_rate = Column(Float, nullable=True)
+    cache_evictions = Column(Integer, default=0)
+    cache_provider = Column(String(50), nullable=True)
+    cache_mode = Column(String(50), nullable=True)
+    cache_key = Column(String(128), nullable=True)
+    cache_supported = Column(Boolean, nullable=True)
+    cache_active = Column(Boolean, nullable=True)
+    metrics_source = Column(String(50), nullable=True)
 
     # コスト（USD）
     input_cost = Column(Float, default=0.0)
@@ -1428,6 +1441,19 @@ class TokenUsage(Base):
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
             "cached_tokens": self.cached_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "prompt_eval_tokens": self.prompt_eval_tokens,
+            "prompt_eval_ms": self.prompt_eval_ms,
+            "cache_hit_rate": self.cache_hit_rate,
+            "cache_evictions": self.cache_evictions,
+            "cache_provider": self.cache_provider,
+            "cache_mode": self.cache_mode,
+            "cache_key": self.cache_key,
+            "cache_supported": self.cache_supported,
+            "cache_active": self.cache_active,
+            "metrics_source": self.metrics_source,
             "input_cost": self.input_cost,
             "output_cost": self.output_cost,
             "total_cost": self.total_cost,
@@ -1449,6 +1475,7 @@ class ModelPricing(Base):
     input_price_per_1m = Column(Float, nullable=False)  # USD per 1M tokens
     output_price_per_1m = Column(Float, nullable=False)
     cached_input_price_per_1m = Column(Float, default=0.0)
+    cache_write_input_price_per_1m = Column(Float, default=0.0)
     currency = Column(String(3), default="USD")
     effective_from = Column(DateTime, default=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -1463,6 +1490,7 @@ class ModelPricing(Base):
             "input_price_per_1m": self.input_price_per_1m,
             "output_price_per_1m": self.output_price_per_1m,
             "cached_input_price_per_1m": self.cached_input_price_per_1m,
+            "cache_write_input_price_per_1m": self.cache_write_input_price_per_1m,
             "effective_from": (
                 self.effective_from.isoformat() if self.effective_from else None
             ),

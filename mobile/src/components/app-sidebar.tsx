@@ -393,22 +393,53 @@ function statusDotStyle(status: string) {
 
 function FilesSidebar({ close }: { close: () => void }) {
   const router = useRouter();
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, user } = useAuth();
+  const { selectedProjectId, selectedProject } = useProject();
+  const isAdmin = user?.role === "admin";
   const [source, setSource] = useState<FilesSource>("local");
   const [items, setItems] = useState<FilesEntry[]>([]);
   const [loading, setLoading] = useState(false);
 
+  // サーバー・ワークスペースのルート。管理者はプロジェクト未選択で管理者ルート、
+  // 一般ユーザーは未選択なら null（一覧取得しない）。
+  const serverWorkspaceRoot =
+    isAdmin && !selectedProjectId
+      ? ""
+      : selectedProjectId
+        ? `_projects/project_${selectedProjectId}`
+        : null;
+
+  const projectLabel = selectedProject?.name
+    ? selectedProject.name
+    : isAdmin
+      ? "管理者ルート"
+      : "プロジェクト未選択";
+
+  const needsProjectSelection =
+    source === "server" && serverWorkspaceRoot === null;
+
   const loadFiles = useCallback(async () => {
+    if (source === "server" && serverWorkspaceRoot === null) {
+      setItems([]);
+      return;
+    }
     setLoading(true);
     try {
-      const result = await filesApi.list(source);
+      const result =
+        source === "server"
+          ? await filesApi.list(
+              "server",
+              serverWorkspaceRoot || undefined,
+              "workspace",
+            )
+          : await filesApi.list("local");
       setItems(result.items.slice(0, 20));
     } catch {
       setItems([]);
     } finally {
       setLoading(false);
     }
-  }, [source]);
+  }, [serverWorkspaceRoot, source]);
 
   useEffect(() => {
     if (!isAuthenticated && source === "server") {
@@ -448,6 +479,11 @@ function FilesSidebar({ close }: { close: () => void }) {
           },
         ]}
       />
+      {source === "server" ? (
+        <Text style={styles.filesProjectLabel} numberOfLines={1}>
+          プロジェクト: {projectLabel}
+        </Text>
+      ) : null}
       {loading ? (
         <ActivityIndicator color="#7c3aed" style={styles.loading} />
       ) : (
@@ -455,7 +491,13 @@ function FilesSidebar({ close }: { close: () => void }) {
           data={items}
           keyExtractor={(item) => `${item.source}:${item.path}`}
           ItemSeparatorComponent={() => <Divider style={styles.divider} />}
-          ListEmptyComponent={<Text style={styles.emptyText}>ファイルはありません</Text>}
+          ListEmptyComponent={
+            <Text style={styles.emptyText}>
+              {needsProjectSelection
+                ? "プロジェクトを選択してください"
+                : "ファイルはありません"}
+            </Text>
+          }
           renderItem={({ item }) => (
             <List.Item
               title={item.name}
@@ -531,6 +573,12 @@ function AppSidebarContent({ close }: { close: () => void }) {
           active={pathname.includes("/filer")}
           onPress={() => navigate("/(tabs)/filer")}
         />
+        <NavigationRow
+          icon="file-tree-outline"
+          label="Docs"
+          active={pathname.includes("/docs")}
+          onPress={() => navigate("/(tabs)/docs")}
+        />
       </View>
 
       <View style={styles.section}>
@@ -585,12 +633,18 @@ function AppSidebarContent({ close }: { close: () => void }) {
   );
 }
 
-export function AppSidebar({ children }: { children: React.ReactNode }) {
+export function AppSidebar({
+  children,
+  initialOpen = false,
+}: {
+  children: React.ReactNode;
+  initialOpen?: boolean;
+}) {
   const { canUseApp } = useAuth();
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
   const drawerWidth = Math.min(MAX_DRAWER_WIDTH, Math.round(width * 0.86));
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(initialOpen);
   const translateX = useRef(new Animated.Value(-drawerWidth)).current;
 
   useEffect(() => {
@@ -644,9 +698,15 @@ export function AppSidebar({ children }: { children: React.ReactNode }) {
   return (
     <View style={styles.root}>
       {children}
-      <View style={styles.edgeGesture} {...edgePanResponder.panHandlers} />
+      <View
+        testID="app-sidebar-edge-gesture"
+        style={styles.edgeGesture}
+        {...edgePanResponder.panHandlers}
+      />
       {open && <Pressable style={styles.scrim} onPress={close} />}
       <Animated.View
+        testID="app-sidebar-drawer"
+        pointerEvents={open ? "auto" : "none"}
         style={[
           styles.drawer,
           {
@@ -659,7 +719,7 @@ export function AppSidebar({ children }: { children: React.ReactNode }) {
         {...drawerPanResponder.panHandlers}
       >
         <Surface style={styles.drawerSurface} elevation={4}>
-          <AppSidebarContent close={close} />
+          {open ? <AppSidebarContent close={close} /> : null}
         </Surface>
       </Animated.View>
     </View>
@@ -780,6 +840,12 @@ const styles = StyleSheet.create({
     color: MUTED,
     fontSize: 12,
     fontWeight: "700",
+  },
+  filesProjectLabel: {
+    color: MUTED,
+    fontSize: 11,
+    paddingHorizontal: 8,
+    paddingBottom: 6,
   },
   smallIconButton: {
     margin: 0,

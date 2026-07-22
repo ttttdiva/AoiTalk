@@ -4,6 +4,7 @@ import {
   taskActivities,
   taskAssignees,
   taskAttachments,
+  taskReferences,
   taskComments,
   taskDependencies,
   taskOccurrences,
@@ -88,6 +89,9 @@ export async function deleteTaskTreeRows(taskIds: string[]) {
   await db
     .delete(taskAttachments)
     .where(inArray(taskAttachments.taskId, taskIds));
+  await db
+    .delete(taskReferences)
+    .where(inArray(taskReferences.taskId, taskIds));
   await db.delete(taskTags).where(inArray(taskTags.taskId, taskIds));
   await db.delete(taskAssignees).where(inArray(taskAssignees.taskId, taskIds));
   return db.delete(tasks).where(inArray(tasks.id, taskIds)).returning({

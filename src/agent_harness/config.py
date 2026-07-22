@@ -146,8 +146,8 @@ class AgentHarnessSettings:
         try:
             from ..services.agent_team_service import (
                 agent_team_member_for,
-                agent_team_member_mode,
                 model_route_is_explicit,
+                resolve_agent_team_member_mode,
             )
 
             agent_route = (
@@ -162,8 +162,12 @@ class AgentHarnessSettings:
         route_claude_model = None
         route_claude_effort = None
         route_runner = None
+        # Bare legacy configs without agent_team retain their old behavior;
+        # application configs always contain the global/member switches.
+        agent_team_harness_enabled = _config_get(config, "agent_team", None) is None
         if agent_route:
             route_runner = agent_route.get("runner")
+            agent_team_harness_enabled = True
         normalized_route_runner = _normalize_runner(str(route_runner)) if route_runner else ""
         if agent_route and (
             normalized_route_runner in {"codex_exec", "codex_cli"}
@@ -173,14 +177,14 @@ class AgentHarnessSettings:
             )
         ):
             route_codex_model = agent_route.get("model")
-            route_codex_effort = agent_team_member_mode(config, "agent_harness")
+            route_codex_effort = resolve_agent_team_member_mode(config, member_key="agent_harness", provider="codex-cli", model=str(route_codex_model or ""))
             route_runner = route_runner or "codex_exec"
         elif agent_route and (
             normalized_route_runner in {"claude_code", "claude_cli"}
             or agent_route.get("provider") == "claude-cli"
         ):
             route_claude_model = agent_route.get("model")
-            route_claude_effort = agent_team_member_mode(config, "agent_harness")
+            route_claude_effort = resolve_agent_team_member_mode(config, member_key="agent_harness", provider="claude-cli", model=str(route_claude_model or ""))
             if not route_runner or _normalize_runner(str(route_runner)) == "codex_exec":
                 route_runner = "claude_code"
         by_state_raw = raw.get("max_concurrent_agents_by_state", {}) or {}
@@ -191,7 +195,7 @@ class AgentHarnessSettings:
         }
 
         return cls(
-            enabled=_as_bool(raw.get("enabled"), False),
+            enabled=_as_bool(raw.get("enabled"), False) and agent_team_harness_enabled,
             auto_start=_as_bool(raw.get("auto_start"), False),
             polling_interval_ms=_as_int(raw.get("polling_interval_ms"), 30_000, minimum=1),
             workflow_file=_resolve_path(

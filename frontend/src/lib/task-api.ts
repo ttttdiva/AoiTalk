@@ -79,6 +79,11 @@ export type Task = {
   effective_occurrence_source_kind?: string | null;
   effective_occurrence_status?: string | null;
   google_calendar_sync?: GoogleCalendarSyncResult;
+  remote_server_id?: string;
+  remote_server_name?: string;
+  remote_server_color?: string | null;
+  remote_server_base_url?: string;
+  resource_id?: string;
 };
 
 export type TaskAttachment = {
@@ -154,6 +159,9 @@ export type TaskOccurrence = {
   is_generated?: boolean;
   original_start_at?: string | null;
   tags?: Tag[];
+  source?: "local" | "remote" | string;
+  remote_server_id?: string;
+  resource_id?: string;
 };
 
 export type RecurringOccurrenceContext = {
@@ -182,6 +190,11 @@ export type TimeEntry = {
   space_name?: string | null;
   original_started_at?: string | null;
   original_ended_at?: string | null;
+  remote_server_id?: string;
+  remote_server_name?: string;
+  remote_server_color?: string | null;
+  remote_server_base_url?: string;
+  resource_id?: string;
 };
 
 export type TimeReportBucket = {
@@ -191,6 +204,9 @@ export type TimeReportBucket = {
   entries: number;
   project_id?: string | null;
   project_name?: string | null;
+  source?: "local" | "remote" | string;
+  remote_server_id?: string;
+  resource_id?: string;
 };
 
 export type TimeReport = {
@@ -215,6 +231,12 @@ export type Space = {
   sort_order?: number;
   created_at?: string | null;
   updated_at?: string | null;
+  source?: "local" | "remote" | string;
+  remote_server_id?: string;
+  remote_server_name?: string;
+  remote_server_color?: string | null;
+  remote_server_base_url?: string;
+  resource_id?: string;
 };
 
 export type Project = {
@@ -226,8 +248,35 @@ export type Project = {
   space_id?: string | null;
   knowledge_node_id?: string | null;
   is_completed?: boolean;
+  can_write?: boolean;
   color?: string | null;
+  metadata?: Record<string, unknown> & {
+    workspace_tools_enabled?: boolean;
+  };
+  source?: "local" | "remote" | string;
+  remote_server_id?: string;
+  remote_server_name?: string;
+  remote_server_color?: string | null;
+  remote_server_base_url?: string;
+  resource_id?: string;
+};
+
+export type TaskReference = {
+  id: string;
+  reference_type: string;
+  relation_type: "source" | "related" | string;
+  display_name: string;
+  subtitle?: string | null;
+  target_id?: string | null;
+  target_path?: string | null;
+  target_url?: string | null;
   metadata?: Record<string, unknown>;
+  created_by?: string | null;
+  created_at?: string | null;
+  can_remove: boolean;
+  exists: boolean;
+  open: { id?: string | null; path?: string | null; url?: string | null };
+  attachment?: TaskAttachment;
 };
 
 export type TaskDocsNode = {
@@ -241,12 +290,28 @@ export type TaskDocsNodeResult = {
   created: boolean;
 };
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+class TaskApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "TaskApiError";
+  }
+}
+
+async function request<T>(
+  path: string,
+  init?: RequestInit,
+  timeoutMs = 5000,
+): Promise<T> {
   const res = await fetch(path, {
     credentials: "include",
     ...init,
     headers: { "Content-Type": "application/json", ...init?.headers },
-    signal: init?.signal ?? AbortSignal.timeout(5000),
+    signal: init?.signal
+      ? AbortSignal.any([init.signal, AbortSignal.timeout(timeoutMs)])
+      : AbortSignal.timeout(timeoutMs),
   });
   if (res.status === 401) {
     const shouldRedirectToLogin = ![
@@ -257,14 +322,37 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     if (shouldRedirectToLogin && typeof window !== "undefined") {
       window.location.href = "/login";
     }
-    throw new Error("認証が必要です");
+    throw new TaskApiError("認証が必要です", 401);
   }
   if (!res.ok) {
     const detail = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(detail.detail || res.statusText);
+    throw new TaskApiError(detail.detail || res.statusText, res.status);
   }
   if (res.status === 204) return undefined as T;
   return res.json();
+}
+
+function isRetryableListError(error: unknown): boolean {
+  if (error instanceof TaskApiError) {
+    return error.status === 408 || error.status === 429 || error.status >= 500;
+  }
+  return (
+    error instanceof TypeError ||
+    (error instanceof DOMException && error.name === "TimeoutError")
+  );
+}
+
+async function requestList<T>(path: string, init?: RequestInit): Promise<T> {
+  const attempts = 2;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await request<T>(path, init, 30000);
+    } catch (error) {
+      if (attempt === attempts - 1 || !isRetryableListError(error)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+  }
+  throw new Error("一覧を取得できませんでした");
 }
 
 async function uploadRequest<T>(path: string, form: FormData): Promise<T> {
@@ -354,8 +442,9 @@ export const taskApi = {
   listTasks: (scope?: Scope | string, init?: RequestInit) => {
     const params = buildScopeQuery(scope);
     const qs = params.toString();
-    return request<Task[]>(`/api/tasks${qs ? `?${qs}` : ""}`, init).then(
-      (tasks) => tasks.map(normalizeTaskResponse),
+    const path = `/api/tasks${qs ? `?${qs}` : ""}`;
+    return requestList<Task[]>(path, init).then((tasks) =>
+      tasks.map(normalizeTaskResponse),
     );
   },
   getTask: (taskId: string) =>
@@ -511,6 +600,33 @@ export const taskApi = {
     request<void>(`/api/tasks/${taskId}/attachments/${attachmentId}`, {
       method: "DELETE",
     }),
+  listReferences: (taskId: string) =>
+    request<TaskReference[]>(`/api/tasks/${taskId}/references`),
+  addReference: (
+    taskId: string,
+    data: {
+      reference_type: string;
+      relation_type?: "source" | "related";
+      target_id?: string;
+      target_path?: string;
+      target_url?: string;
+      display_name?: string;
+      metadata?: Record<string, unknown>;
+    },
+  ) =>
+    request<TaskReference>(`/api/tasks/${taskId}/references`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  removeReference: (
+    taskId: string,
+    referenceId: string,
+    confirmSource = false,
+  ) =>
+    request<void>(
+      `/api/tasks/${taskId}/references/${encodeURIComponent(referenceId)}${confirmSource ? "?confirm_source=true" : ""}`,
+      { method: "DELETE" },
+    ),
   runAgentTriage: (taskId: string) =>
     request<TaskAgentTriageResult>(`/api/tasks/${taskId}/agent-triage`, {
       method: "POST",
@@ -617,7 +733,7 @@ export const taskApi = {
 
   // Projects
   listProjects: () =>
-    request<{ projects: Project[]; total: number }>("/api/projects"),
+    requestList<{ projects: Project[]; total: number }>("/api/projects"),
   updateProject: (id: string, data: Record<string, unknown>) =>
     request<Project>(`/api/projects/${id}`, {
       method: "PATCH",
@@ -625,7 +741,8 @@ export const taskApi = {
     }),
 
   // Spaces
-  listSpaces: () => request<{ spaces: Space[]; total: number }>("/api/spaces"),
+  listSpaces: () =>
+    requestList<{ spaces: Space[]; total: number }>("/api/spaces"),
   createSpace: (data: {
     name: string;
     description?: string;

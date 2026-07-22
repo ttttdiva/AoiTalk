@@ -72,14 +72,17 @@ export default function TabLayout() {
         }}
       />
       <Tabs.Screen
-        name="settings"
+        name="docs"
         options={{
-          title: "Settings",
+          title: "Docs",
           tabBarIcon: ({ color, size }) => (
-            <Icon source="cog-outline" size={size} color={color} />
+            <Icon source="file-tree-outline" size={size} color={color} />
           ),
         }}
       />
+      {/* Settings はタブバーから外し、共通ヘッダー右上の歯車から遷移する（スタックは生存） */}
+      <Tabs.Screen name="settings" options={{ href: null }} />
+      <Tabs.Screen name="docs/[nodeId]" options={{ href: null }} />
       <Tabs.Screen name="chat/[sessionId]" options={{ href: null }} />
       <Tabs.Screen name="tasks/[taskId]" options={{ href: null }} />
       <Tabs.Screen name="settings/profile" options={{ href: null }} />

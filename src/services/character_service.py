@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..memory.database import get_db_session
 from ..models.ecc_models import Character, Scenario, ScenarioCharacter
 from ..tools.core import ToolDefinition, ToolParam
+from ..utils.uuid_utils import parse_uuid, parse_uuid_strict
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +154,7 @@ async def get_character(identifier: str) -> dict:
     """IDまたはslugでキャラクターを取得する。"""
     async with await get_db_session() as session:
         # まずUUIDとして試行
-        uid = _parse_uuid(identifier)
+        uid = parse_uuid(identifier)
         if uid:
             char = await session.get(Character, uid)
         else:
@@ -188,7 +189,7 @@ async def list_characters(
 
 async def update_character(character_id: str, data: dict) -> dict:
     """キャラクターを更新する。"""
-    uid = _parse_uuid_strict(character_id)
+    uid = parse_uuid_strict(character_id, lambda v: CharacterError(f"無効なUUID形式です: {v}"))
 
     if "slug" in data:
         _validate_slug(data["slug"])
@@ -228,7 +229,7 @@ async def update_character(character_id: str, data: dict) -> dict:
 
 async def delete_character(character_id: str) -> bool:
     """キャラクターを削除する。"""
-    uid = _parse_uuid_strict(character_id)
+    uid = parse_uuid_strict(character_id, lambda v: CharacterError(f"無効なUUID形式です: {v}"))
 
     async with await get_db_session() as session:
         char = await session.get(Character, uid)
@@ -255,7 +256,12 @@ async def get_character_for_prompt(slug: str) -> dict:
 
     async with await get_db_session() as session:
         char = (
-            await session.execute(select(Character).where(Character.slug == slug))
+            await session.execute(
+                select(Character).where(
+                    Character.slug == slug,
+                    Character.is_enabled.is_(True),
+                )
+            )
         ).scalar_one_or_none()
 
         if char is None:
@@ -263,9 +269,13 @@ async def get_character_for_prompt(slug: str) -> dict:
             result = await session.execute(
                 select(Character).where(Character.is_enabled.is_(True))
             )
+            requested = str(slug or "").casefold()
             for c in result.scalars().all():
                 aliases = c.recognition_aliases or []
-                if slug in aliases or c.name == slug:
+                normalized_aliases = {
+                    str(alias).casefold() for alias in aliases if alias is not None
+                }
+                if requested in normalized_aliases or str(c.name).casefold() == requested:
                     return c.to_dict()
             return None
 
@@ -282,8 +292,8 @@ async def _get_scenario_roleplay_character(slug: str) -> Optional[dict]:
     if len(parts) != 3:
         return None
 
-    scenario_uid = _parse_uuid(parts[1])
-    character_uid = _parse_uuid(parts[2])
+    scenario_uid = parse_uuid(parts[1])
+    character_uid = parse_uuid(parts[2])
     if not scenario_uid or not character_uid:
         return None
 
@@ -458,22 +468,6 @@ def _make_dynamic_agent_class(
 # ────────────────────────────────────────────
 # ユーティリティ
 # ────────────────────────────────────────────
-
-
-def _parse_uuid(value: Any) -> Optional[uuid.UUID]:
-    if value is None:
-        return None
-    try:
-        return uuid.UUID(str(value))
-    except (ValueError, AttributeError):
-        return None
-
-
-def _parse_uuid_strict(value: str) -> uuid.UUID:
-    try:
-        return uuid.UUID(str(value))
-    except (ValueError, AttributeError):
-        raise CharacterError(f"無効なUUID形式です: {value}")
 
 
 def _run_sync(coro):

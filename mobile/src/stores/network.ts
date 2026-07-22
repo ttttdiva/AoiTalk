@@ -15,6 +15,7 @@ import NetInfo, { type NetInfoState } from '@react-native-community/netinfo';
 interface NetworkStoreState {
   online: boolean;
   serverReachable: boolean;
+  serverCheckedAt: number | null;
   lastChange: number;
   _unsubscribe: (() => void) | null;
   start: () => void;
@@ -25,6 +26,7 @@ interface NetworkStoreState {
 export const useNetworkStore = create<NetworkStoreState>((set, get) => ({
   online: true,
   serverReachable: false,
+  serverCheckedAt: null,
   lastChange: Date.now(),
   _unsubscribe: null,
 
@@ -49,5 +51,17 @@ export const useNetworkStore = create<NetworkStoreState>((set, get) => ({
     set({ _unsubscribe: null });
   },
 
-  setServerReachable: (ok: boolean) => set({ serverReachable: ok, lastChange: Date.now() }),
+  setServerReachable: (ok: boolean) =>
+    set({ serverReachable: ok, serverCheckedAt: Date.now(), lastChange: Date.now() }),
 }));
+
+/** 直近の疎通失敗を、送信前に再度長時間待たないための短期キャッシュとして使う。 */
+export function isServerKnownUnreachable(maxAgeMs = 90_000): boolean {
+  const state = useNetworkStore.getState();
+  return (
+    state.online &&
+    state.serverReachable === false &&
+    state.serverCheckedAt !== null &&
+    Date.now() - state.serverCheckedAt <= maxAgeMs
+  );
+}

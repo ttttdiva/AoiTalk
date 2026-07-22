@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import dataclasses
 import json
 import logging
 import os
@@ -67,7 +68,16 @@ from .context_budget import (
 from .openai_compatible_local_profiles import (
     DEFAULT_OPENAI_COMPATIBLE_LOCAL_BASE_URL,
     openai_compatible_local_base_url,
+    openai_compatible_server_profile,
 )
+from .conversation_context import (
+    PromptMessages,
+    build_prompt_messages,
+    normalize_usage,
+    persist_usage_sync,
+    stable_cache_key,
+)
+from .context_snapshot import component, context_bundle_components, message_components, reconcile_snapshot, snapshot, tool_components, without_text
 from .multimodal import openai_content_parts
 from .prompts import build_unified_instructions
 from .provider_capabilities import ProviderCapabilities
@@ -313,6 +323,9 @@ class OpenAICompatibleLocalClient:
         self.enable_response_format = bool(enable_response_format)
         self.enable_extra_body = bool(enable_extra_body)
         self.extra_body = extra_body if isinstance(extra_body, dict) else {}
+        self.server_profile = openai_compatible_server_profile(
+            config, base_url=self.base_url
+        )
         self.capabilities = ProviderCapabilities(
             supports_stream=True,
             supports_tools=True,
@@ -348,8 +361,12 @@ class OpenAICompatibleLocalClient:
         self._context_window_override_tokens: Optional[int] = None
         self._current_tool_hint_context = ""
         self._last_generation_metrics: Optional[Dict[str, Any]] = None
+        self._last_context_snapshots: List[Dict[str, Any]] = []
         self._last_tool_calls: List[Any] = []
         self._last_agentic_events: List[Dict[str, Any]] = []
+        self._last_model_transcript: List[Dict[str, Any]] = []
+        self._last_usage: Dict[str, Any] = {}
+        self._last_tool_loop_messages: List[Dict[str, Any]] = []
         self._current_llm_mode = "fast"
         self.system_prompt = self._build_system_prompt()
 
@@ -372,14 +389,69 @@ class OpenAICompatibleLocalClient:
         return self.session_metadata.copy() if self.session_metadata else {}
 
     def get_generation_metadata(self) -> Dict[str, Any]:
-        if not self._last_generation_metrics:
-            return {}
-        return {"generation_metrics": dict(self._last_generation_metrics)}
+        metadata: Dict[str, Any] = {}
+        if self._last_generation_metrics:
+            metadata["generation_metrics"] = dict(self._last_generation_metrics)
+        if self._last_context_snapshots:
+            latest = dict(self._last_context_snapshots[-1])
+            latest["requests"] = [dict(item) for item in self._last_context_snapshots[-8:]]
+            metadata["context_snapshot"] = latest
+        if self._last_model_transcript:
+            metadata["model_transcript"] = [dict(item) for item in self._last_model_transcript]
+        metadata["cache_usage"] = dict(self._last_usage)
+        metadata["cache_diagnostics"] = {
+            "provider": "openai_compatible_local",
+            "model": self.model_name,
+            "server_profile": self.server_profile.get("name"),
+            "cache_mode": self.server_profile.get("cache_mode"),
+            "cache_supported": self.server_profile.get("cache_supported"),
+            "cache_active": self._last_usage.get("cache_active"),
+            "cache_configured": self.server_profile.get("cache_supported") is True,
+            "metrics_source": self.server_profile.get("metrics_source"),
+            "cache_key": getattr(self, "_cache_key", None),
+        }
+        return metadata
+
+    def _capture_context_request(self, api_kwargs: Dict[str, Any], *, reason: str) -> None:
+        budget = self._current_context_budget
+        rendered_bundle, bundle_parts = context_bundle_components(self._current_context_bundle)
+        parts = [
+            *message_components(without_text(api_kwargs.get("messages", []), rendered_bundle)),
+            *bundle_parts,
+            *tool_components(api_kwargs.get("tools", []), source="chat.completions tools payload"),
+        ]
+        active_names = {
+            str(((item.get("function") or {}).get("name") or ""))
+            for item in api_kwargs.get("tools", []) if isinstance(item, dict)
+        }
+        for tool_def in self._tool_registry.get_all():
+            name = str(getattr(tool_def, "name", "") or "")
+            if name and name not in active_names:
+                parts.append(component(
+                    "native_tool_schemas", "Native tool schemas", source="runtime tool registry",
+                    status="deferred", tokens=0, preview=f"{name}（未送信）",
+                ))
+        item = snapshot(
+            provider="openai_compatible_local",
+            model=self.model_name,
+            components=parts,
+            context_window_tokens=budget.context_window_tokens if budget else None,
+            response_tokens=int(api_kwargs.get("max_tokens") or (budget.response_tokens if budget else 0)),
+            request_index=len(self._last_context_snapshots),
+            request_kind=reason,
+            window_source=budget.source if budget else None,
+        )
+        self._last_context_snapshots.append(item)
+        self._last_context_snapshots = self._last_context_snapshots[-8:]
 
     def _capture_generation_metrics(self, response: Any) -> None:
         payload = _as_plain_dict(response)
         timings = _as_plain_dict(payload.get("timings"))
         usage = _as_plain_dict(payload.get("usage"))
+        normalized_usage = normalize_usage(usage, provider="openai_compatible_local")
+        self._last_usage = {
+            key: value for key, value in normalized_usage.items() if value is not None
+        }
 
         tokens_per_second = _as_finite_float(
             _first_present(
@@ -426,6 +498,10 @@ class OpenAICompatibleLocalClient:
         if prompt_ms is not None:
             metrics["prompt_ms"] = round(prompt_ms, 3)
         self._last_generation_metrics = metrics
+        if prompt_tokens is not None and self._last_context_snapshots:
+            self._last_context_snapshots[-1] = reconcile_snapshot(
+                self._last_context_snapshots[-1], prompt_tokens
+            )
 
     def _build_system_prompt(self) -> str:
         if not self.config:
@@ -527,39 +603,31 @@ class OpenAICompatibleLocalClient:
         user_input: str,
         context_budget: ContextBudget,
     ) -> List[Dict[str, str]]:
-        system_prompt = "\n\n".join(
-            [
-                self._system_prompt_for_budget(context_budget),
-                _current_date_context(),
-            ]
-        )
-        messages = [
-            {
-                "role": "system",
-                "content": system_prompt,
-            }
-        ]
+        system_prompt = self._system_prompt_for_budget(context_budget)
         context_window = self.history_manager.context_window_size
         history_limit = min(context_window * 2, context_budget.history_messages)
-        for msg in self.history_manager.get_all()[-history_limit:]:
-            messages.append(
-                {
-                    "role": msg["role"],
-                    "content": clip_text(
-                        str(msg["content"]),
-                        context_budget.history_message_chars,
-                    ),
-                }
-            )
-        messages.append(
+        history = self.history_manager.get_model_messages()[-history_limit:]
+        messages = [
+            {"role": "system", "content": system_prompt},
+            *build_prompt_messages(
+                history,
+                summary=self.history_manager.summary,
+                current_user_input=clip_text_preserve_tail(
+                    user_input, context_budget.message_budget_chars
+                ),
+            ),
+        ]
+        messages = [
             {
-                "role": "user",
-                "content": clip_text_preserve_tail(
-                    user_input,
-                    context_budget.message_budget_chars,
+                **message,
+                "content": (
+                    clip_text(str(message.get("content") or ""), context_budget.history_message_chars)
+                    if message.get("role") != "user" or message is not messages[-1]
+                    else message.get("content")
                 ),
             }
-        )
+            for message in messages
+        ]
         return self._fit_messages_to_context_budget(messages, context_budget)
 
     def _fit_messages_to_context_budget(
@@ -629,7 +697,10 @@ class OpenAICompatibleLocalClient:
                 block.strip() for block in blocks if block and block.strip()
             )
             return clip_text(compact, min(1400, context_budget.context_bundle_chars))
-        return context_bundle.render_for_prompt(context_budget.context_bundle_chars)
+        bundle = context_bundle
+        if self.history_manager.summary and getattr(bundle, "session_context_block", ""):
+            bundle = dataclasses.replace(bundle, session_context_block="")
+        return bundle.render_for_prompt(context_budget.context_bundle_chars)
 
     def _build_model_messages_for_budget(
         self,
@@ -649,17 +720,41 @@ class OpenAICompatibleLocalClient:
         self._current_tool_hint_context = tool_hint_context
         model_user_input = compose_tool_hint_user_message(
             user_input,
-            tool_hint_context,
+            "",
         )
         context_block = self._context_block_for_budget(
             self._current_context_bundle,
             context_budget,
             has_tool_hints=bool(tool_hint_context),
         )
+        dynamic_context: list[tuple[str, str]] = []
         if context_block:
-            model_user_input = f"{context_block}\n\n{model_user_input}"
+            dynamic_context.append(("Current context bundle", context_block))
+        if tool_hint_context:
+            dynamic_context.append(("Current tool hints", tool_hint_context))
+        model_messages = build_prompt_messages(
+            self.history_manager.get_model_messages()[-context_budget.history_messages :],
+            summary=self.history_manager.summary,
+            current_user_input=clip_text_preserve_tail(
+                model_user_input, context_budget.message_budget_chars
+            ),
+            dynamic_context=dynamic_context,
+        )
+        # Keep the stable system prefix independent from the current date and
+        # current-turn retrieval/tool hints.
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    self._system_prompt_for_budget(context_budget)
+                    + "\n\n"
+                    + _current_date_context()
+                ),
+            },
+            *model_messages,
+        ]
         return (
-            self._build_messages(model_user_input, context_budget),
+            self._fit_messages_to_context_budget(messages, context_budget),
             tool_hint_context,
         )
 
@@ -930,6 +1025,10 @@ class OpenAICompatibleLocalClient:
         if self.enable_response_format:
             api_kwargs["response_format"] = {"type": "json_object"}
         extra_body: Dict[str, Any] = {}
+        if self.server_profile.get("name") != "auto":
+            profile_body = self.server_profile.get("request_extra_body")
+            if isinstance(profile_body, dict) and profile_body:
+                extra_body = _deep_merge_dict(extra_body, profile_body)
         if self.enable_extra_body and self.extra_body:
             extra_body = _deep_merge_dict(extra_body, self.extra_body)
         mode_extra_body = self._mode_extra_body()
@@ -937,6 +1036,19 @@ class OpenAICompatibleLocalClient:
             extra_body = _deep_merge_dict(extra_body, mode_extra_body)
         if extra_body:
             api_kwargs["extra_body"] = extra_body
+        self._cache_key = stable_cache_key(
+            user_id=self._get_session_user_id(),
+            session_id=getattr(self, "current_session_id", None),
+            project_id=self.current_project_id,
+            character=self.character_name,
+            model=self.model_name,
+            system_prompt=self.system_prompt,
+            tool_schemas=api_kwargs.get("tools", []),
+            provider="openai_compatible_local",
+            branch_fingerprint=str(getattr(self, "current_edit_message_id", None) or "default-branch"),
+            summary_version=int(getattr(self.history_manager, "summary_version", 0) or 0),
+            server_instance=str(self.session_metadata.get("server_instance") or "default-instance"),
+        )
         return api_kwargs
 
     def _chat_completion_tools(
@@ -1100,6 +1212,7 @@ class OpenAICompatibleLocalClient:
 
     def _create_completion_with_fallback(self, api_kwargs: Dict[str, Any]) -> Any:
         try:
+            self._capture_context_request(api_kwargs, reason="chat.completions")
             return self.client.chat.completions.create(**api_kwargs)
         except Exception as exc:
             if _is_context_overflow_error(exc) and "tools" in api_kwargs:
@@ -1110,6 +1223,7 @@ class OpenAICompatibleLocalClient:
                     "[OpenAICompatibleLocalClient] Context overflow with native tools; retrying without tools: %s",
                     exc,
                 )
+                self._capture_context_request(retry_kwargs, reason="context_overflow_retry")
                 return self.client.chat.completions.create(**retry_kwargs)
             if _is_local_model_loading_error(exc) or _is_context_overflow_error(exc):
                 raise
@@ -1121,6 +1235,7 @@ class OpenAICompatibleLocalClient:
                 ", ".join(removed),
                 exc,
             )
+            self._capture_context_request(retry_kwargs, reason="compatibility_retry")
             return self.client.chat.completions.create(**retry_kwargs)
 
     def _message_content(self, message: Any) -> str:
@@ -1128,6 +1243,24 @@ class OpenAICompatibleLocalClient:
         if not isinstance(content, str):
             return ""
         return _strip_leading_think_markup(content)
+
+    def _record_model_transcript(
+        self,
+        messages: List[Dict[str, Any]],
+        response_text: str,
+    ) -> None:
+        source_messages = self._last_tool_loop_messages or messages
+        self._last_model_transcript = [
+            dict(message)
+            for message in source_messages
+            if message.get("role") in {"user", "assistant", "tool"}
+        ]
+        if response_text:
+            self._last_model_transcript.append(
+                {"role": "assistant", "content": response_text}
+            )
+        if hasattr(self.history_manager, "set_model_messages"):
+            self.history_manager.set_model_messages(self._last_model_transcript)
 
     def _chat_template_thinking_value(self, api_kwargs: Dict[str, Any]) -> Any:
         extra_body = api_kwargs.get("extra_body")
@@ -1294,7 +1427,7 @@ class OpenAICompatibleLocalClient:
         self._capture_generation_metrics(response)
         choice = response.choices[0]
         if getattr(choice.message, "tool_calls", None):
-            return self._handle_tool_calls(
+            result = self._handle_tool_calls(
                 messages,
                 choice.message,
                 api_kwargs,
@@ -1303,9 +1436,11 @@ class OpenAICompatibleLocalClient:
                 max_tokens=max_tokens,
                 fallback_user_input=fallback_user_input,
             )
+            self._record_model_transcript(messages, result)
+            return result
         content = self._message_content(choice.message)
         if fallback_user_input and project_progress_review_active(fallback_user_input):
-            return self._handle_tool_calls(
+            result = self._handle_tool_calls(
                 messages,
                 choice.message,
                 api_kwargs,
@@ -1314,6 +1449,8 @@ class OpenAICompatibleLocalClient:
                 max_tokens=max_tokens,
                 fallback_user_input=fallback_user_input,
             )
+            self._record_model_transcript(messages, result)
+            return result
         if required_tool_name:
             logger.warning(
                 "[OpenAICompatibleLocalClient] required tool %s was not called",
@@ -1324,7 +1461,9 @@ class OpenAICompatibleLocalClient:
                 f"必須ツール `{required_tool_name}` が実行されませんでした。"
             )
         if content:
-            return guard_tool_execution_claims(content, [])
+            result = guard_tool_execution_claims(content, [])
+            self._record_model_transcript(messages, result)
+            return result
         logger.warning(
             "[OpenAICompatibleLocalClient] local model returned empty content"
         )
@@ -1358,6 +1497,7 @@ class OpenAICompatibleLocalClient:
         stream_kwargs.pop("tool_choice", None)
         stream_kwargs.pop("response_format", None)
         stream_kwargs = self._with_stream_safe_extra_body(stream_kwargs)
+        self._capture_context_request(stream_kwargs, reason="stream")
         stream = self.client.chat.completions.create(**stream_kwargs)
         for chunk in stream:
             if chunk.choices and chunk.choices[0].delta.content:
@@ -1399,6 +1539,9 @@ class OpenAICompatibleLocalClient:
             ),
         )
         self._last_tool_calls.extend(result.tool_calls)
+        self._last_tool_loop_messages = [
+            dict(message) for message in getattr(result, "messages", [])
+        ]
         if result.final_output:
             return guard_tool_execution_claims(result.final_output, result.tool_calls)
         logger.warning(
@@ -1460,8 +1603,12 @@ class OpenAICompatibleLocalClient:
         stream_callback: Any = None,
     ) -> Union[str, Generator[str, None, None]]:
         self._last_generation_metrics = None
+        self._last_context_snapshots = []
         self._last_tool_calls = []
         self._last_agentic_events = []
+        self._last_model_transcript = []
+        self._last_usage = {}
+        self._last_tool_loop_messages = []
         project_token = None
         specialist_provider_token = set_runtime_specialist_provider(
             "openai_compatible_local"
@@ -1520,6 +1667,13 @@ class OpenAICompatibleLocalClient:
                 user_input=user_input,
                 initial_response=response_text,
                 event_callback=_agentic_event_callback,
+            )
+            self._record_model_transcript(messages, response_text)
+            persist_usage_sync(
+                self,
+                provider="openai_compatible_local",
+                model=self.model_name,
+                usage=self._last_usage,
             )
             self.history_manager.add_message("user", user_input)
             self.history_manager.add_message("assistant", response_text)
@@ -1643,6 +1797,14 @@ class OpenAICompatibleLocalClient:
                 )
             yield full_response
         finally:
+            self._record_model_transcript(messages, full_response)
+            persist_usage_sync(
+                self,
+                provider="openai_compatible_local",
+                model=self.model_name,
+                usage=self._last_usage,
+                is_streaming=True,
+            )
             self.history_manager.add_message("user", user_input)
             self.history_manager.add_message("assistant", full_response)
 

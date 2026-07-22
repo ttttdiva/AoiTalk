@@ -228,6 +228,24 @@ export const usageApi = {
     return data.by_agent ?? [];
   },
 
+  getByUser: async (start: string, end: string) => {
+    const params = new URLSearchParams({ start, end });
+    const data = await get<{
+      success: boolean;
+      by_user: Array<{
+        user_id: string;
+        user_name: string;
+        total_input: number;
+        total_output: number;
+        total_cached: number;
+        total_cost: number;
+        total_tokens: number;
+        request_count: number;
+      }>;
+    }>(`/usage/by-user?${params}`);
+    return data.by_user ?? [];
+  },
+
   getTotal: async (start: string, end: string) => {
     const params = new URLSearchParams({ start, end });
     const data = await get<{

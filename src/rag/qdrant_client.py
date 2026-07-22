@@ -6,6 +6,8 @@ Supports two modes:
 2. Local mode: Use local file storage (no server required, like SQLite)
 """
 
+import asyncio
+import contextlib
 import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -23,6 +25,11 @@ from .config import QdrantConfig
 from ..security.field_crypto import decrypt_text_if_needed, encrypt_text
 
 logger = logging.getLogger(__name__)
+
+# ローカル(embedded)モードは local_path ごとに単一の QdrantLocal クライアントを
+# 共有する(SharedQdrantClient)。QdrantLocal はスレッド安全でないため、
+# to_thread 経由の並行クエリを直列化する。server モードでは不要。
+_LOCAL_QUERY_LOCK = asyncio.Lock()
 
 
 class SharedQdrantClient:
@@ -286,13 +293,25 @@ class QdrantManager:
                     )
                 query_filter = models.Filter(must=must_conditions)
             
-            results = self.client.search(
-                collection_name=self.config.collection_name,
-                query_vector=query_embedding,
-                limit=top_k,
-                query_filter=query_filter
+            # qdrant-client 1.12+ で旧 `search` は削除されたため query_points を使う。
+            # query_points はブロッキング呼び出しなので event loop を塞がないよう別スレッドへ回す。
+            # ローカルモードのみ、共有クライアントへの並行アクセスをロックで直列化する。
+            query_guard = (
+                _LOCAL_QUERY_LOCK
+                if self.config.local_path
+                else contextlib.nullcontext()
             )
-            
+            async with query_guard:
+                response = await asyncio.to_thread(
+                    self.client.query_points,
+                    collection_name=self.config.collection_name,
+                    query=query_embedding,
+                    limit=top_k,
+                    query_filter=query_filter,
+                    with_payload=True,
+                )
+            results = response.points
+
             search_results = []
             for hit in results:
                 doc_id = hit.payload.get("doc_id", str(hit.id))

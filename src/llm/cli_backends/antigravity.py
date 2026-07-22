@@ -197,6 +197,36 @@ class AntigravityCLIBackend(CLIBackendBase):
             logger.warning("[Antigravity CLI] Image preparation failed: %s", exc)
             return None
 
+    def prepare_audio_attachment(
+        self, audio_data: Dict[str, Any], cwd: Optional[Path] = None
+    ) -> Optional[Tuple[str, Callable[[], None]]]:
+        """Save audio as a temporary file so Antigravity can inspect it by path."""
+        data_url = str(audio_data.get("data") or audio_data.get("dataUrl") or "")
+        if not data_url:
+            return None
+        try:
+            header, encoded = data_url.split(",", 1) if data_url.startswith("data:") else ("", data_url)
+            mime_type = str(audio_data.get("mimeType") or header.split(";", 1)[0].removeprefix("data:") or "audio/wav")
+            suffix = {
+                "audio/wav": ".wav", "audio/mpeg": ".mp3", "audio/mp4": ".m4a",
+                "audio/ogg": ".ogg", "audio/webm": ".webm",
+            }.get(mime_type, ".audio")
+            tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir=str(self._temp_dir(cwd)))
+            tmp.write(base64.b64decode(encoded))
+            tmp.close()
+            path = Path(tmp.name)
+
+            def cleanup() -> None:
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception as exc:
+                    logger.warning("[Antigravity CLI] Failed to remove temp audio file: %s", exc)
+
+            return (f"\n\nAttached audio file: {path}", cleanup)
+        except Exception as exc:
+            logger.warning("[Antigravity CLI] Audio preparation failed: %s", exc)
+            return None
+
     def get_mcp_args(self, mcp_servers: Dict[str, Any]) -> List[str]:
         """Antigravity CLI does not support runtime MCP arguments."""
         if mcp_servers:

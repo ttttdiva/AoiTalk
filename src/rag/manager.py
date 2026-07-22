@@ -60,8 +60,10 @@ class RagManager:
         if self._initialized:
             return True
         
-        if not self.config.enabled:
-            logger.info("RAG is disabled in configuration")
+        from ..knowledge.index_service import _knowledge_search_enabled
+
+        if not _knowledge_search_enabled():
+            logger.info("Knowledge RAG is disabled (search.knowledge_enabled is off)")
             return False
         
         try:

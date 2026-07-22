@@ -42,6 +42,8 @@ export function formatUpdatedAt(value: string | null): string {
 }
 
 export function docsFieldType(field: DocsField | FieldDraft): DocsFieldType {
+  if (field.field_type === "select" || field.field_type === "multi_select") return "options";
+  if (field.field_type === "project_ref") return "reference";
   return DOCS_FIELD_TYPES.includes(field.field_type as DocsFieldType)
     ? (field.field_type as DocsFieldType)
     : "text";
@@ -66,7 +68,7 @@ export function fieldValueToDraft(value: DocsFieldValue | undefined): string {
   if (value.value_text) return formatStructuredDraft(value.value_text);
   if (value.target_node_id) return value.target_node_id;
   if (value.value_number !== null && value.value_number !== undefined) return String(value.value_number);
-  if (value.value_datetime) return value.value_datetime.slice(0, 16);
+  if (value.value_datetime) return value.value_datetime.slice(0, 10);
   if (value.value_json !== null && value.value_json !== undefined) {
     if (
       typeof value.value_json === "object" &&
@@ -81,6 +83,67 @@ export function fieldValueToDraft(value: DocsFieldValue | undefined): string {
       : formatStructuredValue(value.value_json);
   }
   return "";
+}
+
+export function resolveReferenceLabel(
+  value: string,
+  nodes: DocsNode[],
+  projects: DocsProject[],
+) {
+  const id = value.trim();
+  if (!id) return "";
+  const node = nodes.find((item) => item.id === id);
+  if (node) return node.title || node.body_text.slice(0, 60);
+  const project = projects.find((item) => item.id === id);
+  return project?.name ?? "";
+}
+
+export function referenceOptions(
+  nodes: DocsNode[],
+  projects: DocsProject[],
+  currentNodeId?: string,
+) {
+  return [
+    ...projects.map((project) => ({
+      id: `project:${project.id}`,
+      value: project.id,
+      label: project.name,
+    })),
+    ...nodes
+      .filter((node) => node.id !== currentNodeId)
+      .slice(0, 300)
+      .map((node) => ({
+        id: `node:${node.id}`,
+        value: node.id,
+        label: node.title || node.body_text.slice(0, 60),
+      })),
+  ].filter((option) => option.label.trim());
+}
+
+export function formatFieldSummaryValue(
+  field: DocsField,
+  value: DocsFieldValue | undefined,
+  nodes: DocsNode[],
+  projects: DocsProject[],
+) {
+  const draft = fieldValueToDraft(value).trim();
+  if (!draft) return "";
+  const fieldType = docsFieldType(field);
+  const isProjectReference =
+    field.field_type === "project_ref" ||
+    field.name.toLowerCase() === "project" ||
+    field.system_key === "project" ||
+    field.system_key?.endsWith("_project") === true;
+  // 参照系フィールドは UUID を生表示せず、参照先ノード/プロジェクト名に解決する。
+  // field_type の分類漏れ（node_ref 等）に備え、target_node_id があれば常に解決する。
+  if (fieldType === "reference" || isProjectReference || value?.target_node_id) {
+    return resolveReferenceLabel(value?.target_node_id ?? draft, nodes, projects);
+  }
+  if (fieldType === "date" && /^\d{4}-\d{2}-\d{2}/.test(draft)) {
+    const [, month = "", day = ""] = draft.match(/^\d{4}-(\d{2})-(\d{2})/) ?? [];
+    return month && day ? `${Number(month)}/${Number(day)}` : draft;
+  }
+  return draft.length > 32 ? `${draft.slice(0, 31)}...` : draft;
 }
 
 export function fieldDraftToPayload(field: DocsField, rawDraft: string): unknown {
@@ -293,6 +356,7 @@ export function mergeDocsState(current: DocsState, patch: Partial<DocsState>): D
     supertag_fields: patch.supertag_fields ?? current.supertag_fields,
     placements: patch.placements ?? current.placements,
     field_values: patch.field_values ?? current.field_values,
+    attachments: patch.attachments ?? current.attachments,
     views: patch.views ?? current.views,
     ai_suggestions: patch.ai_suggestions ?? current.ai_suggestions,
     projects: patch.projects ?? current.projects,

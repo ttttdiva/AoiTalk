@@ -65,6 +65,9 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { formatBytes } from "@/lib/utils";
+import { useConfirm } from "@/hooks/use-confirm";
+import { useProjectsData } from "@/hooks/use-projects-data";
 
 async function apiFetch<T = unknown>(
   path: string,
@@ -209,18 +212,6 @@ function folderFromPath(filePath: string): string {
   const parts = normalized.split("/").filter(Boolean);
   parts.pop();
   return parts.join("/") || "プロジェクトファイラー直下";
-}
-
-function formatFileSize(size: number): string {
-  if (!Number.isFinite(size) || size <= 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB"];
-  let value = size;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
 }
 
 function acceptMatchesPath(filePath: string, accept?: string): boolean {
@@ -420,13 +411,20 @@ interface ProjectInfo {
   slug: string;
   aliases?: string[];
   color?: string | null;
-  metadata?: Record<string, unknown>;
+  metadata?: Record<string, unknown> & {
+    workspace_tools_enabled?: boolean;
+    isInboxDefault?: boolean;
+  };
   owner_id?: string;
   estimated_hours?: number | null;
   space_id?: string | null;
   is_completed?: boolean;
   created_at?: string | null;
 }
+
+// SWR データ未取得時に返す安定参照（再レンダー抑制用）。
+const EMPTY_SPACES: SpaceInfo[] = [];
+const EMPTY_PROJECTS: ProjectInfo[] = [];
 
 interface ProjectMember {
   id: string;
@@ -504,10 +502,16 @@ type WbsScanResponse = {
 };
 
 export default function ProjectsPage() {
+  const confirm = useConfirm();
   const { refreshProjects, refreshSpaces } = useProject();
 
-  // スペース一覧
-  const [spaces, setSpaces] = useState<SpaceInfo[]>([]);
+  // スペース一覧・プロジェクト一覧（取得は SWR に委譲）
+  const {
+    spaces: spacesData,
+    projects: projectsData,
+    refresh: refreshProjectsData,
+  } = useProjectsData<SpaceInfo, ProjectInfo>();
+  const spaces = spacesData ?? EMPTY_SPACES;
   const [expandedSpaces, setExpandedSpaces] = useState<Set<string>>(new Set());
   const [expandedClosedSpaces, setExpandedClosedSpaces] = useState<Set<string>>(
     new Set(),
@@ -515,7 +519,7 @@ export default function ProjectsPage() {
   const [isNavigationCollapsed, setIsNavigationCollapsed] = useState(false);
 
   // プロジェクト一覧
-  const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const projects = projectsData ?? EMPTY_PROJECTS;
   const [loading, setLoading] = useState(true);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(
     null,
@@ -555,6 +559,8 @@ export default function ProjectsPage() {
   const [editAliases, setEditAliases] = useState("");
   const [editColor, setEditColor] = useState("#3b82f6");
   const [editSpaceIdField, setEditSpaceIdField] = useState<string>("");
+  const [editWorkspaceToolsEnabled, setEditWorkspaceToolsEnabled] =
+    useState(false);
   const [saving, setSaving] = useState(false);
 
   // 管理資料設定
@@ -593,22 +599,19 @@ export default function ProjectsPage() {
   const [addingMembers, setAddingMembers] = useState(false);
   const [addError, setAddError] = useState("");
 
-  // データ取得
+  // データ取得（取得自体は SWR に委譲し、選択復元・展開などの副作用はここで実行）
   const fetchAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [spacesData, projectsData] = await Promise.all([
-        apiFetch<{ spaces: SpaceInfo[] }>("/api/spaces"),
-        apiFetch<{ projects: ProjectInfo[] }>("/api/projects"),
-      ]);
-      setSpaces(spacesData.spaces);
-      setProjects(projectsData.projects);
-      const activeProjects = projectsData.projects.filter(
+      const result = await refreshProjectsData();
+      const spacesList = result?.spaces ?? EMPTY_SPACES;
+      const projectsList = result?.projects ?? EMPTY_PROJECTS;
+      const activeProjects = projectsList.filter(
         (project) => !project.is_completed,
       );
 
       // 全スペースを展開
-      setExpandedSpaces(new Set(spacesData.spaces.map((s) => s.id)));
+      setExpandedSpaces(new Set(spacesList.map((s) => s.id)));
 
       const savedScope = localStorage.getItem("projectsPageSelectedScope");
       const savedProject = localStorage.getItem("projectsPageSelected");
@@ -622,33 +625,33 @@ export default function ProjectsPage() {
       }
       if (
         parsedScope?.type === "space" &&
-        spacesData.spaces.some((s) => s.id === parsedScope.id)
+        spacesList.some((s) => s.id === parsedScope.id)
       ) {
         setSelectedScope(parsedScope);
       } else if (
         parsedScope?.type === "project" &&
-        projectsData.projects.some((p) => p.id === parsedScope.id)
+        projectsList.some((p) => p.id === parsedScope.id)
       ) {
         setSelectedProjectId(parsedScope.id);
         setSelectedScope(parsedScope);
       } else if (
         savedProject &&
-        projectsData.projects.some((p) => p.id === savedProject)
+        projectsList.some((p) => p.id === savedProject)
       ) {
         setSelectedProjectId(savedProject);
         setSelectedScope({ type: "project", id: savedProject });
       } else if (activeProjects.length > 0) {
         setSelectedProjectId(activeProjects[0].id);
         setSelectedScope({ type: "project", id: activeProjects[0].id });
-      } else if (spacesData.spaces.length > 0) {
-        setSelectedScope({ type: "space", id: spacesData.spaces[0].id });
+      } else if (spacesList.length > 0) {
+        setSelectedScope({ type: "space", id: spacesList[0].id });
       }
     } catch (err) {
       console.error("データ取得失敗:", err);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [refreshProjectsData]);
 
   const fetchUsers = useCallback(async () => {
     try {
@@ -951,9 +954,10 @@ export default function ProjectsPage() {
   const handleDeleteSpace = useCallback(
     async (id: string) => {
       if (
-        !window.confirm(
-          "このスペースと配下のプロジェクトを削除しますか？",
-        )
+        !(await confirm({
+          description: "このスペースと配下のプロジェクトを削除しますか？",
+          destructive: true,
+        }))
       )
         return;
       try {
@@ -964,7 +968,7 @@ export default function ProjectsPage() {
         console.error("スペース削除失敗:", err);
       }
     },
-    [fetchAll, refreshSpaces],
+    [fetchAll, refreshSpaces, confirm],
   );
 
   // === プロジェクト操作 ===
@@ -1033,6 +1037,9 @@ export default function ProjectsPage() {
           color: editColor || null,
           estimated_hours: editEstHours ? parseFloat(editEstHours) : null,
           space_id: editSpaceIdField || null,
+          metadata: {
+            workspace_tools_enabled: editWorkspaceToolsEnabled,
+          },
         }),
       });
       setEditingId(null);
@@ -1051,13 +1058,20 @@ export default function ProjectsPage() {
     editColor,
     editEstHours,
     editSpaceIdField,
+    editWorkspaceToolsEnabled,
     fetchAll,
     refreshProjects,
   ]);
 
   const handleDelete = useCallback(
     async (id: string) => {
-      if (!window.confirm("このプロジェクトを削除しますか？")) return;
+      if (
+        !(await confirm({
+          description: "このプロジェクトを削除しますか？",
+          destructive: true,
+        }))
+      )
+        return;
       try {
         await apiFetch(`/api/projects/${id}`, { method: "DELETE" });
         if (selectedProjectId === id) {
@@ -1071,7 +1085,7 @@ export default function ProjectsPage() {
         console.error("プロジェクト削除失敗:", err);
       }
     },
-    [selectedProjectId, fetchAll, refreshProjects],
+    [selectedProjectId, fetchAll, refreshProjects, confirm],
   );
 
   // === メンバー操作 ===
@@ -1100,7 +1114,12 @@ export default function ProjectsPage() {
   const handleRemoveMember = useCallback(
     async (memberId: string, displayName: string) => {
       if (!selectedProjectId) return;
-      if (!window.confirm(`${displayName} をプロジェクトから除外しますか？`))
+      if (
+        !(await confirm({
+          description: `${displayName} をプロジェクトから除外しますか？`,
+          destructive: true,
+        }))
+      )
         return;
       try {
         await apiFetch(`/api/projects/${selectedProjectId}/members`, {
@@ -1112,7 +1131,7 @@ export default function ProjectsPage() {
         console.error("メンバー除外失敗:", err);
       }
     },
-    [selectedProjectId, fetchMembers],
+    [selectedProjectId, fetchMembers, confirm],
   );
 
   const handleChangeRole = useCallback(
@@ -1188,6 +1207,8 @@ export default function ProjectsPage() {
     selectedScope?.type === "space"
       ? spaces.find((s) => s.id === selectedScope.id)
       : undefined;
+  const selectedProjectIsInbox = selectedProject?.metadata?.isInboxDefault === true
+    || selectedProject?.slug === `inbox-project-${selectedProject?.owner_id ?? ""}`;
 
   // スペースごとにプロジェクトをグループ化（space_idの無いレガシーレコードは表示しない）
   const activeProjectsBySpace = new Map<string, ProjectInfo[]>();
@@ -1268,6 +1289,24 @@ export default function ProjectsPage() {
               </option>
             ))}
           </select>
+          <label className="flex cursor-pointer items-start gap-2 rounded border border-amber-500/30 bg-amber-500/5 p-2">
+            <Checkbox
+              checked={editWorkspaceToolsEnabled}
+              onCheckedChange={(checked) =>
+                setEditWorkspaceToolsEnabled(checked === true)
+              }
+              aria-label="Workspaceツールを有効にする"
+              className="mt-0.5"
+            />
+            <span className="min-w-0">
+              <span className="block text-xs font-medium">
+                Workspaceツールを有効にする
+              </span>
+              <span className="mt-0.5 block text-[11px] leading-relaxed text-muted-foreground">
+                tools/ 配下のプログラムをエージェントが実行できるようにします。信頼できるツールだけを配置してください。
+              </span>
+            </span>
+          </label>
           <div className="flex gap-1">
             <Button
               size="sm"
@@ -1359,6 +1398,9 @@ export default function ProjectsPage() {
                       : "",
                   );
                   setEditSpaceIdField(project.space_id || "");
+                  setEditWorkspaceToolsEnabled(
+                    project.metadata?.workspace_tools_enabled === true,
+                  );
                 }}
               >
                 <Pencil className="size-3" />
@@ -1778,7 +1820,7 @@ export default function ProjectsPage() {
                   <LayoutDashboard className="size-3.5" />
                   ダッシュボード
                 </button>
-                {selectedProject && (
+                {selectedProject && !selectedProjectIsInbox && (
                   <button
                     className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium border-b-2 transition-colors ${
                       rightTab === "information"
@@ -1817,7 +1859,7 @@ export default function ProjectsPage() {
                     タグ
                   </button>
                 )}
-                {selectedProject && (
+                {selectedProject && !selectedProjectIsInbox && (
                   <Link
                     href={`/docs?project_id=${encodeURIComponent(selectedProject.id)}`}
                     className="ml-auto flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
@@ -1833,7 +1875,7 @@ export default function ProjectsPage() {
                 <div className="flex-1 overflow-auto">
                   <ProjectDashboard scope={selectedScope} />
                 </div>
-              ) : rightTab === "information" && selectedProject ? (
+              ) : rightTab === "information" && selectedProject && !selectedProjectIsInbox ? (
                 <div className="flex-1 overflow-auto">
                   <ProjectInformationPanel project={selectedProject} />
                 </div>
@@ -2069,7 +2111,7 @@ export default function ProjectsPage() {
                                       </span>
                                     </span>
                                     <span className="shrink-0 text-[11px] text-muted-foreground">
-                                      {formatFileSize(file.size)}
+                                      {formatBytes(file.size)}
                                     </span>
                                   </button>
                                 ))}

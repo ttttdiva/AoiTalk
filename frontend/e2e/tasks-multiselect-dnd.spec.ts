@@ -286,7 +286,7 @@ test.describe("タスク一覧の複数選択D&D", () => {
     const menu = page.locator('[data-slot="dropdown-menu-content"]').first();
     await expect(menu).toBeVisible();
 
-    await page.keyboard.press("S");
+    await menu.press("S");
 
     await expect.poll(() => statusUpdates.at(-1)).toBe("in_progress");
     await expect(menu).toBeHidden();
@@ -305,7 +305,7 @@ test.describe("タスク一覧の複数選択D&D", () => {
       .first();
     await expect(openStatusMenu).toBeVisible();
 
-    await page.keyboard.press("O");
+    await openStatusMenu.press("O");
 
     await expect.poll(() => statusUpdates.at(-1)).toBe("open");
     await expect(openStatusMenu).toBeHidden();
@@ -325,7 +325,7 @@ test.describe("タスク一覧の複数選択D&D", () => {
     await expect(sameStatusMenu).toBeVisible();
 
     const updateCount = statusUpdates.length;
-    await page.keyboard.press("O");
+    await sameStatusMenu.press("O");
 
     await expect.poll(() => statusUpdates.length).toBe(updateCount);
     await expect(sameStatusMenu).toBeHidden();
@@ -334,6 +334,9 @@ test.describe("タスク一覧の複数選択D&D", () => {
         page.evaluate(() => document.activeElement?.getAttribute("data-testid")),
       )
       .toBe("task-row-task-a");
+
+    await page.keyboard.press("S");
+    await expect.poll(() => statusUpdates.length).toBe(updateCount);
   });
 
   test("closes the sidebar status menu after a status shortcut", async ({
@@ -431,7 +434,7 @@ test.describe("タスク一覧の複数選択D&D", () => {
     const menu = page.locator('[data-slot="dropdown-menu-content"]').first();
     await expect(menu).toBeVisible();
 
-    await page.keyboard.press("S");
+    await menu.press("S");
 
     await expect.poll(() => statusUpdates.at(-1)).toBe("in_progress");
     await expect(menu).toBeHidden();

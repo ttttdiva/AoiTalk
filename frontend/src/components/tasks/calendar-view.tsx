@@ -26,6 +26,9 @@ import {
   type Task,
   type TaskOccurrence,
 } from "@/lib/task-api";
+import { listRemoteTaskOccurrences } from "@/lib/remote-servers";
+import { listRemoteTasks, toRemoteTask } from "@/lib/remote-tasks";
+import { decorateRemoteOccurrence } from "@/lib/remote-resource";
 import {
   getTaskNotificationsDefaultEnabled,
   getUserSettings,
@@ -41,9 +44,11 @@ import {
 import { useProject } from "@/contexts/project-context";
 import { useTheme } from "@/contexts/theme-context";
 import { parseLocalDateTime } from "@/lib/date-time";
-import { resolveProjectColorTokens } from "@/lib/project-colors";
+import {
+  fallbackColorFromId,
+  resolveProjectColorTokens,
+} from "@/lib/project-colors";
 import { isClosedTaskStatus } from "@/lib/task-status";
-import { useRemoteTasks } from "@/components/tasks/hooks/use-remote-tasks";
 import {
   RemoteTaskDialog,
   type RemoteTaskDialogTarget,
@@ -215,8 +220,6 @@ export default function CalendarView() {
   const [prefsLoaded, setPrefsLoaded] = useState(false);
   const contextMenu = useTaskContextMenu();
   const lastKeyboardNavigationRef = useRef(0);
-  const { remoteTasks, profiles: remoteProfiles, reload: reloadRemoteTasks } =
-    useRemoteTasks();
   const [remoteDialogTarget, setRemoteDialogTarget] =
     useState<RemoteTaskDialogTarget | null>(null);
 
@@ -380,27 +383,73 @@ export default function CalendarView() {
       fetchGenerationRef.current = generation;
       setLoading(true);
       try {
-        const [taskList, occList, docsItems] = await Promise.all([
-          taskApi.listTasks(scopeArg),
-          taskApi.listOccurrences(scopeArg, dr.start, dr.end).catch((err) => {
-            console.error("カレンダー繰り返し予定取得失敗:", err);
-            return [] as TaskOccurrence[];
-          }),
-          fetch(`/api/docs/calendar-items?${new URLSearchParams({
-            start: dr.start,
-            end: dr.end,
-            ...(scopeArg.project_id ? { project_id: scopeArg.project_id } : {}),
-            ...(scopeArg.space_id ? { space_id: scopeArg.space_id } : {}),
-          }).toString()}`, {
-            credentials: "include",
-          })
-            .then((res) => (res.ok ? res.json() : { items: [] }))
-            .then((data) => Array.isArray(data.items) ? data.items as DocsCalendarItem[] : [])
-            .catch((err) => {
-              console.error("Docsカレンダー取得失敗:", err);
-              return [] as DocsCalendarItem[];
-            }),
-        ]);
+        const remoteContext =
+          selectedProject?.source === "remote"
+            ? selectedProject
+            : selectedSpace?.source === "remote"
+              ? selectedSpace
+              : null;
+        const remoteProfileId = remoteContext?.remote_server_id;
+        const remoteScope =
+          scope === "project" && selectedProject?.source === "remote"
+            ? { project_id: selectedProject.resource_id }
+            : scope === "space" && selectedSpace?.source === "remote"
+              ? { space_id: selectedSpace.resource_id }
+              : selectedProject?.source === "remote"
+                ? { project_id: selectedProject.resource_id }
+                : selectedSpace?.source === "remote"
+                  ? { space_id: selectedSpace.resource_id }
+                  : {};
+        const remoteTasksPromise = remoteProfileId
+          ? listRemoteTasks(remoteProfileId, remoteScope).then((items) =>
+              items.map((task) =>
+                toRemoteTask(
+                  {
+                    id: remoteProfileId,
+                    name: remoteContext?.remote_server_name ?? "Remote",
+                    display_color: remoteContext?.remote_server_color,
+                    base_url: remoteContext?.remote_server_base_url,
+                  },
+                  task,
+                ),
+              ),
+            )
+          : Promise.resolve([] as Task[]);
+        const remoteOccurrencesPromise = remoteProfileId
+          ? listRemoteTaskOccurrences(remoteProfileId, {
+              ...remoteScope,
+              start_from: dr.start,
+              end_to: dr.end,
+            }).then((items) =>
+              items.map((item) => decorateRemoteOccurrence(remoteProfileId, item)),
+            )
+          : Promise.resolve([] as TaskOccurrence[]);
+        const localDocsPromise = remoteProfileId
+          ? Promise.resolve([] as DocsCalendarItem[])
+          : fetch(`/api/docs/calendar-items?${new URLSearchParams({
+              start: dr.start,
+              end: dr.end,
+              ...(scopeArg.project_id ? { project_id: scopeArg.project_id } : {}),
+              ...(scopeArg.space_id ? { space_id: scopeArg.space_id } : {}),
+            }).toString()}`, {
+              credentials: "include",
+            })
+              .then((res) => (res.ok ? res.json() : { items: [] }))
+              .then((data) => Array.isArray(data.items) ? data.items as DocsCalendarItem[] : [])
+              .catch((err) => {
+                console.error("Docsカレンダー取得失敗:", err);
+                return [] as DocsCalendarItem[];
+              });
+        const [taskList, occList, docsItems] = remoteProfileId
+          ? await Promise.all([remoteTasksPromise, remoteOccurrencesPromise, localDocsPromise])
+          : await Promise.all([
+              taskApi.listTasks(scopeArg),
+              taskApi.listOccurrences(scopeArg, dr.start, dr.end).catch((err) => {
+                console.error("カレンダー繰り返し予定取得失敗:", err);
+                return [] as TaskOccurrence[];
+              }),
+              localDocsPromise,
+            ]);
         if (fetchGenerationRef.current !== generation) {
           return;
         }
@@ -418,7 +467,7 @@ export default function CalendarView() {
         }
       }
     },
-    [scopeArg],
+    [scopeArg, scope, selectedProject, selectedSpace],
   );
 
   useTaskCompletionRefresh(fetchData);
@@ -466,6 +515,10 @@ export default function CalendarView() {
         alert("タスク作成にはプロジェクトを選択してください。");
         return;
       }
+      if (selectedProject?.source === "remote") {
+        alert("Enterprise参照は読み取り専用です。");
+        return;
+      }
       setSelectedTaskId(null);
       setSelectedOccurrenceContext(null);
       setDraftTask({
@@ -477,7 +530,7 @@ export default function CalendarView() {
         ...(allDay !== undefined && { all_day: allDay }),
       });
     },
-    [selectedProjectId, taskNotificationsDefaultEnabled],
+    [selectedProject, selectedProjectId, taskNotificationsDefaultEnabled],
   );
 
   const handleDateClick = useCallback(
@@ -516,6 +569,7 @@ export default function CalendarView() {
         const colorTokens = resolveProjectColorTokens(
           task.project_color,
           resolvedTheme,
+          fallbackColorFromId(task.project_id),
         );
         return {
           id: `task-${task.id}`,
@@ -526,12 +580,13 @@ export default function CalendarView() {
           backgroundColor: colorTokens?.surface,
           borderColor: colorTokens?.border,
           textColor: colorTokens?.text ?? "var(--foreground)",
-          classNames: [`event-${task.status}`],
-          editable: true,
+          classNames: [`event-${task.status}`, ...(task.source === "remote" ? ["event-remote"] : [])],
+          editable: task.source !== "remote",
           extendedProps: {
             taskId: task.id,
             projectId: task.project_id,
             status: task.status,
+            priority: task.priority,
             tags: task.tags || [],
             projectColor: colorTokens?.accent ?? null,
             projectName: task.project_name ?? null,
@@ -540,6 +595,11 @@ export default function CalendarView() {
             occurrenceEndAt: null,
             occurrenceOriginalStartAt: null,
             occurrenceSourceKind: null,
+            isRemote: task.source === "remote",
+            remoteServerId: task.remote_server_id,
+            remoteServerName: task.remote_server_name,
+            remoteBaseUrl: task.remote_server_base_url,
+            remoteTaskId: task.resource_id,
           },
         };
       });
@@ -552,6 +612,7 @@ export default function CalendarView() {
         const colorTokens = resolveProjectColorTokens(
           occurrence.project_color,
           resolvedTheme,
+          fallbackColorFromId(occurrence.project_id),
         );
         return {
           id: `occ-${occurrence.id}`,
@@ -562,12 +623,13 @@ export default function CalendarView() {
           backgroundColor: colorTokens?.surface,
           borderColor: colorTokens?.border,
           textColor: colorTokens?.text ?? "var(--foreground)",
-          classNames: [`event-${occurrence.status}`],
-          editable: true,
+          classNames: [`event-${occurrence.status}`, ...(occurrence.source === "remote" ? ["event-remote"] : [])],
+          editable: occurrence.source !== "remote",
           extendedProps: {
             taskId: occurrence.task_id,
             projectId: occurrence.project_id ?? null,
             status: occurrence.status,
+            priority: "none",
             tags: occurrence.tags || [],
             projectColor: colorTokens?.accent ?? null,
             projectName: occurrence.project_name ?? null,
@@ -581,51 +643,9 @@ export default function CalendarView() {
             occurrenceOriginalStartAt:
               occurrence.original_start_at ?? occurrence.start_at ?? null,
             occurrenceSourceKind: occurrence.source_kind,
-          },
-        };
-      });
-
-    const remoteEvents: CalendarEvent[] = remoteTasks
-      .filter(
-        (task) =>
-          (task.start_at || task.end_at) &&
-          !task.parent_task_id &&
-          (showClosed || !isClosedTaskStatus(task.status)),
-      )
-      .map((task) => {
-        const colorTokens = resolveProjectColorTokens(
-          task.remote_server_color || task.project_color,
-          resolvedTheme,
-        );
-        return {
-          id: `remote-${task.remote_server_id}-${task.id}`,
-          title: `[${task.remote_server_name}] ${task.title}`,
-          start: task.start_at || task.end_at || "",
-          end: getCalendarEventEnd(task.end_at, task.all_day),
-          allDay: task.all_day,
-          backgroundColor: colorTokens?.surface,
-          borderColor: colorTokens?.border,
-          textColor: colorTokens?.text ?? "var(--foreground)",
-          classNames: [`event-${task.status}`, "event-remote"],
-          editable: false,
-          extendedProps: {
-            taskId: task.id,
-            projectId: task.project_id,
-            status: task.status,
-            tags: task.tags || [],
-            projectColor: colorTokens?.accent ?? null,
-            projectName: task.project_name ?? null,
-            occurrenceId: null,
-            occurrenceStartAt: null,
-            occurrenceEndAt: null,
-            occurrenceOriginalStartAt: null,
-            occurrenceSourceKind: null,
-            isRemote: true,
-            remoteServerId: task.remote_server_id,
-            remoteServerName: task.remote_server_name,
-            remoteBaseUrl:
-              remoteProfiles.find((p) => p.id === task.remote_server_id)
-                ?.base_url ?? null,
+            isRemote: occurrence.source === "remote",
+            remoteServerId: occurrence.remote_server_id,
+            remoteTaskId: occurrence.task_id.replace(/^remote:[^:]+:/, ""),
           },
         };
       });
@@ -656,7 +676,7 @@ export default function CalendarView() {
         }))
       : [];
 
-    return [...taskEvents, ...occurrenceEvents, ...remoteEvents, ...docsEvents];
+    return [...taskEvents, ...occurrenceEvents, ...docsEvents];
   }, [
     tasks,
     occurrences,
@@ -665,8 +685,6 @@ export default function CalendarView() {
     showClosed,
     hideRecurring,
     resolvedTheme,
-    remoteTasks,
-    remoteProfiles,
   ]);
 
   const calendarEvents = useMemo(() => {
@@ -718,9 +736,10 @@ export default function CalendarView() {
         profileName: (props.remoteServerName as string) ?? "remote",
         profileColor: (props.projectColor as string | null) ?? null,
         baseUrl: (props.remoteBaseUrl as string | null) ?? "",
-        taskId: props.taskId as string,
+        taskId: (props.remoteTaskId as string) ?? (props.taskId as string),
         title: info.event.title.replace(/^\[[^\]]*\]\s*/, ""),
         status: (props.status as string) ?? "open",
+        priority: (props.priority as string) ?? "none",
         startAt: info.event.start
           ? formatDateTimeLocal(info.event.start)
           : null,
@@ -968,7 +987,7 @@ export default function CalendarView() {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "ao-calendar-toggle";
-      button.textContent = isExpanded ? "しまう" : `+${hiddenCount} more`;
+      button.textContent = isExpanded ? "しまう" : `+${hiddenCount}件`;
       button.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -983,13 +1002,19 @@ export default function CalendarView() {
   }, [hiddenEventCountsByDate, expandedWeekKey, getWeekKey]);
 
   return (
-    <div className="flex h-full flex-col gap-4 p-4">
-      <div className="flex flex-wrap items-center gap-3">
+    <div className="flex h-full flex-col gap-2 p-3">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-border bg-card px-3 py-2">
         <Tabs value={scope} onValueChange={(v) => setScope(v as ScopeMode)}>
-          <TabsList>
-            <TabsTrigger value="project">プロジェクト単位</TabsTrigger>
-            <TabsTrigger value="space">スペース単位</TabsTrigger>
-            <TabsTrigger value="all">全表示</TabsTrigger>
+          <TabsList className="h-8">
+            <TabsTrigger value="project" className="text-xs">
+              プロジェクト単位
+            </TabsTrigger>
+            <TabsTrigger value="space" className="text-xs">
+              スペース単位
+            </TabsTrigger>
+            <TabsTrigger value="all" className="text-xs">
+              全表示
+            </TabsTrigger>
           </TabsList>
         </Tabs>
 
@@ -1005,22 +1030,22 @@ export default function CalendarView() {
                 : "プロジェクト未選択"}
         </div>
 
-        <div className="ml-auto flex items-center gap-4">
-          <label className="flex items-center gap-1.5 text-sm text-muted-foreground cursor-pointer select-none">
+        <div className="ml-auto flex items-center gap-3">
+          <label className="flex cursor-pointer select-none items-center gap-1.5 text-xs text-muted-foreground">
             <Checkbox
               checked={showDocsLayer}
               onCheckedChange={(checked) => setShowDocsLayer(!!checked)}
             />
             Docsを表示
           </label>
-          <label className="flex items-center gap-1.5 text-sm text-muted-foreground cursor-pointer select-none">
+          <label className="flex cursor-pointer select-none items-center gap-1.5 text-xs text-muted-foreground">
             <Checkbox
               checked={hideRecurring}
               onCheckedChange={(checked) => setHideRecurring(!!checked)}
             />
             繰り返しを非表示
           </label>
-          <label className="flex items-center gap-1.5 text-sm text-muted-foreground cursor-pointer select-none">
+          <label className="flex cursor-pointer select-none items-center gap-1.5 text-xs text-muted-foreground">
             <Checkbox
               checked={showClosed}
               onCheckedChange={(checked) => setShowClosed(!!checked)}
@@ -1032,7 +1057,7 @@ export default function CalendarView() {
 
       <div
         ref={calendarContainerRef}
-        className="relative flex-1 min-h-0"
+        className="relative min-h-0 flex-1"
         style={{ minHeight: "500px" }}
       >
         {canRenderCalendar ? (
@@ -1057,17 +1082,49 @@ export default function CalendarView() {
                 | string
                 | null
                 | undefined;
-              const visibleTags = tags.slice(0, 2);
-              const hiddenTagCount = Math.max(
-                0,
-                tags.length - visibleTags.length,
-              );
+              const projectAccent =
+                (info.event.extendedProps.projectColor as string | null) ??
+                undefined;
               const timeText = shouldShowEventTime(
                 info.event.start,
                 info.event.allDay,
               )
                 ? info.timeText
                 : "";
+
+              // 月表示: 高さ一定のコンパクト1行チップ
+              if (info.view.type === "dayGridMonth") {
+                const tooltip = [
+                  info.event.title,
+                  projectName || null,
+                  tags.length > 0
+                    ? tags.map((tag) => tag.name).join(", ")
+                    : null,
+                ]
+                  .filter(Boolean)
+                  .join(" / ");
+                return (
+                  <div className="ao-cal-event" title={tooltip}>
+                    <span
+                      className="ao-cal-event-bar"
+                      style={{ backgroundColor: projectAccent }}
+                    />
+                    <span className="ao-cal-event-title">
+                      {info.event.title}
+                    </span>
+                    {timeText && (
+                      <span className="ao-cal-event-time">{timeText}</span>
+                    )}
+                  </div>
+                );
+              }
+
+              // 週表示・リスト表示: プロジェクト名・タグを表示
+              const visibleTags = tags.slice(0, 2);
+              const hiddenTagCount = Math.max(
+                0,
+                tags.length - visibleTags.length,
+              );
               return (
                 <div className="min-w-0 overflow-hidden">
                   <div className="flex min-w-0 items-baseline gap-1">
@@ -1184,7 +1241,7 @@ export default function CalendarView() {
           </div>
         )}
         {loading && prefsLoaded && (
-          <div className="pointer-events-none absolute right-3 top-3 rounded bg-background/80 px-2 py-1 text-xs text-muted-foreground shadow">
+          <div className="pointer-events-none absolute right-3 top-3 rounded-md border border-border bg-card/90 px-2 py-1 text-xs text-muted-foreground shadow-sm">
             読み込み中...
           </div>
         )}
@@ -1195,10 +1252,10 @@ export default function CalendarView() {
         )}
       </div>
 
-      {selectedProjectId && (
+      {selectedProjectId && selectedProject?.source !== "remote" && (
         <Button
           size="icon"
-          className="fixed bottom-6 right-6 z-50 size-14 rounded-full shadow-lg"
+          className="fixed bottom-6 right-6 z-50 size-14 rounded-full shadow-sm"
           onClick={() => {
             const now = new Date();
             now.setHours(now.getHours(), 0, 0, 0);
@@ -1237,7 +1294,7 @@ export default function CalendarView() {
       <RemoteTaskDialog
         target={remoteDialogTarget}
         onClose={() => setRemoteDialogTarget(null)}
-        onUpdated={() => reloadRemoteTasks()}
+        onUpdated={() => fetchData()}
       />
     </div>
   );

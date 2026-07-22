@@ -74,7 +74,7 @@ export function KeyboardShortcuts() {
           return;
         }
 
-        // Alt+1~9: ページ遷移
+        // Alt+数字: ページ遷移
         if (APP_ALT_SHORTCUTS[e.key]) {
           e.preventDefault();
           window.location.href = APP_ALT_SHORTCUTS[e.key];
@@ -94,6 +94,9 @@ export function KeyboardShortcuts() {
       // 単独キーショートカット: 入力欄にフォーカス中は無効
       if (e.ctrlKey || e.metaKey || e.shiftKey) return;
       if (isInputFocused()) return;
+      // ファイラーは一覧上でのインクリメンタル検索が単発キーを占有するため、
+      // 単独キーショートカット全体を無効化する（Alt+ 系は手前で処理済み）
+      if (pathname.startsWith("/filer")) return;
 
       switch (e.key) {
         case "t":
@@ -113,7 +116,6 @@ export function KeyboardShortcuts() {
           break;
         case "p":
         case "P":
-          if (pathname.startsWith("/filer")) return;
           e.preventDefault();
           window.dispatchEvent(new Event("global-open-memo"));
           break;

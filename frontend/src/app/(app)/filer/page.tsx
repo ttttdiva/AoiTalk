@@ -13,7 +13,6 @@ import {
 import { useSearchParams } from "next/navigation";
 import { useAudioPlayer } from "@/contexts/audio-player-context";
 import { ExplorerProvider, useExplorer } from "@/contexts/explorer-context";
-import { useProject } from "@/contexts/project-context";
 import { useSnippets } from "@/contexts/snippets-context";
 import { ExplorerToolbar } from "@/components/explorer/explorer-toolbar";
 import { FileGrid } from "@/components/explorer/file-grid";
@@ -24,7 +23,11 @@ import { RenameDialog } from "@/components/explorer/rename-dialog";
 import { UploadZone } from "@/components/explorer/upload-zone";
 import { FilePreviewPanel } from "@/components/explorer/file-preview-panel";
 import { GitPanel } from "@/components/explorer/git-panel";
-import { HydrusSearchBar } from "@/components/hf-browser/hydrus-search-bar";
+import {
+  HydrusSearchBar,
+  type HydrusPagingController,
+} from "@/components/hf-browser/hydrus-search-bar";
+import { HfReferenceDialog } from "@/components/hf-browser/hf-reference-dialog";
 import { RecordTableEditor } from "@/components/records/record-table-editor";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -55,6 +58,7 @@ import {
   explorerArchive,
   explorerCopy,
   explorerDelete,
+  explorerDownloadPaths,
   explorerErrorMessage,
   explorerExtract,
   explorerFullContent,
@@ -69,14 +73,18 @@ import {
   type FilerSearchItem,
 } from "@/lib/migemo-lite";
 import {
-  createProjectRecordTable,
   deleteProjectRecordTable,
   isRecordTableFile,
 } from "@/lib/record-tables-api";
 import { getFileServeUrl } from "@/lib/explorer-serve-url";
-import { HF_PREFIX } from "@/lib/hf/virtual-path";
+import { HF_PREFIX, isHfPath } from "@/lib/hf/virtual-path";
 import dynamic from "next/dynamic";
 import { toast } from "sonner";
+import {
+  boundaryViewerFile,
+  preloadViewerFiles,
+  viewerFiles,
+} from "@/lib/viewer-navigation";
 
 const DocumentEditor = dynamic(
   () =>
@@ -113,6 +121,28 @@ function isAudio(type: string) {
   return type.startsWith("audio");
 }
 type ExplorerItem = ExplorerDirectory | ExplorerFile;
+const SUPPORTED_ARCHIVE_SUFFIXES = [
+  ".tar.bz2",
+  ".tar.gz",
+  ".tar.xz",
+  ".tbz2",
+  ".tgz",
+  ".txz",
+  ".7z",
+  ".tar",
+  ".zip",
+  ".bz2",
+  ".gz",
+  ".xz",
+] as const;
+
+function isSupportedArchiveName(name: string) {
+  const lowerName = name.toLowerCase();
+  return SUPPORTED_ARCHIVE_SUFFIXES.some((suffix) =>
+    lowerName.endsWith(suffix),
+  );
+}
+
 function isExplorerDirectory(item: ExplorerItem): item is ExplorerDirectory {
   return !("type" in item);
 }
@@ -172,53 +202,132 @@ function FileViewer({
   files,
   onClose,
   onNavigate,
+  onBoundaryNavigate,
+  onAdjacentFiles,
 }: {
   file: ExplorerFile;
   files: ExplorerFile[];
   onClose: () => void;
   onNavigate: (file: ExplorerFile) => void;
+  onBoundaryNavigate?: (direction: -1 | 1) => Promise<ExplorerFile | null>;
+  onAdjacentFiles?: (direction: -1 | 1) => Promise<ExplorerFile[]>;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const touchStartRef = useRef<{ x: number; y: number; t: number } | null>(
     null,
   );
-  const isViewableFile = (f: ExplorerFile) =>
-    isImage(f.type || "") || isVideo(f.type || "");
-  const viewableFiles = files.filter(isViewableFile);
+  const viewableFiles = useMemo(() => viewerFiles(files), [files]);
   const currentIndex = viewableFiles.findIndex((f) => f.path === file.path);
   const isImageFile = isImage(file.type || "");
+  const navigatingRef = useRef(false);
+  const navigationGenerationRef = useRef(0);
+  const viewerMountedRef = useRef(true);
+  const preloadedImagesRef = useRef(new Map<string, HTMLImageElement>());
 
-  const goPrev = useCallback(() => {
-    if (currentIndex > 0) onNavigate(viewableFiles[currentIndex - 1]);
-  }, [currentIndex, viewableFiles, onNavigate]);
+  useEffect(() => {
+    viewerMountedRef.current = true;
+    return () => {
+      viewerMountedRef.current = false;
+      navigationGenerationRef.current += 1;
+    };
+  }, []);
 
-  const goNext = useCallback(() => {
-    if (currentIndex < viewableFiles.length - 1)
+  const goPrev = useCallback(async () => {
+    if (navigatingRef.current) return;
+    if (currentIndex > 0) {
+      onNavigate(viewableFiles[currentIndex - 1]);
+      return;
+    }
+    if (!onBoundaryNavigate) return;
+    navigatingRef.current = true;
+    const generation = ++navigationGenerationRef.current;
+    try {
+      const target = await onBoundaryNavigate(-1);
+      if (target && viewerMountedRef.current && generation === navigationGenerationRef.current) {
+        onNavigate(target);
+      }
+    } catch (error) {
+      if (viewerMountedRef.current) {
+        toast.error(error instanceof Error ? error.message : "前のページを読み込めませんでした");
+      }
+    } finally {
+      if (generation === navigationGenerationRef.current) navigatingRef.current = false;
+    }
+  }, [currentIndex, onBoundaryNavigate, onNavigate, viewableFiles]);
+
+  const goNext = useCallback(async () => {
+    if (navigatingRef.current) return;
+    if (currentIndex < viewableFiles.length - 1) {
       onNavigate(viewableFiles[currentIndex + 1]);
-  }, [currentIndex, viewableFiles, onNavigate]);
+      return;
+    }
+    if (!onBoundaryNavigate) return;
+    navigatingRef.current = true;
+    const generation = ++navigationGenerationRef.current;
+    try {
+      const target = await onBoundaryNavigate(1);
+      if (target && viewerMountedRef.current && generation === navigationGenerationRef.current) {
+        onNavigate(target);
+      }
+    } catch (error) {
+      if (viewerMountedRef.current) {
+        toast.error(error instanceof Error ? error.message : "次のページを読み込めませんでした");
+      }
+    } finally {
+      if (generation === navigationGenerationRef.current) navigatingRef.current = false;
+    }
+  }, [currentIndex, onBoundaryNavigate, onNavigate, viewableFiles]);
 
-  // 前後 PRELOAD_RADIUS 枚の画像をブラウザキャッシュに載せておく（動画は容量的に除外）
+  // 前後の画像をviewer存続中のブラウザキャッシュへ載せる（動画は容量的に除外）
   useEffect(() => {
     if (currentIndex < 0) return;
-    const PRELOAD_RADIUS = 2;
-    const targets: ExplorerFile[] = [];
-    for (let d = 1; d <= PRELOAD_RADIUS; d++) {
-      const next = viewableFiles[currentIndex + d];
-      const prev = viewableFiles[currentIndex - d];
-      if (next && isImage(next.type || "")) targets.push(next);
-      if (prev && isImage(prev.type || "")) targets.push(prev);
-    }
-    const loaders = targets.map((f) => {
-      const img = new window.Image();
-      img.decoding = "async";
-      img.src = getFilerFileUrl(f.path);
-      return img;
-    });
-    return () => {
-      // 遷移時に未完了のリクエストを破棄してネットワークを空ける
-      for (const img of loaders) img.src = "";
+    let cancelled = false;
+    const PRELOAD_RADIUS = 3;
+    const targets = preloadViewerFiles(files, file.path, PRELOAD_RADIUS);
+    const preload = (items: ExplorerFile[]) => {
+      if (cancelled) return;
+      for (const item of items) {
+        if (!isImage(item.type || "")) continue;
+        const url = getFilerFileUrl(item.path);
+        if (preloadedImagesRef.current.has(url)) continue;
+        while (preloadedImagesRef.current.size >= 12) {
+          const oldest = preloadedImagesRef.current.keys().next().value as string | undefined;
+          if (!oldest) break;
+          preloadedImagesRef.current.get(oldest)!.src = "";
+          preloadedImagesRef.current.delete(oldest);
+        }
+        const img = new window.Image();
+        img.decoding = "async";
+        img.src = url;
+        preloadedImagesRef.current.set(url, img);
+      }
     };
-  }, [currentIndex, viewableFiles]);
+    preload(targets);
+    if (onAdjacentFiles && currentIndex < PRELOAD_RADIUS) {
+      void onAdjacentFiles(-1)
+        .then((items) => preload(items.slice(-PRELOAD_RADIUS)))
+        .catch(() => undefined);
+    }
+    if (
+      onAdjacentFiles &&
+      viewableFiles.length - 1 - currentIndex < PRELOAD_RADIUS
+    ) {
+      void onAdjacentFiles(1)
+        .then((items) => preload(items.slice(0, PRELOAD_RADIUS)))
+        .catch(() => undefined);
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [currentIndex, file.path, files, onAdjacentFiles, viewableFiles]);
+
+  useEffect(
+    () => () => {
+      for (const image of preloadedImagesRef.current.values()) image.src = "";
+      preloadedImagesRef.current.clear();
+    },
+    [],
+  );
 
   // スワイプでページ送り（画像表示時のみ。動画はネイティブコントロール優先）
   const handleTouchStart = useCallback(
@@ -249,8 +358,8 @@ function FileViewer({
       if (dt > 1000) return;
       if (Math.abs(dx) < 50) return;
       if (Math.abs(dx) < Math.abs(dy) * 1.3) return;
-      if (dx > 0) goPrev();
-      else goNext();
+      if (dx > 0) void goPrev();
+      else void goNext();
     },
     [isImageFile, goPrev, goNext],
   );
@@ -264,11 +373,11 @@ function FileViewer({
         return;
       }
       if (e.key === "ArrowLeft") {
-        goPrev();
+        void goPrev();
         return;
       }
       if (e.key === "ArrowRight") {
-        goNext();
+        void goNext();
         return;
       }
       const video = videoRef.current;
@@ -326,7 +435,7 @@ function FileViewer({
       </div>
       <div className="max-w-[98vw] max-h-[96vh] flex items-center justify-center">
         {isImage(file.type || "") && (
-          <ImageDisplay path={file.path} alt={file.name} />
+          <ImageDisplay key={file.path} path={file.path} alt={file.name} />
         )}
         {isVideo(file.type || "") && (
           <video
@@ -625,81 +734,6 @@ function NewTextFileDialog({
   );
 }
 
-function NewRecordTableDialog({
-  open,
-  onOpenChange,
-  onCreated,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  onCreated: (file: ExplorerFile) => void;
-}) {
-  const { selectedProjectId } = useProject();
-  const { refresh } = useExplorer();
-  const [name, setName] = useState("");
-  const [loading, setLoading] = useState(false);
-
-  const handleCreate = async () => {
-    const tableName = name.trim();
-    if (!selectedProjectId || !tableName) return;
-    setLoading(true);
-    try {
-      const result = await createProjectRecordTable(
-        selectedProjectId,
-        tableName,
-      );
-      refresh();
-      setName("");
-      onOpenChange(false);
-      onCreated({
-        name: `${result.table.name}.dbtable`,
-        path: `aoitalk-record-table:${selectedProjectId}:${result.table.id}`,
-        type: "application/x-aoitalk-record-table",
-        extension: ".dbtable",
-        virtual_kind: "record_table",
-        project_id: selectedProjectId,
-        record_table_id: result.table.id,
-        row_count: result.table.row_count ?? 0,
-        description: result.table.description,
-      });
-    } catch {
-      // create error
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-sm">
-        <DialogHeader>
-          <DialogTitle>新規DBテーブル</DialogTitle>
-        </DialogHeader>
-        <Input
-          placeholder="例: 申請台帳"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") void handleCreate();
-          }}
-          autoFocus
-        />
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            キャンセル
-          </Button>
-          <Button
-            onClick={handleCreate}
-            disabled={!selectedProjectId || !name.trim() || loading}
-          >
-            {loading ? "作成中..." : "作成"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
 function ExplorerContent() {
   const explorerRootRef = useRef<HTMLDivElement>(null);
   const explorerScrollRef = useRef<HTMLDivElement>(null);
@@ -727,6 +761,8 @@ function ExplorerContent() {
     loading,
     error,
     viewMode,
+    setViewMode,
+    setSort,
     bookmarks,
     refreshBookmarks,
     filerTab,
@@ -740,6 +776,8 @@ function ExplorerContent() {
     selectedItems,
     focusedItemPath,
     selectItem,
+    toggleSelect,
+    selectRange,
     selectAll,
     clearSelection,
     clipboard,
@@ -751,7 +789,7 @@ function ExplorerContent() {
     hfSearchQuery,
     setHfSearchQuery,
   } = useExplorer();
-  void isHydrusMode;
+  const hydrusPagingRef = useRef<HydrusPagingController | null>(null);
 
   // Hydrus 検索エラー（検索結果そのものは context の browseData に流し込む）
   const [hydrusError, setHydrusError] = useState<string | null>(null);
@@ -765,16 +803,53 @@ function ExplorerContent() {
   // ダイアログ状態
   const [newFolderOpen, setNewFolderOpen] = useState(false);
   const [newTextFileOpen, setNewTextFileOpen] = useState(false);
-  const [newRecordTableOpen, setNewRecordTableOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<
     ExplorerDirectory | ExplorerFile | null
   >(null);
   const [viewerFile, setViewerFile] = useState<ExplorerFile | null>(null);
   const [previewFile, setPreviewFile] = useState<ExplorerFile | null>(null);
+  const [hfReferenceOpen, setHfReferenceOpen] = useState(false);
   const [recordTableFile, setRecordTableFile] = useState<ExplorerFile | null>(
     null,
   );
   const [gitOpen, setGitOpen] = useState(false);
+
+  const loadHydrusBoundary = useCallback(
+    async (direction: -1 | 1): Promise<ExplorerFile | null> => {
+      if (!isHydrusMode) return null;
+      const controller = hydrusPagingRef.current;
+      if (!controller) return null;
+      let targetPage = controller.page + direction;
+      let totalPages = controller.totalPages;
+      while (targetPage >= 1 && targetPage <= totalPages) {
+        const result = await controller.loadPage(targetPage);
+        if (!result) return null;
+        totalPages = result.totalPages;
+        const candidates = viewerFiles(result.data.files).filter(
+          (item) => item.path !== viewerFile?.path,
+        );
+        const target = boundaryViewerFile(candidates, direction);
+        if (target) return target;
+        targetPage += direction;
+      }
+      return null;
+    },
+    [isHydrusMode, viewerFile?.path],
+  );
+
+  const preloadHydrusAdjacent = useCallback(
+    async (direction: -1 | 1): Promise<ExplorerFile[]> => {
+      if (!isHydrusMode) return [];
+      const controller = hydrusPagingRef.current;
+      if (!controller) return [];
+      const targetPage = controller.page + direction;
+      if (targetPage < 1 || targetPage > controller.totalPages) return [];
+      const result = await controller.prefetchPage(targetPage);
+      if (!result) return [];
+      return viewerFiles(result.data.files);
+    },
+    [isHydrusMode],
+  );
 
   // コンテキストメニュー
   const [ctxItem, setCtxItem] = useState<
@@ -820,13 +895,12 @@ function ExplorerContent() {
       }),
     [itemByPath, selectedPaths],
   );
-  const selectedZipPaths = useMemo(
+  const selectedArchivePaths = useMemo(
     () =>
       selectedRegularPaths.filter((path) => {
         const item = itemByPath.get(path);
         if (!item || !("type" in item)) return false;
-        const extension = (item.extension || "").toLowerCase();
-        return extension === ".zip" || item.name.toLowerCase().endsWith(".zip");
+        return isSupportedArchiveName(item.name);
       }),
     [itemByPath, selectedRegularPaths],
   );
@@ -837,8 +911,10 @@ function ExplorerContent() {
   const activeItem = activePath ? (itemByPath.get(activePath) ?? null) : null;
   const canUseFileShortcuts =
     !isAbsoluteFilerPath && !isHfMode && filerTab !== "hydrus";
+  const canUseDownloadShortcut = !isHfMode && filerTab !== "hydrus";
   const canUseExplorerSearch = !isHfMode && filerTab !== "hydrus";
   const isExplorerInteractionBlocked =
+    loading ||
     !!editingFile ||
     !!recordTableFile ||
     !!viewerFile ||
@@ -846,7 +922,6 @@ function ExplorerContent() {
     !!renameTarget ||
     newFolderOpen ||
     newTextFileOpen ||
-    newRecordTableOpen ||
     gitOpen ||
     !!ctxPos;
 
@@ -1062,17 +1137,12 @@ function ExplorerContent() {
   ]);
 
   const extractSelectedItems = useCallback(async () => {
-    const activeItemExtension =
-      activeItem && "type" in activeItem
-        ? (activeItem.extension || "").toLowerCase()
-        : "";
-    let targetPaths = selectedZipPaths;
+    let targetPaths = selectedArchivePaths;
     if (
       targetPaths.length === 0 &&
       activeItem &&
       "type" in activeItem &&
-      (activeItemExtension === ".zip" ||
-        activeItem.name.toLowerCase().endsWith(".zip"))
+      isSupportedArchiveName(activeItem.name)
     ) {
       targetPaths = [activeItem.path];
     }
@@ -1080,16 +1150,16 @@ function ExplorerContent() {
       return;
     }
     if (targetPaths.length === 0) {
-      toast.error("展開できるZIPファイルを選択してください");
+      toast.error("対応している圧縮ファイルを選択してください");
       return;
     }
     try {
       const result = await explorerExtract(targetPaths, currentPath);
       clearSelection();
       await refresh();
-      toast.success(`${result.extracted.length}件のZIPを展開しました`);
+      toast.success(`${result.extracted.length}件の圧縮ファイルを展開しました`);
     } catch {
-      toast.error("zip展開に失敗しました");
+      toast.error("圧縮ファイルの展開に失敗しました");
     }
   }, [
     canUseFileShortcuts,
@@ -1098,8 +1168,30 @@ function ExplorerContent() {
     refresh,
     activeItem,
     selectedPaths.length,
-    selectedZipPaths,
+    selectedArchivePaths,
   ]);
+
+  const downloadSelectedItems = useCallback(async () => {
+    let targetPaths = selectedRegularPaths;
+    if (
+      targetPaths.length === 0 &&
+      activeItem &&
+      (!("type" in activeItem) || !isRecordTableFile(activeItem))
+    ) {
+      targetPaths = [activeItem.path];
+    }
+    if (!canUseDownloadShortcut || targetPaths.length === 0) return;
+    try {
+      await explorerDownloadPaths(targetPaths);
+      toast.success(
+        targetPaths.length === 1
+          ? "ダウンロードを開始しました"
+          : `${targetPaths.length}件をダウンロードします`,
+      );
+    } catch (error) {
+      toast.error(`ダウンロードに失敗しました: ${explorerErrorMessage(error)}`);
+    }
+  }, [activeItem, canUseDownloadShortcut, selectedRegularPaths]);
 
   const deleteSelectedItems = useCallback(async () => {
     if (!canUseFileShortcuts || selectedPaths.length === 0) return;
@@ -1195,6 +1287,103 @@ function ExplorerContent() {
     }).length;
     return Math.max(1, visibleCount || 10);
   }, []);
+
+  const scrollRenderedItemIntoView = useCallback((path: string) => {
+    window.requestAnimationFrame(() => {
+      const element = Array.from(
+        explorerRootRef.current?.querySelectorAll<HTMLElement>(
+          "[data-explorer-item-path]",
+        ) ?? [],
+      ).find((item) => item.dataset.explorerItemPath === path);
+      element?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    });
+  }, []);
+
+  const extendSelectionToPath = useCallback(
+    (nextPath: string, itemPaths: string[]) => {
+      activePathRef.current = nextPath;
+      selectRange(nextPath, itemPaths);
+      scrollRenderedItemIntoView(nextPath);
+    },
+    [scrollRenderedItemIntoView, selectRange],
+  );
+
+  const extendSelectionByOffset = useCallback(
+    (offset: number) => {
+      const itemPaths = getRenderedItemPaths();
+      if (itemPaths.length === 0) return;
+      const currentIndex = activePath
+        ? itemPaths.findIndex((path) => path === activePath)
+        : -1;
+      const nextIndex =
+        currentIndex < 0
+          ? offset < 0
+            ? itemPaths.length - 1
+            : 0
+          : Math.max(0, Math.min(itemPaths.length - 1, currentIndex + offset));
+      const nextPath = itemPaths[nextIndex];
+      if (nextPath) extendSelectionToPath(nextPath, itemPaths);
+    },
+    [activePath, extendSelectionToPath, getRenderedItemPaths],
+  );
+
+  const extendSelectionToIndex = useCallback(
+    (index: number) => {
+      const itemPaths = getRenderedItemPaths();
+      if (itemPaths.length === 0) return;
+      const nextIndex = Math.max(0, Math.min(itemPaths.length - 1, index));
+      const nextPath = itemPaths[nextIndex];
+      if (nextPath) extendSelectionToPath(nextPath, itemPaths);
+    },
+    [extendSelectionToPath, getRenderedItemPaths],
+  );
+
+  const orderedSelectionForClipboard = useCallback(() => {
+    const source =
+      selectedPaths.length > 0
+        ? selectedPaths
+        : activePath
+          ? [activePath]
+          : [];
+    if (source.length === 0) return [];
+    const set = new Set(source);
+    const ordered = getRenderedItemPaths().filter((path) => set.has(path));
+    return ordered.length > 0 ? ordered : source;
+  }, [activePath, getRenderedItemPaths, selectedPaths]);
+
+  const copySelectedPathsText = useCallback(async () => {
+    const paths = orderedSelectionForClipboard();
+    if (paths.length === 0) return;
+    try {
+      await navigator.clipboard.writeText(paths.join("\n"));
+      toast.success(
+        paths.length > 1
+          ? `${paths.length}件のパスをコピーしました`
+          : "パスをコピーしました",
+      );
+    } catch {
+      toast.error("クリップボードへのコピーに失敗しました");
+    }
+  }, [orderedSelectionForClipboard]);
+
+  const copySelectedNamesText = useCallback(async () => {
+    const paths = orderedSelectionForClipboard();
+    if (paths.length === 0) return;
+    const names = paths
+      .map((path) => itemByPath.get(path)?.name)
+      .filter((name): name is string => !!name);
+    if (names.length === 0) return;
+    try {
+      await navigator.clipboard.writeText(names.join("\n"));
+      toast.success(
+        names.length > 1
+          ? `${names.length}件のファイル名をコピーしました`
+          : "ファイル名をコピーしました",
+      );
+    } catch {
+      toast.error("クリップボードへのコピーに失敗しました");
+    }
+  }, [itemByPath, orderedSelectionForClipboard]);
 
   const openExplorerItem = useCallback(
     (item: ExplorerItem) => {
@@ -1344,6 +1533,45 @@ function ExplorerContent() {
         ? (itemByPath.get(activePathForEvent) ?? null)
         : null;
 
+      // 表示切替（`:` サムネイル / `;` リスト）。
+      // インクリメンタル検索が単一文字キーを消費する前に処理する。
+      // `:` は US 配列では Shift+`;` のため shiftKey は条件に含めない。
+      if (!primaryModifier && !e.altKey && !e.isComposing) {
+        if (e.key === ":") {
+          e.preventDefault();
+          setViewMode("grid");
+          return;
+        }
+        if (e.key === ";") {
+          e.preventDefault();
+          setViewMode("list");
+          return;
+        }
+      }
+
+      // ソート切替（F8 名前昇順 / F9 更新日時降順）。
+      // Hydrus タブでは検索時に Hydrus 側でインポート日時降順に並べており、
+      // フロント側の並べ替えは行わない（FileGrid/FileList 側で抑止）。
+      if (!primaryModifier && !e.altKey && !e.shiftKey) {
+        if (e.key === "F8") {
+          e.preventDefault();
+          setSort("name", "asc");
+          return;
+        }
+        if (e.key === "F9") {
+          e.preventDefault();
+          setSort("date", "desc");
+          return;
+        }
+      }
+
+      // Backspace は削除ではなく「戻る」。Alt+← と同じ扱い。
+      if (!primaryModifier && !e.altKey && !e.shiftKey && e.key === "Backspace") {
+        e.preventDefault();
+        goBack();
+        return;
+      }
+
       if (!primaryModifier && e.altKey && !e.shiftKey) {
         if (e.key === "ArrowLeft" || e.key === "Backspace") {
           e.preventDefault();
@@ -1392,6 +1620,34 @@ function ExplorerContent() {
         void extractSelectedItems();
         return;
       }
+      if (primaryModifier && !e.altKey && e.shiftKey && key === "l") {
+        if (canUseDownloadShortcut) {
+          e.preventDefault();
+          void downloadSelectedItems();
+        }
+        return;
+      }
+      if (primaryModifier && !e.altKey && !e.shiftKey && key === "p") {
+        e.preventDefault();
+        void copySelectedPathsText();
+        return;
+      }
+      if (primaryModifier && !e.altKey && e.shiftKey && key === "p") {
+        e.preventDefault();
+        void copySelectedNamesText();
+        return;
+      }
+      if (
+        primaryModifier &&
+        !e.altKey &&
+        !e.shiftKey &&
+        !e.isComposing &&
+        (e.code === "Space" || e.key === " ")
+      ) {
+        e.preventDefault();
+        if (activePathForEvent) toggleSelect(activePathForEvent);
+        return;
+      }
       if (!primaryModifier && !e.altKey && !e.shiftKey) {
         let offset = 0;
         if (e.key === "ArrowLeft") offset = -1;
@@ -1416,6 +1672,28 @@ function ExplorerContent() {
           return;
         }
       }
+      if (!primaryModifier && !e.altKey && e.shiftKey) {
+        let offset = 0;
+        if (e.key === "ArrowUp") offset = -1;
+        if (e.key === "ArrowDown") offset = 1;
+        if (e.key === "PageUp") offset = -getVisibleItemPageSize();
+        if (e.key === "PageDown") offset = getVisibleItemPageSize();
+        if (offset !== 0) {
+          e.preventDefault();
+          extendSelectionByOffset(offset);
+          return;
+        }
+        if (e.key === "Home") {
+          e.preventDefault();
+          extendSelectionToIndex(0);
+          return;
+        }
+        if (e.key === "End") {
+          e.preventDefault();
+          extendSelectionToIndex(Number.MAX_SAFE_INTEGER);
+          return;
+        }
+      }
       if (!primaryModifier && !e.altKey && !e.shiftKey && e.key === "Enter") {
         if (activeItemForEvent) {
           e.preventDefault();
@@ -1436,7 +1714,7 @@ function ExplorerContent() {
         !primaryModifier &&
         !e.altKey &&
         !e.shiftKey &&
-        (e.key === "Delete" || e.key === "Backspace")
+        e.key === "Delete"
       ) {
         e.preventDefault();
         void deleteSelectedItems();
@@ -1456,9 +1734,11 @@ function ExplorerContent() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [
     canUseFileShortcuts,
+    canUseDownloadShortcut,
     archiveSelectedItems,
     copySelectedItems,
     deleteSelectedItems,
+    downloadSelectedItems,
     extractSelectedItems,
     activePath,
     focusItemByIndex,
@@ -1475,6 +1755,13 @@ function ExplorerContent() {
     pasteClipboardItems,
     selectAll,
     selectedPaths.length,
+    setSort,
+    setViewMode,
+    toggleSelect,
+    copySelectedPathsText,
+    copySelectedNamesText,
+    extendSelectionByOffset,
+    extendSelectionToIndex,
   ]);
 
   // コンテキストメニュー（アイテム）
@@ -1540,12 +1827,12 @@ function ExplorerContent() {
 
   // Homeボタンのナビゲート先
   const homeNavigate = useCallback(() => {
-    if (isHfMode) {
+    if (filerTab === "hf" || isHfMode || isHfPath(currentPath)) {
       navigate(HF_PREFIX);
     } else {
       navigate(contextRootPath || "");
     }
-  }, [navigate, contextRootPath, isHfMode]);
+  }, [navigate, contextRootPath, currentPath, filerTab, isHfMode]);
 
   return (
     <div ref={explorerRootRef} className="flex flex-col h-full">
@@ -1631,6 +1918,9 @@ function ExplorerContent() {
             {/* Hydrus 検索バー（カスタムUIはこれだけ。結果は context の browseData に流す） */}
             {filerTab === "hydrus" && (
               <HydrusSearchBar
+                onPagingChange={(controller) => {
+                  hydrusPagingRef.current = controller;
+                }}
                 onResults={(data) => {
                   setBrowseData(data);
                   setHydrusError(null);
@@ -1702,7 +1992,7 @@ function ExplorerContent() {
             {filerTab !== "hydrus" && (
               <ExplorerToolbar
                 onNewFolder={() => setNewFolderOpen(true)}
-                onNewRecordTable={() => setNewRecordTableOpen(true)}
+                onAddHfReference={() => setHfReferenceOpen(true)}
               />
             )}
 
@@ -1867,7 +2157,7 @@ function ExplorerContent() {
               browseData &&
               browseData.directories.length === 0 &&
               browseData.files.length === 0 && (
-                <div className="mx-auto my-8 flex max-w-lg flex-col items-center overflow-hidden rounded-2xl border border-white/65 bg-white/56 text-center text-sm text-muted-foreground shadow-[inset_0_1px_rgba(255,255,255,0.76),0_24px_64px_-46px_rgba(6,81,110,0.75)] backdrop-blur-xl dark:border-white/12 dark:bg-card/75 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12),0_24px_64px_-46px_rgba(0,0,0,0.9)]">
+                <div className="mx-auto my-8 flex max-w-lg flex-col items-center overflow-hidden rounded-2xl border border-border bg-card text-center text-sm text-muted-foreground">
                   <img
                     src="/images/ui/empty-files.png"
                     alt=""
@@ -1920,13 +2210,6 @@ function ExplorerContent() {
           openEditor({ path, name });
         }}
       />
-      <NewRecordTableDialog
-        open={newRecordTableOpen}
-        onOpenChange={setNewRecordTableOpen}
-        onCreated={(file) => {
-          setRecordTableFile(file);
-        }}
-      />
       <RenameDialog
         item={renameTarget}
         open={renameTarget !== null}
@@ -1941,6 +2224,8 @@ function ExplorerContent() {
           files={browseData.files}
           onClose={() => setViewerFile(null)}
           onNavigate={(f) => setViewerFile(f)}
+          onBoundaryNavigate={isHydrusMode ? loadHydrusBoundary : undefined}
+          onAdjacentFiles={isHydrusMode ? preloadHydrusAdjacent : undefined}
         />
       )}
       {previewFile && (
@@ -1949,6 +2234,14 @@ function ExplorerContent() {
           onClose={() => setPreviewFile(null)}
         />
       )}
+      <HfReferenceDialog
+        open={hfReferenceOpen}
+        onOpenChange={setHfReferenceOpen}
+        onAdded={(path) => {
+          if (path) navigate(path);
+          else navigate(HF_PREFIX);
+        }}
+      />
     </div>
   );
 }

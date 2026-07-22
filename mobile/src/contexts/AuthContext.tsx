@@ -19,7 +19,10 @@ import {
   saveApiUrl,
 } from "../lib/auth";
 import { fetchApi, clearApiUrlCache, tryRefreshToken } from "../lib/api-client";
+import { clearFilesApiCaches } from "../lib/files-api";
+import { filesLocationCache } from "../lib/files-location-cache";
 import { clearLocalSyncCache } from "../repositories/sync-cache";
+import { runAuthScopeTransition } from "../sync/engine";
 import type { AuthResult, UserInfo } from "../types/api";
 
 interface AuthContextValue {
@@ -113,40 +116,51 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         authMode === "authenticated" && user
           ? `auth:${user.user_id}`
           : authMode;
-      if (currentScope !== nextScope) {
-        await clearLocalSyncCache();
-      }
-
-      await saveToken(result.access_token);
-      await saveAuthMode("authenticated");
-      setUser({
-        user_id: result.user_id!,
-        username: result.username!,
-        role: result.role!,
+      await runAuthScopeTransition(async () => {
+        if (currentScope !== nextScope) {
+          await clearLocalSyncCache();
+        }
+        filesLocationCache.clear();
+        clearFilesApiCaches();
+        await saveToken(result.access_token!);
+        await saveAuthMode("authenticated");
+        setUser({
+          user_id: result.user_id!,
+          username: result.username!,
+          role: result.role!,
+        });
+        setAuthMode("authenticated");
       });
-      setAuthMode("authenticated");
     },
     [authMode, user],
   );
 
   const continueAsGuest = useCallback(async () => {
-    if (authMode !== "anonymous" || user) {
-      await clearLocalSyncCache();
-    }
-    await removeToken();
-    await saveAuthMode("anonymous");
-    setUser(null);
-    setAuthMode("anonymous");
+    await runAuthScopeTransition(async () => {
+      if (authMode !== "anonymous" || user) {
+        await clearLocalSyncCache();
+      }
+      filesLocationCache.clear();
+      clearFilesApiCaches();
+      await removeToken();
+      await saveAuthMode("anonymous");
+      setUser(null);
+      setAuthMode("anonymous");
+    });
   }, [authMode, user]);
 
   const logout = useCallback(async () => {
-    if (authMode !== "anonymous" || user) {
-      await clearLocalSyncCache();
-    }
-    await removeToken();
-    await saveAuthMode("anonymous");
-    setUser(null);
-    setAuthMode("anonymous");
+    await runAuthScopeTransition(async () => {
+      if (authMode !== "anonymous" || user) {
+        await clearLocalSyncCache();
+      }
+      filesLocationCache.clear();
+      clearFilesApiCaches();
+      await removeToken();
+      await saveAuthMode("anonymous");
+      setUser(null);
+      setAuthMode("anonymous");
+    });
   }, [authMode, user]);
 
   return (

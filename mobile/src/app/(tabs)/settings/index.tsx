@@ -1,5 +1,11 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { ScrollView, StyleSheet, View } from "react-native";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { ActivityIndicator, ScrollView, StyleSheet, View } from "react-native";
 import {
   Button,
   Dialog,
@@ -16,19 +22,30 @@ import { useRouter } from "expo-router";
 import { useAuth } from "../../../contexts/AuthContext";
 import { useProject } from "../../../contexts/ProjectContext";
 import {
-  DEFAULT_MOBILE_LLM_SETTINGS,
-  getMobileLlmFallbackProvider,
-  getMobileLlmSettings,
-  getMobileLlmProfile,
+  getFallbackConfig,
+  getMainSlot,
+  getProviderProfile,
   isDirectProvider,
-  saveMobileLlmFallbackProvider,
-  saveMobileLlmProfile,
-  saveMobileLlmSettings,
-  type DirectMobileLlmProvider,
-  type MobileLlmFallbackProvider,
-  type MobileLlmProfile,
-  type MobileLlmProvider,
+  saveFallbackConfig,
+  saveMainSlot,
+  saveProviderProfile,
+  testMobileLlmConnection,
+  type MobileLlmFallbackConfig,
+  type MobileLlmProviderProfile,
+  type MobileLlmSlotSelection,
 } from "../../../lib/mobile-llm";
+import {
+  DIRECT_PROVIDER_ORDER,
+  fetchCloudModels,
+  getProviderDefinition,
+  getProviderLabel,
+  getSeedModelIds,
+  mergeModelIds,
+  readCachedModels,
+  writeCachedModels,
+  type DirectMobileLlmProvider,
+  type MobileLlmProvider,
+} from "../../../lib/cloud-model-catalog";
 import {
   llmEngineApi,
   type LlmEngineOption,
@@ -46,37 +63,21 @@ import type { UserSettings } from "../../../types/api";
 
 type ModelSlot = "main" | "fallback";
 
-const DIRECT_PROVIDER_LABELS: Record<DirectMobileLlmProvider, string> = {
-  openai: "OpenAI",
-  gemini: "Gemini",
-  openai_compatible: "OpenAI互換API",
-};
+const CUSTOM_MODEL_VALUE = "__custom__";
 
-const DIRECT_PROVIDERS: DirectMobileLlmProvider[] = [
-  "openai",
-  "gemini",
-  "openai_compatible",
-];
-
-const EMPTY_DIRECT_PROFILES: Record<DirectMobileLlmProvider, MobileLlmProfile> = {
-  openai: { apiKey: "", model: "gpt-4o-mini", baseUrl: "https://api.openai.com/v1" },
-  gemini: {
-    apiKey: "",
-    model: "gemini-1.5-flash",
-    baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+const EMPTY_PROVIDER_PROFILES: Record<
+  DirectMobileLlmProvider,
+  MobileLlmProviderProfile
+> = DIRECT_PROVIDER_ORDER.reduce(
+  (acc, provider) => {
+    acc[provider] = {
+      apiKey: "",
+      baseUrl: getProviderDefinition(provider).defaultBaseUrl,
+    };
+    return acc;
   },
-  openai_compatible: {
-    apiKey: "",
-    model: "gpt-4o-mini",
-    baseUrl: "https://api.openai.com/v1",
-  },
-};
-
-function isFallbackDirectProvider(
-  provider: MobileLlmFallbackProvider,
-): provider is DirectMobileLlmProvider {
-  return provider !== "off";
-}
+  {} as Record<DirectMobileLlmProvider, MobileLlmProviderProfile>,
+);
 
 export default function SettingsScreen() {
   const router = useRouter();
@@ -99,54 +100,72 @@ export default function SettingsScreen() {
   const [audioSettingsSaving, setAudioSettingsSaving] = useState(false);
   const [audioSettingsDialogVisible, setAudioSettingsDialogVisible] =
     useState(false);
-  const [chatProvider, setChatProvider] =
-    useState<MobileLlmProvider>("server");
-  const [chatFallbackProvider, setChatFallbackProvider] =
-    useState<MobileLlmFallbackProvider>("off");
-  const [modelSlotDialogVisible, setModelSlotDialogVisible] =
-    useState<ModelSlot | null>(null);
-  const [editingCredentialProvider, setEditingCredentialProvider] =
-    useState<DirectMobileLlmProvider | null>(null);
-  const [directProfiles, setDirectProfiles] =
-    useState<Record<DirectMobileLlmProvider, MobileLlmProfile>>(
-      EMPTY_DIRECT_PROFILES,
+  const [mainSlot, setMainSlot] = useState<MobileLlmSlotSelection>({
+    provider: "server",
+    model: "",
+  });
+  const [fallback, setFallback] = useState<MobileLlmFallbackConfig>({
+    enabled: false,
+    provider: "openai",
+    model: "",
+  });
+  const [providerProfiles, setProviderProfiles] =
+    useState<Record<DirectMobileLlmProvider, MobileLlmProviderProfile>>(
+      EMPTY_PROVIDER_PROFILES,
     );
-  const [chatApiKey, setChatApiKey] = useState("");
-  const [chatModel, setChatModel] = useState(DEFAULT_MOBILE_LLM_SETTINGS.model);
-  const [chatBaseUrl, setChatBaseUrl] = useState(
-    DEFAULT_MOBILE_LLM_SETTINGS.baseUrl,
-  );
-  const [chatSettingsSaved, setChatSettingsSaved] = useState(false);
+  // スロット編集ダイアログのドラフト状態。
+  const [slotDialog, setSlotDialog] = useState<ModelSlot | null>(null);
+  const [draftProvider, setDraftProvider] =
+    useState<MobileLlmProvider>("server");
+  const [draftSelectedModel, setDraftSelectedModel] = useState("");
+  const [draftCustomModel, setDraftCustomModel] = useState("");
+  const [draftApiKey, setDraftApiKey] = useState("");
+  const [draftBaseUrl, setDraftBaseUrl] = useState("");
+  const [draftFallbackEnabled, setDraftFallbackEnabled] = useState(true);
+  const [slotSaving, setSlotSaving] = useState(false);
+  const [slotSaveError, setSlotSaveError] = useState<string | null>(null);
+  const [connTesting, setConnTesting] = useState(false);
+  const [connResult, setConnResult] = useState<{
+    ok: boolean;
+    message?: string;
+  } | null>(null);
+  // モデル一覧（動的取得＋静的シードのマージ結果）とその取得状態。
+  const [draftModelChoices, setDraftModelChoices] = useState<string[]>([]);
+  const [modelListLoading, setModelListLoading] = useState(false);
+  const [modelListError, setModelListError] = useState<string | null>(null);
+  const [modelFilter, setModelFilter] = useState("");
+  // 直近のモデル取得リクエストを識別し、古い結果の反映を防ぐ。
+  const modelReqSeq = useRef(0);
   const [serverEngine, setServerEngine] = useState<LlmEngineState | null>(null);
   const [serverEngineSaving, setServerEngineSaving] = useState(false);
   const [serverEngineDialogVisible, setServerEngineDialogVisible] =
     useState(false);
   const [scopeDialogVisible, setScopeDialogVisible] = useState(false);
-  const [chatCredentialsDialogVisible, setChatCredentialsDialogVisible] =
-    useState(false);
 
-  const loadDirectProfiles = useCallback(async () => {
+  const loadProviderProfiles = useCallback(async () => {
     const entries = await Promise.all(
-      DIRECT_PROVIDERS.map(async (provider) => {
-        const profile = await getMobileLlmProfile(provider);
+      DIRECT_PROVIDER_ORDER.map(async (provider) => {
+        const profile = await getProviderProfile(provider);
         return [provider, profile] as const;
       }),
     );
-    const next = { ...EMPTY_DIRECT_PROFILES };
+    const next = { ...EMPTY_PROVIDER_PROFILES };
     for (const [provider, profile] of entries) {
       next[provider] = profile;
     }
-    setDirectProfiles(next);
+    setProviderProfiles(next);
     return next;
   }, []);
 
   useEffect(() => {
     void (async () => {
-      const llmSettings = await getMobileLlmSettings();
-      const fallbackProvider = await getMobileLlmFallbackProvider();
-      setChatProvider(llmSettings.provider);
-      setChatFallbackProvider(fallbackProvider);
-      await loadDirectProfiles();
+      const [slot, fallbackConfig] = await Promise.all([
+        getMainSlot(),
+        getFallbackConfig(),
+      ]);
+      setMainSlot(slot);
+      setFallback(fallbackConfig);
+      await loadProviderProfiles();
       if (!isAuthenticated) {
         return;
       }
@@ -160,7 +179,304 @@ export default function SettingsScreen() {
         // ignore
       }
     })();
-  }, [isAuthenticated, loadDirectProfiles]);
+  }, [isAuthenticated, loadProviderProfiles]);
+
+  // ドラフトのモデル選択（候補ラジオ or カスタム）を指定プロバイダーへ初期化する。
+  const initDraftModel = useCallback(
+    (provider: MobileLlmProvider, model: string) => {
+      if (!isDirectProvider(provider)) {
+        setDraftSelectedModel("");
+        setDraftCustomModel("");
+        return;
+      }
+      const definition = getProviderDefinition(provider);
+      const trimmed = model.trim();
+      const inCandidates = definition.models.some(
+        (candidate) => candidate.id === trimmed,
+      );
+      if (trimmed && inCandidates) {
+        setDraftSelectedModel(trimmed);
+        setDraftCustomModel("");
+      } else if (trimmed) {
+        setDraftSelectedModel(CUSTOM_MODEL_VALUE);
+        setDraftCustomModel(trimmed);
+      } else if (definition.models.length > 0) {
+        setDraftSelectedModel(definition.defaultModel);
+        setDraftCustomModel("");
+      } else {
+        setDraftSelectedModel(CUSTOM_MODEL_VALUE);
+        setDraftCustomModel("");
+      }
+    },
+    [],
+  );
+
+  // プロバイダーAPIからモデル一覧を取得する。
+  // キャッシュ→即時表示、その後バックグラウンドで最新取得して差し替える。
+  const loadModelChoices = useCallback(
+    async (provider: MobileLlmProvider, apiKey: string, baseUrl: string) => {
+      if (!isDirectProvider(provider)) {
+        setDraftModelChoices([]);
+        setModelListLoading(false);
+        setModelListError(null);
+        return;
+      }
+      const seq = ++modelReqSeq.current;
+      const seeds = getSeedModelIds(provider);
+      setModelListError(null);
+      setModelFilter("");
+      // 前プロバイダーの一覧が残像表示されないよう、まずシードへ同期的に差し替える。
+      setDraftModelChoices(seeds.slice());
+      // 1. キャッシュ（あれば）＋静的シードを即時表示。
+      const cached = await readCachedModels(provider).catch(() => []);
+      if (seq !== modelReqSeq.current) return;
+      setDraftModelChoices(mergeModelIds(cached, seeds));
+      // 2. バックグラウンドで最新を取得。
+      setModelListLoading(true);
+      try {
+        const fetched = await fetchCloudModels(provider, {
+          apiKey: apiKey.trim(),
+          baseUrl: baseUrl.trim(),
+        });
+        if (seq !== modelReqSeq.current) return;
+        if (fetched.length > 0) {
+          setDraftModelChoices(mergeModelIds(fetched, seeds));
+          void writeCachedModels(provider, fetched);
+        } else if (cached.length === 0) {
+          // 取得できず、キャッシュも無い（＝APIキー未入力など）。シードのみ表示。
+          setModelListError(
+            "モデル一覧を取得できませんでした（手入力可）",
+          );
+        }
+      } catch {
+        if (seq !== modelReqSeq.current) return;
+        setModelListError("モデル一覧を取得できませんでした（手入力可）");
+      } finally {
+        if (seq === modelReqSeq.current) setModelListLoading(false);
+      }
+    },
+    [],
+  );
+
+  const openSlotDialog = useCallback(
+    (slot: ModelSlot) => {
+      setSlotSaveError(null);
+      setConnResult(null);
+      if (slot === "main") {
+        const provider = mainSlot.provider;
+        setDraftProvider(provider);
+        initDraftModel(provider, mainSlot.model);
+        setDraftFallbackEnabled(true);
+        if (isDirectProvider(provider)) {
+          const profile = providerProfiles[provider];
+          const apiKey = profile?.apiKey ?? "";
+          const baseUrl =
+            profile?.baseUrl ?? getProviderDefinition(provider).defaultBaseUrl;
+          setDraftApiKey(apiKey);
+          setDraftBaseUrl(baseUrl);
+          void loadModelChoices(provider, apiKey, baseUrl);
+        } else {
+          setDraftApiKey("");
+          setDraftBaseUrl("");
+          setDraftModelChoices([]);
+        }
+      } else {
+        const provider = fallback.provider;
+        setDraftProvider(provider);
+        initDraftModel(provider, fallback.model);
+        setDraftFallbackEnabled(fallback.enabled);
+        const profile = providerProfiles[provider];
+        const apiKey = profile?.apiKey ?? "";
+        const baseUrl =
+          profile?.baseUrl ?? getProviderDefinition(provider).defaultBaseUrl;
+        setDraftApiKey(apiKey);
+        setDraftBaseUrl(baseUrl);
+        void loadModelChoices(provider, apiKey, baseUrl);
+      }
+      setSlotDialog(slot);
+    },
+    [fallback, initDraftModel, loadModelChoices, mainSlot, providerProfiles],
+  );
+
+  // ダイアログ内でプロバイダーを切り替えたら、そのプロバイダーの
+  // 共有プロファイルと既定モデルへドラフトを差し替える。
+  const applyDraftProvider = useCallback(
+    (provider: MobileLlmProvider) => {
+      setDraftProvider(provider);
+      setConnResult(null);
+      setSlotSaveError(null);
+      if (!isDirectProvider(provider)) {
+        setDraftApiKey("");
+        setDraftBaseUrl("");
+        setDraftModelChoices([]);
+        initDraftModel(provider, "");
+        return;
+      }
+      const definition = getProviderDefinition(provider);
+      const profile = providerProfiles[provider];
+      const apiKey = profile?.apiKey ?? "";
+      const baseUrl = profile?.baseUrl ?? definition.defaultBaseUrl;
+      setDraftApiKey(apiKey);
+      setDraftBaseUrl(baseUrl);
+      initDraftModel(provider, "");
+      void loadModelChoices(provider, apiKey, baseUrl);
+    },
+    [initDraftModel, loadModelChoices, providerProfiles],
+  );
+
+  const draftEffectiveModel =
+    draftSelectedModel === CUSTOM_MODEL_VALUE
+      ? draftCustomModel.trim()
+      : draftSelectedModel.trim();
+
+  // 動的一覧が届いた後、カスタム入力中のモデルが一覧に含まれていれば
+  // ラジオ選択へ昇格させる（一覧取得前は候補外＝カスタム扱いだったもの）。
+  useEffect(() => {
+    if (draftSelectedModel !== CUSTOM_MODEL_VALUE) return;
+    const custom = draftCustomModel.trim();
+    if (custom && draftModelChoices.includes(custom)) {
+      setDraftSelectedModel(custom);
+      setDraftCustomModel("");
+    }
+  }, [draftCustomModel, draftModelChoices, draftSelectedModel]);
+
+  // 動的取得済みのモデルへ静的候補のラベルを当てる（無ければIDそのまま）。
+  const modelLabelById = useMemo(() => {
+    const map = new Map<string, string>();
+    if (isDirectProvider(draftProvider)) {
+      for (const candidate of getProviderDefinition(draftProvider).models) {
+        map.set(candidate.id, candidate.label ?? candidate.id);
+      }
+    }
+    return map;
+  }, [draftProvider]);
+
+  const filteredModelChoices = useMemo(() => {
+    const query = modelFilter.trim().toLowerCase();
+    if (!query) return draftModelChoices;
+    return draftModelChoices.filter((id) =>
+      id.toLowerCase().includes(query),
+    );
+  }, [draftModelChoices, modelFilter]);
+
+  const handleRefreshModels = useCallback(() => {
+    void loadModelChoices(draftProvider, draftApiKey, draftBaseUrl);
+  }, [draftApiKey, draftBaseUrl, draftProvider, loadModelChoices]);
+
+  const handleTestConnection = useCallback(async () => {
+    if (!isDirectProvider(draftProvider)) return;
+    const definition = getProviderDefinition(draftProvider);
+    setConnTesting(true);
+    setConnResult(null);
+    try {
+      const result = await testMobileLlmConnection({
+        provider: draftProvider,
+        apiKey: draftApiKey,
+        model: draftEffectiveModel,
+        baseUrl: draftBaseUrl.trim() || definition.defaultBaseUrl,
+      });
+      setConnResult(result);
+    } finally {
+      setConnTesting(false);
+    }
+  }, [draftApiKey, draftBaseUrl, draftEffectiveModel, draftProvider]);
+
+  const handleSaveSlot = useCallback(async () => {
+    const slot = slotDialog;
+    if (!slot) return;
+    setSlotSaveError(null);
+
+    // メインスロットで Server を選択した場合はモデル不要。
+    if (slot === "main" && !isDirectProvider(draftProvider)) {
+      setSlotSaving(true);
+      try {
+        await saveMainSlot("server", "");
+        setMainSlot({ provider: "server", model: "" });
+        setSlotDialog(null);
+      } catch (error) {
+        setSlotSaveError(
+          error instanceof Error ? error.message : "保存に失敗しました。",
+        );
+      } finally {
+        setSlotSaving(false);
+      }
+      return;
+    }
+
+    if (!isDirectProvider(draftProvider)) return;
+    const definition = getProviderDefinition(draftProvider);
+    const model = draftEffectiveModel;
+    if (!model) {
+      setSlotSaveError("モデルIDを指定してください。");
+      return;
+    }
+    const baseUrl = draftBaseUrl.trim() || definition.defaultBaseUrl;
+    if (definition.baseUrlRequired && !baseUrl) {
+      setSlotSaveError("Base URL を入力してください。");
+      return;
+    }
+
+    setSlotSaving(true);
+    try {
+      await saveProviderProfile(draftProvider, {
+        apiKey: draftApiKey,
+        baseUrl,
+      });
+      const nextProfile: MobileLlmProviderProfile = {
+        apiKey: draftApiKey.trim(),
+        baseUrl,
+      };
+      if (slot === "main") {
+        await saveMainSlot(draftProvider, model);
+        setMainSlot({ provider: draftProvider, model });
+      } else {
+        const nextFallback: MobileLlmFallbackConfig = {
+          enabled: draftFallbackEnabled,
+          provider: draftProvider,
+          model,
+        };
+        await saveFallbackConfig(nextFallback);
+        setFallback(nextFallback);
+      }
+      setProviderProfiles((prev) => ({
+        ...prev,
+        [draftProvider]: nextProfile,
+      }));
+      setSlotDialog(null);
+    } catch (error) {
+      setSlotSaveError(
+        error instanceof Error ? error.message : "保存に失敗しました。",
+      );
+    } finally {
+      setSlotSaving(false);
+    }
+  }, [
+    draftApiKey,
+    draftBaseUrl,
+    draftEffectiveModel,
+    draftFallbackEnabled,
+    draftProvider,
+    slotDialog,
+  ]);
+
+  const handleToggleFallbackEnabled = useCallback(async () => {
+    const next: MobileLlmFallbackConfig = {
+      ...fallback,
+      enabled: !fallback.enabled,
+    };
+    // 有効化するのにモデル未設定ならダイアログを開いて設定を促す。
+    if (next.enabled && !fallback.model.trim()) {
+      openSlotDialog("fallback");
+      return;
+    }
+    try {
+      await saveFallbackConfig(next);
+      setFallback(next);
+    } catch {
+      // モデル未設定などで失敗した場合はダイアログへ誘導。
+      openSlotDialog("fallback");
+    }
+  }, [fallback, openSlotDialog]);
 
   const handleLogout = async () => {
     await logout();
@@ -196,93 +512,6 @@ export default function SettingsScreen() {
     } finally {
       setAudioSettingsSaving(false);
     }
-  };
-
-  const handleSelectMainProvider = useCallback(
-    async (provider: MobileLlmProvider) => {
-      const profile = await getMobileLlmProfile(provider);
-      await saveMobileLlmSettings({ provider, ...profile });
-      setChatProvider(provider);
-
-      if (isDirectProvider(provider) && chatFallbackProvider === provider) {
-        await saveMobileLlmFallbackProvider("off");
-        setChatFallbackProvider("off");
-      }
-
-      if (isDirectProvider(provider)) {
-        setDirectProfiles((prev) => ({ ...prev, [provider]: profile }));
-      }
-      setModelSlotDialogVisible(null);
-    },
-    [chatFallbackProvider],
-  );
-
-  const handleSelectFallbackProvider = useCallback(
-    async (provider: MobileLlmFallbackProvider) => {
-      const next =
-        isFallbackDirectProvider(provider) && provider === chatProvider
-          ? "off"
-          : provider;
-      await saveMobileLlmFallbackProvider(next);
-      setChatFallbackProvider(next);
-      if (isFallbackDirectProvider(next)) {
-        const profile = await getMobileLlmProfile(next);
-        setDirectProfiles((prev) => ({ ...prev, [next]: profile }));
-      }
-      setModelSlotDialogVisible(null);
-    },
-    [chatProvider],
-  );
-
-  const openCredentialsDialog = useCallback(
-    async (provider: DirectMobileLlmProvider) => {
-      const profile = await getMobileLlmProfile(provider);
-      setDirectProfiles((prev) => ({ ...prev, [provider]: profile }));
-      setEditingCredentialProvider(provider);
-      setChatApiKey(profile.apiKey);
-      setChatModel(profile.model);
-      setChatBaseUrl(profile.baseUrl);
-      setChatSettingsSaved(false);
-      setChatCredentialsDialogVisible(true);
-    },
-    [],
-  );
-
-  const handleSaveChatLlmSettings = async () => {
-    const provider = editingCredentialProvider;
-    if (!provider) return;
-    const profile = await getMobileLlmProfile(provider);
-    const model =
-      chatModel.trim() || profile.model || DEFAULT_MOBILE_LLM_SETTINGS.model;
-    const baseUrl =
-      chatBaseUrl.trim() ||
-      profile.baseUrl ||
-      DEFAULT_MOBILE_LLM_SETTINGS.baseUrl;
-    await saveMobileLlmProfile(provider, {
-      apiKey: chatApiKey,
-      model,
-      baseUrl,
-    });
-    if (chatProvider === provider) {
-      await saveMobileLlmSettings({
-        provider: chatProvider,
-        apiKey: chatApiKey,
-        model,
-        baseUrl,
-      });
-    }
-    setDirectProfiles((prev) => ({
-      ...prev,
-      [provider]: {
-        apiKey: chatApiKey.trim(),
-        model,
-        baseUrl,
-      },
-    }));
-    setChatModel(model);
-    setChatBaseUrl(baseUrl);
-    setChatSettingsSaved(true);
-    setTimeout(() => setChatSettingsSaved(false), 2000);
   };
 
   const handleSelectServerEngine = async (option: LlmEngineOption) => {
@@ -338,17 +567,28 @@ export default function SettingsScreen() {
     return "All projects";
   }, [projects, selectedProjectId, selectedSpaceId, spaces]);
 
-  const modelSlotSummary = useCallback(
-    (provider: MobileLlmProvider | MobileLlmFallbackProvider) => {
-      if (provider === "off") return "なし";
-      if (provider === "server") return `Server / ${currentServerEngineLabel}`;
-      const profile = directProfiles[provider];
-      const model = profile?.model?.trim() || "モデル未設定";
-      const keyStatus = profile?.apiKey?.trim() ? "APIキーあり" : "APIキー未設定";
-      return `${DIRECT_PROVIDER_LABELS[provider]} / ${model} / ${keyStatus}`;
+  const directSlotSummary = useCallback(
+    (provider: DirectMobileLlmProvider, model: string) => {
+      const modelLabel = model.trim() || "モデル未設定";
+      const keyStatus = providerProfiles[provider]?.apiKey?.trim()
+        ? "APIキーあり"
+        : "APIキー未設定";
+      return `${getProviderLabel(provider)} / ${modelLabel} / ${keyStatus}`;
     },
-    [currentServerEngineLabel, directProfiles],
+    [providerProfiles],
   );
+
+  const mainSlotSummary = useMemo(() => {
+    if (!isDirectProvider(mainSlot.provider)) {
+      return `Server / ${currentServerEngineLabel}`;
+    }
+    return directSlotSummary(mainSlot.provider, mainSlot.model);
+  }, [currentServerEngineLabel, directSlotSummary, mainSlot]);
+
+  const fallbackSlotSummary = useMemo(() => {
+    if (!fallback.enabled) return "無効（メインのみ使用）";
+    return directSlotSummary(fallback.provider, fallback.model);
+  }, [directSlotSummary, fallback]);
 
   const customInstructionsSummary = customInstructions.trim()
     ? "設定済み"
@@ -436,7 +676,7 @@ export default function SettingsScreen() {
       <Surface style={styles.section} elevation={0}>
         <Text style={styles.sectionTitle}>会話・AI応答</Text>
         <Text style={styles.helperText}>
-          通常使うメインモデルと、失敗時だけ使うフォールバックモデルを指定します。
+          通常使うメインモデルと、メインの送信失敗時のみ使うフォールバックモデルを指定します。Direct各種は自分のクラウドAPIキーが必要です。
         </Text>
         <View style={styles.modelSlotList}>
           <Surface style={styles.modelSlotCard} elevation={0}>
@@ -444,21 +684,22 @@ export default function SettingsScreen() {
               <View style={styles.modelSlotText}>
                 <Text style={styles.settingLabel}>メイン</Text>
                 <Text style={styles.settingValue} numberOfLines={2}>
-                  {modelSlotSummary(chatProvider)}
+                  {mainSlotSummary}
                 </Text>
                 <Text style={styles.settingHint}>通常の会話応答で使います。</Text>
               </View>
               <Button
+                accessibilityLabel="メイン設定を開く"
                 mode="outlined"
                 compact
                 style={styles.compactButton}
-                onPress={() => setModelSlotDialogVisible("main")}
+                onPress={() => openSlotDialog("main")}
               >
-                選択
+                設定
               </Button>
             </View>
-            <View style={styles.slotActions}>
-              {chatProvider === "server" ? (
+            {mainSlot.provider === "server" ? (
+              <View style={styles.slotActions}>
                 <Button
                   mode="text"
                   compact
@@ -469,18 +710,8 @@ export default function SettingsScreen() {
                 >
                   Serverモデル
                 </Button>
-              ) : null}
-              {isDirectProvider(chatProvider) ? (
-                <Button
-                  mode="text"
-                  compact
-                  textColor="#89b4fa"
-                  onPress={() => void openCredentialsDialog(chatProvider)}
-                >
-                  資格情報
-                </Button>
-              ) : null}
-            </View>
+              </View>
+            ) : null}
           </Surface>
 
           <Surface style={styles.modelSlotCard} elevation={0}>
@@ -488,33 +719,29 @@ export default function SettingsScreen() {
               <View style={styles.modelSlotText}>
                 <Text style={styles.settingLabel}>フォールバック</Text>
                 <Text style={styles.settingValue} numberOfLines={2}>
-                  {modelSlotSummary(chatFallbackProvider)}
+                  {fallbackSlotSummary}
                 </Text>
                 <Text style={styles.settingHint}>
-                  メインが通信失敗・認証失敗・モデルエラーになった時だけ使います。
+                  メインの送信失敗時のみ使用します。自分のクラウドAPIキーが必要です。
                 </Text>
               </View>
-              <Button
-                mode="outlined"
-                compact
-                style={styles.compactButton}
-                onPress={() => setModelSlotDialogVisible("fallback")}
-              >
-                選択
-              </Button>
-            </View>
-            {isFallbackDirectProvider(chatFallbackProvider) ? (
-              <View style={styles.slotActions}>
+              <View style={styles.fallbackSlotControls}>
+                <Switch
+                  accessibilityLabel="フォールバック切替"
+                  value={fallback.enabled}
+                  onValueChange={() => void handleToggleFallbackEnabled()}
+                />
                 <Button
-                  mode="text"
+                  accessibilityLabel="フォールバック設定を開く"
+                  mode="outlined"
                   compact
-                  textColor="#89b4fa"
-                  onPress={() => void openCredentialsDialog(chatFallbackProvider)}
+                  style={styles.compactButton}
+                  onPress={() => openSlotDialog("fallback")}
                 >
-                  資格情報
+                  設定
                 </Button>
               </View>
-            ) : null}
+            </View>
           </Surface>
         </View>
         <Divider style={styles.innerDivider} />
@@ -831,58 +1058,46 @@ export default function SettingsScreen() {
         </Dialog>
 
         <Dialog
-          visible={modelSlotDialogVisible !== null}
-          onDismiss={() => setModelSlotDialogVisible(null)}
+          visible={slotDialog !== null}
+          onDismiss={() => setSlotDialog(null)}
           style={styles.dialog}
         >
           <Dialog.Title style={styles.dialogTitle}>
-            {modelSlotDialogVisible === "fallback" ? "フォールバック" : "メイン"}
-            モデル
+            {slotDialog === "fallback" ? "フォールバック設定" : "メイン設定"}
           </Dialog.Title>
-          <Dialog.Content>
-            <Text style={styles.settingHint}>
-              {modelSlotDialogVisible === "fallback"
-                ? "メインが使えなかった時だけ使うDirectモデルを選びます。"
-                : "通常の会話応答に使うモデルを1つ選びます。"}
-            </Text>
-          </Dialog.Content>
           <Dialog.ScrollArea style={styles.dialogScrollArea}>
             <ScrollView contentContainerStyle={styles.dialogScrollContent}>
-              {modelSlotDialogVisible === "fallback" ? (
-                <RadioButton.Group
-                  value={chatFallbackProvider}
-                  onValueChange={(value) =>
-                    void handleSelectFallbackProvider(
-                      value as MobileLlmFallbackProvider,
-                    )
-                  }
-                >
-                  <RadioButton.Item
-                    label="なし"
-                    value="off"
-                    labelStyle={styles.radioLabel}
-                    color="#7c3aed"
-                    uncheckedColor="#585b70"
+              <Text style={styles.settingHint}>
+                {slotDialog === "fallback"
+                  ? "メインの送信失敗時のみ使うプロバイダーとモデルを設定します。"
+                  : "通常の会話応答に使うプロバイダーとモデルを設定します。"}
+              </Text>
+
+              {slotDialog === "fallback" ? (
+                <View style={styles.switchRow}>
+                  <View style={styles.switchText}>
+                    <Text style={styles.settingLabel}>
+                      フォールバックを有効にする
+                    </Text>
+                    <Text style={styles.settingHint}>
+                      無効の間はメインが失敗しても切り替えません。
+                    </Text>
+                  </View>
+                  <Switch
+                    value={draftFallbackEnabled}
+                    onValueChange={setDraftFallbackEnabled}
                   />
-                  {DIRECT_PROVIDERS.map((provider) => (
-                    <RadioButton.Item
-                      key={provider}
-                      label={`${DIRECT_PROVIDER_LABELS[provider]} / ${directProfiles[provider].model || "モデル未設定"}`}
-                      value={provider}
-                      labelStyle={styles.radioLabel}
-                      color="#7c3aed"
-                      uncheckedColor="#585b70"
-                      disabled={chatProvider === provider}
-                    />
-                  ))}
-                </RadioButton.Group>
-              ) : (
-                <RadioButton.Group
-                  value={chatProvider}
-                  onValueChange={(value) =>
-                    void handleSelectMainProvider(value as MobileLlmProvider)
-                  }
-                >
+                </View>
+              ) : null}
+
+              <Text style={styles.dialogSubheading}>プロバイダー</Text>
+              <RadioButton.Group
+                value={draftProvider}
+                onValueChange={(value) =>
+                  applyDraftProvider(value as MobileLlmProvider)
+                }
+              >
+                {slotDialog === "main" ? (
                   <RadioButton.Item
                     label={`Server / ${currentServerEngineLabel}`}
                     value="server"
@@ -890,78 +1105,183 @@ export default function SettingsScreen() {
                     color="#7c3aed"
                     uncheckedColor="#585b70"
                   />
-                  {DIRECT_PROVIDERS.map((provider) => (
-                    <RadioButton.Item
-                      key={provider}
-                      label={`${DIRECT_PROVIDER_LABELS[provider]} / ${directProfiles[provider].model || "モデル未設定"}`}
-                      value={provider}
-                      labelStyle={styles.radioLabel}
-                      color="#7c3aed"
-                      uncheckedColor="#585b70"
+                ) : null}
+                {DIRECT_PROVIDER_ORDER.filter(
+                  (provider) => !getProviderDefinition(provider).advanced,
+                ).map((provider) => (
+                  <RadioButton.Item
+                    key={provider}
+                    label={getProviderDefinition(provider).label}
+                    value={provider}
+                    labelStyle={styles.radioLabel}
+                    color="#7c3aed"
+                    uncheckedColor="#585b70"
+                  />
+                ))}
+                <Divider style={styles.innerDivider} />
+                <Text style={styles.advancedNote}>上級者向け</Text>
+                {DIRECT_PROVIDER_ORDER.filter(
+                  (provider) => getProviderDefinition(provider).advanced,
+                ).map((provider) => (
+                  <RadioButton.Item
+                    key={provider}
+                    label={getProviderDefinition(provider).label}
+                    value={provider}
+                    labelStyle={styles.radioLabel}
+                    color="#7c3aed"
+                    uncheckedColor="#585b70"
+                  />
+                ))}
+              </RadioButton.Group>
+
+              {isDirectProvider(draftProvider) ? (
+                <>
+                  {getProviderDefinition(draftProvider).hint ? (
+                    <Text style={styles.settingHint}>
+                      {getProviderDefinition(draftProvider).hint}
+                    </Text>
+                  ) : null}
+
+                  <View style={styles.modelHeaderRow}>
+                    <Text style={styles.dialogSubheading}>モデル</Text>
+                    <View style={styles.modelHeaderActions}>
+                      {modelListLoading ? (
+                        <ActivityIndicator size={16} color="#89b4fa" />
+                      ) : null}
+                      <Button
+                        mode="text"
+                        compact
+                        textColor="#89b4fa"
+                        disabled={modelListLoading}
+                        onPress={handleRefreshModels}
+                      >
+                        {modelListLoading ? "取得中" : "再取得"}
+                      </Button>
+                    </View>
+                  </View>
+                  {modelListError ? (
+                    <Text style={styles.settingHint}>{modelListError}</Text>
+                  ) : null}
+                  {draftModelChoices.length > 8 ? (
+                    <TextInput
+                      label="モデルを絞り込み"
+                      value={modelFilter}
+                      onChangeText={setModelFilter}
+                      mode="outlined"
+                      style={styles.dialogInput}
+                      autoCapitalize="none"
+                      dense
                     />
-                  ))}
-                </RadioButton.Group>
-              )}
+                  ) : null}
+                  <View style={styles.modelListBox}>
+                    <ScrollView
+                      style={styles.modelList}
+                      nestedScrollEnabled
+                      keyboardShouldPersistTaps="handled"
+                    >
+                      <RadioButton.Group
+                        value={draftSelectedModel}
+                        onValueChange={setDraftSelectedModel}
+                      >
+                        {filteredModelChoices.map((id) => (
+                          <RadioButton.Item
+                            key={id}
+                            label={modelLabelById.get(id) ?? id}
+                            value={id}
+                            labelStyle={styles.radioLabel}
+                            color="#7c3aed"
+                            uncheckedColor="#585b70"
+                          />
+                        ))}
+                        <RadioButton.Item
+                          label="カスタムモデルID"
+                          value={CUSTOM_MODEL_VALUE}
+                          labelStyle={styles.radioLabel}
+                          color="#7c3aed"
+                          uncheckedColor="#585b70"
+                        />
+                      </RadioButton.Group>
+                    </ScrollView>
+                  </View>
+                  {draftModelChoices.length === 0 ||
+                  draftSelectedModel === CUSTOM_MODEL_VALUE ? (
+                    <TextInput
+                      label="モデルID"
+                      value={draftCustomModel}
+                      onChangeText={setDraftCustomModel}
+                      mode="outlined"
+                      style={styles.dialogInput}
+                      autoCapitalize="none"
+                    />
+                  ) : null}
+
+                  <Text style={styles.dialogSubheading}>APIキー</Text>
+                  <Text style={styles.settingHint}>
+                    このプロバイダーのメイン／フォールバック共通で使います。
+                  </Text>
+                  <TextInput
+                    label="APIキー"
+                    value={draftApiKey}
+                    onChangeText={setDraftApiKey}
+                    onBlur={() => {
+                      // キー入力後にフォーカスを外したら最新一覧を取り直す。
+                      if (draftApiKey.trim()) handleRefreshModels();
+                    }}
+                    mode="outlined"
+                    style={styles.dialogInput}
+                    secureTextEntry
+                    autoCapitalize="none"
+                  />
+
+                  {getProviderDefinition(draftProvider).baseUrlEditable ? (
+                    <TextInput
+                      label={
+                        getProviderDefinition(draftProvider).baseUrlRequired
+                          ? "Base URL（必須）"
+                          : "Base URL"
+                      }
+                      value={draftBaseUrl}
+                      onChangeText={setDraftBaseUrl}
+                      onBlur={handleRefreshModels}
+                      mode="outlined"
+                      style={styles.dialogInput}
+                      autoCapitalize="none"
+                    />
+                  ) : null}
+
+                  <Button
+                    mode="text"
+                    compact
+                    textColor="#89b4fa"
+                    loading={connTesting}
+                    disabled={connTesting}
+                    onPress={() => void handleTestConnection()}
+                    style={styles.inlineButton}
+                  >
+                    接続テスト
+                  </Button>
+                  {connResult ? (
+                    <Text
+                      style={connResult.ok ? styles.savedText : styles.errorText}
+                    >
+                      {connResult.message ??
+                        (connResult.ok ? "接続に成功しました。" : "接続に失敗しました。")}
+                    </Text>
+                  ) : null}
+                </>
+              ) : null}
+
+              {slotSaveError ? (
+                <Text style={styles.errorText}>{slotSaveError}</Text>
+              ) : null}
             </ScrollView>
           </Dialog.ScrollArea>
           <Dialog.Actions>
-            <Button onPress={() => setModelSlotDialogVisible(null)}>閉じる</Button>
-          </Dialog.Actions>
-        </Dialog>
-
-        <Dialog
-          visible={chatCredentialsDialogVisible}
-          onDismiss={() => setChatCredentialsDialogVisible(false)}
-          style={styles.dialog}
-        >
-          <Dialog.Title style={styles.dialogTitle}>
-            {editingCredentialProvider
-              ? `${DIRECT_PROVIDER_LABELS[editingCredentialProvider]} 資格情報`
-              : "Direct資格情報"}
-          </Dialog.Title>
-          <Dialog.Content>
-            <Text style={styles.settingHint}>
-              メインまたはフォールバックでこのプロバイダーを選んだ時に使います。
-            </Text>
-            <TextInput
-              label="APIキー"
-              value={chatApiKey}
-              onChangeText={setChatApiKey}
-              mode="outlined"
-              style={styles.dialogInput}
-              secureTextEntry
-              autoCapitalize="none"
-              disabled={!editingCredentialProvider}
-            />
-            <TextInput
-              label="Model"
-              value={chatModel}
-              onChangeText={setChatModel}
-              mode="outlined"
-              style={styles.dialogInput}
-              autoCapitalize="none"
-              disabled={!editingCredentialProvider}
-            />
-            <TextInput
-              label="Base URL"
-              value={chatBaseUrl}
-              onChangeText={setChatBaseUrl}
-              mode="outlined"
-              style={styles.dialogInput}
-              autoCapitalize="none"
-              disabled={!editingCredentialProvider}
-            />
-            {chatSettingsSaved ? (
-              <Text style={styles.savedText}>Saved</Text>
-            ) : null}
-          </Dialog.Content>
-          <Dialog.Actions>
-            <Button onPress={() => setChatCredentialsDialogVisible(false)}>
-              閉じる
-            </Button>
+            <Button onPress={() => setSlotDialog(null)}>閉じる</Button>
             <Button
-              disabled={!editingCredentialProvider}
-              onPress={() => void handleSaveChatLlmSettings()}
+              loading={slotSaving}
+              disabled={slotSaving}
+              onPress={() => void handleSaveSlot()}
             >
               保存
             </Button>
@@ -1130,6 +1450,23 @@ const styles = StyleSheet.create({
     gap: 8,
     marginTop: 8,
   },
+  fallbackSlotControls: {
+    alignItems: "center",
+    gap: 8,
+  },
+  dialogSubheading: {
+    color: "#cdd6f4",
+    fontSize: 13,
+    fontWeight: "600",
+    marginTop: 16,
+    marginBottom: 4,
+  },
+  advancedNote: {
+    color: "#f9e2af",
+    fontSize: 12,
+    marginBottom: 4,
+  },
+  errorText: { color: "#f38ba8", marginTop: 10, fontSize: 13 },
   serverEngineBox: {
     backgroundColor: "#1e1e2e",
     borderColor: "#313244",
@@ -1202,6 +1539,24 @@ const styles = StyleSheet.create({
   dialogTitle: { color: "#cdd6f4" },
   dialogInput: { marginTop: 12 },
   savedText: { color: "#a6e3a1", marginTop: 10, fontSize: 13 },
+  modelHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  modelHeaderActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  modelListBox: {
+    borderColor: "#313244",
+    borderWidth: 1,
+    borderRadius: 8,
+    marginTop: 8,
+    overflow: "hidden",
+  },
+  modelList: { maxHeight: 240 },
   dialogScrollArea: { maxHeight: 420, borderColor: "#313244" },
   dialogScrollContent: { paddingVertical: 4 },
   inlineButton: { marginTop: 8, borderColor: "#7c3aed" },

@@ -9,7 +9,8 @@ export default function TasksLayout() {
       }}
     >
       <Stack.Screen name="index" options={{ headerShown: false }} />
-      <Stack.Screen name="[taskId]" options={{ title: 'Task Detail' }} />
+      <Stack.Screen name="create" options={{ title: "タスクを作成" }} />
+      <Stack.Screen name="[taskId]" options={{ title: "タスク詳細" }} />
     </Stack>
   );
 }

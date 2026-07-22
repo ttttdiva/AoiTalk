@@ -22,7 +22,7 @@ import {
 } from "@/lib/ecc-api";
 import { formatLocalDate } from "@/lib/date-time";
 
-type BreakdownTab = "model" | "project" | "agent";
+type BreakdownTab = "model" | "project" | "agent" | "user";
 
 function formatCost(cost: number): string {
   return `$${cost.toFixed(4)}`;
@@ -49,7 +49,7 @@ function getDefaultDateRange(): { start: string; end: string } {
   return { start: formatLocalDate(start), end };
 }
 
-export function CostDashboardSection() {
+export function CostDashboardSection({ isAdmin }: { isAdmin: boolean }) {
   const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [dashboard, setDashboard] = useState<TokenUsageSummary | null>(null);
@@ -82,6 +82,15 @@ export function CostDashboardSection() {
       request_count: number;
     }>
   >([]);
+  const [userBreakdown, setUserBreakdown] = useState<
+    Array<{
+      user_id: string;
+      user_name?: string;
+      total_cost: number;
+      total_tokens: number;
+      request_count: number;
+    }>
+  >([]);
 
   const fetchDashboard = useCallback(async () => {
     setLoading(true);
@@ -103,14 +112,18 @@ export function CostDashboardSection() {
         usageApi.getByModel(dateFrom, dateTo),
         usageApi.getByProject(dateFrom, dateTo),
         usageApi.getByAgent(dateFrom, dateTo),
-      ]);
+      ] as const);
       if (results[0].status === "fulfilled") setModelBreakdown(results[0].value);
       if (results[1].status === "fulfilled") setProjectBreakdown(results[1].value);
       if (results[2].status === "fulfilled") setAgentBreakdown(results[2].value);
+      if (isAdmin) {
+        const users = await usageApi.getByUser(dateFrom, dateTo);
+        setUserBreakdown(users);
+      }
     } catch (err) {
       console.error("内訳データ取得失敗:", err);
     }
-  }, [dateFrom, dateTo]);
+  }, [dateFrom, dateTo, isAdmin]);
 
   const handleToggle = useCallback(() => {
     if (!expanded && !dashboard) {
@@ -153,6 +166,10 @@ export function CostDashboardSection() {
     () => [...agentBreakdown].sort((a, b) => b.total_cost - a.total_cost),
     [agentBreakdown],
   );
+  const sortedUserBreakdown = useMemo(
+    () => [...userBreakdown].sort((a, b) => b.total_tokens - a.total_tokens),
+    [userBreakdown],
+  );
 
   return (
     <Card size="sm">
@@ -164,6 +181,9 @@ export function CostDashboardSection() {
           <span className="flex items-center gap-2">
             <DollarSign className="size-4" />
             トークン使用量 / コストダッシュボード
+            <Badge variant="outline" className="text-[10px]">
+              {isAdmin ? "全体" : "自分"}
+            </Badge>
           </span>
           {expanded ? (
             <ChevronUp className="size-4" />
@@ -287,6 +307,7 @@ export function CostDashboardSection() {
                   <TabsTrigger value="model">モデル別</TabsTrigger>
                   <TabsTrigger value="project">プロジェクト別</TabsTrigger>
                   <TabsTrigger value="agent">エージェント別</TabsTrigger>
+                  {isAdmin && <TabsTrigger value="user">ユーザー別</TabsTrigger>}
                 </TabsList>
               </Tabs>
 
@@ -306,6 +327,9 @@ export function CostDashboardSection() {
                       )}
                       {breakdownTab === "agent" && (
                         <th className="py-1.5 pr-2 font-medium">エージェント</th>
+                      )}
+                      {breakdownTab === "user" && (
+                        <th className="py-1.5 pr-2 font-medium">ユーザー</th>
                       )}
                       <th className="py-1.5 pr-2 font-medium text-right">
                         トークン数
@@ -409,6 +433,36 @@ export function CostDashboardSection() {
                             colSpan={4}
                             className="py-4 text-center text-muted-foreground"
                           >
+                            データがありません
+                          </td>
+                        </tr>
+                      ))}
+                    {breakdownTab === "user" &&
+                      (sortedUserBreakdown.length > 0 ? (
+                        sortedUserBreakdown.map((row) => (
+                          <tr key={row.user_id} className="border-b border-border/50">
+                            <td className="py-1.5 pr-2">
+                              <div>{row.user_name || row.user_id}</div>
+                              {row.user_name && row.user_name !== row.user_id && (
+                                <div className="font-mono text-[10px] text-muted-foreground">
+                                  {row.user_id}
+                                </div>
+                              )}
+                            </td>
+                            <td className="py-1.5 pr-2 text-right">
+                              {formatTokens(row.total_tokens)}
+                            </td>
+                            <td className="py-1.5 pr-2 text-right font-medium">
+                              {formatCost(row.total_cost)}
+                            </td>
+                            <td className="py-1.5 text-right">
+                              {row.request_count.toLocaleString("ja-JP")}
+                            </td>
+                          </tr>
+                        ))
+                      ) : (
+                        <tr>
+                          <td colSpan={4} className="py-4 text-center text-muted-foreground">
                             データがありません
                           </td>
                         </tr>

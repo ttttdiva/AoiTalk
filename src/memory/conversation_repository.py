@@ -257,12 +257,16 @@ class ConversationRepository:
         self,
         session_id: str,
         touch_activity: bool = True,
+        expected_character_name: Optional[str] = None,
         **kwargs
     ) -> bool:
         """Update session fields
         
         Args:
             session_id: Session UUID string
+            expected_character_name: Optional optimistic-concurrency guard. If
+                set, the update is applied only while the row still contains
+                this character name.
             **kwargs: Fields to update (title, is_active, etc.)
             
         Returns:
@@ -276,6 +280,10 @@ class ConversationRepository:
             conditions = [ConversationSession.id == uuid.UUID(session_id)]
             if "deleted_at" not in kwargs:
                 conditions.append(ConversationSession.deleted_at.is_(None))
+            if expected_character_name is not None:
+                conditions.append(
+                    ConversationSession.character_name == expected_character_name
+                )
 
             stmt = update(ConversationSession).where(and_(*conditions)).values(**kwargs)
             

@@ -7,9 +7,11 @@ MCP: Codex CLI reads MCP config from ~/.codex/config.toml
      No command-line option is available.
 """
 
+import base64
 import json
 import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -46,6 +48,7 @@ class CodexCLIBackend(CLIBackendBase):
     ):
         self._model = model
         self._reasoning_effort = reasoning_effort
+        self._image_paths: list[Path] = []
         super().__init__()
 
     def get_cli_command(self, prompt: str) -> List[str]:
@@ -67,16 +70,18 @@ class CodexCLIBackend(CLIBackendBase):
         if model:
             cmd.extend(["--model", model])
 
+        for image_path in self._image_paths:
+            cmd.extend(["--image", str(image_path)])
+
         reasoning_effort = self._reasoning_effort or os.getenv("CODEX_REASONING_EFFORT")
         if reasoning_effort:
             cmd.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
 
-        approval_policy = os.getenv("CODEX_APPROVAL_POLICY")
-        if (
-            approval_policy is None
-            and policy.permission_policy == PermissionPolicy.AUTO_APPROVE
-        ):
-            approval_policy = "never"
+        approval_policy = (
+            "never"
+            if policy.permission_policy == PermissionPolicy.AUTO_APPROVE
+            else os.getenv("CODEX_APPROVAL_POLICY")
+        )
         if approval_policy:
             cmd.extend(["-c", f'approval_policy="{approval_policy.strip()}"'])
 
@@ -99,6 +104,35 @@ class CodexCLIBackend(CLIBackendBase):
     def get_provider_name(self) -> str:
         return "Codex CLI"
 
+    def prepare_image_attachment(
+        self, image_data: Dict[str, Any], cwd: Optional[Path] = None
+    ):
+        """Pass an image through Codex CLI's documented --image option."""
+        data_url = str(image_data.get("data") or "")
+        if not data_url:
+            return None
+        try:
+            header, encoded = data_url.split(",", 1) if data_url.startswith("data:") else ("", data_url)
+            mime_type = str(image_data.get("mimeType") or header.split(";", 1)[0].removeprefix("data:") or "image/png")
+            suffix = {
+                "image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
+                "image/webp": ".webp", "image/gif": ".gif",
+            }.get(mime_type, ".png")
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as fp:
+                fp.write(base64.b64decode(encoded))
+                path = Path(fp.name)
+            self._image_paths.append(path)
+
+            def cleanup() -> None:
+                for image_path in self._image_paths:
+                    image_path.unlink(missing_ok=True)
+                self._image_paths.clear()
+
+            return ("", cleanup)
+        except Exception as exc:
+            logger.warning("[Codex CLI] Image preparation failed: %s", exc)
+            return None
+
     def parse_output(self, raw_output: str) -> str:
         """Extract the final assistant message from Codex JSONL output."""
         agent_messages: list[str] = []
@@ -109,6 +143,9 @@ class CodexCLIBackend(CLIBackendBase):
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            if event.get("type") == "turn.completed":
+                self.set_last_usage(event.get("usage"))
                 continue
             if event.get("type") != "item.completed":
                 continue
@@ -173,16 +210,20 @@ class CodexCLIBackend(CLIBackendBase):
             return
         item_type = str(item.get("type") or "")
         label = self._stream_item_label(item)
+        operation_id = str(item.get("id") or item.get("call_id") or "").strip()
         if event_type == "item.started":
             if self._is_tool_like_item(item):
                 tool_name, tool_args = self._stream_tool_context(item)
+                payload = {
+                    "tool": tool_name,
+                    "tool_args": tool_args,
+                    "message": f"Codex CLI started {tool_name}",
+                }
+                if operation_id:
+                    payload["operation_id"] = operation_id
                 event_callback(
                     "tool_start",
-                    {
-                        "tool": tool_name,
-                        "tool_args": tool_args,
-                        "message": f"Codex CLI started {tool_name}",
-                    },
+                    payload,
                 )
             elif item_type:
                 event_callback(
@@ -196,18 +237,46 @@ class CodexCLIBackend(CLIBackendBase):
         if event_type == "item.completed":
             if self._is_tool_like_item(item):
                 tool_name, tool_args = self._stream_tool_context(item)
+                tool_result = {
+                    "tool": tool_name,
+                    "arguments": tool_args,
+                    "output": self._stream_item_output(item),
+                }
+                for source_key, target_key in (
+                    ("exit_code", "exit_code"),
+                    ("stderr", "stderr"),
+                    ("error", "error"),
+                ):
+                    value = item.get(source_key)
+                    if value is not None and value != "":
+                        tool_result[target_key] = value
+                exit_code = item.get("exit_code")
+                failed_status = str(item.get("status") or "").lower() in {
+                    "failed",
+                    "error",
+                }
+                nonzero_exit = exit_code is not None and str(exit_code).strip() not in {
+                    "0",
+                    "0.0",
+                }
+                if (failed_status or nonzero_exit) and not tool_result.get("error"):
+                    tool_result["error"] = (
+                        f"コマンドが終了コード {exit_code} で失敗しました"
+                        if exit_code is not None
+                        else "コマンドの実行に失敗しました"
+                    )
+                payload = {
+                    "tool": tool_name,
+                    "tool_args": tool_args,
+                    "message": f"Codex CLI completed {tool_name}",
+                    "tool_result": tool_result,
+                }
+                if operation_id:
+                    payload["operation_id"] = operation_id
+                    tool_result["tool_call_id"] = operation_id
                 event_callback(
                     "tool_end",
-                    {
-                        "tool": tool_name,
-                        "tool_args": tool_args,
-                        "message": f"Codex CLI completed {tool_name}",
-                        "tool_result": {
-                            "tool": tool_name,
-                            "arguments": tool_args,
-                            "output": self._stream_item_output(item),
-                        },
-                    },
+                    payload,
                 )
             elif item_type and item_type != "agent_message":
                 event_callback(
@@ -235,6 +304,24 @@ class CodexCLIBackend(CLIBackendBase):
             if command:
                 args["command"] = command
             return "shell_command", args
+
+        if item_type in {"file_change", "file_edit"}:
+            changes = item.get("changes")
+            args = {"changes": changes} if isinstance(changes, list) else {}
+            paths = [
+                str(change.get("path"))
+                for change in changes or []
+                if isinstance(change, dict) and change.get("path")
+            ]
+            if len(paths) == 1:
+                args["path"] = paths[0]
+            elif paths:
+                args["paths"] = paths
+            return "write_file", args
+
+        if item_type == "web_search":
+            query = item.get("query") or item.get("text")
+            return "web_search", {"query": query} if query else {}
 
         label = self._stream_item_label(item)
         args = {}
@@ -268,10 +355,12 @@ class CodexCLIBackend(CLIBackendBase):
         )
 
     def _stream_item_output(self, item: dict[str, Any]) -> str:
-        for key in ("output", "text", "result"):
+        for key in ("aggregated_output", "output", "text", "result"):
             value = item.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
+        if isinstance(item.get("changes"), list):
+            return json.dumps(item["changes"], ensure_ascii=False, default=str)
         return ""
 
     def _is_tool_like_item(self, item: dict[str, Any]) -> bool:
@@ -282,6 +371,10 @@ class CodexCLIBackend(CLIBackendBase):
             "function_call",
             "tool_call",
             "shell",
+            "file_change",
+            "file_edit",
+            "mcp_tool_call",
+            "web_search",
         }
 
     def parse_error_output(self, stdout: str, stderr: str, exit_code: int) -> Optional[str]:

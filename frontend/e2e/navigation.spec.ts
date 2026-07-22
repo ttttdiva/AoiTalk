@@ -55,6 +55,54 @@ test.describe("ナビゲーション", () => {
     await expect(page).toHaveURL(/\/docs/);
   });
 
+  test("設定のチェックでシナリオとTRPGタブを表示・非表示にできる", async ({
+    page,
+  }) => {
+    await addAuthCookie(page);
+    await mockAuthenticatedApis(page);
+
+    let navigationTabs = { scenarios: true, trpg: true };
+    await page.route("**/api/users/me/settings", async (route) => {
+      if (route.request().method() === "PATCH") {
+        const patch = route.request().postDataJSON() as {
+          navigation_tabs?: Partial<typeof navigationTabs>;
+        };
+        navigationTabs = {
+          ...navigationTabs,
+          ...patch.navigation_tabs,
+        };
+      }
+      await route.fulfill({
+        json: { settings: { navigation_tabs: navigationTabs } },
+      });
+    });
+
+    await page.goto("/settings");
+    const scenarioTab = page.locator('header nav a[href="/scenarios"]');
+    const trpgTab = page.locator('header nav a[href="/trpg"]');
+    await expect(scenarioTab).toBeVisible();
+    await expect(trpgTab).toBeVisible();
+
+    await page.getByRole("button", { name: "タブ表示" }).click();
+    const scenarioCheckbox = page.getByRole("checkbox", {
+      name: "シナリオタブを表示",
+    });
+    const trpgCheckbox = page.getByRole("checkbox", {
+      name: "TRPGタブを表示",
+    });
+    await scenarioCheckbox.click();
+    await expect(scenarioTab).toHaveCount(0);
+    await expect(trpgTab).toBeVisible();
+
+    await trpgCheckbox.click();
+    await expect(trpgTab).toHaveCount(0);
+
+    await scenarioCheckbox.click();
+    await trpgCheckbox.click();
+    await expect(scenarioTab).toBeVisible();
+    await expect(trpgTab).toBeVisible();
+  });
+
   test("timer-changedイベントでヘッダータイマーが即時更新される", async ({ page }) => {
     await addAuthCookie(page);
     await mockAuthenticatedApis(page);

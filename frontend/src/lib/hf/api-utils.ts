@@ -123,13 +123,3 @@ export function getMediaType(path: string): MediaType {
   if (TEXT_EXTENSIONS.has(ext)) return "text";
   return "other";
 }
-
-export function formatFileSize(bytes?: number | null): string {
-  if (bytes == null) return "-";
-  if (bytes === 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  const clamped = Math.min(i, units.length - 1);
-  const size = bytes / Math.pow(1024, clamped);
-  return `${size.toFixed(clamped > 0 ? 1 : 0)} ${units[clamped]}`;
-}

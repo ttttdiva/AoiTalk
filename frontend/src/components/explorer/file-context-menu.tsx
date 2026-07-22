@@ -2,6 +2,10 @@
 
 import { useEffect } from "react";
 import { createPortal } from "react-dom";
+import {
+  MenuMnemonicButton,
+  MenuMnemonicSurface,
+} from "@/components/ui/menu-mnemonic";
 import { useExplorer } from "@/contexts/explorer-context";
 import { useContextMenuPosition } from "@/hooks/use-context-menu-position";
 import {
@@ -150,6 +154,7 @@ export function FileContextMenu({
             {
               icon: FolderPlus,
               label: "新規フォルダ (F7)",
+              mnemonic: "N",
               action: () => {
                 onNewFolder?.();
                 onClose();
@@ -158,6 +163,7 @@ export function FileContextMenu({
             {
               icon: FilePlus,
               label: "新規テキストファイル (Shift+F7)",
+              mnemonic: "T",
               action: () => {
                 onNewTextFile?.();
                 onClose();
@@ -170,6 +176,7 @@ export function FileContextMenu({
             {
               icon: ClipboardPaste,
               label: "貼り付け",
+              mnemonic: "P",
               action: handlePasteBackground,
             },
           ]
@@ -177,6 +184,7 @@ export function FileContextMenu({
       {
         icon: RefreshCw,
         label: "更新",
+        mnemonic: "R",
         action: () => {
           refresh();
           onClose();
@@ -185,23 +193,24 @@ export function FileContextMenu({
     ];
 
     return createPortal(
-      <div
+      <MenuMnemonicSurface
         ref={menuRef}
         className="fixed z-50 min-w-48 rounded-lg border bg-popover p-1 shadow-md"
         style={menuStyle}
         onContextMenu={(e) => e.preventDefault()}
       >
         {backgroundItems.map((mi) => (
-          <button
+          <MenuMnemonicButton
             key={mi.label}
+            mnemonic={mi.mnemonic}
             className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-accent"
             onClick={mi.action}
           >
             <mi.icon className="size-3.5" />
             {mi.label}
-          </button>
+          </MenuMnemonicButton>
         ))}
-      </div>,
+      </MenuMnemonicSurface>,
       document.body,
     );
   }
@@ -350,11 +359,18 @@ export function FileContextMenu({
   const menuItems = [
     // 開く: フォルダは常に、ファイルはonOpenがある場合
     ...(isDirectory || (onOpen && (isTextFile || isRecordTable))
-      ? [{ icon: FolderOpen, label: "開く", action: handleOpen }]
+      ? [{ icon: FolderOpen, label: "開く", mnemonic: "O", action: handleOpen }]
       : []),
     // ダウンロード: 実体パスのファイル / フォルダ
     ...(!isRecordTable && !isVirtualPath
-      ? [{ icon: Download, label: "ダウンロード", action: handleDownload }]
+      ? [
+          {
+            icon: Download,
+            label: "ダウンロード",
+            mnemonic: "L",
+            action: handleDownload,
+          },
+        ]
       : []),
     // 画像を親フォルダの代表サムネに設定
     ...(canSetFolderThumb
@@ -362,6 +378,7 @@ export function FileContextMenu({
           {
             icon: ImageIcon,
             label: "親フォルダのサムネに設定",
+            mnemonic: "T",
             action: handleSetFolderThumb,
           },
         ]
@@ -372,6 +389,7 @@ export function FileContextMenu({
           {
             icon: ImageOff,
             label: "サムネイル設定を解除",
+            mnemonic: "U",
             action: handleClearFolderThumb,
           },
         ]
@@ -381,6 +399,7 @@ export function FileContextMenu({
           {
             icon: Pencil,
             label: "リネーム",
+            mnemonic: "R",
             action: () => {
               onRename(item);
               onClose();
@@ -389,6 +408,7 @@ export function FileContextMenu({
           {
             icon: Trash2,
             label: "削除",
+            mnemonic: "D",
             action: handleDelete,
             destructive: true,
           },
@@ -399,19 +419,28 @@ export function FileContextMenu({
           {
             icon: Pencil,
             label: "リネーム",
+            mnemonic: "R",
             action: () => {
               onRename(item);
               onClose();
             },
           },
-          { icon: Copy, label: "コピー", action: handleCopy },
-          { icon: Scissors, label: "切り取り", action: handleCut },
+          { icon: Copy, label: "コピー", mnemonic: "C", action: handleCopy },
+          { icon: Scissors, label: "切り取り", mnemonic: "K", action: handleCut },
           ...(clipboard
-            ? [{ icon: ClipboardPaste, label: "貼り付け", action: handlePaste }]
+            ? [
+                {
+                  icon: ClipboardPaste,
+                  label: "貼り付け",
+                  mnemonic: "P",
+                  action: handlePaste,
+                },
+              ]
             : []),
           {
             icon: Trash2,
             label: "削除",
+            mnemonic: "D",
             action: handleDelete,
             destructive: true,
           },
@@ -422,6 +451,7 @@ export function FileContextMenu({
           {
             icon: Info,
             label: "プロパティ",
+            mnemonic: "I",
             action: () => {
               onProperties(item);
               onClose();
@@ -432,15 +462,16 @@ export function FileContextMenu({
   ];
 
   return createPortal(
-    <div
+    <MenuMnemonicSurface
       ref={menuRef}
       className="fixed z-50 min-w-40 rounded-lg border bg-popover p-1 shadow-md"
       style={menuStyle}
       onContextMenu={(e) => e.preventDefault()}
     >
       {menuItems.map((mi) => (
-        <button
+        <MenuMnemonicButton
           key={mi.label}
+          mnemonic={mi.mnemonic}
           className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-accent ${
             "destructive" in mi ? "text-destructive" : ""
           }`}
@@ -448,9 +479,9 @@ export function FileContextMenu({
         >
           <mi.icon className="size-3.5" />
           {mi.label}
-        </button>
+        </MenuMnemonicButton>
       ))}
-    </div>,
+    </MenuMnemonicSurface>,
     document.body,
   );
 }

@@ -38,6 +38,8 @@ export async function GET(request: NextRequest) {
   return NextResponse.json({
     workspace: serializeWorkspace(state.workspace),
     nodes: state.nodes.map(serializeNode),
+    has_children_ids: state.hasChildrenIds,
+    loaded_children_parent_ids: state.loadedChildrenParentIds,
     supertags: state.supertags.map(serializeSupertag),
     node_supertags: state.nodeSupertags.map(serializeNodeSupertag),
     supertag_fields: state.supertagFields.map(serializeSupertagField),

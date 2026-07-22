@@ -4,6 +4,11 @@ import type {
   ConversationMessage,
   ConversationSession,
 } from "../../types/api";
+import type { DirectMobileLlmSelection } from "../../lib/mobile-llm";
+import type {
+  ChatCommandCapability,
+  SkillSlashCommand,
+} from "./chat-commands";
 
 export type UserCapability = "anonymous" | "authenticated" | "admin" | "restricted";
 
@@ -179,7 +184,10 @@ export type SendConversationCommand = {
   includeProjectContext?: boolean;
   agentMode?: string;
   editMessageId?: string;
-  responseModel?: ChatResponseModelSelection;
+  target?:
+    | { kind: "server"; responseModel?: ChatResponseModelSelection }
+    | { kind: "direct"; selection: DirectMobileLlmSelection };
+  commandCapabilities?: ChatCommandCapability[];
 };
 
 export type ConversationControllerSnapshot = {
@@ -200,4 +208,5 @@ export type ConversationControllerSnapshot = {
   llmModeKind: string | null;
   responseModelOptions: ChatResponseModelOption[];
   responseModelOptionsLoading: boolean;
+  skillCommands: SkillSlashCommand[];
 };

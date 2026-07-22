@@ -24,15 +24,19 @@ import {
   isTaskCompletionTransition,
 } from "@/lib/task-completion-undo";
 import {
+  MenuMnemonicButton,
+  MenuMnemonicSurface,
+} from "@/components/ui/menu-mnemonic";
+import {
   TASK_STATUS_DOT_COLORS as STATUS_DOT,
   TASK_STATUS_KEY_HINTS as STATUS_KEY_HINT,
   TASK_STATUS_LABELS as STATUS_LABEL,
   TASK_STATUS_OPTIONS as STATUS_ORDER,
-  TASK_STATUS_SHORTCUT_KEYS as STATUS_SHORTCUT,
   type TaskStatusOption as Status,
 } from "@/lib/task-status";
 import { cn } from "@/lib/utils";
 import { useContextMenuPosition } from "@/hooks/use-context-menu-position";
+import { useConfirm } from "@/hooks/use-confirm";
 
 type Priority = "urgent" | "high" | "medium" | "low" | "none";
 
@@ -110,6 +114,7 @@ interface Props {
 }
 
 export function TaskContextMenu({ menu, onClose, onRefresh }: Props) {
+  const confirm = useConfirm();
   const { ref, style, submenuSide } = useContextMenuPosition(
     menu ? { x: menu.x, y: menu.y } : null,
     { fallbackWidth: 200, fallbackHeight: 300, submenuWidth: 160 },
@@ -233,9 +238,11 @@ export function TaskContextMenu({ menu, onClose, onRefresh }: Props) {
     onClose();
     try {
       if (task.has_recurrence && occurrenceContext?.start_at) {
-        const deleteFuture = window.confirm(
-          "この回以降の繰り返しを削除しますか？\nOK: 今回以降を削除\nCancel: 選択を続ける",
-        );
+        const deleteFuture = await confirm({
+          description:
+            "この回以降の繰り返しを削除しますか？\nOK: 今回以降を削除\nCancel: 選択を続ける",
+          destructive: true,
+        });
         if (deleteFuture) {
           await taskApi.deleteOccurrence(task.id, {
             mode: "future",
@@ -248,9 +255,10 @@ export function TaskContextMenu({ menu, onClose, onRefresh }: Props) {
           return;
         }
 
-        const deleteSingle = window.confirm(
-          "今回の発生分だけ削除しますか？\nOK: 今回だけ削除\nCancel: 中止",
-        );
+        const deleteSingle = await confirm({
+          description: "今回の発生分だけ削除しますか？\nOK: 今回だけ削除\nCancel: 中止",
+          destructive: true,
+        });
         if (!deleteSingle) return;
 
         await taskApi.deleteOccurrence(task.id, {
@@ -277,7 +285,7 @@ export function TaskContextMenu({ menu, onClose, onRefresh }: Props) {
   );
 
   return createPortal(
-    <div
+    <MenuMnemonicSurface
       ref={ref}
       className="fixed z-50 min-w-48 rounded-md border bg-popover p-1 text-popover-foreground shadow-md"
       style={style}
@@ -288,27 +296,22 @@ export function TaskContextMenu({ menu, onClose, onRefresh }: Props) {
         onMouseEnter={() => setStatusOpen(true)}
         onMouseLeave={() => setStatusOpen(false)}
       >
-        <button className="flex w-full items-center justify-between rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default">
+        <MenuMnemonicButton
+          className="flex w-full items-center justify-between rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default"
+          onClick={() => setStatusOpen(true)}
+        >
           <span className="flex items-center gap-2">
             <RefreshCw className="size-4" />
             ステータス変更
           </span>
           <ChevronRight className="size-4" />
-        </button>
+        </MenuMnemonicButton>
         {statusOpen && (
-          <div
-            className={submenuClassName}
-            onKeyDown={(e) => {
-              const target = STATUS_SHORTCUT[e.key.toLowerCase()];
-              if (target) {
-                e.preventDefault();
-                changeStatus(target);
-              }
-            }}
-          >
+          <MenuMnemonicSurface className={submenuClassName}>
             {STATUS_ORDER.map((status) => (
-              <button
+              <MenuMnemonicButton
                 key={status}
+                mnemonic={STATUS_KEY_HINT[status]}
                 className={cn(
                   "flex w-full items-center justify-between gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default",
                   task.status === status && "font-bold",
@@ -324,12 +327,9 @@ export function TaskContextMenu({ menu, onClose, onRefresh }: Props) {
                   />
                   {STATUS_LABEL[status]}
                 </span>
-                <kbd className="text-[10px] text-muted-foreground opacity-60">
-                  {STATUS_KEY_HINT[status]}
-                </kbd>
-              </button>
+              </MenuMnemonicButton>
             ))}
-          </div>
+          </MenuMnemonicSurface>
         )}
       </div>
 
@@ -338,18 +338,31 @@ export function TaskContextMenu({ menu, onClose, onRefresh }: Props) {
         onMouseEnter={() => setPriorityOpen(true)}
         onMouseLeave={() => setPriorityOpen(false)}
       >
-        <button className="flex w-full items-center justify-between rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default">
+        <MenuMnemonicButton
+          className="flex w-full items-center justify-between rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default"
+          mnemonic="P"
+          onClick={() => setPriorityOpen(true)}
+        >
           <span className="flex items-center gap-2">
             <Flag className="size-4" />
             優先度変更
           </span>
           <ChevronRight className="size-4" />
-        </button>
+        </MenuMnemonicButton>
         {priorityOpen && (
-          <div className={submenuClassName}>
+          <MenuMnemonicSurface className={submenuClassName}>
             {PRIORITY_ORDER.map((priority) => (
-              <button
+              <MenuMnemonicButton
                 key={priority}
+                mnemonic={
+                  {
+                    urgent: "U",
+                    high: "H",
+                    medium: "M",
+                    low: "L",
+                    none: "N",
+                  }[priority]
+                }
                 className={cn(
                   "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default",
                   task.priority === priority && "font-bold",
@@ -363,16 +376,17 @@ export function TaskContextMenu({ menu, onClose, onRefresh }: Props) {
                   )}
                 />
                 {PRIORITY_LABEL[priority]}
-              </button>
+              </MenuMnemonicButton>
             ))}
-          </div>
+          </MenuMnemonicSurface>
         )}
       </div>
 
       <div className="my-1 h-px bg-border" />
 
-      <button
+      <MenuMnemonicButton
         className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default"
+        mnemonic="T"
         onClick={toggleTimer}
       >
         {task.active_time_entry ? (
@@ -386,34 +400,37 @@ export function TaskContextMenu({ menu, onClose, onRefresh }: Props) {
             タイマー開始
           </>
         )}
-      </button>
+      </MenuMnemonicButton>
 
-      <button
+      <MenuMnemonicButton
         className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default"
+        mnemonic="C"
         onClick={duplicate}
       >
         <Copy className="size-4" />
         複製
-      </button>
+      </MenuMnemonicButton>
 
-      <button
+      <MenuMnemonicButton
         className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default"
+        mnemonic="I"
         onClick={copyTaskId}
       >
         <Hash className="size-4" />
         タスクIDをコピー
-      </button>
+      </MenuMnemonicButton>
 
       <div className="my-1 h-px bg-border" />
 
-      <button
+      <MenuMnemonicButton
         className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm text-red-600 hover:bg-red-100 dark:text-red-400 dark:hover:bg-red-900/30 cursor-default"
+        mnemonic="D"
         onClick={remove}
       >
         <Trash2 className="size-4" />
         削除
-      </button>
-    </div>,
+      </MenuMnemonicButton>
+    </MenuMnemonicSurface>,
     document.body,
   );
 }

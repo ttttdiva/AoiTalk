@@ -11,11 +11,17 @@ from typing import Optional
 from .models import SkillTriggerMode
 
 
-def resolve_skill_slash_command(message: str) -> Optional[str]:
+def resolve_skill_slash_command(
+    message: str,
+    *,
+    project_id: Optional[str] = None,
+) -> Optional[str]:
     """先頭の `/skill名` を検出し、対象スキルなら展開済みプロンプトを返す。
 
     Args:
         message: ユーザー入力メッセージ
+        project_id: 呼び出し元でアクセス権を検証済みのプロジェクトID。
+            None の場合はグローバルスキルだけを解決する。
 
     Returns:
         マッチしたスキルの展開済みプロンプト。
@@ -40,9 +46,16 @@ def resolve_skill_slash_command(message: str) -> Optional[str]:
     input_text = parts[1].strip() if len(parts) > 1 else ""
 
     from .registry import get_skill_registry
+    from .loader import load_project_skills
 
     registry = get_skill_registry()
-    skill = registry.get_by_alias(token) or registry.get(token)
+    authorized_project_id = str(project_id or "").strip() or None
+    if authorized_project_id:
+        load_project_skills(authorized_project_id)
+    skill = (
+        registry.get_by_alias(token, authorized_project_id)
+        or registry.get(token, authorized_project_id)
+    )
     if not skill:
         return None
 

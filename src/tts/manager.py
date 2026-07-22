@@ -12,6 +12,8 @@ from .engines.voicevox_engine import VoicevoxEngine
 from .engines.aivisspeech_engine import AivisSpeechEngine
 from .engines.nijivoice_engine import NijivoiceEngine
 from .engines.miotts_engine import MioTTSEngine
+from .irodori_config import IRODORI_TTS_CHECKPOINT, normalize_irodori_settings
+from .yomi_linter import get_yomi_preflight_service
 IrodoriTTSEngine = None
 
 # Windows-only TTS engines (require pythonnet, pywin32, etc.)
@@ -63,6 +65,7 @@ class TTSManager:
         self.current_engine = None
         self.character_configs: Dict[str, Dict[str, Any]] = {}
         self.config = config or {}
+        self.yomi_preflight = get_yomi_preflight_service()
         
     def _preprocess_text(self, text: str) -> str:
         """Preprocess text to remove URLs before TTS
@@ -414,7 +417,6 @@ class TTSManager:
     async def create_irodori_tts_engine(
         self,
         hf_checkpoint: Optional[str] = None,
-        voice_design_checkpoint: Optional[str] = None,
         codec_repo: Optional[str] = None,
         refs_dir: Optional[str] = None,
         cache_dir: Optional[str] = None,
@@ -423,8 +425,7 @@ class TTSManager:
         """Create and initialize Irodori-TTS engine
 
         Args:
-            hf_checkpoint: HuggingFace model repo id or local checkpoint path
-            voice_design_checkpoint: HuggingFace VoiceDesign repo id or local checkpoint path
+            hf_checkpoint: Deprecated override; AoiTalk always uses its v3 model
             codec_repo: HuggingFace codec repo id
             refs_dir: Directory with reference voice audio files
             cache_dir: Directory for downloaded checkpoints
@@ -439,12 +440,11 @@ class TTSManager:
             IrodoriTTSEngine = _IrodoriTTSEngine
 
         irodori_settings = self.config.get('tts_settings', {}).get('irodori_tts', {})
+        normalize_irodori_settings(irodori_settings)
 
-        # Use provided values or fall back to config
-        hf_checkpoint = hf_checkpoint or irodori_settings.get('hf_checkpoint')
-        voice_design_checkpoint = (
-            voice_design_checkpoint or irodori_settings.get('voice_design_checkpoint')
-        )
+        # AoiTalk deliberately exposes one embedded Irodori model only. The
+        # adapter also enforces this boundary for direct callers.
+        hf_checkpoint = hf_checkpoint or IRODORI_TTS_CHECKPOINT
         codec_repo = codec_repo or irodori_settings.get('codec_repo')
         refs_dir = refs_dir or irodori_settings.get('refs_dir')
         cache_dir = cache_dir or irodori_settings.get('cache_dir')
@@ -452,7 +452,6 @@ class TTSManager:
 
         engine = IrodoriTTSEngine(
             hf_checkpoint=hf_checkpoint,
-            voice_design_checkpoint=voice_design_checkpoint,
             codec_repo=codec_repo,
             refs_dir=refs_dir,
             cache_dir=cache_dir,
@@ -464,9 +463,10 @@ class TTSManager:
             num_steps=irodori_settings.get('num_steps', 6),
             t_schedule_mode=irodori_settings.get('t_schedule_mode', 'sway'),
             sway_coeff=irodori_settings.get('sway_coeff', -1.0),
-            seconds=irodori_settings.get('seconds', 30.0),
+            seconds=irodori_settings.get('seconds'),
+            duration_scale=irodori_settings.get('duration_scale', 1.0),
             max_ref_seconds=irodori_settings.get('max_ref_seconds', 30.0),
-            ref_normalize_db=irodori_settings.get('ref_normalize_db'),
+            ref_normalize_db=irodori_settings.get('ref_normalize_db', -16.0),
             ref_ensure_max=irodori_settings.get('ref_ensure_max', True),
             cfg_scale_text=irodori_settings.get('cfg_scale_text', 3.0),
             cfg_scale_caption=irodori_settings.get('cfg_scale_caption', 3.0),
@@ -508,6 +508,19 @@ class TTSManager:
             return None
             
         engine = self.engines[self.current_engine]
+
+        # 全TTS共通の誤読リスク検出。無効時はモデルをロードせず、失敗時も原文を維持する。
+        try:
+            preflight = await self.yomi_preflight.process(
+                processed_text,
+                engine_name=self.current_engine,
+                engine=engine,
+                config=self.config,
+            )
+            processed_text = preflight.final_text
+        except Exception as exc:
+            # 任意のプリフライトが想定外の例外を漏らしてもTTS本体は止めない。
+            print(f"[TTSManager] Yomi Linter preflight warning: {exc}")
         
         # Get global speed adjustment from the DB-backed app config.
         speed_adjustment = self.config.get('tts', {}).get('speed_adjustment', 1.0)
@@ -758,13 +771,17 @@ class TTSManager:
                 irodori_kwargs = {
                     'voice_name': voice_name,
                     'character_name': character_name,
-                    'ref_wav': voice_config.get('ref_wav', kwargs.get('ref_wav')),
-                    'ref_latent': voice_config.get('ref_latent', kwargs.get('ref_latent')),
+                    'ref_wav': voice_config.get(
+                        'ref_wav', params.get('ref_wav', kwargs.get('ref_wav'))
+                    ),
+                    'ref_latent': voice_config.get(
+                        'ref_latent', params.get('ref_latent', kwargs.get('ref_latent'))
+                    ),
                     'caption': voice_config.get('caption', params.get('caption', kwargs.get('caption'))),
                     'no_ref': voice_config.get('no_ref', params.get('no_ref', kwargs.get('no_ref'))),
-                    'voice_design': voice_config.get(
-                        'voice_design',
-                        params.get('voice_design', kwargs.get('voice_design', False)),
+                    'seconds': params.get('seconds', kwargs.get('seconds')),
+                    'duration_scale': params.get(
+                        'duration_scale', kwargs.get('duration_scale')
                     ),
                     'num_steps': params.get('num_steps', kwargs.get('num_steps')),
                     't_schedule_mode': params.get(

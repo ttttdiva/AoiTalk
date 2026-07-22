@@ -23,14 +23,18 @@ import {
   ChevronUp,
   CornerDownRight,
   Trash2,
+  Pencil,
   Zap,
   Gauge,
 } from "lucide-react";
 import { MentionMenu, type MentionItem } from "@/components/chat/mention-menu";
-import {
-  GenerationProfileSelector,
-} from "@/components/chat/generation-profile-selector";
+import { GenerationProfileSelector } from "@/components/chat/generation-profile-selector";
 import { Button } from "@/components/ui/button";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
@@ -49,14 +53,23 @@ import {
   CommandGroup,
   CommandItem,
 } from "@/components/ui/command";
-import { cn } from "@/lib/utils";
+import { cn, formatBytes } from "@/lib/utils";
+import { resolveChatToolsRequired } from "@/lib/chat-tool-intent";
 import { useMarkdownShortcuts } from "@/hooks/use-markdown-shortcuts";
 import { useSnippetAutocomplete } from "@/hooks/use-snippet-autocomplete";
 import { SnippetPopup } from "@/components/ui/snippet-popup";
 import { useSnippets } from "@/contexts/snippets-context";
 import { useUserSettings } from "@/contexts/user-settings-context";
-import { getChatComposerShortcutAction } from "@/lib/chat-keyboard-shortcuts";
-import type { LlmMode } from "@/lib/chat-api";
+import {
+  getChatComposerShortcutAction,
+  resolveComposerBusyEnterAction,
+} from "@/lib/chat-keyboard-shortcuts";
+import { isOversizedMailAttachment } from "@/lib/chat-attachment-validation";
+import type {
+  ContextRequestSnapshot,
+  ContextSnapshot,
+  LlmMode,
+} from "@/lib/chat-api";
 import {
   getSettingsGenerationProfile,
   loadStoredGenerationProfile,
@@ -71,6 +84,7 @@ import {
   firstMatchingChatCommand,
   findChatCommand,
   isSlashCommandToken,
+  resolveChatCommandSubmission,
   type ActiveChatCommand,
   type ChatCommandDefinition,
   type ChatCommandCapability,
@@ -84,6 +98,7 @@ type ChatComposerProps = {
     mentions?: MentionItem[],
     generationProfile?: GenerationProfile,
     commandCapabilities?: ChatCommandCapability[],
+    toolsRequired?: boolean,
   ) => void;
   onSteer?: (content: string) => void;
   onStop?: () => void;
@@ -101,6 +116,10 @@ type ChatComposerProps = {
   onLlmModeChange?: (mode: LlmMode) => void;
   steeringInstructions?: SubmittedSteeringInstruction[];
   onClearSteeringInstructions?: () => void;
+  projectId?: string | null;
+  sessionId?: string | null;
+  contextSnapshot?: ContextSnapshot | null;
+  contextSnapshotStatus?: string;
 };
 
 export type SubmittedSteeringInstruction = {
@@ -109,6 +128,248 @@ export type SubmittedSteeringInstruction = {
   createdAt: string;
   status: "sending" | "queued" | "failed";
 };
+
+type QueuedChatMessage = {
+  id: string;
+  sessionId: string | null;
+  content: string;
+  generationProfile: GenerationProfile;
+  mentions: MentionItem[];
+  capabilities: ChatCommandCapability[];
+  toolsRequired?: boolean;
+};
+
+// crypto.randomUUID は secure context 限定のため、LAN の http 配信などでも
+// 落ちないようフォールバックを用意する。
+function createQueueId(): string {
+  if (
+    typeof crypto !== "undefined" &&
+    typeof crypto.randomUUID === "function"
+  ) {
+    return crypto.randomUUID();
+  }
+  return `queue-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function formatTokens(value?: number | null): string {
+  if (value == null || !Number.isFinite(value)) return "—";
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return Math.round(value).toLocaleString();
+}
+
+function resolveContextPercentage(
+  snapshot?: ContextRequestSnapshot | null,
+): number | null {
+  if (!snapshot) return null;
+  const provided = snapshot.usage_percent ?? snapshot.percentage;
+  if (provided != null) return Math.max(0, Math.min(100, provided));
+  if (snapshot.input_tokens != null && snapshot.context_window_tokens) {
+    return Math.max(
+      0,
+      Math.min(
+        100,
+        (snapshot.input_tokens / snapshot.context_window_tokens) * 100,
+      ),
+    );
+  }
+  return null;
+}
+
+function measurementLabel(value?: string): string {
+  return value === "measured"
+    ? "実測"
+    : value === "tokenizer_estimate" || value === "estimated"
+      ? "推定"
+      : value === "character_estimate" || value === "approximate"
+        ? "概算"
+        : "不明";
+}
+
+function ContextWindowInspector({
+  snapshot,
+  status,
+}: {
+  snapshot?: ContextSnapshot | null;
+  status?: string;
+}) {
+  const requests = snapshot?.requests?.length
+    ? snapshot.requests
+    : snapshot
+      ? [snapshot]
+      : [];
+  const [selectedRequestIndex, setSelectedRequestIndex] = useState<number | null>(
+    null,
+  );
+  const requestIndex = Math.min(
+    selectedRequestIndex ?? Math.max(0, requests.length - 1),
+    Math.max(0, requests.length - 1),
+  );
+  const current = requests[requestIndex] ?? null;
+  const latest = requests[requests.length - 1] ?? null;
+  const percentage = resolveContextPercentage(current);
+  const latestPercentage = resolveContextPercentage(latest);
+  const warning = percentage != null && percentage >= 80;
+  const latestWarning = latestPercentage != null && latestPercentage >= 80;
+  const remaining =
+    current?.remaining_tokens ??
+    (current?.context_window_tokens != null && current.input_tokens != null
+      ? Math.max(0, current.context_window_tokens - current.input_tokens)
+      : null);
+  const categories = (current?.components ?? current?.categories ?? []).filter(
+    (item) => item.tokens != null || item.preview || item.status === "deferred",
+  );
+  const ring =
+    latestPercentage == null
+      ? "conic-gradient(var(--muted-foreground) 12%, transparent 0)"
+      : `conic-gradient(${latestWarning ? "var(--destructive)" : "var(--primary)"} ${latestPercentage}%, var(--muted) 0)`;
+
+  return (
+    <Popover>
+      <PopoverTrigger
+        render={
+          <Button
+            type="button"
+            variant="ghost"
+            className={cn(
+              "h-10 shrink-0 gap-1 px-2 tabular-nums",
+              latestWarning && "text-destructive",
+            )}
+            aria-label="コンテキストウィンドウ使用量"
+            title="コンテキストウィンドウ"
+          />
+        }
+      >
+        <span
+          className="grid size-5 place-items-center rounded-full"
+          style={{ background: ring }}
+        >
+          <span className="size-3.5 rounded-full bg-card" />
+        </span>
+        <span className="hidden text-xs font-medium sm:inline">
+          {latestPercentage == null ? "—" : `${Math.round(latestPercentage)}%`}
+        </span>
+      </PopoverTrigger>
+      <PopoverContent
+        side="top"
+        align="end"
+        sideOffset={8}
+        className="max-h-[min(70vh,36rem)] w-[min(24rem,calc(100vw-1rem))] overflow-y-auto p-3"
+      >
+        <div className="space-y-3">
+          <div>
+            <div className="flex items-center justify-between gap-3">
+              <span className="font-medium">コンテキストウィンドウ</span>
+              <span className="text-sm font-semibold tabular-nums">
+                {current
+                  ? `${formatTokens(current.input_tokens)} / ${formatTokens(current.context_window_tokens)} (${percentage == null ? "—" : `${Math.round(percentage)}%`})`
+                  : "取得不能"}
+              </span>
+            </div>
+            <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted">
+              <div
+                className={cn(
+                  "h-full rounded-full",
+                  warning ? "bg-destructive" : "bg-primary",
+                )}
+                style={{ width: `${percentage ?? 0}%` }}
+              />
+            </div>
+          </div>
+          {current ? (
+            <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs">
+              <span className="text-muted-foreground">残りトークン</span>
+              <span className="text-right tabular-nums">
+                {formatTokens(remaining)}
+              </span>
+              <span className="text-muted-foreground">Provider</span>
+              <span
+                className="truncate text-right"
+                title={current.provider ?? undefined}
+              >
+                {current.provider ?? "不明"}
+              </span>
+              <span className="text-muted-foreground">Model</span>
+              <span
+                className="truncate text-right"
+                title={current.model ?? undefined}
+              >
+                {current.model ?? "不明"}
+              </span>
+              <span className="text-muted-foreground">計測</span>
+              <span className="text-right">
+                {measurementLabel(current.measurement)}
+              </span>
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              {status === "loading"
+                ? "取得中…"
+                : "このチャットには利用可能なSnapshotがありません。"}
+            </p>
+          )}
+          {requests.length > 1 && (
+            <div className="flex items-center justify-between border-t pt-2 text-xs">
+              <span>モデルリクエスト</span>
+              <select
+                className="max-w-52 rounded border bg-background px-2 py-1"
+                value={requestIndex}
+                onChange={(event) =>
+                  setSelectedRequestIndex(Number(event.target.value))
+                }
+              >
+                {requests.map((request, index) => (
+                  <option key={request.id ?? request.request_index ?? index} value={index}>
+                    {index + 1}. {request.model ?? "不明"}
+                    {index === requests.length - 1 ? " (最新)" : ""}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+          {categories.length > 0 && (
+            <div className="space-y-2 border-t pt-2">
+              <div className="text-xs font-medium">内訳</div>
+              {categories.map((item, index) => {
+                const itemPercentage =
+                  item.percentage ??
+                  (current?.input_tokens && item.tokens != null
+                    ? (item.tokens / current.input_tokens) * 100
+                    : null);
+                return (
+                  <div
+                    key={item.id ?? item.category ?? `${item.label}-${index}`}
+                    className="rounded-md border bg-muted/30 p-2 text-xs"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <span className="font-medium">{item.label}</span>
+                      <span className="shrink-0 tabular-nums">
+                        {formatTokens(item.tokens)}
+                        {itemPercentage == null
+                          ? ""
+                          : ` · ${itemPercentage.toFixed(1)}%`}
+                      </span>
+                    </div>
+                    <div className="mt-1 flex flex-wrap gap-x-2 text-[10px] text-muted-foreground">
+                      <span>{item.status ?? "active"}</span>
+                      <span>{measurementLabel(item.measurement)}</span>
+                      {item.source && <span>source: {item.source}</span>}
+                    </div>
+                    {item.preview && (
+                      <p className="mt-1 line-clamp-2 break-words text-muted-foreground">
+                        {item.preview}
+                      </p>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
 
 type SkillSlashCommand = {
   command: string;
@@ -132,10 +393,18 @@ type SkillApiItem = {
   trigger_mode?: string;
 };
 
-async function fetchSkillSlashCommands(): Promise<SkillSlashCommand[]> {
-  const res = await fetch("/api/python-proxy/skills", {
-    credentials: "include",
-  });
+async function fetchSkillSlashCommands(
+  projectId?: string | null,
+): Promise<SkillSlashCommand[]> {
+  const searchParams = new URLSearchParams();
+  if (projectId) searchParams.set("project_id", projectId);
+  const query = searchParams.toString();
+  const res = await fetch(
+    `/api/python-proxy/skills${query ? `?${query}` : ""}`,
+    {
+      credentials: "include",
+    },
+  );
   if (!res.ok) throw new Error(`API Error: ${res.status}`);
   const data: { skills?: SkillApiItem[] } = await res.json();
   return (
@@ -151,18 +420,15 @@ async function fetchSkillSlashCommands(): Promise<SkillSlashCommand[]> {
   );
 }
 
-function formatFileSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
 function isImageFile(file: File) {
   return file.type.startsWith("image/");
 }
 
 function isAudioFile(file: File) {
-  return file.type.startsWith("audio/") || /\.(wav|mp3|m4a|flac|ogg|webm)$/i.test(file.name);
+  return (
+    file.type.startsWith("audio/") ||
+    /\.(wav|mp3|m4a|flac|ogg|webm)$/i.test(file.name)
+  );
 }
 
 const MAX_IMAGE_ATTACHMENTS = 4;
@@ -189,7 +455,7 @@ function ComposerAttachmentPreview({
   }, [previewUrl]);
 
   return (
-    <div className="group relative flex max-w-full items-center gap-2 rounded-lg border border-white/60 bg-white/52 p-2 pr-8 text-sm text-foreground shadow-[inset_0_1px_rgba(255,255,255,0.7)] backdrop-blur-xl dark:border-white/12 dark:bg-card/70 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12)]">
+    <div className="group relative flex max-w-full items-center gap-2 rounded-lg border border-border bg-card p-2 pr-8 text-sm text-foreground">
       {previewUrl ? (
         // eslint-disable-next-line @next/next/no-img-element
         <img
@@ -207,7 +473,7 @@ function ComposerAttachmentPreview({
           {file.name}
         </div>
         <div className="text-xs text-muted-foreground">
-          {formatFileSize(file.size)}
+          {formatBytes(file.size)}
         </div>
       </div>
       <button
@@ -410,7 +676,7 @@ function SteeringInstructionPreview({
     instructions.length > 1 ? `追加指示 ${instructions.length}件` : "追加指示";
 
   return (
-    <div className="overflow-hidden rounded-xl border border-border/70 bg-muted/35 text-xs shadow-sm backdrop-blur-xl">
+    <div className="overflow-hidden rounded-xl border border-border bg-muted text-xs shadow-sm">
       <div className="flex min-h-9 items-center gap-2 px-3 py-2">
         <button
           type="button"
@@ -486,8 +752,15 @@ export function ChatComposer({
   onLlmModeChange,
   steeringInstructions = [],
   onClearSteeringInstructions,
+  projectId,
+  sessionId,
+  contextSnapshot,
+  contextSnapshotStatus,
 }: ChatComposerProps) {
   const [value, setValue] = useState("");
+  const [messageQueue, setMessageQueue] = useState<QueuedChatMessage[]>([]);
+  const queueSuppressedRef = useRef(false);
+  const prevBusyRef = useRef(busy);
   const [showSlashMenu, setShowSlashMenu] = useState(false);
   const [slashSelectionIndex, setSlashSelectionIndex] = useState(0);
   const [skillCommands, setSkillCommands] = useState<SkillSlashCommand[]>([]);
@@ -511,6 +784,7 @@ export function ChatComposer({
     useState(false);
   const [llmModeMenuOpen, setLlmModeMenuOpen] = useState(false);
   const [toolsMenuOpen, setToolsMenuOpen] = useState(false);
+  const [toolFreeMode, setToolFreeMode] = useState(false);
   const [audioAttachmentEnabled, setAudioAttachmentEnabled] = useState(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -539,7 +813,8 @@ export function ChatComposer({
         if (!res.ok) return;
         const data = await res.json();
         const engine =
-          data?.settings?.model_routing?.classes?.audio?.engine ?? "speech_recognition";
+          data?.settings?.model_routing?.classes?.audio?.engine ??
+          "speech_recognition";
         if (!cancelled) setAudioAttachmentEnabled(engine !== "off");
       } catch {
         if (!cancelled) setAudioAttachmentEnabled(true);
@@ -600,7 +875,7 @@ export function ChatComposer({
   }, []);
   const webSearchActive = activeCommand?.capability === "web_search";
   const toolsMenuActive =
-    projectContextEnabled || deepResearchEnabled || webSearchActive;
+    projectContextEnabled || deepResearchEnabled || webSearchActive || toolFreeMode;
 
   useEffect(() => {
     textareaRef.current?.focus();
@@ -685,6 +960,57 @@ export function ChatComposer({
     adjustHeight();
   }, [value, adjustHeight]);
 
+  // 生成完了(busy true→false)でキュー先頭を1件ずつ通常送信する
+  useEffect(() => {
+    const wasBusy = prevBusyRef.current;
+    prevBusyRef.current = busy;
+    if (
+      wasBusy &&
+      !busy &&
+      !queueSuppressedRef.current &&
+      messageQueue.length > 0
+    ) {
+      const [next, ...rest] = messageQueue;
+      // セッション切り替えと同一レンダーで busy が false になった場合、
+      // 旧セッションのキューを現行セッションへ誤送信しないようガードする。
+      // 不一致なら送らず、後続のクリア effect に破棄させる。
+      if (next.sessionId !== (sessionId ?? null)) return;
+      queueMicrotask(() => {
+        setMessageQueue(rest);
+        onSend(
+          next.content,
+          undefined,
+          next.mentions.length ? next.mentions : undefined,
+          next.generationProfile,
+          next.capabilities.length ? next.capabilities : undefined,
+          next.toolsRequired,
+        );
+      });
+    }
+  }, [busy, messageQueue, onSend, sessionId]);
+
+  // セッション切り替えでキューを破棄する（value はクリアしない）
+  useEffect(() => {
+    const clearTimer = window.setTimeout(() => setMessageQueue([]), 0);
+    return () => window.clearTimeout(clearTimer);
+  }, [sessionId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    skillsFetchedRef.current = true;
+    fetchSkillSlashCommands(projectId)
+      .then((commands) => {
+        if (!cancelled) setSkillCommands(commands);
+      })
+      .catch((err) => {
+        console.warn("スキル一覧の取得に失敗:", err);
+        if (!cancelled) skillsFetchedRef.current = false;
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
   useEffect(() => {
     if (!showSlashMenu || selectedSlashMenuIndex < 0) return;
     const el = slashMenuRef.current?.querySelector<HTMLElement>(
@@ -693,31 +1019,36 @@ export function ChatComposer({
     el?.scrollIntoView({ block: "nearest" });
   }, [selectedSlashMenuIndex, showSlashMenu]);
 
-  const handleSend = useCallback(() => {
-    if (isSteeringMode) {
-      const instruction = value.trim();
-      if (!instruction || !onSteer) return;
-      onSteer(instruction);
-      setValue("");
-      requestAnimationFrame(() => {
-        if (textareaRef.current) {
-          textareaRef.current.style.height = "auto";
-          textareaRef.current.focus();
-        }
-      });
+  const enqueue = useCallback(() => {
+    const text = value.trim();
+    if (!text) return;
+    const submission = resolveChatCommandSubmission(
+      value,
+      activeCommand,
+      false,
+    );
+    if (submission.error) {
+      toast.error(submission.error);
       return;
     }
-    if (isEmpty || disabled) return;
-    onSend(
-      value.trim(),
-      attachedFiles.length > 0 ? attachedFiles : undefined,
-      mentions.length > 0 ? mentions : undefined,
-      generationProfile,
-      commandCapabilitiesForActiveCommand(activeCommand),
-    );
+    setMessageQueue((prev) => [
+      ...prev,
+      {
+        id: createQueueId(),
+        sessionId: sessionId ?? null,
+        content: submission.content,
+        generationProfile,
+        mentions,
+        capabilities: submission.capabilities ?? [],
+        toolsRequired: resolveChatToolsRequired(
+          submission.capabilities,
+          toolFreeMode,
+        ),
+      },
+    ]);
     setValue("");
     setActiveCommand(null);
-    onAttachedFilesChange([]);
+    setToolFreeMode(false);
     setMentions([]);
     requestAnimationFrame(() => {
       if (textareaRef.current) {
@@ -725,19 +1056,96 @@ export function ChatComposer({
         textareaRef.current.focus();
       }
     });
-  }, [
-    value,
-    isEmpty,
-    disabled,
-    isSteeringMode,
-    onSend,
-    onSteer,
-    attachedFiles,
-    mentions,
-    generationProfile,
-    activeCommand,
-    onAttachedFilesChange,
-  ]);
+  }, [value, activeCommand, generationProfile, mentions, sessionId, toolFreeMode]);
+
+  const handleSend = useCallback(
+    (options?: { steerImmediately?: boolean }) => {
+      if (isSteeringMode) {
+        const text = value.trim();
+        if (!text) return;
+        if (options?.steerImmediately) {
+          if (!onSteer) return;
+          onSteer(text);
+          setValue("");
+          requestAnimationFrame(() => {
+            if (textareaRef.current) {
+              textareaRef.current.style.height = "auto";
+              textareaRef.current.focus();
+            }
+          });
+        } else {
+          enqueue();
+        }
+        return;
+      }
+      const submission = resolveChatCommandSubmission(
+        value,
+        activeCommand,
+        attachedFiles.length > 0,
+      );
+      if (submission.error) {
+        toast.error(submission.error);
+        return;
+      }
+      if (isEmpty || disabled) return;
+      queueSuppressedRef.current = false;
+      onSend(
+        submission.content,
+        attachedFiles.length > 0 ? attachedFiles : undefined,
+        mentions.length > 0 ? mentions : undefined,
+        generationProfile,
+        submission.capabilities,
+        resolveChatToolsRequired(submission.capabilities, toolFreeMode),
+      );
+      setValue("");
+      setActiveCommand(null);
+      setToolFreeMode(false);
+      onAttachedFilesChange([]);
+      setMentions([]);
+      requestAnimationFrame(() => {
+        if (textareaRef.current) {
+          textareaRef.current.style.height = "auto";
+          textareaRef.current.focus();
+        }
+      });
+    },
+    [
+      value,
+      isEmpty,
+      disabled,
+      isSteeringMode,
+      onSend,
+      onSteer,
+      attachedFiles,
+      mentions,
+      generationProfile,
+      activeCommand,
+      onAttachedFilesChange,
+      enqueue,
+      toolFreeMode,
+    ],
+  );
+
+  const editQueuedMessage = useCallback((item: QueuedChatMessage) => {
+    setValue((cur) =>
+      cur.trim() ? `${cur.replace(/\s+$/, "")}\n${item.content}` : item.content,
+    );
+    setMentions((prev) => [...prev, ...item.mentions]);
+    setMessageQueue((prev) => prev.filter((q) => q.id !== item.id));
+    requestAnimationFrame(() => {
+      const textarea = textareaRef.current;
+      if (!textarea) return;
+      textarea.focus();
+      textarea.style.height = "auto";
+      const lineHeight = 24;
+      const maxHeight = lineHeight * 5;
+      textarea.style.height = `${Math.min(textarea.scrollHeight, maxHeight)}px`;
+    });
+  }, []);
+
+  const removeQueuedMessage = useCallback((id: string) => {
+    setMessageQueue((prev) => prev.filter((q) => q.id !== id));
+  }, []);
 
   const applyChatCommand = useCallback(
     (command: ChatCommandDefinition) => {
@@ -752,6 +1160,7 @@ export function ChatComposer({
           toast.success(`Project context: ${nextValue ? "on" : "off"}`);
         } else {
           const nextValue = !deepResearchEnabled;
+          if (nextValue) setToolFreeMode(false);
           onDeepResearchToggle?.(nextValue);
           toast.success(`Deep Research: ${nextValue ? "on" : "off"}`);
         }
@@ -759,6 +1168,7 @@ export function ChatComposer({
         return;
       }
 
+      setToolFreeMode(false);
       setActiveCommand(command);
       toast.success(`${command.label} を次の送信に適用します`);
       requestAnimationFrame(() => textareaRef.current?.focus());
@@ -788,6 +1198,7 @@ export function ChatComposer({
 
   const handleDeepResearchMenuToggle = useCallback(
     (checked: boolean) => {
+      if (checked) setToolFreeMode(false);
       onDeepResearchToggle?.(checked);
       requestAnimationFrame(() => textareaRef.current?.focus());
     },
@@ -801,6 +1212,7 @@ export function ChatComposer({
           toast.error("Web検索コマンドが見つかりません");
           return;
         }
+        setToolFreeMode(false);
         setActiveCommand(searchCommand);
         toast.success("Web検索を次の送信に適用します");
       } else if (webSearchActive) {
@@ -950,7 +1362,9 @@ export function ChatComposer({
       e.preventDefault();
       if (confirmSlashCommand()) return;
       if (!showSlashMenu && !showMentionMenu) {
-        handleSend();
+        handleSend({
+          steerImmediately: resolveComposerBusyEnterAction(e) === "steer",
+        });
       }
     }
     if (
@@ -976,13 +1390,13 @@ export function ChatComposer({
   const loadSkillCommands = useCallback(() => {
     if (skillsFetchedRef.current) return;
     skillsFetchedRef.current = true;
-    fetchSkillSlashCommands()
+    fetchSkillSlashCommands(projectId)
       .then(setSkillCommands)
       .catch((err) => {
         console.warn("スキル一覧の取得に失敗:", err);
         skillsFetchedRef.current = false;
       });
-  }, []);
+  }, [projectId]);
 
   const handleSlashSearchChange = useCallback(
     (nextValue: string) => {
@@ -1053,11 +1467,15 @@ export function ChatComposer({
         for (const file of incoming) {
           if (isImageFile(file)) {
             if (file.size > MAX_IMAGE_BYTES) {
-              toast.error(`画像は1枚 ${formatFileSize(MAX_IMAGE_BYTES)} までです`);
+              toast.error(
+                `画像は1枚 ${formatBytes(MAX_IMAGE_BYTES)} までです`,
+              );
               continue;
             }
             if (imageCount >= MAX_IMAGE_ATTACHMENTS) {
-              toast.error(`画像は最大 ${MAX_IMAGE_ATTACHMENTS} 枚まで添付できます`);
+              toast.error(
+                `画像は最大 ${MAX_IMAGE_ATTACHMENTS} 枚まで添付できます`,
+              );
               continue;
             }
             imageCount += 1;
@@ -1067,7 +1485,7 @@ export function ChatComposer({
               continue;
             }
             if (file.size > MAX_AUDIO_BYTES) {
-              toast.error(`音声は ${formatFileSize(MAX_AUDIO_BYTES)} までです`);
+              toast.error(`音声は ${formatBytes(MAX_AUDIO_BYTES)} までです`);
               continue;
             }
             if (audioCount >= MAX_AUDIO_ATTACHMENTS) {
@@ -1075,6 +1493,9 @@ export function ChatComposer({
               continue;
             }
             audioCount += 1;
+          } else if (isOversizedMailAttachment(file)) {
+            toast.error("メールファイルは 10 MB までです");
+            continue;
           }
           accepted.push(file);
         }
@@ -1130,7 +1551,7 @@ export function ChatComposer({
   );
 
   return (
-    <div className="border-t border-border/60 bg-background/48 p-4 shadow-[inset_0_1px_rgba(255,255,255,0.72)] backdrop-blur-2xl dark:shadow-[inset_0_1px_rgba(255,255,255,0.1)]">
+    <div className="border-t border-border bg-card p-4">
       <div className="mx-auto max-w-3xl space-y-2 transition-transform duration-200 ease-linear xl:translate-x-[var(--chat-viewport-offset)]">
         {/* 添付ファイルプレビュー */}
         {attachedFiles.length > 0 && (
@@ -1150,6 +1571,48 @@ export function ChatComposer({
             instructions={steeringInstructions}
             onClear={onClearSteeringInstructions}
           />
+        )}
+
+        {messageQueue.length > 0 && (
+          <div className="overflow-hidden rounded-xl border border-border bg-muted text-xs shadow-sm">
+            <div className="flex min-h-9 items-center gap-2 border-b border-border/60 px-3 py-2 font-medium text-muted-foreground">
+              <CornerDownRight className="size-3.5 shrink-0" />
+              <span>送信待ち {messageQueue.length}件</span>
+            </div>
+            <div className="max-h-32 space-y-1 overflow-y-auto px-3 py-2">
+              {messageQueue.map((item) => (
+                <div
+                  key={item.id}
+                  className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-2"
+                >
+                  <span
+                    className="min-w-0 truncate text-foreground/85"
+                    title={item.content}
+                  >
+                    {item.content}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => editQueuedMessage(item)}
+                    className="flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-background/70 hover:text-foreground"
+                    aria-label="この送信待ちを編集"
+                    title="編集"
+                  >
+                    <Pencil className="size-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => removeQueuedMessage(item.id)}
+                    className="flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-destructive hover:text-destructive-foreground"
+                    aria-label="この送信待ちを削除"
+                    title="削除"
+                  >
+                    <X className="size-3.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
         )}
 
         <div className="flex items-end gap-2">
@@ -1204,6 +1667,7 @@ export function ChatComposer({
               className="w-56"
             >
               <DropdownMenuCheckboxItem
+                mnemonic="P"
                 checked={projectContextEnabled}
                 onCheckedChange={(checked) =>
                   handleProjectContextMenuToggle(checked === true)
@@ -1214,6 +1678,7 @@ export function ChatComposer({
                 <span>Project context</span>
               </DropdownMenuCheckboxItem>
               <DropdownMenuCheckboxItem
+                mnemonic="D"
                 checked={deepResearchEnabled}
                 onCheckedChange={(checked) =>
                   handleDeepResearchMenuToggle(checked === true)
@@ -1224,6 +1689,7 @@ export function ChatComposer({
                 <span>Deep Research</span>
               </DropdownMenuCheckboxItem>
               <DropdownMenuCheckboxItem
+                mnemonic="W"
                 checked={webSearchActive}
                 onCheckedChange={(checked) =>
                   handleWebSearchMenuToggle(checked === true)
@@ -1233,8 +1699,21 @@ export function ChatComposer({
                 <Search className="size-4" />
                 <span>Web検索</span>
               </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                mnemonic="N"
+                checked={toolFreeMode}
+                disabled={deepResearchEnabled || webSearchActive}
+                onCheckedChange={(checked) =>
+                  setToolFreeMode(checked === true)
+                }
+                className="gap-2 py-1.5"
+              >
+                <Gauge className="size-4" />
+                <span>ツールなし（無料枠優先）</span>
+              </DropdownMenuCheckboxItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem
+                mnemonic="F"
                 onClick={() => fileInputRef.current?.click()}
                 className="gap-2 py-1.5"
               >
@@ -1247,7 +1726,7 @@ export function ChatComposer({
             ref={fileInputRef}
             type="file"
             multiple
-            accept="image/*,audio/*,.txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.xml,.log"
+            accept="image/*,audio/*,.txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.xml,.log,.msg,.eml,application/vnd.ms-outlook,message/rfc822"
             className="hidden"
             onChange={handleFileSelect}
           />
@@ -1383,7 +1862,7 @@ export function ChatComposer({
               }
               rows={1}
               className={cn(
-                "flex w-full resize-none rounded-xl border border-input bg-white/55 px-3 py-2.5 text-sm text-foreground shadow-[inset_0_1px_rgba(255,255,255,0.72)] transition-colors outline-none backdrop-blur-xl dark:bg-input/30 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12)]",
+                "flex w-full resize-none rounded-xl border border-input bg-card px-3 py-2.5 text-sm text-foreground transition-colors outline-none",
                 "placeholder:text-muted-foreground",
                 "focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50",
                 isDragOver && "border-primary ring-3 ring-primary/50",
@@ -1392,12 +1871,21 @@ export function ChatComposer({
             />
           </div>
 
+          <ContextWindowInspector
+            key={contextSnapshot?.message_id ?? contextSnapshot?.captured_at ?? "context-unavailable"}
+            snapshot={contextSnapshot}
+            status={contextSnapshotStatus}
+          />
+
           {isSteeringMode && onStop ? (
             <Button
               type="button"
               variant="destructive"
               size="icon"
-              onClick={onStop}
+              onClick={() => {
+                queueSuppressedRef.current = true;
+                onStop();
+              }}
               className="shrink-0"
               title="応答生成を停止"
             >
@@ -1407,8 +1895,13 @@ export function ChatComposer({
             <Button
               size="icon"
               onMouseDown={(event) => event.preventDefault()}
-              onClick={handleSend}
-              disabled={isEmpty || disabled}
+              onClick={() => handleSend()}
+              disabled={
+                (isEmpty &&
+                  activeCommand?.capability !== "docs_ingest" &&
+                  activeCommand?.capability !== "work_intake") ||
+                disabled
+              }
               className="shrink-0"
               title="送信"
             >

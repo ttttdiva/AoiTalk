@@ -53,7 +53,12 @@ import {
 } from "@/lib/chat-scroll";
 import { getFileServeUrl, getImageThumbnailUrl } from "@/lib/explorer-serve-url";
 import { getToolLabel } from "@/lib/tool-labels";
-import { cn } from "@/lib/utils";
+import {
+  CHAT_COMMANDS,
+  commandCapabilitiesFromMessageMetadata,
+  type ChatCommandCapability,
+} from "@/lib/chat-commands";
+import { cn, formatBytes } from "@/lib/utils";
 import Link from "next/link";
 
 const AUTO_SCROLL_BOTTOM_THRESHOLD_PX = 96;
@@ -191,13 +196,6 @@ function getCharacterColor(name: string): string {
   return `hsl(${hue}, 70%, 60%)`;
 }
 
-function formatFileSize(bytes?: number): string | null {
-  if (typeof bytes !== "number" || !Number.isFinite(bytes)) return null;
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
 function getMessageAttachments(
   message: ConversationMessage,
 ): ChatAttachmentMetadata[] {
@@ -222,6 +220,42 @@ function getMessageToolResults(
       typeof result === "object" &&
       (typeof (result as ChatToolResultMetadata).output === "string" ||
         Array.isArray((result as ChatToolResultMetadata).urls)),
+  );
+}
+
+/** capability値から /コマンド のラベル情報を逆引きする */
+function commandChipInfo(
+  capability: ChatCommandCapability,
+): { command: string; label: string } | null {
+  const match = CHAT_COMMANDS.find(
+    (item) => item.kind === "capability" && item.capability === capability,
+  );
+  if (!match) return null;
+  return { command: match.command, label: match.label };
+}
+
+/** userメッセージ本文の前に表示する、コマンド由来を示す控えめなチップ列 */
+function CommandCapabilityChips({
+  capabilities,
+}: {
+  capabilities: ChatCommandCapability[];
+}) {
+  if (capabilities.length === 0) return null;
+  return (
+    <div className="flex flex-wrap justify-end gap-1">
+      {capabilities.map((capability) => {
+        const info = commandChipInfo(capability);
+        return (
+          <span
+            key={capability}
+            className="inline-flex items-center rounded-full border border-border bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground"
+            title={info?.label ?? capability}
+          >
+            {info?.command ?? capability}
+          </span>
+        );
+      })}
+    </div>
   );
 }
 
@@ -414,7 +448,9 @@ function MessageAttachments({
     >
       {attachments.map((attachment, index) => {
         const isImage = isImageAttachment(attachment);
-        const sizeLabel = formatFileSize(attachment.size);
+        // 共通 formatBytes は未指定/0以下を "-" で返すため、従来どおり非表示にする
+        const rawSize = formatBytes(attachment.size);
+        const sizeLabel = rawSize === "-" ? null : rawSize;
         const kindLabel = attachmentKindLabel(attachment.kind);
         const href = attachment.path
           ? getFileServeUrl(attachment.path)
@@ -1143,7 +1179,7 @@ export function MessageList({
       <div className="mx-auto flex max-w-3xl flex-col gap-4 p-4 transition-transform duration-200 ease-linear xl:translate-x-[var(--chat-viewport-offset)]">
         {showEmptyState && (
           <div className="flex justify-center py-20">
-            <div className="max-w-md rounded-2xl border border-white/65 bg-white/52 px-6 py-5 text-center text-sm text-muted-foreground shadow-[inset_0_1px_rgba(255,255,255,0.76),0_22px_55px_-44px_rgba(6,81,110,0.72)] backdrop-blur-2xl dark:border-white/12 dark:bg-card/70 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12)]">
+            <div className="max-w-md rounded-2xl border border-border bg-card px-6 py-5 text-center text-sm text-muted-foreground">
               {emptyMessage}
             </div>
           </div>
@@ -1176,6 +1212,8 @@ export function MessageList({
             const isEditing = editingId === msg.id;
             const attachments = getMessageAttachments(msg);
             const senderLabel = msg.sender_display_name;
+            const commandCapabilities =
+              commandCapabilitiesFromMessageMetadata(msg.metadata);
             return (
               <div
                 key={msg.id}
@@ -1195,7 +1233,7 @@ export function MessageList({
                         }
                         if (e.key === "Escape") cancelEditing();
                       }}
-                      className="w-full resize-none rounded-xl border border-input bg-white/55 px-3 py-2 text-sm text-foreground outline-none backdrop-blur-xl focus-visible:ring-2 focus-visible:ring-ring dark:bg-input/30"
+                      className="w-full resize-none rounded-xl border border-input bg-card px-3 py-2 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
                       rows={Math.min(editContent.split("\n").length + 1, 6)}
                     />
                     <div className="flex justify-end gap-1.5">
@@ -1220,6 +1258,7 @@ export function MessageList({
                         {senderLabel}
                       </span>
                     )}
+                    <CommandCapabilityChips capabilities={commandCapabilities} />
                     {msg.content.trim() && (
                       <div className="rounded-2xl rounded-br-md bg-primary px-4 py-2.5 text-sm text-primary-foreground shadow-[0_14px_34px_-28px_rgba(5,87,115,0.9)] whitespace-pre-wrap">
                         <MentionText text={msg.content} />
@@ -1298,17 +1337,19 @@ export function MessageList({
                   metrics={generationMetrics}
                   responseElapsedMs={responseElapsedMs}
                 />
+                {agentRunId && (
+                  <AgentRunTimeline
+                    runId={agentRunId}
+                    onContentChange={scrollToBottom}
+                  />
+                )}
                 {msg.content.trim() && (
-                  <div className="min-w-0 max-w-full overflow-hidden rounded-2xl rounded-bl-md border border-white/60 bg-white/62 px-4 py-2.5 text-sm text-card-foreground shadow-[inset_0_1px_rgba(255,255,255,0.72),0_16px_34px_-30px_rgba(6,81,110,0.7)] [overflow-wrap:anywhere] backdrop-blur-xl prose-sm dark:border-white/12 dark:bg-card/75 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12),0_16px_34px_-30px_rgba(0,0,0,0.85)]">
+                  <div className="min-w-0 max-w-full overflow-hidden rounded-2xl rounded-bl-md border border-border bg-card px-4 py-2.5 text-sm text-card-foreground [overflow-wrap:anywhere] prose-sm">
                     <MessageContent content={msg.content} />
                   </div>
                 )}
                 <MessageAttachments attachments={attachments} />
-                <ToolResultDetails results={toolResults} />
-                <AgentRunTimeline
-                  runId={agentRunId}
-                  onContentChange={scrollToBottom}
-                />
+                {!agentRunId && <ToolResultDetails results={toolResults} />}
                 {renderActions(msg, previousUserInput)}
                 {hasBranch && (
                   <BranchNav
@@ -1345,24 +1386,30 @@ export function MessageList({
         {isStreaming && streamingContent && (
           <div className="flex justify-start">
             <div className="flex min-w-0 max-w-full flex-col gap-1">
-              <div className="min-w-0 max-w-full overflow-hidden rounded-2xl rounded-bl-md border border-white/60 bg-white/62 px-4 py-2.5 text-sm text-card-foreground shadow-[inset_0_1px_rgba(255,255,255,0.72),0_16px_34px_-30px_rgba(6,81,110,0.7)] [overflow-wrap:anywhere] backdrop-blur-xl prose-sm dark:border-white/12 dark:bg-card/75 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12),0_16px_34px_-30px_rgba(0,0,0,0.85)]">
-                <MessageContent content={streamingContent} />
-                <ToolResultDetails results={liveToolResults} />
-                {!activeTool && (activityMessage ? (
-                  <span className="inline-flex items-center gap-2 text-xs text-muted-foreground">
-                    <Loader2 className="size-3 animate-spin" />
-                    {activityMessage}
-                  </span>
-                ) : (
-                  <TypingIndicator />
-                ))}
-              </div>
-              {activeTool && <ToolIndicator toolName={activeTool} />}
               <AgentRunTimeline
                 runId={activeAgentRunId}
                 live
                 onContentChange={scrollToBottom}
               />
+              <div className="min-w-0 max-w-full overflow-hidden rounded-2xl rounded-bl-md border border-border bg-card px-4 py-2.5 text-sm text-card-foreground [overflow-wrap:anywhere] prose-sm">
+                <MessageContent content={streamingContent} />
+                {!activeAgentRunId &&
+                  !activeTool &&
+                  (activityMessage ? (
+                    <span className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+                      <Loader2 className="size-3 animate-spin" />
+                      {activityMessage}
+                    </span>
+                  ) : (
+                    <TypingIndicator />
+                  ))}
+              </div>
+              {!activeAgentRunId && (
+                <ToolResultDetails results={liveToolResults} />
+              )}
+              {!activeAgentRunId && activeTool && (
+                <ToolIndicator toolName={activeTool} />
+              )}
             </div>
           </div>
         )}
@@ -1371,47 +1418,48 @@ export function MessageList({
         {isStreaming && !streamingContent && (
           <div className="flex justify-start">
             <div className="flex min-w-0 max-w-full flex-col gap-1">
-              <div className="min-w-0 max-w-full overflow-hidden rounded-2xl rounded-bl-md border border-white/60 bg-white/62 px-4 py-2.5 text-sm text-card-foreground shadow-[inset_0_1px_rgba(255,255,255,0.72),0_16px_34px_-30px_rgba(6,81,110,0.7)] [overflow-wrap:anywhere] backdrop-blur-xl prose-sm dark:border-white/12 dark:bg-card/75 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12),0_16px_34px_-30px_rgba(0,0,0,0.85)]">
-                {activeTool ? (
-                  <ToolIndicator toolName={activeTool} />
-                ) : (
-                  activityMessage ? (
+              <AgentRunTimeline
+                runId={activeAgentRunId}
+                live
+                onContentChange={scrollToBottom}
+              />
+              {!activeAgentRunId && (
+                <div className="min-w-0 max-w-full overflow-hidden rounded-2xl rounded-bl-md border border-border bg-card px-4 py-2.5 text-sm text-card-foreground [overflow-wrap:anywhere] prose-sm">
+                  {activeTool ? (
+                    <ToolIndicator toolName={activeTool} />
+                  ) : activityMessage ? (
                     <span className="inline-flex items-center gap-2 text-xs text-muted-foreground">
                       <Loader2 className="size-3 animate-spin" />
                       {activityMessage}
                     </span>
                   ) : (
                     <TypingIndicator />
-                  )
-                )}
-              </div>
-              <AgentRunTimeline
-                runId={activeAgentRunId}
-                live
-                onContentChange={scrollToBottom}
-              />
+                  )}
+                </div>
+              )}
             </div>
           </div>
         )}
 
         {/* 応答待ち（送信済み〜stream_start受信前） */}
-        {isWaitingResponse && !isStreaming && (activeTool || activeAgentRunId) && (
-          <div className="flex justify-start">
-            <div className="flex min-w-0 max-w-full flex-col gap-1">
-              {activeTool && (
-                <div className="min-w-0 max-w-full overflow-hidden rounded-2xl rounded-bl-md border border-white/60 bg-white/62 px-4 py-2.5 text-sm text-card-foreground shadow-[inset_0_1px_rgba(255,255,255,0.72),0_16px_34px_-30px_rgba(6,81,110,0.7)] [overflow-wrap:anywhere] backdrop-blur-xl prose-sm dark:border-white/12 dark:bg-card/75 dark:shadow-[inset_0_1px_rgba(255,255,255,0.12),0_16px_34px_-30px_rgba(0,0,0,0.85)]">
-                  <ToolIndicator toolName={activeTool} />
-                </div>
-              )}
-              <AgentRunTimeline
-                runId={activeAgentRunId}
-                live
-                onContentChange={scrollToBottom}
-              />
+        {isWaitingResponse &&
+          !isStreaming &&
+          (activeTool || activeAgentRunId) && (
+            <div className="flex justify-start">
+              <div className="flex min-w-0 max-w-full flex-col gap-1">
+                <AgentRunTimeline
+                  runId={activeAgentRunId}
+                  live
+                  onContentChange={scrollToBottom}
+                />
+                {!activeAgentRunId && activeTool && (
+                  <div className="min-w-0 max-w-full overflow-hidden rounded-2xl rounded-bl-md border border-border bg-card px-4 py-2.5 text-sm text-card-foreground [overflow-wrap:anywhere] prose-sm">
+                    <ToolIndicator toolName={activeTool} />
+                  </div>
+                )}
+              </div>
             </div>
-          </div>
-        )}
-
+          )}
       </div>
       <Dialog
         open={!!feedbackTarget}

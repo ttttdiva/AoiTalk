@@ -41,7 +41,7 @@ export const TASK_STATUS_KEY_HINTS: Record<string, string> = {
   in_progress: "S",
   review: "R",
   on_hold: "H",
-  open: "X",
+  open: "O",
 };
 
 export const TASK_STATUS_SHORTCUT_KEYS: Record<string, TaskStatusOption> = {
@@ -49,7 +49,7 @@ export const TASK_STATUS_SHORTCUT_KEYS: Record<string, TaskStatusOption> = {
   s: "in_progress",
   r: "review",
   h: "on_hold",
-  x: "open",
+  o: "open",
 };
 
 export function normalizeTaskStatus(status: unknown): string {

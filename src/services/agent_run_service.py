@@ -16,6 +16,7 @@ from sqlalchemy.orm import selectinload
 from ..memory.database import get_database_manager
 from ..memory.models import AgentRun, AgentRunEdge, AgentRunEvent, AgentRunToolCall
 from .agent_team_service import AGENT_TEAM_MEMBER_LABELS
+from ..utils.uuid_utils import parse_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -67,17 +68,6 @@ def reset_current_agent_run_id(token: Token) -> None:
 
 def get_current_agent_run_id() -> str | None:
     return _current_agent_run_id.get()
-
-
-def _parse_uuid(value: Any) -> uuid.UUID | None:
-    if value is None or value == "":
-        return None
-    if isinstance(value, uuid.UUID):
-        return value
-    try:
-        return uuid.UUID(str(value))
-    except (TypeError, ValueError):
-        return None
 
 
 def _jsonable(value: Any) -> Any:
@@ -166,6 +156,79 @@ def _model_text(payload: dict[str, Any], *keys: str) -> str:
 
 def _humanize_key(value: str) -> str:
     return value.replace("_", " ").strip() or "ツール"
+
+
+TOOL_OPERATION_LABELS = {
+    "web_search": "Webを検索",
+    "search_web": "Webを検索",
+    "shell_command": "コマンドを実行",
+    "get_weather": "天気を確認",
+    "get_current_time": "現在時刻を確認",
+    "calculate": "計算を実行",
+    "create_task": "タスクを作成",
+    "update_task": "タスクを更新",
+    "list_tasks": "タスクを確認",
+    "list_project_information": "案件情報を確認",
+    "get_project_context": "案件コンテキストを確認",
+    "list_record_tables": "台帳を確認",
+    "read_file": "ファイルを読み取り",
+    "write_file": "ファイルを編集",
+    "execute_code": "コードを実行",
+    "generate_image": "画像を生成",
+}
+
+
+def _tool_operation_label(tool_name: str, actor_label: str | None = None) -> str:
+    return TOOL_OPERATION_LABELS.get(
+        tool_name,
+        f"{actor_label or _humanize_key(tool_name)}を実行",
+    )
+
+
+def _event_operation_key(event: AgentRunEvent) -> str:
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    return _payload_text(
+        payload,
+        "operation_id",
+        "tool_call_id",
+        "call_id",
+        "agent_instance_key",
+        "actor_instance_key",
+    )
+
+
+def _event_tool_arguments(payload: dict[str, Any]) -> dict[str, Any]:
+    for key in ("tool_args", "arguments", "args"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return _jsonable(value)
+    tool_result = payload.get("tool_result")
+    if isinstance(tool_result, dict):
+        for key in ("arguments", "args"):
+            value = tool_result.get(key)
+            if isinstance(value, dict):
+                return _jsonable(value)
+    return {}
+
+
+def _event_tool_result(payload: dict[str, Any]) -> str | None:
+    tool_result = payload.get("tool_result")
+    if not isinstance(tool_result, dict):
+        return None
+    for key in ("output", "result"):
+        value = tool_result.get(key)
+        if value is not None:
+            return _clip(value)
+    return None
+
+
+def _event_tool_error(payload: dict[str, Any]) -> str | None:
+    tool_result = payload.get("tool_result")
+    if isinstance(tool_result, dict) and tool_result.get("error"):
+        return _clip(tool_result["error"], max_chars=4000)
+    if payload.get("error"):
+        return _clip(payload["error"], max_chars=4000)
+    return None
 
 
 def _event_tool_name(event_type: str, payload: dict[str, Any]) -> str:
@@ -356,7 +419,22 @@ def _timeline_event_item(run: AgentRun, event: AgentRunEvent) -> dict[str, Any]:
         "actor_label": actor["actor_label"],
         "provider": provider or None,
         "model": model or None,
-        "mode": _payload_text(payload, "mode", "model_mode", "reasoning_effort") or None,
+        "mode": _payload_text(
+            payload, "mode", "model_mode", "reasoning_effort", "effort"
+        ) or None,
+        "group_id": _payload_text(payload, "group_id", "model_group") or None,
+        "routing_profile": _payload_text(
+            payload, "routing_profile", "routing_profile_id"
+        )
+        or None,
+        "pool": _payload_text(payload, "pool", "pool_id") or None,
+        "credential_profile": _payload_text(
+            payload, "credential_profile", "credential_profile_id"
+        )
+        or None,
+        "candidate": _payload_text(payload, "candidate", "candidate_id") or None,
+        "quota_pool_ids": list(payload.get("quota_pool_ids") or []),
+        "fallback_count": int(payload.get("fallback_count") or 0),
         "action": _event_action(event.event_type, tool_label),
         "message": _timeline_event_message(
             event.message,
@@ -367,6 +445,11 @@ def _timeline_event_item(run: AgentRun, event: AgentRunEvent) -> dict[str, Any]:
         "raw_tool_name": (
             raw_display_tool_name if raw_display_tool_name else None
         ),
+        "tool_call_id": _event_operation_key(event) or None,
+        "arguments": _event_tool_arguments(payload),
+        "result": _event_tool_result(payload),
+        "result_preview": _clip(_event_tool_result(payload), max_chars=1200),
+        "error": _event_tool_error(payload),
         "payload": _jsonable(payload),
         "created_at": _dt(event.created_at),
     }
@@ -374,7 +457,13 @@ def _timeline_event_item(run: AgentRun, event: AgentRunEvent) -> dict[str, Any]:
 
 
 def _timeline_tool_call_item(
+    run: AgentRun,
     tool_call: AgentRunToolCall,
+    *,
+    operation_id: str | None = None,
+    operation_started_at: datetime | None = None,
+    operation_ended_at: datetime | None = None,
+    operation_error: str | None = None,
 ) -> dict[str, Any]:
     raw_tool_name = _clean_tool_name(tool_call.tool_name)
     tool_name = _normalize_tool_name(raw_tool_name)
@@ -384,13 +473,14 @@ def _timeline_tool_call_item(
     if tool_name == "shell_command" and raw_tool_name != tool_name:
         arguments = dict(arguments)
         arguments.setdefault("command", raw_tool_name)
-    action = (
-        f"{actor['actor_label'] or 'ツール'}の実行完了"
-        if tool_call.success
-        else f"{actor['actor_label'] or 'ツール'}の実行に失敗"
-    )
+    error = operation_error or _payload_text(metadata, "error") or None
+    started_at = tool_call.started_at or operation_started_at
+    ended_at = tool_call.ended_at or operation_ended_at
+    duration_ms = tool_call.duration_ms
+    if duration_ms is None and started_at and ended_at and ended_at >= started_at:
+        duration_ms = int((ended_at - started_at).total_seconds() * 1000)
     return {
-        "id": f"tool:{tool_call.id}",
+        "id": operation_id or f"tool:{tool_call.id}",
         "source": "tool_call",
         "run_id": str(tool_call.run_id),
         "event_id": str(tool_call.event_id) if tool_call.event_id else None,
@@ -406,81 +496,378 @@ def _timeline_tool_call_item(
             "agent_provider",
             "model_provider",
         )
+        or run.provider
         or None,
-        "model": _model_text(metadata, "model", "agent_model", "model_name") or None,
+        "model": _model_text(metadata, "model", "agent_model", "model_name")
+        or _model_text({"model": run.model}, "model")
+        or None,
         "mode": _payload_text(metadata, "mode", "model_mode", "reasoning_effort") or None,
-        "action": action,
+        "group_id": _payload_text(metadata, "group_id", "model_group") or None,
+        "action": _tool_operation_label(tool_name, actor.get("actor_label")),
         "message": tool_name,
         "tool_name": tool_name,
         "raw_tool_name": raw_tool_name if raw_tool_name != tool_name else None,
         "tool_call_id": tool_call.tool_call_id,
         "arguments": arguments,
+        "result": _clip(tool_call.result),
         "result_preview": _clip(tool_call.result, max_chars=1200),
+        "error": error,
         "success": bool(tool_call.success),
         "mutation_confirmed": bool(tool_call.mutation_confirmed),
-        "duration_ms": tool_call.duration_ms,
+        "duration_ms": duration_ms,
         "payload": metadata,
         "created_at": _dt(tool_call.created_at),
-        "started_at": _dt(tool_call.started_at),
-        "ended_at": _dt(tool_call.ended_at),
+        "started_at": _dt(started_at),
+        "ended_at": _dt(ended_at),
     }
 
 
 def build_agent_run_timeline(run: AgentRun) -> list[dict[str, Any]]:
-    """Build a chronological UI timeline from run events and tool evidence."""
+    """Build UI work records, correlating lifecycle events into one operation."""
 
     items: list[tuple[datetime, int, dict[str, Any]]] = []
-    tool_calls = list(getattr(run, "tool_calls", []) or [])
-    recorded_tool_cutoffs: dict[str, datetime] = {}
-    for tool_call in tool_calls:
-        tool_name = _normalize_tool_name(_clean_tool_name(tool_call.tool_name))
-        if not tool_name:
-            continue
-        cutoff_candidates = [
-            value
-            for value in (tool_call.started_at, tool_call.ended_at, tool_call.created_at)
-            if value
-        ]
-        cutoff = max(cutoff_candidates) if cutoff_candidates else None
-        if cutoff and (
-            tool_name not in recorded_tool_cutoffs
-            or cutoff > recorded_tool_cutoffs[tool_name]
-        ):
-            recorded_tool_cutoffs[tool_name] = cutoff
-    for event in getattr(run, "events", []) or []:
+    events = sorted(
+        list(getattr(run, "events", []) or []),
+        key=lambda event: (event.created_at or datetime.min, int(event.sequence or 0)),
+    )
+    tool_calls = sorted(
+        list(getattr(run, "tool_calls", []) or []),
+        key=lambda call: call.created_at or call.started_at or datetime.min,
+    )
+
+    tool_operations: list[dict[str, Any]] = []
+    open_tool_operations: dict[str, list[dict[str, Any]]] = {}
+    agent_operations: list[dict[str, Any]] = []
+    open_agent_operations: dict[str, list[dict[str, Any]]] = {}
+    interrupted_status = run.status if run.status in {"failed", "cancelled"} else None
+
+    for event in events:
         payload = event.payload if isinstance(event.payload, dict) else {}
-        tool_name = _normalize_tool_name(_event_tool_name(event.event_type, payload))
-        event_created_at = event.created_at or datetime.min
-        if (
-            event.event_type in {"stream.tool_start", "stream.tool_end"}
-            and tool_name
-            and tool_name in recorded_tool_cutoffs
-            and event_created_at <= recorded_tool_cutoffs[tool_name]
-        ):
+        event_type = event.event_type
+        created_at = event.created_at or datetime.min
+
+        if event_type.startswith("agent_team.instance_"):
+            actor = _actor_for_event(run, event)
+            stable_key = _event_operation_key(event) or str(actor.get("actor_key") or "")
+            if event_type == "agent_team.instance_started":
+                operation = {"start": event, "end": None, "key": stable_key}
+                agent_operations.append(operation)
+                open_agent_operations.setdefault(stable_key, []).append(operation)
+            else:
+                queue = open_agent_operations.get(stable_key, [])
+                operation = queue.pop(0) if queue else {
+                    "start": None,
+                    "end": None,
+                    "key": stable_key,
+                }
+                if not queue:
+                    open_agent_operations.pop(stable_key, None)
+                if operation not in agent_operations:
+                    agent_operations.append(operation)
+                operation["end"] = event
             continue
-        if (
-            event.event_type in {"tool.end", "tool.failed"}
-            and tool_name
-            and tool_name in recorded_tool_cutoffs
-        ):
+
+        if event_type in {"stream.tool_start", "stream.tool_end"}:
+            raw_tool_name = _event_tool_name(event_type, payload)
+            tool_name = _normalize_tool_name(raw_tool_name)
+            stable_id = _event_operation_key(event)
+            queue_key = f"id:{stable_id}" if stable_id else f"name:{tool_name}"
+            if event_type == "stream.tool_start":
+                signature = (
+                    raw_tool_name
+                    if _looks_like_shell_command(raw_tool_name)
+                    else _payload_shell_command(payload)
+                    or json.dumps(
+                        _event_tool_arguments(payload),
+                        sort_keys=True,
+                        ensure_ascii=False,
+                    )
+                )
+                current_queue = open_tool_operations.get(queue_key, [])
+                if not stable_id and current_queue:
+                    previous = current_queue[-1]
+                    previous_start = previous.get("start")
+                    previous_at = previous_start.created_at if previous_start else None
+                    is_immediate_duplicate = (
+                        previous.get("signature") == signature
+                        and previous_at is not None
+                        and event.created_at is not None
+                        and 0
+                        <= (event.created_at - previous_at).total_seconds()
+                        <= 0.05
+                    )
+                    if is_immediate_duplicate:
+                        continue
+                operation = {
+                    "start": event,
+                    "end": None,
+                    "key": queue_key,
+                    "tool_name": tool_name,
+                    "signature": signature,
+                    "used": False,
+                }
+                tool_operations.append(operation)
+                open_tool_operations.setdefault(queue_key, []).append(operation)
+            else:
+                queue = open_tool_operations.get(queue_key, [])
+                operation = None
+                if not stable_id:
+                    signature = (
+                        raw_tool_name
+                        if _looks_like_shell_command(raw_tool_name)
+                        else _payload_shell_command(payload)
+                        or json.dumps(
+                            _event_tool_arguments(payload),
+                            sort_keys=True,
+                            ensure_ascii=False,
+                        )
+                    )
+                    matching_index = next(
+                        (
+                            index
+                            for index, candidate in enumerate(queue)
+                            if candidate.get("signature") == signature
+                        ),
+                        None,
+                    )
+                    if matching_index is not None:
+                        operation = queue.pop(matching_index)
+                if operation is None and not queue and not stable_id:
+                    candidates = [
+                        candidate
+                        for candidate in tool_operations
+                        if candidate.get("end") is None
+                        and candidate.get("tool_name") == tool_name
+                        and candidate.get("signature") == signature
+                    ]
+                    if not candidates:
+                        candidates = [
+                            candidate
+                            for candidate in tool_operations
+                            if candidate.get("end") is None
+                            and candidate.get("tool_name") == tool_name
+                        ]
+                    if candidates:
+                        candidate_key = str(candidates[0].get("key") or "")
+                        queue = open_tool_operations.get(candidate_key, [])
+                        queue_key = candidate_key
+                if operation is None:
+                    operation = queue.pop(0) if queue else {
+                        "start": None,
+                        "end": None,
+                        "key": queue_key,
+                        "tool_name": tool_name,
+                        "used": False,
+                    }
+                if not queue:
+                    open_tool_operations.pop(queue_key, None)
+                if operation not in tool_operations:
+                    tool_operations.append(operation)
+                operation["end"] = event
             continue
-        items.append(
-            (
-                event_created_at,
-                int(event.sequence or 0),
-                _timeline_event_item(run, event),
-            )
+
+        if event_type in {"tool.end", "tool.failed"}:
+            # AgentRunToolCall が実内容を保持するため、記録ライフサイクルは表示しない。
+            continue
+
+        items.append((created_at, int(event.sequence or 0), _timeline_event_item(run, event)))
+
+    for operation in agent_operations:
+        start = operation.get("start")
+        end = operation.get("end")
+        base_event = end or start
+        if base_event is None:
+            continue
+        item = _timeline_event_item(run, base_event)
+        start_payload = start.payload if start and isinstance(start.payload, dict) else {}
+        end_payload = end.payload if end and isinstance(end.payload, dict) else {}
+        started_at = start.created_at if start else None
+        ended_at = end.created_at if end else run.ended_at if interrupted_status else None
+        duration_ms = None
+        if started_at and ended_at and ended_at >= started_at:
+            duration_ms = int((ended_at - started_at).total_seconds() * 1000)
+        result = _payload_text(end_payload, "result", "result_preview") or None
+        error = _payload_text(end_payload, "error") or (
+            str(run.error) if interrupted_status == "failed" and run.error else None
         )
+        task = _payload_text(start_payload, "task")
+        label = str(item.get("actor_label") or "サブエージェント")
+        item.update(
+            {
+                "id": f"operation:agent:{start.id if start else end.id}",
+                "event_type": "agent_operation",
+                "status": (
+                    interrupted_status
+                    if end is None and interrupted_status
+                    else "running"
+                    if end is None
+                    else "failed"
+                    if error or str(end.status) == "failed"
+                    else "succeeded"
+                ),
+                "display_status": (
+                    interrupted_status
+                    if end is None and interrupted_status
+                    else "started"
+                    if end is None
+                    else "failed"
+                    if error or str(end.status) == "failed"
+                    else "succeeded"
+                ),
+                "action": task or label,
+                "message": None,
+                "result": _clip(result),
+                "result_preview": _clip(result, max_chars=1200),
+                "error": error,
+                "success": (
+                    False
+                    if end is None and interrupted_status == "failed"
+                    else None
+                    if end is None
+                    else not bool(error or str(end.status) == "failed")
+                ),
+                "duration_ms": duration_ms,
+                "payload": {**_jsonable(start_payload), **_jsonable(end_payload)},
+                "created_at": _dt(started_at or ended_at),
+                "started_at": _dt(started_at),
+                "ended_at": _dt(ended_at),
+            }
+        )
+        items.append((started_at or ended_at or datetime.min, int(start.sequence if start else end.sequence or 0), item))
 
     for index, tool_call in enumerate(tool_calls):
-        created_at = tool_call.created_at or tool_call.started_at or datetime.min
+        tool_name = _normalize_tool_name(_clean_tool_name(tool_call.tool_name))
+        correlation_id = str(tool_call.tool_call_id or "")
+        call_arguments = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
+        call_signature = (
+            _clean_tool_name(tool_call.tool_name)
+            if _looks_like_shell_command(_clean_tool_name(tool_call.tool_name))
+            else json.dumps(call_arguments, sort_keys=True, ensure_ascii=False)
+        )
+        candidates = [
+            operation
+            for operation in tool_operations
+            if not operation["used"]
+            and operation["tool_name"] == tool_name
+            and (
+                operation["key"] == f"id:{correlation_id}"
+                if correlation_id
+                else operation.get("signature") == call_signature
+            )
+        ]
+        if not candidates and not correlation_id:
+            candidates = [
+                operation
+                for operation in tool_operations
+                if not operation["used"] and operation["tool_name"] == tool_name
+            ]
+        if not candidates and correlation_id:
+            candidates = [
+                operation
+                for operation in tool_operations
+                if not operation["used"]
+                and operation["tool_name"] == tool_name
+                and operation["key"].startswith("name:")
+            ]
+        operation = candidates[0] if candidates else None
+        if operation:
+            operation["used"] = True
+        start = operation.get("start") if operation else None
+        end = operation.get("end") if operation else None
+        operation_id = (
+            f"operation:tool:{start.id if start else end.id}"
+            if start or end
+            else None
+        )
+        created_at = (
+            (start.created_at if start else None)
+            or tool_call.started_at
+            or tool_call.created_at
+            or datetime.min
+        )
         items.append(
             (
                 created_at,
                 100000 + index,
-                _timeline_tool_call_item(tool_call),
+                _timeline_tool_call_item(
+                    run,
+                    tool_call,
+                    operation_id=operation_id,
+                    operation_started_at=start.created_at if start else None,
+                    operation_ended_at=end.created_at if end else None,
+                    operation_error=(
+                        _event_tool_error(end.payload)
+                        if end and isinstance(end.payload, dict)
+                        else None
+                    ),
+                ),
             )
         )
+
+    for operation in tool_operations:
+        if operation["used"]:
+            continue
+        start = operation.get("start")
+        end = operation.get("end")
+        base_event = end or start
+        if base_event is None:
+            continue
+        item = _timeline_event_item(run, base_event)
+        start_payload = start.payload if start and isinstance(start.payload, dict) else {}
+        end_payload = end.payload if end and isinstance(end.payload, dict) else {}
+        started_at = start.created_at if start else None
+        ended_at = end.created_at if end else run.ended_at if interrupted_status else None
+        duration_ms = None
+        if started_at and ended_at and ended_at >= started_at:
+            duration_ms = int((ended_at - started_at).total_seconds() * 1000)
+        error = _event_tool_error(end_payload) or (
+            str(run.error) if interrupted_status == "failed" and run.error else None
+        )
+        result = _event_tool_result(end_payload)
+        tool_name = str(operation.get("tool_name") or item.get("tool_name") or "")
+        item.update(
+            {
+                "id": f"operation:tool:{start.id if start else end.id}",
+                "event_type": "tool_operation",
+                "status": (
+                    interrupted_status
+                    if end is None and interrupted_status
+                    else "running"
+                    if end is None
+                    else "failed"
+                    if error
+                    else "succeeded"
+                ),
+                "display_status": (
+                    interrupted_status
+                    if end is None and interrupted_status
+                    else "started"
+                    if end is None
+                    else "failed"
+                    if error
+                    else "succeeded"
+                ),
+                "action": _tool_operation_label(tool_name, item.get("actor_label")),
+                "message": None,
+                "arguments": _event_tool_arguments(start_payload) or _event_tool_arguments(end_payload),
+                "result": result,
+                "result_preview": _clip(result, max_chars=1200),
+                "error": error,
+                "success": (
+                    False
+                    if end is None and interrupted_status == "failed"
+                    else None
+                    if end is None
+                    else not bool(error)
+                ),
+                "duration_ms": duration_ms,
+                "payload": {**_jsonable(start_payload), **_jsonable(end_payload)},
+                "created_at": _dt(started_at or ended_at),
+                "started_at": _dt(started_at),
+                "ended_at": _dt(ended_at),
+            }
+        )
+        items.append((started_at or ended_at or datetime.min, int(start.sequence if start else end.sequence or 0), item))
 
     return [
         item
@@ -489,35 +876,6 @@ def build_agent_run_timeline(run: AgentRun) -> list[dict[str, Any]]:
             key=lambda row: (row[0], row[1]),
         )
     ]
-
-
-def build_agent_run_timeline_columns(
-    timeline: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Group timeline rows by displayed actor for the chat UI."""
-
-    columns: list[dict[str, Any]] = []
-    by_key: dict[str, dict[str, Any]] = {}
-    for item in timeline:
-        actor_key = str(item.get("actor_key") or item.get("actor_label") or "main")
-        column = by_key.get(actor_key)
-        if column is None:
-            column = {
-                "key": actor_key,
-                "label": item.get("actor_label") or actor_key,
-                "actor_type": item.get("actor_type"),
-                "provider": item.get("provider"),
-                "model": item.get("model"),
-                "items": [],
-            }
-            by_key[actor_key] = column
-            columns.append(column)
-        if not column.get("provider") and item.get("provider"):
-            column["provider"] = item.get("provider")
-        if not column.get("model") and item.get("model"):
-            column["model"] = item.get("model")
-        column["items"].append(item)
-    return columns
 
 
 class AgentRunService:
@@ -552,7 +910,7 @@ class AgentRunService:
         session = await self._session()
         try:
             now = datetime.utcnow()
-            parent_uuid = _parse_uuid(parent_run_id)
+            parent_uuid = parse_uuid(parent_run_id)
             root_uuid = None
             if parent_uuid:
                 parent = await session.get(AgentRun, parent_uuid)
@@ -562,9 +920,9 @@ class AgentRunService:
             run = AgentRun(
                 parent_run_id=parent_uuid,
                 root_run_id=root_uuid,
-                session_id=_parse_uuid(session_id),
-                trigger_message_id=_parse_uuid(trigger_message_id),
-                project_id=_parse_uuid(project_id),
+                session_id=parse_uuid(session_id),
+                trigger_message_id=parse_uuid(trigger_message_id),
+                project_id=parse_uuid(project_id),
                 user_id=str(user_id) if user_id else None,
                 run_type=run_type or "chat_turn",
                 status="queued",
@@ -614,7 +972,7 @@ class AgentRunService:
         include_edges: bool = False,
         include_timeline: bool = False,
     ) -> Dict[str, Any] | None:
-        run_uuid = _parse_uuid(run_id)
+        run_uuid = parse_uuid(run_id)
         if run_uuid is None:
             return None
 
@@ -645,11 +1003,7 @@ class AgentRunService:
                 include_edges=include_edges,
             )
             if include_timeline:
-                timeline = build_agent_run_timeline(run)
-                payload["timeline"] = timeline
-                payload["timeline_columns"] = build_agent_run_timeline_columns(
-                    timeline
-                )
+                payload["timeline"] = build_agent_run_timeline(run)
             return payload
         finally:
             await session.close()
@@ -665,8 +1019,8 @@ class AgentRunService:
         safe_limit = min(max(int(limit or 50), 1), 200)
         stmt = select(AgentRun)
         filters = []
-        session_uuid = _parse_uuid(session_id)
-        project_uuid = _parse_uuid(project_id)
+        session_uuid = parse_uuid(session_id)
+        project_uuid = parse_uuid(project_id)
         if session_id and session_uuid is None:
             return []
         if project_id and project_uuid is None:
@@ -697,7 +1051,7 @@ class AgentRunService:
         message: str | None = None,
         payload: Dict[str, Any] | None = None,
     ) -> Dict[str, Any] | None:
-        run_uuid = _parse_uuid(run_id)
+        run_uuid = parse_uuid(run_id)
         if run_uuid is None:
             return None
 
@@ -807,7 +1161,7 @@ class AgentRunService:
         ended_at: datetime | None = None,
         duration_ms: int | None = None,
     ) -> Dict[str, Any] | None:
-        run_uuid = _parse_uuid(run_id)
+        run_uuid = parse_uuid(run_id)
         if run_uuid is None or not tool_name:
             return None
 
@@ -819,7 +1173,7 @@ class AgentRunService:
             now = datetime.utcnow()
             tool_call = AgentRunToolCall(
                 run_id=run.id,
-                event_id=_parse_uuid(event_id),
+                event_id=parse_uuid(event_id),
                 tool_name=str(tool_name),
                 tool_call_id=tool_call_id,
                 arguments=_jsonable(arguments),
@@ -864,8 +1218,8 @@ class AgentRunService:
         purpose: str | None = None,
         metadata: Dict[str, Any] | None = None,
     ) -> Dict[str, Any] | None:
-        parent_uuid = _parse_uuid(parent_run_id)
-        child_uuid = _parse_uuid(child_run_id)
+        parent_uuid = parse_uuid(parent_run_id)
+        child_uuid = parse_uuid(child_run_id)
         if parent_uuid is None or child_uuid is None:
             return None
 
@@ -906,7 +1260,7 @@ class AgentRunService:
         started: bool = False,
         ended: bool = False,
     ) -> Dict[str, Any] | None:
-        run_uuid = _parse_uuid(run_id)
+        run_uuid = parse_uuid(run_id)
         if run_uuid is None:
             return None
 

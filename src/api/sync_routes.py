@@ -39,7 +39,17 @@ from ..models.ecc_models import (
     ScenarioScene,
 )
 from ..memory.project_repository import ProjectRepository
+from ..services.docs_graph_service import DocsGraphService
 from ..services.task_management_service import TaskManagementError, TaskManagementService
+from .docs_sync import (
+    DOCS_PULL_LIMITS,
+    DOCS_SYNC_TABLES,
+    DocsOperationError,
+    apply_docs_operation,
+    load_current_docs_entity,
+    pull_docs_table,
+)
+from .uuid_http import parse_uuid_or_400
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +67,15 @@ SYNC_TABLES = {
     "scenario_characters",
     "scenario_scenes",
     "scenario_episodes",
+    *DOCS_SYNC_TABLES,
+}
+
+# push が Docs ハンドラ（apply_docs_operation）へ委譲するテーブル。
+DOCS_PUSH_TABLES = {
+    "knowledge_nodes",
+    "knowledge_supertags",
+    "knowledge_node_supertags",
+    "knowledge_field_values",
 }
 
 SYNC_PULL_LIMITS = {
@@ -72,6 +91,7 @@ SYNC_PULL_LIMITS = {
     "scenario_characters": 5000,
     "scenario_scenes": 5000,
     "scenario_episodes": 5000,
+    **DOCS_PULL_LIMITS,
 }
 
 
@@ -86,15 +106,6 @@ class SyncOperation(BaseModel):
 
 class SyncPushPayload(BaseModel):
     operations: list[SyncOperation] = Field(default_factory=list)
-
-
-def _parse_uuid(value: Optional[str], field_name: str) -> Optional[UUID]:
-    if value in (None, ""):
-        return None
-    try:
-        return UUID(value)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid {field_name}") from exc
 
 
 def _parse_datetime(value: Optional[str], field_name: str) -> Optional[datetime]:
@@ -147,7 +158,10 @@ async def _accessible_project_ids(session: AsyncSession, user_id: UUID) -> list[
     result = await session.execute(
         select(ProjectMember.project_id)
         .join(Project, Project.id == ProjectMember.project_id)
-        .where(ProjectMember.user_id == user_id)
+        .where(
+            ProjectMember.user_id == user_id,
+            Project.deleted_at.is_(None),
+        )
     )
     return list(result.scalars().all())
 
@@ -549,7 +563,18 @@ async def _pull_table(
     user_id: UUID,
     project_ids: list[UUID],
     since: Optional[datetime],
+    docs_workspace_id: Optional[UUID] = None,
 ) -> dict[str, Any]:
+    if table in DOCS_SYNC_TABLES:
+        if docs_workspace_id is None:
+            return {"changes": [], "tombstones": [], "cursor": None}
+        return await pull_docs_table(
+            table,
+            session,
+            workspace_id=docs_workspace_id,
+            accessible_project_ids=project_ids,
+            since=since,
+        )
     if table == "projects":
         return await _pull_projects(session, project_ids, since)
     if table == "tasks":
@@ -580,8 +605,8 @@ async def _pull_table(
 
 
 def _task_updates_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "project_id": _parse_uuid(payload.get("project_id"), "project_id")
+    updates = {
+        "project_id": parse_uuid_or_400(payload.get("project_id"), "project_id")
         if "project_id" in payload
         else None,
         "title": payload.get("title"),
@@ -597,14 +622,43 @@ def _task_updates_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "all_day": payload.get("all_day"),
         "reminder_offsets": payload.get("reminder_offsets"),
         "notifications_enabled": payload.get("notifications_enabled"),
-        "task_metadata": payload.get("metadata") or payload.get("task_metadata"),
+        "task_metadata": _task_metadata_from_payload(payload),
     }
+    if "estimated_hours" in payload:
+        updates["estimated_hours"] = payload.get("estimated_hours")
+    if "parent_task_id" in payload:
+        updates["parent_task_id"] = (
+            parse_uuid_or_400(payload.get("parent_task_id"), "parent_task_id")
+            if payload.get("parent_task_id")
+            else None
+        )
+    if "tag_ids" in payload:
+        updates["tag_ids"] = [
+            parse_uuid_or_400(value, "tag_id")
+            for value in (payload.get("tag_ids") or [])
+        ]
+    if "assignee_ids" in payload:
+        updates["assignee_ids"] = [
+            parse_uuid_or_400(value, "assignee_id")
+            for value in (payload.get("assignee_ids") or [])
+        ]
+    return updates
+
+
+def _task_metadata_from_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    raw_metadata = payload.get("metadata") or payload.get("task_metadata")
+    if not isinstance(raw_metadata, dict):
+        return None
+    metadata = dict(raw_metadata)
+    metadata.pop("mobile_sync_status", None)
+    metadata.pop("mobile_sync_error", None)
+    return metadata
 
 
 def _time_entry_values_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {
-        "task_id": _parse_uuid(payload.get("task_id"), "task_id"),
-        "occurrence_id": _parse_uuid(payload.get("occurrence_id"), "occurrence_id")
+        "task_id": parse_uuid_or_400(payload.get("task_id"), "task_id"),
+        "occurrence_id": parse_uuid_or_400(payload.get("occurrence_id"), "occurrence_id")
         if "occurrence_id" in payload
         else None,
         "started_at": _parse_datetime(payload.get("started_at"), "started_at")
@@ -673,7 +727,7 @@ async def _apply_task_operation(
     user_id: UUID,
     operation: SyncOperation,
 ) -> dict[str, Any]:
-    task_id = _parse_uuid(operation.entity_id, "entity_id")
+    task_id = parse_uuid_or_400(operation.entity_id, "entity_id")
     if task_id is None:
         raise TaskManagementError("entity_id is required", status_code=400)
 
@@ -703,7 +757,7 @@ async def _apply_task_operation(
             session,
             user_id=user_id,
             task_id=task_id,
-            project_id=_parse_uuid(payload.get("project_id"), "project_id"),
+            project_id=parse_uuid_or_400(payload.get("project_id"), "project_id"),
             title=title,
             description=payload.get("description"),
             status=str(payload.get("status") or "open"),
@@ -712,7 +766,22 @@ async def _apply_task_operation(
             end_at=_parse_wall_clock_datetime(payload.get("end_at"), "end_at"),
             all_day=bool(payload.get("all_day") or False),
             reminder_offsets=payload.get("reminder_offsets"),
-            task_metadata=payload.get("metadata") or payload.get("task_metadata"),
+            notifications_enabled=payload.get("notifications_enabled"),
+            estimated_hours=payload.get("estimated_hours"),
+            parent_task_id=(
+                parse_uuid_or_400(payload.get("parent_task_id"), "parent_task_id")
+                if payload.get("parent_task_id")
+                else None
+            ),
+            tag_ids=[
+                parse_uuid_or_400(value, "tag_id")
+                for value in (payload.get("tag_ids") or [])
+            ],
+            assignee_ids=[
+                parse_uuid_or_400(value, "assignee_id")
+                for value in (payload.get("assignee_ids") or [])
+            ],
+            task_metadata=_task_metadata_from_payload(payload),
             source=str(payload.get("source") or "mobile"),
         )
         return created
@@ -737,7 +806,7 @@ async def _apply_time_entry_operation(
     user_id: UUID,
     operation: SyncOperation,
 ) -> dict[str, Any]:
-    entry_id = _parse_uuid(operation.entity_id, "entity_id")
+    entry_id = parse_uuid_or_400(operation.entity_id, "entity_id")
     if entry_id is None:
         raise TaskManagementError("entity_id is required", status_code=400)
 
@@ -821,7 +890,7 @@ async def _apply_project_operation(
     user_id: UUID,
     operation: SyncOperation,
 ) -> dict[str, Any]:
-    project_id = _parse_uuid(operation.entity_id, "entity_id")
+    project_id = parse_uuid_or_400(operation.entity_id, "entity_id")
     if project_id is None:
         raise TaskManagementError("entity_id is required", status_code=400)
 
@@ -890,6 +959,29 @@ async def _apply_project_operation(
     raise TaskManagementError("Unsupported project sync action", status_code=400)
 
 
+async def _apply_docs_push_operation(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    operation: SyncOperation,
+) -> dict[str, Any]:
+    """Docs push をRESTと同一の処理へ委譲し、サーバー版を検証する。"""
+    service = DocsGraphService(session)
+    workspace = await service.ensure_workspace(user_id)
+    return await apply_docs_operation(
+        session,
+        service,
+        user_id=user_id,
+        workspace_id=workspace.id,
+        table=operation.table,
+        action=operation.action,
+        entity_id=operation.entity_id,
+        payload=operation.payload,
+        base_updated_at=operation.base_updated_at,
+        require_base_version=True,
+    )
+
+
 def create_sync_router(
     get_db_manager,
     get_user_from_request,
@@ -928,6 +1020,12 @@ def create_sync_router(
             await ProjectRepository.ensure_user_inbox_setup(session, user_id)
             await session.commit()
             project_ids = await _accessible_project_ids(session, user_id)
+            # Docs テーブルが要求された場合のみ workspace を解決する。
+            docs_workspace_id: Optional[UUID] = None
+            if any(table in DOCS_SYNC_TABLES for table in requested):
+                workspace = await DocsGraphService(session).ensure_workspace(user_id)
+                await session.commit()
+                docs_workspace_id = workspace.id
             pulled = {}
             for table in requested:
                 pulled[table] = await _pull_table(
@@ -936,6 +1034,7 @@ def create_sync_router(
                     user_id=user_id,
                     project_ids=project_ids,
                     since=since_dt,
+                    docs_workspace_id=docs_workspace_id,
                 )
                 pulled[table]["cursor"] = server_time.isoformat()
             return {
@@ -970,6 +1069,10 @@ def create_sync_router(
                         entity = await _apply_time_entry_operation(
                             service, session, user_id=user_id, operation=operation
                         )
+                    elif operation.table in DOCS_PUSH_TABLES:
+                        entity = await _apply_docs_push_operation(
+                            session, user_id=user_id, operation=operation
+                        )
                     else:
                         raise TaskManagementError(
                             f"Unsupported push table: {operation.table}",
@@ -985,12 +1088,27 @@ def create_sync_router(
                             else None,
                         }
                     )
-                except TaskManagementError as exc:
+                except (TaskManagementError, DocsOperationError) as exc:
                     await session.rollback()
                     status = "conflict" if exc.status_code == 409 else "error"
                     conflict_entity: Optional[dict[str, Any]] = None
-                    entity_id = _parse_uuid(operation.entity_id, "entity_id")
-                    if status == "conflict" and entity_id is not None:
+                    # Docs テーブルの entity_id は複合キー（"<node>:<field>" 等）が
+                    # あり得るため、UUID として解釈できない場合は None として扱う
+                    # （push 全体を 400 で落とさない）。
+                    try:
+                        entity_id = parse_uuid_or_400(operation.entity_id, "entity_id")
+                    except HTTPException:
+                        entity_id = None
+                    if status == "conflict" and operation.table in DOCS_PUSH_TABLES:
+                        docs_service = DocsGraphService(session)
+                        docs_workspace = await docs_service.ensure_workspace(user_id)
+                        conflict_entity = await load_current_docs_entity(
+                            session,
+                            workspace_id=docs_workspace.id,
+                            table=operation.table,
+                            entity_id=operation.entity_id,
+                        )
+                    elif status == "conflict" and entity_id is not None:
                         if operation.table == "tasks":
                             conflict_entity = await _load_current_task_payload(
                                 service, session, entity_id

@@ -22,9 +22,14 @@ class HistoryManager:
             context_window_size: Number of messages to use for context generation.
         """
         self.history: List[Dict[str, Any]] = []
+        # Display history and model transcript are deliberately separate.  The
+        # latter may contain tool items or turn-local context metadata.
+        self.model_history: Optional[List[Dict[str, Any]]] = None
         self.max_history_length = max_history_length
         self.context_window_size = context_window_size
         self.summary: str = ""
+        self.summary_version: int = 0
+        self.summary_checkpoint: Optional[str] = None
         self.hard_limit = 100  # Safety limit preventing memory leaks if summarization fails
         
     def add_message(self, role: str, content: str, **kwargs) -> None:
@@ -95,7 +100,33 @@ class HistoryManager:
 
     def update_summary(self, new_summary: str) -> None:
         """Update conversation summary."""
-        self.summary = new_summary
+        normalized = str(new_summary or "").strip()
+        if normalized != self.summary:
+            self.summary_version += 1
+        self.summary = normalized
+        self.summary_checkpoint = f"summary-v{self.summary_version}" if normalized else None
+
+    def set_summary(self, summary: str, *, version: Optional[int] = None) -> None:
+        """Restore a persisted summary checkpoint without touching display messages."""
+        self.summary = str(summary or "").strip()
+        if version is not None:
+            try:
+                self.summary_version = max(0, int(version))
+            except (TypeError, ValueError):
+                self.summary_version = 0
+        elif self.summary and not self.summary_version:
+            self.summary_version = 1
+        self.summary_checkpoint = f"summary-v{self.summary_version}" if self.summary else None
+
+    def set_model_messages(self, messages: Optional[List[Dict[str, Any]]]) -> None:
+        """Set the canonical transcript used for the next model request."""
+        self.model_history = [dict(message) for message in (messages or [])]
+
+    def get_model_messages(self) -> List[Dict[str, Any]]:
+        """Return canonical model messages, falling back to display history."""
+        if self.model_history is not None:
+            return [dict(message) for message in self.model_history]
+        return self.get_all()
 
     def pop_oldest(self, count: int) -> List[Dict[str, Any]]:
         """
@@ -121,3 +152,7 @@ class HistoryManager:
     def clear(self) -> None:
         """Clear all history."""
         self.history = []
+        self.model_history = None
+        self.summary = ""
+        self.summary_version = 0
+        self.summary_checkpoint = None

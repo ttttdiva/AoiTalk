@@ -62,6 +62,63 @@ export interface CommandCandidate {
   color?: string;
   /** 選択済みチェックマーク表示 */
   checked?: boolean;
+  /** 候補に紐づくプロジェクトID（/m の同名プロジェクト識別用） */
+  projectId?: string;
+  /** value/label 以外に候補検索へ使う文字列 */
+  keywords?: string[];
+}
+
+export type CommandCandidateSelection = {
+  command: string;
+  candidate: CommandCandidate;
+};
+
+export function normalizeCommandValue(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function getCandidateSearchValues(candidate: CommandCandidate): string[] {
+  return [candidate.value, candidate.label, ...(candidate.keywords || [])]
+    .filter((value): value is string => !!value)
+    .map(normalizeCommandValue);
+}
+
+export function filterCommandCandidates(
+  candidates: CommandCandidate[],
+  rawQuery: string,
+): CommandCandidate[] {
+  const query = normalizeCommandValue(rawQuery);
+  if (!query) return candidates;
+  return candidates.filter((candidate) =>
+    getCandidateSearchValues(candidate).some((value) =>
+      value.startsWith(query),
+    ),
+  );
+}
+
+export function resolveCommandCandidate(
+  candidates: CommandCandidate[],
+  rawQuery: string,
+): CommandCandidate | null {
+  const query = normalizeCommandValue(rawQuery);
+  if (!query) return null;
+
+  const uniqueCandidate = (matches: CommandCandidate[]) => {
+    const byIdentity = new Map<string, CommandCandidate>();
+    for (const candidate of matches) {
+      const identity = candidate.projectId
+        ? `project:${candidate.projectId}`
+        : `value:${normalizeCommandValue(candidate.value)}`;
+      if (!byIdentity.has(identity)) byIdentity.set(identity, candidate);
+    }
+    return byIdentity.size === 1 ? [...byIdentity.values()][0] : null;
+  };
+
+  const exact = candidates.filter((candidate) =>
+    getCandidateSearchValues(candidate).includes(query),
+  );
+  if (exact.length > 0) return uniqueCandidate(exact);
+  return uniqueCandidate(filterCommandCandidates(candidates, query));
 }
 
 /** タスク用デフォルトコマンド */
@@ -100,7 +157,10 @@ interface SlashCommandInputProps extends Omit<
   /** Tab 時にプレビュー候補を入力欄へ補完する関数 */
   getValueCompletion?: ValuePreviewFn;
   /** スラッシュコマンドをインラインでパースする（blurせずにEnterで処理） */
-  onParseSlashCommands?: (text: string) => string;
+  onParseSlashCommands?: (
+    text: string,
+    selection?: CommandCandidateSelection,
+  ) => string;
   /** コマンド別の値候補（例: { "/m": [{value:"Project1"}, ...] }） */
   commandCandidates?: Record<string, CommandCandidate[]>;
   /** 候補アイテムに追加のUI（三点リーダー等）を表示する */
@@ -140,6 +200,8 @@ export function SlashCommandInput({
   // --- コマンド補完メニュー ---
   const [showMenu, setShowMenu] = useState(false);
   const [selectedIdx, setSelectedIdx] = useState(0);
+  const [commandSelectionExplicit, setCommandSelectionExplicit] =
+    useState(false);
   const [filtered, setFiltered] = useState<SlashCommandDef[]>([]);
   const [slashPos, setSlashPos] = useState(-1);
 
@@ -147,6 +209,8 @@ export function SlashCommandInput({
   const [showCandidates, setShowCandidates] = useState(false);
   const [candidateList, setCandidateList] = useState<CommandCandidate[]>([]);
   const [candidateIdx, setCandidateIdx] = useState(0);
+  const [candidateSelectionExplicit, setCandidateSelectionExplicit] =
+    useState(false);
   const [candidateCmd, setCandidateCmd] = useState<string>(""); // "/m" etc
   const [candidateSlashPos, setCandidateSlashPos] = useState(-1);
 
@@ -208,17 +272,11 @@ export function SlashCommandInput({
           commandCandidates[matchedCmd.command]
         ) {
           const allCandidates = commandCandidates[matchedCmd.command];
-          const query = valuePart.toLowerCase();
-          const matches = query
-            ? allCandidates.filter(
-                (c) =>
-                  c.value.toLowerCase().startsWith(query) ||
-                  (c.label && c.label.toLowerCase().startsWith(query)),
-              )
-            : allCandidates; // 空入力時は全候補
+          const matches = filterCommandCandidates(allCandidates, valuePart);
 
           setCandidateList(matches);
           setCandidateIdx(0);
+          setCandidateSelectionExplicit(false);
           setCandidateCmd(matchedCmd.command);
           setCandidateSlashPos(lastSlash);
           setShowCandidates(matches.length > 0);
@@ -256,15 +314,22 @@ export function SlashCommandInput({
       setPreviewText(null);
       setPreviewCmd(null);
       const query = fragment.toLowerCase(); // e.g. "/s", "/du"
-      const matches = commands.filter((c) =>
+      const prefixMatches = commands.filter((c) =>
         getTaskCommandVariants(c.command).some((variant) =>
           variant.toLowerCase().startsWith(query),
         ),
       );
+      const exactMatches = prefixMatches.filter((c) =>
+        getTaskCommandVariants(c.command).some(
+          (variant) => variant.toLowerCase() === query,
+        ),
+      );
+      const matches = exactMatches.length > 0 ? exactMatches : prefixMatches;
 
       if (matches.length > 0) {
         setFiltered(matches);
         setSelectedIdx(0);
+        setCommandSelectionExplicit(false);
         setSlashPos(lastSlash);
         setShowMenu(true);
       } else {
@@ -318,7 +383,10 @@ export function SlashCommandInput({
 
       // パース処理を実行（コマンドを消費して反映）
       if (onParseSlashCommands) {
-        const result = onParseSlashCommands(newVal);
+        const result = onParseSlashCommands(newVal, {
+          command: candidateCmd,
+          candidate,
+        });
         onChange(result);
       } else {
         onChange(newVal);
@@ -386,10 +454,12 @@ export function SlashCommandInput({
         switch (e.key) {
           case "ArrowDown":
             e.preventDefault();
+            setCandidateSelectionExplicit(true);
             setCandidateIdx((prev) => (prev + 1) % candidateList.length);
             return;
           case "ArrowUp":
             e.preventDefault();
+            setCandidateSelectionExplicit(true);
             setCandidateIdx(
               (prev) =>
                 (prev - 1 + candidateList.length) % candidateList.length,
@@ -399,6 +469,18 @@ export function SlashCommandInput({
           case "Tab":
             e.preventDefault();
             e.stopPropagation();
+            if (!candidateSelectionExplicit && candidateList.length > 1) {
+              const lastSlash = findLastCommandSlash(value);
+              const fragment = lastSlash >= 0 ? value.slice(lastSlash) : "";
+              const spaceIdx = fragment.indexOf(" ");
+              const resolved = resolveCommandCandidate(
+                candidateList,
+                spaceIdx >= 0 ? fragment.slice(spaceIdx + 1) : "",
+              );
+              if (!resolved) return;
+              applyCandidateSelection(resolved);
+              return;
+            }
             applyCandidateSelection(candidateList[candidateIdx]);
             return;
           case "Escape":
@@ -413,10 +495,12 @@ export function SlashCommandInput({
         switch (e.key) {
           case "ArrowDown":
             e.preventDefault();
+            setCommandSelectionExplicit(true);
             setSelectedIdx((prev) => (prev + 1) % filtered.length);
             break;
           case "ArrowUp":
             e.preventDefault();
+            setCommandSelectionExplicit(true);
             setSelectedIdx(
               (prev) => (prev - 1 + filtered.length) % filtered.length,
             );
@@ -425,6 +509,7 @@ export function SlashCommandInput({
           case "Tab":
             e.preventDefault();
             e.stopPropagation();
+            if (filtered.length > 1 && !commandSelectionExplicit) break;
             applyCommand(filtered[selectedIdx]);
             break;
           case "Escape":
@@ -483,11 +568,14 @@ export function SlashCommandInput({
       showMenu,
       filtered,
       selectedIdx,
+      commandSelectionExplicit,
       applyCommand,
       showCandidates,
       candidateList,
       candidateIdx,
+      candidateSelectionExplicit,
       applyCandidateSelection,
+      findLastCommandSlash,
       applyPreviewCompletion,
       hasUnprocessedSlash,
       value,
@@ -550,7 +638,10 @@ export function SlashCommandInput({
                 "flex items-center justify-between rounded-sm px-2 py-1.5 text-sm cursor-pointer",
                 idx === selectedIdx && "bg-accent text-accent-foreground",
               )}
-              onMouseEnter={() => setSelectedIdx(idx)}
+              onMouseEnter={() => {
+                setSelectedIdx(idx);
+                setCommandSelectionExplicit(true);
+              }}
               onMouseDown={(e) => {
                 e.preventDefault(); // blur 防止
                 applyCommand(cmd);
@@ -582,12 +673,15 @@ export function SlashCommandInput({
           </div>
           {candidateList.map((c, idx) => (
             <div
-              key={c.value}
+              key={`${c.projectId ?? "candidate"}:${c.value}:${idx}`}
               className={cn(
                 "flex items-center gap-2 rounded-sm px-2 py-1.5 text-sm cursor-pointer",
                 idx === candidateIdx && "bg-accent text-accent-foreground",
               )}
-              onMouseEnter={() => setCandidateIdx(idx)}
+              onMouseEnter={() => {
+                setCandidateIdx(idx);
+                setCandidateSelectionExplicit(true);
+              }}
               onMouseDown={(e) => {
                 e.preventDefault();
                 applyCandidateSelection(c);

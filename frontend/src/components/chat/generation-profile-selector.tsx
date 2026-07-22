@@ -22,24 +22,28 @@ const GENERATION_PROFILES = [
   {
     value: "chat",
     label: "チャットモード",
+    mnemonic: "C",
     desc: "単発応答、必要なツールのみ使用",
     icon: MessageSquare,
   },
   {
     value: "assisted_work",
     label: "支援作業",
+    mnemonic: "S",
     desc: "検証ループあり、ツールは確認",
     icon: ShieldCheck,
   },
   {
     value: "autonomous_work",
     label: "自律作業",
+    mnemonic: "A",
     desc: "検証ループあり、権限を自動承認",
     icon: Code,
   },
   {
     value: "review",
     label: "レビュー",
+    mnemonic: "R",
     desc: "変更せず確認中心で実行",
     icon: ClipboardList,
   },
@@ -103,7 +107,11 @@ export function GenerationProfileSelector({
           {GENERATION_PROFILES.map((mode) => {
             const Icon = mode.icon;
             return (
-              <DropdownMenuRadioItem key={mode.value} value={mode.value}>
+              <DropdownMenuRadioItem
+                key={mode.value}
+                value={mode.value}
+                mnemonic={mode.mnemonic}
+              >
                 <Icon className="size-4 shrink-0" />
                 <div className="flex flex-col">
                   <span className="text-sm font-medium">{mode.label}</span>

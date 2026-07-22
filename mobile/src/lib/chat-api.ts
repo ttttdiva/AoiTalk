@@ -10,6 +10,11 @@ import type {
   ConversationMessage,
   LlmModelCatalogResponse,
 } from "../types/api";
+import type {
+  ChatCommandCapability,
+  SkillSlashCommand,
+} from "../features/conversation/chat-commands";
+import { skillSlashCommands } from "../features/conversation/chat-commands";
 
 export type LlmMode = string;
 
@@ -38,6 +43,14 @@ export const chatApi = {
 
   async getLlmModelCatalog(): Promise<LlmModelCatalogResponse> {
     return fetchApi<LlmModelCatalogResponse>("/api/llm/models");
+  },
+
+  async listSkillSlashCommands(projectId?: string | null): Promise<SkillSlashCommand[]> {
+    const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
+    const data = await fetchApi<{
+      skills?: Array<{ name: string; description?: string; trigger_mode?: string }>;
+    }>(`/api/skills${query}`);
+    return skillSlashCommands(data.skills ?? []);
   },
 
   /** セッション一覧取得 */
@@ -98,6 +111,7 @@ export const chatApi = {
       include_project_context?: boolean;
       edit_message_id?: string;
       response_model?: ChatResponseModelSelection;
+      command_capabilities?: ChatCommandCapability[];
       mentions?: Array<{ type: string; id: string; name: string }>;
       attachments?: Array<Record<string, unknown>>;
     },

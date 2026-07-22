@@ -36,6 +36,7 @@ export function TaskStatusMenuItems({
       {TASK_STATUS_OPTIONS.map((status) => (
         <DropdownMenuItem
           key={status}
+          mnemonic={STATUS_KEY_HINTS[status]}
           className={cn(
             "flex items-center justify-between gap-2 cursor-pointer",
             currentStatus !== undefined &&
@@ -53,11 +54,6 @@ export function TaskStatusMenuItems({
             />
             {STATUS_LABELS[status]}
           </span>
-          {STATUS_KEY_HINTS[status] && (
-            <kbd className="ml-auto text-[10px] text-muted-foreground opacity-60">
-              {STATUS_KEY_HINTS[status]}
-            </kbd>
-          )}
         </DropdownMenuItem>
       ))}
     </>

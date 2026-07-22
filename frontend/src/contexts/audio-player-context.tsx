@@ -10,6 +10,7 @@ import {
 } from "react";
 import { explorerList, filerBrowse } from "@/lib/explorer-api";
 import { useUserSettings } from "@/contexts/user-settings-context";
+import { getFileExt } from "@/lib/utils";
 
 interface AudioTrack {
   name: string;
@@ -42,7 +43,7 @@ interface AudioPlayerContextType extends AudioPlayerState {
 
 const AudioPlayerContext = createContext<AudioPlayerContextType | null>(null);
 const VOLUME_STORAGE_KEY = "aoitalk-audio-volume";
-const AUDIO_EXTENSIONS = new Set([".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac"]);
+const AUDIO_EXTENSIONS = new Set(["mp3", "wav", "ogg", "flac", "m4a", "aac"]);
 const MAX_GLOBAL_AUDIO_TRACKS = 1000;
 const MAX_GLOBAL_AUDIO_DIRECTORIES = 240;
 
@@ -62,11 +63,6 @@ function loadSavedVolume(): number {
     }
   } catch {}
   return 1;
-}
-
-function getFileExt(name: string): string {
-  const index = name.lastIndexOf(".");
-  return index >= 0 ? name.slice(index).toLowerCase() : "";
 }
 
 function isAudioTrackLike(track: Pick<AudioTrack, "name" | "type">): boolean {

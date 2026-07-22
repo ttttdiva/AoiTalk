@@ -88,17 +88,15 @@ export async function PUT(
     ];
   });
 
-  const storedFieldIds = fieldIds.filter(
-    (fieldId: string) => !proxiedFieldIds.has(fieldId),
-  );
+  const requestedFieldIds = Array.from(new Set(fieldIds));
   const rows = await db.transaction(async (tx) => {
-    if (storedFieldIds.length > 0) {
+    if (requestedFieldIds.length > 0) {
       await tx
         .delete(knowledgeFieldValues)
         .where(
           and(
             eq(knowledgeFieldValues.nodeId, access.node.id),
-            inArray(knowledgeFieldValues.fieldId, storedFieldIds),
+            inArray(knowledgeFieldValues.fieldId, requestedFieldIds),
           ),
         );
     }

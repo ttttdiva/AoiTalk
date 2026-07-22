@@ -171,6 +171,16 @@ def upgrade() -> None:
     bind = op.get_bind()
 
     for scenario in SCENARIOS.values():
+        # fresh DB では対象 scenario 行が存在しない。ハードコードされた scenario_id への
+        # canon INSERT は外部キー違反になるため、対象 scenario が無ければこの scenario の
+        # 処理をまるごとスキップする。既存(本番)DB には対象行が存在するため挙動は変わらない。
+        exists = bind.execute(
+            sa.text("SELECT 1 FROM scenarios WHERE id = :scenario_id"),
+            {"scenario_id": scenario["id"]},
+        ).first()
+        if exists is None:
+            continue
+
         bind.execute(
             sa.text(
                 """

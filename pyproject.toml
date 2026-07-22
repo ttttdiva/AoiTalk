@@ -57,6 +57,7 @@ dependencies = [
     # Office File Reading
     "markitdown[docx,pptx,xlsx,pdf]>=0.0.1",
     "openpyxl>=3.1.0",
+    "extract-msg>=0.55.0",
 
     # Knowledge Note Frontmatter
     "python-frontmatter>=1.1.0",
@@ -78,6 +79,7 @@ dependencies = [
     "requests>=2.31.0",
     "httpx>=0.24.0",
     "aiofiles>=23.0.0",
+    "py7zr>=1.1.0,<2.0.0",
     "beautifulsoup4>=4.12.0",
     "Pillow>=10.0.0",
     "croniter>=1.3.0",
@@ -140,9 +142,10 @@ irodori = [
     "safetensors>=0.7.0",
     "soundfile>=0.12.0",
     "sentencepiece>=0.2.1,<0.3",
-    "torch>=2.10.0",
-    "torchaudio>=2.10.0",
-    "torchcodec>=0.10.0",
+    "silentcipher @ git+https://github.com/SesameAILabs/silentcipher.git@d46d7d0893a583d8968ab3a6626e2289faec9152",
+    "torch>=2.10.0,<2.11.0",
+    "torchaudio>=2.10.0,<2.11.0",
+    "torchcodec>=0.10.0,<0.11.0",
     "transformers<5",
     "tqdm>=4.67.3",
 ]
@@ -159,6 +162,33 @@ miotts = [
     "torchaudio>=2.10.0",
     "transformers>=4.57.6,<5",
 ]
+
+# TTS共通の日本語誤読リスク検出（各TTSエンジンから独立）
+yomi-linter = [
+    "huggingface-hub>=0.34.0,<1.0",
+    "safetensors>=0.7.0",
+    "torch>=2.2.0,<2.11.0",
+    "transformers>=4.48.0,<5",
+]
+
+[tool.ruff]
+# 初期導入のため致命的ルールのみに限定（構文エラー・比較ミス・未定義名など）
+target-version = "py312"
+exclude = [
+    "src/vendor",
+    "venv",
+    "node_modules",
+    "alembic/versions",
+    "frontend",
+    "mobile",
+    "build",
+    "dist",
+    ".git",
+]
+
+[tool.ruff.lint]
+# E9: 構文エラー / F63: 無効な比較 / F7: 構文的に誤ったキーワード使用 / F82: 未定義名
+select = ["E9", "F63", "F7", "F82"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

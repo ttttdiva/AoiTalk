@@ -12,7 +12,7 @@ import contextvars
 import json
 import logging
 from types import SimpleNamespace
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from typing import Any, Callable, Sequence
 
 from ..tools.registry import ToolRegistry
@@ -31,7 +31,6 @@ from .tool_policy import (
     looks_like_media_request,
     looks_like_project_management_request,
     project_progress_review_active,
-    looks_like_memory_request,
     looks_like_search_request,
     looks_like_utility_request,
 )
@@ -130,6 +129,7 @@ class OpenAIToolCallRecord:
 class OpenAIToolCallLoopResult:
     final_output: str
     tool_calls: list[OpenAIToolCallRecord]
+    messages: list[dict[str, Any]] = dataclass_field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -303,6 +303,7 @@ def build_tool_hint_context_sync(
         user_input,
         registry,
     )
+    knowledge_search_hint = "knowledge_search" in registry
     return _build_context_block(
         matched_rules,
         user_input=user_input,
@@ -313,6 +314,7 @@ def build_tool_hint_context_sync(
         direct_filesystem_hint=direct_filesystem_hint,
         direct_project_hint=direct_project_hint,
         project_progress_review_hint=project_progress_review_hint,
+        knowledge_search_hint=knowledge_search_hint,
     )
 
 
@@ -342,6 +344,7 @@ async def build_tool_hint_context_async(
         user_input,
         registry,
     )
+    knowledge_search_hint = "knowledge_search" in registry
     return _build_context_block(
         matched_rules,
         user_input=user_input,
@@ -352,6 +355,7 @@ async def build_tool_hint_context_async(
         direct_filesystem_hint=direct_filesystem_hint,
         direct_project_hint=direct_project_hint,
         project_progress_review_hint=project_progress_review_hint,
+        knowledge_search_hint=knowledge_search_hint,
     )
 
 
@@ -663,6 +667,7 @@ def run_openai_tool_call_loop(
             )
             for tool_result in result.tool_results
         ],
+        messages=[dict(message) for message in result.messages],
     )
 
 
@@ -687,7 +692,9 @@ def _should_hint_direct_search_tools(user_input: str, registry: ToolRegistry) ->
 
 
 def _should_hint_direct_memory_tools(user_input: str, registry: ToolRegistry) -> bool:
-    return looks_like_memory_request(user_input) and any(
+    # search_memory は読み取り専用の深掘りツール。キーワード一致に依らず、
+    # 使えるなら常にヒントを添えてモデルが必要な時に自発的に呼べるようにする。
+    return any(
         tool_name in registry for tool_name in DIRECT_MEMORY_TOOL_HINT_NAMES
     )
 
@@ -721,7 +728,15 @@ def _build_context_block(
     direct_filesystem_hint: bool = False,
     direct_project_hint: bool = False,
     project_progress_review_hint: bool = False,
+    knowledge_search_hint: bool = False,
 ) -> str:
+    autonomous_execution_guidance = (
+        "## Autonomous Tool Execution\n"
+        "- Use the available tools without asking the user for execution permission. "
+        "Ask only when required information or a consequential user choice is missing."
+        if policy.permission_policy.value == "auto_approve"
+        else ""
+    )
     if (
         not rules
         and not direct_search_hint
@@ -730,17 +745,24 @@ def _build_context_block(
         and not direct_project_hint
         and not project_progress_review_hint
     ):
-        return ""
+        return autonomous_execution_guidance
     tool_lines = [f"- Consider `{rule.tool_name}`." for rule in rules]
     if direct_search_hint:
-        tool_lines.append(
-            "- 公開Webや最新情報は `web_search`、X/Twitterは `grok_x_search`、"
-            "Knowledge Sourceは `knowledge_search`、過去会話は `search_memory` を使って確認してください。"
-        )
+        if knowledge_search_hint:
+            tool_lines.append(
+                "- 公開Webや最新情報は `web_search`、X/Twitterは `grok_x_search`、"
+                "Knowledge Sourceは `knowledge_search` を使って確認してください。"
+            )
+        else:
+            tool_lines.append(
+                "- 公開Webや最新情報は `web_search`、"
+                "X/Twitterは `grok_x_search` を使って確認してください。"
+            )
     if direct_memory_hint:
         tool_lines.append(
-            "- 過去会話、以前話した内容、ユーザーが覚えているか確認している内容は "
-            "`search_memory` を使って確認してください。"
+            "- ユーザーの好み・名前・過去の決定・以前の作業内容など、現在の会話に無い文脈が"
+            "必要になったら `search_memory` で過去会話を検索してください。"
+            "自動で添えられた過去会話の抜粋で足りない場合も `search_memory` で掘り下げてください。"
         )
     if direct_filesystem_hint:
         tool_lines.append(
@@ -772,6 +794,8 @@ def _build_context_block(
             "- 案件情報Docsや台帳を更新した場合は、最終回答前に `get_project_progress` を再実行してください。"
         )
     block = "\n".join(["## Tool Hints", *tool_lines]).strip()
+    if autonomous_execution_guidance:
+        block = f"{block}\n\n{autonomous_execution_guidance}"
     matched_tool_names = [rule.tool_name for rule in rules]
     if direct_search_hint:
         matched_tool_names.append("search_tools")
