@@ -1,8 +1,8 @@
 {
     "mobile":  {
-                   "date":  "2026-07-22",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.89/aoitalk-mobile.apk",
-                   "version":  "0.1.89",
-                   "notes":  "v0.1.89 リリース"
+                   "date":  "2026-07-23",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.90/aoitalk-mobile.apk",
+                   "version":  "0.1.90",
+                   "notes":  "v0.1.90: ローカル接続時のチャットフォールバックを修正、更新チェック失敗時の理由表示を追加、タスク作成・詳細画面の日付入力をコンパクトなピッカーに刷新"
                }
 }
