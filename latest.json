@@ -1,8 +1,8 @@
 {
     "mobile":  {
-                   "date":  "2026-07-24",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.93/aoitalk-mobile.apk",
-                   "version":  "0.1.93",
-                   "notes":  "v0.1.93 リリース"
+                   "date":  "2026-07-26",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.94/aoitalk-mobile.apk",
+                   "version":  "0.1.94",
+                   "notes":  "モバイルファイラーの長押しメニューを改善し、ローカル・サーバーのファイルを端末へ保存できるようにしました。削除などの操作もAndroidで確実に選べます。"
                }
 }
