@@ -1,8 +1,8 @@
 {
     "mobile":  {
                    "date":  "2026-07-28",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.98/aoitalk-mobile.apk",
-                   "version":  "0.1.98",
-                   "notes":  "v0.1.98 リリース"
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.99/aoitalk-mobile.apk",
+                   "version":  "0.1.99",
+                   "notes":  "v0.1.99 リリース\n\n- クリップ取り込みがAoiTalkサーバー未接続でも成功するようになりました（端末LLMでのローカル取り込み、または保留キューへの退避と接続時の自動再送）\n- クリップ取り込み専用のモデル設定（プロバイダー / モデル / 推論の深さ）を設定画面に追加しました"
                }
 }
