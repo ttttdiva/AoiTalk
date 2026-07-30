@@ -1,8 +1,8 @@
 {
     "mobile":  {
                    "date":  "2026-07-31",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.105/aoitalk-mobile.apk",
-                   "version":  "0.1.105",
-                   "notes":  "Docsを開いた直後とアプリ復帰時にサーバー同期し、SQLiteの表示を最新化するよう修正しました。\nDocs同期を他領域の失敗から分離し、通信状態の誤判定と編集中タイトルの巻き戻りも修正しました。"
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.106/aoitalk-mobile.apk",
+                   "version":  "0.1.106",
+                   "notes":  "Docsの自動同期・復帰時更新・編集内容保護を追加し、古い表示へ戻る問題を修正しました。\n複数APIが並行した場合も、遅れて完了した通信失敗が到達状態を上書きしないよう改善しました。"
                }
 }
