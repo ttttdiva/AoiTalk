@@ -1,8 +1,8 @@
 {
     "mobile":  {
                    "date":  "2026-07-31",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.104/aoitalk-mobile.apk",
-                   "version":  "0.1.104",
-                   "notes":  "Docsの階層編集を改善し、子ノードのダブルタップ遷移と字下げ操作を修正しました。"
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.105/aoitalk-mobile.apk",
+                   "version":  "0.1.105",
+                   "notes":  "Docsを開いた直後とアプリ復帰時にサーバー同期し、SQLiteの表示を最新化するよう修正しました。\nDocs同期を他領域の失敗から分離し、通信状態の誤判定と編集中タイトルの巻き戻りも修正しました。"
                }
 }
