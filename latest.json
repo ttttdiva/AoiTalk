@@ -1,8 +1,8 @@
 {
     "mobile":  {
-                   "date":  "2026-07-30",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.103/aoitalk-mobile.apk",
-                   "version":  "0.1.103",
-                   "notes":  "v0.1.103 リリース"
+                   "date":  "2026-07-31",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.104/aoitalk-mobile.apk",
+                   "version":  "0.1.104",
+                   "notes":  "Docsの階層編集を改善し、子ノードのダブルタップ遷移と字下げ操作を修正しました。"
                }
 }
