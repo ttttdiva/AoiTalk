@@ -1,8 +1,8 @@
 {
     "mobile":  {
-                   "date":  "2026-07-29",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.102/aoitalk-mobile.apk",
-                   "version":  "0.1.102",
-                   "notes":  "チャット画面の接続バーを簡素化しました。正常時は緑のドットだけを表示し、「サーバー接続済み」「リアルタイム」の文言は出しません。文字の折り返しでヘッダーが極端に高くなる問題も解消しています。"
+                   "date":  "2026-07-30",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.103/aoitalk-mobile.apk",
+                   "version":  "0.1.103",
+                   "notes":  "v0.1.103 リリース"
                }
 }
