@@ -1,8 +1,8 @@
 {
     "mobile":  {
                    "date":  "2026-08-02",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.110/aoitalk-mobile.apk",
-                   "version":  "0.1.110",
-                   "notes":  "Docsツリーを初期状態で格納し、展開・格納操作を改善"
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.111/aoitalk-mobile.apk",
+                   "version":  "0.1.111",
+                   "notes":  "v0.1.111 リリース"
                }
 }
