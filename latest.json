@@ -1,8 +1,8 @@
 {
     "mobile":  {
                    "date":  "2026-08-03",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.113/aoitalk-mobile.apk",
-                   "version":  "0.1.113",
-                   "notes":  "クリップ取り込みをオフラインでも実行できるようにし、サーバー接続時の失敗を減らしました。タスク一覧の並びがリロードのたびに入れ替わる不具合を修正し、reasoning effortでmaxまで選べるようにしました。ステータスの「取消」を選択肢から外しました。"
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.114/aoitalk-mobile.apk",
+                   "version":  "0.1.114",
+                   "notes":  "カレンダーで同じタスクが複数回表示される不具合を修正しました。"
                }
 }
