@@ -1,8 +1,8 @@
 {
     "mobile":  {
                    "date":  "2026-08-12",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.126/aoitalk-mobile.apk",
-                   "version":  "0.1.126",
-                   "notes":  "AoiTalk v0.1.126 リリース\n\n- クリップ取り込みのルーティング検証と要約品質を改善\n- BM25検索の認可・キャッシュ・同時実行時の安全性を強化\n- ランタイム機能制御とチャット・音声・モバイルUIの安定性を改善"
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.127/aoitalk-mobile.apk",
+                   "version":  "0.1.127",
+                   "notes":  "v0.1.127 リリース"
                }
 }
