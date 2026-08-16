@@ -1,8 +1,8 @@
 {
     "mobile":  {
-                   "date":  "2026-08-16",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.132/aoitalk-mobile.apk",
-                   "version":  "0.1.132",
-                   "notes":  "v0.1.132 リリース"
+                   "date":  "2026-08-17",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.134/aoitalk-mobile.apk",
+                   "version":  "0.1.134",
+                   "notes":  "ClipIngest v4: 知識正規化のgrounding強化（CJK entity anchor・ではsubject parser・Server/Mobile parity）"
                }
 }
