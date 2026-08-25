@@ -9,12 +9,103 @@ silently drop a session.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Optional
 
+from .chat_attachment_utils import (
+    add_project_attachment_context_marker,
+    build_message_with_attachment_context,
+)
+from ..llm.conversation_context import (
+    compact_model_transcript_for_history,
+    merge_model_transcript_snapshot,
+)
 from ..memory.manager import ConversationMemoryManager
 from ..memory.models import ConversationMessage
 
 PromptMessage = dict[str, Any]
+_CACHED_GENERATION_METADATA_KEYS = frozenset(
+    {
+        "cache_usage",
+        "context_snapshot",
+        "conversation_state",
+        "free_team_route",
+        "generation_metrics",
+        "model_transcript",
+        "token_usage",
+    }
+)
+_ATTACHMENT_PATH_PREFIXES = ("_projects/", "_users/")
+
+
+def _attachment_history_context(
+    metadata: Any,
+    *,
+    project_id: Any = None,
+    user_id: Any = None,
+    shared_session: bool = False,
+) -> str:
+    """Return safe path-only references for attachments from a prior turn."""
+    if not isinstance(metadata, dict):
+        return ""
+    attachments = metadata.get("attachments")
+    if not isinstance(attachments, list):
+        return ""
+
+    lines: list[str] = []
+    safe_items: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for item in attachments:
+        if not isinstance(item, dict) or item.get("upload_failed"):
+            continue
+        raw_path = item.get("path")
+        if not isinstance(raw_path, str):
+            continue
+        normalized_path = raw_path.replace("\\", "/").strip()
+        if (
+            not normalized_path
+            or normalized_path.startswith("/")
+            or re.match(r"^[A-Za-z]:/", normalized_path)
+            or not normalized_path.casefold().startswith(_ATTACHMENT_PATH_PREFIXES)
+        ):
+            continue
+        parts = normalized_path.split("/")
+        if any(part in {"", ".", ".."} for part in parts):
+            continue
+        if any(ord(char) < 32 for char in normalized_path):
+            continue
+        if normalized_path.casefold().startswith("_users/"):
+            user_prefix = f"_users/user_{str(user_id or '').strip()}/".casefold()
+            if shared_session or not user_id or not normalized_path.casefold().startswith(
+                user_prefix
+            ):
+                continue
+        if normalized_path in seen_paths:
+            continue
+        seen_paths.add(normalized_path)
+
+        raw_name = str(item.get("name") or parts[-1]).strip()
+        safe_name = re.sub(r"[\r\n\x00-\x1f\]]+", " ", raw_name).strip()
+        safe_name = safe_name or parts[-1]
+        safe_item = {"name": safe_name, "path": normalized_path}
+        # Preserve only the upload route's structured registration bit when
+        # rebuilding a prompt.  A path line alone is never enough to recreate
+        # the Project attachment marker.
+        if item.get("registered") is True:
+            safe_item["registered"] = True
+        safe_items.append(safe_item)
+        lines.append(f"[添付ファイル: {safe_name}] {normalized_path}")
+
+    context = "\n".join(lines)
+    project_key = str(project_id or "").strip()
+    if project_key:
+        marked = add_project_attachment_context_marker(
+            context,
+            safe_items,
+            project_key,
+        )
+        return marked or ""
+    return context
 
 
 @dataclass
@@ -31,6 +122,43 @@ class ClientUserContextSnapshot:
     session_metadata: Any = None
     had_system_prompt: bool = False
     system_prompt: Any = None
+
+
+def reset_turn_generation_metadata(llm_client: Any) -> None:
+    """Clear cached output metadata before a new Web turn selects its session."""
+
+    if llm_client is None:
+        return
+    empty_values = {
+        "_last_model_transcript": [],
+        "_history_authoritative_model_transcript": [],
+        "_history_active_model_transcript": [],
+        "_last_context_snapshots": [],
+        "_last_turn_tool_records": [],
+        "_last_turn_tool_rounds_exhausted": False,
+        "_last_usage_records": [],
+        "_last_generation_metadata": {},
+        "_last_usage": {},
+        "_last_generation_metrics": None,
+        "_last_cli_usage": {},
+        "_last_route_metadata": {},
+    }
+    for attribute, empty_value in empty_values.items():
+        if hasattr(llm_client, attribute):
+            try:
+                setattr(llm_client, attribute, empty_value)
+            except Exception:
+                pass
+
+
+def without_cached_generation_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Remove fields that can only describe a completed LLM generation."""
+
+    return {
+        key: value
+        for key, value in metadata.items()
+        if key not in _CACHED_GENERATION_METADATA_KEYS
+    }
 
 
 def apply_turn_user_context_to_client(
@@ -157,6 +285,34 @@ class ChatTurnPersistence:
                 pass
         return canonical_name
 
+    async def load_session_context(
+        self,
+        session_id: Optional[str],
+    ) -> dict[str, Any]:
+        """会話セッションの非表示ランタイム状態を返す。"""
+        if not session_id or not await self._ensure_ready():
+            return {}
+        repo = self.memory_manager.repository
+        try:
+            session = await repo.get_session_by_id(session_id, with_messages=False)
+        except TypeError:
+            session = await repo.get_session_by_id(session_id)
+        context = getattr(session, "context", None) if session is not None else None
+        return dict(context) if isinstance(context, dict) else {}
+
+    async def update_session_context(
+        self,
+        session_id: Optional[str],
+        updates: dict[str, Any],
+    ) -> bool:
+        """既存 context を保持したままランタイム状態をマージする。"""
+        if not session_id or not updates or not await self._ensure_ready():
+            return False
+        updater = getattr(self.memory_manager.repository, "update_session_context", None)
+        if not callable(updater):
+            return False
+        return bool(await updater(session_id, dict(updates)))
+
     async def save_user_message(
         self,
         *,
@@ -167,11 +323,13 @@ class ChatTurnPersistence:
         sender_type: Optional[str] = None,
         sender_id: Optional[str] = None,
         sender_display_name: Optional[str] = None,
+        message_id: Optional[str] = None,
     ) -> Optional[ConversationMessage]:
         if not session_id or (not content and not metadata):
             return None
         if not await self._ensure_ready():
             return None
+        message_identity = {"message_id": message_id} if message_id else {}
         message = await self.memory_manager.add_message_to_session(
             session_id=session_id,
             role="user",
@@ -181,6 +339,7 @@ class ChatTurnPersistence:
             sender_type=sender_type,
             sender_id=sender_id,
             sender_display_name=sender_display_name,
+            **message_identity,
         )
         if message is not None:
             try:
@@ -193,6 +352,38 @@ class ChatTurnPersistence:
                 pass
         return message
 
+    async def load_message(
+        self, message_id: str
+    ) -> Optional[ConversationMessage]:
+        if not message_id or not await self._ensure_ready():
+            return None
+        return await self.memory_manager.repository.get_message_by_id(message_id)
+
+    async def delete_message(
+        self, *, session_id: Optional[str], message_id: Optional[str]
+    ) -> bool:
+        """Roll back a newly persisted message that was never accepted."""
+        if not session_id or not message_id or not await self._ensure_ready():
+            return False
+        deleter = getattr(self.memory_manager.repository, "delete_message_by_id", None)
+        if not callable(deleter):
+            return False
+        return bool(await deleter(session_id, message_id))
+
+    async def update_message_metadata(
+        self,
+        *,
+        session_id: Optional[str],
+        message_id: Optional[str],
+        updates: dict[str, Any],
+    ) -> bool:
+        if not session_id or not message_id or not await self._ensure_ready():
+            return False
+        updater = getattr(self.memory_manager.repository, "update_message_metadata", None)
+        if not callable(updater):
+            return False
+        return bool(await updater(session_id, message_id, updates))
+
     async def save_assistant_message(
         self,
         *,
@@ -202,11 +393,13 @@ class ChatTurnPersistence:
         sender_type: Optional[str] = None,
         sender_id: Optional[str] = None,
         sender_display_name: Optional[str] = None,
+        message_id: Optional[str] = None,
     ) -> Optional[ConversationMessage]:
         if not session_id or not content:
             return None
         if not await self._ensure_ready():
             return None
+        message_identity = {"message_id": message_id} if message_id else {}
         return await self.memory_manager.add_message_to_session(
             session_id=session_id,
             role="assistant",
@@ -215,6 +408,7 @@ class ChatTurnPersistence:
             sender_type=sender_type,
             sender_id=sender_id,
             sender_display_name=sender_display_name,
+            **message_identity,
         )
 
     async def load_prompt_history(
@@ -248,10 +442,45 @@ class ChatTurnPersistence:
                 break
             if msg.role not in {"system", "user", "assistant"}:
                 continue
-            prompt_message: PromptMessage = {"role": msg.role, "content": msg.content}
             metadata = getattr(msg, "message_metadata", None) or getattr(msg, "metadata", None) or {}
+            if (
+                isinstance(metadata, dict)
+                and metadata.get("delivery_mode") == "immediate_interrupt"
+                and metadata.get("interrupt_receipt_status") == "pending"
+            ):
+                # A route may have been cancelled after the pending row was
+                # committed but before the active generation accepted it.
+                # Keep it visible for reconciliation, but never inject an
+                # outcome-unknown instruction into a later prompt.
+                continue
+            content = msg.content
+            if msg.role == "user":
+                attachment_context = _attachment_history_context(
+                    metadata,
+                    project_id=(
+                        getattr(persisted_session, "project_id", None)
+                        if persisted_session is not None
+                        else None
+                    ),
+                    user_id=(
+                        getattr(persisted_session, "user_id", None)
+                        if persisted_session is not None
+                        else None
+                    ),
+                    shared_session=bool(
+                        getattr(persisted_session, "is_group_chat", False)
+                        if persisted_session is not None
+                        else False
+                    ),
+                )
+                if attachment_context:
+                    content = build_message_with_attachment_context(
+                        content,
+                        attachment_context,
+                    )
+            prompt_message: PromptMessage = {"role": msg.role, "content": content}
             model_transcript = metadata.get("model_transcript") if isinstance(metadata, dict) else None
-            if isinstance(model_transcript, list) and model_transcript:
+            if msg.role == "assistant" and isinstance(model_transcript, list) and model_transcript:
                 prompt_message["_model_transcript"] = model_transcript
             if not prompt_messages and persisted_session is not None:
                 summary = str(getattr(persisted_session, "current_summary", "") or "").strip()
@@ -308,6 +537,20 @@ class ChatTurnPersistence:
         prompt_history: list[PromptMessage],
     ) -> None:
         """Prime provider-local history from persisted active-branch messages."""
+        provider_state = next(
+            (
+                dict(msg.get("_provider_state") or {})
+                for msg in prompt_history
+                if isinstance(msg.get("_provider_state"), dict)
+            ),
+            {},
+        )
+        if hasattr(llm_client, "_provider_state"):
+            llm_client._provider_state = {
+                "previous_response_id": provider_state.get("previous_response_id"),
+                "fingerprint": provider_state.get("fingerprint"),
+            }
+
         if hasattr(llm_client, "history_manager"):
             history_manager = llm_client.history_manager
             if hasattr(history_manager, "clear"):
@@ -323,38 +566,25 @@ class ChatTurnPersistence:
             )
             if summary and hasattr(history_manager, "set_summary"):
                 history_manager.set_summary(summary)
-            provider_state = next(
-                (
-                    dict(msg.get("_provider_state") or {})
-                    for msg in prompt_history
-                    if isinstance(msg.get("_provider_state"), dict)
-                ),
-                None,
-            )
-            if provider_state is not None and hasattr(llm_client, "_provider_state"):
-                llm_client._provider_state = {
-                    "previous_response_id": provider_state.get("previous_response_id"),
-                    "fingerprint": provider_state.get("fingerprint"),
-                }
 
             model_messages: list[dict[str, Any]] = []
+            previous_transcript: list[dict[str, Any]] = []
+            fallback_start = 0
             for msg in prompt_history:
                 transcript = msg.get("_model_transcript")
-                if isinstance(transcript, list) and transcript:
-                    # The transcript includes the user message belonging to
-                    # this assistant reply.  Remove the display-only fallback
-                    # user item we may have appended immediately beforehand.
-                    first = transcript[0] if isinstance(transcript[0], dict) else {}
-                    if (
-                        model_messages
-                        and first.get("role") == "user"
-                        and model_messages[-1].get("role") == "user"
-                    ):
-                        model_messages.pop()
-                    model_messages.extend(
-                        dict(item)
-                        for item in transcript
-                        if isinstance(item, dict) and item.get("role") in {"system", "user", "assistant", "tool"}
+                if (
+                    msg.get("role") == "assistant"
+                    and isinstance(transcript, list)
+                    and transcript
+                ):
+                    model_messages, previous_transcript, fallback_start = (
+                        merge_model_transcript_snapshot(
+                            model_messages,
+                            previous_transcript,
+                            fallback_start,
+                            transcript,
+                            allowed_roles={"system", "user", "assistant", "tool"},
+                        )
                     )
                 elif (
                     msg.get("role") in {"system", "user", "assistant", "tool"}
@@ -369,8 +599,41 @@ class ChatTurnPersistence:
                     )
             if hasattr(history_manager, "set_model_messages"):
                 history_manager.set_model_messages(model_messages)
+            full_model_transcript = [
+                dict(item)
+                for item in model_messages
+                if isinstance(item, dict)
+                and item.get("role") in {"user", "assistant", "tool"}
+            ]
             try:
                 llm_client._model_transcript = [dict(item) for item in model_messages]
+                llm_client._last_model_transcript = [
+                    dict(item) for item in previous_transcript
+                ]
+                llm_client._history_authoritative_model_transcript = full_model_transcript
+            except Exception:
+                pass
+
+            compacted_model_messages = compact_model_transcript_for_history(
+                model_messages,
+                getattr(llm_client, "config", None),
+            )
+            if compacted_model_messages != model_messages:
+                if hasattr(history_manager, "set_model_messages"):
+                    history_manager.set_model_messages(compacted_model_messages)
+                try:
+                    llm_client._model_transcript = [
+                        dict(item) for item in compacted_model_messages
+                    ]
+                except Exception:
+                    pass
+            try:
+                llm_client._history_active_model_transcript = [
+                    dict(item)
+                    for item in compacted_model_messages
+                    if isinstance(item, dict)
+                    and item.get("role") in {"user", "assistant", "tool"}
+                ]
             except Exception:
                 pass
 

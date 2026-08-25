@@ -6,6 +6,8 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
+import { BlurFade } from "@/components/magicui/blur-fade";
+import { BorderBeam } from "@/components/magicui/border-beam";
 
 function LoginForm() {
   const [username, setUsername] = useState("");
@@ -109,23 +111,33 @@ function LoginForm() {
 
 export default function LoginPage() {
   return (
-    <Card className="w-full border border-border bg-card shadow-sm">
-      <CardHeader className="items-center gap-3">
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src="/images/ui/brand-orb.png"
-          alt=""
-          className="size-14 rounded-full object-cover ring-1 ring-border"
+    <BlurFade className="w-full" duration={0.3} blur="4px" offset={8}>
+      <Card className="relative w-full overflow-hidden border border-border bg-card shadow-sm">
+        <BorderBeam
+          className="pointer-events-none"
+          duration={10}
+          size={80}
+          borderWidth={1}
+          colorFrom="var(--primary)"
+          colorTo="var(--chart-2)"
         />
-        <CardTitle className="text-center text-2xl tracking-tight">
-          AoiTalk
-        </CardTitle>
-      </CardHeader>
-      <CardContent>
-        <Suspense>
-          <LoginForm />
-        </Suspense>
-      </CardContent>
-    </Card>
+        <CardHeader className="items-center gap-3">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src="/images/ui/brand-orb.png"
+            alt=""
+            className="size-14 rounded-full object-cover ring-1 ring-border"
+          />
+          <CardTitle className="text-center text-2xl tracking-tight">
+            AoiTalk
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <Suspense>
+            <LoginForm />
+          </Suspense>
+        </CardContent>
+      </Card>
+    </BlurFade>
   );
 }

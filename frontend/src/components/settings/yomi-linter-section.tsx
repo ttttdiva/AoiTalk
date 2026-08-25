@@ -1,5 +1,7 @@
 "use client";
 
+import { AppSelect } from "@/components/ui/app-select";
+
 import { useCallback, useRef, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -163,6 +165,7 @@ export function YomiLinterSection() {
     <div className="space-y-3">
       <SettingsDisclosure
         title="誤読リスク検出"
+        targetId="yomi-linter"
         contentClassName="space-y-4"
         onOpenChange={loadWhenOpened}
       >
@@ -186,15 +189,15 @@ export function YomiLinterSection() {
           <Button variant="ghost" size="sm" onClick={() => setAdvanced((value) => !value)}>詳細設定 {advanced ? "を閉じる" : "を開く"}</Button>
           {advanced && <div className="grid gap-3 md:grid-cols-3">
             <div><Label>モデルID</Label><Input value={settings.model_id} onChange={(event) => setSettings((current) => ({ ...current, model_id: event.target.value }))} onBlur={() => void saveSetting("model_id", settings.model_id)} /></div>
-            <div><Label>デバイス</Label><select className="h-9 w-full rounded-md border bg-background px-3 text-sm" value={settings.device} onChange={(event) => void saveSetting("device", event.target.value)}><option value="cpu">CPU</option><option value="auto">自動</option><option value="cuda">CUDA</option></select></div>
-            <div><Label>量子化</Label><select className="h-9 w-full rounded-md border bg-background px-3 text-sm" value={settings.quantization} onChange={(event) => void saveSetting("quantization", event.target.value)}><option value="int8">INT8</option><option value="none">なし</option></select></div>
+            <div><Label>デバイス</Label><AppSelect className="h-9 w-full rounded-md border bg-background px-3 text-sm" value={settings.device} onChange={(event) => void saveSetting("device", event.target.value)}><option value="cpu">CPU</option><option value="auto">自動</option><option value="cuda">CUDA</option></AppSelect></div>
+            <div><Label>量子化</Label><AppSelect className="h-9 w-full rounded-md border bg-background px-3 text-sm" value={settings.quantization} onChange={(event) => void saveSetting("quantization", event.target.value)}><option value="int8">INT8</option><option value="none">なし</option></AppSelect></div>
           </div>}
           {status?.error && <p className="text-xs text-destructive">{status.error}</p>}
           {message && <p className="text-xs text-muted-foreground">{message}</p>}
         </fieldset>
       </SettingsDisclosure>
 
-      <SettingsDisclosure title="共通読み辞書" onOpenChange={loadWhenOpened}>
+      <SettingsDisclosure title="共通読み辞書" targetId="yomi-dictionary" onOpenChange={loadWhenOpened}>
         {initialLoading && <p className="text-xs text-muted-foreground">読み設定を取得中...</p>}
         {!ready && !initialLoading && message && <p className="text-xs text-destructive">{message}</p>}
         <fieldset disabled={!ready} className="contents disabled:opacity-60">
@@ -209,6 +212,7 @@ export function YomiLinterSection() {
 
       <SettingsDisclosure
         title="未解決の誤読候補"
+        targetId="yomi-candidates"
         contentClassName="space-y-2"
         onOpenChange={loadWhenOpened}
       >

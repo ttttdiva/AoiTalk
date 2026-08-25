@@ -149,11 +149,11 @@ function fallbackTokens(
   if (theme === "dark") {
     return {
       accent: color,
-      surface: `color-mix(in srgb, #1a2233 68%, ${color} 32%)`,
-      surfaceAlt: `color-mix(in srgb, #111827 66%, ${color} 34%)`,
-      surfaceHover: `color-mix(in srgb, #202a3d 62%, ${color} 38%)`,
-      surfaceGradient: `linear-gradient(135deg, color-mix(in srgb, #1a2233 68%, ${color} 32%), color-mix(in srgb, #111827 66%, ${color} 34%))`,
-      border: `color-mix(in srgb, #94a3b8 44%, ${color} 56%)`,
+      surface: `color-mix(in srgb, var(--surface-container) 68%, ${color} 32%)`,
+      surfaceAlt: `color-mix(in srgb, var(--surface-container-low) 66%, ${color} 34%)`,
+      surfaceHover: `color-mix(in srgb, var(--surface-container-high) 62%, ${color} 38%)`,
+      surfaceGradient: `linear-gradient(135deg, color-mix(in srgb, var(--surface-container) 68%, ${color} 32%), color-mix(in srgb, var(--surface-container-low) 66%, ${color} 34%))`,
+      border: `color-mix(in srgb, var(--outline) 44%, ${color} 56%)`,
       text: DEFAULT_TEXT_COLOR,
       mutedText: DEFAULT_MUTED_TEXT_COLOR,
       stripe: color,
@@ -162,11 +162,11 @@ function fallbackTokens(
 
   return {
     accent: color,
-    surface: `color-mix(in srgb, white 76%, ${color} 24%)`,
-    surfaceAlt: `color-mix(in srgb, white 68%, ${color} 32%)`,
-    surfaceHover: `color-mix(in srgb, white 62%, ${color} 38%)`,
-    surfaceGradient: `linear-gradient(135deg, color-mix(in srgb, white 76%, ${color} 24%), color-mix(in srgb, white 68%, ${color} 32%))`,
-    border: `color-mix(in srgb, white 42%, ${color} 58%)`,
+    surface: `color-mix(in srgb, var(--surface-container-lowest) 76%, ${color} 24%)`,
+    surfaceAlt: `color-mix(in srgb, var(--surface-container-low) 68%, ${color} 32%)`,
+    surfaceHover: `color-mix(in srgb, var(--surface-container) 62%, ${color} 38%)`,
+    surfaceGradient: `linear-gradient(135deg, color-mix(in srgb, var(--surface-container-lowest) 76%, ${color} 24%), color-mix(in srgb, var(--surface-container-low) 68%, ${color} 32%))`,
+    border: `color-mix(in srgb, var(--outline-variant) 42%, ${color} 58%)`,
     text: DEFAULT_TEXT_COLOR,
     mutedText: DEFAULT_MUTED_TEXT_COLOR,
     stripe: color,

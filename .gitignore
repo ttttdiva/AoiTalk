@@ -48,6 +48,10 @@ cache/
 *.mp3
 config/miotts_refs/
 config/miotts_presets/
+# Character voice reference/capture assets (privacy-sensitive user audio)
+data/character_voice_assets/
+data/character_voice_captures/
+data/generated_media/
 
 # OS
 .DS_Store
@@ -63,6 +67,9 @@ temp.md
 
 .mypy_cache/
 .pytest_cache/
+# Windows の 8.3 短縮パス配下では symlink 判定が壊れるため、
+# pytest を --basetemp=.pytest-tmp で長いパスへ逃がすことがある。
+.pytest-tmp/
 mypy.ini
 
 # Test coverage and reports
@@ -110,6 +117,7 @@ artifacts/
 *_token.json
 *_credentials.json
 .mcp.json
+/.runtime-secrets/
 
 # SSL certificates (private keys should never be committed)
 certs/
@@ -117,8 +125,6 @@ certs/
 # Caddy / lego binaries
 caddy/caddy.exe
 caddy/lego.exe
-
-sample_livedoor_news/
 
 # User workspace data (user files, projects)
 workspaces/
@@ -137,3 +143,7 @@ mobile/ios/
 # Playwright debug screenshots (自動生成)
 frontend/screenshots/
 aoitalk-mobile.apk
+
+# Skill録画の一時データ
+data/skill_recordings/
+tests/.artifacts/

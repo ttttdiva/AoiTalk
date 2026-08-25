@@ -266,7 +266,7 @@ Q&A の正本は `project_qa_entries`。Docs 本文側は Q&A block の表示位
 - canonical Docs node がない案件は、API/tool の初回 ensure で `案件情報` Docs node を作る。
 - 既存 record table は WBS・課題同期・agent tool・参照 ID の互換性を保つ移行元として残し、本文へコピーせず Docs から参照する。
 - 新しく人が管理する構造化一覧は、Supertag を行の型、`knowledge_fields` を列、Docs node を行、Saved View の `table` layout を表として作成する。
-- `.dbtable` は物理ファイルではないため Workspace filer には表示しない。大量データ・外部ミラー用途の record table は内部データ基盤として扱う。
+- `.dbtable` は物理ファイルではないため Project Files には表示しない。大量データ・外部ミラー用途の record table は内部データ基盤として扱う。
 - 既存 record table の正本移行は、project scope、添付、監査イベント、sensitivity、外部同期、参照 ID の対応と件数・値検証を用意してから段階的に行う。
 
 ローカル DB では旧 facts/documents/sync states は空、categories は既定値のみだったため、drop による案件本文の消失はない。

@@ -37,6 +37,7 @@ export function buildDraftTask(draftTask?: Partial<Task> | null): Task {
     start_at: draftTask?.start_at || null,
     end_at: draftTask?.end_at || null,
     all_day: draftTask?.all_day === true,
+    auto_close_on_due: draftTask?.auto_close_on_due === true,
     reminder_offsets: Array.isArray(draftTask?.reminder_offsets)
       ? draftTask.reminder_offsets
       : [],
@@ -680,35 +681,39 @@ export function buildTaskCommandCandidates({
   const result: Record<string, CommandCandidate[]> = {};
 
   if (projects && projects.length > 0) {
-    result["/m"] = projects.flatMap((project): CommandCandidate[] => {
-      if (project.can_write === false) return [];
-      const aliasHint =
-        project.aliases && project.aliases.length > 0
-          ? ` (${project.aliases.join(", ")})`
-          : "";
-      const spaceName = project.space_id
-        ? projectSpaceNames?.get(project.space_id)
-        : undefined;
-      const projectLabel = spaceName
-        ? `${spaceName} / ${project.name}`
-        : project.name;
-      const keywords = [project.name, project.slug, ...(project.aliases || [])];
-      const aliasItems = (project.aliases || []).map((alias) => ({
-        value: alias,
-        label: `${projectLabel} (${alias})`,
-        projectId: project.id,
-        keywords,
-      }));
-      return [
-        {
+    const uniqueProjects = new Map<string, Project>();
+    for (const project of projects) {
+      if (project.can_write === false || uniqueProjects.has(project.id)) {
+        continue;
+      }
+      uniqueProjects.set(project.id, project);
+    }
+
+    result["/m"] = Array.from(uniqueProjects.values()).map(
+      (project): CommandCandidate => {
+        const aliasHint =
+          project.aliases && project.aliases.length > 0
+            ? ` (${project.aliases.join(", ")})`
+            : "";
+        const spaceName = project.space_id
+          ? projectSpaceNames?.get(project.space_id)
+          : undefined;
+        const projectLabel = spaceName
+          ? `${spaceName} / ${project.name}`
+          : project.name;
+        const keywords = [
+          project.name,
+          project.slug,
+          ...(project.aliases || []),
+        ];
+        return {
           value: project.name,
           label: projectLabel + aliasHint,
           projectId: project.id,
           keywords,
-        },
-        ...aliasItems,
-      ];
-    });
+        };
+      },
+    );
   }
 
   if (tags.length > 0) {

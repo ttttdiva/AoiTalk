@@ -5,10 +5,12 @@ import type {
   ConversationSession,
 } from "../../types/api";
 import type { DirectMobileLlmSelection } from "../../lib/mobile-llm";
+import type { ChatResponseTarget } from "./chat-llm-preferences";
 import type {
   ChatCommandCapability,
   SkillSlashCommand,
 } from "./chat-commands";
+import type { ChatAttachmentMetadata } from "../../lib/chat-api";
 
 export type UserCapability = "anonymous" | "authenticated" | "admin" | "restricted";
 
@@ -64,6 +66,31 @@ export type SyncState =
   | "pending-refresh"
   | "conflict";
 
+export type LlmSelectionSyncStatus =
+  | "idle"
+  | "pending"
+  | "syncing"
+  | "synced"
+  | "unsynced"
+  | "rejected";
+
+/** 直近の生成で実際に使われた provider/model/effort。 */
+export type EffectiveGenerationRoute =
+  | {
+      kind: "server";
+      provider?: string;
+      model?: string;
+      reasoningEffort?: string;
+      fallback?: boolean;
+    }
+  | {
+      kind: "direct";
+      provider: string;
+      model: string;
+      reasoningEffort?: string;
+      fallback?: boolean;
+    };
+
 export type ConversationCommandId =
   | "send-message"
   | "attach-file"
@@ -99,6 +126,7 @@ export type ConversationDiagnostics = {
   activityMessage: string | null;
   pendingMessages: number;
   lastRefreshAt?: string | null;
+  serverCheckedAt?: number | null;
 };
 
 export type PermissionRequest = {
@@ -181,6 +209,8 @@ export type TimelineItem =
 export type SendConversationCommand = {
   message: string;
   projectId?: string | null;
+  appId?: string | null;
+  appTargetId?: string | null;
   includeProjectContext?: boolean;
   agentMode?: string;
   editMessageId?: string;
@@ -188,6 +218,7 @@ export type SendConversationCommand = {
     | { kind: "server"; responseModel?: ChatResponseModelSelection }
     | { kind: "direct"; selection: DirectMobileLlmSelection };
   commandCapabilities?: ChatCommandCapability[];
+  attachments?: ChatAttachmentMetadata[];
 };
 
 export type ConversationControllerSnapshot = {
@@ -206,7 +237,13 @@ export type ConversationControllerSnapshot = {
   llmModeOptions: string[];
   llmModeLabels: Record<string, string>;
   llmModeKind: string | null;
+  llmModeSyncStatus: LlmSelectionSyncStatus;
+  llmSelectionMessage: string | null;
+  llmPreferencesReady: boolean;
+  effectiveGeneration: EffectiveGenerationRoute | null;
   responseModelOptions: ChatResponseModelOption[];
   responseModelOptionsLoading: boolean;
+  responseTarget: ChatResponseTarget;
   skillCommands: SkillSlashCommand[];
+  retryingMessageIds: string[];
 };

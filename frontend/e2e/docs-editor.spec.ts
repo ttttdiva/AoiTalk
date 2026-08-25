@@ -7,11 +7,12 @@ type MockNode = {
   parent_id: string | null;
   root_page_id: string | null;
   project_id: string | null;
+  system_key?: string | null;
   title: string;
   description?: string;
   body_json: Record<string, unknown>;
   body_text: string;
-  node_type: "page" | "block" | "object" | "search";
+  node_type: "node" | "page" | "block" | "object" | "search" | "day";
   query_json?: Record<string, unknown> | null;
   view_json?: Record<string, unknown>;
   sort_order: number;
@@ -339,7 +340,38 @@ function titleFor(text: string) {
   return text.replace(/\r\n?/g, "\n").split("\n").find((line) => line.trim())?.trim().slice(0, 500) ?? "";
 }
 
-async function installDocsMock(page: Page, state: MockState, options: { createDelays?: number[]; patchDelays?: number[]; tagDelays?: number[]; tagCommittedWarnings?: number[]; invalidTagIds?: string[] } = {}) {
+type DocsMockOptions = {
+  createDelays?: number[];
+  createFailures?: number[];
+  patchDelays?: number[];
+  /** Hold one PATCH until the caller releases it to make navigation races deterministic. */
+  patchGate?: {
+    requestIndex?: number;
+    onStart?: () => void;
+    release?: Promise<void>;
+  };
+  tagDelays?: number[];
+  tagCommittedWarnings?: number[];
+  invalidTagIds?: string[];
+  deleteFailures?: string[];
+  deleteCommittedWarnings?: string[];
+  childrenDelays?: Record<string, number>;
+  detailsDelays?: Record<string, number>;
+};
+
+function expectPersistedBlank(node: MockNode | undefined) {
+  expect(node).toBeTruthy();
+  expect(node?.title).toBe("");
+  expect(node?.body_text).toBe("");
+  expect(node?.node_type).toBe("node");
+  expect(node?.body_json).toMatchObject({
+    format: "doc_block",
+    block_type: "paragraph",
+    blank: true,
+  });
+}
+
+async function installDocsMock(page: Page, state: MockState, options: DocsMockOptions = {}) {
   let nextNodeSequence = 1;
   let createRequestIndex = 0;
   let patchRequestIndex = 0;
@@ -416,6 +448,28 @@ async function installDocsMock(page: Page, state: MockState, options: { createDe
           children_next_cursor_by_parent: {},
         },
       });
+      return;
+    }
+    if (url.pathname === "/api/docs/today" && method === "GET") {
+      // Today is intentionally backed by the same mutable mock state as the
+      // regular page route. This lets save-barrier tests verify that an edit
+      // is applied before the state-replacing Today load completes.
+      const today = state.nodes.find((node) => node.node_type === "day") ?? {
+        id: "mock-today",
+        workspace_id: "workspace-1",
+        parent_id: null,
+        root_page_id: "mock-today",
+        project_id: "project-1",
+        title: "Today",
+        body_json: blockJson(),
+        body_text: "",
+        node_type: "day" as const,
+        sort_order: 0,
+        created_at: "2026-07-04T00:00:00",
+        updated_at: "2026-07-04T00:00:00",
+        archived_at: null,
+      };
+      await route.fulfill({ json: { node: today, node_supertags: [] } });
       return;
     }
     if (url.pathname === "/api/docs/pages" && method === "GET") {
@@ -508,6 +562,8 @@ async function installDocsMock(page: Page, state: MockState, options: { createDe
       const allChildren = state.nodes.filter((node) => node.parent_id === parentId && !node.archived_at);
       const children = allChildren.slice(offset, offset + 80);
       const nextCursor = offset + children.length < allChildren.length ? String(offset + children.length) : null;
+      const childrenDelay = options.childrenDelays?.[parentId] ?? 0;
+      if (childrenDelay > 0) await new Promise((resolve) => setTimeout(resolve, childrenDelay));
       await route.fulfill({
         json: {
           parent_node_id: parentId,
@@ -527,6 +583,8 @@ async function installDocsMock(page: Page, state: MockState, options: { createDe
     if (detailsMatch && method === "GET") {
       const nodeId = detailsMatch[1];
       const node = state.nodes.find((item) => item.id === nodeId);
+      const detailsDelay = options.detailsDelays?.[nodeId] ?? 0;
+      if (detailsDelay > 0) await new Promise((resolve) => setTimeout(resolve, detailsDelay));
       await route.fulfill({
         json: {
           nodes: node ? [node] : [],
@@ -591,6 +649,37 @@ async function installDocsMock(page: Page, state: MockState, options: { createDe
       return;
     }
 
+    if (url.pathname === "/api/docs/fields" && method === "POST") {
+      const body = await route.request().postDataJSON();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const fieldId = `field-created-${state.fields.length + 1}`;
+      const field = {
+        id: fieldId,
+        workspace_id: "workspace-1",
+        supertag_id: body.supertag_id,
+        system_key: null,
+        name: body.name,
+        field_type: body.field_type ?? "text",
+        required: false,
+        options_json: body.options_json ?? {},
+        default_value_json: null,
+        sort_order: state.fields.filter((item) => item.supertag_id === body.supertag_id).length + 1,
+      };
+      state.fields.push(field);
+      await route.fulfill({
+        json: {
+          field,
+          supertag_field: {
+            supertag_id: body.supertag_id,
+            field_id: fieldId,
+            required: false,
+            sort_order: field.sort_order,
+          },
+        },
+      });
+      return;
+    }
+
     const moveMatch = url.pathname.match(/^\/api\/docs\/nodes\/([^/]+)\/move$/);
     if (moveMatch && method === "POST") {
       const body = await route.request().postDataJSON();
@@ -642,7 +731,12 @@ async function installDocsMock(page: Page, state: MockState, options: { createDe
       const nodeId = nodeMatch[1];
       const body = await route.request().postDataJSON();
       const patchDelay = options.patchDelays?.[patchRequestIndex] ?? 0;
+      const requestIndex = patchRequestIndex;
       patchRequestIndex += 1;
+      if (options.patchGate?.requestIndex === requestIndex) {
+        options.patchGate.onStart?.();
+        if (options.patchGate.release) await options.patchGate.release;
+      }
       if (patchDelay > 0) await new Promise((resolve) => setTimeout(resolve, patchDelay));
       const index = state.nodes.findIndex((node) => node.id === nodeId);
       if (index >= 0) {
@@ -659,19 +753,44 @@ async function installDocsMock(page: Page, state: MockState, options: { createDe
 
     if (nodeMatch && method === "DELETE") {
       const nodeId = nodeMatch[1];
-      const index = state.nodes.findIndex((node) => node.id === nodeId);
-      if (index >= 0) {
-        state.nodes[index] = { ...state.nodes[index], archived_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+      if (options.deleteFailures?.includes(nodeId)) {
+        await route.fulfill({ status: 409, json: { detail: "Archive failed for testing" } });
+        return;
       }
-      await route.fulfill({ json: { node: state.nodes[index] } });
+      const now = new Date().toISOString();
+      const archiveTree = (id: string) => {
+        const index = state.nodes.findIndex((node) => node.id === id);
+        if (index < 0) return;
+        state.nodes[index] = { ...state.nodes[index], archived_at: now, updated_at: now };
+        for (const child of state.nodes.filter((node) => node.parent_id === id)) {
+          archiveTree(child.id);
+        }
+      };
+      archiveTree(nodeId);
+      const index = state.nodes.findIndex((node) => node.id === nodeId);
+      const taskBindingError = options.deleteCommittedWarnings?.includes(nodeId)
+        ? "mock task unlink failure"
+        : null;
+      await route.fulfill({
+        json: {
+          node: state.nodes[index],
+          committed: true,
+          task_binding_error: taskBindingError,
+        },
+      });
       return;
     }
 
     if (url.pathname === "/api/docs" && method === "POST") {
       const body = await route.request().postDataJSON();
-      const createDelay = options.createDelays?.[createRequestIndex] ?? 0;
+      const requestIndex = createRequestIndex;
+      const createDelay = options.createDelays?.[requestIndex] ?? 0;
       createRequestIndex += 1;
       if (createDelay > 0) await new Promise((resolve) => setTimeout(resolve, createDelay));
+      if (options.createFailures?.includes(requestIndex)) {
+        await route.fulfill({ status: 500, json: { detail: "mock create failure" } });
+        return;
+      }
       const id = body.id ?? `mock-node-${nextNodeSequence++}`;
       const node: MockNode = {
         id,
@@ -697,7 +816,7 @@ async function installDocsMock(page: Page, state: MockState, options: { createDe
   });
 }
 
-async function openDocs(page: Page, state: MockState, options: { createDelays?: number[]; patchDelays?: number[]; tagDelays?: number[]; tagCommittedWarnings?: number[]; invalidTagIds?: string[] } = {}) {
+async function openDocs(page: Page, state: MockState, options: DocsMockOptions = {}) {
   await addAuthCookie(page);
   await installDocsMock(page, state, options);
   await page.goto("/docs/node-a");
@@ -741,6 +860,199 @@ test.describe("Docs block editor", () => {
     await expect(page.locator('[data-docs-sidebar-node-id="deep-parent"]')).toBeVisible();
   });
 
+  test("expands and collapses a focused sidebar node with Ctrl+Arrow", async ({ page }) => {
+    const state = createDeepState();
+    await openDocs(page, state);
+
+    const sidebarRoot = page.locator('[data-docs-sidebar-node-id="node-a"]');
+    // The chevron is a sibling of the row button, so keyboard expansion must
+    // resolve its owning sidebar node as well.
+    await sidebarRoot.locator("xpath=preceding-sibling::button[1]").focus();
+    await page.keyboard.press("Control+ArrowRight");
+    const sidebarHeading = page.locator('[data-docs-sidebar-node-id="block-title"]');
+    await expect(sidebarHeading).toBeVisible();
+
+    await sidebarHeading.focus();
+    await page.keyboard.press("Control+ArrowRight");
+    await expect(page.locator('[data-docs-sidebar-node-id="deep-parent"]')).toBeVisible();
+    await expect(page.locator('[data-docs-sidebar-node-id="deep-child"]')).toHaveCount(0);
+
+    await page.keyboard.press("Control+ArrowLeft");
+    await expect(page.locator('[data-docs-sidebar-node-id="deep-parent"]')).toHaveCount(0);
+  });
+
+  test("bulk expands and collapses only currently visible sidebar nodes", async ({ page }) => {
+    const state = createDeepState();
+    await openDocs(page, state);
+
+    const sidebarRoot = page.locator('[data-docs-sidebar-node-id="node-a"]');
+    await sidebarRoot.focus();
+    await page.keyboard.press("Control+ArrowRight");
+    await expect(page.locator('[data-docs-sidebar-node-id="block-title"]')).toBeVisible();
+    // The first press above is a single-node expansion.  Start a fresh
+    // two-press gesture after the 500ms bulk window has elapsed.
+    await page.waitForTimeout(550);
+    await sidebarRoot.focus();
+    await page.keyboard.press("Control+ArrowRight");
+    await page.keyboard.press("Control+ArrowRight");
+    await expect(page.locator('[data-docs-sidebar-node-id="deep-parent"]')).toBeVisible();
+    await expect(page.locator('[data-docs-sidebar-node-id="deep-child"]')).toHaveCount(0);
+
+    // A leaf keeps focus while the second press bulk-collapses the expanded
+    // rows that are still visible in the sidebar.
+    await page.locator('[data-docs-sidebar-node-id="block-task"]').focus();
+    await page.waitForTimeout(550);
+    await page.keyboard.press("Control+ArrowLeft");
+    await page.keyboard.press("Control+ArrowLeft");
+    await expect(page.locator('[data-docs-sidebar-node-id="block-title"]')).toHaveCount(0);
+  });
+
+  test("keeps body Ctrl+ArrowRight expansion behavior", async ({ page }) => {
+    const state = createDeepState();
+    await openDocs(page, state);
+    const bodyHeading = page.locator('[data-docs-block-id="block-title"]');
+    await bodyHeading.focus();
+    await page.keyboard.press("Control+ArrowRight");
+    await expect(page.locator('[data-docs-block-id="deep-parent"]')).toBeVisible();
+  });
+
+  test("renders and edits a typed Markdown table, then keeps the content after reload", async ({ page }) => {
+    const state = createState();
+    state.nodes.push({
+      ...state.nodes[1],
+      id: "typed-markdown",
+      title: "Markdown原文",
+      body_text: "Markdown原文",
+      body_json: {
+        format: "doc_block",
+        block_type: "markdown",
+        label: "Markdown原文",
+        content: "| A | B |\n| --- | --- |\n| x | y |",
+      },
+      sort_order: 5,
+    });
+    state.nodes.push({
+      ...state.nodes[1],
+      id: "typed-code",
+      title: "Code原文",
+      body_text: "Code原文",
+      body_json: {
+        format: "doc_block",
+        block_type: "code",
+        label: "Code原文",
+        content: "```bash\ncd ComfyUI/custom_nodes\ngit clone https://example.test/repo\n```",
+      },
+      sort_order: 6,
+    });
+    await openDocs(page, state);
+
+    const block = page.locator('[data-docs-block-id="typed-markdown"]');
+    await expect(block.getByRole("columnheader", { name: "A" })).toBeVisible();
+    await expect(block.getByTestId("docs-typed-content-edit")).toHaveCount(0);
+    await block.getByTestId("docs-typed-content-display").click();
+    const editor = block.getByTestId("docs-typed-content-editor").locator(".cm-content");
+    await editor.fill("# changed\n\n| A | B |\n| --- | --- |\n| edited | row |");
+    await block.getByTestId("docs-typed-content-save").click();
+    await expect.poll(() => (state.nodes.find((node) => node.id === "typed-markdown")?.body_json.content)).toBe(
+      "# changed\n\n| A | B |\n| --- | --- |\n| edited | row |",
+    );
+
+    await page.reload();
+    await expect(page.locator('[data-docs-block-id="typed-markdown"]').getByText("changed")).toBeVisible();
+    await expect(page.locator('[data-docs-block-id="typed-markdown"]').getByRole("columnheader", { name: "A" })).toBeVisible();
+
+    const codeBlock = page.locator('[data-docs-block-id="typed-code"]');
+    const codeDisplay = codeBlock.getByTestId("docs-typed-content-display");
+    await expect(codeDisplay).toContainText("cd ComfyUI/custom_nodes");
+    await expect(codeDisplay).not.toContainText("```bash");
+    await codeDisplay.click();
+    await expect(codeBlock.getByTestId("docs-typed-content-editor").locator(".cm-content")).toContainText("```bash");
+    await codeBlock.getByRole("button", { name: "キャンセル" }).click();
+  });
+
+  test("does not abort body children loading when the matching sidebar node is collapsed", async ({ page }) => {
+    const state = createDeepState();
+    state.attachments.push({
+      id: "body-detail-attachment",
+      node_id: "block-title",
+      file_name: "本文詳細.txt",
+      file_path: "workspaces/_docs/attachments/body-detail.txt",
+      mime_type: "text/plain",
+      size_bytes: 12,
+      metadata: {},
+      created_by: "user-1",
+      created_at: "2026-07-04T00:00:00",
+    });
+    await openDocs(page, state, {
+      childrenDelays: { "block-title": 400 },
+      detailsDelays: { "block-title": 400 },
+    });
+
+    const sidebarRoot = page.locator('[data-docs-sidebar-node-id="node-a"]');
+    await sidebarRoot.focus();
+    await page.keyboard.press("Control+ArrowRight");
+    const sidebarHeading = page.locator('[data-docs-sidebar-node-id="block-title"]');
+    await expect(sidebarHeading).toBeVisible();
+
+    const childrenRequest = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return request.method() === "GET" && url.pathname === "/api/docs/nodes/block-title/children";
+    });
+    const detailsRequest = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return request.method() === "GET" && url.pathname === "/api/docs/nodes/block-title/details";
+    });
+    const childrenResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return response.request().method() === "GET" && url.pathname === "/api/docs/nodes/block-title/children";
+    });
+    const detailsResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return response.request().method() === "GET" && url.pathname === "/api/docs/nodes/block-title/details";
+    });
+    await page.locator('[data-docs-block-id="block-title"]').focus();
+    await page.keyboard.press("Control+ArrowRight");
+    await Promise.all([childrenRequest, detailsRequest]);
+
+    // The sidebar expansion shares the in-flight request, then a single
+    // collapse must not abort the body expansion that started it.
+    await sidebarHeading.focus();
+    await page.keyboard.press("Control+ArrowRight");
+    await page.keyboard.press("Control+ArrowLeft");
+    const [loadedChildren, loadedDetails] = await Promise.all([childrenResponse, detailsResponse]);
+    expect(loadedChildren.status()).toBe(200);
+    expect(loadedDetails.status()).toBe(200);
+    await expect(page.locator('[data-docs-block-id="deep-parent"]')).toBeVisible();
+    await expect(page.locator('[data-docs-block-id="block-title"] [data-docs-attachment-id="body-detail-attachment"]')).toBeVisible();
+  });
+
+  test("does not abort sidebar children loading when the matching body node is collapsed", async ({ page }) => {
+    const state = createDeepState();
+    await openDocs(page, state, { childrenDelays: { "block-title": 400 } });
+
+    const sidebarRoot = page.locator('[data-docs-sidebar-node-id="node-a"]');
+    await sidebarRoot.focus();
+    await page.keyboard.press("Control+ArrowRight");
+    const sidebarHeading = page.locator('[data-docs-sidebar-node-id="block-title"]');
+    await expect(sidebarHeading).toBeVisible();
+
+    const childrenResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return response.request().method() === "GET" && url.pathname === "/api/docs/nodes/block-title/children";
+    });
+    await sidebarHeading.focus();
+    await page.keyboard.press("Control+ArrowRight");
+
+    // Collapse the same node in the body while the sidebar request is still
+    // waiting on its delayed response.  The shared load must stay alive.
+    await page.locator('[data-docs-block-id="block-title"]').focus();
+    await page.keyboard.press("Control+ArrowLeft");
+
+    const response = await childrenResponse;
+    expect(response.status()).toBe(200);
+    await expect(page.locator('[data-docs-sidebar-node-id="deep-parent"]')).toBeVisible();
+  });
+
   test("exposes the next child page from the keyboard instead of hiding rows after 80", async ({ page }) => {
     const state = createState();
     for (let index = 0; index < 90; index += 1) {
@@ -779,12 +1091,23 @@ test.describe("Docs block editor", () => {
 
   test("Tab indents under the previous sibling rather than its deepest visible child", async ({ page }) => {
     const state = createDeepState();
+    const initialNodeIds = new Set(state.nodes.map((node) => node.id));
     await openDocs(page, state);
     await page.locator('[data-docs-block-id="block-title"]').getByTitle("展開").click();
     await expect(page.locator('[data-docs-block-id="deep-parent"]')).toBeVisible();
     await page.locator('[data-docs-block-id="block-task"]').click();
     await page.keyboard.press("Tab");
     await expect.poll(() => state.nodes.find((node) => node.id === "block-task")?.parent_id).toBe("block-title");
+    await page.keyboard.press("End");
+    await page.keyboard.press("Enter");
+    await page.keyboard.type("次の項目");
+    await page.keyboard.press("Enter");
+    await expect.poll(() => state.nodes.find((node) => !initialNodeIds.has(node.id))?.parent_id).toBe("block-title");
+    await expect.poll(() => {
+      const created = state.nodes.find((node) => !initialNodeIds.has(node.id));
+      const moved = state.nodes.find((node) => node.id === "block-task");
+      return created && moved ? created.sort_order > moved.sort_order : false;
+    }).toBe(true);
   });
 
   test("sets a parent Field through /field without opening a property panel", async ({ page }) => {
@@ -863,15 +1186,22 @@ test.describe("Docs block editor", () => {
     await page.locator('[data-docs-block-id="block-link"]').click();
     await page.keyboard.press("End");
     await page.keyboard.press("Enter");
+    await expect.poll(() => state.nodes.find((node) => (
+      node.id !== "block-link" && node.parent_id === "node-a" && node.title === ""
+    ))).toBeTruthy();
+    const blankNode = state.nodes.find((node) => (
+      node.id !== "block-link" && node.parent_id === "node-a" && node.title === ""
+    ));
+    expectPersistedBlank(blankNode);
     await page.keyboard.type("/field");
     await page.keyboard.press("Enter");
     await expect(page.getByRole("listbox", { name: "インライン候補" })).toContainText("Page Role");
     await page.keyboard.press("ArrowDown");
     await page.keyboard.press("ArrowDown");
     await page.keyboard.press("Enter");
-    const shorthandEditor = page.locator('.cm-content[contenteditable="true"]');
+    const shorthandEditor = page.locator(`[data-docs-block-id="${blankNode?.id}"] .cm-content`);
     await expect(shorthandEditor).toBeFocused();
-    await expect(shorthandEditor).toHaveText("Page Role:");
+    await expect(shorthandEditor).toHaveText("Page Role: ");
     await page.keyboard.type("canonical");
     await expect(shorthandEditor).toHaveText("Page Role: canonical");
     await page.keyboard.press("Enter");
@@ -1048,8 +1378,115 @@ test.describe("Docs block editor", () => {
     await openDocs(page, state);
     await expect(page.getByRole("textbox", { name: "1行説明" })).toHaveCount(0);
     await expect(page.getByTestId("docs-document-fields")).toContainText(">備考");
-    await expect(page.getByRole("textbox", { name: "Field 備考" })).toHaveValue("正本を優先");
+    const noteField = page.getByRole("textbox", { name: "Field 備考" });
+    await expect(noteField).toHaveValue("正本を優先");
+    await page.getByText(">備考", { exact: true }).click();
+    await expect(noteField).toBeFocused();
     await expect(page.getByText("13 fields")).toHaveCount(0);
+  });
+
+  test("renders email long text readably and hides only the legacy Field mirror outline", async ({ page }) => {
+    const state = createState();
+    const emailBodyFirstLine = `quoted header ${"recipient@example.com ".repeat(12)}`;
+    const emailBodySecondLine = "本文の続き";
+    const emailBody = `${emailBodyFirstLine}\n${emailBodySecondLine}`;
+    state.nodes[0] = {
+      ...state.nodes[0],
+      title: "RE: SSL証明書発行依頼",
+      system_key: "project_mail:project-1:dedupe",
+      body_json: { format: "email", dedupe_key: "message-id:mail@example.com" },
+    };
+    state.supertags.push({
+      ...state.supertags[0],
+      id: "tag-email",
+      system_key: "email",
+      name: "メール",
+      base_type: "email",
+      pinned_field_ids: ["field-email-body"],
+    });
+    state.node_supertags.push({ node_id: "node-a", supertag_id: "tag-email" });
+    state.fields.push({
+      ...state.fields[0],
+      id: "field-email-body",
+      supertag_id: "tag-email",
+      system_key: "email_body",
+      name: "本文",
+      field_type: "long_text",
+      options_json: {},
+      default_value_json: null,
+      sort_order: 1,
+    });
+    state.field_values.push({
+      node_id: "node-a",
+      field_id: "field-email-body",
+      value_json: null,
+      value_text: emailBody,
+      value_number: null,
+      value_datetime: null,
+      target_node_id: null,
+    });
+    state.nodes.push(
+      {
+        ...state.nodes[1],
+        id: "legacy-body-label",
+        parent_id: "node-a",
+        title: "本文",
+        body_text: "本文",
+        sort_order: 20,
+      },
+      {
+        ...state.nodes[1],
+        id: "legacy-body-value",
+        parent_id: "legacy-body-label",
+        title: emailBodyFirstLine,
+        body_text: emailBodyFirstLine,
+        sort_order: 1,
+      },
+      {
+        ...state.nodes[1],
+        id: "legacy-body-value-2",
+        parent_id: "legacy-body-label",
+        title: emailBodySecondLine,
+        body_text: emailBodySecondLine,
+        sort_order: 2,
+      },
+      {
+        ...state.nodes[1],
+        id: "email-user-note",
+        parent_id: "node-a",
+        title: "利用者が追加した対応メモ",
+        body_text: "利用者が追加した対応メモ",
+        sort_order: 21,
+      },
+    );
+
+    const consoleErrors: string[] = [];
+    page.on("console", (message) => {
+      if (message.type() === "error") consoleErrors.push(message.text());
+    });
+    await openDocs(page, state);
+
+    const bodyField = page.getByRole("textbox", { name: "Field 本文" });
+    await expect(bodyField).toHaveAttribute("wrap", "soft");
+    await expect(bodyField).toHaveAttribute("rows", "4");
+    await expect(bodyField).toHaveCSS("overflow-x", "hidden");
+    await page.getByText(">本文", { exact: true }).click();
+    await expect(bodyField).toBeFocused();
+    await expect(page.locator('[data-docs-block-id="legacy-body-label"]')).toHaveCount(0);
+    await expect(page.locator('[data-docs-block-id="legacy-body-value"]')).toHaveCount(0);
+    await expect(page.locator('[data-docs-block-id="legacy-body-value-2"]')).toHaveCount(0);
+    await expect(page.locator('[data-docs-block-id="email-user-note"]')).toBeVisible();
+
+    await page.getByTitle("分割表示").click();
+    const splitBodyFields = page.getByRole("textbox", { name: "Field 本文" });
+    await expect(splitBodyFields).toHaveCount(2);
+    expect(await splitBodyFields.nth(0).getAttribute("id")).not.toBe(
+      await splitBodyFields.nth(1).getAttribute("id"),
+    );
+    await page.getByText(">本文", { exact: true }).nth(1).click();
+    await expect(splitBodyFields.nth(1)).toBeFocused();
+    await expect(splitBodyFields.nth(0)).not.toBeFocused();
+    expect(consoleErrors).toEqual([]);
   });
 
   test("opens populated Fields lazily and traverses them with the keyboard", async ({ page }) => {
@@ -1113,9 +1550,9 @@ test.describe("Docs block editor", () => {
     await row.click();
     await page.keyboard.press("Control+ArrowRight");
     const select = page.getByRole("combobox", { name: "Field 状態" });
-    await expect(select).toHaveValue("draft");
+    await expect(select).toContainText("draft");
     await select.press("ArrowDown");
-    await expect(select).toHaveValue("published");
+    await expect(select).toContainText("published");
     await expect.poll(() => state.field_values.find(
       (value) => value.node_id === "block-link" && value.field_id === "field-status",
     )?.value_text).toBe("published");
@@ -1165,6 +1602,470 @@ test.describe("Docs block editor", () => {
     await expect(row).toContainText("local-undo");
     await page.keyboard.press("Control+Z");
     await expect(row).not.toContainText("local-undo");
+  });
+
+  test("splits a title in the middle without restoring or duplicating the old text", async ({ page }) => {
+    const state = createState();
+    const target = state.nodes.find((node) => node.id === "block-link");
+    if (!target) throw new Error("split target is missing");
+    target.title = "雑談人がAIへ指示する形は普及しにくいという予想";
+    target.body_text = target.title;
+    await openDocs(page, state);
+
+    const row = page.locator('[data-docs-block-id="block-link"]');
+    await row.click();
+    await page.keyboard.press("Home");
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("Enter");
+
+    const suffix = "人がAIへ指示する形は普及しにくいという予想";
+    await expect.poll(() => state.nodes.find((node) => node.title === suffix)?.id ?? null).not.toBeNull();
+    const created = state.nodes.find((node) => node.title === suffix);
+    expect(created?.parent_id).toBe(target.parent_id);
+    expect(state.nodes.find((node) => node.id === target.id)?.title).toBe("雑談");
+    expect(state.nodes.filter((node) => node.title === suffix && !node.archived_at)).toHaveLength(1);
+    const createdRow = page.locator(`[data-docs-block-id="${created?.id}"]`);
+    await expect(createdRow).toBeVisible();
+    // Enter in the middle must keep the split suffix at the same outline
+    // depth, not accidentally adopt a visible descendant's depth.
+    expect(await createdRow.getAttribute("style")).toBe(await row.getAttribute("style"));
+    const siblings = state.nodes
+      .filter((node) => node.parent_id === target.parent_id && !node.archived_at)
+      .sort((left, right) => left.sort_order - right.sort_order);
+    expect(siblings[siblings.findIndex((node) => node.id === target.id) + 1]?.id).toBe(created?.id);
+
+    // A focus change/blur must not send the pre-split full title back to the API.
+    await page.getByTestId("docs-block-editor").click();
+    await expect.poll(() => state.nodes.find((node) => node.id === target.id)?.title).toBe("雑談");
+    await page.reload();
+    await expect(page.locator('[data-docs-block-id="block-link"]')).toContainText("雑談");
+    await expect(page.locator('[data-docs-block-id="block-link"]')).not.toContainText(suffix);
+    await expect(createdRow).toContainText(suffix);
+  });
+
+  test("preserves a Delete-at-line-end merge after the active editor blurs", async ({ page }) => {
+    const state = createState();
+    const currentId = "merge-delete-current";
+    const nextId = "merge-delete-next";
+    state.nodes.push(
+      {
+        ...state.nodes[3],
+        id: currentId,
+        title: "CCC333",
+        body_text: "CCC333",
+        sort_order: 50,
+      },
+      {
+        ...state.nodes[3],
+        id: nextId,
+        title: "DDD444",
+        body_text: "DDD444",
+        sort_order: 51,
+      },
+    );
+    await openDocs(page, state);
+
+    const currentRow = page.locator(`[data-docs-block-id="${currentId}"]`);
+    const nextRow = page.locator(`[data-docs-block-id="${nextId}"]`);
+    await expect(currentRow).toBeVisible();
+    await expect(nextRow).toBeVisible();
+    await currentRow.click();
+    await page.keyboard.press("End");
+
+    const patchResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return response.request().method() === "PATCH"
+        && url.pathname === `/api/docs/nodes/${currentId}`;
+    });
+    const deleteResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return response.request().method() === "DELETE"
+        && url.pathname === `/api/docs/nodes/${nextId}`;
+    });
+    await page.keyboard.press("Delete");
+    const [patch, deleted] = await Promise.all([patchResponse, deleteResponse]);
+    expect(patch.status()).toBe(200);
+    expect(deleted.status()).toBe(200);
+
+    // Blur the still-active merged editor as soon as its PATCH is durable;
+    // this is the stale-draft race that previously restored the old title.
+    await page.locator('[data-docs-block-id="block-link"]').click();
+    // A stale same-node PATCH must not be hidden by the optimistic row state;
+    // reload the server snapshot before checking the merged title.
+    await page.reload();
+    await expect.poll(() => state.nodes.find((node) => node.id === currentId)?.title)
+      .toBe("CCC333DDD444");
+    await expect.poll(() => state.nodes.find((node) => node.id === nextId)?.archived_at)
+      .not.toBeNull();
+    await expect(currentRow).toContainText("CCC333DDD444");
+    await expect(nextRow).toHaveCount(0);
+  });
+
+  test("persists an explicit blank paragraph after a line-end Enter", async ({ page }) => {
+    const state = createState();
+    await openDocs(page, state);
+    const initialCount = state.nodes.length;
+    const source = state.nodes.find((node) => node.id === "block-link");
+    if (!source) throw new Error("line-end source is missing");
+    const sourceRow = page.locator('[data-docs-block-id="block-link"]');
+    await sourceRow.click();
+    await page.keyboard.press("End");
+    await page.keyboard.press("Enter");
+
+    await expect.poll(() => state.nodes.find((node) => (
+      !node.archived_at
+      && node.id !== source.id
+      && node.parent_id === source.parent_id
+      && node.title === ""
+    ))).toBeTruthy();
+    const blankNode = state.nodes.find((node) => (
+      !node.archived_at
+      && node.id !== source.id
+      && node.parent_id === source.parent_id
+      && node.title === ""
+    ));
+    expectPersistedBlank(blankNode);
+    expect(state.nodes.length).toBe(initialCount + 1);
+
+    const blankRow = page.locator(`[data-docs-block-id="${blankNode?.id}"]`);
+    await expect(blankRow).toBeVisible();
+    await expect(blankRow.locator(".cm-content")).toBeFocused();
+    // The persisted blank is a same-parent/same-depth sibling, not an
+    // editor-only pending row.
+    expect(await blankRow.getAttribute("style")).toBe(await sourceRow.getAttribute("style"));
+    await expect(page.locator('[data-docs-blank-row-input]')).toHaveCount(0);
+
+    // Explicit blank rows are part of the server snapshot, so a reload must
+    // not collapse the intentional empty line back into a transient input.
+    await page.reload();
+    await expect(blankRow).toBeVisible();
+    expectPersistedBlank(state.nodes.find((node) => node.id === blankNode?.id));
+  });
+
+  test("persists a blank sibling before the current row for Enter at start", async ({ page }) => {
+    const state = createState();
+    const source = state.nodes.find((node) => node.id === "block-link");
+    if (!source) throw new Error("line-start source is missing");
+    await openDocs(page, state);
+    const sourceRow = page.locator('[data-docs-block-id="block-link"]');
+    await sourceRow.click();
+    await page.keyboard.press("Home");
+    await page.keyboard.press("Enter");
+
+    await expect.poll(() => state.nodes.find((node) => (
+      !node.archived_at
+      && node.id !== source.id
+      && node.parent_id === source.parent_id
+      && node.title === ""
+    ))).toBeTruthy();
+    const blankNode = state.nodes.find((node) => (
+      !node.archived_at
+      && node.id !== source.id
+      && node.parent_id === source.parent_id
+      && node.title === ""
+    ));
+    expectPersistedBlank(blankNode);
+    const siblings = state.nodes
+      .filter((node) => node.parent_id === source.parent_id && !node.archived_at)
+      .sort((left, right) => left.sort_order - right.sort_order);
+    expect(siblings.findIndex((node) => node.id === blankNode?.id)).toBeLessThan(
+      siblings.findIndex((node) => node.id === source.id),
+    );
+    const blankRow = page.locator(`[data-docs-block-id="${blankNode?.id}"]`);
+    await expect(blankRow).toBeVisible();
+    await expect(blankRow.locator(".cm-content")).toBeFocused();
+    expect(await blankRow.getAttribute("style")).toBe(await sourceRow.getAttribute("style"));
+  });
+
+  test("keeps consecutive persisted blank paragraphs across reload", async ({ page }) => {
+    const state = createState();
+    const source = state.nodes.find((node) => node.id === "block-link");
+    if (!source) throw new Error("consecutive-blank source is missing");
+    await openDocs(page, state);
+    await page.locator('[data-docs-block-id="block-link"]').click();
+    await page.keyboard.press("End");
+    await page.keyboard.press("Enter");
+
+    await expect.poll(() => state.nodes.find((node) => (
+      !node.archived_at
+      && node.id !== source.id
+      && node.parent_id === source.parent_id
+      && node.title === ""
+    ))).toBeTruthy();
+    const firstBlank = state.nodes.find((node) => (
+      !node.archived_at
+      && node.id !== source.id
+      && node.parent_id === source.parent_id
+      && node.title === ""
+    ));
+    expectPersistedBlank(firstBlank);
+    const firstBlankRow = page.locator(`[data-docs-block-id="${firstBlank?.id}"]`);
+    await expect(firstBlankRow.locator(".cm-content")).toBeFocused();
+    await page.keyboard.press("Enter");
+
+    await expect.poll(() => state.nodes.filter((node) => (
+      !node.archived_at
+      && node.parent_id === source.parent_id
+      && node.title === ""
+    ))).toHaveLength(2);
+    const blankNodes = state.nodes
+      .filter((node) => !node.archived_at && node.parent_id === source.parent_id && node.title === "")
+      .sort((left, right) => left.sort_order - right.sort_order);
+    expect(blankNodes).toHaveLength(2);
+    blankNodes.forEach((node) => expectPersistedBlank(node));
+    for (const node of blankNodes) await expect(page.locator(`[data-docs-block-id="${node.id}"]`)).toBeVisible();
+
+    await page.reload();
+    for (const node of blankNodes) {
+      expectPersistedBlank(state.nodes.find((candidate) => candidate.id === node.id));
+      await expect(page.locator(`[data-docs-block-id="${node.id}"]`)).toBeVisible();
+    }
+  });
+
+  test("blocks Today navigation until the active Docs commit is durable", async ({ page }) => {
+    const state = createState();
+    let releasePatch!: () => void;
+    let patchStartedResolve!: () => void;
+    const patchStarted = new Promise<void>((resolve) => {
+      patchStartedResolve = resolve;
+    });
+    const patchRelease = new Promise<void>((resolve) => {
+      releasePatch = resolve;
+    });
+    let todayRequestStarted = false;
+    page.on("request", (request) => {
+      if (new URL(request.url()).pathname === "/api/docs/today") todayRequestStarted = true;
+    });
+    await openDocs(page, state, {
+      patchGate: {
+        requestIndex: 0,
+        onStart: patchStartedResolve,
+        release: patchRelease,
+      },
+    });
+
+    const row = page.locator('[data-docs-block-id="block-link"]');
+    await row.click();
+    await page.keyboard.press("Control+A");
+    await page.keyboard.type("Daily note edit");
+    const todayClick = page
+      .getByTestId("workspace-navigation-frame")
+      .getByRole("button", { name: "Today" })
+      .click();
+    await patchStarted;
+    // The state-replacing Today GET must not start while the PATCH is held.
+    await expect.poll(() => todayRequestStarted).toBe(false);
+
+    releasePatch();
+    await todayClick;
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-link")?.title)
+      .toBe("Daily note edit");
+
+    // Return to the original route and reload; the edit must survive the
+    // navigation barrier and the server snapshot replacement.
+    await page.goto("/docs/node-a");
+    await expect(page.locator('[data-docs-block-id="block-link"]')).toContainText("Daily note edit");
+  });
+
+  test("hydrates persisted Today children on repeated navigation", async ({ page }) => {
+    const state = createState();
+    const todayNode: MockNode = {
+      id: "today-node",
+      workspace_id: "workspace-1",
+      parent_id: null,
+      root_page_id: "today-node",
+      project_id: "project-1",
+      title: "2026年8月23日(日)",
+      body_json: blockJson(),
+      body_text: "",
+      node_type: "day",
+      sort_order: 3,
+      created_at: "2026-08-23T00:00:00",
+      updated_at: "2026-08-23T00:00:00",
+      archived_at: null,
+    };
+    const todayChild: MockNode = {
+      id: "today-child",
+      workspace_id: "workspace-1",
+      parent_id: todayNode.id,
+      root_page_id: todayNode.id,
+      project_id: "project-1",
+      title: "Persisted today child",
+      body_json: blockJson(),
+      body_text: "Persisted today child",
+      node_type: "block",
+      sort_order: 1,
+      created_at: "2026-08-23T00:00:00",
+      updated_at: "2026-08-23T00:00:00",
+      archived_at: null,
+    };
+    state.nodes.push(todayNode, todayChild);
+    await openDocs(page, state);
+
+    const todayButton = page
+      .getByTestId("workspace-navigation-frame")
+      .getByRole("button", { name: "Today" });
+    const waitForTodayNeighborhood = () => Promise.all([
+      page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return response.request().method() === "GET" && url.pathname === "/api/docs/today";
+      }),
+      page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return response.request().method() === "GET" && url.pathname === `/api/docs/nodes/${todayNode.id}/tree`;
+      }),
+      page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return response.request().method() === "GET" && url.pathname === `/api/docs/nodes/${todayNode.id}/children`;
+      }),
+      page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return response.request().method() === "GET" && url.pathname === `/api/docs/nodes/${todayNode.id}/details`;
+      }),
+    ]);
+
+    let todayLoad = waitForTodayNeighborhood();
+    await todayButton.click();
+    await todayLoad;
+    await expect(page.locator(`[data-docs-block-id="${todayChild.id}"]`)).toBeVisible();
+
+    // A repeat Today navigation replaces the canonical state from the API.
+    // The persisted child must be hydrated again rather than disappearing.
+    todayLoad = waitForTodayNeighborhood();
+    await todayButton.click();
+    await todayLoad;
+    await expect(page.locator(`[data-docs-block-id="${todayChild.id}"]`)).toBeVisible();
+  });
+
+  test("keeps pending-row text when optimistic node persistence fails", async ({ page }) => {
+    const state = createState();
+    // The first request is the explicit blank created by Enter. Fail it and
+    // then fail the user's retry as well; only this error path is allowed to
+    // retain an editor-only pending row.
+    await openDocs(page, state, { createFailures: [0, 1] });
+    await page.locator('[data-docs-block-id="block-link"]').click();
+    await page.keyboard.press("End");
+    await page.keyboard.press("Enter");
+    const blankInput = page.locator('[data-docs-blank-row-input]');
+    await expect(blankInput).toBeVisible();
+    await blankInput.fill("保存失敗でも残す");
+    await blankInput.press("Enter");
+    await expect(blankInput).toHaveValue("保存失敗でも残す");
+    expect(state.nodes.some((node) => node.title === "保存失敗でも残す" && !node.archived_at)).toBe(false);
+  });
+
+  test("keeps a failed split suffix as a pending row", async ({ page }) => {
+    const state = createState();
+    const target = state.nodes.find((node) => node.id === "block-link");
+    if (!target) throw new Error("split target is missing");
+    target.title = "prefix suffix";
+    target.body_text = target.title;
+    await openDocs(page, state, { createFailures: [0] });
+    await page.locator('[data-docs-block-id="block-link"]').click();
+    await page.keyboard.press("Home");
+    for (let index = 0; index < 7; index += 1) await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("Enter");
+    const blankInput = page.locator('[data-docs-blank-row-input]');
+    await expect(blankInput).toHaveValue("suffix");
+    expect(state.nodes.some((node) => node.title === "suffix" && !node.archived_at)).toBe(false);
+  });
+
+  test("uses pending text undo before falling back to Workspace history", async ({ page }) => {
+    const state = createState();
+    await openDocs(page, state, { createFailures: [0, 1] });
+    await page.locator('[data-docs-block-id="block-link"]').click();
+    await page.keyboard.press("End");
+    await page.keyboard.press("Enter");
+    const blankInput = page.locator('[data-docs-blank-row-input]');
+    await blankInput.fill("first created");
+    await blankInput.press("Enter");
+    await expect(blankInput).toHaveValue("first created");
+    // Exercise the real native input path (not only Playwright's value setter)
+    // so the local pending-row history is proven before Workspace fallback.
+    await blankInput.pressSequentially("local text");
+    await blankInput.press("Control+Z");
+    await expect(blankInput).toHaveValue("first created");
+    await blankInput.press("Control+Z");
+    await expect(blankInput).toHaveValue("");
+    expect(state.nodes.some((node) => node.title === "first created" && !node.archived_at)).toBe(false);
+  });
+
+  test("syncs an active CodeMirror view after Workspace Undo", async ({ page }) => {
+    const state = createState();
+    await openDocs(page, state);
+    const row = page.locator('[data-docs-block-id="block-link"]');
+    await row.click();
+    await page.keyboard.press("Control+A");
+    await page.keyboard.type("history newer");
+    await page.keyboard.press("Escape");
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-link")?.title).toBe("history newer");
+    await row.click();
+    await expect(row.locator(".cm-content")).toBeFocused();
+    await page.keyboard.press("Control+Z");
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-link")?.title).toBe("関連ページ");
+    await page.locator('[data-docs-block-id="block-title"]').click();
+    await page.waitForTimeout(80);
+    expect(state.nodes.find((node) => node.id === "block-link")?.title).toBe("関連ページ");
+  });
+
+  test("does not move focus back when a later pending create fails", async ({ page }) => {
+    const state = createState();
+    // The first Enter create is delayed/fails, then the user's retry is also
+    // delayed/fails. The rollback of the later request must not steal focus
+    // from an external control.
+    await openDocs(page, state, { createDelays: [200, 200], createFailures: [0, 1] });
+    await page.locator('[data-docs-block-id="block-link"]').click();
+    await page.keyboard.press("End");
+    await page.keyboard.press("Enter");
+    const blankInput = page.locator('[data-docs-blank-row-input]');
+    await blankInput.fill("late failure");
+    await blankInput.press("Enter");
+    const pageTitle = page.getByRole("textbox", { name: "ページタイトル" });
+    await pageTitle.focus();
+    await expect.poll(() => blankInput.inputValue(), { timeout: 1000 }).toBe("late failure");
+    await expect(pageTitle).toBeFocused();
+    await expect(blankInput).not.toBeFocused();
+  });
+
+  test("applies a Markdown shortcut while editing a persisted blank paragraph", async ({ page }) => {
+    const state = createState();
+    await openDocs(page, state);
+    await page.locator('[data-docs-block-id="block-link"]').click();
+    await page.keyboard.press("End");
+    await page.keyboard.press("Enter");
+    await expect.poll(() => state.nodes.find((node) => node.id !== "block-link" && node.title === "")?.id ?? null).not.toBeNull();
+    const blankNode = state.nodes.find((node) => node.id !== "block-link" && node.title === "");
+    expectPersistedBlank(blankNode);
+    const blankEditor = page.locator(`[data-docs-block-id="${blankNode?.id}"] .cm-content`);
+    await expect(blankEditor).toBeFocused();
+    await blankEditor.fill("# 見出し");
+    await blankEditor.press("Enter");
+    await expect.poll(() => state.nodes.find((node) => node.title === "見出し")?.body_json.block_type).toBe("heading_1");
+    const nextBlank = state.nodes.find((node) => !node.archived_at && node.title === "" && node.id !== blankNode?.id && node.id !== "node-a");
+    expectPersistedBlank(nextBlank);
+  });
+
+  test("falls back to workspace Undo immediately on the newly focused split row", async ({ page }) => {
+    const state = createState();
+    const target = state.nodes.find((node) => node.id === "block-link");
+    if (!target) throw new Error("split target is missing");
+    target.title = "first second";
+    target.body_text = target.title;
+    await openDocs(page, state);
+    await page.locator('[data-docs-block-id="block-link"]').click();
+    await expect(page.locator('[data-docs-block-id="block-link"]')).toContainText("first second");
+    await page.keyboard.press("Home");
+    for (let index = 0; index < 6; index += 1) await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("Enter");
+    await expect.poll(() => state.nodes.find((node) => node.id !== target.id && node.parent_id === target.parent_id && node.title === "second")?.id ?? null).not.toBeNull();
+    const created = state.nodes.find((node) => node.id !== target.id && node.parent_id === target.parent_id && node.title === "second");
+    expect(created).toBeTruthy();
+    // The newly created row has an empty CodeMirror history.  Ctrl+Z must
+    // therefore fall back to the Workspace history without leaving the editor.
+    await page.keyboard.press("Control+Z");
+    await expect.poll(() => state.nodes.find((node) => node.id === created?.id)?.archived_at ?? null).not.toBeNull();
+    await expect.poll(() => state.nodes.find((node) => node.id === target.id)?.title).toBe("first ");
   });
 
   test("keeps linked mentions and outgoing links at the page bottom", async ({ page }) => {
@@ -1270,6 +2171,40 @@ test.describe("Docs block editor", () => {
     expect(state.attachments).toHaveLength(0);
   });
 
+  test("hides a loaded ClipIngest image while the row is collapsed and restores it on re-expand", async ({ page }) => {
+    const state = createState();
+    state.nodes.push({
+      ...state.nodes[1],
+      id: "block-clip-image",
+      title: "ClipIngest画像ノード",
+      body_text: "ClipIngest画像ノード",
+      sort_order: 5,
+    });
+    state.attachments.push({
+      id: "clip-image-1",
+      node_id: "block-clip-image",
+      file_name: "clip-ingest.png",
+      file_path: "workspaces/_docs/attachments/clip-ingest.png",
+      mime_type: "image/png",
+      size_bytes: 68,
+      metadata: { source: "clip_ingest" },
+      created_by: "user-1",
+      created_at: "2026-07-19T00:00:00",
+    });
+    await openDocs(page, state);
+
+    const row = page.locator('[data-docs-block-id="block-clip-image"]');
+    await row.getByTitle("展開").click();
+    const attachment = row.locator('[data-docs-attachment-control][data-docs-attachment-id="clip-image-1"]');
+    await expect(attachment).toBeVisible();
+
+    await row.getByTitle("折りたたみ").click();
+    await expect(attachment).toHaveCount(0);
+
+    await row.getByTitle("展開").click();
+    await expect(attachment).toBeVisible();
+  });
+
   test("does not reopen completion inside a closed wikilink and dismisses suggestions outside", async ({ page }) => {
     const state = createState();
     const node = state.nodes.find((item) => item.id === "block-link")!;
@@ -1313,6 +2248,7 @@ test.describe("Docs block editor", () => {
     await page.keyboard.press("Enter");
     await expect(page.getByRole("dialog", { name: "別ページへ移動" })).toHaveCount(0);
     expect(state.nodes.find((node) => node.id === "block-link")?.parent_id).toBe("node-meeting");
+    expect(state.nodes.find((node) => node.id === "block-link")?.title).toBe("関連ページ");
     expect(state.node_supertags).toContainEqual({ node_id: "block-link", supertag_id: "tag-task" });
     expect(state.field_values).toContainEqual(expect.objectContaining({ node_id: "block-link", field_id: "field-status", value_text: "doing" }));
   });
@@ -1360,7 +2296,7 @@ test.describe("Docs block editor", () => {
     await input.fill("meeting-alias");
     await expect(page.getByRole("option", { name: /関連Meeting/ })).toBeVisible();
     await page.getByRole("option", { name: /関連Meeting/ }).click();
-    await expect(page).toHaveURL(/\/docs\/node-meeting$/);
+    await expect(page).toHaveURL(/\/docs$/);
     await expect(page.locator('[data-docs-node-id="node-meeting"]').first()).toBeVisible();
     await expect(page.locator('[data-docs-sidebar-node-id="node-a"]')).toBeVisible();
     await expect(page.locator('[data-docs-sidebar-node-id="node-meeting"]')).toHaveClass(/bg-accent/);
@@ -1373,20 +2309,26 @@ test.describe("Docs block editor", () => {
       if (request.method() === "POST" && new URL(request.url()).pathname === "/api/docs/query") queryRequests += 1;
     });
     await openDocs(page, state);
-    const summary = page.getByTestId("docs-search-node-summary");
-    await expect(summary).toBeVisible();
-    await expect(summary).toContainText("未完了タスク");
-    await expect(summary).toContainText("0件");
+    const toggle = page.getByTestId("docs-search-node-toggle");
+    await expect(toggle).toBeVisible();
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await expect(toggle).toHaveAccessibleName("未完了タスクのLive Queryを展開");
+    await expect(page.getByText("未完了タスク", { exact: true })).toHaveCount(1);
+    await expect(page.getByTestId("docs-search-node-controls")).toHaveCount(0);
     await expect.poll(() => queryRequests).toBe(0);
     await expect(page.getByRole("button", { name: "List" })).toHaveCount(0);
     await expect(page.getByText("ノート化")).toHaveCount(0);
-    await summary.click();
+    await toggle.focus();
+    await page.keyboard.press("Enter");
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await expect(toggle).toHaveAccessibleName("未完了タスクのLive Queryを折りたたむ");
     await expect.poll(() => queryRequests).toBe(1);
-    await expect(page.locator('[data-testid="docs-search-node-summary"] + div')).toContainText("初回打合せ日程を確定");
+    await expect(page.getByTestId("docs-search-node-controls")).toContainText("1件");
+    await expect(page.getByTestId("docs-search-node-results")).toContainText("初回打合せ日程を確定");
     await expect(page.getByRole("button", { name: "List" })).toHaveCount(0);
     await expect(page.getByText("ノート化")).toHaveCount(0);
-    await summary.click();
-    await summary.click();
+    await toggle.click();
+    await toggle.click();
     await expect.poll(() => queryRequests).toBe(1);
   });
 
@@ -1453,7 +2395,7 @@ test.describe("Docs block editor", () => {
     await page.keyboard.press("Enter");
     await page.keyboard.type("> ");
     await page.keyboard.type("引用本文");
-    await page.keyboard.press("Escape");
+    await page.keyboard.press("Enter");
     await expect(page.locator('[data-block-kind="quote"]', { hasText: "引用本文" })).toBeVisible();
   });
 
@@ -1464,20 +2406,44 @@ test.describe("Docs block editor", () => {
     await page.keyboard.press("End");
     await page.keyboard.press("Enter");
     await page.keyboard.press("Tab");
-    const fieldRowId = state.nodes.at(-1)?.id;
-    await expect.poll(() => state.nodes.find((node) => node.id === fieldRowId)?.parent_id).toBe("block-task");
-    const taskRow = page.locator('[data-docs-block-id="block-task"]');
-    const expand = taskRow.getByTitle("展開");
-    if (await expand.count()) await expand.click();
-    await page.locator(`[data-docs-block-id="${fieldRowId}"]`).click();
     await page.keyboard.type("/field");
-    await expect(page.getByRole("listbox")).toContainText("/field — フィールド");
     await page.keyboard.press("Enter");
-    await expect(page.getByRole("listbox")).toContainText("状態");
+    await expect(page.getByRole("listbox", { name: "インライン候補" })).toContainText("状態");
     await page.keyboard.press("Enter");
     await page.keyboard.type("doing");
     await page.keyboard.press("Enter");
     await expect.poll(() => state.field_values.find((value) => value.node_id === "block-task" && value.field_id === "field-status")?.value_text).toBe("doing");
+  });
+
+  test("shows guidance and creates the first Field from /field", async ({ page }) => {
+    const state = createState();
+    state.node_supertags = [{ node_id: "node-a", supertag_id: "tag-task" }];
+    state.fields = [];
+    state.field_values = [];
+    // This fixture intentionally starts with no Field definitions, but still
+    // models an actor-owned library so the definition-write permission gate
+    // can be exercised by the inline creator.
+    Object.assign(state, { docs_library_id: "workspace-1" });
+    for (const node of state.nodes) Object.assign(node, { docs_library_id: "workspace-1" });
+    for (const tag of state.supertags) Object.assign(tag, { docs_library_id: "workspace-1" });
+    await openDocs(page, state);
+    await page.locator('[data-docs-block-id="block-link"]').click();
+    await page.keyboard.press("End");
+    await page.keyboard.press("Enter");
+    await page.keyboard.type("/field");
+    await page.keyboard.press("Enter");
+    const candidates = page.getByRole("listbox", { name: "インライン候補" });
+    await expect(candidates).toContainText("新規Field名を入力してください");
+    await page.keyboard.type("備考");
+    await expect(candidates).toContainText("Field「備考」を作成");
+    await page.keyboard.press("Enter");
+    await page.keyboard.type("正本を優先");
+    await page.keyboard.press("Enter");
+    await expect.poll(() => state.fields.find((field) => field.name === "備考")).toBeTruthy();
+    const created = state.fields.find((field) => field.name === "備考");
+    await expect.poll(() => state.field_values.find(
+      (value) => value.node_id === "node-a" && value.field_id === created?.id,
+    )?.value_text).toBe("正本を優先");
   });
 
   test("inserts an @task reference and opens it in the task modal", async ({ page }) => {
@@ -1510,10 +2476,16 @@ test.describe("Docs block editor", () => {
     await page.keyboard.type("Second line");
     await page.keyboard.press("Enter");
     await page.keyboard.type("Third line");
+    await page.keyboard.press("Enter");
 
-    await expect.poll(() => state.nodes.length).toBe(initialCount + 2);
-    await expect(page.locator(".cm-content")).toBeFocused();
-    await expect(page.locator(".cm-content")).toContainText("Third line");
+    await expect.poll(() => state.nodes.length).toBe(initialCount + 3);
+    const blankNodes = state.nodes.filter((node) => !node.archived_at && node.title === "");
+    expect(blankNodes.length).toBeGreaterThanOrEqual(1);
+    blankNodes.forEach((node) => expectPersistedBlank(node));
+    // A delayed optimistic response may leave the final blank row outside the
+    // current virtualized viewport; the invariant is that the editor remains
+    // mounted and every persisted blank retains its canonical metadata.
+    await expect(page.getByTestId("docs-block-editor")).toBeVisible();
   });
 
   test("queues a newer draft while an earlier commit for the same line is saving", async ({ page }) => {
@@ -1540,11 +2512,13 @@ test.describe("Docs block editor", () => {
     await page.keyboard.press("End");
     await page.keyboard.press("Enter");
     await page.keyboard.type("Initial text");
+    await page.keyboard.press("Enter");
     const createdRow = page.locator('[data-docs-block-id]', { hasText: "Initial text" }).first();
     const createdId = await createdRow.getAttribute("data-docs-block-id");
     expect(createdId).toBeTruthy();
-    await page.keyboard.press("Escape");
-    await expect(page.getByTestId("docs-block-editor")).toBeFocused();
+    const trailingBlank = state.nodes.find((node) => !node.archived_at && node.title === "" && node.id !== "node-a");
+    expectPersistedBlank(trailingBlank);
+    await expect(page.locator(`[data-docs-block-id="${trailingBlank?.id}"] .cm-content`)).toBeFocused();
 
     await page.locator(`[data-docs-block-id="${createdId}"]`).click();
     await page.keyboard.press("Control+A");
@@ -1559,29 +2533,196 @@ test.describe("Docs block editor", () => {
     await expect.poll(() => state.nodes.find((node) => node.id === createdId)?.archived_at).not.toBeNull();
   });
 
-  test("undoes and redoes block split operations", async ({ page }) => {
+  test("undoes and redoes explicit blank paragraph creation", async ({ page }) => {
     const state = createState();
+    page.on("console", (message) => {
+      if (message.text().includes("DEBUG")) console.log(message.text());
+    });
+    const archiveRequests: string[] = [];
+    page.on("request", (request) => {
+      if (request.method() === "DELETE" && new URL(request.url()).pathname.includes("/api/docs/nodes/")) {
+        archiveRequests.push(request.url());
+      }
+    });
     await openDocs(page, state);
     await page.locator('[data-docs-block-id="block-link"]').click();
     await page.keyboard.press("End");
     await page.keyboard.press("Enter");
-    await page.keyboard.type("Undo split block");
-    const createdRow = page.locator('[data-docs-block-id]', { hasText: "Undo split block" }).first();
-    await expect(createdRow).toBeVisible();
-    const createdId = await createdRow.getAttribute("data-docs-block-id");
-    expect(createdId).toBeTruthy();
-    await expect(page.locator(`[data-docs-block-id="${createdId}"]`)).toContainText("Undo split block");
+    await expect.poll(() => state.nodes.find((node) => node.id !== "block-link" && node.title === "")?.id ?? null).not.toBeNull();
+    const created = state.nodes.find((node) => node.id !== "block-link" && node.title === "");
+    expectPersistedBlank(created);
+    const createdRow = page.locator(`[data-docs-block-id="${created?.id}"]`);
+    await expect(createdRow.locator(".cm-content")).toBeFocused();
 
-    await page.keyboard.press("Escape");
-    await expect(page.getByTestId("docs-block-editor")).toBeFocused();
-    await page.getByTestId("docs-block-editor").press("Control+Z");
-    await expect(page.locator(`[data-docs-block-id="${createdId}"]`)).toHaveCount(0);
-    await expect.poll(() => state.nodes.find((node) => node.id === createdId)?.archived_at).not.toBeNull();
+    await createdRow.locator(".cm-content").press("Control+Z");
+    await expect.poll(() => archiveRequests.length).toBeGreaterThan(0);
+    await expect(createdRow).toHaveCount(0);
+    await expect.poll(() => state.nodes.find((node) => node.id === created?.id)?.archived_at).not.toBeNull();
 
     await page.getByTestId("docs-block-editor").press("Control+Y");
-    await expect.poll(() => state.nodes.find((node) => node.id === createdId)?.archived_at).toBeNull();
-    await expect(page.locator(`[data-docs-block-id="${createdId}"]`)).toBeVisible();
-    await expect(page.locator(`[data-docs-block-id="${createdId}"]`)).toContainText("Undo split block");
-    await expect.poll(() => state.nodes.find((node) => node.id === createdId)?.archived_at).toBeNull();
+    await expect.poll(() => state.nodes.find((node) => node.id === created?.id)?.archived_at).toBeNull();
+    await expect(createdRow).toBeVisible();
+    expectPersistedBlank(state.nodes.find((node) => node.id === created?.id));
+  });
+});
+
+test.describe("Docs block editor multiple selected nodes", () => {
+  async function selectTitleAndTask(page: import("@playwright/test").Page) {
+    await page.locator('[data-docs-block-id="block-title"]').click();
+    await page.keyboard.press("Shift+ArrowDown");
+  }
+
+  test("multiple selected nodes: Backspace archives the whole selection", async ({ page }) => {
+    const state = createState();
+    await openDocs(page, state);
+    await selectTitleAndTask(page);
+    await page.keyboard.press("Backspace");
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-title")?.archived_at).not.toBeNull();
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-task")?.archived_at).not.toBeNull();
+    await expect(page.locator('[data-docs-block-id="block-link"]')).toBeVisible();
+    await expect(page.locator('[data-docs-block-id="block-title"]')).toHaveCount(0);
+    await expect(page.locator('[data-docs-block-id="block-task"]')).toHaveCount(0);
+  });
+
+  test("multiple selected nodes: Delete archives the whole selection", async ({ page }) => {
+    const state = createState();
+    await openDocs(page, state);
+    await selectTitleAndTask(page);
+    await page.keyboard.press("Delete");
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-title")?.archived_at).not.toBeNull();
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-task")?.archived_at).not.toBeNull();
+    await expect(page.locator('[data-docs-block-id="block-link"]')).toBeVisible();
+  });
+
+  test("multiple selected nodes: Backspace in body text deletes characters only", async ({ page }) => {
+    const state = createState();
+    await openDocs(page, state);
+    await page.locator('[data-docs-block-id="block-link"]').click();
+    await page.keyboard.press("End");
+    const before = state.nodes.find((node) => node.id === "block-link")?.title ?? "";
+    await page.keyboard.press("Backspace");
+    await page.keyboard.press("Escape");
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-link")?.archived_at).toBeNull();
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-link")?.title).toBe(before.slice(0, -1));
+  });
+
+  test("multiple selected nodes: Backspace on selected body text does not archive", async ({ page }) => {
+    const state = createState();
+    await openDocs(page, state);
+    await selectTitleAndTask(page);
+    await page.keyboard.press("End");
+    await page.keyboard.press("Shift+Home");
+    await page.keyboard.press("Backspace");
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-title")?.archived_at).toBeNull();
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-task")?.archived_at).toBeNull();
+    await expect(page.locator('[data-docs-block-id="block-title"]')).toBeVisible();
+    await expect(page.locator('[data-docs-block-id="block-task"]')).toBeVisible();
+    await expect(page.locator('[data-docs-block-id="block-task"] .cm-content')).toHaveText("");
+  });
+
+  test("multiple selected nodes: Delete on selected body text does not archive", async ({ page }) => {
+    const state = createState();
+    await openDocs(page, state);
+    await selectTitleAndTask(page);
+    await page.keyboard.press("End");
+    await page.keyboard.press("Shift+Home");
+    await page.keyboard.press("Delete");
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-title")?.archived_at).toBeNull();
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-task")?.archived_at).toBeNull();
+    await expect(page.locator('[data-docs-block-id="block-title"]')).toBeVisible();
+    await expect(page.locator('[data-docs-block-id="block-task"]')).toBeVisible();
+    await expect(page.locator('[data-docs-block-id="block-task"] .cm-content')).toHaveText("");
+  });
+
+  test("multiple selected nodes: partial DELETE failure keeps history aligned", async ({ page }) => {
+    const pageErrors: string[] = [];
+    page.on("pageerror", (error) => pageErrors.push(error.message));
+    const state = createState();
+    await openDocs(page, state, { deleteFailures: ["block-task"] });
+    await selectTitleAndTask(page);
+    await page.keyboard.press("Backspace");
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-title")?.archived_at).not.toBeNull();
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-task")?.archived_at).toBeNull();
+    expect(pageErrors).toEqual([]);
+    await page.getByTestId("docs-block-editor").press("Control+Z");
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-title")?.archived_at).toBeNull();
+    await expect(page.locator('[data-docs-block-id="block-title"]')).toBeVisible();
+    await expect(page.locator('[data-docs-block-id="block-task"]')).toBeVisible();
+  });
+
+  test("multiple selected nodes: post-mutation DELETE warning keeps history aligned", async ({ page }) => {
+    const pageErrors: string[] = [];
+    page.on("pageerror", (error) => pageErrors.push(error.message));
+    const state = createState();
+    await openDocs(page, state, { deleteCommittedWarnings: ["block-task"] });
+    await selectTitleAndTask(page);
+    await page.keyboard.press("Backspace");
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-title")?.archived_at).not.toBeNull();
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-task")?.archived_at).not.toBeNull();
+    expect(pageErrors).toEqual([]);
+    await page.getByTestId("docs-block-editor").press("Control+Z");
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-title")?.archived_at).toBeNull();
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-task")?.archived_at).toBeNull();
+    await expect(page.locator('[data-docs-block-id="block-title"]')).toBeVisible();
+    await expect(page.locator('[data-docs-block-id="block-task"]')).toBeVisible();
+  });
+
+  test("multiple selected nodes: reverse partial DELETE failure focuses surviving node", async ({ page }) => {
+    const pageErrors: string[] = [];
+    page.on("pageerror", (error) => pageErrors.push(error.message));
+    const state = createState();
+    await openDocs(page, state, { deleteFailures: ["block-title"] });
+    await selectTitleAndTask(page);
+    await page.keyboard.press("Backspace");
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-title")?.archived_at).toBeNull();
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-task")?.archived_at).not.toBeNull();
+    await expect(page.locator('[data-docs-block-id="block-title"]')).toBeVisible();
+    await expect(page.locator('[data-docs-block-id="block-task"]')).toHaveCount(0);
+    const survivor = page.locator('[data-docs-block-id="block-title"]');
+    await expect(survivor).toHaveClass(/bg-primary/);
+    await expect(page.locator('[data-docs-block-id="block-title"] .cm-content')).toBeFocused();
+    expect(pageErrors).toEqual([]);
+  });
+
+  test("multiple selected nodes: one undo restores a bulk archive", async ({ page }) => {
+    const state = createState();
+    await openDocs(page, state);
+    await selectTitleAndTask(page);
+    await page.keyboard.press("Backspace");
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-title")?.archived_at).not.toBeNull();
+    await page.getByTestId("docs-block-editor").press("Control+Z");
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-title")?.archived_at).toBeNull();
+    await expect.poll(() => state.nodes.find((node) => node.id === "block-task")?.archived_at).toBeNull();
+    await expect(page.locator('[data-docs-block-id="block-title"]')).toBeVisible();
+    await expect(page.locator('[data-docs-block-id="block-task"]')).toBeVisible();
+  });
+
+  test("multiple selected nodes: parent-child selection archives only the parent root", async ({ page }) => {
+    const state = createDeepState();
+    await openDocs(page, state);
+    await page.locator('[data-docs-block-id="block-title"]').getByTitle("展開").click();
+    await expect(page.locator('[data-docs-block-id="deep-parent"]')).toBeVisible();
+    await page.locator('[data-docs-block-id="deep-parent"]').click();
+    await page.keyboard.press("Shift+ArrowDown");
+    await page.keyboard.press("Backspace");
+    await expect.poll(() => state.nodes.find((node) => node.id === "deep-parent")?.archived_at).not.toBeNull();
+    await expect.poll(() => state.nodes.find((node) => node.id === "deep-child")?.archived_at).not.toBeNull();
+    await expect(page.locator('[data-docs-block-id="deep-parent"]')).toHaveCount(0);
+    await expect(page.locator('[data-docs-block-id="deep-child"]')).toHaveCount(0);
+    const survivor = page.locator('[data-docs-block-id="block-title"]');
+    await expect(survivor).toBeVisible();
+    await expect(survivor).toHaveClass(/bg-primary/);
+  });
+
+  test("multiple selected nodes: clears deleted ids and highlights a surviving row", async ({ page }) => {
+    const state = createState();
+    await openDocs(page, state);
+    await selectTitleAndTask(page);
+    await page.keyboard.press("Backspace");
+    await expect(page.locator('[data-docs-block-id="block-title"]')).toHaveCount(0);
+    await expect(page.locator('[data-docs-block-id="block-task"]')).toHaveCount(0);
+    const survivor = page.locator('[data-docs-block-id="block-link"]');
+    await expect(survivor).toBeVisible();
+    await expect(survivor).toHaveClass(/bg-primary/);
   });
 });

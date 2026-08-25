@@ -13,7 +13,7 @@ def register(mcp: FastMCP):
     """Register memory search tool on an MCP server."""
 
     @mcp.tool()
-    async def search_memory(
+    async def semantic_memory_search(
         query: str,
         time_range: str = "all",
         max_results: int = 10,
@@ -22,9 +22,9 @@ def register(mcp: FastMCP):
     ) -> str:
         """Search relevant past conversation memory."""
         try:
-            from src.tools.memory.memory_tools import search_memory as search_memory_tool
+            from src.tools.memory.memory_tools import semantic_memory_search
 
-            result = await search_memory_tool.execute_async(
+            result = await semantic_memory_search(
                 query=query,
                 time_range=time_range,
                 max_results=max_results,

@@ -36,6 +36,29 @@ export const STATUS_DOT_COLORS: Record<string, string> = {
     "border-green-500 bg-green-500 dark:border-green-400 dark:bg-green-400",
 };
 
+export function getTaskDisplayStatus(task: Task): string {
+  return task.effective_occurrence_status ?? task.status;
+}
+
+/**
+ * タイマー開始成功後に一覧へ反映するローカル状態を作る。
+ * startTimer API は時間エントリだけを返すため、サーバー側で同時に進行中へ
+ * 更新されるタスク status もここで先に反映して表示の遅延を防ぐ。
+ */
+export function applyTaskTimerStart(
+  task: Task,
+  activeTimeEntry: NonNullable<Task["active_time_entry"]>,
+): Task {
+  return {
+    ...task,
+    active_time_entry: activeTimeEntry,
+    status: "in_progress",
+    ...(task.effective_occurrence_id
+      ? { effective_occurrence_status: "in_progress" }
+      : {}),
+  };
+}
+
 export const STATUS_SHORTCUT_KEYS: Record<string, string> = {
   c: "closed",
   s: "in_progress",
@@ -253,7 +276,7 @@ export function isToday(dateStr: string): boolean {
 
 export function isOverdue(task: Task): boolean {
   const endAt = getTaskDisplayEndAt(task);
-  if (!endAt || task.status === "closed") return false;
+  if (!endAt || getTaskDisplayStatus(task) === "closed") return false;
   const due = parseTaskDateValue(endAt);
   if (!due) return false;
   if (
@@ -317,7 +340,7 @@ export function dateColor(
   task: Task,
   kind: "start" | "end" = "end",
 ): string {
-  if (!dateStr || task.status === "closed") return "";
+  if (!dateStr || getTaskDisplayStatus(task) === "closed") return "";
   const yellow =
     "font-semibold border-yellow-300/70 bg-yellow-50/80 text-yellow-800 hover:bg-yellow-100/80 dark:border-yellow-400/40 dark:bg-yellow-500/10 dark:text-yellow-200 dark:hover:bg-yellow-500/15";
   const red = "text-red-500 dark:text-red-400";

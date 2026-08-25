@@ -1,0 +1,9 @@
+# SGLang/GPU を必須依存にする厳格起動オーバーレイ。
+# GPU検証時は次のように base と併用する:
+# docker compose -f docker-compose.yml -f docker-compose.sglang.yml --profile sglang up -d --build --wait
+services:
+  aoitalk:
+    depends_on:
+      sglang:
+        condition: service_healthy
+        required: true

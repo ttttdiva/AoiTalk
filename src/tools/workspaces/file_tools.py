@@ -19,6 +19,27 @@ from .file_service import (
 )
 
 
+def _enterprise_disabled() -> bool:
+    """Legacy shared-root user-file tools are not an Enterprise surface."""
+    try:
+        from ...features import Features
+
+        return Features.is_enterprise()
+    except Exception:
+        # A profile lookup failure must not expose a shared-root writer.
+        return True
+
+
+def _enterprise_disabled_result() -> Dict[str, Any]:
+    return {
+        "success": False,
+        "error": (
+            "Enterpriseでは旧ユーザーファイルツールを無効化しています。"
+            "ユーザー/プロジェクトの専用ファイルAPIを使用してください。"
+        ),
+    }
+
+
 @function_tool
 def upload_user_file(filename: str, content_base64: str) -> Dict[str, Any]:
     """ユーザーファイルをアップロードする
@@ -33,6 +54,8 @@ def upload_user_file(filename: str, content_base64: str) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: アップロード結果
     """
+    if _enterprise_disabled():
+        return _enterprise_disabled_result()
     print(f"[Tool] upload_user_file が呼び出されました: {filename}")
     if not check_permission_sync("upload_user_file", {"filename": filename}):
         return {"success": False, "error": "ユーザーによってファイル保存がキャンセルされました。"}
@@ -51,6 +74,8 @@ def download_user_file(filename: str) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: ファイル内容（Base64）とメタデータ
     """
+    if _enterprise_disabled():
+        return _enterprise_disabled_result()
     print(f"[Tool] download_user_file が呼び出されました: {filename}")
     return download_file_impl(filename)
 
@@ -62,6 +87,8 @@ def list_user_files() -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: ファイル一覧
     """
+    if _enterprise_disabled():
+        return _enterprise_disabled_result()
     print("[Tool] list_user_files が呼び出されました")
     return list_files_impl()
 
@@ -76,6 +103,8 @@ def delete_user_file(filename: str) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: 削除結果
     """
+    if _enterprise_disabled():
+        return _enterprise_disabled_result()
     print(f"[Tool] delete_user_file が呼び出されました: {filename}")
     if not check_permission_sync("delete_user_file", {"filename": filename}):
         return {"success": False, "error": "ユーザーによってファイル削除がキャンセルされました。"}
@@ -94,5 +123,7 @@ def get_user_file_info(filename: str) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: ファイルメタデータ
     """
+    if _enterprise_disabled():
+        return _enterprise_disabled_result()
     print(f"[Tool] get_user_file_info が呼び出されました: {filename}")
     return get_file_info_impl(filename)

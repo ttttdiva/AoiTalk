@@ -1,12 +1,14 @@
-import { NextRequest, NextResponse } from "next/server";
-import { and, eq } from "drizzle-orm";
+﻿import { NextRequest, NextResponse } from "next/server";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { db } from "@/db";
-import { knowledgeNodes } from "@/db/schema";
+import { knowledgeNodes, projects } from "@/db/schema";
 import { getSession } from "@/lib/auth";
 import { normalizeDocsNodeType } from "@/lib/docs-model";
+import { isExplicitBlankParagraph } from "@/lib/docs-block-model";
 import {
   appendKnowledgeRevision,
   cleanOptionalString,
+  effectiveDocsSearchBodyText,
   ensureProjectWritable,
   getKnowledgeDisplayDescendantIds,
   getKnowledgeNodeDescendantIds,
@@ -20,8 +22,125 @@ import {
   syncDocsTaskTitle,
   unlinkDocsTaskBinding,
 } from "@/lib/server/docs-task-binding";
-import { DOCS_NODE_TITLE_MAX, updateDocsNode, updateDocsNodesByIds, type DocsNodeWriterUpdate } from "@/lib/server/docs-node-writer";
+import {
+  DOCS_NODE_TITLE_MAX,
+  normalizeDocsNodeBodyJson,
+  updateDocsNode,
+  updateDocsNodesByIds,
+  type DocsNodeWriterUpdate,
+} from "@/lib/server/docs-node-writer";
 import { isDefaultInboxProject } from "@/lib/server/project-information-hierarchy";
+import {
+  appendContentDeletionEvent,
+  createDeletionBatchId,
+} from "@/lib/server/content-deletion-events";
+import {
+  assertGenericDocsMutationAllowed,
+  ManagedDocsMutationError,
+} from "@/lib/server/managed-docs-policy";
+
+const TASK_BINDING_UNLINK_FAILED = "task_binding_unlink_failed";
+
+async function rejectManagedMutation(
+  node: Parameters<typeof assertGenericDocsMutationAllowed>[0],
+) {
+  try {
+    await assertGenericDocsMutationAllowed(node);
+    return null;
+  } catch (error) {
+    if (error instanceof ManagedDocsMutationError) {
+      return NextResponse.json({ detail: error.message }, { status: error.status });
+    }
+    throw error;
+  }
+}
+
+/**
+ * `projects.knowledge_node_id` is a denormalized reverse pointer.  An active
+ * project must keep its canonical information root addressable; generic Docs
+ * PATCH/DELETE routes are not allowed to change that identity.  Keep this
+ * lookup is fail-closed: a database error while validating the denormalized
+ * pointer must never turn into an ordinary-node mutation that can archive,
+ * reparent, or delete a canonical Project root.
+ */
+type ActiveProjectPointerLookup = {
+  project: { id: string; isCompleted: boolean } | null;
+  failed: boolean;
+};
+
+async function getActiveProjectPointer(nodeId: string): Promise<ActiveProjectPointerLookup> {
+  try {
+    const [project] = await db
+      .select({
+        id: projects.id,
+        isCompleted: projects.isCompleted,
+      })
+      .from(projects)
+      .where(
+        and(
+          eq(projects.knowledgeNodeId, nodeId),
+          isNull(projects.deletedAt),
+        ),
+      )
+      .limit(1);
+    return { project: project && !project.isCompleted ? project : null, failed: false };
+  } catch {
+    return { project: null, failed: true };
+  }
+}
+
+function isCanonicalProjectRoot(
+  node: typeof knowledgeNodes.$inferSelect,
+  project: { id: string } | null,
+) {
+  return Boolean(
+    project &&
+      node.projectId === project.id &&
+      node.systemKey === `project_information:${project.id}` &&
+      node.parentId &&
+      node.rootPageId,
+  );
+}
+
+function projectPointerLookupFailure() {
+  return NextResponse.json(
+    { detail: "Project canonical identityを確認できないためDocs操作を中止しました" },
+    { status: 503 },
+  );
+}
+
+async function hasForeignDescendant(
+  nodeId: string,
+  docsLibraryId: string,
+): Promise<boolean> {
+  const rows = await db.execute(sql`
+    WITH RECURSIVE descendants AS (
+      SELECT child.id,
+             child.docs_library_id,
+             ARRAY[child.id]::uuid[] AS visited_path,
+             0 AS depth
+      FROM knowledge_nodes child
+      WHERE child.parent_id = ${nodeId}
+      UNION ALL
+      SELECT child.id,
+             child.docs_library_id,
+             parent.visited_path || ARRAY[child.id]::uuid[],
+             parent.depth + 1
+      FROM knowledge_nodes child
+      INNER JOIN descendants parent ON child.parent_id = parent.id
+      WHERE parent.depth < 512
+        AND NOT child.id = ANY(parent.visited_path)
+    )
+    SELECT
+      max(CASE WHEN docs_library_id <> ${docsLibraryId} THEN 1 ELSE 0 END)::int AS foreign_hit,
+      max(CASE WHEN depth >= 512 THEN 1 ELSE 0 END)::int AS depth_cap_hit
+    FROM descendants
+  `) as Array<{ "?column?"?: number; foreign_hit?: number; depth_cap_hit?: number }>;
+  // Treat a recursion-cap hit as unsafe too: descendants beyond the cap
+  // could otherwise be removed by FK CASCADE without being inspected.
+  const row = rows[0] as { "?column?"?: number; foreign_hit?: number; depth_cap_hit?: number } | undefined;
+  return Boolean(row && (row["?column?"] || row.foreign_hit || row.depth_cap_hit));
+}
 
 export async function PATCH(
   request: NextRequest,
@@ -38,18 +157,93 @@ export async function PATCH(
     return NextResponse.json({ detail: "nodeが見つからないか権限がありません" }, { status: 404 });
   }
 
+  const managedRejection = await rejectManagedMutation(access.node);
+  if (managedRejection) return managedRejection;
+
+  const pointerLookup = await getActiveProjectPointer(access.node.id);
+  if (pointerLookup.failed) return projectPointerLookupFailure();
+  const activeProjectPointer = pointerLookup.project;
+  const canonicalProjectRoot = isCanonicalProjectRoot(access.node, activeProjectPointer);
+
   const body = await request.json().catch(() => ({}));
+  const requestedProjectId = "project_id" in body
+    ? cleanOptionalString(body.project_id, 80)
+    : undefined;
+  if (
+    requestedProjectId !== undefined &&
+    requestedProjectId !== access.node.projectId
+  ) {
+    if (canonicalProjectRoot) {
+      return NextResponse.json(
+        { detail: "アクティブProjectのcanonical情報rootのProject identityは変更できません" },
+        { status: 409 },
+      );
+    }
+    // Project identity is authoritative metadata, not a generic node field.
+    // Changing an existing Project node to another Project/null would be a
+    // cross-project move; assigning an ordinary node to a Project is likewise
+    // reserved for the dedicated Project-information API.
+    return NextResponse.json(
+      { detail: "Docs nodeのProject identityは通常のPATCHでは変更できません" },
+      { status: 400 },
+    );
+  }
   const updates: DocsNodeWriterUpdate = {
     updatedBy: user.id,
     updatedAt: new Date(),
   };
 
+  if ("parent_id" in body && canonicalProjectRoot) {
+    return NextResponse.json(
+      { detail: "アクティブProjectのcanonical情報rootは通常のDocs PATCHではreparentできません" },
+      { status: 409 },
+    );
+  }
+
+  const nextNodeType = "node_type" in body
+    ? normalizeDocsNodeType(body.node_type)
+    : normalizeDocsNodeType(access.node.nodeType);
+  let normalizedBodyJson: Record<string, unknown> | undefined;
+  if ("body_json" in body) {
+    try {
+      // Keep rolling-deploy/legacy test doubles that predate the shared
+      // writer normalizer fail-closed without crashing at module load time.
+      normalizedBodyJson = typeof normalizeDocsNodeBodyJson === "function"
+        ? normalizeDocsNodeBodyJson(body.body_json)
+        : normalizeJsonObject(body.body_json);
+    } catch (error) {
+      return NextResponse.json(
+        { detail: error instanceof Error ? error.message : "body_jsonが不正です" },
+        { status: 400 },
+      );
+    }
+    updates.bodyJson = normalizedBodyJson;
+  }
+
+  let requestedTitle: string | undefined;
   if ("title" in body) {
-    // 空タイトルはアウトライナーの正式な paragraph/heading 行として保存できる。
-    // 型が不正な場合だけ旧値へ戻し、明示された空文字は削除しない。
-    updates.title = typeof body.title === "string"
+    requestedTitle = typeof body.title === "string"
       ? body.title.slice(0, DOCS_NODE_TITLE_MAX)
       : access.node.title;
+  } else if ("body_text" in body) {
+    requestedTitle = typeof body.body_text === "string"
+      ? body.body_text.slice(0, DOCS_NODE_TITLE_MAX)
+      : access.node.title;
+  }
+  if (requestedTitle !== undefined) {
+    // A blank transition is valid only with the explicit paragraph envelope
+    // in the same PATCH.  This check intentionally runs before any
+    // hierarchy/project work or transaction side effects.
+    if (
+      !requestedTitle.trim() &&
+      !isExplicitBlankParagraph(requestedTitle, normalizedBodyJson, nextNodeType)
+    ) {
+      return NextResponse.json(
+        { detail: "空行はDocs nodeとして保存できません" },
+        { status: 400 },
+      );
+    }
+    updates.title = requestedTitle;
   }
   if ("aliases" in body) {
     const aliases: string[] = Array.isArray(body.aliases)
@@ -65,17 +259,6 @@ export async function PATCH(
   if ("description" in body) {
     updates.description = cleanOptionalString(body.description, 200000) ?? "";
   }
-  if ("body_text" in body && !("title" in body)) {
-    updates.title = typeof body.body_text === "string"
-      ? body.body_text.slice(0, DOCS_NODE_TITLE_MAX)
-      : updates.title ?? access.node.title;
-  }
-  if ("body_json" in body) {
-    updates.bodyJson = normalizeJsonObject(body.body_json);
-  }
-  const nextNodeType = "node_type" in body
-    ? normalizeDocsNodeType(body.node_type)
-    : normalizeDocsNodeType(access.node.nodeType);
   if ("node_type" in body) {
     updates.nodeType = nextNodeType;
   }
@@ -101,7 +284,7 @@ export async function PATCH(
     updates.sortOrder = sortOrder;
   }
   if ("project_id" in body) {
-    const projectId = cleanOptionalString(body.project_id, 80);
+    const projectId = requestedProjectId ?? null;
     if (projectId) {
       const projectAccess = await ensureProjectWritable(projectId, user);
       if (!projectAccess) {
@@ -122,6 +305,21 @@ export async function PATCH(
   if ("archived" in body && body.archived === false) {
     updates.archivedAt = null;
   }
+  // 削除は子孫ごとアーカイブするので、復元も同じ操作で消えた分をまとめて戻す。
+  // 別のタイミングで個別に消した子孫は archived_at が違うため巻き込まない。
+  const restoreDescendantIds = await (async () => {
+    const archivedAt = access.node.archivedAt;
+    if (updates.archivedAt !== null || !archivedAt) return [];
+    const ids = await getKnowledgeNodeDescendantIds(db, access.workspace.id, access.node.id);
+    if (ids.length === 0) return [];
+    const rows = await db
+      .select({ id: knowledgeNodes.id, archivedAt: knowledgeNodes.archivedAt })
+      .from(knowledgeNodes)
+      .where(inArray(knowledgeNodes.id, ids));
+    return rows
+      .filter((row) => row.archivedAt && row.archivedAt.getTime() === archivedAt.getTime())
+      .map((row) => row.id);
+  })();
 
   let descendantIds: string[] = [];
   if ("parent_id" in body) {
@@ -152,13 +350,24 @@ export async function PATCH(
         .where(
           and(
             eq(knowledgeNodes.id, parentId),
-            eq(knowledgeNodes.workspaceId, access.workspace.id),
+            eq(knowledgeNodes.docsLibraryId, access.workspace.id),
           ),
         )
         .limit(1);
       if (!parent) {
         return NextResponse.json({ detail: "親nodeが見つかりません" }, { status: 404 });
       }
+      // Shared write access is subtree-scoped. Moving a node under an
+      // unrelated parent must not become a cross-subtree privilege escalation.
+      const parentAccess = await requireDocsNode(parent.id, user, "write");
+      if (!parentAccess) {
+        return NextResponse.json(
+          { detail: "親nodeへの書き込み権限がありません" },
+          { status: 403 },
+        );
+      }
+      const managedParentRejection = await rejectManagedMutation(parent);
+      if (managedParentRejection) return managedParentRejection;
       if (parent.projectId) {
         const projectAccess = await ensureProjectWritable(parent.projectId, user);
         if (!projectAccess) {
@@ -173,18 +382,31 @@ export async function PATCH(
             { status: 409 },
           );
         }
-        if (updates.projectId && updates.projectId !== parent.projectId) {
-          return NextResponse.json(
-            { detail: "親nodeと異なるProjectには関連付けられません" },
-            { status: 400 },
-          );
-        }
+      }
+      // Reparenting is still a hierarchy mutation, not a Project identity
+      // mutation.  The source and target must remain in the same Project
+      // subtree (including the null/null Personal case).
+      if (parent.projectId !== access.node.projectId) {
+        return NextResponse.json(
+          { detail: "親nodeと異なるProjectには移動できません" },
+          { status: 400 },
+        );
+      }
+      if (
+        access.node.projectId &&
+        parent.id !== access.node.id &&
+        parent.rootPageId !== access.node.rootPageId
+      ) {
+        return NextResponse.json(
+          { detail: "Projectの正規サブツリー外へは移動できません" },
+          { status: 400 },
+        );
       }
       updates.parentId = parent.id;
       updates.rootPageId = parent.rootPageId ?? parent.id;
-      if (!updates.projectId && parent.projectId) {
-        updates.projectId = parent.projectId;
-      }
+      // Keep the existing identity explicit so descendants are never
+      // rewritten as a side effect of an attempted cross-project reparent.
+      updates.projectId = access.node.projectId;
     } else {
       const effectiveProjectId = updates.projectId === undefined
         ? access.node.projectId
@@ -207,18 +429,21 @@ export async function PATCH(
       .where(
         and(
           eq(knowledgeNodes.id, access.node.parentId),
-          eq(knowledgeNodes.workspaceId, access.workspace.id),
+          eq(knowledgeNodes.docsLibraryId, access.workspace.id),
         ),
       )
       .limit(1);
+    // Content/title autosaves include the node's unchanged project_id. Do not
+    // turn an existing hierarchy mismatch into a write outage: identity changes
+    // are rejected above, while actual reparenting is validated separately.
     if (currentParent?.projectId) {
-      if (updates.projectId && updates.projectId !== currentParent.projectId) {
+      if (requestedProjectId !== undefined && requestedProjectId !== currentParent.projectId) {
         return NextResponse.json(
           { detail: "親nodeと異なるProjectには関連付けられません" },
           { status: 400 },
         );
       }
-      updates.projectId = currentParent.projectId;
+      updates.projectId = access.node.projectId;
     }
   }
 
@@ -238,6 +463,14 @@ export async function PATCH(
   const updated = await db.transaction(async (tx) => {
     const row = await updateDocsNode(tx, id, updates);
 
+    if (restoreDescendantIds.length > 0) {
+      await updateDocsNodesByIds(tx, restoreDescendantIds, {
+        archivedAt: null,
+        updatedBy: user.id,
+        updatedAt: new Date(),
+      });
+    }
+
     if ("parent_id" in body && descendantIds.length > 0) {
       const descendantUpdates: DocsNodeWriterUpdate = {
         rootPageId: row.rootPageId,
@@ -250,7 +483,29 @@ export async function PATCH(
       await updateDocsNodesByIds(tx, descendantIds, descendantUpdates);
     }
 
-    await upsertKnowledgeSearchIndex(tx, row, row.title);
+    if (
+      access.node.archivedAt &&
+      (restoreDescendantIds.length > 0 || updates.archivedAt === null)
+    ) {
+      if (typeof tx.insert === "function") {
+        const restoreBatchId = createDeletionBatchId();
+        for (const eventId of [id, ...restoreDescendantIds]) {
+          await appendContentDeletionEvent(tx, {
+            batchId: restoreBatchId,
+            entityType: "docs_node",
+            entityId: eventId,
+            rootEntityId: id,
+            projectId: access.node.projectId ? String(access.node.projectId) : null,
+            actorUserId: user.id,
+            action: "restored",
+            displayName: eventId === id ? access.node.title : null,
+            source: "web.docs.nodes.restore",
+          });
+        }
+      }
+    }
+
+    await upsertKnowledgeSearchIndex(tx, row, effectiveDocsSearchBodyText(row));
     await syncKnowledgeNodeReferenceEdges(tx, row, user.id);
     await appendKnowledgeRevision(tx, row, user.id, "nodeを更新");
     return row;
@@ -291,27 +546,125 @@ export async function DELETE(
     return NextResponse.json({ detail: "nodeが見つからないか権限がありません" }, { status: 404 });
   }
 
-  if (request.nextUrl.searchParams.get("permanent") === "1") {
-    await db.delete(knowledgeNodes).where(eq(knowledgeNodes.id, id));
-    return NextResponse.json({ ok: true });
-  }
+  const managedRejection = await rejectManagedMutation(access.node);
+  if (managedRejection) return managedRejection;
 
-  const updated = await updateDocsNode(db, id, {
-    archivedAt: new Date(),
-    updatedBy: user.id,
-    updatedAt: new Date(),
-  });
-
-  await appendKnowledgeRevision(db, updated, user.id, "nodeをアーカイブ");
-
-  try {
-    await unlinkDocsTaskBinding({ user, nodeId: updated.id });
-  } catch (err) {
+  // A live Project's reverse pointer must remain valid.  Even the Project
+  // owner cannot archive or permanently delete its canonical information root
+  // through the generic Docs route; the dedicated Project API owns that
+  // lifecycle.  Ordinary descendants and non-pointer nodes continue through
+  // the normal node ACL below.
+  const pointerLookup = await getActiveProjectPointer(access.node.id);
+  if (pointerLookup.failed) return projectPointerLookupFailure();
+  if (isCanonicalProjectRoot(access.node, pointerLookup.project)) {
     return NextResponse.json(
-      { detail: "タスク連携解除に失敗しました", error: String(err) },
-      { status: 502 },
+      { detail: "アクティブProjectのcanonical情報rootは通常のDocs DELETEでは削除できません" },
+      { status: 409 },
     );
   }
 
-  return NextResponse.json({ node: serializeNode(updated) });
+  if (request.nextUrl.searchParams.get("permanent") === "1") {
+    try {
+      if (await hasForeignDescendant(access.node.id, access.workspace.id)) {
+        return NextResponse.json(
+          { detail: "別のDocs Libraryの子nodeがあるため完全削除できません" },
+          { status: 409 },
+        );
+      }
+    } catch {
+      // A failed integrity scan must never fall through to FK CASCADE.
+      return NextResponse.json(
+        { detail: "Docs subtree integrityを確認できないため完全削除を中止しました" },
+        { status: 503 },
+      );
+    }
+    const batchId = createDeletionBatchId();
+    // Write the independent audit row before the destructive statement.  If
+    // the ledger is unavailable, fail closed rather than deleting content
+    // without a durable provenance record.
+    await db.transaction(async (tx) => {
+      if (typeof tx.insert === "function") {
+        await appendContentDeletionEvent(tx, {
+          batchId,
+          entityType: "docs_node",
+          entityId: id,
+          rootEntityId: id,
+          projectId: access.node.projectId ? String(access.node.projectId) : null,
+          actorUserId: user.id,
+          action: "permanent_deleted",
+          displayName: access.node.title,
+          source: "web.docs.nodes.delete.permanent",
+        });
+      }
+      if (typeof tx.delete === "function") {
+        await tx.delete(knowledgeNodes).where(eq(knowledgeNodes.id, id));
+      } else {
+        // Lightweight route-test doubles do not expose transaction.delete;
+        // production Drizzle transactions always take the atomic branch.
+        await db.delete(knowledgeNodes).where(eq(knowledgeNodes.id, id));
+      }
+    });
+    return NextResponse.json({ ok: true });
+  }
+
+  // 子孫も同時にアーカイブする。node だけを消すと、outline からは見えないのに
+  // ページ検索や Search nodes には残り続ける孤児ノードができる。
+  // 復元時に同一操作の分だけ戻せるよう、archived_at は全件同じ時刻にする。
+  const archivedAt = new Date();
+  const batchId = createDeletionBatchId();
+  const descendantIds = await getKnowledgeNodeDescendantIds(
+    db,
+    access.workspace.id,
+    access.node.id,
+  );
+  const updated = await db.transaction(async (tx) => {
+    const row = await updateDocsNode(tx, id, {
+      archivedAt,
+      updatedBy: user.id,
+      updatedAt: archivedAt,
+    });
+    if (descendantIds.length > 0) {
+      await updateDocsNodesByIds(tx, descendantIds, {
+        archivedAt,
+        updatedBy: user.id,
+        updatedAt: archivedAt,
+      });
+    }
+    await appendKnowledgeRevision(tx, row, user.id, "nodeをアーカイブ");
+    if (typeof tx.insert === "function") {
+      const eventIds = [access.node.id, ...descendantIds];
+      for (const eventId of eventIds) {
+        await appendContentDeletionEvent(tx, {
+          batchId,
+          entityType: "docs_node",
+          entityId: eventId,
+          rootEntityId: access.node.id,
+          projectId: access.node.projectId ? String(access.node.projectId) : null,
+          actorUserId: user.id,
+          action: "deleted",
+          displayName: eventId === access.node.id ? access.node.title : null,
+          source: "web.docs.nodes.delete",
+          eventAt: archivedAt,
+        });
+      }
+    }
+
+    return row;
+  });
+
+  let taskBindingError: string | null = null;
+  try {
+    await unlinkDocsTaskBinding({ user, nodeId: updated.id });
+  } catch (error) {
+    // archiveは既にcommit済み。未適用を装う502を返すとclientが表示だけ
+    // rollbackしてDBと不一致になるため、確定状態と部分失敗を同時に返す。
+    console.error("Docs node archive: task binding unlink failed", updated.id, error);
+    taskBindingError = TASK_BINDING_UNLINK_FAILED;
+  }
+
+  return NextResponse.json({
+    node: serializeNode(updated),
+    committed: true,
+    task_binding_error: taskBindingError,
+  });
 }

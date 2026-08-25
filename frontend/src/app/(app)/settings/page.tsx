@@ -21,11 +21,9 @@ import {
   Bell,
   AudioLines,
   Bug,
-  CalendarDays,
   ChevronDown,
   ChevronUp,
   CircleHelp,
-  Database,
   KeyRound,
   Keyboard,
   Loader2,
@@ -52,19 +50,59 @@ import { MemorySection } from "@/components/settings/memory-section";
 import { ComfyUISection } from "@/components/settings/comfyui-section";
 import { SnippetsSection } from "@/components/settings/snippets-section";
 import { GoogleCalendarSection } from "@/components/settings/google-calendar-section";
+import { WebexSection } from "@/components/settings/webex-section";
 import { RemoteServerSection } from "@/components/settings/remote-server-section";
 import { UserManagementConsole } from "@/components/settings/user-management-console";
 import { HeartbeatsSection } from "@/components/settings/heartbeats-section";
 import { LlmModelSection } from "@/components/settings/llm-model-section";
+import { AutonomousTaskExecutionSection } from "@/components/settings/autonomous-task-execution-section";
 import { SearchSettingsSection } from "@/components/settings/search-settings-section";
 import { SpotifySection } from "@/components/settings/spotify-section";
 import { EditorSettingsSection } from "@/components/settings/editor-settings-section";
 import { YomiLinterSection } from "@/components/settings/yomi-linter-section";
 import { NavigationTabsSection } from "@/components/settings/navigation-tabs-section";
 import { SettingsDisclosure } from "@/components/settings/settings-disclosure";
+import {
+  SettingsCategoryNavigation,
+  type SettingsCategoryId,
+} from "@/components/settings/settings-category-navigation";
+import {
+  QUICK_SETTING_REGISTRY,
+  getSettingsTarget,
+  isSettingsCategoryId,
+  type SettingsTargetId,
+} from "@/components/settings/settings-target-registry";
+import { SettingsOverview } from "@/components/settings/settings-overview";
+import { HydrusSettingsSection } from "@/components/settings/hydrus-settings-section";
+import { CookieManagementSection } from "@/components/settings/cookie-management-section";
+import { openSettingsTarget } from "@/components/settings/settings-target-navigation";
+import {
+  getSettingsScrollContainer,
+  pushSettingsCategoryHash,
+  scrollSettingsCategory,
+  type SettingsScrollBehavior,
+} from "@/components/settings/settings-scroll-navigation";
 import { getTaskNotificationsDefaultEnabled } from "@/lib/user-settings";
 import { useUserSettings } from "@/contexts/user-settings-context";
 import { serializeAudioPlayerSettings } from "@/lib/audio-player-settings";
+import { useWorkspaceShellRegistration } from "@/components/layout/shell-context";
+
+function requestSettingsFrame(callback: () => void): number {
+  if (typeof window === "undefined") return -1;
+  if (typeof window.requestAnimationFrame === "function") {
+    return window.requestAnimationFrame(callback);
+  }
+  return window.setTimeout(callback, 0);
+}
+
+function cancelSettingsFrame(frame: number) {
+  if (typeof window === "undefined" || frame < 0) return;
+  if (typeof window.cancelAnimationFrame === "function") {
+    window.cancelAnimationFrame(frame);
+  } else {
+    window.clearTimeout(frame);
+  }
+}
 
 async function pyFetch<T = unknown>(
   path: string,
@@ -133,6 +171,7 @@ interface AuthStatus {
     username: string;
     role: string | null;
     display_name: string | null;
+    avatar_url: string | null;
     password_reset_required?: boolean | null;
     user_settings?: Record<string, unknown>;
   };
@@ -148,53 +187,15 @@ const AGENT_DESCRIPTIONS: Record<string, string> = {
   project_management: "メインassistantが案件情報Docs・WBS・タスク系の直接ツールを使う権限です。",
 };
 
-type QuickSettingId =
-  | "task-notifications"
-  | "web-search"
-  | "user-memory"
-  | "google-calendar"
-  | "snippets"
-  | "integrations"
-  | "custom-instructions"
-  | "characters"
-  | "llm-model"
-  | "embed-card"
-  | "mobile-commands"
-  | "knowledge-sources"
-  | "crawler-status"
-  | "tool-permissions"
-  | "account-security";
-
-type QuickSettingDefinition = {
-  id: QuickSettingId;
-  href: string;
-  label: string;
-  icon: typeof Bell;
-};
-
-const QUICK_SETTING_REGISTRY: QuickSettingDefinition[] = [
-  { id: "task-notifications", href: "#notifications", label: "タスク通知", icon: Bell },
-  { id: "web-search", href: "#knowledge", label: "検索プロバイダ", icon: Search },
-  { id: "user-memory", href: "#conversation", label: "Dreamingメモリ", icon: Database },
-  { id: "google-calendar", href: "#notifications", label: "Google Calendar", icon: CalendarDays },
-  { id: "snippets", href: "#input", label: "スニペット", icon: Keyboard },
-  { id: "integrations", href: "#integrations", label: "外部連携", icon: Plug },
-  { id: "custom-instructions", href: "#conversation", label: "会話カスタム指示", icon: MessageSquareText },
-  { id: "characters", href: "#conversation", label: "キャラクター", icon: MessageSquareText },
-  { id: "llm-model", href: "#conversation", label: "言語モデル", icon: MessageSquareText },
-  { id: "embed-card", href: "#input", label: "埋め込みカード", icon: Keyboard },
-  { id: "mobile-commands", href: "#input", label: "モバイルコマンド", icon: Smartphone },
-  { id: "knowledge-sources", href: "#knowledge", label: "ナレッジソース", icon: Database },
-  { id: "crawler-status", href: "#knowledge", label: "クローラーステータス", icon: Bug },
-  { id: "tool-permissions", href: "#tool-permissions", label: "ツール権限", icon: ShieldCheck },
-  { id: "account-security", href: "#account", label: "アカウント", icon: KeyRound },
-];
+type QuickSettingId = SettingsTargetId;
+type QuickSettingDefinition = (typeof QUICK_SETTING_REGISTRY)[number];
 
 const DEFAULT_QUICK_SETTING_IDS: QuickSettingId[] = [
   "task-notifications",
   "web-search",
   "user-memory",
   "google-calendar",
+  "webex",
   "snippets",
   "integrations",
 ];
@@ -245,20 +246,50 @@ function SettingsGroup({
   children: ReactNode;
 }) {
   return (
-    <section id={id} className="scroll-mt-4 space-y-3">
-      <div className="flex items-center gap-2 border-b pb-2">
-        {icon}
-        <h2 className="text-sm font-semibold">{title}</h2>
+    <section id={id} className="scroll-mt-5 space-y-3" data-settings-group={id}>
+      <div className="flex items-center gap-2 border-b border-border-subtle pb-2">
+        <span className="text-primary">{icon}</span>
+        <h2 tabIndex={-1} className="text-sm font-semibold tracking-tight">
+          {title}
+        </h2>
       </div>
       <div className="space-y-3">{children}</div>
     </section>
   );
 }
 
+/**
+ * Keeps a stable target around legacy section components that do not accept an
+ * id prop yet. `contents` preserves their layout while hash navigation can
+ * still locate and open the first disclosure in the section.
+ */
+function SettingsTargetFrame({
+  targetId,
+  children,
+}: {
+  targetId: SettingsTargetId;
+  children: ReactNode;
+}) {
+  return (
+    <div
+      data-settings-target={targetId}
+      className="contents"
+    >
+      {children}
+    </div>
+  );
+}
+
+function isVisibleSettingsTarget(targetId: string, isAdmin: boolean) {
+  const target = getSettingsTarget(targetId);
+  return target && (!target.adminOnly || isAdmin) ? target : null;
+}
+
 function QuickSettings() {
   const { settings, patch } = useUserSettings();
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [feedback, setFeedback] = useState<string | null>(null);
   const selectedIds = getQuickSettingIds(settings);
   const selectedItems = selectedIds
     .map(getQuickSettingDefinition)
@@ -266,8 +297,12 @@ function QuickSettings() {
 
   const saveSelectedIds = async (nextIds: QuickSettingId[]) => {
     setSaving(true);
+    setFeedback(null);
     try {
       await patch({ quick_settings: { pins: nextIds } });
+      setFeedback("よく使う設定を保存しました。");
+    } catch (error) {
+      setFeedback(error instanceof Error ? error.message : "保存に失敗しました。");
     } finally {
       setSaving(false);
     }
@@ -308,12 +343,18 @@ function QuickSettings() {
             {editing ? "完了" : "編集"}
           </Button>
         </div>
+        {feedback && (
+          <p role="status" className="text-xs text-muted-foreground">
+            {feedback}
+          </p>
+        )}
         {selectedItems.length > 0 ? (
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            {selectedItems.map(({ id, href, label, icon: Icon }) => (
+            {selectedItems.map(({ id, targetId, label, icon: Icon }) => (
               <a
                 key={id}
-                href={href}
+                href={`#${targetId}`}
+                data-settings-target-link={targetId}
                 className="inline-flex h-7 items-center justify-start gap-1 rounded-md border bg-background px-2.5 text-[0.8rem] font-medium transition-colors hover:bg-muted"
               >
                 <Icon className="size-4" />
@@ -418,16 +459,25 @@ function QuickSettings() {
 function ToolPermissionsCard({
   loading,
   settings,
+  error,
+  onRetry,
   onToggle,
 }: {
   loading: boolean;
   settings: SettingsResponse | null;
+  error?: Error;
+  onRetry?: () => void;
   onToggle: (agentKey: string, enabled: boolean) => void;
 }) {
   const agents = settings?.agents;
 
   return (
-    <SettingsDisclosure title="ツール権限" icon={<ShieldCheck className="size-4" />}>
+    <SettingsDisclosure
+      title="ツール権限"
+      icon={<ShieldCheck className="size-4" />}
+      id="tool-permissions-card"
+      targetId="tool-permissions"
+    >
         {loading ? (
           <div className="space-y-3">
             {Array.from({ length: 2 }).map((_, i) => (
@@ -465,6 +515,15 @@ function ToolPermissionsCard({
               );
             })}
           </div>
+        ) : error ? (
+          <div role="alert" className="space-y-2 text-sm text-destructive">
+            <p>ツール権限を取得できませんでした。{error.message}</p>
+            {onRetry && (
+              <Button type="button" variant="outline" size="sm" onClick={onRetry}>
+                再試行
+              </Button>
+            )}
+          </div>
         ) : (
           <p className="text-sm text-muted-foreground">
             ツール権限を取得できませんでした
@@ -474,51 +533,10 @@ function ToolPermissionsCard({
   );
 }
 
-function McpEnableCard({
-  loading,
-  enabled,
-  onToggle,
-}: {
-  loading: boolean;
-  enabled: boolean | null;
-  onToggle: (enabled: boolean) => void;
-}) {
-  return (
-    <SettingsDisclosure
-      title="MCP"
-      icon={<Plug className="size-4" />}
-      summary={
-          <Badge variant={enabled ? "default" : "secondary"}>
-            {enabled === null ? "未取得" : enabled ? "ON" : "OFF"}
-          </Badge>
-      }
-    >
-        {loading ? (
-          <Skeleton className="h-10 w-full rounded" />
-        ) : (
-          <div className="flex items-start justify-between gap-3 rounded border p-3">
-            <div className="space-y-1">
-              <Label htmlFor="mcp-enabled" className="text-sm font-medium">
-                MCPを有効化
-              </Label>
-              <p className="text-xs text-muted-foreground">
-                MCP連携と登録済みMCPサーバーの利用を切り替えます。
-              </p>
-            </div>
-            <Checkbox
-              id="mcp-enabled"
-              checked={enabled === true}
-              onCheckedChange={(checked) => onToggle(checked === true)}
-            />
-          </div>
-        )}
-    </SettingsDisclosure>
-  );
-}
-
 function AudioPlayerSettingsCard() {
   const { audioPlayerSettings, patch } = useUserSettings();
   const [saving, setSaving] = useState(false);
+  const [feedback, setFeedback] = useState<string | null>(null);
   const scopeLabel =
     audioPlayerSettings.playbackScope === "global_next"
       ? "フォルダ跨ぎ"
@@ -530,9 +548,13 @@ function AudioPlayerSettingsCard() {
 
   const save = async (patchValue: Partial<typeof audioPlayerSettings>) => {
     setSaving(true);
+    setFeedback(null);
     try {
       const next = { ...audioPlayerSettings, ...patchValue };
       await patch({ audio_player: serializeAudioPlayerSettings(next) });
+      setFeedback("音楽プレイヤー設定を保存しました。");
+    } catch (error) {
+      setFeedback(error instanceof Error ? error.message : "保存に失敗しました。");
     } finally {
       setSaving(false);
     }
@@ -542,6 +564,8 @@ function AudioPlayerSettingsCard() {
     <SettingsDisclosure
       title="音楽プレイヤー"
       icon={<Music className="size-4" />}
+      id="audio-player-card"
+      targetId="audio-player"
       summary={
         <Badge variant="secondary">
           {flags.length > 0
@@ -550,6 +574,7 @@ function AudioPlayerSettingsCard() {
         </Badge>
       }
     >
+      {feedback && <p role="status" className="text-xs text-muted-foreground">{feedback}</p>}
       <div className="space-y-2">
         <Label className="text-xs text-muted-foreground">再生範囲</Label>
         <div className="grid gap-2 sm:grid-cols-2">
@@ -625,55 +650,43 @@ const SETTINGS_SWR_OPTIONS = {
 export default function SettingsPage() {
   const confirm = useConfirm();
   const [loading, setLoading] = useState(true);
+  const [currentUser, setCurrentUser] = useState<AuthStatus["user"] | null>(
+    null,
+  );
+  const [authStatusLoaded, setAuthStatusLoaded] = useState(false);
+  const isAdmin = currentUser?.role === "admin";
   // 独立したサーバー状態（settings / mobileCommands / crawlers）は SWR で管理する。
   // currentUser は編集ドラフトの初期値を供給し、各保存操作で楽観的に patch される
   // ハイブリッド状態のため従来の useState のまま扱う。
-  const settingsRef = useRef<SettingsResponse | null>(null);
-  const { data: settings = null, mutate: mutateSettings } = useSWR<SettingsResponse | null>(
+  const { data: settings = null, error: settingsError, mutate: mutateSettings } = useSWR<SettingsResponse | null>(
     "settings/page-settings",
     async () => {
-      try {
-        const raw = (await pyFetch<SettingsResponse>("/settings")) as Record<
-          string,
-          unknown
-        >;
-        return (raw.settings ?? raw) as SettingsResponse;
-      } catch {
-        return settingsRef.current;
-      }
+      const raw = (await pyFetch<SettingsResponse>("/settings")) as Record<
+        string,
+        unknown
+      >;
+      return (raw.settings ?? raw) as SettingsResponse;
     },
     SETTINGS_SWR_OPTIONS,
   );
-  settingsRef.current = settings;
-  const { data: mobileCommands = null, mutate: mutateMobileCommands } =
+  const { data: mobileCommands = null, error: mobileCommandsError, mutate: mutateMobileCommands } =
     useSWR<MobileCommandsResponse | null>(
-      "settings/mobile-commands",
+      authStatusLoaded && isAdmin ? "settings/mobile-commands" : null,
       async () => {
-        try {
-          return await pyFetch<MobileCommandsResponse>("/mobile/commands");
-        } catch {
-          return null;
-        }
+        return await pyFetch<MobileCommandsResponse>("/mobile/commands");
       },
       SETTINGS_SWR_OPTIONS,
     );
-  const { data: crawlers = null, mutate: mutateCrawlers } = useSWR<
+  const { data: crawlers = null, error: crawlersError, mutate: mutateCrawlers } = useSWR<
     CrawlerInfo[] | null
   >(
     "settings/crawler-status",
     async () => {
-      try {
-        return (await pyFetch<CrawlerStatusResponse>("/crawler/status")).crawlers;
-      } catch {
-        return [];
-      }
+      return (await pyFetch<CrawlerStatusResponse>("/crawler/status")).crawlers;
     },
     SETTINGS_SWR_OPTIONS,
   );
   const [runningCommandId, setRunningCommandId] = useState<string | null>(null);
-  const [currentUser, setCurrentUser] = useState<AuthStatus["user"] | null>(
-    null,
-  );
 
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -693,20 +706,131 @@ export default function SettingsPage() {
   const [customInstructions, setCustomInstructions] = useState("");
   const [customInstructionsSaving, setCustomInstructionsSaving] =
     useState(false);
+  const [activeCategory, setActiveCategory] =
+    useState<SettingsCategoryId>("overview");
+  const categoryScrollFrameRef = useRef<number | null>(null);
+  const directTargetFrameRef = useRef<number | null>(null);
+  const navigationGenerationRef = useRef(0);
+  const categoryScrollObserverRef = useRef<ResizeObserver | null>(null);
+  const categoryScrollWatchTimeoutRef = useRef<number | null>(null);
+  const lastHashSyncKeyRef = useRef<string | null>(null);
+  const [actionFeedback, setActionFeedback] = useState<{
+    kind: "success" | "error";
+    message: string;
+  } | null>(null);
+
+  /**
+   * Wait for the shell/page paint before measuring a category.  This avoids
+   * racing the initial async settings render while still issuing exactly one
+   * scroll once the target exists.  If a target is temporarily absent (for
+   * example while a gated section mounts), retry a bounded number of frames.
+   */
+  const cancelCategoryScroll = useCallback(() => {
+    if (categoryScrollFrameRef.current !== null) {
+      cancelSettingsFrame(categoryScrollFrameRef.current);
+      categoryScrollFrameRef.current = null;
+    }
+    categoryScrollObserverRef.current?.disconnect();
+    categoryScrollObserverRef.current = null;
+    if (categoryScrollWatchTimeoutRef.current !== null) {
+      window.clearTimeout(categoryScrollWatchTimeoutRef.current);
+      categoryScrollWatchTimeoutRef.current = null;
+    }
+  }, []);
+
+  const scheduleCategoryScroll = useCallback(
+    (category: SettingsCategoryId, behavior: SettingsScrollBehavior) => {
+      if (typeof window === "undefined") return;
+      cancelCategoryScroll();
+      const navigationGeneration = navigationGenerationRef.current;
+      const expectedHash = `#${category}`;
+
+      let attempts = 0;
+      const measure = () => {
+        const didScroll = scrollSettingsCategory(category, {
+          behavior,
+          focus: true,
+        });
+        if (!didScroll && attempts < 3) {
+          attempts += 1;
+          categoryScrollFrameRef.current = requestSettingsFrame(measure);
+          return;
+        }
+        categoryScrollFrameRef.current = null;
+
+        // Account's history/cost cards mount after auth and can change the
+        // scrollHeight after the first paint.  Watch that short settling
+        // window and remeasure only when the page actually grew, avoiding a
+        // second scroll for an unchanged layout.
+        if (didScroll && typeof ResizeObserver !== "undefined") {
+          const page = document.querySelector<HTMLElement>("[data-settings-page]");
+          const container = getSettingsScrollContainer();
+          if (page && container) {
+            let lastScrollHeight = container.scrollHeight;
+            const observer = new ResizeObserver(() => {
+              if (
+                navigationGeneration !== navigationGenerationRef.current ||
+                window.location.hash !== expectedHash
+              ) {
+                observer.disconnect();
+                if (categoryScrollObserverRef.current === observer) {
+                  categoryScrollObserverRef.current = null;
+                }
+                return;
+              }
+              const nextScrollHeight = container.scrollHeight;
+              if (nextScrollHeight === lastScrollHeight) return;
+              lastScrollHeight = nextScrollHeight;
+              scrollSettingsCategory(category, {
+                behavior: "auto",
+                focus: false,
+              });
+            });
+            observer.observe(page);
+            categoryScrollObserverRef.current = observer;
+            categoryScrollWatchTimeoutRef.current = window.setTimeout(() => {
+              observer.disconnect();
+              if (categoryScrollObserverRef.current === observer) {
+                categoryScrollObserverRef.current = null;
+              }
+              categoryScrollWatchTimeoutRef.current = null;
+            }, 1_500);
+          }
+        }
+      };
+
+      // A single RAF is enough for normal clicks; retries only run when the
+      // target has not mounted yet, so a category never receives duplicate
+      // smooth scrolls from this handler.
+      categoryScrollFrameRef.current = requestSettingsFrame(measure);
+    },
+    [cancelCategoryScroll],
+  );
+
+  useEffect(
+    () => () => {
+      cancelCategoryScroll();
+      if (directTargetFrameRef.current !== null) {
+        cancelSettingsFrame(directTargetFrameRef.current);
+        directTargetFrameRef.current = null;
+      }
+    },
+    [cancelCategoryScroll],
+  );
 
   const fetchAll = useCallback(async () => {
     setLoading(true);
     try {
-      // settings / mobileCommands は SWR fetcher が取得と失敗時フォールバックを担う。
+      // settings は SWR fetcher が取得と失敗時フォールバックを担う。
+      // mobile commands は admin 確定後に別 effect で取得する。
       // authStatus は currentUser とドラフト初期値の供給のため従来どおり直接取得する。
       const results = await Promise.allSettled([
         mutateSettings(),
-        mutateMobileCommands(),
         apiFetch<AuthStatus>("/api/auth/status"),
       ]);
 
-      if (results[2].status === "fulfilled" && results[2].value.authenticated) {
-        const u = results[2].value.user || null;
+      if (results[1].status === "fulfilled" && results[1].value.authenticated) {
+        const u = results[1].value.user || null;
         setCurrentUser(u);
         if (u?.user_settings) {
           setRestartShortcutEnabled(
@@ -731,19 +855,130 @@ export default function SettingsPage() {
     } catch (err) {
       console.error("設定取得失敗:", err);
     } finally {
+      setAuthStatusLoaded(true);
       setLoading(false);
     }
-  }, [mutateSettings, mutateMobileCommands]);
+  }, [mutateSettings]);
+
+  useEffect(() => {
+    if (!authStatusLoaded || !isAdmin) return;
+    void mutateMobileCommands();
+  }, [authStatusLoaded, isAdmin, mutateMobileCommands]);
 
   const fetchCrawlers = useCallback(async () => {
     // 取得前に一旦未取得状態（null）へ戻してから再取得する（従来挙動を維持）。
-    await mutateCrawlers(null, { revalidate: false });
-    await mutateCrawlers();
+    try {
+      await mutateCrawlers(null, { revalidate: false });
+      await mutateCrawlers();
+    } catch {
+      // SWR exposes the error so the section can render stale/error + retry.
+    }
   }, [mutateCrawlers]);
 
   useEffect(() => {
     fetchAll();
   }, [fetchAll]);
+
+  // Hash links are the stable contract between the Settings category
+  // navigation and section owners. Validate every incoming hash so an old or
+  // unauthorized deep link never renders a blank page; direct targets also
+  // open their disclosure and move keyboard focus to its trigger.
+  useEffect(() => {
+    const syncHash = () => {
+      // Wait for auth resolution before the first hash movement.  Account is
+      // public to authenticated users, but admin/support visibility is not;
+      // deferring all initial movement prevents a pending→loaded transition
+      // from scrolling the same target twice while still revalidating ACLs
+      // once authStatusLoaded flips true.
+      if (!authStatusLoaded) return;
+      const rawHash = window.location.hash.replace(/^#/, "");
+      // Browsers commonly emit both popstate and hashchange when traversing
+      // hash history.  Treat that pair as one navigation so the same section
+      // cannot receive two smooth-scroll requests.
+      const syncKey = `${rawHash}|${authStatusLoaded ? "loaded" : "pending"}|${isAdmin ? "admin" : "user"}`;
+      if (lastHashSyncKeyRef.current === syncKey) return;
+      lastHashSyncKeyRef.current = syncKey;
+      cancelCategoryScroll();
+      navigationGenerationRef.current += 1;
+      if (directTargetFrameRef.current !== null) {
+        cancelSettingsFrame(directTargetFrameRef.current);
+        directTargetFrameRef.current = null;
+      }
+      if (!rawHash) {
+        setActiveCategory("overview");
+        return;
+      }
+      const target = isVisibleSettingsTarget(rawHash, isAdmin);
+      if (target) {
+        setActiveCategory(target.category);
+        if (target.openDisclosure === false) {
+          scheduleCategoryScroll(target.category, "auto");
+          return;
+        }
+        const generation = navigationGenerationRef.current;
+        const targetHash = `#${target.targetId}`;
+        let directTargetFrameRan = false;
+        const directTargetFrame = requestSettingsFrame(() => {
+          directTargetFrameRan = true;
+          directTargetFrameRef.current = null;
+          if (
+            generation !== navigationGenerationRef.current ||
+            window.location.hash !== targetHash
+          ) {
+            return;
+          }
+          openSettingsTarget(target.targetId, {
+            isCurrent: () =>
+              generation === navigationGenerationRef.current &&
+              window.location.hash === targetHash,
+          });
+        });
+        if (!directTargetFrameRan) {
+          directTargetFrameRef.current = directTargetFrame;
+        }
+        return;
+      }
+      if (isSettingsCategoryId(rawHash)) {
+        // Category registry ids are always valid except admin/support for a
+        // non-admin user. Keep those paths safe and visibly recoverable.
+        if ((rawHash === "admin" || rawHash === "support") && !isAdmin) {
+          setActiveCategory("overview");
+          window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#overview`);
+          scheduleCategoryScroll("overview", "auto");
+          return;
+        }
+        setActiveCategory(rawHash);
+        scheduleCategoryScroll(rawHash, "auto");
+        return;
+      }
+      setActiveCategory("overview");
+      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#overview`);
+      scheduleCategoryScroll("overview", "auto");
+    };
+    syncHash();
+    window.addEventListener("hashchange", syncHash);
+    window.addEventListener("popstate", syncHash);
+    return () => {
+      window.removeEventListener("hashchange", syncHash);
+      window.removeEventListener("popstate", syncHash);
+    };
+  }, [authStatusLoaded, cancelCategoryScroll, isAdmin, scheduleCategoryScroll]);
+
+  const handleCategorySelect = useCallback((category: SettingsCategoryId) => {
+    setActiveCategory(category);
+    cancelCategoryScroll();
+    navigationGenerationRef.current += 1;
+    if (directTargetFrameRef.current !== null) {
+      cancelSettingsFrame(directTargetFrameRef.current);
+      directTargetFrameRef.current = null;
+    }
+    // Category anchors keep their href for copy/link semantics, but prevent
+    // native scrolling so this is the only history + scroll path.
+    pushSettingsCategoryHash(category);
+    if (!authStatusLoaded) return;
+    lastHashSyncKeyRef.current = `${category}|${authStatusLoaded ? "loaded" : "pending"}|${isAdmin ? "admin" : "user"}`;
+    scheduleCategoryScroll(category, "smooth");
+  }, [authStatusLoaded, cancelCategoryScroll, isAdmin, scheduleCategoryScroll]);
 
   const handleRunMobileCommand = useCallback(
     async (commandId: string, requiresConfirmation?: boolean) => {
@@ -761,8 +996,13 @@ export default function SettingsPage() {
           method: "POST",
           body: JSON.stringify({ command_id: commandId }),
         });
+        setActionFeedback({ kind: "success", message: `コマンド「${commandId}」を実行しました。` });
       } catch (err) {
         console.error("コマンド実行失敗:", err);
+        setActionFeedback({
+          kind: "error",
+          message: err instanceof Error ? err.message : "コマンドの実行に失敗しました。",
+        });
       } finally {
         setRunningCommandId(null);
       }
@@ -793,8 +1033,13 @@ export default function SettingsPage() {
             },
           };
         }, { revalidate: false });
+        setActionFeedback({ kind: "success", message: "ツール権限を更新しました。" });
       } catch (err) {
         console.error("エージェント設定変更失敗:", err);
+        setActionFeedback({
+          kind: "error",
+          message: err instanceof Error ? err.message : "ツール権限の更新に失敗しました。",
+        });
       }
     },
     [mutateSettings],
@@ -802,7 +1047,10 @@ export default function SettingsPage() {
 
   const handleTaskNotificationMinutesSave = useCallback(async () => {
     const minutes = Number(taskNotificationMinutesBefore);
-    if (!Number.isFinite(minutes) || minutes < 0) return;
+    if (!Number.isFinite(minutes) || minutes < 0) {
+      setActionFeedback({ kind: "error", message: "通知時間は0以上の数値で入力してください。" });
+      return;
+    }
     setTaskNotificationSaving(true);
     try {
       await apiFetch("/api/users/me/settings", {
@@ -823,6 +1071,12 @@ export default function SettingsPage() {
           : prev,
       );
       setTaskNotificationMinutesBefore(String(Math.floor(minutes)));
+      setActionFeedback({ kind: "success", message: "タスク通知の設定を保存しました。" });
+    } catch (error) {
+      setActionFeedback({
+        kind: "error",
+        message: error instanceof Error ? error.message : "タスク通知の保存に失敗しました。",
+      });
     } finally {
       setTaskNotificationSaving(false);
     }
@@ -849,8 +1103,13 @@ export default function SettingsPage() {
               }
             : prev,
         );
-      } catch {
+        setActionFeedback({ kind: "success", message: "タスク通知の既定値を更新しました。" });
+      } catch (error) {
         setTaskNotificationsDefaultEnabled(!enabled);
+        setActionFeedback({
+          kind: "error",
+          message: error instanceof Error ? error.message : "タスク通知の更新に失敗しました。",
+        });
       }
     },
     [],
@@ -876,6 +1135,12 @@ export default function SettingsPage() {
             }
           : prev,
       );
+      setActionFeedback({ kind: "success", message: "カスタム指示を保存しました。" });
+    } catch (error) {
+      setActionFeedback({
+        kind: "error",
+        message: error instanceof Error ? error.message : "カスタム指示の保存に失敗しました。",
+      });
     } finally {
       setCustomInstructionsSaving(false);
     }
@@ -920,16 +1185,96 @@ export default function SettingsPage() {
     }
   }, [currentPassword, newPassword, confirmPassword]);
 
+  const settingsNavigation = (
+    <aside
+      className="ao-workspace-nav-panel bg-surface-charcoal"
+      data-shell-slot="workspace-navigation"
+      data-workspace="settings"
+    >
+      <div className="min-h-0 flex-1 overflow-y-auto p-2">
+        <div className="border-b border-border-subtle px-1 pb-3 pt-2">
+          <h2 className="text-base font-semibold tracking-tight">Settings</h2>
+          <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
+            項目をカテゴリから開きます
+          </p>
+        </div>
+        <div className="pt-2">
+          <SettingsCategoryNavigation
+            activeCategory={activeCategory}
+            isAdmin={isAdmin}
+            onSelect={handleCategorySelect}
+          />
+        </div>
+      </div>
+    </aside>
+  );
+
+  useWorkspaceShellRegistration({
+    id: "settings-workspace",
+    workspaceNavigation: settingsNavigation,
+    priority: 30,
+  });
+
+  const showMobileCommandsError = Boolean(isAdmin && mobileCommandsError);
+
   return (
-    <div className="mx-auto w-full max-w-5xl space-y-5 p-4 pb-8">
-      <div>
-        <h1 className="text-lg font-bold">設定</h1>
-        <p className="mt-1 text-xs text-muted-foreground">
+    <div className="settings-page w-full space-y-6 px-6 py-5 pb-10" data-settings-page>
+      <div className="flex flex-wrap items-end justify-between gap-3 border-b border-border-subtle pb-4">
+        <div>
+        <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-primary">AoiTalk Workspace</p>
+        <h1 className="mt-1 text-2xl font-semibold tracking-tight">設定</h1>
+        <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
           よく使う項目から、会話、操作、通知、ナレッジ、連携、権限、管理へ順番に整理しています。
         </p>
+        </div>
+        <div className="rounded-sm border border-border-subtle bg-card px-2.5 py-1.5 text-[11px] text-muted-foreground dark:bg-surface-charcoal">
+          Settings / {currentUser?.role === "admin" ? "Admin" : "Workspace"}
+        </div>
       </div>
 
-      <QuickSettings />
+      {(settingsError || showMobileCommandsError || crawlersError || actionFeedback) && (
+        <div
+          role={settingsError || showMobileCommandsError || crawlersError || actionFeedback?.kind === "error" ? "alert" : "status"}
+          aria-live="polite"
+          className={
+            settingsError || showMobileCommandsError || crawlersError || actionFeedback?.kind === "error"
+              ? "rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive"
+              : "rounded-md border border-border bg-muted/30 px-3 py-2 text-sm text-muted-foreground"
+          }
+        >
+          {settingsError && (
+            <p className="flex flex-wrap items-center justify-between gap-2">
+              <span>設定を取得できませんでした。{settings ? "前回の値を表示しています。" : ""}</span>
+              <Button type="button" variant="outline" size="sm" onClick={() => void mutateSettings().catch(() => undefined)}>
+                再試行
+              </Button>
+            </p>
+          )}
+          {showMobileCommandsError && (
+            <p className="mt-1 flex flex-wrap items-center justify-between gap-2">
+              <span>モバイルコマンドを取得できませんでした。</span>
+              <Button type="button" variant="outline" size="sm" onClick={() => void mutateMobileCommands().catch(() => undefined)}>
+                再試行
+              </Button>
+            </p>
+          )}
+          {crawlersError && (
+            <p className="mt-1 flex flex-wrap items-center justify-between gap-2">
+              <span>クローラー状態を取得できませんでした。</span>
+              <Button type="button" variant="outline" size="sm" onClick={() => void fetchCrawlers()}>
+                再試行
+              </Button>
+            </p>
+          )}
+          {actionFeedback && <p className="mt-1">{actionFeedback.message}</p>}
+        </div>
+      )}
+
+      <SettingsOverview
+        isAdmin={isAdmin}
+        onSelectCategory={handleCategorySelect}
+        quickSettings={<QuickSettings />}
+      />
 
       <SettingsGroup
         id="conversation"
@@ -939,6 +1284,8 @@ export default function SettingsPage() {
         <SettingsDisclosure
           title="会話カスタム指示"
           icon={<MessageSquareText className="size-4" />}
+          id="custom-instructions-card"
+          targetId="custom-instructions"
           summary={
             customInstructions.trim() ? (
               <Badge variant="secondary">設定済み</Badge>
@@ -972,9 +1319,9 @@ export default function SettingsPage() {
             </div>
           </div>
         </SettingsDisclosure>
-        <MemorySection />
-        <CharactersSection />
-        <LlmModelSection />
+        <SettingsTargetFrame targetId="memory"><MemorySection /></SettingsTargetFrame>
+        <SettingsTargetFrame targetId="characters"><CharactersSection /></SettingsTargetFrame>
+        <SettingsTargetFrame targetId="llm-model"><LlmModelSection /></SettingsTargetFrame>
       </SettingsGroup>
 
       <SettingsGroup
@@ -982,7 +1329,7 @@ export default function SettingsPage() {
         title="音声・読み"
         icon={<AudioLines className="size-4" />}
       >
-        <YomiLinterSection />
+        <SettingsTargetFrame targetId="yomi-linter"><YomiLinterSection /></SettingsTargetFrame>
       </SettingsGroup>
 
       <SettingsGroup
@@ -990,13 +1337,16 @@ export default function SettingsPage() {
         title="入力・操作"
         icon={<Keyboard className="size-4" />}
       >
-        <NavigationTabsSection />
-        <EditorSettingsSection />
-        <AudioPlayerSettingsCard />
-        <SnippetsSection />
-        <SettingsDisclosure
+        <SettingsTargetFrame targetId="navigation-tabs"><NavigationTabsSection /></SettingsTargetFrame>
+        <SettingsTargetFrame targetId="editor-settings"><EditorSettingsSection /></SettingsTargetFrame>
+        <SettingsTargetFrame targetId="audio-player"><AudioPlayerSettingsCard /></SettingsTargetFrame>
+        <SettingsTargetFrame targetId="snippets"><SnippetsSection /></SettingsTargetFrame>
+        {isAdmin && (
+          <SettingsDisclosure
           title="モバイルコマンド"
           icon={<Smartphone className="size-4" />}
+          id="mobile-commands"
+          targetId="mobile-commands"
           summary={
             mobileCommands?.enabled && mobileCommands.commands.length > 0 ? (
               <Badge variant="secondary">
@@ -1008,7 +1358,14 @@ export default function SettingsPage() {
           <p className="text-xs text-muted-foreground">
             端末操作や外部スクリプトを起動するため、必要な時だけ開いて実行します。
           </p>
-          {mobileCommands ? (
+          {mobileCommandsError ? (
+            <div role="alert" className="space-y-2 text-sm text-destructive">
+              <p>モバイルコマンドを取得できませんでした。</p>
+              <Button type="button" variant="outline" size="sm" onClick={() => void mutateMobileCommands().catch(() => undefined)}>
+                再試行
+              </Button>
+            </div>
+          ) : mobileCommands ? (
             mobileCommands.enabled ? (
               mobileCommands.commands.length > 0 ? (
                 <div className="flex flex-wrap gap-2">
@@ -1042,16 +1399,21 @@ export default function SettingsPage() {
                 モバイルコマンドは無効です
               </p>
             )
+          ) : loading ? (
+            <p className="text-sm text-muted-foreground">取得中...</p>
           ) : (
             <p className="text-sm text-muted-foreground">
               取得できませんでした
             </p>
           )}
-        </SettingsDisclosure>
+          </SettingsDisclosure>
+        )}
         {currentUser?.role === "admin" && (
           <SettingsDisclosure
             title="ショートカット"
             icon={<Keyboard className="size-4" />}
+            id="restart-shortcut-card"
+            targetId="restart-shortcut"
           >
               <div className="flex items-center gap-2">
                 <Checkbox
@@ -1067,8 +1429,13 @@ export default function SettingsPage() {
                           restart_shortcut_enabled: val,
                         }),
                       });
-                    } catch {
+                      setActionFeedback({ kind: "success", message: "再起動ショートカットを更新しました。" });
+                    } catch (error) {
                       setRestartShortcutEnabled(!val);
+                      setActionFeedback({
+                        kind: "error",
+                        message: error instanceof Error ? error.message : "ショートカットの更新に失敗しました。",
+                      });
                     }
                   }}
                 />
@@ -1088,6 +1455,8 @@ export default function SettingsPage() {
         <SettingsDisclosure
           title="タスク通知"
           icon={<Bell className="size-4" />}
+          id="task-notifications"
+          targetId="task-notifications"
           summary={
             <Badge variant={taskNotificationsDefaultEnabled ? "default" : "secondary"}>
               {taskNotificationsDefaultEnabled ? "ON" : "OFF"}
@@ -1156,8 +1525,8 @@ export default function SettingsPage() {
               </p>
             </div>
         </SettingsDisclosure>
-        <GoogleCalendarSection />
-        <RemoteServerSection />
+        <SettingsTargetFrame targetId="google-calendar"><GoogleCalendarSection /></SettingsTargetFrame>
+        <SettingsTargetFrame targetId="remote-server"><RemoteServerSection /></SettingsTargetFrame>
       </SettingsGroup>
 
       <SettingsGroup
@@ -1165,12 +1534,14 @@ export default function SettingsPage() {
         title="ナレッジ・検索"
         icon={<Search className="size-4" />}
       >
-        <SearchSettingsSection />
-        <ClipIngestTargetsSection />
-        <KnowledgeSourcesSection />
+        <SettingsTargetFrame targetId="search-provider"><SearchSettingsSection /></SettingsTargetFrame>
+        <SettingsTargetFrame targetId="clip-ingest"><ClipIngestTargetsSection /></SettingsTargetFrame>
+        <SettingsTargetFrame targetId="knowledge-sources"><KnowledgeSourcesSection /></SettingsTargetFrame>
         <SettingsDisclosure
           title="クローラーステータス"
           icon={<Bug className="size-4" />}
+          id="crawler-status"
+          targetId="crawler-status"
           summary={
             crawlers && crawlers.length > 0 ? (
               <Badge variant="secondary">{crawlers.length}件</Badge>
@@ -1180,7 +1551,14 @@ export default function SettingsPage() {
           <Button variant="outline" size="sm" onClick={fetchCrawlers}>
             更新
           </Button>
-          {crawlers === null ? (
+          {crawlersError ? (
+            <div role="alert" className="space-y-2 text-sm text-destructive">
+              <p>クローラー状態を取得できませんでした。</p>
+              <Button type="button" variant="outline" size="sm" onClick={() => void fetchCrawlers()}>
+                再試行
+              </Button>
+            </div>
+          ) : crawlers === null ? (
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               必要な時に更新してください
             </div>
@@ -1230,14 +1608,18 @@ export default function SettingsPage() {
         title="外部連携"
         icon={<Plug className="size-4" />}
       >
-        <SpotifySection />
-        <ComfyUISection />
-        <McpEnableCard
-          loading={loading}
-          enabled={settings?.agents?.mcp?.enabled ?? null}
-          onToggle={(enabled) => handleAgentToggle("mcp", enabled)}
-        />
-        <McpSection />
+        <div className="grid gap-3 lg:grid-cols-2 xl:grid-cols-3" data-settings-integrations-grid>
+          <SettingsTargetFrame targetId="webex"><WebexSection /></SettingsTargetFrame>
+          <SettingsTargetFrame targetId="spotify"><SpotifySection /></SettingsTargetFrame>
+          <SettingsTargetFrame targetId="hydrus"><HydrusSettingsSection /></SettingsTargetFrame>
+          <SettingsTargetFrame targetId="comfyui"><ComfyUISection /></SettingsTargetFrame>
+          <SettingsTargetFrame targetId="cookie-management"><CookieManagementSection /></SettingsTargetFrame>
+          <SettingsTargetFrame targetId="mcp"><McpSection
+              loading={loading}
+              enabled={settings?.agents?.mcp?.enabled ?? null}
+              onToggle={(enabled) => handleAgentToggle("mcp", enabled)}
+            /></SettingsTargetFrame>
+        </div>
       </SettingsGroup>
 
       <SettingsGroup
@@ -1248,8 +1630,11 @@ export default function SettingsPage() {
         <ToolPermissionsCard
           loading={loading}
           settings={settings}
+          error={settingsError}
+          onRetry={() => void mutateSettings().catch(() => undefined)}
           onToggle={handleAgentToggle}
         />
+        <AutonomousTaskExecutionSection />
       </SettingsGroup>
 
       <SettingsGroup
@@ -1260,6 +1645,8 @@ export default function SettingsPage() {
         <SettingsDisclosure
           title="パスワード変更"
           icon={<Lock className="size-4" />}
+          id="password"
+          targetId="password"
         >
           <div className="space-y-1">
             <Label className="text-xs">現在のパスワード</Label>
@@ -1308,11 +1695,11 @@ export default function SettingsPage() {
             <p className="text-xs text-destructive">{passwordError}</p>
           )}
         </SettingsDisclosure>
-        {currentUser && (
-          <LoginHistorySection isAdmin={currentUser.role === "admin"} />
+        {isAdmin && currentUser && (
+          <SettingsTargetFrame targetId="login-history"><LoginHistorySection isAdmin /></SettingsTargetFrame>
         )}
         {currentUser && (
-          <CostDashboardSection isAdmin={currentUser.role === "admin"} />
+          <SettingsTargetFrame targetId="cost-dashboard"><CostDashboardSection isAdmin={currentUser.role === "admin"} /></SettingsTargetFrame>
         )}
       </SettingsGroup>
 
@@ -1322,10 +1709,10 @@ export default function SettingsPage() {
           title="管理・運用"
           icon={<UserCog className="size-4" />}
         >
-          <UserManagementConsole currentUser={currentUser} />
-          <UserExportSection />
-          <SkillsSection />
-          <HeartbeatsSection />
+          <SettingsTargetFrame targetId="user-management"><UserManagementConsole currentUser={currentUser} /></SettingsTargetFrame>
+          <SettingsTargetFrame targetId="user-export"><UserExportSection /></SettingsTargetFrame>
+          <SettingsTargetFrame targetId="skills"><SkillsSection /></SettingsTargetFrame>
+          <SettingsTargetFrame targetId="heartbeats"><HeartbeatsSection /></SettingsTargetFrame>
         </SettingsGroup>
       )}
 
@@ -1335,7 +1722,7 @@ export default function SettingsPage() {
           title="サポート"
           icon={<CircleHelp className="size-4" />}
         >
-          <FeedbackSection />
+          <SettingsTargetFrame targetId="feedback"><FeedbackSection /></SettingsTargetFrame>
         </SettingsGroup>
       )}
     </div>

@@ -1,0 +1,25 @@
+# External-provider marker overlay.  deploy-compose.sh also regenerates the
+# Enterprise YAML overlay so the first database seed uses these values.
+services:
+  aoitalk:
+    # The router is operator-owned and runs on the Linux host, not in this
+    # Compose project.  Docker's host-gateway keeps the endpoint stable on
+    # both Docker Engine and Docker Desktop.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      AOITALK_BACKEND: external
+      AOITALK_ACTIVE_DEPLOYMENT_BACKEND: external
+      AOITALK_LLM_MODE: external
+      AOITALK_ALLOWED_PROVIDER_IDS: ${AOITALK_ALLOWED_PROVIDER_IDS:-openai_compatible_local}
+      AOITALK_EFFECTIVE_LLM_PROVIDER: ${AOITALK_EXTERNAL_PROVIDER:-openai_compatible_local}
+      AOITALK_EXTERNAL_PROVIDER: ${AOITALK_EXTERNAL_PROVIDER:-openai_compatible_local}
+      AOITALK_EXTERNAL_MODEL: ${AOITALK_EXTERNAL_MODEL:-qwen3.8-27b}
+      AOITALK_EXTERNAL_BASE_URL: ${AOITALK_EXTERNAL_BASE_URL:-http://host.docker.internal:18080/v1}
+      AOITALK_EXTERNAL_REQUIRED_MODELS: ${AOITALK_EXTERNAL_REQUIRED_MODELS:-qwen3.8-27b,gemma-4-26b-a4b-it-qat-q4-0}
+      OPENAI_COMPATIBLE_LOCAL_MODEL: ${AOITALK_EXTERNAL_MODEL:-qwen3.8-27b}
+      OPENAI_COMPATIBLE_LOCAL_BASE_URL: ${AOITALK_EXTERNAL_BASE_URL:-http://host.docker.internal:18080/v1}
+      # Never let a known llama.cpp profile imply ownership of the router.
+      LLAMA_CPP_AUTO_START: "false"
+      OPENROUTER_BASE_URL: ${AOITALK_EXTERNAL_BASE_URL:-https://openrouter.ai/api/v1}
+      OPENROUTER_MODEL: ${AOITALK_EXTERNAL_MODEL:-openai/gpt-4o-mini}

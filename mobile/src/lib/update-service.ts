@@ -19,6 +19,11 @@ export type UpdateCheckResult = {
   version?: string;
   url?: string;
   notes?: string;
+  /**
+   * 更新チェックが失敗した場合の理由。
+   * 値が入っている場合は「最新です」ではなく、通信/取得失敗として扱う。
+   */
+  error?: string;
 };
 
 function isNewerVersion(current: string, latest: string): boolean {
@@ -48,7 +53,9 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
   const currentVersion = getCurrentVersion();
   try {
     const response = await fetch(UPDATE_CHECK_URL, { cache: 'no-store' });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) {
+      throw new Error(`サーバー応答エラー (HTTP ${response.status})`);
+    }
     const data = (await response.json()) as LatestJson;
     const info = data.mobile;
     if (info && isNewerVersion(currentVersion, info.version)) {
@@ -61,8 +68,13 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
       };
     }
     return { available: false, currentVersion };
-  } catch {
-    return { available: false, currentVersion };
+  } catch (error) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : '更新情報の取得に失敗しました';
+    console.warn('[update-service] checkForUpdate failed:', message);
+    return { available: false, currentVersion, error: message };
   }
 }
 
@@ -88,8 +100,10 @@ export function showUpdateAlert(result: UpdateCheckResult): void {
             await Linking.openURL(result.url!);
           }
         } catch (error) {
-          const messageText =
-            error instanceof Error ? error.message : '更新の開始に失敗しました';
+          const reason =
+            error instanceof Error ? error.message : String(error);
+          console.warn('[update-service] APK download/install failed:', reason);
+          const messageText = `更新の開始に失敗しました。\n\n理由: ${reason}\n\nブラウザから直接ダウンロードできます。`;
           Alert.alert('ダウンロードに失敗', messageText, [
             { text: 'キャンセル', style: 'cancel' },
             {

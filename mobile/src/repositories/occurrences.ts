@@ -2,6 +2,12 @@ import { and, desc, eq, gte, isNull, lte } from "drizzle-orm";
 import { getDb, schema } from "../db/client";
 import { rescheduleLocalTaskNotificationsFromCache } from "../lib/local-notifications";
 import { taskApi } from "../lib/task-api";
+import { compareTaskTimestamps, isTaskTombstoned } from "./tasks";
+import {
+  compareTombstoneTimestamps,
+  loadTombstoneLedger,
+  persistTombstoneLedger,
+} from "./tombstone-ledger";
 import type { TaskOccurrence } from "../types/api";
 
 type DbOccurrence = typeof schema.taskOccurrences.$inferSelect;
@@ -53,7 +59,48 @@ export async function applyRemoteOccurrences(
   if (!list.length) return;
   const db = getDb();
   const now = new Date().toISOString();
+  const ledger = await loadTombstoneLedger("task-occurrences:tombstones");
+  let ledgerChanged = false;
   for (const occurrence of list) {
+    // A task tree tombstone is authoritative for its materialized rows. Do
+    // not let a stale occurrence payload recreate a child while the task is
+    // deleted locally (including when only the missing-row ledger exists).
+    if (await isTaskTombstoned(occurrence.task_id)) continue;
+    const existing = await db
+      .select({ deletedAt: schema.taskOccurrences.deletedAt, updatedAt: schema.taskOccurrences.updatedAt })
+      .from(schema.taskOccurrences)
+      .where(eq(schema.taskOccurrences.id, occurrence.id));
+    const current = existing[0];
+    const incomingUpdatedAt = occurrence.updated_at ?? now;
+    const hasIncomingVersion =
+      typeof occurrence.updated_at === "string" && occurrence.updated_at.trim().length > 0;
+    const explicitActive =
+      Object.prototype.hasOwnProperty.call(occurrence, "deleted_at") &&
+      occurrence.deleted_at == null;
+    const ledgerDeletedAt = ledger.entries.get(occurrence.id) ?? null;
+    if (
+      ledgerDeletedAt != null &&
+      !(
+        explicitActive &&
+        hasIncomingVersion &&
+        compareTombstoneTimestamps(incomingUpdatedAt, ledgerDeletedAt) > 0
+      )
+    ) {
+      continue;
+    }
+    if (ledgerDeletedAt != null && ledger.entries.delete(occurrence.id)) {
+      ledgerChanged = true;
+    }
+    if (
+      current?.deletedAt != null &&
+      !(
+        explicitActive &&
+        hasIncomingVersion &&
+        compareTaskTimestamps(incomingUpdatedAt, current.deletedAt) > 0
+      )
+    ) {
+      continue;
+    }
     await db
       .insert(schema.taskOccurrences)
       .values({
@@ -86,6 +133,7 @@ export async function applyRemoteOccurrences(
         },
       });
   }
+  if (ledgerChanged) await persistTombstoneLedger(ledger);
   void rescheduleLocalTaskNotificationsFromCache();
 }
 
@@ -94,13 +142,22 @@ export async function applyOccurrenceTombstones(
 ): Promise<void> {
   if (!tombstones.length) return;
   const db = getDb();
+  const ledger = await loadTombstoneLedger("task-occurrences:tombstones");
+  let ledgerChanged = false;
   for (const item of tombstones) {
     const deletedAt = item.deleted_at ?? new Date().toISOString();
+    const previous = ledger.entries.get(item.id);
+    if (previous && compareTombstoneTimestamps(deletedAt, previous) < 0) {
+      continue;
+    }
+    ledger.entries.set(item.id, deletedAt);
+    ledgerChanged = true;
     await db
       .update(schema.taskOccurrences)
       .set({ deletedAt, updatedAt: deletedAt })
       .where(eq(schema.taskOccurrences.id, item.id));
   }
+  if (ledgerChanged) await persistTombstoneLedger(ledger);
   void rescheduleLocalTaskNotificationsFromCache();
 }
 

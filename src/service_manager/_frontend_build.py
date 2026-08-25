@@ -129,7 +129,10 @@ def _is_frontend_build_input(path: Path, frontend_dir: Path) -> bool:
     except ValueError:
         return False
 
-    if any(part in _FRONTEND_BUILD_EXCLUDED_DIR_NAMES for part in relative.parts):
+    if any(
+        part in _FRONTEND_BUILD_EXCLUDED_DIR_NAMES or part.startswith(".next-")
+        for part in relative.parts
+    ):
         return False
     if path.name in _FRONTEND_BUILD_EXCLUDED_FILE_NAMES:
         return False
@@ -144,7 +147,10 @@ def _iter_frontend_build_input_files(frontend_dir: Path) -> list[Path]:
     input_files: list[Path] = []
     for root, dir_names, file_names in os.walk(frontend_dir):
         dir_names[:] = [
-            name for name in dir_names if name not in _FRONTEND_BUILD_EXCLUDED_DIR_NAMES
+            name
+            for name in dir_names
+            if name not in _FRONTEND_BUILD_EXCLUDED_DIR_NAMES
+            and not name.startswith(".next-")
         ]
         root_path = Path(root)
         for file_name in file_names:
@@ -316,6 +322,25 @@ def _frontend_static_build_invalid_reason(frontend_dir: Path) -> str | None:
     return None
 
 
+def _validate_frontend_startup_artifacts(project_root: Path) -> None:
+    """Validate startup prerequisites without installing or building anything."""
+    frontend_dir = project_root / "frontend"
+    if not _next_bin_path(frontend_dir).exists():
+        raise RuntimeError(
+            "Frontend dependencies are not installed. "
+            "Run setup.bat/setup.sh or `cd frontend && npm ci` before run.bat. "
+            "run.bat does not install dependencies."
+        )
+
+    invalid_reason = _frontend_static_build_invalid_reason(frontend_dir)
+    if invalid_reason:
+        raise RuntimeError(
+            f"Frontend build is not ready: {invalid_reason}. "
+            "Run `cd frontend && npm run build:production` manually, or restart "
+            "run.bat so its startup self-repair can retry the production build."
+        )
+
+
 def _frontend_build_rebuild_reason(frontend_dir: Path) -> tuple[str | None, dict[str, object]]:
     fingerprint = _frontend_build_fingerprint(frontend_dir)
     invalid_reason = _frontend_static_build_invalid_reason(frontend_dir)
@@ -334,7 +359,7 @@ def _ensure_frontend_build(
     log_path: Path,
     env: dict[str, str],
 ) -> None:
-    """Ensure Next.js production artifacts match the current frontend tree."""
+    """Ensure the canonical ``.next`` production build matches the frontend tree."""
     frontend_dir = project_root / "frontend"
     reason, fingerprint = _frontend_build_rebuild_reason(frontend_dir)
     if not reason:
@@ -343,7 +368,9 @@ def _ensure_frontend_build(
     next_dir = frontend_dir / ".next"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
-        log_file.write(f"{reason}; running npm run build before startup.\n")
+        log_file.write(
+            f"{reason}; running npm run build:production before startup.\n"
+        )
         log_file.flush()
 
         if next_dir.exists():
@@ -356,7 +383,7 @@ def _ensure_frontend_build(
                 ) from exc
 
         result = subprocess.run(
-            [_npm_command(), "run", "build"],
+            [_npm_command(), "run", "build:production"],
             cwd=str(frontend_dir),
             env=env,
             stdout=log_file,
@@ -366,7 +393,7 @@ def _ensure_frontend_build(
 
     if result.returncode != 0:
         raise RuntimeError(
-            "Frontend build is stale or broken and npm run build failed.\n"
+            "Frontend build is stale or broken and npm run build:production failed.\n"
             f"frontend.log tail:\n{_read_log_tail(log_path)}"
         )
 

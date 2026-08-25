@@ -174,7 +174,12 @@ class ConversationMemoryManager:
             old_session = self._current_sessions[session_key]
             if old_session and old_session.is_active:
                 try:
-                    await self.repository.deactivate_session(str(old_session.id))
+                    # Starting a new session must not make the old session
+                    # look recently active in the history list.
+                    await self.repository.deactivate_session(
+                        str(old_session.id),
+                        touch_activity=False,
+                    )
                     print(f"[ConversationMemoryManager] Deactivated old session: {old_session.id}")
                 except Exception as e:
                     print(f"[ConversationMemoryManager] Failed to deactivate old session: {e}")
@@ -278,7 +283,8 @@ class ConversationMemoryManager:
                                      sender_type: Optional[str] = None,
                                      sender_id: Optional[str] = None,
                                      sender_display_name: Optional[str] = None,
-                                     llm_client = None) -> ConversationMessage:
+                                     llm_client = None,
+                                     message_id: Optional[str] = None) -> ConversationMessage:
         """Add message to a specific conversation session by ID
         
         Args:
@@ -303,8 +309,9 @@ class ConversationMemoryManager:
             success = await self.initialize()
             if not success:
                 return None
-        
+
         # Add message directly to the specified session
+        message_identity = {"message_id": message_id} if message_id else {}
         message = await self.repository.add_message(
             session_id,
             role,
@@ -314,6 +321,7 @@ class ConversationMemoryManager:
             sender_type=sender_type,
             sender_id=sender_id,
             sender_display_name=sender_display_name,
+            **message_identity,
         )
         
         session_info = None
@@ -338,6 +346,10 @@ class ConversationMemoryManager:
             message_created_at = message.created_at
             index_user_id = session_info.user_id
             index_character_name = session_info.character_name
+            session_project_id = getattr(session_info, "project_id", None)
+            index_project_id = (
+                str(session_project_id) if session_project_id else None
+            )
 
             async def _index_in_background():
                 try:
@@ -349,6 +361,7 @@ class ConversationMemoryManager:
                         role=role,
                         content=content,
                         character_name=index_character_name,
+                        project_id=index_project_id,
                         timestamp=message_created_at,
                     )
                 except Exception as e:
@@ -501,54 +514,37 @@ class ConversationMemoryManager:
             return
         
         # Create summary
-        summary = await self.summarization_service.create_summary(messages_to_summarize, llm_client)
+        summary = await self.summarization_service.create_summary(
+            messages_to_summarize,
+            llm_client,
+            previous_summary=getattr(session, "current_summary", None),
+        )
 
         if not summary:
             print(f"[ConversationMemoryManager] Failed to create summary")
             return
 
-        # A branch edit can happen while the summarizer is running.  Commit
-        # the checkpoint only while the snapshotted messages are still on the
-        # active branch; otherwise the summary would mix inactive history into
-        # the next prompt.
-        if callable(get_active):
-            current_active = await get_active(session.id)
-            active_ids = {str(message.id) for message in current_active}
-            if any(str(message.id) not in active_ids for message in messages_to_summarize):
-                print("[ConversationMemoryManager] Active branch changed; summary discarded")
-                return
-        
-        # Create archive
         start_time = messages_to_summarize[0].created_at
         end_time = messages_to_summarize[-1].created_at
-        
-        archive = await self.repository.create_archive(
-            user_id=session.user_id,
-            character_name=session.character_name,
-            original_session_id=session.id,
+        checkpoint = await self.repository.apply_summary_checkpoint(
+            session_id=session.id,
+            message_ids=[message.id for message in messages_to_summarize],
             summary=summary,
-            message_count=len(messages_to_summarize),
             start_time=start_time,
             end_time=end_time,
-            metadata={"summarization_config": self.config.__dict__}
+            metadata={"summarization_config": self.config.__dict__},
+            expected_previous_summary=getattr(
+                session, "current_summary", None
+            )
+            or "",
         )
-
-        # Delete exactly the snapshotted messages.  New turns may have been
-        # appended while the LLM was generating the summary.
-        if hasattr(self.repository, "delete_messages_by_ids"):
-            deleted_count = await self.repository.delete_messages_by_ids(
-                session.id,
-                [message.id for message in messages_to_summarize],
+        if checkpoint is None:
+            print(
+                "[ConversationMemoryManager] Summary checkpoint discarded; "
+                "active branch changed"
             )
-        else:
-            deleted_count = await self.repository.delete_old_messages(
-                session.id, self.config.summary_overlap
-            )
-
-        if deleted_count <= 0:
-            print("[ConversationMemoryManager] Summary deletion skipped; active branch changed")
             return
-        await self.repository.update_session_summary(session.id, summary)
+        archive, deleted_count = checkpoint
 
         print(f"[ConversationMemoryManager] Summarization complete:")
         print(f"  - Archive ID: {archive.id}")
@@ -556,8 +552,15 @@ class ConversationMemoryManager:
         print(f"  - Messages deleted: {deleted_count}")
         print(f"  - Messages kept: {self.config.summary_overlap}")
     
-    async def search_memory(self, user_id: str, character_name: str, query: str,
-                          time_range: str = "all", max_results: Optional[int] = None) -> List[Dict[str, Any]]:
+    async def search_conversation_memory(
+        self,
+        user_id: str,
+        character_name: str,
+        query: str,
+        time_range: str = "all",
+        max_results: Optional[int] = None,
+        project_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Search conversation memory
         
         Args:
@@ -566,6 +569,7 @@ class ConversationMemoryManager:
             query: Search query
             time_range: Time range filter
             max_results: Maximum results to return
+            project_id: Project scope. None searches only non-project conversations.
             
         Returns:
             List[Dict[str, Any]]: Search results
@@ -576,8 +580,13 @@ class ConversationMemoryManager:
         if self.search_service is None:
             return []
 
-        return await self.search_service.search_memory(
-            user_id, character_name, query, time_range, max_results
+        return await self.search_service.search_conversation_memory(
+            user_id,
+            character_name,
+            query,
+            time_range,
+            max_results,
+            project_id=project_id,
         )
     
     async def get_recent_messages(self, user_id: str, character_name: str, count: int = 10) -> List[Dict[str, Any]]:

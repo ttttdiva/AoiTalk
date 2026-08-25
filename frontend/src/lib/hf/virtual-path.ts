@@ -34,7 +34,8 @@ export function parseHfPath(p: string): HfVirtualPath | null {
   const parts = p.split(HF_SEP);
   if (parts.length < 4) return null;
   const [, accountId, repoTypeRaw, repoId, ...rest] = parts;
-  const repoType: RepoType = repoTypeRaw === "dataset" ? "dataset" : "model";
+  if (repoTypeRaw !== "model" && repoTypeRaw !== "dataset") return null;
+  const repoType: RepoType = repoTypeRaw;
   return {
     kind: "repo",
     accountId,

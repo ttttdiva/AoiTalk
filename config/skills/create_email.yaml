@@ -59,10 +59,9 @@ aliases:
   - メール
   - email
 bound_tools:
-  - find_workspace_items
-  - inspect_workspace_tree
-  - read_workspace_file
-  - view_file
+  - search_files
+  - list_directory
+  - read_file
 examples:
   - "/create_email 来週火曜に打ち合わせを設定したい"
   - "/create_email 移行資料をBoxにアップしたので連絡メール"

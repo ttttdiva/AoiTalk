@@ -318,19 +318,43 @@ export function findIncrementalSearchMatch(
 ): FilerSearchItem | null {
   if (items.length === 0 || terms.length === 0) return null;
 
-  const activeIndex = activePath
-    ? items.findIndex((item) => item.path === activePath)
-    : -1;
+  const activeIndex = findActiveIndex(items, activePath);
   if (activeIndex >= 0 && itemMatchesMigemoTerms(items[activeIndex], terms)) {
     return items[activeIndex];
   }
 
-  const startIndex = activeIndex >= 0 ? activeIndex + 1 : 0;
+  return findMatchFrom(items, activeIndex + 1, terms);
+}
+
+/**
+ * 現在の項目が一致していても必ず次の候補へ進める「次の一致」用。
+ * 末尾まで到達したら先頭へ wrap するため、一致が1件だけならその項目自身を返す。
+ */
+export function findNextIncrementalSearchMatch(
+  items: FilerSearchItem[],
+  activePath: string | null,
+  terms: string[],
+): FilerSearchItem | null {
+  if (items.length === 0 || terms.length === 0) return null;
+  return findMatchFrom(items, findActiveIndex(items, activePath) + 1, terms);
+}
+
+function findActiveIndex(
+  items: FilerSearchItem[],
+  activePath: string | null,
+): number {
+  return activePath ? items.findIndex((item) => item.path === activePath) : -1;
+}
+
+function findMatchFrom(
+  items: FilerSearchItem[],
+  startIndex: number,
+  terms: string[],
+): FilerSearchItem | null {
   for (let offset = 0; offset < items.length; offset += 1) {
     const index = (startIndex + offset) % items.length;
     if (itemMatchesMigemoTerms(items[index], terms)) return items[index];
   }
-
   return null;
 }
 

@@ -59,26 +59,31 @@ function SelectTrigger({
 function SelectContent({
   className,
   children,
+  positionerClassName,
   side = "bottom",
   sideOffset = 4,
   align = "center",
   alignOffset = 0,
-  alignItemWithTrigger = true,
+  alignItemWithTrigger = false,
+  container,
   ...props
 }: SelectPrimitive.Popup.Props &
   Pick<
     SelectPrimitive.Positioner.Props,
     "align" | "alignOffset" | "side" | "sideOffset" | "alignItemWithTrigger"
-  >) {
+  > & {
+    positionerClassName?: string
+    container?: SelectPrimitive.Portal.Props["container"]
+  }) {
   return (
-    <SelectPrimitive.Portal>
+    <SelectPrimitive.Portal container={container}>
       <SelectPrimitive.Positioner
         side={side}
         sideOffset={sideOffset}
         align={align}
         alignOffset={alignOffset}
         alignItemWithTrigger={alignItemWithTrigger}
-        className="isolate z-50"
+        className={cn("isolate z-50", positionerClassName)}
       >
         <SelectPrimitive.Popup
           data-slot="select-content"
@@ -111,8 +116,9 @@ function SelectLabel({
 function SelectItem({
   className,
   children,
+  showIndicator = true,
   ...props
-}: SelectPrimitive.Item.Props) {
+}: SelectPrimitive.Item.Props & { showIndicator?: boolean }) {
   return (
     <SelectPrimitive.Item
       data-slot="select-item"
@@ -125,13 +131,18 @@ function SelectItem({
       <SelectPrimitive.ItemText className="flex flex-1 shrink-0 gap-2 whitespace-nowrap">
         {children}
       </SelectPrimitive.ItemText>
-      <SelectPrimitive.ItemIndicator
-        render={
-          <span className="pointer-events-none absolute right-2 flex size-4 items-center justify-center" />
-        }
-      >
-        <CheckIcon className="pointer-events-none" />
-      </SelectPrimitive.ItemIndicator>
+      {showIndicator && (
+        <SelectPrimitive.ItemIndicator
+          render={
+            <span
+              data-slot="select-item-indicator"
+              className="pointer-events-none absolute right-2 flex size-4 items-center justify-center"
+            />
+          }
+        >
+          <CheckIcon className="pointer-events-none" />
+        </SelectPrimitive.ItemIndicator>
+      )}
     </SelectPrimitive.Item>
   )
 }

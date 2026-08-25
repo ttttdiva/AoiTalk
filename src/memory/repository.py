@@ -6,13 +6,22 @@ import uuid
 import logging
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any, Tuple, Union
-from sqlalchemy import select, delete, update, func, desc, and_, or_
+from sqlalchemy import case, select, delete, update, func, desc, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from .database import get_db_session
 from .models import ConversationSession, ConversationMessage, ConversationArchive, ConversationHistory
 logger = logging.getLogger(__name__)
+
+
+def _monotonic_activity(value):
+    """Advance activity without allowing an older concurrent writer to regress it."""
+    return case(
+        (ConversationSession.last_activity.is_(None), value),
+        (ConversationSession.last_activity < value, value),
+        else_=ConversationSession.last_activity,
+    )
 
 
 class ConversationRepository:
@@ -58,7 +67,16 @@ class ConversationRepository:
                     ConversationSession.character_name == character_name,
                     ConversationSession.is_active == True
                 )
-            ).order_by(desc(ConversationSession.last_activity))
+            ).order_by(
+                desc(
+                    func.coalesce(
+                        ConversationSession.last_activity,
+                        ConversationSession.session_start,
+                    )
+                ).nullslast(),
+                desc(ConversationSession.session_start).nullslast(),
+                desc(ConversationSession.id),
+            )
 
             result = await session.execute(stmt)
             sessions = list(result.scalars().all())
@@ -70,10 +88,7 @@ class ConversationRepository:
                 await session.execute(
                     update(ConversationSession).where(
                         ConversationSession.id.in_(extra_ids)
-                    ).values(
-                        is_active=False,
-                        last_activity=datetime.utcnow()
-                    )
+                    ).values(is_active=False)
                 )
                 await session.commit()
                 logger.warning(
@@ -114,13 +129,17 @@ class ConversationRepository:
         session_id: Union[str, uuid.UUID],
         title: str,
         source: Optional[str] = None,
+        expected_title: Optional[str] = None,
     ) -> bool:
         """Update the title for a conversation session."""
         if isinstance(session_id, str):
             session_id = uuid.UUID(session_id)
 
         async with await get_db_session() as session:
-            values = {"title": title, "last_activity": datetime.utcnow()}
+            # A generated title is presentation metadata, not a new chat
+            # activity. Keeping last_activity unchanged prevents a title job
+            # racing with mark-as-read from creating a false unread marker.
+            values = {"title": title}
             if source:
                 result = await session.execute(
                     select(ConversationSession.context).where(
@@ -139,6 +158,8 @@ class ConversationRepository:
                 .where(ConversationSession.id == session_id)
                 .values(**values)
             )
+            if expected_title is not None:
+                stmt = stmt.where(ConversationSession.title == expected_title)
             result = await session.execute(stmt)
             await session.commit()
             return result.rowcount > 0
@@ -152,12 +173,16 @@ class ConversationRepository:
         async with await get_db_session() as session:
             stmt = update(ConversationSession).where(
                 ConversationSession.id == session_id
-            ).values(last_activity=datetime.utcnow())
+            ).values(last_activity=_monotonic_activity(datetime.utcnow()))
             
             await session.execute(stmt)
             await session.commit()
     
-    async def deactivate_session(self, session_id: Union[str, uuid.UUID]):
+    async def deactivate_session(
+        self,
+        session_id: Union[str, uuid.UUID],
+        touch_activity: bool = True,
+    ):
         """Deactivate a session (mark as inactive)
         
         Args:
@@ -168,9 +193,12 @@ class ConversationRepository:
             session_id = uuid.UUID(session_id)
             
         async with await get_db_session() as session:
+            values = {"is_active": False}
+            if touch_activity:
+                values["last_activity"] = _monotonic_activity(datetime.utcnow())
             stmt = update(ConversationSession).where(
                 ConversationSession.id == session_id
-            ).values(is_active=False, last_activity=datetime.utcnow())
+            ).values(**values)
             
             await session.execute(stmt)
             await session.commit()
@@ -261,6 +289,7 @@ class ConversationRepository:
         sender_type: Optional[str] = None,
         sender_id: Optional[str] = None,
         sender_display_name: Optional[str] = None,
+        message_id: Optional[str] = None,
     ) -> ConversationMessage:
         """Add message to conversation session
         
@@ -274,6 +303,14 @@ class ConversationRepository:
             ConversationMessage: Created message
         """
         async with await get_db_session() as session:
+            conversation_result = await session.execute(
+                select(ConversationSession)
+                .where(ConversationSession.id == session_id)
+                .with_for_update()
+            )
+            conversation = conversation_result.scalar_one_or_none()
+            if conversation is None:
+                raise ValueError(f"Conversation session not found: {session_id}")
             await self._ensure_linear_parent_links(session, session_id)
 
             parent_message_id: Optional[uuid.UUID] = None
@@ -301,7 +338,11 @@ class ConversationRepository:
                     session, session_id, parent_message_id
                 )
 
+            message_identity = {
+                "id": uuid.UUID(message_id)
+            } if message_id else {}
             message = ConversationMessage(
+                **message_identity,
                 session_id=session_id,
                 role=role,
                 content=content,
@@ -318,40 +359,121 @@ class ConversationRepository:
             
             session.add(message)
             
-            # Update session message count and last activity
+            # Update session message count and durable chat status. Only
+            # user/assistant turns are activity events; system/maintenance
+            # rows must not move the sidebar history.
+            update_values = {
+                "message_count": func.coalesce(
+                    ConversationSession.message_count, 0
+                )
+                + 1,
+            }
+            if role in {"user", "assistant"}:
+                update_values["last_activity"] = _monotonic_activity(datetime.utcnow())
+                update_values["development_status"] = (
+                    "working" if role == "user" else "waiting_for_user"
+                )
             await session.execute(
                 update(ConversationSession).where(
                     ConversationSession.id == session_id
-                ).values(
-                    message_count=func.coalesce(
-                        ConversationSession.message_count, 0
-                    )
-                    + 1,
-                    last_activity=datetime.utcnow()
-                )
+                ).values(**update_values)
             )
             
             await session.commit()
             await session.refresh(message)
             return message
 
+    async def _archive_current_summary_generation(
+        self,
+        session: AsyncSession,
+        conversation: ConversationSession,
+        superseded_at: datetime,
+    ) -> None:
+        """Preserve a current summary unless its latest archive already matches."""
+        previous_summary = str(conversation.current_summary or "").strip()
+        if not previous_summary:
+            return
+
+        latest_result = await session.execute(
+            select(ConversationArchive)
+            .where(
+                ConversationArchive.original_session_id == str(conversation.id)
+            )
+            .order_by(
+                desc(ConversationArchive.archived_at),
+                desc(ConversationArchive.id),
+            )
+            .limit(1)
+        )
+        latest_archive = latest_result.scalar_one_or_none()
+        if (
+            latest_archive is not None
+            and str(latest_archive.summary or "").strip() == previous_summary
+        ):
+            return
+
+        session.add(
+            ConversationArchive(
+                user_id=conversation.user_id,
+                character_name=conversation.character_name,
+                original_session_id=str(conversation.id),
+                summary=previous_summary,
+                message_count=int(conversation.message_count or 0),
+                start_time=conversation.session_start,
+                end_time=conversation.last_activity or superseded_at,
+                message_metadata={
+                    "archive_type": "summary_revision",
+                    "superseded_at": superseded_at.isoformat(),
+                },
+            )
+        )
+
     async def update_session_summary(
         self,
         session_id: Union[str, uuid.UUID],
         summary: str,
+        expected_previous_summary: Optional[str] = None,
     ) -> bool:
-        """Update the current summary stored on a conversation session."""
+        """Update the current summary while preserving the previous generation."""
         if isinstance(session_id, str):
             session_id = uuid.UUID(session_id)
 
         async with await get_db_session() as session:
-            conversation = await session.get(ConversationSession, session_id)
-            if not conversation:
-                return False
-            conversation.current_summary = summary
-            conversation.last_activity = datetime.utcnow()
-            await session.commit()
-            return True
+            try:
+                result = await session.execute(
+                    select(ConversationSession)
+                    .where(ConversationSession.id == session_id)
+                    .with_for_update()
+                )
+                conversation = result.scalar_one_or_none()
+                if not conversation:
+                    return False
+
+                previous_summary = str(conversation.current_summary or "").strip()
+                if (
+                    expected_previous_summary is not None
+                    and previous_summary
+                    != str(expected_previous_summary or "").strip()
+                ):
+                    return False
+                next_summary = str(summary or "").strip()
+                if not next_summary:
+                    return False
+
+                now = datetime.utcnow()
+                if previous_summary and previous_summary != next_summary:
+                    await self._archive_current_summary_generation(
+                        session,
+                        conversation,
+                        now,
+                    )
+
+                conversation.current_summary = next_summary
+                await session.commit()
+                return True
+            except Exception:
+                await session.rollback()
+                raise
 
     async def update_session_context(
         self,
@@ -366,7 +488,6 @@ class ConversationRepository:
                 return False
             existing = conversation.context if isinstance(conversation.context, dict) else {}
             conversation.context = {**existing, **(context or {})}
-            conversation.last_activity = datetime.utcnow()
             await session.commit()
             return True
     
@@ -408,6 +529,99 @@ class ConversationRepository:
             )
             result = await session.execute(stmt)
             return list(result.scalars().all())
+
+    async def delete_message_by_id(
+        self,
+        session_id: Union[str, uuid.UUID],
+        message_id: Union[str, uuid.UUID],
+    ) -> bool:
+        """Delete one uncommitted chat row while preserving branch links."""
+        session_uuid = (
+            uuid.UUID(session_id) if isinstance(session_id, str) else session_id
+        )
+        message_uuid = (
+            uuid.UUID(message_id) if isinstance(message_id, str) else message_id
+        )
+        async with await get_db_session() as session:
+            conversation = await session.scalar(
+                select(ConversationSession)
+                .where(ConversationSession.id == session_uuid)
+                .with_for_update()
+            )
+            if conversation is None:
+                return False
+            message = await session.scalar(
+                select(ConversationMessage)
+                .where(
+                    ConversationMessage.id == message_uuid,
+                    ConversationMessage.session_id == session_uuid,
+                )
+                .with_for_update()
+            )
+            if message is None:
+                return False
+
+            await session.execute(
+                update(ConversationMessage)
+                .where(
+                    ConversationMessage.session_id == session_uuid,
+                    ConversationMessage.parent_message_id == message_uuid,
+                )
+                .values(parent_message_id=message.parent_message_id)
+            )
+            await session.delete(message)
+            await session.flush()
+            remaining_count = await session.scalar(
+                select(func.count()).where(
+                    ConversationMessage.session_id == session_uuid,
+                    ConversationMessage.deleted_at.is_(None),
+                )
+            )
+            conversation.message_count = int(remaining_count or 0)
+            latest_message = await self._latest_active_message(session, session_uuid)
+            conversation.development_status = (
+                "working"
+                if latest_message is not None and latest_message.role == "user"
+                else (
+                    "waiting_for_user"
+                    if latest_message is not None
+                    and latest_message.role == "assistant"
+                    else None
+                )
+            )
+            await session.commit()
+            return True
+
+    async def update_message_metadata(
+        self,
+        session_id: Union[str, uuid.UUID],
+        message_id: Union[str, uuid.UUID],
+        updates: Dict[str, Any],
+    ) -> bool:
+        """Merge durable receipt fields into one conversation message."""
+        session_uuid = (
+            uuid.UUID(session_id) if isinstance(session_id, str) else session_id
+        )
+        message_uuid = (
+            uuid.UUID(message_id) if isinstance(message_id, str) else message_id
+        )
+        async with await get_db_session() as session:
+            message = await session.scalar(
+                select(ConversationMessage)
+                .where(
+                    ConversationMessage.id == message_uuid,
+                    ConversationMessage.session_id == session_uuid,
+                )
+                .with_for_update()
+            )
+            if message is None:
+                return False
+            message.message_metadata = {
+                **(message.message_metadata or {}),
+                **dict(updates or {}),
+            }
+            await session.commit()
+            return True
 
     async def get_recent_messages(self, session_id: Union[str, uuid.UUID], count: int) -> List[ConversationMessage]:
         """Get recent messages from a session
@@ -475,7 +689,7 @@ class ConversationRepository:
             await session.execute(
                 update(ConversationSession)
                 .where(ConversationSession.id == session_id)
-                .values(message_count=len(keep_ids), last_activity=datetime.utcnow())
+                .values(message_count=len(keep_ids))
             )
             await session.commit()
 
@@ -533,13 +747,134 @@ class ConversationRepository:
             await session.execute(
                 update(ConversationSession)
                 .where(ConversationSession.id == session_uuid)
-                .values(message_count=len(remaining.all()), last_activity=datetime.utcnow())
+                .values(message_count=len(remaining.all()))
             )
             await session.commit()
             return int(result.rowcount or 0)
-    
+
+    async def apply_summary_checkpoint(
+        self,
+        session_id: Union[str, uuid.UUID],
+        message_ids: List[Union[str, uuid.UUID]],
+        summary: str,
+        start_time: datetime,
+        end_time: datetime,
+        metadata: Optional[Dict[str, Any]] = None,
+        expected_previous_summary: Optional[str] = None,
+    ) -> Optional[Tuple[ConversationArchive, int]]:
+        """Atomically archive, delete, and replace a session summary.
+
+        The session and snapshotted message rows are locked before validation.
+        If the active branch changed or any write fails, no part of the
+        checkpoint is committed.
+        """
+        if not message_ids or not str(summary or "").strip():
+            return None
+
+        session_uuid = (
+            uuid.UUID(str(session_id)) if isinstance(session_id, str) else session_id
+        )
+        ids = [
+            uuid.UUID(str(message_id)) if isinstance(message_id, str) else message_id
+            for message_id in message_ids
+        ]
+        if len(set(ids)) != len(ids):
+            return None
+
+        async with await get_db_session() as session:
+            try:
+                session_result = await session.execute(
+                    select(ConversationSession)
+                    .where(ConversationSession.id == session_uuid)
+                    .with_for_update()
+                )
+                conversation = session_result.scalar_one_or_none()
+                if conversation is None:
+                    return None
+                if (
+                    expected_previous_summary is not None
+                    and str(conversation.current_summary or "").strip()
+                    != str(expected_previous_summary or "").strip()
+                ):
+                    return None
+
+                message_result = await session.execute(
+                    select(ConversationMessage)
+                    .where(
+                        ConversationMessage.session_id == session_uuid,
+                        ConversationMessage.is_active_branch == True,
+                        ConversationMessage.id.in_(ids),
+                    )
+                    .with_for_update()
+                )
+                snapshotted_messages = list(message_result.scalars().all())
+                if {message.id for message in snapshotted_messages} != set(ids):
+                    return None
+
+                now = datetime.utcnow()
+                if (
+                    str(conversation.current_summary or "").strip()
+                    and str(conversation.current_summary or "").strip()
+                    != str(summary).strip()
+                ):
+                    await self._archive_current_summary_generation(
+                        session,
+                        conversation,
+                        now,
+                    )
+
+                archive_metadata = dict(metadata or {})
+                archive_metadata["archive_type"] = "summary_checkpoint"
+                archive = ConversationArchive(
+                    user_id=conversation.user_id,
+                    character_name=conversation.character_name,
+                    original_session_id=str(conversation.id),
+                    summary=str(summary).strip(),
+                    message_count=len(ids),
+                    start_time=start_time,
+                    end_time=end_time,
+                    message_metadata=archive_metadata,
+                )
+                session.add(archive)
+                await session.flush()
+
+                await session.execute(
+                    update(ConversationMessage)
+                    .where(
+                        ConversationMessage.session_id == session_uuid,
+                        ~ConversationMessage.id.in_(ids),
+                        ConversationMessage.parent_message_id.in_(ids),
+                    )
+                    .values(parent_message_id=None, branch_index=0)
+                )
+                delete_result = await session.execute(
+                    delete(ConversationMessage).where(
+                        ConversationMessage.session_id == session_uuid,
+                        ConversationMessage.is_active_branch == True,
+                        ConversationMessage.id.in_(ids),
+                    )
+                )
+                deleted_count = int(delete_result.rowcount or 0)
+                if deleted_count != len(ids):
+                    await session.rollback()
+                    return None
+
+                remaining_result = await session.execute(
+                    select(func.count()).where(
+                        ConversationMessage.session_id == session_uuid,
+                        ConversationMessage.deleted_at.is_(None),
+                    )
+                )
+                conversation.message_count = int(remaining_result.scalar() or 0)
+                conversation.current_summary = str(summary).strip()
+                await session.commit()
+                return archive, deleted_count
+            except Exception:
+                await session.rollback()
+                raise
+
     async def create_archive(self, user_id: str, character_name: str, original_session_id: Union[str, uuid.UUID],
-                           summary: str, message_count: int, start_time: datetime, 
+                           summary: str, message_count: int, start_time: datetime,
                            end_time: datetime, metadata: Optional[Dict[str, Any]] = None) -> ConversationArchive:
         """Create conversation archive
         

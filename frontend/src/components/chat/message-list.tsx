@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useMemo, useState, useCallback } from "react";
+import { memo, useEffect, useRef, useMemo, useState, useCallback } from "react";
 import {
   Pencil,
   Check,
@@ -14,16 +14,16 @@ import {
   FileText,
   Image as ImageIcon,
   AlertTriangle,
-  Download,
   ExternalLink,
-  Package,
   Search,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  GitFork,
+  MessageSquareText,
+  Bot,
 } from "lucide-react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { MarkdownContent as SharedMarkdownContent } from "@/components/ui/markdown-content";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -39,6 +39,11 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { AgentRunTimeline } from "@/components/chat/agent-run-timeline";
+import { AgentResourceMutationList } from "@/components/chat/agent-resource-mutation-list";
+import {
+  ChatMessageHistoryRail,
+  getChatMessageDomId,
+} from "@/components/chat/chat-message-history-rail";
 import type {
   ChatAttachmentMetadata,
   ChatGenerationMetrics,
@@ -63,63 +68,51 @@ import Link from "next/link";
 
 const AUTO_SCROLL_BOTTOM_THRESHOLD_PX = 96;
 
-function generatedImageSrc(imagePath: string): string {
-  if (!imagePath) return "";
-  if (/^https?:\/\//i.test(imagePath) || imagePath.startsWith("/api/")) {
-    return imagePath;
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function generatedImageSrc(imageRef: string): string {
+  if (!imageRef) return "";
+  if (/^https?:\/\//i.test(imageRef) || imageRef.startsWith("/api/")) {
+    return imageRef;
   }
-  return `/api/python-proxy/filer/image-thumbnail?path=${encodeURIComponent(imagePath)}&size=1024`;
+  if (UUID_RE.test(imageRef)) {
+    return `/api/python-proxy/api/generated-media/${imageRef}`;
+  }
+  return "";
 }
 
-function isAppFactoryDownloadLink(href?: string): boolean {
-  return Boolean(
-    href?.includes("/api/app-factory/artifacts/") && href.includes("/download"),
+function isDocsLink(href?: string): boolean {
+  return /^\/docs\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    href ?? "",
   );
 }
 
-type AppFactoryDownloadLink = {
-  artifactId: string;
-  title: string;
-  downloadHref: string;
-  previewHref?: string;
-};
-
-function extractAppFactoryDownloadLinks(content: string): AppFactoryDownloadLink[] {
-  const downloadPattern =
-    /\[([^\]]+)\]\(((?:\/api\/python-proxy)?\/api\/app-factory\/artifacts\/([A-Za-z0-9_.-]+)\/download)\)/g;
-  const previewPattern =
-    /\[[^\]]+\]\(((?:\/api\/python-proxy)?\/api\/app-factory\/artifacts\/([A-Za-z0-9_.-]+)\/preview)\)/g;
-  const previewById = new Map<string, string>();
-  const linksById = new Map<string, AppFactoryDownloadLink>();
-
-  for (const match of content.matchAll(previewPattern)) {
-    previewById.set(match[2], match[1]);
-  }
-
-  for (const match of content.matchAll(downloadPattern)) {
-    const title = match[1].replace(/[`*_]/g, "").trim() || "app-factory.zip";
-    const artifactId = match[3];
-    if (!linksById.has(artifactId)) {
-      linksById.set(artifactId, {
-        artifactId,
-        title,
-        downloadHref: match[2],
-        previewHref: previewById.get(artifactId),
-      });
-    }
-  }
-
-  return Array.from(linksById.values());
-}
-
-/** @[[type:id:name]] パターンをリンクに変換して表示 */
+/** @mention と canonical Docs参照をリンクに変換して表示 */
 function MentionText({ text }: { text: string }) {
-  const parts = text.split(/(@\[\[[^\]]+\]\])/g);
+  const parts = text.split(
+    /(@\[\[[^\]]+\]\]|\[\[node:[0-9a-f-]{36}\|[^\]]+\]\])/gi,
+  );
   return (
     <>
       {parts.map((part, i) => {
+        const docsMatch = part.match(
+          /^\[\[node:([0-9a-f-]{36})\|([^\]]+)\]\]$/i,
+        );
+        if (docsMatch) {
+          const [, id, name] = docsMatch;
+          return (
+            <Link
+              key={i}
+              href={`/docs/${id}`}
+              className="inline-flex items-center gap-0.5 rounded bg-mention-docs/15 px-1 text-mention-docs underline"
+            >
+              {name}
+            </Link>
+          );
+        }
         const match = part.match(
-          /^@\[\[(file|task|project):([^:]+):([^\]]+)\]\]$/,
+          /^@\[\[(file|task|project|app|docs|chat_session):([^:]+):([^\]]+)\]\]$/,
         );
         if (!match) return <span key={i}>{part}</span>;
         const [, type, id, name] = match;
@@ -128,7 +121,7 @@ function MentionText({ text }: { text: string }) {
             <Link
               key={i}
               href={`/filer?open=${encodeURIComponent(id)}`}
-              className="inline-flex items-center gap-0.5 rounded bg-primary/20 px-1 text-primary-foreground underline"
+              className="inline-flex items-center gap-0.5 rounded bg-mention-file/15 px-1 text-mention-file underline"
             >
               @{name}
             </Link>
@@ -139,7 +132,7 @@ function MentionText({ text }: { text: string }) {
             <Link
               key={i}
               href={`/tasks/${id}`}
-              className="inline-flex items-center gap-0.5 rounded bg-green-500/20 px-1 text-primary-foreground underline"
+              className="inline-flex items-center gap-0.5 rounded bg-mention-task/15 px-1 text-mention-task underline"
             >
               @{name}
             </Link>
@@ -149,10 +142,43 @@ function MentionText({ text }: { text: string }) {
           return (
             <span
               key={i}
-              className="inline-flex items-center gap-0.5 rounded bg-purple-500/20 px-1 text-xs font-medium"
+              className="inline-flex items-center gap-0.5 rounded bg-mention-project/15 px-1 text-xs font-medium text-mention-project"
             >
               @{name}
             </span>
+          );
+        }
+        if (type === "app") {
+          return (
+            <Link
+              key={i}
+              href={`/apps/${id}`}
+              className="inline-flex items-center gap-0.5 rounded bg-mention-app/15 px-1 text-xs font-medium text-mention-app underline"
+            >
+              @{name}
+            </Link>
+          );
+        }
+        if (type === "docs") {
+          return (
+            <Link
+              key={i}
+              href={`/docs/${id}`}
+              className="inline-flex items-center gap-0.5 rounded bg-mention-docs/15 px-1 text-xs font-medium text-mention-docs underline"
+            >
+              @{name}
+            </Link>
+          );
+        }
+        if (type === "chat_session") {
+          return (
+            <Link
+              key={i}
+              href={`/chat?s=${encodeURIComponent(id)}`}
+              className="inline-flex items-center gap-0.5 rounded bg-mention-chat/15 px-1 text-xs font-medium text-mention-chat underline"
+            >
+              @{name}
+            </Link>
           );
         }
         return <span key={i}>{part}</span>;
@@ -171,7 +197,17 @@ type MessageListProps = {
   activeTool?: string | null;
   activityMessage?: string | null;
   activeAgentRunId?: string | null;
+  generationKey?: string | null;
+  generationStartedAt?: string | null;
+  showGenerationActivity?: boolean;
+  onTaskClick?: (taskId: string) => void;
   onEditMessage?: (messageId: string, newContent: string) => void;
+  onForkMessage?: (message: ConversationMessage) => void | Promise<void>;
+  onForkStoryMessage?: (message: ConversationMessage) => void | Promise<void>;
+  onSwitchBranch?: (
+    message: ConversationMessage,
+    targetBranchIndex: number,
+  ) => void | Promise<void>;
   onRerunMessage?: (
     message: ConversationMessage,
     responseModel?: ChatResponseModelSelection,
@@ -194,6 +230,13 @@ function getCharacterColor(name: string): string {
     hash = name.charCodeAt(i) + ((hash << 5) - hash);
   const hue = Math.abs(hash % 360);
   return `hsl(${hue}, 70%, 60%)`;
+}
+
+function formatMessageTime(value?: string | null): string | null {
+  if (!value) return null;
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) return null;
+  return timestamp.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
 
 function getMessageAttachments(
@@ -493,6 +536,11 @@ function MessageAttachments({
                   : [kindLabel, sizeLabel].filter(Boolean).join(" / ") ||
                     "添付"}
               </span>
+              {attachment.upload_failed && attachment.error ? (
+                <span className="block max-w-[260px] truncate text-xs text-destructive">
+                  {attachment.error}
+                </span>
+              ) : null}
             </span>
           </>
         );
@@ -539,73 +587,24 @@ function ToolIndicator({ toolName }: { toolName: string }) {
   );
 }
 
-/** [GENERATED_IMAGE:path] タグを画像として表示し、残りをMarkdownで描画 */
-function AppFactoryArtifactCards({
-  links,
+const MessageContent = memo(function MessageContent({
+  content,
 }: {
-  links: AppFactoryDownloadLink[];
+  content: string;
 }) {
-  if (links.length === 0) return null;
-
-  return (
-    <div className="mt-2 space-y-2">
-      {links.map((link) => (
-        <div
-          key={link.artifactId}
-          className="flex max-w-full flex-wrap items-center gap-2 rounded-md border border-border bg-muted/60 p-2"
-        >
-          <span className="flex size-9 shrink-0 items-center justify-center rounded bg-background text-muted-foreground">
-            <Package className="size-4" />
-          </span>
-          <span className="min-w-0 flex-1">
-            <span className="block truncate text-xs font-semibold">
-              {link.title}
-            </span>
-            <span className="block truncate text-[11px] text-muted-foreground">
-              {link.artifactId}
-            </span>
-          </span>
-          <span className="flex shrink-0 items-center gap-1">
-            <a
-              href={link.downloadHref}
-              download
-              className="inline-flex h-8 items-center gap-1 rounded-md border border-border bg-background px-2 text-xs font-medium hover:bg-accent hover:text-accent-foreground"
-            >
-              <Download className="size-3.5" />
-              ZIP
-            </a>
-            {link.previewHref && (
-              <a
-                href={link.previewHref}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex h-8 items-center gap-1 rounded-md border border-border bg-background px-2 text-xs font-medium hover:bg-accent hover:text-accent-foreground"
-              >
-                <ExternalLink className="size-3.5" />
-                Preview
-              </a>
-            )}
-          </span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function MessageContent({ content }: { content: string }) {
   const visibleContent = content
     .replace(/\[SCENE_DESCRIPTION:[\s\S]*?\]/g, "")
     .replace(/\[IMAGE_TRIGGER:[\s\S]*?\]/g, "")
     .trim();
-  const artifactLinks = extractAppFactoryDownloadLinks(visibleContent);
   const parts = visibleContent.split(/(\[GENERATED_IMAGE:[^\]]+\])/g);
   return (
     <>
       {parts.map((part, i) => {
         const imgMatch = part.match(/^\[GENERATED_IMAGE:(.+)\]$/);
         if (imgMatch) {
-          const fullPath = imgMatch[1];
-          const imageSrc = generatedImageSrc(fullPath);
+          const imageRef = imgMatch[1];
+          const imageSrc = generatedImageSrc(imageRef);
+          if (!imageSrc) return null;
           return (
             // eslint-disable-next-line @next/next/no-img-element
             <img
@@ -620,115 +619,42 @@ function MessageContent({ content }: { content: string }) {
         if (!part.trim()) return null;
         return <MarkdownContent key={i} content={part} />;
       })}
-      <AppFactoryArtifactCards links={artifactLinks} />
     </>
   );
-}
+});
 
-/** マークダウンレンダリング */
+/** Markdownを安全な外部リンクとして描画する */
 function MarkdownContent({ content }: { content: string }) {
   return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
+    <SharedMarkdownContent
+      content={content}
       components={{
-        pre: ({ children }) => (
-          <pre className="my-2 max-w-full overflow-x-auto rounded-md bg-black/20 p-3 text-sm">
-            {children}
-          </pre>
-        ),
-        code: ({ className, children, ...props }) => {
-          const isInline = !className;
-          if (isInline) {
+        a: ({ href, children }) => {
+          const docsLink = isDocsLink(href);
+          if (docsLink) {
             return (
-              <code
-                className="max-w-full rounded bg-black/20 px-1.5 py-0.5 text-sm [overflow-wrap:anywhere]"
-                {...props}
+              <Link
+                href={href ?? "/docs"}
+                className="my-1 inline-flex h-8 items-center gap-1.5 rounded-md border border-mention-docs/40 bg-mention-docs/15 px-3 text-xs font-medium text-mention-docs no-underline transition-colors hover:bg-mention-docs/25"
               >
-                {children}
-              </code>
+                <FileText className="size-3.5" />
+                Docsで開く
+              </Link>
             );
           }
           return (
-          <code className={cn("max-w-full", className)} {...props}>
-            {children}
-          </code>
-        );
-        },
-        p: ({ children }) => (
-          <p className="mb-2 max-w-full [overflow-wrap:anywhere] last:mb-0">
-            {children}
-          </p>
-        ),
-        ul: ({ children }) => (
-          <ul className="mb-2 ml-4 list-disc space-y-1 last:mb-0">
-            {children}
-          </ul>
-        ),
-        ol: ({ children }) => (
-          <ol className="mb-2 ml-4 list-decimal space-y-1 last:mb-0">
-            {children}
-          </ol>
-        ),
-        li: ({ children }) => <li className="text-sm">{children}</li>,
-        h1: ({ children }) => (
-          <h1 className="mb-2 text-lg font-bold">{children}</h1>
-        ),
-        h2: ({ children }) => (
-          <h2 className="mb-2 text-base font-bold">{children}</h2>
-        ),
-        h3: ({ children }) => (
-          <h3 className="mb-1 text-sm font-bold">{children}</h3>
-        ),
-        strong: ({ children }) => (
-          <strong className="font-bold">{children}</strong>
-        ),
-        em: ({ children }) => (
-          <em
-            className="italic text-muted-foreground/80 not-italic"
-            style={{ fontStyle: "italic" }}
-          >
-            {children}
-          </em>
-        ),
-        blockquote: ({ children }) => (
-          <blockquote className="my-2 border-l-2 border-muted-foreground/30 pl-3 italic">
-            {children}
-          </blockquote>
-        ),
-        table: ({ children }) => (
-          <div className="my-2 max-w-full overflow-x-auto">
-            <table className="min-w-full border-collapse text-sm">
-              {children}
-            </table>
-          </div>
-        ),
-        th: ({ children }) => (
-          <th className="border border-border bg-muted px-3 py-1.5 text-left font-semibold">
-            {children}
-          </th>
-        ),
-        td: ({ children }) => (
-          <td className="border border-border px-3 py-1.5">{children}</td>
-        ),
-        a: ({ href, children }) => {
-          const isDownloadLink = isAppFactoryDownloadLink(href);
-          return (
             <a
               href={href}
-              target={isDownloadLink ? undefined : "_blank"}
-              rel={isDownloadLink ? undefined : "noopener noreferrer"}
-              download={isDownloadLink ? true : undefined}
+              target="_blank"
+              rel="noopener noreferrer"
               className="text-primary underline [overflow-wrap:anywhere] hover:text-primary/80"
             >
               {children}
             </a>
           );
         },
-        hr: () => <hr className="my-3 border-border" />,
       }}
-    >
-      {content}
-    </ReactMarkdown>
+    />
   );
 }
 
@@ -749,11 +675,13 @@ function BranchNav({
   total,
   onPrev,
   onNext,
+  disabled = false,
 }: {
   current: number;
   total: number;
   onPrev: () => void;
   onNext: () => void;
+  disabled?: boolean;
 }) {
   return (
     <div className="mt-1 flex items-center gap-1 text-xs text-muted-foreground">
@@ -761,7 +689,8 @@ function BranchNav({
         variant="ghost"
         size="icon-xs"
         onClick={onPrev}
-        disabled={current <= 1}
+        disabled={disabled || current <= 1}
+        aria-label="前の分岐"
       >
         <ChevronLeft className="size-3" />
       </Button>
@@ -772,12 +701,45 @@ function BranchNav({
         variant="ghost"
         size="icon-xs"
         onClick={onNext}
-        disabled={current >= total}
+        disabled={disabled || current >= total}
+        aria-label="次の分岐"
       >
         <ChevronRight className="size-3" />
       </Button>
     </div>
   );
+}
+
+type BranchNavigationState = {
+  index: number;
+  current: number;
+  total: number;
+};
+
+/**
+ * Branch metadata is projected by the server.  Do not infer the number of
+ * branches from the rows currently present in the active-path cache: inactive
+ * siblings are intentionally not loaded by the Web client.
+ */
+function getBranchNavigationState(
+  message: ConversationMessage,
+): BranchNavigationState | null {
+  const branchCount = message.branch_count;
+  const total =
+    typeof branchCount === "number" &&
+    Number.isInteger(branchCount) &&
+    branchCount > 1
+      ? branchCount
+      : 1;
+  if (total <= 1) return null;
+
+  const branchIndex = message.branch_index;
+  const index =
+    typeof branchIndex === "number" && Number.isInteger(branchIndex)
+      ? Math.max(0, Math.min(branchIndex, total - 1))
+      : 0;
+
+  return { index, current: index + 1, total };
 }
 
 export function MessageList({
@@ -790,7 +752,14 @@ export function MessageList({
   activeTool,
   activityMessage,
   activeAgentRunId,
+  generationKey,
+  generationStartedAt,
+  showGenerationActivity = false,
+  onTaskClick,
   onEditMessage,
+  onForkMessage,
+  onForkStoryMessage,
+  onSwitchBranch,
   onRerunMessage,
   responseModelOptions = [],
   responseModelOptionsLoading = false,
@@ -809,12 +778,43 @@ export function MessageList({
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [savingDocsId, setSavingDocsId] = useState<string | null>(null);
   const [savedDocsId, setSavedDocsId] = useState<string | null>(null);
+  const [branchSwitchingMessageId, setBranchSwitchingMessageId] = useState<
+    string | null
+  >(null);
+  // State updates are batched by React.  Keep a ref as the synchronous guard
+  // so two rapid clicks cannot enqueue competing switch requests.
+  const branchSwitchingMessageIdRef = useRef<string | null>(null);
+
+  const resizeEditTextareaFallback = useCallback(
+    (textarea: HTMLTextAreaElement) => {
+      if (
+        typeof CSS !== "undefined" &&
+        CSS.supports?.("field-sizing", "content")
+      ) {
+        textarea.style.height = "";
+        return;
+      }
+
+      textarea.style.height = "auto";
+      const maxHeight = window.innerHeight * 0.6;
+      textarea.style.height = `${Math.max(
+        160,
+        Math.min(textarea.scrollHeight, maxHeight),
+      )}px`;
+    },
+    [],
+  );
 
   const startEditing = useCallback((msg: ConversationMessage) => {
     setEditingId(msg.id);
     setEditContent(msg.content);
-    setTimeout(() => editTextareaRef.current?.focus(), 50);
-  }, []);
+    setTimeout(() => {
+      const textarea = editTextareaRef.current;
+      if (!textarea) return;
+      resizeEditTextareaFallback(textarea);
+      textarea.focus();
+    }, 50);
+  }, [resizeEditTextareaFallback]);
 
   const cancelEditing = useCallback(() => {
     setEditingId(null);
@@ -911,6 +911,48 @@ export function MessageList({
     }
   }, [savingDocsId]);
 
+  const switchBranch = useCallback(
+    async (message: ConversationMessage, targetBranchIndex: number) => {
+      if (!onSwitchBranch) return;
+      if (isStreaming || isWaitingResponse || showGenerationActivity) return;
+      if (branchSwitchingMessageIdRef.current !== null) return;
+
+      const navigation = getBranchNavigationState(message);
+      if (!navigation) return;
+      if (
+        !Number.isInteger(targetBranchIndex) ||
+        targetBranchIndex < 0 ||
+        targetBranchIndex >= navigation.total ||
+        targetBranchIndex === navigation.index
+      ) {
+        return;
+      }
+
+      branchSwitchingMessageIdRef.current = message.id;
+      setBranchSwitchingMessageId(message.id);
+      try {
+        const switchResult = onSwitchBranch(message, targetBranchIndex);
+        // A synchronous callback has completed once it returns.  Await only
+        // an actual thenable so the pending guard covers network requests
+        // without unnecessarily swallowing a second click for void callers.
+        if (switchResult && typeof switchResult.then === "function") {
+          await switchResult;
+        }
+      } finally {
+        if (branchSwitchingMessageIdRef.current === message.id) {
+          branchSwitchingMessageIdRef.current = null;
+          setBranchSwitchingMessageId(null);
+        }
+      }
+    },
+    [
+      isStreaming,
+      isWaitingResponse,
+      onSwitchBranch,
+      showGenerationActivity,
+    ],
+  );
+
   const actionButtonClass =
     "h-7 w-7 p-0 text-muted-foreground hover:text-foreground";
 
@@ -951,6 +993,43 @@ export function MessageList({
           >
             <Pencil className="size-3.5" />
           </Button>
+        )}
+        {isPersisted && onForkMessage && !onForkStoryMessage && (
+          <Button
+            variant="ghost"
+            size="icon"
+            className={actionButtonClass}
+            onClick={() => void onForkMessage(msg)}
+            title="ここから別の会話へフォーク"
+          >
+            <GitFork className="size-3.5" />
+          </Button>
+        )}
+        {isPersisted && onForkMessage && onForkStoryMessage && (
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className={actionButtonClass}
+                  title="フォーク"
+                />
+              }
+            >
+              <GitFork className="size-3.5" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start">
+              <DropdownMenuItem onClick={() => void onForkMessage(msg)}>
+                <MessageSquareText className="size-3.5" />
+                チャットだけをフォーク
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => void onForkStoryMessage(msg)}>
+                <GitFork className="size-3.5" />
+                物語とチャットをフォーク
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         )}
         {canRerun && (
           <Button
@@ -1022,6 +1101,8 @@ export function MessageList({
       saveMessageToDocs,
       savingDocsId,
       onEditMessage,
+      onForkMessage,
+      onForkStoryMessage,
       onRerunMessage,
       openFeedback,
       responseModelOptions,
@@ -1030,60 +1111,79 @@ export function MessageList({
     ],
   );
 
-  // ブランチ選択状態: parentId → 表示中のbranchIndex
-  const [branchSelections, setBranchSelections] = useState<
-    Record<string, number>
-  >({});
-
-  // ブランチ情報を計算
+  // Inactive siblings are normally removed by the active-path message cache.
+  // Keep a small in-memory grouping guard for optimistic/transition states,
+  // but never use it to determine branch counts or the selected branch.
   const branchInfo = useMemo(() => {
     const groups: Record<string, ConversationMessage[]> = {};
     for (const msg of messages) {
-      const parentKey = msg.parent_message_id || "__root__";
-      if (!groups[parentKey]) groups[parentKey] = [];
-      groups[parentKey].push(msg);
+      const groupKey = msg.parent_message_id
+        ? `parent:${msg.parent_message_id}`
+        : `root:${msg.role}`;
+      if (!groups[groupKey]) groups[groupKey] = [];
+      groups[groupKey].push(msg);
     }
     return groups;
   }, [messages]);
 
-  // 表示するメッセージをフィルタリング（ブランチ考慮）
+  // 表示するメッセージをフィルタリング（active branch考慮）
   const visibleMessages = useMemo(() => {
     const result: ConversationMessage[] = [];
     const seen = new Set<string>();
 
     for (const msg of messages) {
-      const parentKey = msg.parent_message_id || "__root__";
-      const siblings = branchInfo[parentKey];
+      // A null parent is also used by legacy/optimistic linear rows.  Root
+      // branch metadata is server-authoritative, so never collapse those
+      // rows based on local array membership.
+      const groupKey = msg.parent_message_id
+        ? `parent:${msg.parent_message_id}`
+        : null;
+      const siblings = groupKey ? branchInfo[groupKey] : undefined;
 
-      if (parentKey === "__root__" || !siblings || siblings.length <= 1) {
-        if (!seen.has(msg.id)) {
-          result.push(msg);
-          seen.add(msg.id);
-        }
-      } else {
-        if (seen.has(parentKey + "__branch__")) continue;
-        seen.add(parentKey + "__branch__");
-
-        const selectedIndex =
-          branchSelections[parentKey] ??
-          siblings.findIndex((s) => s.is_active_branch);
-        const idx = selectedIndex >= 0 ? selectedIndex : 0;
-        const selected = siblings[idx];
+      if (groupKey && siblings && siblings.length > 1) {
+        if (seen.has(groupKey)) continue;
+        seen.add(groupKey);
+        const selected = siblings.find(
+          (sibling) => sibling.is_active_branch !== false,
+        );
         if (selected && !seen.has(selected.id)) {
           result.push(selected);
           seen.add(selected.id);
         }
+        continue;
+      }
+
+      if (!seen.has(msg.id) && msg.is_active_branch !== false) {
+        result.push(msg);
+        seen.add(msg.id);
       }
     }
     return result;
-  }, [messages, branchInfo, branchSelections]);
+  }, [messages, branchInfo]);
+  const previousUserInputByMessageId = useMemo(() => {
+    const result = new Map<string, string>();
+    let previousUserInput = "";
+
+    for (const message of visibleMessages) {
+      if (message.role === "user") {
+        previousUserInput = message.content || "";
+      } else if (message.role === "assistant") {
+        result.set(message.id, previousUserInput);
+      }
+    }
+
+    return result;
+  }, [visibleMessages]);
   const visibleMessageIds = useMemo(
     () => visibleMessages.map((message) => message.id),
     [visibleMessages],
   );
 
   const showEmptyState =
-    visibleMessages.length === 0 && !isStreaming && !isWaitingResponse;
+    visibleMessages.length === 0 &&
+    !isStreaming &&
+    !isWaitingResponse &&
+    !showGenerationActivity;
 
   const updatePinnedToBottom = useCallback(() => {
     const scrollContainer = scrollContainerRef.current;
@@ -1166,40 +1266,41 @@ export function MessageList({
     activeTool,
     activityMessage,
     activeAgentRunId,
+    showGenerationActivity,
     scrollToBottom,
   ]);
 
   return (
-    <div
-      ref={scrollContainerRef}
-      data-testid="chat-message-list"
-      className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
-      onScroll={updatePinnedToBottom}
-    >
-      <div className="mx-auto flex max-w-3xl flex-col gap-4 p-4 transition-transform duration-200 ease-linear xl:translate-x-[var(--chat-viewport-offset)]">
+    <div className="chat-message-history-container relative min-h-0 flex-1">
+      <div
+        ref={scrollContainerRef}
+        data-testid="chat-message-list"
+        className="h-full min-h-0 w-full overflow-y-auto overscroll-contain"
+        onScroll={updatePinnedToBottom}
+      >
+        <div className="chat-viewport-center mx-auto flex w-full max-w-5xl flex-col gap-6 px-6 py-6">
         {showEmptyState && (
           <div className="flex justify-center py-20">
-            <div className="max-w-md rounded-2xl border border-border bg-card px-6 py-5 text-center text-sm text-muted-foreground">
+            <div className="max-w-md rounded-md border border-border-subtle bg-surface-container-low px-6 py-5 text-center text-sm text-text-secondary">
               {emptyMessage}
             </div>
           </div>
         )}
 
-        {visibleMessages.map((msg, index) => {
-          const parentKey = msg.parent_message_id || "__root__";
-          const siblings = branchInfo[parentKey];
-          // __root__グループはブランチではない（parent_message_idがnullの独立メッセージ群）
-          const hasBranch =
-            parentKey !== "__root__" && siblings && siblings.length > 1;
-          const currentBranchIdx = hasBranch
-            ? siblings.findIndex((s) => s.id === msg.id) + 1
-            : 0;
-          const totalBranches = hasBranch ? siblings.length : 0;
+        {visibleMessages.map((msg) => {
+          const branchNavigation = getBranchNavigationState(msg);
+          const branchNavDisabled =
+            branchSwitchingMessageId !== null ||
+            isStreaming ||
+            Boolean(isWaitingResponse) ||
+            showGenerationActivity ||
+            !onSwitchBranch;
 
           if (msg.role === "system") {
             return (
               <div
                 key={msg.id}
+                id={getChatMessageDomId(msg.id)}
                 data-chat-message-id={msg.id}
                 className="py-2 text-center text-xs text-muted-foreground"
               >
@@ -1212,20 +1313,40 @@ export function MessageList({
             const isEditing = editingId === msg.id;
             const attachments = getMessageAttachments(msg);
             const senderLabel = msg.sender_display_name;
+            const isImmediateInterrupt =
+              msg.metadata?.delivery_mode === "immediate_interrupt";
+            const interruptStatus = msg.metadata?.delivery_status;
+            const interruptReceiptStatus =
+              msg.metadata?.interrupt_receipt_status;
+            const interruptLabel =
+              interruptStatus === "failed"
+                ? "割り込み失敗"
+                : interruptReceiptStatus === "pending" &&
+                    interruptStatus !== "sending"
+                  ? "割り込み結果不明"
+                : interruptStatus === "sending"
+                  ? "割り込み送信中"
+                  : "即時割り込み";
             const commandCapabilities =
               commandCapabilitiesFromMessageMetadata(msg.metadata);
+            const messageTime = formatMessageTime(msg.created_at);
             return (
               <div
                 key={msg.id}
+                id={getChatMessageDomId(msg.id)}
                 data-chat-message-id={msg.id}
-                className="group/msg flex flex-col items-end gap-1"
+                className="group/msg flex min-w-0 flex-col items-end gap-1"
               >
                 {isEditing ? (
-                  <div className="flex max-w-[80%] flex-col gap-2">
-                    <textarea
+                  <div className="flex min-w-0 w-full max-w-[80%] flex-col gap-2">
+                    <Textarea
                       ref={editTextareaRef}
+                      aria-label="メッセージ本文を編集"
                       value={editContent}
-                      onChange={(e) => setEditContent(e.target.value)}
+                      onChange={(e) => {
+                        setEditContent(e.target.value);
+                        resizeEditTextareaFallback(e.currentTarget);
+                      }}
                       onKeyDown={(e) => {
                         if (e.key === "Enter" && !e.shiftKey) {
                           e.preventDefault();
@@ -1233,8 +1354,7 @@ export function MessageList({
                         }
                         if (e.key === "Escape") cancelEditing();
                       }}
-                      className="w-full resize-none rounded-xl border border-input bg-card px-3 py-2 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                      rows={Math.min(editContent.split("\n").length + 1, 6)}
+                      className="min-h-40 max-h-[60vh] resize-y overflow-y-auto rounded-xl px-3 py-2"
                     />
                     <div className="flex justify-end gap-1.5">
                       <Button variant="ghost" size="sm" onClick={cancelEditing}>
@@ -1252,15 +1372,26 @@ export function MessageList({
                     </div>
                   </div>
                 ) : (
-                  <div className="flex max-w-[80%] flex-col items-end gap-1">
-                    {senderLabel && (
-                      <span className="text-xs font-medium text-muted-foreground">
-                        {senderLabel}
+                  <div className="flex min-w-0 max-w-[80%] flex-col items-end gap-1">
+                    <span className="text-[11px] font-medium text-text-secondary">
+                      {senderLabel || "You"}
+                      {messageTime && <span className="ml-2 font-normal">{messageTime}</span>}
+                    </span>
+                    {isImmediateInterrupt && (
+                      <span
+                        className={cn(
+                          "rounded-full border px-2 py-0.5 text-[10px] font-medium",
+                          interruptStatus === "failed"
+                            ? "border-destructive/50 bg-destructive/10 text-destructive"
+                            : "border-primary/30 bg-primary/10 text-primary",
+                        )}
+                      >
+                        {interruptLabel}
                       </span>
                     )}
                     <CommandCapabilityChips capabilities={commandCapabilities} />
                     {msg.content.trim() && (
-                      <div className="rounded-2xl rounded-br-md bg-primary px-4 py-2.5 text-sm text-primary-foreground shadow-[0_14px_34px_-28px_rgba(5,87,115,0.9)] whitespace-pre-wrap">
+                      <div className="min-w-0 max-w-full rounded-md rounded-br-sm border border-border-subtle bg-surface-container-low px-4 py-3 text-sm text-on-surface shadow-none whitespace-pre-wrap [overflow-wrap:anywhere]">
                         <MentionText text={msg.content} />
                       </div>
                     )}
@@ -1268,29 +1399,16 @@ export function MessageList({
                   </div>
                 )}
                 {!isEditing && renderActions(msg, "")}
-                {hasBranch && (
+                {branchNavigation && (
                   <BranchNav
-                    current={currentBranchIdx}
-                    total={totalBranches}
+                    current={branchNavigation.current}
+                    total={branchNavigation.total}
+                    disabled={branchNavDisabled}
                     onPrev={() =>
-                      setBranchSelections((prev) => ({
-                        ...prev,
-                        [parentKey]: Math.max(
-                          0,
-                          (prev[parentKey] ??
-                            siblings.findIndex((s) => s.is_active_branch)) - 1,
-                        ),
-                      }))
+                      void switchBranch(msg, branchNavigation.index - 1)
                     }
                     onNext={() =>
-                      setBranchSelections((prev) => ({
-                        ...prev,
-                        [parentKey]: Math.min(
-                          siblings.length - 1,
-                          (prev[parentKey] ??
-                            siblings.findIndex((s) => s.is_active_branch)) + 1,
-                        ),
-                      }))
+                      void switchBranch(msg, branchNavigation.index + 1)
                     }
                   />
                 )}
@@ -1299,14 +1417,14 @@ export function MessageList({
           }
 
           // assistant
-          const previousUserInput = [...visibleMessages]
-            .slice(0, index)
-            .reverse()
-            .find((item) => item.role === "user")?.content || "";
+          const previousUserInput =
+            previousUserInputByMessageId.get(msg.id) ?? "";
           const attachments = getMessageAttachments(msg);
           const toolResults = getMessageToolResults(msg);
           const generationMetrics = getMessageGenerationMetrics(msg);
           const responseElapsedMs = getMessageResponseElapsedMs(msg);
+          const generationCancelled =
+            msg.metadata?.generation_status === "cancelled";
           const agentRunId =
             typeof msg.metadata?.agent_run_id === "string"
               ? msg.metadata.agent_run_id
@@ -1316,27 +1434,39 @@ export function MessageList({
             (typeof msg.metadata?.character_name === "string"
               ? msg.metadata.character_name
               : "");
+          const messageTime = formatMessageTime(msg.created_at);
           return (
             <div
               key={msg.id}
+              id={getChatMessageDomId(msg.id)}
               data-chat-message-id={msg.id}
-              className="group/msg flex justify-start"
+              className="group/msg flex justify-start gap-3"
             >
+              <div className="mt-1 flex size-8 shrink-0 items-center justify-center rounded-md border border-primary/60 bg-primary-container/15 text-primary" aria-hidden="true">
+                <Bot className="size-4" />
+              </div>
               <div className="flex min-w-0 max-w-full flex-col gap-1">
-                {assistantSender && (
-                  <span
-                    className="text-xs font-medium mb-0.5 block"
-                    style={{
-                      color: getCharacterColor(assistantSender),
-                    }}
-                  >
-                    {assistantSender}
-                  </span>
-                )}
+                <span
+                  className="mb-0.5 block text-[13px] font-semibold"
+                  style={{
+                    color: assistantSender ? getCharacterColor(assistantSender) : "var(--primary)",
+                  }}
+                >
+                  {assistantSender || "Assistant"}
+                  {messageTime && <span className="ml-2 text-[11px] font-normal text-text-secondary">{messageTime}</span>}
+                </span>
                 <GenerationMetricsLine
                   metrics={generationMetrics}
                   responseElapsedMs={responseElapsedMs}
                 />
+                {generationCancelled && (
+                  <span
+                    data-generation-status="cancelled"
+                    className="text-xs text-warning"
+                  >
+                    応答生成を停止しました
+                  </span>
+                )}
                 {agentRunId && (
                   <AgentRunTimeline
                     runId={agentRunId}
@@ -1344,36 +1474,31 @@ export function MessageList({
                   />
                 )}
                 {msg.content.trim() && (
-                  <div className="min-w-0 max-w-full overflow-hidden rounded-2xl rounded-bl-md border border-border bg-card px-4 py-2.5 text-sm text-card-foreground [overflow-wrap:anywhere] prose-sm">
+                  <div className="min-w-0 max-w-full overflow-hidden rounded-none border-0 bg-transparent px-0 py-0 text-[14px] leading-6 text-on-surface [overflow-wrap:anywhere] prose-sm">
                     <MessageContent content={msg.content} />
                   </div>
                 )}
+                {agentRunId && (
+                  <AgentResourceMutationList
+                    runId={agentRunId}
+                    onTaskClick={onTaskClick}
+                  />
+                )}
                 <MessageAttachments attachments={attachments} />
-                {!agentRunId && <ToolResultDetails results={toolResults} />}
+                {(!agentRunId || generationCancelled) && (
+                  <ToolResultDetails results={toolResults} />
+                )}
                 {renderActions(msg, previousUserInput)}
-                {hasBranch && (
+                {branchNavigation && (
                   <BranchNav
-                    current={currentBranchIdx}
-                    total={totalBranches}
+                    current={branchNavigation.current}
+                    total={branchNavigation.total}
+                    disabled={branchNavDisabled}
                     onPrev={() =>
-                      setBranchSelections((prev) => ({
-                        ...prev,
-                        [parentKey]: Math.max(
-                          0,
-                          (prev[parentKey] ??
-                            siblings.findIndex((s) => s.is_active_branch)) - 1,
-                        ),
-                      }))
+                      void switchBranch(msg, branchNavigation.index - 1)
                     }
                     onNext={() =>
-                      setBranchSelections((prev) => ({
-                        ...prev,
-                        [parentKey]: Math.min(
-                          siblings.length - 1,
-                          (prev[parentKey] ??
-                            siblings.findIndex((s) => s.is_active_branch)) + 1,
-                        ),
-                      }))
+                      void switchBranch(msg, branchNavigation.index + 1)
                     }
                   />
                 )}
@@ -1384,14 +1509,20 @@ export function MessageList({
 
         {/* ストリーミング中のメッセージ */}
         {isStreaming && streamingContent && (
-          <div className="flex justify-start">
+          <div className="flex justify-start gap-3">
+            <div className="mt-1 flex size-8 shrink-0 items-center justify-center rounded-md border border-primary/60 bg-primary-container/15 text-primary" aria-hidden="true">
+              <Bot className="size-4" />
+            </div>
             <div className="flex min-w-0 max-w-full flex-col gap-1">
               <AgentRunTimeline
                 runId={activeAgentRunId}
                 live
+                generationKey={generationKey}
+                generationStartedAt={generationStartedAt}
+                activityMessage={activityMessage}
                 onContentChange={scrollToBottom}
               />
-              <div className="min-w-0 max-w-full overflow-hidden rounded-2xl rounded-bl-md border border-border bg-card px-4 py-2.5 text-sm text-card-foreground [overflow-wrap:anywhere] prose-sm">
+              <div className="min-w-0 max-w-full overflow-hidden rounded-none border-0 bg-transparent px-0 py-0 text-[14px] leading-6 text-on-surface [overflow-wrap:anywhere] prose-sm">
                 <MessageContent content={streamingContent} />
                 {!activeAgentRunId &&
                   !activeTool &&
@@ -1416,15 +1547,21 @@ export function MessageList({
 
         {/* ストリーミング開始直後（内容なし）またはツール実行中 */}
         {isStreaming && !streamingContent && (
-          <div className="flex justify-start">
+          <div className="flex justify-start gap-3">
+            <div className="mt-1 flex size-8 shrink-0 items-center justify-center rounded-md border border-primary/60 bg-primary-container/15 text-primary" aria-hidden="true">
+              <Bot className="size-4" />
+            </div>
             <div className="flex min-w-0 max-w-full flex-col gap-1">
               <AgentRunTimeline
                 runId={activeAgentRunId}
                 live
+                generationKey={generationKey}
+                generationStartedAt={generationStartedAt}
+                activityMessage={activityMessage}
                 onContentChange={scrollToBottom}
               />
               {!activeAgentRunId && (
-                <div className="min-w-0 max-w-full overflow-hidden rounded-2xl rounded-bl-md border border-border bg-card px-4 py-2.5 text-sm text-card-foreground [overflow-wrap:anywhere] prose-sm">
+                <div className="min-w-0 max-w-full overflow-hidden rounded-md border border-border-subtle bg-surface-container-low px-3 py-2.5 text-sm text-on-surface [overflow-wrap:anywhere] prose-sm">
                   {activeTool ? (
                     <ToolIndicator toolName={activeTool} />
                   ) : activityMessage ? (
@@ -1442,30 +1579,38 @@ export function MessageList({
         )}
 
         {/* 応答待ち（送信済み〜stream_start受信前） */}
-        {isWaitingResponse &&
+        {showGenerationActivity &&
           !isStreaming &&
-          (activeTool || activeAgentRunId) && (
-            <div className="flex justify-start">
+          (
+            <div className="flex justify-start gap-3">
+              <div className="mt-1 flex size-8 shrink-0 items-center justify-center rounded-md border border-primary/60 bg-primary-container/15 text-primary" aria-hidden="true">
+                <Bot className="size-4" />
+              </div>
               <div className="flex min-w-0 max-w-full flex-col gap-1">
                 <AgentRunTimeline
                   runId={activeAgentRunId}
                   live
+                  generationKey={generationKey}
+                  generationStartedAt={generationStartedAt}
+                  activityMessage={activityMessage}
                   onContentChange={scrollToBottom}
                 />
                 {!activeAgentRunId && activeTool && (
-                  <div className="min-w-0 max-w-full overflow-hidden rounded-2xl rounded-bl-md border border-border bg-card px-4 py-2.5 text-sm text-card-foreground [overflow-wrap:anywhere] prose-sm">
+                  <div className="min-w-0 max-w-full overflow-hidden rounded-md border border-border-subtle bg-surface-container-low px-3 py-2.5 text-sm text-on-surface [overflow-wrap:anywhere] prose-sm">
                     <ToolIndicator toolName={activeTool} />
                   </div>
                 )}
               </div>
             </div>
           )}
+        </div>
       </div>
+      <ChatMessageHistoryRail messages={visibleMessages} />
       <Dialog
         open={!!feedbackTarget}
         onOpenChange={(open) => !open && setFeedbackTarget(null)}
       >
-        <DialogContent className="sm:max-w-lg">
+        <DialogContent size="lg">
           <DialogHeader>
             <DialogTitle>応答へのフィードバック</DialogTitle>
           </DialogHeader>

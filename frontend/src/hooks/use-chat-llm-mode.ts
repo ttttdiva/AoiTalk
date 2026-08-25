@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import useSWR from "swr";
 import { getLlmMode, setLlmMode, type LlmMode } from "@/lib/chat-api";
 import { toast } from "sonner";
+import { useOptionalRuntimeContext } from "@/contexts/runtime-context";
 
 // SWR キャッシュキー。チャット画面で一意なので固定文字列を使う。
 const LLM_MODE_SWR_KEY = "chat/llm-mode";
@@ -16,6 +17,47 @@ type LlmModeData = {
 
 const EMPTY_OPTIONS: LlmMode[] = [];
 const EMPTY_LABELS: Record<string, string> = {};
+const ERROR_DETAIL_MAX_LENGTH = 120;
+
+function sanitizeErrorDetail(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return null;
+  return normalized.length > ERROR_DETAIL_MAX_LENGTH
+    ? `${normalized.slice(0, ERROR_DETAIL_MAX_LENGTH - 1)}…`
+    : normalized;
+}
+
+function apiErrorDetail(error: unknown): string | null {
+  if (error && typeof error === "object") {
+    const record = error as Record<string, unknown>;
+    const detail = sanitizeErrorDetail(record.detail);
+    if (detail) return detail;
+
+    const rawMessage =
+      typeof record.message === "string" ? record.message : null;
+    if (!rawMessage) return null;
+
+    const responseBody = rawMessage.match(/\s-\s(\{[\s\S]*\})$/)?.[1];
+    if (responseBody) {
+      try {
+        const parsed = JSON.parse(responseBody) as Record<string, unknown>;
+        return (
+          sanitizeErrorDetail(parsed.detail) ??
+          sanitizeErrorDetail(parsed.message) ??
+          sanitizeErrorDetail(rawMessage)
+        );
+      } catch {
+        // JSONでないエラー本文は、長さと制御文字を制限したmessageを使う。
+      }
+    }
+    return sanitizeErrorDetail(rawMessage);
+  }
+  return sanitizeErrorDetail(error);
+}
 
 // API レスポンスを内部データ形へ正規化する（旧実装の setState 群と同じ導出）。
 function normalizeLlmMode(result: {
@@ -42,21 +84,36 @@ function normalizeLlmMode(result: {
  * 公開 API と表示挙動は従来の useState 実装と互換。
  */
 export function useChatLlmMode() {
-  const { data, mutate } = useSWR<LlmModeData>(
+  const runtime = useOptionalRuntimeContext();
+  const { data, error, isLoading, mutate } = useSWR<LlmModeData>(
     LLM_MODE_SWR_KEY,
     async () => normalizeLlmMode(await getLlmMode()),
     {
       revalidateOnMount: true,
       revalidateOnFocus: false,
-      revalidateOnReconnect: false,
-      revalidateIfStale: false,
-      shouldRetryOnError: false,
+      // 一時的なmode API失敗はRuntime再接続時に自然復旧させる。SWRの
+      // keepPreviousDataと併用し、既に取得済みのeffortを空へ戻さない。
+      revalidateOnReconnect: true,
+      revalidateIfStale: true,
+      shouldRetryOnError: true,
+      errorRetryCount: 3,
+      errorRetryInterval: 1500,
+      keepPreviousData: true,
       onError: (err) => {
         console.warn("LLMモード取得に失敗:", err);
         toast.error("LLMモードの取得に失敗しました");
       },
     },
   );
+
+  const wasConnectedRef = useRef(false);
+  useEffect(() => {
+    const connected = runtime?.isConnected === true;
+    if (connected && !wasConnectedRef.current) {
+      void mutate();
+    }
+    wasConnectedRef.current = connected;
+  }, [mutate, runtime?.isConnected]);
 
   const llmMode = data?.mode ?? "";
   const llmModeOptions = data?.options ?? EMPTY_OPTIONS;
@@ -115,7 +172,18 @@ export function useChatLlmMode() {
         );
       } catch (err) {
         console.error("LLMモード切り替えに失敗:", err);
-        toast.error("LLMモードの切り替えに失敗しました");
+        const detail = apiErrorDetail(err);
+        toast.error(
+          detail
+            ? `LLMモードの切り替えに失敗しました: ${detail}`
+            : "LLMモードの切り替えに失敗しました",
+        );
+        try {
+          // POSTが設定保存後のhot applyで失敗する場合があるため、server stateを正とする。
+          await mutate();
+        } catch (syncError) {
+          console.warn("LLMモード切り替え失敗後の再同期に失敗:", syncError);
+        }
       }
     },
     [mutate],
@@ -129,5 +197,8 @@ export function useChatLlmMode() {
     setLlmModeOptions,
     setLlmModeLabels,
     handleLlmModeChange,
+    llmModeError: error ?? null,
+    llmModeLoading: isLoading,
+    refreshLlmMode: mutate,
   };
 }

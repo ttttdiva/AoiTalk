@@ -43,7 +43,7 @@ export function AlertDialog({
         if (!next) onCancel();
       }}
     >
-      <DialogContent showCloseButton={false} className="sm:max-w-sm">
+      <DialogContent showCloseButton={false}>
         <DialogHeader>
           <DialogTitle>{title ?? "確認"}</DialogTitle>
           {description ? (

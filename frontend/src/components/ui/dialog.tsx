@@ -39,13 +39,28 @@ function DialogOverlay({
   )
 }
 
+/** sm 以上の max-width。既定は sm（384px）。className の max-w-* より後に適用し twMerge で上書きする。 */
+export const dialogContentSizeClasses = {
+  sm: "sm:max-w-sm",
+  md: "sm:max-w-md",
+  lg: "sm:max-w-lg",
+  xl: "sm:max-w-xl",
+  "2xl": "sm:max-w-2xl",
+  "3xl": "sm:max-w-3xl",
+  "4xl": "sm:max-w-4xl",
+} as const
+
+export type DialogContentSize = keyof typeof dialogContentSizeClasses
+
 function DialogContent({
   className,
   children,
   showCloseButton = true,
+  size = "sm",
   ...props
 }: DialogPrimitive.Popup.Props & {
   showCloseButton?: boolean
+  size?: DialogContentSize
 }) {
   return (
     <DialogPortal>
@@ -53,7 +68,8 @@ function DialogContent({
       <DialogPrimitive.Popup
         data-slot="dialog-content"
         className={cn(
-          "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl border border-border bg-card p-4 text-sm shadow-lg duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
+          "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl border border-border bg-card p-4 text-sm shadow-lg duration-100 outline-none data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
+          dialogContentSizeClasses[size],
           className
         )}
         {...props}

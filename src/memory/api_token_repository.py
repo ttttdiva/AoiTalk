@@ -43,6 +43,7 @@ class ApiTokenRepository:
         user_id: UUID,
         name: str,
         expires_at: Optional[datetime] = None,
+        session_version: int = 1,
     ) -> Tuple[LongLivedApiToken, str]:
         """トークンを発行する。
 
@@ -56,6 +57,7 @@ class ApiTokenRepository:
             name=name,
             token_hash=ApiTokenRepository.hash_token(plaintext),
             token_prefix=plaintext[:_DISPLAY_PREFIX_LEN],
+            session_version=max(1, int(session_version or 1)),
             expires_at=expires_at,
         )
         session.add(record)

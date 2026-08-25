@@ -1,10 +1,14 @@
 "use client";
 
-import { useEffect, type Dispatch, type RefObject } from "react";
+import {
+  useEffect,
+  type Dispatch,
+  type RefObject,
+  type SetStateAction,
+} from "react";
 import { toast } from "sonner";
 import type {
   ChatToolResultMetadata,
-  ConversationGenerationStatus,
   ConversationMessage,
   ConversationSession,
   LlmMode,
@@ -16,11 +20,27 @@ import {
   createLocalMessage,
   isChatToolResultMetadata,
 } from "@/lib/chat-local-messages";
-import { getWebSocketMessageAgentRunId } from "@/lib/chat-websocket-events";
+import {
+  getCancelledAssistantPayloads,
+  getWebSocketMessageClientMessageId,
+  getWebSocketMessageEventKey,
+  getWebSocketMessageId,
+  getWebSocketMessageAgentRunId,
+  getWebSocketMessageSessionId,
+  isWebSocketMessageForSession,
+} from "@/lib/chat-websocket-events";
+import type {
+  ChatGenerationEvent,
+  ChatGenerationState,
+} from "@/lib/chat-generation-state";
+import { selectGenerationAgentRunId } from "@/lib/chat-generation-state";
 import { explorerBookmarks, explorerSearch } from "@/lib/explorer-api";
 import type {
+  AskUserQuestionRequest,
   ExternalModelPromptRequest,
+  PlanApprovalRequest,
   ToolPermissionRequest,
+  ToolPermissionScope,
 } from "@/components/chat/chat-permission-dialogs";
 
 type WSMessage = NonNullable<ReturnType<typeof useWebSocket>["lastMessage"]>;
@@ -29,20 +49,22 @@ type ChatTimelineAction = Parameters<typeof chatTimelineReducer>[1];
 type UseChatWebSocketEventsArgs = {
   lastMessage: WSMessage | null;
   activeSessionId: string | null;
+  connectionGeneration?: number;
   streamBuffer: RefObject<string>;
-  pendingAgentRunId: string | null;
   currentSession: ConversationSession | null;
 
-  processedMsgRef: RefObject<string | null>;
+  processedEventIdsRef: RefObject<Set<string>>;
+  processedLegacyMessageRef: RefObject<unknown>;
   liveToolResultsRef: RefObject<ChatToolResultMetadata[]>;
   streamingIntervalRef: RefObject<ReturnType<typeof setInterval> | null>;
   responsePollGenerationRef: RefObject<number>;
 
   dispatchChatTimeline: Dispatch<ChatTimelineAction>;
-  clearWaitingResponse: (sessionId: string | null) => void;
   refreshPersistedMessages: (
     sessionId: string,
   ) => Promise<ConversationMessage[] | null>;
+  /** Bump only after refresh confirms the assistant row is persisted. */
+  bumpSessionForAssistant: (sessionId: string, messageId: string) => void;
   maybeGenerateLoadedSessionTitle: (
     session: ConversationSession,
     messages: ConversationMessage[],
@@ -57,15 +79,20 @@ type UseChatWebSocketEventsArgs = {
     request: ExternalModelPromptRequest | null,
   ) => void;
   setExternalModelPromptDraft: (draft: string) => void;
-  setRestoredGenerationStatus: (
-    status: ConversationGenerationStatus | null,
-  ) => void;
-  setSteeringInstructions: (instructions: SubmittedSteeringInstruction[]) => void;
+  setAskUserQuestionRequest?: (request: AskUserQuestionRequest | null) => void;
+  setAskUserQuestionDraft?: (draft: string) => void;
+  setAskUserQuestionChoices?: (choices: string[]) => void;
+  setPlanApprovalRequest?: (request: PlanApprovalRequest | null) => void;
+  setPlanApprovalDraft?: (draft: string) => void;
+  setPlanApprovalFeedbackDraft?: (draft: string) => void;
+  setSteeringInstructions: Dispatch<
+    SetStateAction<SubmittedSteeringInstruction[]>
+  >;
   setStreamingContent: (content: string) => void;
   setLiveToolResults: (results: ChatToolResultMetadata[]) => void;
-  setCurrentSession: Dispatch<
-    (prev: ConversationSession | null) => ConversationSession | null
-  >;
+
+  generationState: ChatGenerationState;
+  dispatchGeneration: Dispatch<ChatGenerationEvent>;
 
   play: (item: { name: string; path: string; type: string }) => void;
   stopAudio: () => void;
@@ -79,16 +106,17 @@ type UseChatWebSocketEventsArgs = {
 export function useChatWebSocketEvents({
   lastMessage,
   activeSessionId,
+  connectionGeneration,
   streamBuffer,
-  pendingAgentRunId,
   currentSession,
-  processedMsgRef,
+  processedEventIdsRef,
+  processedLegacyMessageRef,
   liveToolResultsRef,
   streamingIntervalRef,
   responsePollGenerationRef,
   dispatchChatTimeline,
-  clearWaitingResponse,
   refreshPersistedMessages,
+  bumpSessionForAssistant,
   maybeGenerateLoadedSessionTitle,
   updateSidebarTitle,
   setLlmModeState,
@@ -97,11 +125,17 @@ export function useChatWebSocketEvents({
   setToolPermissionRequest,
   setExternalModelPromptRequest,
   setExternalModelPromptDraft,
-  setRestoredGenerationStatus,
+  setAskUserQuestionRequest,
+  setAskUserQuestionDraft,
+  setAskUserQuestionChoices,
+  setPlanApprovalRequest,
+  setPlanApprovalDraft,
+  setPlanApprovalFeedbackDraft,
   setSteeringInstructions,
   setStreamingContent,
   setLiveToolResults,
-  setCurrentSession,
+  generationState,
+  dispatchGeneration,
   play,
   stopAudio,
   setVolume,
@@ -109,16 +143,87 @@ export function useChatWebSocketEvents({
   useEffect(() => {
     if (!lastMessage) return;
 
-    // 同じメッセージの再処理を防止（依存配列の他の値が変わった場合にも対応）
-    const msgKey = JSON.stringify(lastMessage);
-    if (processedMsgRef.current === msgKey) return;
-    processedMsgRef.current = msgKey;
+    if (!isWebSocketMessageForSession(lastMessage, activeSessionId)) return;
+    if (
+      typeof lastMessage.__connection_generation === "number" &&
+      (lastMessage.__connection_generation !== connectionGeneration ||
+        lastMessage.__connection_session_id !== activeSessionId)
+    ) {
+      return;
+    }
 
+    // Stable event_id/sequence is the primary idempotency key.  Legacy
+    // servers have no such field, so only the same object instance is ignored
+    // on an effect re-run; identical payloads from newer events are never
+    // collapsed by content.
+    const eventSessionId = getWebSocketMessageSessionId(lastMessage);
+    const eventAgentRunId = getWebSocketMessageAgentRunId(lastMessage);
+    const eventClientMessageId =
+      getWebSocketMessageClientMessageId(lastMessage);
+    const eventId = getWebSocketMessageEventKey(lastMessage);
+    const currentAgentRunId = activeSessionId
+      ? selectGenerationAgentRunId(generationState, activeSessionId)
+      : null;
+    if (
+      eventAgentRunId &&
+      currentAgentRunId &&
+      eventAgentRunId !== currentAgentRunId &&
+      lastMessage.type !== "steering_update" &&
+      lastMessage.type !== "live_voice.event"
+    ) {
+      return;
+    }
     const isForeignSessionEvent = (sessionId: unknown) =>
       typeof sessionId === "string" &&
       sessionId.length > 0 &&
       Boolean(activeSessionId) &&
       sessionId !== activeSessionId;
+
+    if (isForeignSessionEvent(eventSessionId)) return;
+
+    const generationIsCorrelated = (() => {
+      if (!activeSessionId || eventSessionId !== activeSessionId) return false;
+      if (currentAgentRunId) {
+        if (eventAgentRunId) return eventAgentRunId === currentAgentRunId;
+        return Boolean(
+          eventClientMessageId &&
+            eventClientMessageId === generationState.lifecycle.clientMessageId,
+        );
+      }
+      if (generationState.lifecycle.generationEpoch == null) return true;
+      return Boolean(
+        eventClientMessageId &&
+          eventClientMessageId === generationState.lifecycle.clientMessageId,
+      );
+    })();
+
+    const requiresGenerationCorrelation =
+      lastMessage.type === "tool_start" ||
+      lastMessage.type === "tool_end" ||
+      lastMessage.type === "status_update" ||
+      lastMessage.type === "reasoning_progress" ||
+      lastMessage.type === "stream_start" ||
+      lastMessage.type === "stream_cancelled" ||
+      lastMessage.type === "stream_end" ||
+      lastMessage.type === "response" ||
+      (lastMessage.type === "conversation_persisted" &&
+        lastMessage.role === "assistant");
+    // REST dispatch acceptance can bind agent_run_id after the first WS event
+    // arrives.  Do not consume that event's id until it can be correlated; the
+    // generation-state update will rerun this effect with the same message.
+    if (requiresGenerationCorrelation && !generationIsCorrelated) return;
+
+    if (eventId) {
+      if (processedEventIdsRef.current.has(eventId)) return;
+      processedEventIdsRef.current.add(eventId);
+      if (processedEventIdsRef.current.size > 512) {
+        const oldest = processedEventIdsRef.current.values().next().value;
+        if (oldest) processedEventIdsRef.current.delete(oldest);
+      }
+    } else {
+      if (processedLegacyMessageRef.current === lastMessage) return;
+      processedLegacyMessageRef.current = lastMessage;
+    }
 
     if (lastMessage.type === "llm_mode_change") {
       const data = lastMessage.data as
@@ -189,8 +294,20 @@ export function useChatWebSocketEvents({
 
     if (lastMessage.type === "external_llm_permission_request") {
       const data = lastMessage.data as Record<string, unknown> | undefined;
-      if (data) {
+      if (data && eventSessionId === activeSessionId && eventSessionId) {
+        // scope_options は「1回だけ許可 / このセッション中は許可」の選択肢。
+        // 未指定の古いバックエンドでは once のみとして扱う。
+        const scopeOptions = Array.isArray(data.scope_options)
+          ? (data.scope_options
+              .map((item) => String(item))
+              .filter(
+                (item): item is ToolPermissionScope =>
+                  item === "once" || item === "session",
+              ) as ToolPermissionScope[])
+          : (["once"] as ToolPermissionScope[]);
+
         setToolPermissionRequest({
+          sessionId: eventSessionId,
           requestId: String(data.request_id || ""),
           toolName: String(data.tool_name || "tool"),
           description: String(data.description || "ツール実行を許可しますか？"),
@@ -198,6 +315,7 @@ export function useChatWebSocketEvents({
             data.tool_args && typeof data.tool_args === "object"
               ? (data.tool_args as Record<string, unknown>)
               : {},
+          scopeOptions: scopeOptions.length > 0 ? scopeOptions : ["once"],
         });
       }
       return;
@@ -205,7 +323,7 @@ export function useChatWebSocketEvents({
 
     if (lastMessage.type === "external_model_prompt_request") {
       const data = lastMessage.data as Record<string, unknown> | undefined;
-      if (data) {
+      if (data && eventSessionId === activeSessionId && eventSessionId) {
         const prompt = String(data.original_prompt || data.prompt || "");
         const redactedPrompt = String(data.redacted_prompt || prompt);
         const redactionFindings = Array.isArray(data.redaction_findings)
@@ -228,6 +346,7 @@ export function useChatWebSocketEvents({
               )
           : [];
         const request = {
+          sessionId: eventSessionId,
           requestId: String(data.request_id || ""),
           provider: String(data.provider || ""),
           model: String(data.model || ""),
@@ -239,6 +358,10 @@ export function useChatWebSocketEvents({
           redactedPrompt,
           redactionFindings,
           notify: data.notify !== false,
+          sourceKind: String(data.source_kind || ""),
+          riskLevel: String(data.risk_level || ""),
+          semanticStatus: String(data.semantic_status || ""),
+          warning: String(data.warning || ""),
         };
         setExternalModelPromptRequest(request);
         setExternalModelPromptDraft(redactedPrompt);
@@ -249,17 +372,78 @@ export function useChatWebSocketEvents({
       return;
     }
 
+    if (lastMessage.type === "ask_user_question_request") {
+      const data = lastMessage.data as Record<string, unknown> | undefined;
+      if (data && eventSessionId === activeSessionId && eventSessionId) {
+        setAskUserQuestionRequest?.({
+          sessionId: eventSessionId,
+          requestId: String(data.request_id || ""),
+          question: String(data.question || "確認してください"),
+          inputType: String(data.input_type || "free_text"),
+          choices: Array.isArray(data.choices)
+            ? data.choices.map((item) => String(item))
+            : [],
+          allowMultiple: Boolean(data.allow_multiple),
+          allowFreeText: data.allow_free_text !== false,
+          revision: Number(data.revision || 0),
+        });
+        setAskUserQuestionDraft?.("");
+        setAskUserQuestionChoices?.([]);
+      }
+      return;
+    }
+
+    if (lastMessage.type === "plan_approval_request") {
+      const data = lastMessage.data as Record<string, unknown> | undefined;
+      if (data && eventSessionId === activeSessionId && eventSessionId) {
+        const planText = String(data.plan_text || "");
+        setPlanApprovalRequest?.({
+          sessionId: eventSessionId,
+          requestId: String(data.request_id || ""),
+          planText,
+          summary: String(data.summary || "実行前に計画を確認してください。"),
+          revision: Number(data.revision || 0),
+        });
+        setPlanApprovalDraft?.(planText);
+        setPlanApprovalFeedbackDraft?.("");
+      }
+      return;
+    }
+
+    // Live Voice transcripts are persisted by the provider-owned sideband
+    // into the same ConversationSession as Chat.  Only the active durable
+    // session may hydrate a message identified by the server message_id;
+    // browser telemetry without an id is deliberately ignored to avoid a
+    // second/local transcript store or cross-session leakage.
+    if (lastMessage.type === "live_voice.event") {
+      const eventSessionId = getWebSocketMessageSessionId(lastMessage);
+      const messageId = getWebSocketMessageId(lastMessage);
+      if (
+        activeSessionId &&
+        currentSession?.id === activeSessionId &&
+        eventSessionId === activeSessionId &&
+        messageId
+      ) {
+        void refreshPersistedMessages(activeSessionId);
+      }
+      return;
+    }
+
     if (lastMessage.type === "new_message") {
       const data = lastMessage.data as Record<string, unknown> | undefined;
       if (isForeignSessionEvent(data?.session_id)) return;
       if (data && data.type === "assistant") {
-        clearWaitingResponse(activeSessionId);
-        setRestoredGenerationStatus(null);
         setSteeringInstructions([]);
         const content = (data.message as string) || "";
         if (content && activeSessionId) {
           const agentRunId =
-            getWebSocketMessageAgentRunId(lastMessage) ?? pendingAgentRunId;
+            getWebSocketMessageAgentRunId(lastMessage) ??
+            selectGenerationAgentRunId(generationState, activeSessionId);
+          const messageId = getWebSocketMessageId(lastMessage);
+          if (!agentRunId && !messageId) {
+            void refreshPersistedMessages(activeSessionId);
+            return;
+          }
           const metadata: ConversationMessage["metadata"] = {
             character: data.character,
             ...(typeof data.session_id === "string" && data.session_id
@@ -269,14 +453,15 @@ export function useChatWebSocketEvents({
           if (agentRunId) {
             metadata.agent_run_id = agentRunId;
           }
+          const liveAssistant = createLocalMessage(
+            activeSessionId,
+            "assistant",
+            content,
+            metadata,
+          );
           dispatchChatTimeline({
             type: "append",
-            message: createLocalMessage(
-              activeSessionId,
-              "assistant",
-              content,
-              metadata,
-            ),
+            message: messageId ? { ...liveAssistant, id: messageId } : liveAssistant,
           });
           void refreshPersistedMessages(activeSessionId);
         }
@@ -289,14 +474,33 @@ export function useChatWebSocketEvents({
       const sessionId = (lastMessage.session_id as string) || "";
       if (activeSessionId && sessionId === activeSessionId) {
         if (lastMessage.role === "assistant") {
-          responsePollGenerationRef.current += 1;
-          clearWaitingResponse(sessionId);
-          setRestoredGenerationStatus(null);
           setSteeringInstructions([]);
         }
         void (async () => {
           const persistedMessages =
             await refreshPersistedMessages(activeSessionId);
+          if (lastMessage.role === "assistant" && persistedMessages) {
+            const announcedMessageId = getWebSocketMessageId(lastMessage);
+            const announcedRunId = getWebSocketMessageAgentRunId(lastMessage);
+            const persistedAssistant = persistedMessages.find(
+              (message) =>
+                message.role === "assistant" &&
+                ((announcedMessageId && message.id === announcedMessageId) ||
+                  (announcedRunId &&
+                    message.metadata?.agent_run_id === announcedRunId)),
+            );
+            if (persistedAssistant) {
+              bumpSessionForAssistant(sessionId, persistedAssistant.id);
+              dispatchGeneration({
+                type: "assistant_persisted",
+                sessionId,
+                agentRunId: announcedRunId,
+                clientMessageId: eventClientMessageId,
+                assistantMessageId: persistedAssistant.id,
+                eventId,
+              });
+            }
+          }
           if (
             lastMessage.role === "assistant" &&
             currentSession?.id === activeSessionId &&
@@ -317,21 +521,29 @@ export function useChatWebSocketEvents({
       const title = (lastMessage.title as string) || "";
       if (sessionId && title) {
         updateSidebarTitle(sessionId, title);
-        setCurrentSession((prev) =>
-          prev && prev.id === sessionId ? { ...prev, title } : prev,
-        );
       }
       return;
     }
 
     if (lastMessage.type === "generated_image") {
-      if (isForeignSessionEvent(lastMessage.session_id)) return;
-      const content = (lastMessage.content as string) || "";
+      const content =
+        (typeof lastMessage.content === "string" && lastMessage.content) ||
+        (typeof lastMessage.media_id === "string" &&
+          `[GENERATED_IMAGE:${lastMessage.media_id}]`) ||
+        "";
       if (content && activeSessionId) {
+        const messageId = getWebSocketMessageId(lastMessage);
+        const imageAgentRunId = getWebSocketMessageAgentRunId(lastMessage);
+        if (!messageId && !imageAgentRunId) {
+          void refreshPersistedMessages(activeSessionId);
+          return;
+        }
         dispatchChatTimeline({
           type: "append_to_last_assistant",
           sessionId: activeSessionId,
           content,
+          messageId,
+          agentRunId: imageAgentRunId,
         });
       }
       return;
@@ -344,8 +556,118 @@ export function useChatWebSocketEvents({
       lastMessage.type === "reasoning_progress" ||
       lastMessage.type === "steering_update"
     ) {
-      if (isForeignSessionEvent(lastMessage.session_id)) return;
-      setRestoredGenerationStatus(null);
+      if (!activeSessionId) return;
+      if (
+        lastMessage.type !== "steering_update" &&
+        !generationIsCorrelated
+      ) {
+        return;
+      }
+      const eventAgentRunId = getWebSocketMessageAgentRunId(lastMessage);
+      if (lastMessage.type === "tool_start") {
+        dispatchGeneration({
+          type: "tool_started",
+          sessionId: activeSessionId,
+          agentRunId: eventAgentRunId,
+          clientMessageId: eventClientMessageId,
+          tool:
+            typeof lastMessage.tool === "string" && lastMessage.tool
+              ? lastMessage.tool
+              : "tool",
+          statusMessage:
+            typeof lastMessage.message === "string"
+              ? lastMessage.message
+              : null,
+          eventId,
+        });
+      } else if (lastMessage.type === "tool_end") {
+        dispatchGeneration({
+          type: "tool_finished",
+          sessionId: activeSessionId,
+          agentRunId: eventAgentRunId,
+          clientMessageId: eventClientMessageId,
+          statusMessage:
+            typeof lastMessage.message === "string"
+              ? lastMessage.message
+              : null,
+          eventId,
+        });
+      } else if (lastMessage.type !== "steering_update") {
+        const status =
+          typeof lastMessage.status === "string"
+            ? lastMessage.status
+            : lastMessage.type;
+        const statusMessage =
+          typeof lastMessage.message === "string"
+            ? lastMessage.message
+            : null;
+        const terminalType =
+          status === "completed"
+            ? "completed"
+            : status === "cancelled"
+              ? "cancelled"
+              : status === "failed"
+                ? "failed"
+                : status === "cancellation_pending"
+                  ? "cancellation_pending"
+                  : status === "cancellation_failed"
+                    ? "cancellation_failed"
+                    : null;
+        if (terminalType) {
+          dispatchGeneration({
+            type: terminalType,
+            sessionId: activeSessionId,
+            agentRunId: eventAgentRunId,
+            clientMessageId: eventClientMessageId,
+            statusMessage,
+            eventId,
+          });
+        } else {
+          dispatchGeneration({
+            type: "status_updated",
+            sessionId: activeSessionId,
+            agentRunId: eventAgentRunId,
+            clientMessageId: eventClientMessageId,
+            status,
+            statusMessage,
+            eventId,
+          });
+        }
+      }
+      if (lastMessage.type === "steering_update") {
+        const clientMessageId = String(
+          lastMessage.client_message_id || "",
+        ).trim();
+        if (clientMessageId) {
+          const status =
+            lastMessage.status === "rejected" ? "failed" : "interrupting";
+          setSteeringInstructions((current) =>
+            current.map((item) =>
+              item.id === clientMessageId ? { ...item, status } : item,
+            ),
+          );
+          dispatchChatTimeline({
+            type: "update_by_client_message_id",
+            sessionId: activeSessionId,
+            clientMessageId,
+            update: (message) => ({
+              ...message,
+              metadata: {
+                ...message.metadata,
+                delivery_mode: "immediate_interrupt",
+                delivery_status: status,
+              },
+            }),
+          });
+          if (lastMessage.status === "rejected") {
+            toast.error(
+              String(lastMessage.message || "現在の応答へ割り込めませんでした"),
+            );
+          } else {
+            toast.success("追加指示を送信しました");
+          }
+        }
+      }
       if (
         lastMessage.type === "tool_end" &&
         isChatToolResultMetadata(lastMessage.tool_result)
@@ -360,36 +682,209 @@ export function useChatWebSocketEvents({
     }
 
     if (lastMessage.type === "stream_start") {
-      if (isForeignSessionEvent(lastMessage.session_id)) return;
-      setRestoredGenerationStatus(null);
-      clearWaitingResponse(activeSessionId);
+      if (!generationIsCorrelated) return;
+      responsePollGenerationRef.current += 1;
+      if (activeSessionId) {
+        dispatchGeneration({
+          type: "stream_started",
+          sessionId: activeSessionId,
+          agentRunId: getWebSocketMessageAgentRunId(lastMessage),
+          clientMessageId: eventClientMessageId,
+          statusMessage:
+            typeof lastMessage.message === "string"
+              ? lastMessage.message
+              : "応答を生成しています",
+          eventId,
+        });
+      }
       setStreamingContent("");
       liveToolResultsRef.current = [];
       setLiveToolResults([]);
       // ストリーミングバッファを定期的に反映
+      if (streamingIntervalRef.current) {
+        clearInterval(streamingIntervalRef.current);
+      }
       streamingIntervalRef.current = setInterval(() => {
         setStreamingContent(streamBuffer.current);
       }, 50);
     }
 
     if (lastMessage.type === "stream_cancelled") {
-      if (isForeignSessionEvent(lastMessage.session_id)) return;
+      if (!generationIsCorrelated) return;
       responsePollGenerationRef.current += 1;
-      clearWaitingResponse(activeSessionId);
-      setRestoredGenerationStatus(null);
+      if (lastMessage.status === "cancellation_pending") {
+        if (activeSessionId) {
+          dispatchGeneration({
+            type: "cancellation_pending",
+            sessionId: activeSessionId,
+            agentRunId: getWebSocketMessageAgentRunId(lastMessage),
+            clientMessageId: eventClientMessageId,
+            statusMessage:
+              typeof lastMessage.message === "string"
+                ? lastMessage.message
+                : "停止処理を継続しています",
+            eventId,
+          });
+        }
+        toast.info("停止処理を継続しています");
+        return;
+      }
+      if (lastMessage.status === "cancellation_failed") {
+        const failedRunId =
+          getWebSocketMessageAgentRunId(lastMessage) ??
+          selectGenerationAgentRunId(generationState, activeSessionId);
+        const partialContent = streamBuffer.current;
+        const partialToolResults = liveToolResultsRef.current;
+        if (activeSessionId && partialContent.trim()) {
+          dispatchChatTimeline({
+            type: "append",
+            message: {
+              id: `temp-assistant-cancellation-failed-${failedRunId ?? activeSessionId}`,
+              session_id: activeSessionId,
+              role: "assistant",
+              content: partialContent,
+              metadata: {
+                agent_run_id: failedRunId ?? undefined,
+                generation_status: "cancellation_failed",
+                partial: true,
+                persistence_failed: true,
+                tool_results: partialToolResults,
+              },
+              created_at: new Date().toISOString(),
+              parent_message_id: null,
+              branch_index: 0,
+              is_active_branch: true,
+            },
+          });
+        }
+        if (activeSessionId) {
+          dispatchGeneration({
+            type: "cancellation_failed",
+            sessionId: activeSessionId,
+            agentRunId: failedRunId,
+            clientMessageId: eventClientMessageId,
+            statusMessage:
+              typeof lastMessage.message === "string"
+                ? lastMessage.message
+                : "応答生成を完全に停止できませんでした",
+            eventId,
+          });
+        }
+        if (streamingIntervalRef.current) {
+          clearInterval(streamingIntervalRef.current);
+          streamingIntervalRef.current = null;
+        }
+        setStreamingContent("");
+        liveToolResultsRef.current = [];
+        setLiveToolResults([]);
+        setSteeringInstructions([]);
+        toast.error(
+          typeof lastMessage.message === "string"
+            ? lastMessage.message
+            : "応答生成を停止できませんでした",
+        );
+        if (activeSessionId) {
+          void refreshPersistedMessages(activeSessionId);
+        }
+        return;
+      }
+      if (activeSessionId) {
+        dispatchGeneration({
+          type: "cancelled",
+          sessionId: activeSessionId,
+          agentRunId:
+            getWebSocketMessageAgentRunId(lastMessage) ??
+            generationState.lifecycle.agentRunId,
+          clientMessageId: eventClientMessageId,
+          statusMessage:
+            typeof lastMessage.message === "string"
+              ? lastMessage.message
+              : "応答生成を停止しました",
+          eventId,
+        });
+      }
       if (streamingIntervalRef.current) {
         clearInterval(streamingIntervalRef.current);
         streamingIntervalRef.current = null;
+      }
+      const cancelledAssistants =
+        getCancelledAssistantPayloads(lastMessage);
+      const failedRunIds = Array.isArray(
+        lastMessage.persistence_failed_run_ids,
+      )
+        ? lastMessage.persistence_failed_run_ids.filter(
+            (item): item is string => typeof item === "string",
+          )
+        : [];
+      const liveRunId =
+        getWebSocketMessageAgentRunId(lastMessage) ??
+        selectGenerationAgentRunId(generationState, activeSessionId);
+      const failedBufferRunId =
+        failedRunIds.length === 1
+          ? failedRunIds[0]
+          : failedRunIds.length > 1
+            ? null
+            : liveRunId;
+      const failedBufferKey =
+        failedRunIds.length > 0
+          ? [...failedRunIds].sort().join("-")
+          : (failedBufferRunId ?? activeSessionId ?? "unknown");
+      if (activeSessionId) {
+        for (const cancelledAssistant of cancelledAssistants) {
+          dispatchChatTimeline({
+            type: "append",
+            message: {
+              id: cancelledAssistant.messageId,
+              session_id: activeSessionId,
+              role: "assistant",
+              content: cancelledAssistant.content,
+              metadata: cancelledAssistant.metadata,
+              created_at: new Date().toISOString(),
+              parent_message_id: null,
+              branch_index: 0,
+              is_active_branch: true,
+            },
+          });
+        }
+        if (
+          lastMessage.persistence_failed === true &&
+          streamBuffer.current.trim()
+        ) {
+          dispatchChatTimeline({
+            type: "append",
+            message: {
+              id: `temp-assistant-cancelled-${failedBufferKey}`,
+              session_id: activeSessionId,
+              role: "assistant",
+              content: streamBuffer.current,
+              metadata: {
+                agent_run_id: failedBufferRunId ?? undefined,
+                generation_status: "cancelled",
+                partial: true,
+                persistence_failed: true,
+                tool_results: liveToolResultsRef.current,
+              },
+              created_at: new Date().toISOString(),
+              parent_message_id: null,
+              branch_index: 0,
+              is_active_branch: true,
+            },
+          });
+        }
       }
       setStreamingContent("");
       liveToolResultsRef.current = [];
       setLiveToolResults([]);
       setSteeringInstructions([]);
-      toast.info(
-        typeof lastMessage.message === "string"
-          ? lastMessage.message
-          : "応答生成を停止しました",
-      );
+      if (lastMessage.persistence_failed === true) {
+        toast.error("停止しましたが、一部の途中応答を保存できませんでした");
+      } else {
+        toast.info(
+          typeof lastMessage.message === "string"
+            ? lastMessage.message
+            : "応答生成を停止しました",
+        );
+      }
       if (activeSessionId) {
         void refreshPersistedMessages(activeSessionId);
       }
@@ -397,10 +892,19 @@ export function useChatWebSocketEvents({
     }
 
     if (lastMessage.type === "stream_end" || lastMessage.type === "response") {
-      if (isForeignSessionEvent(lastMessage.session_id)) return;
-      responsePollGenerationRef.current += 1;
-      clearWaitingResponse(activeSessionId);
-      setRestoredGenerationStatus(null);
+      if (!generationIsCorrelated) return;
+      const terminalMessageId = getWebSocketMessageId(lastMessage);
+      if (activeSessionId) {
+        dispatchGeneration({
+          type: "completed",
+          sessionId: activeSessionId,
+          agentRunId: eventAgentRunId,
+          clientMessageId: eventClientMessageId,
+          assistantMessageId: terminalMessageId,
+          eventId,
+          awaitingPersistence: !terminalMessageId,
+        });
+      }
       setSteeringInstructions([]);
       // インターバル停止
       if (streamingIntervalRef.current) {
@@ -413,7 +917,24 @@ export function useChatWebSocketEvents({
       if (finalContent && activeSessionId) {
         const toolResults = liveToolResultsRef.current;
         const streamEndAgentRunId =
-          getWebSocketMessageAgentRunId(lastMessage) ?? pendingAgentRunId;
+          getWebSocketMessageAgentRunId(lastMessage) ??
+          selectGenerationAgentRunId(generationState, activeSessionId);
+        const streamEndMessageId = terminalMessageId;
+        if (
+          !streamEndAgentRunId &&
+          !streamEndMessageId &&
+          !eventClientMessageId
+        ) {
+          void refreshPersistedMessages(activeSessionId);
+          if (streamingIntervalRef.current) {
+            clearInterval(streamingIntervalRef.current);
+            streamingIntervalRef.current = null;
+          }
+          setStreamingContent("");
+          liveToolResultsRef.current = [];
+          setLiveToolResults([]);
+          return;
+        }
         const assistantMetadata: ConversationMessage["metadata"] = {};
         if (toolResults.length > 0) {
           assistantMetadata.tool_results = toolResults;
@@ -421,14 +942,17 @@ export function useChatWebSocketEvents({
         if (streamEndAgentRunId) {
           assistantMetadata.agent_run_id = streamEndAgentRunId;
         }
+        const liveAssistant = createLocalMessage(
+          activeSessionId,
+          "assistant",
+          finalContent,
+          assistantMetadata,
+        );
         dispatchChatTimeline({
           type: "append",
-          message: createLocalMessage(
-            activeSessionId,
-            "assistant",
-            finalContent,
-            assistantMetadata,
-          ),
+          message: streamEndMessageId
+            ? { ...liveAssistant, id: streamEndMessageId }
+            : liveAssistant,
         });
       }
 
@@ -443,6 +967,7 @@ export function useChatWebSocketEvents({
   }, [
     lastMessage,
     activeSessionId,
+    connectionGeneration,
     refreshPersistedMessages,
     streamBuffer,
     play,
@@ -451,7 +976,10 @@ export function useChatWebSocketEvents({
     updateSidebarTitle,
     currentSession,
     maybeGenerateLoadedSessionTitle,
-    clearWaitingResponse,
-    pendingAgentRunId,
+    bumpSessionForAssistant,
+    processedEventIdsRef,
+    processedLegacyMessageRef,
+    generationState,
+    dispatchGeneration,
   ]);
 }

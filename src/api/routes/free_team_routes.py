@@ -242,10 +242,9 @@ def register_free_team_routes(app: FastAPI, server: "WebChatServer") -> None:
             "display_name",
             "enabled",
             "main_pool_id",
-            "agent_team_enabled",
             "max_fallbacks",
             "pools",
-            "agent_team",
+            "llm_profiles",
         }
         for key in body:
             if key not in allowed:
@@ -280,6 +279,53 @@ def register_free_team_routes(app: FastAPI, server: "WebChatServer") -> None:
                 )
         if str(next_profile.get("main_pool_id") or "") not in next_profile["pools"]:
             raise HTTPException(status_code=422, detail="main_pool_id がpoolsに存在しません")
+        llm_profiles = next_profile.get("llm_profiles")
+        if not isinstance(llm_profiles, dict):
+            raise HTTPException(status_code=422, detail="llm_profiles はobjectで指定してください")
+        for profile_id, profile in llm_profiles.items():
+            if not isinstance(profile, dict):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"llm_profiles.{profile_id} はobjectで指定してください",
+                )
+            unsupported = set(profile) - {
+                "profile_id",
+                "name",
+                "target_type",
+                "provider",
+                "model",
+                "effort_policy",
+                "effort",
+                "pool_id",
+                "routing_profile_id",
+            }
+            if unsupported:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"llm_profiles.{profile_id} に未対応の項目があります: {sorted(unsupported)[0]}",
+                )
+            target_type = str(profile.get("target_type") or "inherit").strip().lower()
+            if target_type not in {"inherit", "static", "pool"}:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"llm_profiles.{profile_id}.target_type が不正です",
+                )
+            effort_policy = str(profile.get("effort_policy") or "same").strip().lower()
+            if effort_policy not in {"same", "lower", "explicit", "default"}:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"llm_profiles.{profile_id}.effort_policy が不正です",
+                )
+            if target_type == "pool" and str(profile.get("pool_id") or "") not in next_profile["pools"]:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"llm_profiles.{profile_id}.pool_id がpoolsに存在しません",
+                )
+            if str(profile.get("routing_profile_id") or FREE_TEAM_PROFILE_ID) != FREE_TEAM_PROFILE_ID:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"llm_profiles.{profile_id}.routing_profile_id はfree-team固定です",
+                )
         next_profile["max_fallbacks"] = max(
             0, min(10, int(next_profile.get("max_fallbacks") or 0))
         )

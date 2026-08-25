@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { taskApi, type RecurrenceRule, type Task } from "@/lib/task-api";
 import {
@@ -8,6 +8,11 @@ import {
   parseRrule,
   recurrenceEndDateInputValue,
 } from "@/components/tasks/task-date-picker";
+import { supportsSkipWeekend } from "@/lib/recurrence-rrule";
+import {
+  normalizeSkipMode,
+  type RecurrenceSkipMode,
+} from "@/lib/recurrence-preview";
 
 /**
  * タスク詳細モーダルの繰り返し設定 state とロジックをまとめた hook。
@@ -19,11 +24,13 @@ export function useTaskRecurrence({
   onTaskUpdated,
   setTask,
   ensureTaskId,
+  lifecycleGeneration = 0,
 }: {
   effectiveTaskId: string | null;
   onTaskUpdated: () => void;
   setTask: React.Dispatch<React.SetStateAction<Task | null>>;
   ensureTaskId: () => Promise<string | null>;
+  lifecycleGeneration?: number;
 }) {
   const [recurrenceRule, setRecurrenceRule] = useState<RecurrenceRule | null>(
     null,
@@ -39,10 +46,69 @@ export function useTaskRecurrence({
   const [recEndDate, setRecEndDate] = useState<string | null>(null);
   const [recSkipWeekend, setRecSkipWeekend] = useState(false);
   const [recSkipHoliday, setRecSkipHoliday] = useState(false);
+  const [recSkipMode, setRecSkipMode] =
+    useState<RecurrenceSkipMode>("shift_forward");
   const [recurrenceSaving, setRecurrenceSaving] = useState(false);
+  const requestScopeRef = useRef({
+    taskId: effectiveTaskId,
+    lifecycleGeneration,
+    generation: 0,
+  });
+  if (
+    requestScopeRef.current.taskId !== effectiveTaskId ||
+    requestScopeRef.current.lifecycleGeneration !== lifecycleGeneration
+  ) {
+    requestScopeRef.current = {
+      taskId: effectiveTaskId,
+      lifecycleGeneration,
+      generation: requestScopeRef.current.generation + 1,
+    };
+  }
+
+  const isCurrentScope = useCallback(
+    (scope: {
+      taskId: string | null;
+      lifecycleGeneration: number;
+      generation: number;
+    }) =>
+      requestScopeRef.current.taskId === scope.taskId &&
+      requestScopeRef.current.lifecycleGeneration ===
+        scope.lifecycleGeneration &&
+      requestScopeRef.current.generation === scope.generation,
+    [],
+  );
+
+  const isCurrentSaveTarget = useCallback(
+    (
+      scope: {
+        taskId: string | null;
+        lifecycleGeneration: number;
+        generation: number;
+      },
+      targetTaskId: string | null,
+    ) => {
+      const current = requestScopeRef.current;
+      if (current.lifecycleGeneration !== scope.lifecycleGeneration) {
+        return false;
+      }
+      if (scope.taskId === null) {
+        return current.taskId === null || current.taskId === targetTaskId;
+      }
+      return isCurrentScope(scope);
+    },
+    [isCurrentScope],
+  );
+
+  useEffect(() => {
+    setRecurrenceSaving(false);
+  }, [effectiveTaskId]);
 
   // 繰り返し設定を初期値へ戻す（open 時のリセット用）。
   const resetRecurrenceState = useCallback(() => {
+    requestScopeRef.current = {
+      ...requestScopeRef.current,
+      generation: requestScopeRef.current.generation + 1,
+    };
     setRecurrenceRule(null);
     setRecFreq("WEEKLY");
     setRecInterval(1);
@@ -55,13 +121,18 @@ export function useTaskRecurrence({
     setRecEndDate(null);
     setRecSkipWeekend(false);
     setRecSkipHoliday(false);
+    setRecSkipMode("shift_forward");
+    setRecurrenceSaving(false);
   }, []);
 
   // 繰り返し設定取得
   const fetchRecurrence = useCallback(async () => {
     if (!effectiveTaskId) return;
+    const requestScope = requestScopeRef.current;
+    const requestedTaskId = effectiveTaskId;
     try {
-      const rule = await taskApi.getRecurrence(effectiveTaskId);
+      const rule = await taskApi.getRecurrence(requestedTaskId);
+      if (!isCurrentScope(requestScope)) return;
       setRecurrenceRule(rule);
       if (rule) {
         const parsed = parseRrule(rule.rrule);
@@ -84,11 +155,14 @@ export function useTaskRecurrence({
         setRecResetStatusTo(rule.reset_status_to || "open");
         setRecSkipWeekend(rule.skip_weekend ?? false);
         setRecSkipHoliday(rule.skip_holiday ?? false);
+        setRecSkipMode(normalizeSkipMode(rule.skip_mode));
       }
     } catch (err) {
-      console.error("繰り返し設定取得失敗:", err);
+      if (isCurrentScope(requestScope)) {
+        console.error("繰り返し設定取得失敗:", err);
+      }
     }
-  }, [effectiveTaskId]);
+  }, [effectiveTaskId, isCurrentScope]);
 
   // 曜日トグル
   const toggleWeekday = useCallback((dayKey: string) => {
@@ -113,10 +187,13 @@ export function useTaskRecurrence({
 
   // 繰り返し設定の保存
   const handleSaveRecurrence = useCallback(async () => {
+    const requestScope = requestScopeRef.current;
+    let targetTaskId: string | null = effectiveTaskId;
     setRecurrenceSaving(true);
     try {
-      const targetTaskId = effectiveTaskId ?? (await ensureTaskId());
+      targetTaskId = effectiveTaskId ?? (await ensureTaskId());
       if (!targetTaskId) return;
+      if (!isCurrentSaveTarget(requestScope, targetTaskId)) return;
 
       const rrule = buildRrule(
         recFreq,
@@ -133,16 +210,24 @@ export function useTaskRecurrence({
         reset_status_to: recResetStatusTo,
         end_count: recRecurForever ? null : recEndCount,
         end_date: recRecurForever ? null : recEndDate,
-        skip_weekend: recFreq === "DAILY" ? recSkipWeekend : false,
+        skip_weekend: supportsSkipWeekend(recFreq, recByDay)
+          ? recSkipWeekend
+          : false,
         skip_holiday: recSkipHoliday,
+        skip_mode: recSkipMode,
       });
+      if (!isCurrentSaveTarget(requestScope, targetTaskId)) return;
       setRecurrenceRule(rule);
       setTask((prev) => (prev ? { ...prev, has_recurrence: true } : prev));
       onTaskUpdated();
     } catch (err) {
-      console.error("繰り返し設定の保存に失敗:", err);
+      if (isCurrentSaveTarget(requestScope, targetTaskId)) {
+        console.error("繰り返し設定の保存に失敗:", err);
+      }
     } finally {
-      setRecurrenceSaving(false);
+      if (isCurrentSaveTarget(requestScope, targetTaskId)) {
+        setRecurrenceSaving(false);
+      }
     }
   }, [
     recFreq,
@@ -156,8 +241,10 @@ export function useTaskRecurrence({
     recEndDate,
     recSkipWeekend,
     recSkipHoliday,
+    recSkipMode,
     effectiveTaskId,
     ensureTaskId,
+    isCurrentSaveTarget,
     onTaskUpdated,
     setTask,
   ]);
@@ -165,9 +252,12 @@ export function useTaskRecurrence({
   // 繰り返し設定の削除
   const handleDeleteRecurrence = useCallback(async () => {
     if (!effectiveTaskId) return;
+    const requestScope = requestScopeRef.current;
+    const requestedTaskId = effectiveTaskId;
     setRecurrenceSaving(true);
     try {
-      await taskApi.deleteRecurrence(effectiveTaskId);
+      await taskApi.deleteRecurrence(requestedTaskId);
+      if (!isCurrentScope(requestScope)) return;
       setRecurrenceRule(null);
       setTask((prev) => (prev ? { ...prev, has_recurrence: false } : prev));
 
@@ -183,13 +273,18 @@ export function useTaskRecurrence({
       setRecEndDate(null);
       setRecSkipWeekend(false);
       setRecSkipHoliday(false);
+      setRecSkipMode("shift_forward");
       onTaskUpdated();
     } catch (err) {
-      console.error("繰り返し設定の削除に失敗:", err);
+      if (isCurrentScope(requestScope)) {
+        console.error("繰り返し設定の削除に失敗:", err);
+      }
     } finally {
-      setRecurrenceSaving(false);
+      if (isCurrentScope(requestScope)) {
+        setRecurrenceSaving(false);
+      }
     }
-  }, [effectiveTaskId, onTaskUpdated, setTask]);
+  }, [effectiveTaskId, isCurrentScope, onTaskUpdated, setTask]);
 
   return {
     recurrenceRule,
@@ -205,6 +300,7 @@ export function useTaskRecurrence({
     recEndDate,
     recSkipWeekend,
     recSkipHoliday,
+    recSkipMode,
     recurrenceSaving,
     setRecInterval,
     setRecTriggerStatus,
@@ -215,6 +311,7 @@ export function useTaskRecurrence({
     setRecEndDate,
     setRecSkipWeekend,
     setRecSkipHoliday,
+    setRecSkipMode,
     resetRecurrenceState,
     fetchRecurrence,
     toggleWeekday,

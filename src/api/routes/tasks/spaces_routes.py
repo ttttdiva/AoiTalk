@@ -14,6 +14,11 @@ from ._shared import CreateSpacePayload, TaskRouterContext
 
 
 def register_space_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
+    # Space 削除は配下 Project の workspace まで消すため、ロック取得先と削除先の
+    # root を一致させる必要がある。TaskRouterContext が実効 root を持っていれば
+    # それを使い、無ければ ``None``（= AOITALK_WORKSPACES_DIR 由来の既定 root）を
+    # そのまま渡す。どちらの場合も ProjectRepository 側で 1 度だけ解決される。
+    workspace_root = ctx.workspace_root
     require_auth_dependency = ctx.require_auth_dependency
     get_db_manager = ctx.get_db_manager
     _get_current_user = ctx.get_current_user
@@ -23,6 +28,20 @@ def register_space_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
     _member_space_ids = ctx.member_space_ids
     _get_readable_space = ctx.get_readable_space
     _can_write_space = ctx.can_write_space
+
+    def _serialize_space(space: Space, *, can_write: bool) -> dict:
+        """Serialize a Space together with the caller's write capability.
+
+        ``Space.to_dict`` intentionally remains context-free.  The capability
+        is attached only at the authenticated API boundary so callers cannot
+        accidentally persist one user's authorization decision as model data.
+        Every caller obtains ``can_write`` from the existing
+        ``_can_write_space`` helper (or the result already returned by it),
+        keeping Inbox/owner/admin semantics in one place.
+        """
+        payload = space.to_dict()
+        payload["can_write"] = bool(can_write)
+        return payload
 
     @router.get("/spaces")
     async def list_spaces(
@@ -43,13 +62,27 @@ def register_space_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
             for space in result.scalars().all():
                 if _is_inbox_space(space):
                     if space.owner_id == user_id:
-                        spaces.append(space.to_dict())
+                        can_write, _ = await _can_write_space(
+                            session,
+                            space_id=str(space.id),
+                            user_id=user_id,
+                            user_info=user_info,
+                        )
+                        spaces.append(
+                            _serialize_space(space, can_write=can_write)
+                        )
                 elif (
                     space.owner_id == user_id
                     or is_admin
                     or space.id in member_space_ids
                 ):
-                    spaces.append(space.to_dict())
+                    can_write, _ = await _can_write_space(
+                        session,
+                        space_id=str(space.id),
+                        user_id=user_id,
+                        user_info=user_info,
+                    )
+                    spaces.append(_serialize_space(space, can_write=can_write))
             return {"spaces": spaces, "total": len(spaces)}
         finally:
             await session.close()
@@ -60,7 +93,7 @@ def register_space_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
         request: Request,
         _auth=Depends(require_auth_dependency),
     ):
-        user_id, _ = await _get_current_user(request)
+        user_id, user_info = await _get_current_user(request)
         name = payload.name.strip()
         if not name:
             raise HTTPException(status_code=400, detail="name is required")
@@ -88,7 +121,16 @@ def register_space_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
             session.add(space)
             await session.commit()
             await session.refresh(space)
-            return {"success": True, "space": space.to_dict()}
+            can_write, _ = await _can_write_space(
+                session,
+                space_id=str(space.id),
+                user_id=user_id,
+                user_info=user_info,
+            )
+            return {
+                "success": True,
+                "space": _serialize_space(space, can_write=can_write),
+            }
         finally:
             await session.close()
 
@@ -108,7 +150,13 @@ def register_space_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
                 raise HTTPException(
                     status_code=404, detail="スペースが見つかりません"
                 )
-            return space.to_dict()
+            can_write, _ = await _can_write_space(
+                session,
+                space_id=str(space.id),
+                user_id=user_id,
+                user_info=user_info,
+            )
+            return _serialize_space(space, can_write=can_write)
         finally:
             await session.close()
 
@@ -150,7 +198,10 @@ def register_space_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
 
             await session.commit()
             await session.refresh(space)
-            return {"success": True, "space": space.to_dict()}
+            return {
+                "success": True,
+                "space": _serialize_space(space, can_write=allowed),
+            }
         finally:
             await session.close()
 
@@ -181,6 +232,7 @@ def register_space_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
                 session,
                 space.id,
                 delete_workspaces=True,
+                workspace_root=workspace_root,
             )
             await session.delete(space)
             await session.commit()

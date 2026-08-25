@@ -1,6 +1,16 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  // 開発・通常検証が稼働中の本番成果物を上書きしないよう出力先を分離する。
+  // next dev は .next-dev、npm run build は .next-verify を使用する。
+  // npm run build:production と next start だけが本番の .next を使用する。
+  distDir:
+    process.env.NEXT_DIST_DIR ||
+    (process.env.NODE_ENV === "development"
+      ? ".next-dev"
+      : process.env.npm_lifecycle_event === "build"
+        ? ".next-verify"
+        : ".next"),
   experimental: {
     proxyClientMaxBodySize: "100mb",
   },

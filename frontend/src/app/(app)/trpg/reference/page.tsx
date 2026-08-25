@@ -1,439 +1,357 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Badge } from "@/components/ui/badge";
+import Link from "next/link";
+import { useMemo, useState } from "react";
+import useSWR from "swr";
+import {
+  ArrowLeft,
+  ArrowUpRight,
+  BookOpen,
+  FileText,
+  Link2,
+  Loader2,
+  LockKeyhole,
+  RefreshCcw,
+  Search,
+} from "lucide-react";
+import { AppSelect } from "@/components/ui/app-select";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { BookOpen, Database, ScrollText, Search, Shield, Skull } from "lucide-react";
+import { TrpgWorkspaceShell } from "@/components/trpg/trpg-workspace";
 
-type RuleReference = {
-  id: string;
-  title: string;
-  rule_domain: string;
-  mechanic_key: string;
-  source_title: string;
-  raw_excerpt: string;
-  confidence: number;
-  needs_review: boolean;
-};
-
-type CreatureReference = {
-  id: string;
-  name: string;
-  entry_type: string;
-  classification: string;
-  summary: string;
-  source_excerpt: string;
-  confidence: string;
-  ocr_status: string;
-  characteristics: Record<string, number>;
-  attacks: Array<Record<string, unknown>>;
-  spells: Array<Record<string, unknown>>;
-  san_loss: string;
-  mechanic_links: string[];
-  needs_review: boolean;
-};
-
-type ReferenceResponse = {
-  rules: RuleReference[];
-  creatures: CreatureReference[];
-  count: number;
-};
-
-type ReferenceStats = {
-  rule_items: number;
-  creature_entries: number;
-  creature_types: Record<string, number>;
-  rule_domains: Record<string, number>;
-  mechanics: Record<string, number>;
-};
-
-type RulesetProfile = {
-  key: string;
-  display_name: string;
+type Ruleset = {
+  key?: string;
+  name?: string;
+  label?: string;
+  display_name?: string;
+  description?: string;
   edition?: string;
   system_type?: string;
 };
 
-type RulesetResponse = {
-  rulesets: RulesetProfile[];
-  count: number;
+type ReferenceItem = Record<string, unknown>;
+
+type ReferenceBundle = {
+  count?: number;
+  rules?: ReferenceItem[];
+  creatures?: ReferenceItem[];
+  mechanic_links?: ReferenceItem[];
 };
 
-type ViewMode = "creatures" | "rules" | "tomes" | "all";
+type RulesetsPayload = { rulesets?: Ruleset[] };
 
-const TOME_DOMAINS = new Set(["mythos_tomes", "occult_tomes"]);
+const EMPTY_RULESETS: Ruleset[] = [];
+const EMPTY_BUNDLE: ReferenceBundle = {};
 
-const FALLBACK_RULESETS: RulesetProfile[] = [
-  { key: "coc6", display_name: "クトゥルフ神話TRPG 6版", system_type: "coc" },
-  { key: "coc7", display_name: "クトゥルフ神話TRPG 7版", system_type: "coc" },
-  { key: "generic", display_name: "汎用TRPG", system_type: "generic" },
-];
+// 資料は読み取り専用の参照 UI。フォーカス/再接続などの自動再取得は行わない。
+const REFERENCE_SWR_OPTIONS = {
+  revalidateOnMount: true,
+  revalidateOnFocus: false,
+  revalidateOnReconnect: false,
+  revalidateIfStale: false,
+  shouldRetryOnError: false,
+} as const;
 
-async function py<T>(path: string): Promise<T> {
-  const res = await fetch(`/api/python-proxy${path}`, {
-    credentials: "include",
-  });
-  if (!res.ok) throw new Error(`API Error: ${res.status}`);
-  return res.json();
+function textValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-function excerpt(value: string, limit = 520) {
-  const text = (value || "").replace(/\n{3,}/g, "\n\n").trim();
-  if (text.length <= limit) return text;
-  return `${text.slice(0, limit - 1).trim()}...`;
+function itemText(item: ReferenceItem, ...keys: string[]): string {
+  for (const key of keys) {
+    const value = textValue(item[key]);
+    if (value) return value;
+  }
+  return "資料項目";
 }
 
-function statLine(stats: Record<string, number>) {
-  return ["STR", "CON", "SIZ", "INT", "POW", "DEX", "APP", "EDU", "SAN"]
-    .filter((key) => stats[key] !== undefined && stats[key] !== null)
-    .map((key) => `${key} ${stats[key]}`)
-    .join(" / ");
+function itemDescription(item: ReferenceItem): string {
+  return itemText(item, "description", "summary", "content", "source_text", "text");
 }
 
-export default function TRPGReferencePage() {
-  const detailScrollRef = useRef<HTMLDivElement | null>(null);
-  const [rulesets, setRulesets] = useState<RulesetProfile[]>(FALLBACK_RULESETS);
-  const [selectedRuleset, setSelectedRuleset] = useState("coc6");
-  const [query, setQuery] = useState("");
-  const [mode, setMode] = useState<ViewMode>("creatures");
-  const [creatureType, setCreatureType] = useState("");
-  const [data, setData] = useState<ReferenceResponse>({ rules: [], creatures: [], count: 0 });
-  const [stats, setStats] = useState<ReferenceStats | null>(null);
-  const [selectedCreature, setSelectedCreature] = useState<CreatureReference | null>(null);
-  const [selectedRule, setSelectedRule] = useState<RuleReference | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
+function rulesetName(ruleset: Ruleset): string {
+  return ruleset.display_name ?? ruleset.name ?? ruleset.label ?? ruleset.key ?? "ルールセット";
+}
 
-  const selectedRulesetProfile = useMemo(
-    () => rulesets.find((ruleset) => ruleset.key === selectedRuleset) ?? null,
-    [rulesets, selectedRuleset],
-  );
-  const isCocRuleset =
-    selectedRulesetProfile?.system_type === "coc" || selectedRuleset.startsWith("coc");
-  const creatureModeLabel = isCocRuleset ? "神話生物" : "生物・データ";
-  const searchPlaceholder = isCocRuleset
-    ? "名称、SAN、攻撃、呪文など"
-    : "名称、判定、技能、リソースなど";
-  const tomeCount = (stats?.rule_domains?.mythos_tomes ?? 0) + (stats?.rule_domains?.occult_tomes ?? 0);
-  const ruleOnlyCount = Math.max(0, (stats?.rule_items ?? 0) - tomeCount);
+function rulesetMeta(ruleset: Ruleset): string | null {
+  const values = [ruleset.system_type, ruleset.edition].map(textValue).filter(Boolean);
+  return values.length ? values.join(" · ") : null;
+}
 
-  const resetDetailScroll = useCallback(() => {
-    detailScrollRef.current?.scrollTo({ top: 0 });
-  }, []);
+async function fetchJson<T>(url: string, failureMessage: string): Promise<T> {
+  const response = await fetch(url, { cache: "no-store" });
+  if (!response.ok) throw new Error(failureMessage);
+  return (await response.json()) as T;
+}
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError("");
-    try {
-      const params = new URLSearchParams({
-        query,
-        kind: mode,
-        limit: "40",
-      });
-      if (mode === "creatures" && creatureType) {
-        params.set("creature_type", creatureType);
-      }
-      const result = await py<ReferenceResponse>(
-        `/api/trpg/rulesets/${encodeURIComponent(selectedRuleset)}/references?${params.toString()}`,
-      );
-      setData(result);
-      setSelectedCreature((current) => {
-        if (current && result.creatures.some((item) => item.id === current.id)) return current;
-        return result.creatures[0] ?? null;
-      });
-      setSelectedRule((current) => {
-        if (current && result.rules.some((item) => item.id === current.id)) return current;
-        return result.rules[0] ?? null;
-      });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "読み込みに失敗しました");
-    } finally {
-      setLoading(false);
-    }
-  }, [creatureType, mode, query, selectedRuleset]);
+function errorMessage(reason: unknown): string {
+  return reason instanceof Error ? reason.message : "資料を取得できませんでした";
+}
 
-  useEffect(() => {
-    py<RulesetResponse>("/api/trpg/rulesets")
-      .then((result) => {
-        if (result.rulesets.length > 0) {
-          setRulesets(result.rulesets);
-        }
-      })
-      .catch(() => {
-        setRulesets(FALLBACK_RULESETS);
-      });
-  }, []);
+const sectionDefinitions = [
+  { key: "rules", label: "ルール", icon: BookOpen, description: "判定・技能・戦闘などの構造化されたルール項目" },
+  { key: "creatures", label: "クリーチャー", icon: Search, description: "ルールセットに登録されたクリーチャー資料" },
+  { key: "mechanic_links", label: "関連資料", icon: Link2, description: "メカニクスに紐づく参照リンク" },
+] as const;
 
-  useEffect(() => {
-    setStats(null);
-    setSelectedCreature(null);
-    setSelectedRule(null);
-    setData({ rules: [], creatures: [], count: 0 });
-    setCreatureType("");
-    resetDetailScroll();
-    py<ReferenceStats>(
-      `/api/trpg/rulesets/${encodeURIComponent(selectedRuleset)}/reference-stats`,
-    )
-      .then(setStats)
-      .catch((err) => setError(err instanceof Error ? err.message : "統計の取得に失敗しました"));
-  }, [resetDetailScroll, selectedRuleset]);
-
-  useEffect(() => {
-    const timer = window.setTimeout(load, 180);
-    return () => window.clearTimeout(timer);
-  }, [load]);
-
-  const activeDetail = useMemo(() => {
-    if (mode === "rules" || mode === "tomes") return selectedRule;
-    return selectedCreature ?? selectedRule;
-  }, [mode, selectedCreature, selectedRule]);
-
-  const selectCreature = useCallback(
-    (item: CreatureReference) => {
-      setSelectedCreature(item);
-      resetDetailScroll();
-    },
-    [resetDetailScroll],
-  );
-
-  const selectRule = useCallback(
-    (item: RuleReference) => {
-      setSelectedRule(item);
-      resetDetailScroll();
-    },
-    [resetDetailScroll],
-  );
+function ReferenceItemCard({ item, sectionKey }: { item: ReferenceItem; sectionKey: string }) {
+  const metadataKeys = sectionKey === "creatures"
+    ? ["entry_type", "source_title"]
+    : ["rule_domain", "mechanic_key", "source_title"];
+  const metadata = metadataKeys
+    .map((key) => textValue(item[key]))
+    .filter((value): value is string => Boolean(value));
+  const sourceUrl = textValue(item.url) ?? textValue(item.source_url);
 
   return (
-    <div className="mx-auto flex max-w-7xl flex-col gap-5 p-4 md:p-6">
-      <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
-        <div>
-          <h1 className="flex items-center gap-2 text-2xl font-semibold tracking-normal">
-            <BookOpen className="size-6" />
-            TRPG ルール資料
-          </h1>
-          <div className="mt-2 flex flex-wrap gap-2 text-sm">
-            <Badge variant="outline">
-              {selectedRulesetProfile?.display_name ?? selectedRuleset}
-            </Badge>
-            <Badge variant="secondary">
-              ルール {stats ? ruleOnlyCount : "-"}
-            </Badge>
-            <Badge variant="secondary">
-              書物 {stats ? tomeCount : "-"}
-            </Badge>
-            <Badge variant="secondary">
-              {creatureModeLabel} {stats?.creature_entries ?? "-"}
-            </Badge>
-            {isCocRuleset && (
-              <>
-                <Badge variant="outline">
-                  神格 {stats?.creature_types?.deity ?? 0}
-                </Badge>
-                <Badge variant="outline">
-                  クリーチャー {stats?.creature_types?.creature ?? 0}
-                </Badge>
-              </>
-            )}
-          </div>
-        </div>
-        <div className="flex flex-col gap-2 md:w-[520px]">
-          <select
-            value={selectedRuleset}
-            onChange={(event) => setSelectedRuleset(event.target.value)}
-            className="h-9 rounded-md border border-input bg-background px-3 text-sm"
-            aria-label="TRPGシステム"
+    <article className="min-w-0 rounded-[4px] border border-border bg-background/70 p-3 transition-colors hover:border-primary/45 hover:bg-muted/20">
+      <div className="flex items-start justify-between gap-3">
+        <h3 className="min-w-0 truncate text-sm font-semibold">{itemText(item, "title", "name", "label", "key")}</h3>
+        {sourceUrl ? (
+          <a
+            href={sourceUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="shrink-0 text-muted-foreground hover:text-primary"
+            aria-label="関連資料を開く"
           >
-            {rulesets.map((ruleset) => (
-              <option key={ruleset.key} value={ruleset.key}>
-                {ruleset.display_name || ruleset.key}
-              </option>
-            ))}
-          </select>
-          <div className="flex gap-2">
-            <div className="relative min-w-0 flex-1">
-              <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                className="pl-9"
-                placeholder={searchPlaceholder}
-              />
-            </div>
-            <Button variant="outline" onClick={load} disabled={loading}>
-              <Search className="size-4" />
-            </Button>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {(["creatures", "rules", "tomes", "all"] as const).map((value) => (
-              <Button
-                key={value}
-                type="button"
-                size="sm"
-                variant={mode === value ? "default" : "outline"}
-                onClick={() => setMode(value)}
-              >
-                {value === "creatures"
-                  ? creatureModeLabel
-                  : value === "rules"
-                    ? "ルール"
-                    : value === "tomes"
-                      ? "書物"
-                      : "すべて"}
-              </Button>
-            ))}
-            {mode === "creatures" && (
-              <select
-                value={creatureType}
-                onChange={(event) => setCreatureType(event.target.value)}
-                className="h-9 rounded-md border border-input bg-background px-3 text-sm"
-                aria-label="種別"
-              >
-                <option value="">全種別</option>
-                <option value="creature">クリーチャー</option>
-                <option value="deity">神格</option>
-              </select>
-            )}
-          </div>
-        </div>
+            <ArrowUpRight className="size-3.5" aria-hidden="true" />
+          </a>
+        ) : null}
       </div>
-
-      {error && (
-        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {error}
-        </div>
-      )}
-
-      <div className="grid min-h-0 gap-4 lg:h-[calc(100vh-190px)] lg:min-h-[560px] lg:grid-cols-[minmax(0,1fr)_420px]">
-        <div className="flex min-h-[420px] flex-col overflow-hidden rounded-md border lg:h-full">
-          <div className="flex shrink-0 items-center justify-between border-b px-3 py-2">
-            <span className="text-sm text-muted-foreground">
-              {loading ? "読み込み中" : `${data.count}件`}
+      <p className="mt-1.5 line-clamp-3 text-xs leading-5 text-muted-foreground">{itemDescription(item)}</p>
+      {metadata.length ? (
+        <div className="mt-3 flex flex-wrap gap-1.5">
+          {metadata.map((value) => (
+            <span key={value} className="rounded-[3px] border border-border bg-muted/35 px-1.5 py-0.5 text-[10px] text-muted-foreground">
+              {value}
             </span>
-            <Database className="size-4 text-muted-foreground" />
-          </div>
-          <div className="min-h-0 flex-1 divide-y overflow-y-auto">
-            {mode !== "rules" &&
-              data.creatures.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => selectCreature(item)}
-                  className="flex w-full flex-col gap-2 px-4 py-3 text-left hover:bg-muted/50"
-                >
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Skull className="size-4 text-muted-foreground" />
-                    <span className="font-medium">{item.name}</span>
-                    <Badge variant={item.entry_type === "deity" ? "default" : "secondary"}>
-                      {item.entry_type === "deity" ? "神格" : "クリーチャー"}
-                    </Badge>
-                    {item.san_loss && <Badge variant="outline">SAN {item.san_loss}</Badge>}
-                    {item.needs_review && <Badge variant="outline">要確認</Badge>}
-                  </div>
-                  <p className="line-clamp-2 whitespace-pre-line text-sm text-muted-foreground">
-                    {excerpt(item.summary || item.source_excerpt, 180)}
-                  </p>
-                </button>
-              ))}
-            {mode !== "creatures" &&
-              data.rules.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => selectRule(item)}
-                  className="flex w-full flex-col gap-2 px-4 py-3 text-left hover:bg-muted/50"
-                >
-                  <div className="flex flex-wrap items-center gap-2">
-                    {TOME_DOMAINS.has(item.rule_domain) ? (
-                      <ScrollText className="size-4 text-muted-foreground" />
-                    ) : (
-                      <Shield className="size-4 text-muted-foreground" />
-                    )}
-                    <span className="font-medium">{item.title}</span>
-                    <Badge variant="secondary">
-                      {item.rule_domain === "mythos_tomes"
-                        ? "魔道書"
-                        : item.rule_domain === "occult_tomes"
-                          ? "オカルト本"
-                          : item.rule_domain}
-                    </Badge>
-                    {item.mechanic_key && <Badge variant="outline">{item.mechanic_key}</Badge>}
-                    {item.needs_review && <Badge variant="outline">要確認</Badge>}
-                  </div>
-                  <p className="line-clamp-2 whitespace-pre-line text-sm text-muted-foreground">
-                    {excerpt(item.raw_excerpt, 180)}
-                  </p>
-                </button>
-              ))}
-            {!loading && data.count === 0 && (
-              <div className="px-4 py-10 text-center text-sm text-muted-foreground">
-                該当なし
-              </div>
-            )}
-          </div>
+          ))}
         </div>
+      ) : null}
+    </article>
+  );
+}
 
-        <Card className="min-h-[420px] gap-0 overflow-hidden py-0 lg:h-full">
-          <CardContent
-            ref={detailScrollRef}
-            className="h-full space-y-4 overflow-y-auto p-4"
-          >
-            {activeDetail && "name" in activeDetail ? (
-              <>
-                <div className="space-y-2">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <h2 className="text-lg font-semibold">{activeDetail.name}</h2>
-                    <Badge variant={activeDetail.entry_type === "deity" ? "default" : "secondary"}>
-                      {activeDetail.entry_type === "deity" ? "神格" : "クリーチャー"}
-                    </Badge>
-                  </div>
-                  {activeDetail.san_loss && <Badge variant="outline">SAN {activeDetail.san_loss}</Badge>}
-                </div>
-                {statLine(activeDetail.characteristics) && (
-                  <div className="rounded-md bg-muted px-3 py-2 text-sm">
-                    {statLine(activeDetail.characteristics)}
-                  </div>
-                )}
-                <div className="whitespace-pre-line text-sm leading-6">
-                  {excerpt(activeDetail.source_excerpt, 1400)}
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {activeDetail.mechanic_links.map((link) => (
-                    <Badge key={link} variant="outline">
-                      {link}
-                    </Badge>
+export default function TrpgReferencePage() {
+  // 明示的に選ばれていない間は先頭のルールセットを使う（effect 内 setState を避ける）。
+  const [selectedRulesetKey, setSelectedRulesetKey] = useState("");
+  const [query, setQuery] = useState("");
+  const [submittedQuery, setSubmittedQuery] = useState("");
+
+  const {
+    data: rulesetsPayload,
+    error: rulesetsError,
+    isLoading: rulesetsLoading,
+    mutate: mutateRulesets,
+  } = useSWR<RulesetsPayload>(
+    "trpg/rulesets",
+    () =>
+      fetchJson<RulesetsPayload>(
+        "/api/python-proxy/trpg/rulesets",
+        "ルールセットを取得できませんでした",
+      ),
+    REFERENCE_SWR_OPTIONS,
+  );
+
+  const rulesets = rulesetsPayload?.rulesets ?? EMPTY_RULESETS;
+  const rulesetKey = selectedRulesetKey || rulesets[0]?.key || "";
+  const activeRuleset = rulesets.find((ruleset) => ruleset.key === rulesetKey);
+
+  const {
+    data: bundle = EMPTY_BUNDLE,
+    error: referencesError,
+    isLoading: referencesLoading,
+    isValidating: referencesValidating,
+    mutate: mutateReferences,
+  } = useSWR<ReferenceBundle>(
+    rulesetKey ? ["trpg/references", rulesetKey, submittedQuery] : null,
+    () => {
+      const params = new URLSearchParams({ query: submittedQuery, kind: "all", limit: "40" });
+      return fetchJson<ReferenceBundle>(
+        `/api/python-proxy/trpg/rulesets/${encodeURIComponent(rulesetKey)}/references?${params.toString()}`,
+        "資料を取得できませんでした",
+      );
+    },
+    REFERENCE_SWR_OPTIONS,
+  );
+
+  const loading =
+    rulesetsLoading || (rulesetKey !== "" && (referencesLoading || referencesValidating));
+  const failure = rulesetsError ?? referencesError;
+  const error = failure ? errorMessage(failure) : null;
+
+  const sections = useMemo(
+    () =>
+      sectionDefinitions.map((definition) => ({
+        ...definition,
+        items: bundle[definition.key] ?? [],
+      })),
+    [bundle],
+  );
+
+  const retry = () => {
+    if (rulesetsError) void mutateRulesets();
+    if (rulesetKey) void mutateReferences();
+  };
+
+  return (
+    <TrpgWorkspaceShell>
+      <div className="min-h-full bg-background text-foreground" data-trpg-capability="read-only">
+        <div className="mx-auto max-w-[1480px] p-5 sm:p-6">
+          <header className="flex flex-wrap items-end justify-between gap-4 border-b border-border pb-5">
+            <div className="min-w-0">
+              <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-primary">
+                TRPG · Reference Library
+              </div>
+              <h1 className="mt-1 text-2xl font-semibold tracking-tight sm:text-[28px]">資料を参照</h1>
+              <p className="mt-2 max-w-2xl text-sm leading-5 text-muted-foreground">
+                ルールセットを選び、登録済みのルール・クリーチャー・関連資料を検索します。
+                この画面から資料を編集することはできません。
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="inline-flex items-center gap-1.5 rounded-[4px] border border-primary/35 bg-primary/10 px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-primary">
+                <LockKeyhole className="size-3.5" aria-hidden="true" />
+                Read only
+              </span>
+              <Button nativeButton={false} variant="outline" size="sm" render={<Link href="/trpg" />}>
+                <ArrowLeft className="size-3.5" aria-hidden="true" />
+                TRPGホーム
+              </Button>
+            </div>
+          </header>
+
+          <section className="mt-5 rounded-lg border border-border bg-card" aria-labelledby="reference-controls-title">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border bg-muted/25 px-4 py-3">
+              <div className="flex items-center gap-2">
+                <Search className="size-4 text-primary" aria-hidden="true" />
+                <h2 id="reference-controls-title" className="text-sm font-semibold">参照条件</h2>
+              </div>
+              <span className="text-[11px] text-muted-foreground">
+                {bundle.count !== undefined ? `${bundle.count.toLocaleString("ja-JP")}件` : "読み取り専用"}
+              </span>
+            </div>
+            <div className="flex flex-col gap-3 p-4 lg:flex-row lg:items-end">
+              <label className="flex min-w-52 flex-1 flex-col gap-1.5 text-xs font-medium text-muted-foreground">
+                ルールセット
+                <AppSelect
+                  aria-label="ルールセット"
+                  className="h-9 w-full rounded-[4px] border border-input bg-background px-3 text-sm text-foreground"
+                  value={rulesetKey}
+                  disabled={rulesetsLoading || rulesets.length === 0}
+                  onChange={(event) => setSelectedRulesetKey(event.target.value)}
+                >
+                  {rulesets.map((ruleset) => (
+                    <option key={ruleset.key} value={ruleset.key}>
+                      {rulesetName(ruleset)}
+                    </option>
                   ))}
-                </div>
-              </>
-            ) : activeDetail && "title" in activeDetail ? (
-              <>
-                <div className="space-y-2">
-                  <h2 className="text-lg font-semibold">{activeDetail.title}</h2>
-                  <div className="flex flex-wrap gap-2">
-                    <Badge variant="secondary">
-                      {activeDetail.rule_domain === "mythos_tomes"
-                        ? "魔道書"
-                        : activeDetail.rule_domain === "occult_tomes"
-                          ? "オカルト本"
-                          : activeDetail.rule_domain}
-                    </Badge>
-                    {activeDetail.mechanic_key && (
-                      <Badge variant="outline">{activeDetail.mechanic_key}</Badge>
+                </AppSelect>
+              </label>
+              <form
+                className="flex min-w-0 flex-[2] gap-2"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  setSubmittedQuery(query.trim());
+                }}
+              >
+                <label className="sr-only" htmlFor="trpg-reference-query">資料を検索</label>
+                <input
+                  id="trpg-reference-query"
+                  aria-label="資料を検索"
+                  className="h-9 min-w-0 flex-1 rounded-[4px] border border-input bg-background px-3 text-sm outline-none transition-colors placeholder:text-muted-foreground focus:border-primary focus:ring-1 focus:ring-primary"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder="ルール・クリーチャーを検索"
+                />
+                <Button type="submit" size="sm">
+                  <Search className="size-3.5" aria-hidden="true" />
+                  検索
+                </Button>
+              </form>
+            </div>
+            {activeRuleset ? (
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-border px-4 py-3 text-xs text-muted-foreground">
+                <span className="font-medium text-foreground">{rulesetName(activeRuleset)}</span>
+                {rulesetMeta(activeRuleset) ? <span>{rulesetMeta(activeRuleset)}</span> : null}
+                {textValue(activeRuleset.description) ? <span className="basis-full lg:basis-auto">{activeRuleset.description}</span> : null}
+              </div>
+            ) : null}
+          </section>
+
+          {error ? (
+            <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive" role="alert">
+              <span>{error}</span>
+              <Button type="button" variant="outline" size="sm" onClick={retry}>
+                <RefreshCcw className="size-3.5" aria-hidden="true" />
+                再読み込み
+              </Button>
+            </div>
+          ) : null}
+
+          <div className="mt-4 space-y-4" aria-busy={loading}>
+            {loading ? (
+              <div className="flex items-center justify-center gap-2 rounded-lg border border-border bg-card px-4 py-12 text-sm text-muted-foreground">
+                <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+                資料を読み込んでいます…
+              </div>
+            ) : null}
+
+            {!loading && !error && rulesetKey === "" ? (
+              <div className="rounded-lg border border-dashed border-border bg-card px-4 py-12 text-center">
+                <BookOpen className="mx-auto size-8 text-muted-foreground/60" aria-hidden="true" />
+                <h2 className="mt-3 text-sm font-semibold">利用できるルールセットがありません</h2>
+                <p className="mt-1.5 text-xs leading-5 text-muted-foreground">ルールセットが登録されると、ここから資料を参照できます。</p>
+              </div>
+            ) : null}
+
+            {!loading && rulesetKey !== "" ? (
+              <div className="grid gap-4 xl:grid-cols-2">
+                {sections.map(({ key, label, icon: Icon, description, items }) => (
+                  <section key={key} className="overflow-hidden rounded-lg border border-border bg-card" aria-labelledby={`trpg-section-${key}`}>
+                    <div className="flex items-center justify-between gap-3 border-b border-border bg-muted/25 px-4 py-3">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <Icon className="size-4 shrink-0 text-primary" aria-hidden="true" />
+                        <div className="min-w-0">
+                          <h2 id={`trpg-section-${key}`} className="truncate text-sm font-semibold">{label}</h2>
+                          <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{description}</p>
+                        </div>
+                      </div>
+                      <span className="rounded-[4px] border border-border bg-background px-2 py-1 text-[10px] font-medium tabular-nums text-muted-foreground">
+                        {items.length}
+                      </span>
+                    </div>
+                    {items.length ? (
+                      <div className="grid gap-2 p-3 sm:grid-cols-2">
+                        {items.map((item, index) => (
+                          <ReferenceItemCard key={`${key}-${String(item.id ?? item.key ?? index)}`} item={item} sectionKey={key} />
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="px-4 py-8 text-center text-xs text-muted-foreground">
+                        該当する資料はありません。
+                      </div>
                     )}
-                  </div>
-                </div>
-                <div className="whitespace-pre-line text-sm leading-6">
-                  {excerpt(activeDetail.raw_excerpt, 1400)}
-                </div>
-              </>
-            ) : (
-              <div className="py-12 text-center text-sm text-muted-foreground">未選択</div>
-            )}
-          </CardContent>
-        </Card>
+                  </section>
+                ))}
+              </div>
+            ) : null}
+          </div>
+
+          <footer className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4">
+            <p className="text-xs text-muted-foreground">資料の編集とルールブック管理は各専用画面で行います。</p>
+            <div className="flex flex-wrap gap-2">
+              <Button nativeButton={false} variant="outline" size="sm" render={<Link href="/scenarios/library?tab=rules" />}>
+                <BookOpen className="size-3.5" aria-hidden="true" />
+                共有ルールブック
+              </Button>
+              <Button nativeButton={false} variant="ghost" size="sm" render={<Link href="/scenarios?kind=trpg" />}>
+                <FileText className="size-3.5" aria-hidden="true" />
+                Story Studio
+              </Button>
+            </div>
+          </footer>
+        </div>
       </div>
-    </div>
+    </TrpgWorkspaceShell>
   );
 }

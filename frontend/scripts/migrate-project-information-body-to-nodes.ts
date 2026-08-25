@@ -189,7 +189,7 @@ async function main() {
         for (const [index, item] of nodes.entries()) {
           const child = await insertDocsNode(tx, {
             id: randomUUID(),
-            workspaceId: plan.node.workspaceId,
+            docsLibraryId: plan.node.docsLibraryId,
             parentId,
             rootPageId,
             projectId: plan.node.projectId,

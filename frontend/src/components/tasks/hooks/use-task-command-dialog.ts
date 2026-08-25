@@ -76,8 +76,10 @@ export function useTaskCommandDialog({
   );
   const [taskCommandError, setTaskCommandError] = useState<string | null>(null);
   const [taskCommandLoading, setTaskCommandLoading] = useState(false);
-  // バックグラウンド保存の同時実行数。連発時は最後の1件完了時だけ再取得する。
+  // バックグラウンド保存の同時実行数。成功時は更新レスポンスを局所反映し、
+  // いずれかが失敗した時だけ最後に全量再取得してロールバックする。
   const pendingSavesRef = useRef(0);
+  const failedSaveRef = useRef(false);
   const taskCommandTask = useMemo(
     () => tasks.find((item) => item.id === taskCommandTaskId) ?? null,
     [taskCommandTaskId, tasks],
@@ -266,13 +268,14 @@ export function useTaskCommandDialog({
               queueTaskCompletionUndo([targetTask]);
             }
           } catch (err) {
+            failedSaveRef.current = true;
             console.error("タスクコマンド実行失敗:", err);
             toast.error("タスクコマンドの実行に失敗しました。");
           } finally {
             pendingSavesRef.current -= 1;
-            // 連発時は最後の保存完了時だけ全件再取得し、サーバー状態と整合させる。
-            // 失敗時はこの再取得が楽観的更新のロールバックを兼ねる。
-            if (pendingSavesRef.current === 0) {
+            // 成功時は upsert 済みなので再取得しない。失敗時だけ楽観更新を戻す。
+            if (pendingSavesRef.current === 0 && failedSaveRef.current) {
+              failedSaveRef.current = false;
               await fetchData();
             }
           }

@@ -2,7 +2,8 @@ import React from 'react';
 import { Alert, StyleSheet, View } from 'react-native';
 import { useRouter } from 'expo-router';
 import { goBackOrReplace } from '../../../lib/navigation';
-import { Button, IconButton, Surface, Text } from 'react-native-paper';
+import { Button, Surface, Text } from 'react-native-paper';
+import { ScreenHeader } from '../../../components/screen-header';
 import { checkForUpdate, getCurrentVersion, showUpdateAlert } from '../../../lib/update-service';
 
 export default function SettingsAboutScreen() {
@@ -10,14 +11,10 @@ export default function SettingsAboutScreen() {
 
   return (
     <View style={styles.container}>
-      <Surface style={styles.header} elevation={1}>
-        <View style={styles.headerRow}>
-          <IconButton icon="arrow-left" iconColor="#cdd6f4" onPress={() => goBackOrReplace(router, '/(tabs)/settings')} />
-          <Text variant="titleLarge" style={styles.headerTitle}>
-            アプリ情報
-          </Text>
-        </View>
-      </Surface>
+      <ScreenHeader
+        title="アプリ情報"
+        onBack={() => goBackOrReplace(router, '/(tabs)/settings')}
+      />
       <Surface style={styles.card} elevation={0}>
         <Text style={styles.appName}>AoiTalk Mobile</Text>
         <Text style={styles.meta}>バージョン {getCurrentVersion()}</Text>
@@ -32,6 +29,11 @@ export default function SettingsAboutScreen() {
             const result = await checkForUpdate();
             if (result.available) {
               showUpdateAlert(result);
+            } else if (result.error) {
+              Alert.alert(
+                '更新の確認に失敗しました',
+                `更新情報を取得できませんでした。\n\n理由: ${result.error}\n\n通信環境を確認して、もう一度お試しください。`,
+              );
             } else {
               Alert.alert(
                 'アプリ',
@@ -49,9 +51,6 @@ export default function SettingsAboutScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#11111b', paddingBottom: 24 },
-  header: { paddingTop: 52, paddingHorizontal: 8, paddingBottom: 16, backgroundColor: '#1e1e2e' },
-  headerRow: { flexDirection: 'row', alignItems: 'center' },
-  headerTitle: { color: '#cdd6f4', fontWeight: 'bold' },
   card: { backgroundColor: '#1e1e2e', borderRadius: 12, padding: 16, margin: 16 },
   appName: { color: '#cdd6f4', fontSize: 20, fontWeight: '700' },
   meta: { color: '#a6adc8', fontSize: 13, marginTop: 4 },

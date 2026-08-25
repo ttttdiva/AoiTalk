@@ -30,6 +30,15 @@ import {
   keymap,
   rectangularSelection,
 } from "@codemirror/view";
+import {
+  createEditorImageInsertExtension,
+  type EditorImageInsertHandler,
+} from "./image-insert-extension";
+
+// Re-export the shared pipeline for editors that import all CodeMirror
+// primitives from this module.
+export { createEditorImageInsertExtension } from "./image-insert-extension";
+export type { EditorImageInsertHandler } from "./image-insert-extension";
 
 export type EditorLanguage =
   | "plain"
@@ -172,6 +181,18 @@ export function baseTextEditorExtensions(options?: {
   language?: string;
   includeSearch?: boolean;
   includeCompletion?: boolean;
+  /** Optional image upload pipeline; omitted to preserve text-editor defaults. */
+  imageInsertHandler?: EditorImageInsertHandler;
+  /** Disable image handling for non-markdown documents without rebuilding view. */
+  imageInsertEnabled?: boolean | (() => boolean);
+  /** Keep async insertion tied to the editor/document that started it. */
+  imageInsertActive?: boolean | (() => boolean);
+  /** Owner token used to reject results from a previous document in a reused view. */
+  imageInsertOwnerKey?: () => unknown;
+  /** Supports static and dynamic read-only editor surfaces. */
+  imageInsertReadOnly?: boolean | (() => boolean);
+  /** Alias for callers that already expose a `readOnly` prop. */
+  readOnly?: boolean;
 }): Extension[] {
   const language = options?.language ?? "markdown";
   const languageExtension = getLanguageExtension(language);
@@ -201,6 +222,17 @@ export function baseTextEditorExtensions(options?: {
     ]),
     ...(options?.includeCompletion ? [autocompletion()] : []),
     ...(languageExtension ? [languageExtension] : []),
+    ...(options?.imageInsertHandler
+      ? [
+          createEditorImageInsertExtension({
+            handler: options.imageInsertHandler,
+            enabled: options.imageInsertEnabled,
+            active: options.imageInsertActive,
+            ownerKey: options.imageInsertOwnerKey,
+            readOnly: options.imageInsertReadOnly ?? options.readOnly,
+          }),
+        ]
+      : []),
   ];
 }
 

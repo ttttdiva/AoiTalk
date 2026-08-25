@@ -1,22 +1,21 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { RelatedTaskSummary } from "@/components/chat/related-information-panel";
 
 type UseRelatedTasksPanelArgs = {
   activeSessionId: string | null;
   isMobile: boolean;
-  hasScenarioPanel: boolean;
 };
 
 /**
- * チャット右レール（関連情報パネル・関連タスク数・モバイルシート開閉）を担うフック。
- * `page.tsx` 由来のロジックを挙動不変で移設したもの。依存配列は元コードと同一に保つ。
+ * Chat mobile drawer state and the task-count callback used by the single
+ * mounted RelatedInformationPanel.  Task fetching/polling belongs to that
+ * panel only; keeping it here would create a second request loop.
  */
 export function useRelatedTasksPanel({
   activeSessionId,
   isMobile,
-  hasScenarioPanel,
 }: UseRelatedTasksPanelArgs) {
   const [relatedPanelOpen, setRelatedPanelOpen] = useState(false);
   const [relatedTaskCount, setRelatedTaskCount] = useState(0);
@@ -24,42 +23,10 @@ export function useRelatedTasksPanel({
     string | null
   >(null);
   const [mobileRailOpen, setMobileRailOpen] = useState(false);
-  // hasScenarioPanel が false→true に変化したらモバイルレールを開く。
-  // 旧: useEffect 内の同期 setState を、React 標準の「描画中に前回値と比較」パターンへ移設。
-  // 初期比較値を false とすることで、マウント時に true の場合も開く元挙動を保持する。
-  const [prevHasScenarioPanel, setPrevHasScenarioPanel] = useState(false);
-  if (hasScenarioPanel !== prevHasScenarioPanel) {
-    setPrevHasScenarioPanel(hasScenarioPanel);
-    if (hasScenarioPanel) setMobileRailOpen(true);
-  }
+  const activeSessionIdRef = useRef(activeSessionId);
 
   useEffect(() => {
-    const refreshRelatedTaskCount = async () => {
-      if (!activeSessionId) {
-        setRelatedTaskCount(0);
-        return;
-      }
-      try {
-        const response = await fetch(
-          `/api/conversations/${encodeURIComponent(activeSessionId)}/related-tasks`,
-          { credentials: "include", cache: "no-store" },
-        );
-        if (!response.ok) return;
-        const data = (await response.json()) as { tasks?: unknown[] };
-        setRelatedTaskCount(Array.isArray(data.tasks) ? data.tasks.length : 0);
-      } catch {
-        // 関連情報は補助表示のため、取得失敗でチャット全体を止めない。
-      }
-    };
-    void refreshRelatedTaskCount();
-    const interval = window.setInterval(() => void refreshRelatedTaskCount(), 5000);
-    window.addEventListener("aoitalk-task-updated", refreshRelatedTaskCount);
-    window.addEventListener("aoitalk-task-created", refreshRelatedTaskCount);
-    return () => {
-      window.clearInterval(interval);
-      window.removeEventListener("aoitalk-task-updated", refreshRelatedTaskCount);
-      window.removeEventListener("aoitalk-task-created", refreshRelatedTaskCount);
-    };
+    activeSessionIdRef.current = activeSessionId;
   }, [activeSessionId]);
 
   const handleRelatedPanelToggle = useCallback(() => {
@@ -71,8 +38,13 @@ export function useRelatedTasksPanel({
   }, [isMobile]);
 
   const handleRelatedTasksChange = useCallback(
-    (tasks: RelatedTaskSummary[]) => setRelatedTaskCount(tasks.length),
-    [],
+    (tasks: RelatedTaskSummary[]) => {
+      // Panel のアンマウント後に返る旧 session の結果をバッジへ反映しない。
+      if (activeSessionIdRef.current === activeSessionId) {
+        setRelatedTaskCount(tasks.length);
+      }
+    },
+    [activeSessionId],
   );
 
   const notifyTaskUpdated = useCallback(() => {

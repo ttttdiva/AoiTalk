@@ -13,7 +13,7 @@ import {
 } from "@/lib/server/knowledge-docs-utils";
 
 async function wouldCreateSupertagCycle(
-  workspaceId: string,
+  docsLibraryId: string,
   currentId: string,
   proposedParentId: string,
 ) {
@@ -23,7 +23,7 @@ async function wouldCreateSupertagCycle(
       parentSupertagId: knowledgeSupertags.parentSupertagId,
     })
     .from(knowledgeSupertags)
-    .where(eq(knowledgeSupertags.workspaceId, workspaceId));
+    .where(eq(knowledgeSupertags.docsLibraryId, docsLibraryId));
   const parentById = new Map(tags.map((tag) => [tag.id, tag.parentSupertagId]));
   let cursor: string | null | undefined = proposedParentId;
   const seen = new Set<string>();
@@ -84,7 +84,7 @@ export async function PATCH(
         .where(
           and(
             eq(knowledgeSupertags.id, parentSupertagId),
-            eq(knowledgeSupertags.workspaceId, workspace.id),
+            eq(knowledgeSupertags.docsLibraryId, workspace.id),
           ),
         )
         .limit(1);

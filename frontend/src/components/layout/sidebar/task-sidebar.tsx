@@ -388,7 +388,9 @@ export function TaskSidebar() {
         onOpenChange={(open) => {
           if (!open) setSelectedTaskId(null);
         }}
-        onTaskUpdated={fetchTasks}
+        onTaskUpdated={() => {
+          void fetchTasks();
+        }}
       />
       <TaskContextMenu
         menu={contextMenu.menu}

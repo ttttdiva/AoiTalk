@@ -1,15 +1,13 @@
 import React, { useState, useCallback, useMemo, useEffect } from "react";
-import { View, FlatList, StyleSheet, Pressable } from "react-native";
+import { Alert, View, FlatList, StyleSheet, Pressable } from "react-native";
 import {
   Text,
   Surface,
   IconButton,
   Switch,
-  Menu,
-  Button,
 } from "react-native-paper";
 import { Calendar, LocaleConfig } from "react-native-calendars";
-import { useFocusEffect } from "expo-router";
+import { useFocusEffect, useRouter } from "expo-router";
 import {
   endOfMonth,
   format,
@@ -37,6 +35,7 @@ import {
   type RemoteTaskDialogTarget,
 } from "../../../components/remote-task-dialog";
 import { ScreenHeader } from "../../../components/screen-header";
+import { ScopeSwitcher } from "../../../components/scope-switcher";
 
 LocaleConfig.locales["ja"] = {
   monthNames: [
@@ -149,6 +148,8 @@ function toTaskItem(task: Task): CalendarItem | null {
     projectName: task.project_name ?? null,
     tags: task.tags || [],
     isOccurrence: false,
+    startAt: task.start_at,
+    endAt: task.end_at,
   };
 }
 
@@ -170,6 +171,8 @@ function toOccurrenceItem(occurrence: TaskOccurrence): CalendarItem | null {
     projectName: occurrence.project_name ?? null,
     tags: occurrence.tags || [],
     isOccurrence: true,
+    startAt: occurrence.start_at,
+    endAt: occurrence.end_at,
   };
 }
 
@@ -200,16 +203,13 @@ function toRemoteTaskItem(
 }
 
 export default function CalendarScreen() {
+  const router = useRouter();
   const { isAuthenticated } = useAuth();
   const {
-    projects,
-    spaces,
     selectedProjectId,
     selectedSpaceId,
     selectedSpace,
     selectedProject,
-    setSelectedProjectId,
-    setSelectedSpaceId,
   } = useProject();
   const [tasks, setTasks] = useState<Task[]>([]);
   const [occurrences, setOccurrences] = useState<TaskOccurrence[]>([]);
@@ -219,7 +219,7 @@ export default function CalendarScreen() {
   const [showClosed, setShowClosed] = useState(false);
   const [hideRecurring, setHideRecurring] = useState(false);
   const [prefsLoaded, setPrefsLoaded] = useState(false);
-  const [scopeMenuVisible, setScopeMenuVisible] = useState(false);
+  const [calendarRefreshToken, setCalendarRefreshToken] = useState(0);
   const completionRefreshToken = useTaskCompletionUndoStore(
     (state) => state.refreshToken,
   );
@@ -351,6 +351,7 @@ export default function CalendarScreen() {
       selectedProjectId,
       selectedSpaceId,
       selectedDate,
+      calendarRefreshToken,
     ]),
   );
 
@@ -367,13 +368,34 @@ export default function CalendarScreen() {
       map[item.dateKey].push(item);
     };
 
+    // 繰り返しルールを持たないタスクは tasks 本体の予定が正本。
+    // バックエンドはそれらにも task_occurrences へ source_kind="task_schedule" の
+    // ミラー行を1件作るため、そのまま描画するとタスク本体と二重になる。
+    // しかもタスク本体は end_at 基準、オカレンスは start_at 基準で日付が決まるので、
+    // 同じタスクが別々の日に1件ずつ並ぶ形の重複になる。
+    // モバイルは端末内 SQLite キャッシュを先に描画し、applyRemoteOccurrences は
+    // upsert のみで API が返さなくなった古いミラー行を消さないため、
+    // サーバー側の修正だけでは重複が残る。よってここで必ずミラー行を落とす。
+    // 落とすのはオカレンス側。タスク本体を残さないと、ミラー行を持たない
+    // 他の非繰り返しタスク（end_at 基準で表示）と日付の基準がずれてしまう。
+    const nonRecurringTaskIds = new Set(
+      tasks.filter((task) => !task.has_recurrence).map((task) => task.id),
+    );
+
+    // 実際に描画するオカレンス。繰り返し非表示のときは 1 件も出さない。
+    const visibleOccurrences = hideRecurring
+      ? []
+      : occurrences.filter(
+          (occurrence) => !nonRecurringTaskIds.has(occurrence.task_id),
+        );
+
     tasks
       .filter((task) => !task.has_recurrence)
       .forEach((task) => push(toTaskItem(task)));
 
-    if (!hideRecurring) {
-      occurrences.forEach((occurrence) => push(toOccurrenceItem(occurrence)));
-    }
+    visibleOccurrences.forEach((occurrence) =>
+      push(toOccurrenceItem(occurrence)),
+    );
 
     remoteTasks.forEach((task) => push(toRemoteTaskItem(task)));
 
@@ -452,7 +474,13 @@ export default function CalendarScreen() {
   const handleStatusToggle = async (item: CalendarItem) => {
     const next = item.status === "closed" ? "open" : "closed";
     try {
-      await tasksRepo.update(item.taskId, { status: next });
+      if (item.isOccurrence) {
+        await taskApi.updateOccurrence(item.id.replace(/^occ-/, ""), {
+          status: next,
+        });
+      } else {
+        await tasksRepo.update(item.taskId, { status: next });
+      }
       const taskList = selectedProjectId
         ? await tasksRepo.list(selectedProjectId)
         : await tasksRepo.listByScope(
@@ -471,10 +499,79 @@ export default function CalendarScreen() {
           ],
         });
       }
+      setCalendarRefreshToken((value) => value + 1);
     } catch {
       // ignore
     }
   };
+
+  const handleMoveToSelectedDate = useCallback(
+    async (item: CalendarItem) => {
+      if (item.isRemote || !item.startAt) return;
+      const start = parseISO(item.startAt);
+      if (Number.isNaN(start.getTime())) return;
+      const end = item.endAt ? parseISO(item.endAt) : null;
+      const duration = end && !Number.isNaN(end.getTime())
+        ? Math.max(0, end.getTime() - start.getTime())
+        : 0;
+      const nextStartDate = parseISO(
+        `${selectedDate}T${format(start, "HH:mm:ss")}`,
+      );
+      const nextStart = `${selectedDate}T${format(start, "HH:mm:ss")}`;
+      const nextEnd = duration
+        ? format(
+            new Date(nextStartDate.getTime() + duration),
+            "yyyy-MM-dd'T'HH:mm:ss",
+          )
+        : null;
+      try {
+        if (item.isOccurrence) {
+          await taskApi.updateOccurrence(item.id.replace(/^occ-/, ""), {
+            start_at: nextStart,
+            end_at: nextEnd,
+          });
+        } else {
+          await tasksRepo.update(item.taskId, {
+            start_at: nextStart,
+            end_at: nextEnd,
+          });
+        }
+        setCalendarRefreshToken((value) => value + 1);
+      } catch (error) {
+        Alert.alert(
+          "移動できませんでした",
+          error instanceof Error ? error.message : "サーバーへの保存に失敗しました",
+        );
+      }
+    },
+    [selectedDate],
+  );
+
+  const handleDeleteOccurrence = useCallback((item: CalendarItem) => {
+    if (!item.isOccurrence || item.isRemote) return;
+    Alert.alert(
+      "予定を削除しますか？",
+      "この繰り返し回だけをキャンセルします。繰り返しルール本体は変更されません。",
+      [
+        { text: "キャンセル", style: "cancel" },
+        {
+          text: "削除",
+          style: "destructive",
+          onPress: () => {
+            void taskApi
+              .deleteOccurrence(item.id.replace(/^occ-/, ""))
+              .then(() => setCalendarRefreshToken((value) => value + 1))
+              .catch((error) =>
+                Alert.alert(
+                  "削除できませんでした",
+                  error instanceof Error ? error.message : "保存に失敗しました",
+                ),
+              );
+          },
+        },
+      ],
+    );
+  }, []);
 
   return (
     <View style={styles.container}>
@@ -486,58 +583,22 @@ export default function CalendarScreen() {
           "すべてのプロジェクト"
         }
         right={
-          <Menu
-            visible={scopeMenuVisible}
-            onDismiss={() => setScopeMenuVisible(false)}
-            anchor={
-              <Button
-                mode="outlined"
-                compact
-                icon="folder-outline"
-                textColor="#cdd6f4"
-                style={styles.scopeButton}
-                contentStyle={styles.scopeButtonContent}
-                onPress={() => setScopeMenuVisible(true)}
-              >
-                切替
-              </Button>
-            }
-          >
-            <Menu.Item
-              leadingIcon={
-                !selectedProjectId && !selectedSpaceId ? "check" : undefined
-              }
+          <View style={styles.headerActions}>
+            <ScopeSwitcher />
+            <IconButton
+              icon="plus"
+              iconColor="#cdd6f4"
+              accessibilityLabel="選択日のタスクを作成"
               onPress={() => {
-                void setSelectedProjectId(null);
-                setScopeMenuVisible(false);
+                const query = selectedProjectId
+                  ? `?projectId=${encodeURIComponent(selectedProjectId)}&startDate=${selectedDate}`
+                  : selectedSpaceId
+                    ? `?spaceId=${encodeURIComponent(selectedSpaceId)}&startDate=${selectedDate}`
+                    : `?startDate=${selectedDate}`;
+                router.push(`/(tabs)/tasks/create${query}`);
               }}
-              title="すべてのプロジェクト"
             />
-            {spaces.map((space) => (
-              <Menu.Item
-                key={`space-${space.id}`}
-                leadingIcon={space.id === selectedSpaceId ? "check" : undefined}
-                onPress={() => {
-                  void setSelectedSpaceId(space.id);
-                  setScopeMenuVisible(false);
-                }}
-                title={`スペース: ${space.name}`}
-              />
-            ))}
-            {projects.map((project) => (
-              <Menu.Item
-                key={`project-${project.id}`}
-                leadingIcon={
-                  project.id === selectedProjectId ? "check" : undefined
-                }
-                onPress={() => {
-                  void setSelectedProjectId(project.id);
-                  setScopeMenuVisible(false);
-                }}
-                title={project.name}
-              />
-            ))}
-          </Menu>
+          </View>
         }
       />
       <Surface style={styles.header} elevation={1}>
@@ -628,8 +689,16 @@ export default function CalendarScreen() {
             />
             <Pressable
               style={{ flex: 1 }}
-              disabled={!item.isRemote}
-              onPress={() => openRemoteDialog(item)}
+              accessibilityRole="button"
+              accessibilityLabel={`${item.title}を開く`}
+              onPress={() => {
+                if (item.isRemote) {
+                  openRemoteDialog(item);
+                  return;
+                }
+                router.push(`/(tabs)/tasks/${item.taskId}`);
+              }}
+              onLongPress={() => handleDeleteOccurrence(item)}
             >
               <Text
                 style={[
@@ -680,6 +749,16 @@ export default function CalendarScreen() {
                 </View>
               ) : null}
             </Pressable>
+            {!item.isRemote ? (
+              <IconButton
+                icon="calendar-edit"
+                iconColor="#89b4fa"
+                size={18}
+                accessibilityLabel={`${item.title}を${selectedDate}へ移動`}
+                onPress={() => void handleMoveToSelectedDate(item)}
+                style={{ margin: 0 }}
+              />
+            ) : null}
           </Surface>
         )}
         ListEmptyComponent={
@@ -699,14 +778,13 @@ export default function CalendarScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b" },
+  headerActions: { flexDirection: "row", alignItems: "center" },
   header: {
     paddingTop: 4,
     paddingBottom: 8,
     paddingHorizontal: 16,
     backgroundColor: "#1e1e2e",
   },
-  scopeButton: { borderColor: "#45475a" },
-  scopeButtonContent: { height: 34 },
   toggleRow: { gap: 8 },
   toggleItem: {
     flexDirection: "row",

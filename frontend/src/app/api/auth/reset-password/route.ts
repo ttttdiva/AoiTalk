@@ -1,51 +1,41 @@
-import { NextRequest, NextResponse } from "next/server";
-import bcrypt from "bcryptjs";
-import { eq } from "drizzle-orm";
-import { db } from "@/db";
-import { users } from "@/db/schema";
-import { verifyPasswordResetToken } from "@/lib/auth";
+import { NextRequest } from "next/server";
+import { proxyRequestToPythonApi } from "@/lib/server/python-api-proxy";
+
+const MAX_RESET_TOKEN_LENGTH = 8192;
+const MAX_PASSWORD_LENGTH = 1024;
+
+async function readResetPasswordInput(
+  request: NextRequest,
+): Promise<{ token: string; password: string } | null> {
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return null;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const { token, password } = body as Record<string, unknown>;
+  if (
+    typeof token !== "string" ||
+    !token ||
+    token.length > MAX_RESET_TOKEN_LENGTH ||
+    typeof password !== "string" ||
+    password.length < 6 ||
+    password.length > MAX_PASSWORD_LENGTH
+  ) {
+    return null;
+  }
+  return { token, password };
+}
 
 export async function POST(request: NextRequest) {
-  const { token, password } = await request.json();
-  if (!token) {
-    return NextResponse.json({ detail: "再設定トークンが必要です" }, { status: 400 });
+  const input = await readResetPasswordInput(request);
+  if (!input) {
+    return Response.json({ detail: "入力が不正です" }, { status: 400 });
   }
-  if (!password || password.length < 6) {
-    return NextResponse.json(
-      { detail: "新しいパスワードは6文字以上必要です" },
-      { status: 400 },
-    );
-  }
-
-  const userId = await verifyPasswordResetToken(token);
-  if (!userId) {
-    return NextResponse.json(
-      { detail: "再設定リンクが無効または期限切れです" },
-      { status: 400 },
-    );
-  }
-
-  const [target] = await db
-    .select()
-    .from(users)
-    .where(eq(users.id, userId))
-    .limit(1);
-  if (!target || !target.isActive) {
-    return NextResponse.json(
-      { detail: "対象ユーザーが存在しないか無効です" },
-      { status: 400 },
-    );
-  }
-
-  const hash = await bcrypt.hash(password, 12);
-  await db
-    .update(users)
-    .set({
-      passwordHash: hash,
-      isPasswordResetRequired: false,
-      updatedAt: new Date(),
-    })
-    .where(eq(users.id, userId));
-
-  return NextResponse.json({ success: true });
+  return proxyRequestToPythonApi(request, {
+    path: ["auth", "reset-password"],
+    user: {},
+    body: JSON.stringify(input),
+  });
 }

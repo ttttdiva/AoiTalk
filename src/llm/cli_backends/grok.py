@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import Any, List, Optional
 
-from .base import CLIBackendBase, CLIEventCallback
+from .base import CLIBackendBase, CLIEventCallback, CLISessionCapabilities
+from ..turn_stream_events import emit_assistant_text
 
 _AUTH_MARKERS = (
     "not logged in",
@@ -76,9 +78,77 @@ def _event_payload(event: dict[str, Any]) -> dict[str, Any]:
 class GrokCLIBackend(CLIBackendBase):
     """Grok Build CLI backend for AoiTalk's normal CLI client."""
 
+    scoped_execution_delegate = True
+
+    _native_sessions_available: Optional[bool] = None
+
     def __init__(self, model: Optional[str] = None):
         self._model = model
+        # text delta を溜め、ツール呼び出し境界でまとまった assistant_text にする。
+        self._text_delta_buffer: list[str] = []
+        self._stream_round = 0
         super().__init__()
+
+    def _reset_stream_state(self) -> None:
+        self._text_delta_buffer = []
+        self._stream_round = 0
+
+    def get_session_capabilities(self) -> CLISessionCapabilities:
+        if self.__class__._native_sessions_available is None:
+            self.__class__._native_sessions_available = self.cli_help_contains(
+                os.getenv("GROK_BIN", "grok"),
+                ["--help"],
+                "--resume",
+                "--session-id",
+                "--output-format",
+            )
+        supported = bool(self.__class__._native_sessions_available)
+        return CLISessionCapabilities(
+            native_sessions=supported,
+            supports_resume=supported,
+            supports_follow_up=supported,
+            fallback_to_stateless=True,
+            supports_explicit_session_id=supported,
+            supports_detach=False,
+        )
+
+    def create_native_session_id(self) -> Optional[str]:
+        return str(uuid.uuid4())
+
+    def extract_native_session_id(self, raw_output: str) -> Optional[str]:
+        for event in self._events(raw_output):
+            payload = _event_payload(event)
+            event_type = self._event_type(event, payload)
+            if event_type in {
+                "session_started",
+                "session_completed",
+                "run_completed",
+                "end",
+                "done",
+            } or any(key in event or key in payload for key in ("sessionId", "session_id")):
+                for source in (event, payload):
+                    for key in ("sessionId", "session_id", "conversationId", "conversation_id"):
+                        value = source.get(key)
+                        if value:
+                            return str(value).strip()
+        return super().extract_native_session_id(raw_output)
+
+    def execute_prompt(self, *args: Any, **kwargs: Any):
+        self._reset_stream_state()
+        return super().execute_prompt(*args, **kwargs)
+
+    def _flush_text_delta_buffer(self, event_callback: CLIEventCallback) -> None:
+        """溜めた delta をまとまった途中経過テキストとして配信する。"""
+        buffered = "".join(self._text_delta_buffer).strip()
+        self._text_delta_buffer = []
+        if not buffered:
+            return
+        emit_assistant_text(
+            event_callback,
+            buffered,
+            round_index=self._stream_round,
+        )
+        self._stream_round += 1
 
     def get_cli_command(self, prompt: str) -> List[str]:
         bin_path = os.getenv("GROK_BIN", "grok")
@@ -88,6 +158,12 @@ class GrokCLIBackend(CLIBackendBase):
             "--output-format",
             "streaming-json",
         ]
+        action = str(getattr(self, "_active_native_session_action", "stateless"))
+        session_id = str(getattr(self, "_active_native_session_id", "") or "").strip()
+        if action == "resume" and session_id:
+            cmd.extend(["--resume", session_id])
+        elif action == "start" and session_id:
+            cmd.extend(["--session-id", session_id])
         model = self._model or os.getenv("GROK_MODEL")
         if model:
             cmd.extend(["--model", model])
@@ -152,6 +228,8 @@ class GrokCLIBackend(CLIBackendBase):
             return
 
         if normalized in {"tool", "tool_start", "tool_started", "tool_use", "tool_call", "command", "command_execution", "shell"}:
+            # ツール呼び出し直前までのテキストは途中経過として確定する。
+            self._flush_text_delta_buffer(event_callback)
             tool_name, args = self._tool_context(payload)
             tool_event = {
                 "tool": tool_name,
@@ -167,6 +245,7 @@ class GrokCLIBackend(CLIBackendBase):
             return
 
         if normalized in {"tool_end", "tool_completed", "tool_result", "command_completed", "command_execution_completed"}:
+            self._flush_text_delta_buffer(event_callback)
             tool_name, args = self._tool_context(payload)
             tool_result = {
                 "tool": tool_name,
@@ -204,6 +283,9 @@ class GrokCLIBackend(CLIBackendBase):
             return
 
         if normalized in {"turn_completed", "session_completed", "run_completed", "message_stop", "done"}:
+            # 完了時点で残っている delta は最終回答そのもの（parse_output が返す）ため、
+            # assistant_text として重複配信せず破棄する。
+            self._text_delta_buffer = []
             event_callback(
                 "status_update",
                 {"status": f"grok_{normalized}", "message": f"Grok Build CLI {normalized}"},
@@ -212,6 +294,8 @@ class GrokCLIBackend(CLIBackendBase):
 
         text = self._event_text(event, payload)
         if text and self._is_delta(event, payload, normalized):
+            self._text_delta_buffer.append(text)
+            # 既存の逐次表示は互換のためそのまま残す。
             event_callback(
                 "status_update",
                 {"status": "grok_text_delta", "message": text},

@@ -6,6 +6,12 @@ import {
   normalizeTask,
   normalizeTaskStatus,
 } from "@/lib/task-status";
+import { normalizeSkipMode } from "@/lib/recurrence-preview";
+import {
+  requestTaskCompletionConfirmation,
+  TaskCompletionCancelledError,
+  type IncompleteSubtaskSummary,
+} from "@/lib/task-completion-confirmation";
 import { toast } from "sonner";
 
 export type Tag = {
@@ -24,6 +30,12 @@ export type TaskAssignee = {
   is_primary: boolean;
   display_name?: string | null;
   username?: string | null;
+};
+
+export type TaskAssigneeCandidate = {
+  user_id: string;
+  username?: string | null;
+  display_name?: string | null;
 };
 
 export type TaskComment = {
@@ -50,6 +62,8 @@ export type Task = {
   start_at?: string | null;
   end_at?: string | null;
   all_day: boolean;
+  /** 期日 (end_at) 到達時に自動で完了する設定。旧レスポンス互換で未指定は false。 */
+  auto_close_on_due?: boolean;
   reminder_offsets: number[];
   notifications_enabled: boolean;
   source: string;
@@ -140,6 +154,7 @@ export type RecurrenceRule = {
   end_date?: string | null;
   skip_weekend?: boolean;
   skip_holiday?: boolean;
+  skip_mode?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
 };
@@ -231,6 +246,8 @@ export type Space = {
   sort_order?: number;
   created_at?: string | null;
   updated_at?: string | null;
+  /** Explicit server-side capability used by Tasks/Projects color editing. */
+  can_write?: boolean;
   source?: "local" | "remote" | string;
   remote_server_id?: string;
   remote_server_name?: string;
@@ -249,6 +266,11 @@ export type Project = {
   knowledge_node_id?: string | null;
   is_completed?: boolean;
   can_write?: boolean;
+  /** Explicit server-side capability required by the Project PATCH route. */
+  can_manage_settings?: boolean;
+  /** Accessible via authorization; participating only when owner/member read. */
+  is_participating?: boolean;
+  membership?: { role: string | null; permissions?: Record<string, unknown> | null } | null;
   color?: string | null;
   metadata?: Record<string, unknown> & {
     workspace_tools_enabled?: boolean;
@@ -279,6 +301,26 @@ export type TaskReference = {
   attachment?: TaskAttachment;
 };
 
+export type TaskAppLink = {
+  id: string;
+  task_id: string;
+  app_id: string;
+  target_id?: string | null;
+  relation_type: "develops" | "fixes" | "tests" | "releases" | "uses" | "related" | string;
+  created_by?: string | null;
+  created_at?: string | null;
+  app?: {
+    id: string;
+    name: string;
+    related_project_ids?: string[];
+  };
+  target?: {
+    id: string;
+    target_key: string;
+    display_name: string;
+  } | null;
+};
+
 export type TaskDocsNode = {
   id: string;
   title: string;
@@ -290,10 +332,11 @@ export type TaskDocsNodeResult = {
   created: boolean;
 };
 
-class TaskApiError extends Error {
+export class TaskApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly responseBody: unknown = null,
   ) {
     super(message);
     this.name = "TaskApiError";
@@ -322,11 +365,13 @@ async function request<T>(
     if (shouldRedirectToLogin && typeof window !== "undefined") {
       window.location.href = "/login";
     }
-    throw new TaskApiError("認証が必要です", 401);
+    throw new TaskApiError("認証が必要です", 401, null);
   }
   if (!res.ok) {
     const detail = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new TaskApiError(detail.detail || res.statusText, res.status);
+    const message =
+      typeof detail?.detail === "string" ? detail.detail : res.statusText;
+    throw new TaskApiError(message || "API request failed", res.status, detail);
   }
   if (res.status === 204) return undefined as T;
   return res.json();
@@ -366,11 +411,15 @@ async function uploadRequest<T>(path: string, form: FormData): Promise<T> {
     if (typeof window !== "undefined") {
       window.location.href = "/login";
     }
-    throw new Error("Authentication required");
+    throw new TaskApiError("Authentication required", 401);
   }
   if (!res.ok) {
     const detail = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(detail.detail || res.statusText);
+    const message =
+      typeof detail?.detail === "string" && detail.detail.trim()
+        ? detail.detail
+        : res.statusText || `HTTP ${res.status}`;
+    throw new TaskApiError(message, res.status);
   }
   return res.json();
 }
@@ -386,8 +435,10 @@ function normalizeTaskResponse(task: Task): Task {
       }`,
     );
   }
+  const normalized = normalizeTask(task);
   return {
-    ...normalizeTask(task),
+    ...normalized,
+    auto_close_on_due: task.auto_close_on_due === true,
     subtasks: task.subtasks?.map(normalizeTaskResponse),
   };
 }
@@ -411,6 +462,60 @@ function normalizeTaskPayload(
   };
 }
 
+function getIncompleteSubtasksConfirmation(
+  error: unknown,
+): IncompleteSubtaskSummary[] | null {
+  if (!(error instanceof TaskApiError) || error.status !== 409) return null;
+  const body = error.responseBody;
+  if (typeof body !== "object" || body === null) return null;
+  const payload = body as {
+    code?: unknown;
+    incomplete_subtasks?: unknown;
+  };
+  if (
+    payload.code !== "incomplete_subtasks_confirmation_required" ||
+    !Array.isArray(payload.incomplete_subtasks)
+  ) {
+    return null;
+  }
+  return payload.incomplete_subtasks.filter(
+    (item): item is IncompleteSubtaskSummary =>
+      typeof item === "object" &&
+      item !== null &&
+      typeof (item as IncompleteSubtaskSummary).id === "string" &&
+      typeof (item as IncompleteSubtaskSummary).title === "string" &&
+      typeof (item as IncompleteSubtaskSummary).status === "string",
+  );
+}
+
+async function updateTaskWithSubtaskConfirmation(
+  taskId: string,
+  data: Record<string, unknown>,
+): Promise<Task> {
+  const normalized = normalizeTaskPayload(data);
+  try {
+    return await request<Task>(`/api/tasks/${taskId}`, {
+      method: "PATCH",
+      body: JSON.stringify(normalized),
+    }).then(normalizeTaskResponse);
+  } catch (error) {
+    const incompleteSubtasks = getIncompleteSubtasksConfirmation(error);
+    if (!incompleteSubtasks) throw error;
+    const confirmed = await requestTaskCompletionConfirmation({
+      taskId,
+      incompleteSubtasks,
+    });
+    if (!confirmed) throw new TaskCompletionCancelledError();
+    return request<Task>(`/api/tasks/${taskId}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        ...normalized,
+        close_incomplete_subtasks: true,
+      }),
+    }).then(normalizeTaskResponse);
+  }
+}
+
 function normalizeRecurrencePayload(
   data: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -421,7 +526,19 @@ function normalizeRecurrencePayload(
   if ("reset_status_to" in next) {
     next.reset_status_to = normalizeTaskStatus(next.reset_status_to);
   }
+  if ("skip_mode" in next) {
+    next.skip_mode = normalizeSkipMode(
+      typeof next.skip_mode === "string" ? next.skip_mode : null,
+    );
+  }
   return next;
+}
+
+function normalizeRecurrenceResponse(rule: RecurrenceRule): RecurrenceRule {
+  return {
+    ...normalizeRecurrenceRule(rule),
+    skip_mode: normalizeSkipMode(rule.skip_mode),
+  };
 }
 
 export type Scope = { project_id?: string; space_id?: string };
@@ -454,11 +571,7 @@ export const taskApi = {
       method: "POST",
       body: JSON.stringify(normalizeTaskPayload(data)),
     }).then(normalizeTaskResponse),
-  updateTask: (taskId: string, data: Record<string, unknown>) =>
-    request<Task>(`/api/tasks/${taskId}`, {
-      method: "PATCH",
-      body: JSON.stringify(normalizeTaskPayload(data)),
-    }).then(normalizeTaskResponse),
+  updateTask: updateTaskWithSubtaskConfirmation,
   moveTask: (taskId: string, data: Record<string, unknown>) =>
     request<Task>(`/api/tasks/${taskId}`, {
       method: "PATCH",
@@ -472,10 +585,19 @@ export const taskApi = {
     }),
   deleteTask: (taskId: string) =>
     request<void>(`/api/tasks/${taskId}`, { method: "DELETE" }),
-  reorderTasks: (projectId: string, taskIds: string[]) =>
+  reorderTasks: (
+    projectId: string,
+    taskIds: string[],
+    parentTaskId?: string | null,
+  ) =>
     request<void>(`/api/projects/${projectId}/tasks/reorder`, {
       method: "POST",
-      body: JSON.stringify({ task_ids: taskIds }),
+      body: JSON.stringify({
+        task_ids: taskIds,
+        ...(parentTaskId !== undefined
+          ? { parent_task_id: parentTaskId }
+          : {}),
+      }),
     }),
   reorderAllTasks: (taskIds: string[]) =>
     request<void>("/api/tasks/reorder", {
@@ -486,7 +608,7 @@ export const taskApi = {
   // Recurrence
   getRecurrence: (taskId: string) =>
     request<RecurrenceRule | null>(`/api/tasks/${taskId}/recurrence`).then(
-      (rule) => (rule ? normalizeRecurrenceRule(rule) : null),
+      (rule) => (rule ? normalizeRecurrenceResponse(rule) : null),
     ),
   saveRecurrence: (
     taskId: string,
@@ -502,12 +624,13 @@ export const taskApi = {
       end_date?: string | null;
       skip_weekend?: boolean;
       skip_holiday?: boolean;
+      skip_mode?: string;
     },
   ) =>
     request<RecurrenceRule>(`/api/tasks/${taskId}/recurrence`, {
       method: "PUT",
       body: JSON.stringify(normalizeRecurrencePayload(data)),
-    }).then(normalizeRecurrenceRule),
+    }).then(normalizeRecurrenceResponse),
   deleteRecurrence: (taskId: string) =>
     request<void>(`/api/tasks/${taskId}/recurrence`, { method: "DELETE" }),
 
@@ -627,6 +750,27 @@ export const taskApi = {
       `/api/tasks/${taskId}/references/${encodeURIComponent(referenceId)}${confirmSource ? "?confirm_source=true" : ""}`,
       { method: "DELETE" },
     ),
+  listAppLinks: (taskId: string) =>
+    request<{ task_id: string; apps: TaskAppLink[] }>(`/api/python-proxy/tasks/${taskId}/apps`),
+  linkApp: (
+    taskId: string,
+    data: { app_id: string; target_id?: string | null; relation_type?: TaskAppLink["relation_type"] },
+  ) =>
+    request<{ success: boolean; link: TaskAppLink }>(`/api/python-proxy/tasks/${taskId}/apps`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  unlinkApp: (
+    taskId: string,
+    appId: string,
+    options?: { targetId?: string | null; relationType?: string | null },
+  ) => {
+    const params = new URLSearchParams();
+    if (options?.targetId) params.set("target_id", options.targetId);
+    if (options?.relationType) params.set("relation_type", options.relationType);
+    const query = params.toString() ? `?${params.toString()}` : "";
+    return request<{ success: boolean }>(`/api/python-proxy/tasks/${taskId}/apps/${appId}${query}`, { method: "DELETE" });
+  },
   runAgentTriage: (taskId: string) =>
     request<TaskAgentTriageResult>(`/api/tasks/${taskId}/agent-triage`, {
       method: "POST",
@@ -734,6 +878,10 @@ export const taskApi = {
   // Projects
   listProjects: () =>
     requestList<{ projects: Project[]; total: number }>("/api/projects"),
+  listAssigneeCandidates: (projectId: string) =>
+    request<{ members: TaskAssigneeCandidate[]; total: number }>(
+      `/api/projects/${projectId}/assignee-candidates`,
+    ).then((response) => response.members),
   updateProject: (id: string, data: Record<string, unknown>) =>
     request<Project>(`/api/projects/${id}`, {
       method: "PATCH",

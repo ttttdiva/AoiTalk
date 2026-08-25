@@ -10,6 +10,10 @@ import threading
 import uvicorn
 from pathlib import Path
 from .server import create_web_interface as create_fastapi_interface
+from src.utils.startup_timing import get_startup_timer
+
+
+_startup_timer = get_startup_timer()
 
 class WebChatInterface:
     """Wrapper class for FastAPI WebSocket server"""
@@ -18,8 +22,9 @@ class WebChatInterface:
         """Initialize FastAPI wrapper"""
         self.config = config
         self.character_name = character_name
-        self.server = create_fastapi_interface(config, character_name)
-        self.app = self.server.get_app()
+        with _startup_timer.phase("startup.web.fastapi.app_factory"):
+            self.server = create_fastapi_interface(config, character_name)
+            self.app = self.server.get_app()
         
         # Server state
         self.is_running = False
@@ -28,6 +33,7 @@ class WebChatInterface:
         self.video_http_server = None
         self.video_http_thread = None
         self._server_loop = None  # uvicornスレッドのイベントループ
+        self._startup_error: Exception | None = None
 
         # Expose server methods
         self.add_assistant_message = self._async_wrapper(self.server.add_assistant_message)
@@ -100,10 +106,38 @@ class WebChatInterface:
         try:
             web_config = self.config.config.get('web_interface', {})
             video_config = web_config.get('video_http_server', {})
-            # デフォルトはTrue（後方互換性のため）
-            return video_config.get('enabled', True)
+            return video_config.get('enabled', False) is True
         except Exception:
-            return True
+            return False
+
+    def _get_video_http_host(self) -> str:
+        """Resolve the dedicated helper bind without inheriting a public UI bind."""
+        try:
+            web_config = self.config.config.get('web_interface', {})
+            video_config = web_config.get('video_http_server', {})
+            return str(video_config.get('host', '127.0.0.1')).strip()
+        except Exception:
+            return '127.0.0.1'
+
+    def _get_video_http_allowed_origins(self, main_port: int) -> list[str]:
+        """Return explicit local UI origins for the credential-free helper."""
+        try:
+            web_config = self.config.config.get('web_interface', {})
+            video_config = web_config.get('video_http_server', {})
+            configured = video_config.get('allowed_origins')
+            if configured is not None:
+                if isinstance(configured, str):
+                    return [configured]
+                if isinstance(configured, (list, tuple)):
+                    return [str(origin) for origin in configured]
+                return []
+        except Exception:
+            return []
+        return [
+            f"https://127.0.0.1:{main_port}",
+            f"https://localhost:{main_port}",
+            f"https://[::1]:{main_port}",
+        ]
 
     def _can_bind(self, host: str, port: int) -> bool:
         """Return whether uvicorn can bind the requested host/port."""
@@ -116,13 +150,21 @@ class WebChatInterface:
         except OSError:
             return False
     
-    def _start_video_http_server(self, host: str, video_port: int):
+    def _start_video_http_server(
+        self,
+        host: str,
+        video_port: int,
+        *,
+        allowed_origins: list[str] | None = None,
+    ):
         """Start HTTP video server in a separate thread"""
         try:
-            from .video_http_server import create_video_http_app
+            from .video_http_server import create_video_http_app, is_loopback_host
         except ImportError:
             print("[WebUI] ⚠️ Video HTTP server module not found, skipping")
             return
+        if not is_loopback_host(host):
+            raise ValueError("Video HTTP server must bind to a loopback host")
         
         def run_video_server():
             try:
@@ -130,7 +172,7 @@ class WebChatInterface:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 
-                video_app = create_video_http_app()
+                video_app = create_video_http_app(allowed_origins=allowed_origins)
                 config = uvicorn.Config(
                     app=video_app,
                     host=host,
@@ -160,7 +202,9 @@ class WebChatInterface:
         use_ssl = ssl_keyfile and ssl_certfile
         protocol = "https" if use_ssl else "http"
 
-        if not self._can_bind(host, port):
+        with _startup_timer.phase("startup.web.fastapi.listener_probe"):
+            can_bind = self._can_bind(host, port)
+        if not can_bind:
             print(
                 f"[WebUI] Port {port} is already in use on {host}; "
                 "FastAPI server was not started."
@@ -171,11 +215,19 @@ class WebChatInterface:
         # Start HTTP video server if using SSL AND enabled in config (for Android compatibility)
         if use_ssl and self._is_video_http_enabled():
             video_port = self._get_video_http_port(port)
-            self._start_video_http_server(host, video_port)
+            video_host = self._get_video_http_host()
+            self._start_video_http_server(
+                video_host,
+                video_port,
+                allowed_origins=self._get_video_http_allowed_origins(port),
+            )
         elif use_ssl and not self._is_video_http_enabled():
             print("[WebUI] ℹ️ HTTP video server disabled in config")
-        
+
+        self._startup_error = None
+
         def run_server():
+            loop = None
             try:
                 print(f"[WebUI] Starting FastAPI server on {protocol}://{host}:{port}")
                 if use_ssl:
@@ -184,7 +236,8 @@ class WebChatInterface:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 self._server_loop = loop  # broadcast用に保存
-                
+                _startup_timer.mark("startup.web.fastapi.uvicorn_thread_started")
+
                 config = uvicorn.Config(
                     app=self.app,
                     host=host,
@@ -197,19 +250,55 @@ class WebChatInterface:
                     ws_ping_timeout=10,
                 )
                 self.uvicorn_server = uvicorn.Server(config)
+                _startup_timer.mark("startup.web.fastapi.uvicorn_configured")
                 loop.run_until_complete(self.uvicorn_server.serve())
             except Exception as e:
+                self._startup_error = e
                 print(f"[WebUI] Server error: {e}")
+            finally:
+                self._server_loop = None
+                if loop is not None:
+                    try:
+                        loop.close()
+                    except Exception:
+                        pass
                 
         self.is_running = True
-        self.server_thread = threading.Thread(target=run_server, daemon=True)
-        self.server_thread.start()
-        
-        # Wait for server to start
+        with _startup_timer.phase("startup.web.fastapi.thread_spawn"):
+            self.server_thread = threading.Thread(target=run_server, daemon=True)
+            self.server_thread.start()
+
+        # Uvicorn が lifespan startup を完了するまで待つ。固定 sleep だけでは、
+        # bind 失敗したスレッドを起動成功として Caddy を公開してしまう。
         import time
-        time.sleep(2)
-        
-        return f"{protocol}://{host}:{port}"
+        with _startup_timer.phase("startup.web.fastapi.readiness_poll"):
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if self.uvicorn_server and self.uvicorn_server.started:
+                    # ``Server.started`` is set after sockets are bound and the
+                    # ASGI lifespan startup has completed. Keep listener and
+                    # HTTP handling milestones distinct in the log even though
+                    # Uvicorn exposes them through this single readiness flag.
+                    _startup_timer.mark("startup.web.fastapi.listener_ready")
+                    _startup_timer.mark("startup.web.fastapi.lifespan_ready")
+                    _startup_timer.mark("startup.web.fastapi.http_ready")
+                    return f"{protocol}://{host}:{port}"
+                if not self.server_thread.is_alive():
+                    break
+                time.sleep(0.05)
+
+            self.is_running = False
+            if self.uvicorn_server:
+                self.uvicorn_server.should_exit = True
+            if self._startup_error:
+                raise RuntimeError(
+                    f"FastAPI startup failed on {host}:{port}: {self._startup_error}"
+                ) from self._startup_error
+            print(
+                f"[WebUI] FastAPI server did not become ready on "
+                f"{protocol}://{host}:{port}"
+            )
+            return None
         
     def stop_server(self):
         """Stop FastAPI server"""
@@ -220,6 +309,15 @@ class WebChatInterface:
             self.video_http_server.should_exit = True
         if self.server_thread:
             print("[WebUI] Stopping FastAPI server")
+            if self.server_thread is not threading.current_thread():
+                self.server_thread.join(timeout=10)
+                if not self.server_thread.is_alive():
+                    self.server_thread = None
+        if self.video_http_thread:
+            if self.video_http_thread is not threading.current_thread():
+                self.video_http_thread.join(timeout=5)
+                if not self.video_http_thread.is_alive():
+                    self.video_http_thread = None
 
 def create_web_interface(config, character_name):
     """Factory function for WebChatInterface"""

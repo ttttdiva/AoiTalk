@@ -267,7 +267,15 @@ class SpotifyRecommendationsEngine:
                 config = Config()
                 
                 # LLMクライアントを作成
-                llm_client = AgentLLMClient(api_key=api_key, model="gpt-4o-mini", config=config)
+                # Use the persisted main OpenAI target rather than a retired
+                # mini fallback. AgentLLMClient applies the model's configured
+                # or Luna default reasoning effort to the native request.
+                model = str(
+                    config.get("llm_model", "")
+                    or config.get("openai.model", "")
+                    or "gpt-5.6-luna"
+                ).strip()
+                llm_client = AgentLLMClient(api_key=api_key, model=model, config=config)
                 response = llm_client.generate_response(prompt)
                 
                 if response:

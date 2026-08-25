@@ -86,6 +86,20 @@ async function mockTimelineApis(
       return;
     }
 
+    if (url.pathname === "/api/python-proxy/voice_status") {
+      await route.fulfill({
+        json: { ready: true, rms: 16384, recording: true },
+      });
+      return;
+    }
+
+    if (url.pathname === "/api/python-proxy/config") {
+      await route.fulfill({
+        json: { asr_engine: "whisper", asr_model: "small" },
+      });
+      return;
+    }
+
     if (url.pathname === "/api/python-proxy/characters") {
       await route.fulfill({ json: { characters: [], current: "" } });
       return;
@@ -119,7 +133,7 @@ async function mockTimelineApis(
     }
 
     if (url.pathname === "/api/python-proxy/runtime/features") {
-      await route.fulfill({ json: { features: {} } });
+      await route.fulfill({ json: { features: { local_mic: true } } });
       return;
     }
 
@@ -184,6 +198,25 @@ async function mockTimelineApis(
           message: null,
           active_tool: null,
           agent_run_id: options.liveTransition ? AGENT_RUN_ID : null,
+        },
+      });
+      return;
+    }
+
+    if (
+      url.pathname ===
+      `/api/python-proxy/conversations/${SESSION_ID}/generation/steer`
+    ) {
+      const body = route.request().postDataJSON() as {
+        client_message_id?: string;
+      };
+      await route.fulfill({
+        json: {
+          session_id: SESSION_ID,
+          agent_run_id: AGENT_RUN_ID,
+          client_message_id: body.client_message_id,
+          queued: false,
+          interrupted: true,
         },
       });
       return;
@@ -357,6 +390,44 @@ async function mockTimelineApis(
   });
 }
 
+test("Context Railは音声を最上段に置き、実行履歴をタブで開ける", async ({
+  page,
+}) => {
+  await addAuthCookie(page);
+  await mockTimelineApis(page);
+
+  await page.goto(`/chat?s=${SESSION_ID}`);
+  const rail = page.getByTestId("chat-context-rail");
+  await expect(rail).toBeVisible();
+  await expect(rail.getByTestId("chat-voice-status")).toContainText("録音中");
+  await expect(rail.getByTestId("chat-voice-status")).toContainText(
+    "ASR whisper / small",
+  );
+  await expect(rail.getByRole("tab", { name: "コンテキスト" })).toBeVisible();
+  const executionTab = rail.getByRole("tab", { name: /実行/ });
+  await expect(executionTab).not.toContainText("●");
+  await executionTab.click();
+  await expect(rail.getByRole("tabpanel", { name: "実行" })).toBeVisible();
+
+  // The meter moved into the rail; the global header no longer renders a
+  // second "録音中" status.
+  await expect(page.locator("header").getByText("録音中")).toHaveCount(0);
+});
+
+test("mobile Context Rail Sheetも同じvoice/tabs UIを使う", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await addAuthCookie(page);
+  await mockTimelineApis(page);
+
+  await page.goto(`/chat?s=${SESSION_ID}`);
+  await page.getByRole("button", { name: "関連情報を開く" }).click();
+  const rail = page.getByTestId("chat-context-rail");
+  await expect(rail).toBeVisible();
+  await expect(rail.getByTestId("chat-voice-status")).toBeVisible();
+  await expect(rail.getByRole("tab", { name: "コンテキスト" })).toBeVisible();
+  await expect(rail.getByRole("tab", { name: /実行/ })).toBeVisible();
+});
+
 test("saved agent run timelines start collapsed and expand on demand", async ({
   page,
 }) => {
@@ -507,7 +578,10 @@ test("live operation updates the same row when it completes", async ({
   await mockTimelineApis(page, { liveTransition: true });
 
   await page.goto(`/chat?s=${SESSION_ID}`);
-  const log = page.getByTestId("agent-run-work-log");
+  // During a live generation the execution tab intentionally mirrors the
+  // message's work log. Scope this assertion to the message list so the
+  // rail's inspection copy does not make the main-log contract ambiguous.
+  const log = page.getByTestId("chat-message-list").getByTestId("agent-run-work-log");
   await expect(log).toHaveCount(1);
   await expect(
     log.getByRole("button", { name: /実行中 1件の操作/ }),
@@ -523,6 +597,31 @@ test("live operation updates the same row when it completes", async ({
   await expect(log.getByText("Webを検索", { exact: true })).toHaveCount(1);
   await expect(log.getByText("1.3秒 · gpt-5.6-sol")).toBeVisible();
   await expect(page.getByText(/実行開始|実行完了/)).toHaveCount(0);
+});
+
+test("busy composer queues Enter and renders Ctrl+Enter as an immediate user message", async ({
+  page,
+}) => {
+  await addAuthCookie(page, process.env.E2E_USER_ID ?? "user-1");
+  await mockTimelineApis(page, { liveTransition: true });
+
+  await page.goto(`/chat?s=${SESSION_ID}`);
+  const input = page.getByRole("textbox", { name: "メッセージ入力" });
+  await expect(input).toHaveAttribute(
+    "placeholder",
+    /Enter: 次に送る \/ Ctrl\+Enter: 今の応答へ割り込む/,
+  );
+
+  await input.fill("応答後に送るメッセージ");
+  await input.press("Enter");
+  await expect(page.getByText("送信待ち 1件")).toBeVisible();
+  await expect(page.getByText("応答後に送るメッセージ")).toBeVisible();
+
+  await input.fill("今の応答へ割り込むメッセージ");
+  await input.press("Control+Enter");
+  await expect(page.getByText("今の応答へ割り込むメッセージ")).toBeVisible();
+  await expect(page.getByText("割り込み送信中")).toBeVisible();
+  await expect(page.getByText("送信待ち 1件")).toBeVisible();
 });
 
 test("simple results and changed file counts stay visible", async ({

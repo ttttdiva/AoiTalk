@@ -5,6 +5,8 @@
 
 import type { ChatCommandCapability } from "@/lib/chat-commands";
 export type { ChatCommandCapability } from "@/lib/chat-commands";
+import type { LlmDeploymentMetadata } from "@/lib/llm-provider-visibility";
+export type { LlmDeploymentMetadata } from "@/lib/llm-provider-visibility";
 import type { components } from "@/lib/api-types.gen";
 
 // ─── OpenAPI 生成型ユーティリティ ───
@@ -30,8 +32,17 @@ export type ConversationSession = {
   last_activity?: string | null;
   message_count: number;
   is_active: boolean;
+  /** Public session metadata; privacy_mode is used only for effective-mode display. */
+  context?: Record<string, unknown>;
   project_id?: string | null;
   is_group_chat?: boolean;
+  app_id?: string | null;
+  app_target_id?: string | null;
+  development_status?: "working" | "waiting_for_user" | "completed" | null;
+  last_read_at?: string | null;
+  is_unread?: boolean;
+  parent_session_id?: string | null;
+  forked_from_message_id?: string | null;
   group_character_names?: string[];
   participants?: ConversationParticipant[];
   rp_settings?: Record<string, number>;
@@ -80,6 +91,9 @@ export type ConversationMessageMetadata = Record<string, unknown> & {
   image_mime_type?: string | null;
   image_name?: string | null;
   tool_results?: ChatToolResultMetadata[];
+  generation_status?: "cancelled" | "completed" | "failed" | string;
+  partial?: boolean;
+  finish_reason?: string;
 };
 
 export type ChatGenerationMetrics = {
@@ -112,11 +126,20 @@ export type ContextSnapshotCategory = {
   measurement?: ContextMeasurement;
   source?: string | null;
   preview?: string | null;
+  selection_reason?: string | null;
+  duration_ms?: number | null;
+  retrieved_chars?: number | null;
+  selected_chars?: number | null;
+  size_chars?: number | null;
 };
 
 export type ContextRequestSnapshot = {
   id?: string;
   request_index?: number;
+  /** Number of model requests represented by this persisted snapshot series. */
+  request_count?: number;
+  /** Number of older requests omitted by backend retention bounds. */
+  requests_omitted?: number;
   request_kind?: string;
   captured_at?: string | null;
   created_at?: string | null;
@@ -135,6 +158,8 @@ export type ContextRequestSnapshot = {
 export type ContextSnapshot = ContextRequestSnapshot & {
   message_id?: string;
   session_id?: string;
+  /** Optional explicit Main request supplied by newer backends. */
+  main?: ContextRequestSnapshot | null;
   requests?: ContextRequestSnapshot[];
 };
 
@@ -143,6 +168,20 @@ export type ContextSnapshotResponse = {
   status: "available" | "unavailable" | "missing" | string;
   snapshot?: ContextSnapshot | null;
 };
+
+/**
+ * Resolve the single effective Main request for UI display.
+ *
+ * `requests` is bounded diagnostic history (retries/tool follow-ups), not a
+ * token budget to aggregate. Newer APIs may send an explicit `main` object;
+ * legacy APIs already put the effective Main observation at the top level.
+ */
+export function resolveMainContextSnapshot(
+  snapshot?: ContextSnapshot | null,
+): ContextRequestSnapshot | null {
+  if (!snapshot) return null;
+  return snapshot.main ?? snapshot;
+}
 
 export type ChatToolResultMetadata = {
   tool?: string;
@@ -162,7 +201,9 @@ export type ConversationMessage = {
   sender_id?: string | null;
   sender_display_name?: string | null;
   created_at?: string | null;
+  updated_at?: string | null;
   parent_message_id?: string | null;
+  branch_count?: number | null;
   branch_index: number;
   is_active_branch: boolean;
 };
@@ -189,15 +230,31 @@ export type LlmCatalogModelOption = {
   custom_current?: boolean;
   selection_kind?: "static" | "routing_profile";
   routing_profile_id?: string;
+  reasoning_effort_options?: string[];
+  reasoning_effort_default?: string;
+  reasoning_effort_supports_disable?: boolean;
+  reasoning_effort_wire?: { transport?: string; path?: string };
+  context_window_tokens?: number | null;
+  supports_reasoning?: boolean;
 };
 
 export type LlmCatalogProvider = {
   id: string;
   label: string;
+  /** Backend deployment/profile availability. Omitted on personal/legacy APIs. */
+  available?: boolean;
+  disabled?: boolean;
+  unavailable?: boolean;
+  availability_reason?: string | null;
   configured_model?: string;
   models: LlmCatalogModelOption[];
   settings?: {
     api_key_configured?: boolean;
+    reasoning_effort?: string | null;
+    reasoning_effort_options?: string[];
+    reasoning_effort_default?: string | null;
+    reasoning_effort_supports_disable?: boolean;
+    reasoning_effort_wire?: { transport?: string; path?: string } | null;
   };
   selection_kind?: "static" | "routing_profile";
 };
@@ -205,6 +262,7 @@ export type LlmCatalogProvider = {
 export type LlmModelCatalogResponse = {
   current: ChatResponseModelSelection;
   providers: LlmCatalogProvider[];
+  deployment?: LlmDeploymentMetadata | null;
 };
 
 export type ConversationSearchResult = {
@@ -229,8 +287,16 @@ export type ConversationGenerationStatus = {
   message?: string | null;
   active_tool?: string | null;
   agent_run_id?: string | null;
+  client_message_id?: string | null;
   started_at?: string | null;
   updated_at?: string | null;
+};
+
+export type AgentRunUsage = {
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cached_tokens?: number | null;
+  total_tokens?: number | null;
 };
 
 export type AgentRunTimelineItem = {
@@ -240,6 +306,7 @@ export type AgentRunTimelineItem = {
   event_id?: string | null;
   sequence?: number | null;
   event_type?: string | null;
+  visibility?: "normal" | "audit" | string | null;
   status?: string | null;
   display_status?: string | null;
   actor_type?: string | null;
@@ -267,10 +334,59 @@ export type AgentRunTimelineItem = {
   success?: boolean;
   mutation_confirmed?: boolean;
   duration_ms?: number | null;
+  /** agent_team 集約項目に付く子 run の id（子タイムラインへのドリルダウン用） */
+  child_run_id?: string | null;
   payload?: Record<string, unknown>;
   created_at?: string | null;
   started_at?: string | null;
   ended_at?: string | null;
+};
+
+/** 生の実行イベント（include_events=true 時のみ含まれる） */
+export type AgentRunEvent = {
+  id: string;
+  run_id: string;
+  sequence?: number | null;
+  event_type: string;
+  visibility?: "normal" | "audit" | string | null;
+  status?: string | null;
+  message?: string | null;
+  payload?: Record<string, unknown>;
+  created_at?: string | null;
+};
+
+/** 生のツール呼び出し（include_tool_calls=true 時のみ含まれる） */
+export type AgentRunToolCall = {
+  id: string;
+  run_id: string;
+  event_id?: string | null;
+  tool_name: string;
+  tool_call_id?: string | null;
+  arguments?: Record<string, unknown>;
+  result?: string | null;
+  success?: boolean;
+  mutation_confirmed?: boolean;
+  metadata?: Record<string, unknown>;
+  started_at?: string | null;
+  ended_at?: string | null;
+  duration_ms?: number | null;
+  created_at?: string | null;
+};
+
+/** Agent Runの成功したタスク/Docs操作をチャット成果物向けに正規化した値 */
+export type AgentResourceMutation = {
+  resource_type: "task" | "docs_node";
+  resource_id: string;
+  title: string;
+  operation: "created" | "updated" | "moved" | "archived" | "deleted";
+  success: boolean;
+  project_name?: string | null;
+  start_at?: string | null;
+  due_date?: string | null;
+  end_at?: string | null;
+  all_day?: boolean | null;
+  updated_at?: string | null;
+  occurred_at?: string | null;
 };
 
 export type AgentRun = {
@@ -288,44 +404,25 @@ export type AgentRun = {
   provider?: string | null;
   model?: string | null;
   error?: string | null;
+  result?: Record<string, unknown>;
+  validation?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   created_at?: string | null;
   updated_at?: string | null;
   started_at?: string | null;
   ended_at?: string | null;
   last_event_at?: string | null;
+  usage?: AgentRunUsage | null;
   timeline?: AgentRunTimelineItem[];
+  events?: AgentRunEvent[];
+  tool_calls?: AgentRunToolCall[];
+  resource_mutations?: AgentResourceMutation[];
 };
 
-export type ScenarioLogType = "writing" | "roleplay" | "trpg";
-
-export type ScenarioLogEntry = {
-  id: string;
-  type: ScenarioLogType;
-  type_label: string;
-  scenario_id: string;
-  conversation_session_id?: string | null;
-  room_id?: string | null;
-  target_id?: string | null;
-  target_label: string;
-  title: string;
-  status: string;
-  count: number;
-  created_at?: string | null;
-  updated_at?: string | null;
-  href?: string | null;
-};
-
-export type ScenarioLogResponse = {
-  scenario: {
-    id: string;
-    title: string;
-    scenario_kind?: "writing" | "trpg" | string;
-  };
-  logs: ScenarioLogEntry[];
-  count: number;
-  active_log_id?: string | null;
-  active_log_type?: ScenarioLogType | null;
+export type AgentRunFetchOptions = {
+  includeEvents?: boolean;
+  includeToolCalls?: boolean;
+  includeTimeline?: boolean;
 };
 
 // ─── ベースリクエスト関数 ───
@@ -495,9 +592,8 @@ export const chatApi = {
       timeoutMs: 5000,
     });
     const key = current.toLocaleLowerCase();
-    const match = (Array.isArray(catalog.characters)
-      ? catalog.characters
-      : []
+    const match = (
+      Array.isArray(catalog.characters) ? catalog.characters : []
     ).find((character) => {
       const candidates = [
         character.slug,
@@ -531,9 +627,8 @@ export const chatApi = {
       timeoutMs: 5000,
     });
     const key = characterName.trim().toLocaleLowerCase();
-    const match = (Array.isArray(catalog.characters)
-      ? catalog.characters
-      : []
+    const match = (
+      Array.isArray(catalog.characters) ? catalog.characters : []
     ).find((character) => {
       const candidates = [
         character.slug,
@@ -554,11 +649,16 @@ export const chatApi = {
   },
 
   /** セッション一覧取得 */
-  listSessions: (projectId?: string) =>
-    request<{ conversations: ConversationSession[] }>(
-      `/api/conversations${projectId ? `?project_id=${projectId}` : ""}`,
+  listSessions: (projectId?: string, appId?: string) => {
+    const params = new URLSearchParams();
+    if (projectId) params.set("project_id", projectId);
+    if (appId) params.set("app_id", appId);
+    const query = params.toString();
+    return request<{ conversations: ConversationSession[] }>(
+      `/api/conversations${query ? `?${query}` : ""}`,
       { retries: 3, retryDelayMs: 500 },
-    ),
+    );
+  },
 
   searchConversations: (query: string, projectId?: string | null) => {
     const params = new URLSearchParams({ q: query });
@@ -581,6 +681,12 @@ export const chatApi = {
       content: string;
       client_message_id?: string;
     },
+    appContext?: { appId: string; targetId: string } | null,
+    mainRoute?: {
+      provider?: string;
+      model?: string;
+      effort?: string;
+    } | null,
   ) =>
     request<{
       session: ConversationSession;
@@ -590,21 +696,33 @@ export const chatApi = {
       body: JSON.stringify({
         character_name: characterName,
         project_id: projectId,
+        app_id: appContext?.appId,
+        app_target_id: appContext?.targetId,
         initial_message: initialMessage,
+        ...(mainRoute?.provider && mainRoute?.model
+          ? { main_route: mainRoute }
+          : {}),
       }),
     }),
 
-  /** セッションのメッセージ一覧取得 */
-  getMessages: (sessionId: string) =>
-    request<{ messages: ConversationMessage[] }>(
-      `/api/conversations/${sessionId}/messages`,
+  /**
+   * セッションのメッセージ一覧取得。
+   * since（ISO8601）を渡すと差分のみ取得し、レスポンスの server_time を次回 since に使う。
+   */
+  getMessages: (sessionId: string, since?: string) => {
+    const query = since ? `?since=${encodeURIComponent(since)}` : "";
+    // cache: "no-store" は付けない。サーバの ETag + Cache-Control: private, no-cache を活かし、
+    // ブラウザの条件付き GET（If-None-Match → 304）で帯域を節約する。
+    // 差分が無い間は ?since が一定になり同一 URL の 304 が成立する。
+    return request<{ messages: ConversationMessage[]; server_time?: string }>(
+      `/api/conversations/${sessionId}/messages${query}`,
       {
-        cache: "no-store",
         headers: { "Cache-Control": "no-cache" },
         retries: 2,
         retryDelayMs: 500,
       },
-    ),
+    );
+  },
 
   getContextSnapshot: (sessionId: string) =>
     request<ContextSnapshotResponse>(
@@ -634,10 +752,10 @@ export const chatApi = {
       },
     ),
 
-  /** セッション再開（メッセージ付き） */
-  resumeSession: (sessionId: string) =>
+  /** セッション再開。キャッシュ再訪時は includeMessages=false で全履歴転送を省く。 */
+  resumeSession: (sessionId: string, includeMessages = true) =>
     request<{ session: ConversationSession; messages: ConversationMessage[] }>(
-      `/api/conversations/${sessionId}/resume`,
+      `/api/conversations/${sessionId}/resume?include_messages=${includeMessages ? "true" : "false"}`,
       {
         method: "POST",
         retries: 3,
@@ -668,9 +786,14 @@ export const chatApi = {
       body: JSON.stringify(data),
     }),
 
-  getAgentRun: (runId: string) =>
-    request<{ success: boolean; agent_run: AgentRun }>(
-      `/api/python-proxy/agent-runs/${runId}?include_events=false&include_tool_calls=false&include_timeline=true`,
+  getAgentRun: (runId: string, options?: AgentRunFetchOptions) => {
+    const query = new URLSearchParams({
+      include_events: String(options?.includeEvents ?? false),
+      include_tool_calls: String(options?.includeToolCalls ?? false),
+      include_timeline: String(options?.includeTimeline ?? true),
+    });
+    return request<{ success: boolean; agent_run: AgentRun }>(
+      `/api/python-proxy/agent-runs/${runId}?${query.toString()}`,
       {
         cache: "no-store",
         headers: { "Cache-Control": "no-cache" },
@@ -678,15 +801,24 @@ export const chatApi = {
         retryDelayMs: 300,
         timeoutMs: 10000,
       },
-    ),
+    );
+  },
 
   stopGeneration: (sessionId: string) =>
-    request<{ success: boolean; cancelled: number; session_id: string }>(
-      `/api/python-proxy/conversations/${sessionId}/generation/stop`,
-      {
-        method: "POST",
-      },
-    ),
+    request<{
+      success: boolean;
+      cancelled: number;
+      session_id: string;
+      status?: string;
+      message?: ConversationMessage | null;
+      messages?: ConversationMessage[];
+      persistence_failed?: boolean;
+      persistence_failed_run_ids?: string[];
+      agent_run_id?: string | null;
+      agent_run_ids?: string[];
+    }>(`/api/python-proxy/conversations/${sessionId}/generation/stop`, {
+      method: "POST",
+    }),
 
   getGenerationStatus: (sessionId: string) =>
     request<ConversationGenerationStatus>(
@@ -699,9 +831,30 @@ export const chatApi = {
       },
     ),
 
-  steerGeneration: (sessionId: string, message: string) => {
-    const body: Schemas["UserMessage"] = { message };
-    return request<{ success: boolean; queued: boolean; session_id: string }>(
+  steerGeneration: (
+    sessionId: string,
+    message: string,
+    clientMessageId?: string,
+    agentRunId?: string | null,
+  ) => {
+    const body = {
+      message,
+      client_message_id: clientMessageId,
+      agent_run_id: agentRunId || undefined,
+    };
+    return request<{
+      success: boolean;
+      queued: boolean;
+      interrupted?: boolean;
+      blocked?: boolean;
+      status?: string;
+      agent_run_id?: string;
+      client_message_id?: string;
+      user_message_id?: string;
+      persistence_failed?: boolean;
+      duplicate?: boolean;
+      session_id: string;
+    }>(
       `/api/python-proxy/conversations/${sessionId}/generation/steer`,
       {
         method: "POST",
@@ -722,6 +875,29 @@ export const chatApi = {
       body: JSON.stringify({ title }),
     }),
 
+  markSessionRead: (sessionId: string) =>
+    request<{
+      success: boolean;
+      session_id: string;
+      last_read_at?: string | null;
+    }>(`/api/conversations/${sessionId}/read`, {
+      method: "POST",
+      retries: 1,
+      retryDelayMs: 250,
+    }),
+
+  updateSessionDevelopmentStatus: (
+    sessionId: string,
+    developmentStatus: "working" | "waiting_for_user" | "completed",
+  ) =>
+    request<{ success: boolean; session: ConversationSession }>(
+      `/api/conversations/${sessionId}`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ development_status: developmentStatus }),
+      },
+    ),
+
   /** 初回会話文脈からセッションタイトルを生成 */
   generateSessionTitle: (sessionId: string) =>
     request<{
@@ -735,6 +911,19 @@ export const chatApi = {
     }),
 
   // ─── ブランチング関連API ───
+
+  /** 指定メッセージまでを独立した会話へフォーク */
+  forkSession: (sessionId: string, fromMessageId: string, title?: string) =>
+    request<{ success: boolean; session: ConversationSession }>(
+      `/api/python-proxy/conversations/${sessionId}/fork`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          from_message_id: fromMessageId,
+          title,
+        }),
+      },
+    ),
 
   /** メッセージ編集（新ブランチ作成） */
   editMessage: (sessionId: string, messageId: string, content: string) => {
@@ -825,90 +1014,17 @@ export const chatApi = {
   /** RP設定取得 */
   getRpSettings: (sessionId: string) =>
     request<{ rp_settings: Record<string, number> }>(
-      `/api/conversations/${sessionId}/rp-settings`,
+      `/api/python-proxy/conversations/${sessionId}/rp-settings`,
     ),
 
   /** RP設定更新 */
   updateRpSettings: (sessionId: string, settings: Record<string, number>) =>
     request<{ success: boolean }>(
-      `/api/conversations/${sessionId}/rp-settings`,
+      `/api/python-proxy/conversations/${sessionId}/rp-settings`,
       {
         method: "PUT",
         body: JSON.stringify(settings),
       },
     ),
 
-  // ─── シナリオ関連API ───
-
-  /** シナリオ詳細を取得 */
-  getScenario: (scenarioId: string) =>
-    request<{
-      id: string;
-      title: string;
-      description?: string;
-      characters?: Array<{
-        id: string;
-        name: string;
-        role?: string;
-        description?: string;
-      }>;
-    }>(`/api/python-proxy/scenarios/${scenarioId}`),
-
-  /** シナリオに紐づくログ一覧を取得 */
-  getScenarioLogs: (scenarioId: string) =>
-    request<ScenarioLogResponse>(
-      `/api/python-proxy/scenarios/${scenarioId}/logs`,
-    ),
-
-  /** 会話セッションIDからシナリオログ文脈を取得 */
-  getScenarioLogContextByConversation: (convSessionId: string) =>
-    request<ScenarioLogResponse | null>(
-      `/api/python-proxy/scenarios/logs/by-conversation/${convSessionId}`,
-    ),
-
-  /** 会話セッションIDからプレイセッション情報を取得 */
-  getScenarioPlaySessionByConversation: (convSessionId: string) =>
-    request<{
-      id: string;
-      scenario_id: string;
-      conversation_session_id: string;
-      current_scene_id: string | null;
-      player_state: Record<string, unknown>;
-      perspective: string;
-      status: string;
-      scenario?: {
-        id: string;
-        title: string;
-        description: string;
-      };
-      current_scene?: {
-        id: string;
-        title: string;
-        description: string;
-      };
-    } | null>(`/api/python-proxy/scenarios/by-conversation/${convSessionId}`),
-
-  /** 会話セッションIDから執筆セッション情報を取得 */
-  getWritingSessionByConversation: (convSessionId: string) =>
-    request<{
-      id: string;
-      scenario_id: string;
-      conversation_session_id: string;
-      target_scene_id: string;
-      status: string;
-      scenario?: {
-        id: string;
-        title: string;
-      };
-      target_scene?: {
-        id: string;
-        title: string;
-      };
-      target_episode?: {
-        id: string;
-        title: string;
-      };
-    } | null>(
-      `/api/python-proxy/scenarios/write/by-conversation/${convSessionId}`,
-    ),
 };

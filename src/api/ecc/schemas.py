@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ── 統合キャラクター ──
@@ -17,6 +17,45 @@ class CreateCharacterRequest(BaseModel):
     system_prompt: str = ""
     model: str = ""
     allowed_tools: List[str] = []
+    # 音声（既存 UpdateCharacterRequest と同じ fields を作成時にも受理する）
+    voice_engine: str = ""
+    voice_name: str = ""
+    voice_id: str = ""
+    speaker_id: Optional[int] = None
+    voice_parameters: dict = {}
+    # 性格
+    greeting: str = ""
+    invalid_content_reply: str = ""
+    fallback_reply: str = ""
+    goodbye_reply: str = ""
+    recognition_aliases: List[str] = []
+    # ロールプレイ
+    description: str = ""
+    personality_summary: str = ""
+    first_message: str = ""
+    alternate_greetings: List[str] = []
+    example_messages: str = ""
+    scenario: str = ""
+    # RP画像自動生成
+    auto_image_gen: bool = False
+    image_gen_trigger: Literal["scene_change", "every_n", "emotion_change"] = "scene_change"
+    image_gen_interval: int = Field(default=5, ge=1)
+    # 外見・画像生成
+    appearance_tags: str = ""
+    negative_tags: str = ""
+    image_gen_engine: Literal["", "comfyui"] = ""
+    comfyui_config: dict = {}
+    avatar_image_path: str = ""
+
+    @field_validator("image_gen_engine", mode="before")
+    @classmethod
+    def reject_unsupported_image_engine(cls, value: object) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized == "gemini":
+            raise ValueError("image_gen_engine=gemini はサポートされていません")
+        if normalized in {"", "comfyui"}:
+            return normalized
+        raise ValueError(f"未対応の image_gen_engine です: {value}")
 
 
 class ContextBuildPreviewRequest(BaseModel):
@@ -84,9 +123,25 @@ class UpdateCharacterRequest(BaseModel):
     # 外見・画像生成
     appearance_tags: Optional[str] = None
     negative_tags: Optional[str] = None
-    image_gen_engine: Optional[str] = None
+    image_gen_engine: Optional[Literal["", "comfyui"]] = None
     comfyui_config: Optional[dict] = None
     avatar_image_path: Optional[str] = None
+    # RP画像自動生成
+    auto_image_gen: Optional[bool] = None
+    image_gen_trigger: Optional[Literal["scene_change", "every_n", "emotion_change"]] = None
+    image_gen_interval: Optional[int] = Field(default=None, ge=1)
+
+    @field_validator("image_gen_engine", mode="before")
+    @classmethod
+    def reject_unsupported_image_engine(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip().lower()
+        if normalized == "gemini":
+            raise ValueError("image_gen_engine=gemini はサポートされていません")
+        if normalized in {"", "comfyui"}:
+            return normalized
+        raise ValueError(f"未対応の image_gen_engine です: {value}")
 
 
 # ── 5. スキル拡張 ──
@@ -176,3 +231,32 @@ class UpdateEntryRequest(BaseModel):
 
 class LinkCharacterRequest(BaseModel):
     character_id: str
+
+
+# ── Irodori 参照音声 ──
+
+
+class VoiceAssetOrderRequest(BaseModel):
+    """登録済み asset id の新しい順序。"""
+
+    asset_ids: List[str]
+
+
+class VoiceCaptureStartRequest(BaseModel):
+    """WASAPI render-loopback の録音開始指定。"""
+
+    device_id: Optional[str] = None
+    # 旧クライアント向けに index も任意受理する。新しい UI は device_id
+    # を正本として送信し、バックエンドは開始時にデバイスを再列挙する。
+    device_index: Optional[int] = None
+
+
+class VoicePreviewRequest(BaseModel):
+    """Irodori 試聴テキストと編集中設定の任意上書き。"""
+
+    text: str
+    caption: Optional[str] = None
+    # Character settings are often edited locally before the save request.  A
+    # preview can therefore carry the selector directly without mutating the
+    # persisted ``voice_parameters`` JSON.
+    irodori_model: Optional[str] = None

@@ -2,27 +2,32 @@ import React, { useCallback, useState } from 'react';
 import { Alert, ScrollView, StyleSheet, View } from 'react-native';
 import { useFocusEffect, useRouter } from 'expo-router';
 import { goBackOrReplace } from "../../lib/navigation";
-import { Button, Chip, IconButton, Surface, Switch, Text, TextInput } from 'react-native-paper';
-import { scenarioApi } from '../../lib/scenario-api';
+import { Button, Chip, IconButton, Surface, Text, TextInput } from 'react-native-paper';
+import { storyApi } from '../../lib/story-api';
+import storyRepo from '../../repositories/story';
 import { trpgApi } from '../../lib/trpg-api';
-import type { Scenario } from '../../types/api';
+import type { StoryWork } from '../../types/api';
 
 export default function TrpgHostScreen() {
   const router = useRouter();
-  const [scenarios, setScenarios] = useState<Scenario[]>([]);
-  const [scenarioId, setScenarioId] = useState('');
+  const [works, setWorks] = useState<StoryWork[]>([]);
+  const [workId, setWorkId] = useState('');
   const [roomTitle, setRoomTitle] = useState('');
-  const [maxPlayers, setMaxPlayers] = useState('4');
   const [gmMode, setGmMode] = useState<'ai' | 'human'>('ai');
-  const [isPublic, setIsPublic] = useState(true);
 
   const load = useCallback(async () => {
-    const nextScenarios = await scenarioApi.list();
-    setScenarios(nextScenarios);
-    if (!scenarioId && nextScenarios[0]) {
-      setScenarioId(nextScenarios[0].id);
+    let allWorks: StoryWork[];
+    try {
+      allWorks = await storyApi.listWorks();
+    } catch {
+      // Keep the selector usable offline after the last successful Story
+      // list has been cached locally.
+      allWorks = await storyRepo.listWorks();
     }
-  }, [scenarioId]);
+    const nextWorks = allWorks.filter((work) => work.kind === 'trpg');
+    setWorks(nextWorks);
+    setWorkId((current) => (current && nextWorks.some((work) => work.id === current) ? current : nextWorks[0]?.id ?? ''));
+  }, []);
 
   useFocusEffect(
     useCallback(() => {
@@ -31,14 +36,14 @@ export default function TrpgHostScreen() {
   );
 
   const handleCreate = async () => {
-    if (!scenarioId) return;
+    if (!workId) return;
     try {
       const room = await trpgApi.createRoom({
-        scenario_id: scenarioId,
+        // trpgApi serializes this selected Story Work ID as canonical
+        // `work_id` for POST /api/trpg/sessions.
+        work_id: workId,
         room_title: roomTitle.trim() || undefined,
-        max_players: Number(maxPlayers) || 4,
         gm_mode: gmMode,
-        is_public: isPublic,
       });
       router.replace(`/trpg/${room.id}`);
     } catch (error) {
@@ -62,17 +67,17 @@ export default function TrpgHostScreen() {
 
       <ScrollView contentContainerStyle={styles.content}>
         <Surface style={styles.card} elevation={0}>
-          <Text style={styles.cardTitle}>Scenario</Text>
+          <Text style={styles.cardTitle}>Story Work (TRPG)</Text>
           <View style={styles.wrap}>
-            {scenarios.map((scenario) => (
+            {works.map((work) => (
               <Chip
-                key={scenario.id}
-                selected={scenarioId === scenario.id}
-                onPress={() => setScenarioId(scenario.id)}
-                style={[styles.chip, scenarioId === scenario.id && styles.chipActive]}
+                key={work.id}
+                selected={workId === work.id}
+                onPress={() => setWorkId(work.id)}
+                style={[styles.chip, workId === work.id && styles.chipActive]}
                 textStyle={styles.chipText}
               >
-                {scenario.title}
+                {work.title}
               </Chip>
             ))}
           </View>
@@ -84,14 +89,6 @@ export default function TrpgHostScreen() {
             value={roomTitle}
             onChangeText={setRoomTitle}
             mode="outlined"
-            style={styles.input}
-          />
-          <TextInput
-            label="Max Players"
-            value={maxPlayers}
-            onChangeText={setMaxPlayers}
-            mode="outlined"
-            keyboardType="numeric"
             style={styles.input}
           />
           <Text style={styles.cardTitle}>GM Mode</Text>
@@ -107,10 +104,6 @@ export default function TrpgHostScreen() {
                 {value.toUpperCase()}
               </Chip>
             ))}
-          </View>
-          <View style={styles.switchRow}>
-            <Text style={styles.switchLabel}>Public Room</Text>
-            <Switch value={isPublic} onValueChange={setIsPublic} />
           </View>
           <Button mode="contained" buttonColor="#7c3aed" textColor="#cdd6f4" onPress={handleCreate}>
             Create Room
@@ -135,11 +128,4 @@ const styles = StyleSheet.create({
   chipActive: { backgroundColor: '#4c1d95' },
   chipText: { color: '#cdd6f4' },
   input: { marginBottom: 12 },
-  switchRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 16,
-  },
-  switchLabel: { color: '#cdd6f4', fontSize: 14 },
 });

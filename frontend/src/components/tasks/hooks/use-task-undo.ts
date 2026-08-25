@@ -88,6 +88,7 @@ export function useTaskUndo({
               start_at: t.start_at ?? null,
               end_at: t.end_at ?? null,
               all_day: t.all_day,
+              ...(t.auto_close_on_due ? { auto_close_on_due: true } : {}),
               notifications_enabled: t.notifications_enabled,
               parent_task_id: t.parent_task_id ?? null,
               tag_ids: (t.tags || []).map((tag) => tag.id),

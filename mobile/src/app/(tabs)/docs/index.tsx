@@ -5,8 +5,15 @@
  * 各行タップで詳細（アウトライン編集）へ。FAB で新規ページ作成、ヘッダから検索とデイリーページ。
  */
 
-import React, { useCallback, useState } from "react";
-import { FlatList, RefreshControl, StyleSheet, View } from "react-native";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Alert,
+  AppState,
+  FlatList,
+  RefreshControl,
+  StyleSheet,
+  View,
+} from "react-native";
 import {
   ActivityIndicator,
   Divider,
@@ -19,6 +26,7 @@ import {
 import { useFocusEffect, useRouter } from "expo-router";
 import { ScreenHeader } from "../../../components/screen-header";
 import { RichTitle } from "../../../components/docs/rich-title";
+import { ClipIngestDialog } from "../../../components/docs/clip-ingest-dialog";
 import { docsRepo } from "../../../repositories/docs";
 import { docsApi } from "../../../lib/docs-api";
 import { useNetworkStore } from "../../../stores/network";
@@ -37,32 +45,69 @@ export default function DocsListScreen() {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [busyToday, setBusyToday] = useState(false);
+  const [clipIngestVisible, setClipIngestVisible] = useState(false);
+  const focusedRef = useRef(false);
+  const loadRequestRef = useRef(0);
+  const revalidateFlightRef = useRef<Promise<void> | null>(null);
 
   const loadPages = useCallback(async () => {
+    const requestId = ++loadRequestRef.current;
     try {
-      setPages(await docsRepo.listPages());
+      const nextPages = await docsRepo.listPages();
+      if (requestId === loadRequestRef.current) setPages(nextPages);
     } catch {
-      setPages([]);
+      if (requestId === loadRequestRef.current) setPages([]);
     } finally {
-      setLoading(false);
+      if (requestId === loadRequestRef.current) setLoading(false);
     }
   }, []);
 
+  const revalidatePages = useCallback((): Promise<void> => {
+    if (!online) return loadPages();
+    if (revalidateFlightRef.current) return revalidateFlightRef.current;
+
+    const flight = runSync()
+      .then(loadPages)
+      .catch(() => {
+        // ローカル先読みは維持する。次のfocus/foreground/手動更新で再試行する。
+      })
+      .finally(() => {
+        if (revalidateFlightRef.current === flight) {
+          revalidateFlightRef.current = null;
+        }
+      });
+    revalidateFlightRef.current = flight;
+    return flight;
+  }, [loadPages, online]);
+
   useFocusEffect(
     useCallback(() => {
+      focusedRef.current = true;
       void loadPages();
-    }, [loadPages]),
+      void revalidatePages();
+      return () => {
+        focusedRef.current = false;
+        loadRequestRef.current += 1;
+      };
+    }, [loadPages, revalidatePages]),
   );
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (state) => {
+      if (state === "active" && focusedRef.current) {
+        void revalidatePages();
+      }
+    });
+    return () => subscription.remove();
+  }, [revalidatePages]);
 
   const onRefresh = async () => {
     setRefreshing(true);
     try {
-      if (online) await runSync();
+      await revalidatePages();
     } finally {
-      // オフライン・同期失敗時も、既存のSQLiteキャッシュを表示する。
-      await loadPages();
+      setRefreshing(false);
     }
-    setRefreshing(false);
   };
 
   const openNode = useCallback(
@@ -138,7 +183,23 @@ export default function DocsListScreen() {
       const result = await docsApi.today();
       openNode(result.node.id);
     } catch {
-      // オフライン時はデイリーページ生成不可
+      // オフライン時はローカルキャッシュ済みの Day ノードへフォールバックする。
+      // 新規作成はサーバ ensure が重複排除を担うためオフラインでは行わない。
+      const now = new Date();
+      const today = [
+        now.getFullYear(),
+        String(now.getMonth() + 1).padStart(2, "0"),
+        String(now.getDate()).padStart(2, "0"),
+      ].join("-");
+      const cached = await docsRepo.findDayNode(today).catch(() => null);
+      if (cached) {
+        openNode(cached.id);
+      } else {
+        Alert.alert(
+          "デイリーページ",
+          "オフラインのため今日のデイリーページを作成できません。接続後に再度お試しください。",
+        );
+      }
     } finally {
       setBusyToday(false);
     }
@@ -152,6 +213,14 @@ export default function DocsListScreen() {
         title="Docs"
         right={
           <>
+            <IconButton
+              icon="tray-arrow-down"
+              size={22}
+              iconColor="#a6adc8"
+              style={styles.headerIcon}
+              accessibilityLabel="クリップ取り込み"
+              onPress={() => setClipIngestVisible(true)}
+            />
             <IconButton
               icon={searchVisible ? "magnify-close" : "magnify"}
               size={22}
@@ -271,6 +340,14 @@ export default function DocsListScreen() {
         style={styles.fab}
         onPress={() => void createPage()}
         color="#cdd6f4"
+      />
+      <ClipIngestDialog
+        visible={clipIngestVisible}
+        onDismiss={() => setClipIngestVisible(false)}
+        onOpenNode={(nodeId) => {
+          setClipIngestVisible(false);
+          openNode(nodeId);
+        }}
       />
     </View>
   );

@@ -313,10 +313,8 @@ test.describe("タスクのプロジェクト移動", () => {
     await page.goto("/tasks");
     await expect(page.getByText("Move me")).toBeVisible();
 
-    await page
-      .getByTestId("task-row-task-a")
-      .locator("select")
-      .selectOption("project-2");
+    await page.getByTestId("task-row-task-a").getByRole("combobox").click();
+    await page.getByRole("option", { name: "Project Two" }).click();
 
     await expect.poll(() => patchPayloads).toHaveLength(1);
     expect(patchPayloads[0]).toMatchObject({
@@ -663,10 +661,8 @@ test.describe("タスクのプロジェクト移動", () => {
     await page.goto("/tasks");
     await expect(page.getByText("Keep my row")).toBeVisible();
 
-    await page
-      .getByTestId("task-row-task-b")
-      .locator("select")
-      .selectOption("project-1");
+    await page.getByTestId("task-row-task-b").getByRole("combobox").click();
+    await page.getByRole("option", { name: "Project One" }).click();
 
     await expect.poll(() => patchPayloads).toHaveLength(1);
     expect(patchPayloads[0]).toMatchObject({
@@ -706,5 +702,96 @@ test.describe("タスクのプロジェクト移動", () => {
         ),
       )
       .toEqual(["task-a", "task-b", "task-c"]);
+  });
+
+  test("日付Picker内の繰り返しSelectを前面で操作できる", async ({ page }) => {
+    const tasks = [task("task-date", "project-1", "Recurrence menu", 0)];
+
+    await page.route("**/api/**", async (route) => {
+      const url = new URL(route.request().url());
+
+      if (url.pathname === "/api/auth/status") {
+        await route.fulfill({
+          json: {
+            authenticated: true,
+            user: { id: "user-1", username: "tester", role: "admin" },
+          },
+        });
+        return;
+      }
+      if (url.pathname === "/api/projects") {
+        await route.fulfill({ json: { projects, total: projects.length } });
+        return;
+      }
+      if (url.pathname === "/api/spaces") {
+        await route.fulfill({ json: { spaces: [], total: 0 } });
+        return;
+      }
+      if (url.pathname === "/api/tasks") {
+        await route.fulfill({ json: tasks });
+        return;
+      }
+      if (url.pathname === "/api/tasks/task-date/recurrence") {
+        await route.fulfill({ json: null });
+        return;
+      }
+      if (
+        url.pathname.startsWith("/api/projects/") &&
+        url.pathname.endsWith("/tags")
+      ) {
+        await route.fulfill({ json: [] });
+        return;
+      }
+      if (url.pathname === "/api/conversations") {
+        await route.fulfill({ json: { conversations: [], total: 0 } });
+        return;
+      }
+      if (url.pathname === "/api/notifications") {
+        await route.fulfill({ json: [] });
+        return;
+      }
+      if (url.pathname === "/api/python-proxy/health") {
+        await route.fulfill({ status: 503, json: { ok: false } });
+        return;
+      }
+      if (url.pathname.endsWith("/explorer/list")) {
+        await route.fulfill({
+          json: {
+            success: true,
+            current_path: "",
+            parent_path: null,
+            can_go_up: false,
+            directories: [],
+            files: [],
+            total_items: 0,
+          },
+        });
+        return;
+      }
+      await route.fulfill({ json: {} });
+    });
+
+    await page.goto("/tasks");
+    const taskRow = page.getByTestId("task-row-task-date");
+    await expect(taskRow).toBeVisible();
+    await taskRow.getByTitle("Start Date").click();
+    await page.getByRole("button", { name: "繰り返しを設定" }).click();
+
+    const frequencySelect = page
+      .getByRole("combobox")
+      .filter({ hasText: "毎週" });
+    await frequencySelect.click();
+
+    const dailyOption = page.getByRole("option", { name: "毎日" });
+    await expect(dailyOption).toBeVisible();
+    const selectContent = dailyOption.locator(
+      "xpath=ancestor::*[@data-slot='select-content']",
+    );
+    await expect(selectContent.locator("..")).toHaveCSS("z-index", "210");
+
+    await dailyOption.click();
+    await expect(
+      page.getByRole("combobox").filter({ hasText: "毎日" }),
+    ).toBeVisible();
   });
 });

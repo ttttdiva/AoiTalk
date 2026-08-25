@@ -1,14 +1,17 @@
-"""Context-window based prompt budgeting for local OpenAI-compatible servers."""
+"""Context-window based prompt budgeting for AoiTalk model runtimes."""
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
+
+from .openai_model_context_registry import openai_model_context_window_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +20,10 @@ DEFAULT_REMOTE_CONTEXT_WINDOW_TOKENS = 32768
 DEFAULT_RESPONSE_TOKENS = 1024
 DEFAULT_CHARS_PER_TOKEN = 1.15
 MIN_CONTEXT_WINDOW_TOKENS = 1024
-MAX_CONTEXT_WINDOW_TOKENS = 1048576
+# Keep the bound at the largest currently documented value.  The previous
+# one-MiB cap silently rounded GPT-5.6's official 1,050,000-token window down
+# to 1,048,576.
+MAX_CONTEXT_WINDOW_TOKENS = 1_050_000
 PROBE_CACHE_TTL_SECONDS = 60.0
 PROBE_TIMEOUT_SECONDS = 0.2
 
@@ -83,6 +89,20 @@ def resolve_context_budget(
             requested_max_tokens=requested_max_tokens,
         )
 
+    # The official OpenAI model API does not return context limits.  Consult
+    # our exact-match documentation registry before attempting a provider
+    # probe, and never infer a value for an unknown model ID.
+    if provider_key == "openai":
+        official = openai_model_context_window_tokens(model_name)
+        if official:
+            return build_context_budget(
+                context_window_tokens=official,
+                source="official-registry",
+                config=config,
+                provider_key=provider_key,
+                requested_max_tokens=requested_max_tokens,
+            )
+
     if _probe_enabled(config, provider_key):
         probed_tokens, probed_source = _probe_context_window_tokens(
             base_url=base_url,
@@ -101,7 +121,7 @@ def resolve_context_budget(
 
     return build_context_budget(
         context_window_tokens=_fallback_context_window_tokens(provider_key),
-        source="fallback",
+        source=("provider-default" if provider_key in {"deepseek", "deepinfra"} else "fallback"),
         config=config,
         provider_key=provider_key,
         requested_max_tokens=requested_max_tokens,
@@ -232,14 +252,6 @@ def _configured_context_window_tokens(config: Any, provider_key: str) -> int | N
     ]
     if provider_key == "sglang":
         config_keys.append("sglang.max_model_len")
-    if provider_key == "openai_compatible_local":
-        config_keys.extend(
-            [
-                "openai_compatible_local.qwopus.ctx_size",
-                "openai_compatible_local.qwopus.context_window",
-                "openai_compatible_local.qwopus.context_window_tokens",
-            ]
-        )
     for key in config_keys:
         value = _parse_int(_config_get(config, key))
         if value:
@@ -346,6 +358,8 @@ def _chars_per_token(
 
 
 def _fallback_context_window_tokens(provider_key: str) -> int:
+    if provider_key in {"deepseek", "deepinfra"}:
+        return 1048576
     if provider_key in {"openai_compatible_local", "sglang"}:
         return DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS
     return DEFAULT_REMOTE_CONTEXT_WINDOW_TOKENS
@@ -405,11 +419,15 @@ def _config_bool(value: Any, default: bool) -> bool:
 
 
 def _parse_int(value: Any) -> int | None:
-    if value is None or value == "":
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    if isinstance(value, float) and (
+        not math.isfinite(value) or not value.is_integer()
+    ):
         return None
     try:
         parsed = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return parsed if parsed > 0 else None
 

@@ -54,6 +54,16 @@ export default function TabLayout() {
         }}
       />
       <Tabs.Screen
+        name="apps"
+        options={{
+          href: null,
+          title: "Apps",
+          tabBarIcon: ({ color, size }) => (
+            <Icon source="application-brackets-outline" size={size} color={color} />
+          ),
+        }}
+      />
+      <Tabs.Screen
         name="calendar"
         options={{
           title: "Calendar",
@@ -83,8 +93,10 @@ export default function TabLayout() {
       {/* Settings はタブバーから外し、共通ヘッダー右上の歯車から遷移する（スタックは生存） */}
       <Tabs.Screen name="settings" options={{ href: null }} />
       <Tabs.Screen name="docs/[nodeId]" options={{ href: null }} />
+      <Tabs.Screen name="filer/text" options={{ href: null }} />
       <Tabs.Screen name="chat/[sessionId]" options={{ href: null }} />
       <Tabs.Screen name="tasks/[taskId]" options={{ href: null }} />
+      <Tabs.Screen name="apps/[appId]" options={{ href: null }} />
       <Tabs.Screen name="settings/profile" options={{ href: null }} />
       <Tabs.Screen name="settings/connection" options={{ href: null }} />
       <Tabs.Screen name="settings/notifications" options={{ href: null }} />

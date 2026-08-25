@@ -1,0 +1,53 @@
+# Experimental DeepSeek llama.cpp backend.  This overlay is intentionally
+# conservative: no implicit download, no GPU-all/999 device shortcut, no
+# performance promise, and restart is disabled for operator-controlled use.
+services:
+  aoitalk:
+    environment:
+      AOITALK_BACKEND: deepseek-llamacpp
+      AOITALK_ACTIVE_DEPLOYMENT_BACKEND: deepseek-llamacpp
+      AOITALK_LLM_MODE: openai_compatible_local
+      AOITALK_EFFECTIVE_LLM_PROVIDER: openai_compatible_local
+      AOITALK_EXTERNAL_PROVIDER: openai_compatible_local
+      AOITALK_EXTERNAL_MODEL: ${AOITALK_DEEPSEEK_SERVED_MODEL:-deepseek-llamacpp}
+      AOITALK_EXTERNAL_BASE_URL: ${AOITALK_DEEPSEEK_BASE_URL:-http://deepseek-llamacpp:8080/v1}
+      OPENAI_COMPATIBLE_LOCAL_MODEL: ${AOITALK_DEEPSEEK_SERVED_MODEL:-deepseek-llamacpp}
+      OPENAI_COMPATIBLE_LOCAL_BASE_URL: ${AOITALK_DEEPSEEK_BASE_URL:-http://deepseek-llamacpp:8080/v1}
+      OPENAI_COMPATIBLE_LOCAL_SERVER_PROFILE: llama.cpp
+      OPENAI_COMPATIBLE_LOCAL_TOOLS: "true"
+      OPENAI_COMPATIBLE_LOCAL_API_KEY_FILE: /run/secrets/openai_compatible_local_api_key
+    depends_on:
+      deepseek-llamacpp:
+        condition: service_healthy
+        required: true
+
+  deepseek-llamacpp:
+    image: ${AOITALK_DEEPSEEK_LLAMA_CPP_IMAGE:?AOITALK_DEEPSEEK_LLAMA_CPP_IMAGE must be an immutable repository@sha256 digest}
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        test -f "/models/deepseek/${AOITALK_DEEPSEEK_MODEL_FILE:-model.gguf}";
+        export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1;
+        exec llama-server
+        --model "/models/deepseek/${AOITALK_DEEPSEEK_MODEL_FILE:-model.gguf}"
+        --host 0.0.0.0 --port 8080
+        --alias "${AOITALK_DEEPSEEK_SERVED_MODEL:-deepseek-llamacpp}"
+    volumes:
+      - ${AOITALK_DEEPSEEK_MODEL_DIR:-${AOITALK_DATA_ROOT:?AOITALK_DATA_ROOT is required}/huggingface/deepseek-llamacpp}:/models/deepseek:ro
+    expose:
+      - "8080"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl -fsS http://127.0.0.1:8080/health >/dev/null
+    networks:
+      - aoitalk-network
+    restart: "no"
+
+secrets:
+  openai_compatible_local_api_key:
+    file: ${AOITALK_SECRETS_DIR:?AOITALK_SECRETS_DIR is required}/openai_compatible_local_api_key

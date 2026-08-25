@@ -6,14 +6,19 @@ import {
   knowledgeFieldValues,
   knowledgeNodes,
   knowledgeNodeSupertags,
+  knowledgeNodeShares,
   knowledgeSupertags,
   tasks,
 } from "@/db/schema";
+import { docsLibraries } from "@/lib/server/docs-library-schema";
 import { getSession } from "@/lib/auth";
-import { getReadableProjectIds } from "@/lib/server/task-route-utils";
+import {
+  getParticipatingProjectIds,
+} from "@/lib/server/task-route-utils";
 import {
   ensureDocsWorkspace,
-  ensureProjectReadable,
+  getDocsLibraryIdsForReadableProjects,
+  getDocsNodeAccess,
   decryptNodeBodyText,
   normalizeJsonObject,
   serializeFieldValue,
@@ -88,11 +93,43 @@ function uuidListSql(ids: string[]) {
   return sql.join(ids.map((id) => sql`${id}::uuid`), sql`, `);
 }
 
+/**
+ * Resolve a system/name key only when it is unambiguous across the searched
+ * libraries. Personal libraries intentionally carry the same built-in keys;
+ * silently choosing whichever row happened to be returned first would make
+ * an all-project query filter the wrong library.
+ */
+function uniqueKeyMap<T>(
+  rows: T[],
+  keyOf: (row: T) => string | null | undefined,
+  valueOf: (row: T) => string,
+) {
+  const values = new Map<string, string>();
+  const ambiguous = new Set<string>();
+  for (const row of rows) {
+    const rawKey = keyOf(row);
+    if (!rawKey) continue;
+    const key = rawKey.toLowerCase();
+    const value = valueOf(row);
+    if (ambiguous.has(key)) continue;
+    const existing = values.get(key);
+    if (existing && existing !== value) {
+      values.delete(key);
+      ambiguous.add(key);
+      continue;
+    }
+    values.set(key, value);
+  }
+  return values;
+}
+
 function tagExistsCondition(tagIds: string[]) {
   if (tagIds.length === 0) return sql`false`;
   return sql`exists (
     select 1 from knowledge_node_supertags docs_nst
+    inner join knowledge_supertags docs_tags on docs_tags.id = docs_nst.supertag_id
     where docs_nst.node_id = ${knowledgeNodes.id}
+      and docs_tags.docs_library_id = ${knowledgeNodes.docsLibraryId}
       and docs_nst.supertag_id in (${uuidListSql(tagIds)})
   )`;
 }
@@ -115,7 +152,9 @@ function fieldFilterCondition(filter: FieldFilter) {
   if (op === "not_set" || op === "is_not_set") {
     return sql`not exists (
       select 1 from knowledge_field_values docs_fv
+      inner join knowledge_fields docs_fields on docs_fields.id = docs_fv.field_id
       where docs_fv.node_id = ${knowledgeNodes.id}
+        and docs_fields.docs_library_id = ${knowledgeNodes.docsLibraryId}
         and docs_fv.field_id = ${fieldId}::uuid
     )`;
   }
@@ -126,7 +165,9 @@ function fieldFilterCondition(filter: FieldFilter) {
   if (dateRange) {
     return sql`exists (
       select 1 from knowledge_field_values docs_fv
+      inner join knowledge_fields docs_fields on docs_fields.id = docs_fv.field_id
       where docs_fv.node_id = ${knowledgeNodes.id}
+        and docs_fields.docs_library_id = ${knowledgeNodes.docsLibraryId}
         and docs_fv.field_id = ${fieldId}::uuid
         and left(${comparable}, 10) >= ${dateRange.start}
         and left(${comparable}, 10) < ${dateRange.end}
@@ -147,6 +188,11 @@ function fieldFilterCondition(filter: FieldFilter) {
   return sql`exists (
     select 1 from knowledge_field_values docs_fv
     where docs_fv.node_id = ${knowledgeNodes.id}
+      and exists (
+        select 1 from knowledge_fields docs_fields
+        where docs_fields.id = docs_fv.field_id
+          and docs_fields.docs_library_id = ${knowledgeNodes.docsLibraryId}
+      )
       and docs_fv.field_id = ${fieldId}::uuid
       and ${valueCondition}
   )`;
@@ -216,11 +262,11 @@ function taskMatchesSystemFieldFilters(
 
 function serializeVirtualTaskNode(
   task: typeof tasks.$inferSelect,
-  workspaceId: string,
+  docsLibraryId: string,
 ) {
   return {
     id: `task:${task.id}`,
-    workspace_id: workspaceId,
+    docs_library_id: docsLibraryId,
     parent_id: null,
     root_page_id: null,
     project_id: task.projectId,
@@ -288,29 +334,53 @@ export async function POST(request: NextRequest) {
   }
 
   const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
-  const queryJson = normalizeJsonObject(body.query_json ?? body.query);
-  const projectId =
-    typeof body.project_id === "string"
-      ? body.project_id
-      : typeof queryJson.project_id === "string"
-        ? queryJson.project_id
-        : null;
+  const rawQueryJson = normalizeJsonObject(body.query_json ?? body.query);
+  // Project selection is no longer a generic Docs query scope. Project IDs
+  // remain node/task identity fields and ACL inputs, but a query cannot switch
+  // to another library or narrow candidates by `project_id`.
+  const queryJson = { ...rawQueryJson };
+  delete queryJson.project_id;
   const workspace = await ensureDocsWorkspace(user);
-  if (projectId) {
-    const project = await ensureProjectReadable(projectId, user);
-    if (!project) {
-      return NextResponse.json({ detail: "Projectへの読み取り権限がありません" }, { status: 403 });
-    }
+  if (!workspace) {
+    return NextResponse.json({ detail: "Docs workspaceへのアクセス権がありません" }, { status: 403 });
   }
-  const readableProjectIds = projectId ? [projectId] : await getReadableProjectIds(user.id);
+  // Search candidates from every workspace the actor could possibly see.
+  // ACL resolution below is authoritative; keeping the SQL predicate broad
+  // is necessary for a shared personal subtree whose node.project_id points
+  // at a project the recipient cannot otherwise list.
+  const personalWorkspace = await ensureDocsWorkspace(user);
+  const sharedRows = await db
+    .select({ docsLibraryId: knowledgeNodes.docsLibraryId })
+    .from(knowledgeNodeShares)
+    .innerJoin(knowledgeNodes, eq(knowledgeNodeShares.nodeId, knowledgeNodes.id))
+    .innerJoin(docsLibraries, eq(knowledgeNodes.docsLibraryId, docsLibraries.id))
+    .where(
+      and(
+        eq(knowledgeNodeShares.userId, user.id),
+        eq(docsLibraries.libraryType, "personal"),
+      ),
+    );
+  const workspaceIds = await getDocsLibraryIdsForReadableProjects(user.id, [
+    workspace.id,
+    personalWorkspace?.id,
+    ...sharedRows.map((row) => row.docsLibraryId),
+  ].filter((value): value is string => Boolean(value)));
 
   const clauses = clausesFromQuery(queryJson);
   const allTags = await db
     .select()
     .from(knowledgeSupertags)
-    .where(eq(knowledgeSupertags.workspaceId, workspace.id));
-  const tagIdBySystemKey = new Map(allTags.filter((tag) => tag.systemKey).map((tag) => [tag.systemKey as string, tag.id]));
-  const tagIdByName = new Map(allTags.map((tag) => [tag.name.toLowerCase(), tag.id]));
+    .where(inArray(knowledgeSupertags.docsLibraryId, workspaceIds));
+  const tagIdBySystemKey = uniqueKeyMap(
+    allTags,
+    (tag) => tag.systemKey,
+    (tag) => tag.id,
+  );
+  const tagIdByName = uniqueKeyMap(
+    allTags,
+    (tag) => tag.name,
+    (tag) => tag.id,
+  );
   const textClause = clauses.find((clause) => typeof clause.text === "string" || typeof clause.q === "string");
   const q =
     typeof body.q === "string"
@@ -360,10 +430,18 @@ export async function POST(request: NextRequest) {
   const allFields = await db
     .select()
     .from(knowledgeFields)
-    .where(eq(knowledgeFields.workspaceId, workspace.id));
+    .where(inArray(knowledgeFields.docsLibraryId, workspaceIds));
   const fieldsById = new Map(allFields.map((field) => [field.id, field]));
-  const fieldsBySystemKey = new Map(allFields.filter((field) => field.systemKey).map((field) => [field.systemKey as string, field]));
-  const fieldsByName = new Map(allFields.map((field) => [field.name.toLowerCase(), field]));
+  const fieldsBySystemKey = uniqueKeyMap(
+    allFields,
+    (field) => field.systemKey,
+    (field) => field.id,
+  );
+  const fieldsByName = uniqueKeyMap(
+    allFields,
+    (field) => field.name,
+    (field) => field.id,
+  );
   const resolvedFieldFilters: FieldFilter[] = [];
   for (const filter of fieldFilters) {
     if (typeof filter.field_id !== "string") {
@@ -373,7 +451,7 @@ export async function POST(request: NextRequest) {
     const rawFieldId = filter.field_id;
     const resolved = isUuid(rawFieldId)
       ? rawFieldId
-      : fieldsBySystemKey.get(rawFieldId)?.id ?? fieldsByName.get(rawFieldId.toLowerCase())?.id ?? null;
+      : fieldsBySystemKey.get(rawFieldId.toLowerCase()) ?? fieldsByName.get(rawFieldId.toLowerCase()) ?? null;
     if (!resolved) {
       return NextResponse.json({ detail: `Unknown docs field: ${rawFieldId}` }, { status: 400 });
     }
@@ -388,10 +466,15 @@ export async function POST(request: NextRequest) {
       .filter((field) => !!field.systemKey)
       .map((field) => [field.id, field.systemKey as string]),
   );
+  const taskFieldIdsBySystemKey = uniqueKeyMap(
+    taskSystemFields,
+    (field) => field.systemKey,
+    (field) => field.id,
+  );
   const taskFieldsBySystemKey = new Map(
-    taskSystemFields
-      .filter((field) => !!field.systemKey)
-      .map((field) => [field.systemKey as string, field]),
+    Array.from(taskFieldIdsBySystemKey.entries())
+      .map(([systemKey, fieldId]) => [systemKey, fieldsById.get(fieldId)] as const)
+      .filter((entry): entry is readonly [string, typeof knowledgeFields.$inferSelect] => Boolean(entry[1])),
   );
   const taskFieldFilters = resolvedFieldFilters.filter(
     (filter) =>
@@ -431,20 +514,43 @@ export async function POST(request: NextRequest) {
         )`,
       )
     : undefined;
+  const notLegacyEmailBlank = sql<boolean>`NOT (
+    ${knowledgeNodes.title} = '（空行）'
+    AND EXISTS (
+      WITH RECURSIVE email_ancestors AS (
+        SELECT id, parent_id, system_key, docs_library_id,
+               ARRAY[id]::uuid[] AS visited_path, 0 AS depth
+        FROM knowledge_nodes
+        WHERE id = ${knowledgeNodes.id}
+          AND docs_library_id = ${knowledgeNodes.docsLibraryId}
+        UNION ALL
+        SELECT parent.id, parent.parent_id, parent.system_key,
+               parent.docs_library_id,
+               child.visited_path || ARRAY[parent.id]::uuid[], child.depth + 1
+        FROM knowledge_nodes AS parent
+        INNER JOIN email_ancestors AS child ON parent.id = child.parent_id
+        WHERE parent.docs_library_id = ${knowledgeNodes.docsLibraryId}
+          AND child.depth < 512
+          AND NOT parent.id = ANY(child.visited_path)
+      )
+      SELECT 1 FROM email_ancestors WHERE system_key LIKE 'project_mail:%'
+    )
+  )`;
 
   const conditions = [
-    eq(knowledgeNodes.workspaceId, workspace.id),
+    inArray(knowledgeNodes.docsLibraryId, workspaceIds),
     isNull(knowledgeNodes.archivedAt),
-    projectId
-      ? eq(knowledgeNodes.projectId, projectId)
-      : readableProjectIds.length > 0
-        ? or(isNull(knowledgeNodes.projectId), inArray(knowledgeNodes.projectId, readableProjectIds))
-        : isNull(knowledgeNodes.projectId),
+    // 空行は KnowledgeNode ではない。旧legacy rowも検索結果へ戻さない。
+    sql`regexp_replace(trim(${knowledgeNodes.title}), '[[:space:]]+', '', 'g') <> ''`,
+    notLegacyEmailBlank,
+    // Do not pre-filter project_id for an all-project query.  A personal
+    // node may be explicitly shared while carrying an inaccessible project
+    // reference; getDocsNodeAccess below filters that candidate safely.
     q
       ? sql`exists (
           select 1 from knowledge_search_index docs_ksi
           where docs_ksi.node_id = ${knowledgeNodes.id}
-            and docs_ksi.workspace_id = ${workspace.id}::uuid
+            and docs_ksi.docs_library_id in (${uuidListSql(workspaceIds)})
             and (docs_ksi.title_text ilike ${`%${q}%`} or docs_ksi.body_text_plain ilike ${`%${q}%`})
         )`
       : undefined,
@@ -458,8 +564,18 @@ export async function POST(request: NextRequest) {
     .from(knowledgeNodes)
     .where(and(...conditions))
     .orderBy(desc(knowledgeNodes.updatedAt), asc(knowledgeNodes.sortOrder))
-    .limit(Math.min(500, limit + 1))
+    .limit(Math.min(500, Math.max(limit + 1, (limit + 1) * 4)))
     .offset(cursor);
+
+  // SQL workspace/project predicates are not sufficient for inherited
+  // personal subtree shares. Re-check every candidate through the same ACL
+  // resolver used by node/detail APIs before returning search results.
+  const visibleCandidates = await Promise.all(
+    nodes.map((node) => getDocsNodeAccess(node.id, user)),
+  );
+  nodes = visibleCandidates
+    .map((access) => access?.node)
+    .filter((node): node is NonNullable<typeof node> => Boolean(node));
 
   if (includesTaskTag && taskFieldFilters.length > 0 && nodes.length > 0) {
     const nodeIds = nodes.map((node) => node.id);
@@ -493,18 +609,18 @@ export async function POST(request: NextRequest) {
     nodes = nodes.filter((node) => !linkedNodeIds.has(node.id) || matchingNodeIds.has(node.id));
   }
 
-  const readableTaskProjectIds = includesTaskTag && !projectId ? readableProjectIds : [];
+  const readableTaskProjectIds = includesTaskTag
+    ? await getParticipatingProjectIds(user.id)
+    : [];
   const virtualTasks =
-    includeVirtualTasks && includesTaskTag && (projectId || readableTaskProjectIds.length > 0)
+    includeVirtualTasks && includesTaskTag && readableTaskProjectIds.length > 0
       ? (
           await db
             .select()
             .from(tasks)
             .where(
               and(
-                projectId
-                  ? eq(tasks.projectId, projectId)
-                  : inArray(tasks.projectId, readableTaskProjectIds),
+                inArray(tasks.projectId, readableTaskProjectIds),
                 isNull(tasks.deletedAt),
                 isNull(tasks.archivedAt),
                 q
@@ -535,18 +651,64 @@ export async function POST(request: NextRequest) {
   const pagedVirtualTasks = virtualTasks.slice(0, limit);
 
   const candidateIds = nodes.map((node) => node.id);
-  const [nodeSupertags, storedFieldValues] = candidateIds.length
+  const nodeWorkspaceById = new Map(
+    nodes.map((node) => [node.id, node.docsLibraryId]),
+  );
+  const [nodeSupertagRows, fieldValueRows] = candidateIds.length
     ? await Promise.all([
         db
-          .select()
+          .select({
+            relation: knowledgeNodeSupertags,
+            supertagWorkspaceId: knowledgeSupertags.docsLibraryId,
+          })
           .from(knowledgeNodeSupertags)
-          .where(inArray(knowledgeNodeSupertags.nodeId, candidateIds)),
+          .innerJoin(knowledgeSupertags, eq(knowledgeNodeSupertags.supertagId, knowledgeSupertags.id))
+          .where(inArray(knowledgeNodeSupertags.nodeId, candidateIds))
+          .then((rows) => rows
+            // A malformed relation can point at a tag from another library.
+            // Keep only definitions belonging to the source node's library.
+            .filter((row) => row.supertagWorkspaceId === nodeWorkspaceById.get(row.relation.nodeId))
+            .map((row) => row.relation)),
         db
-          .select()
+          .select({
+            value: knowledgeFieldValues,
+            fieldWorkspaceId: knowledgeFields.docsLibraryId,
+          })
           .from(knowledgeFieldValues)
-          .where(inArray(knowledgeFieldValues.nodeId, candidateIds)),
+          .innerJoin(knowledgeFields, eq(knowledgeFieldValues.fieldId, knowledgeFields.id))
+          .where(inArray(knowledgeFieldValues.nodeId, candidateIds))
+          .then((rows) => rows
+            // Field values are metadata in the source node's library.  Do not
+            // let a foreign definition/value survive an ID-only lookup.
+            .filter((row) => row.fieldWorkspaceId === nodeWorkspaceById.get(row.value.nodeId))
+            .map((row) => row.value)),
       ])
     : [[], []];
+
+  const targetIds = Array.from(new Set(
+    fieldValueRows
+      .map((value) => value.targetNodeId)
+      .filter((value): value is string => Boolean(value)),
+  ));
+  const targetAccessRows = await Promise.all(
+    targetIds.map((targetId) => getDocsNodeAccess(targetId, user)),
+  );
+  const targetAccessById = new Map(
+    targetAccessRows
+      .filter((item): item is NonNullable<typeof item> => Boolean(item))
+      .map((item) => [item.node.id, item]),
+  );
+  // A target_node_id is itself sensitive metadata.  It must be readable by
+  // the actor and live in the same library as the source value's node.
+  const storedFieldValues = fieldValueRows.filter((value) => {
+    if (!value.targetNodeId) return true;
+    const targetAccess = targetAccessById.get(value.targetNodeId);
+    return Boolean(
+      targetAccess
+      && targetAccess.workspace.id === nodeWorkspaceById.get(value.nodeId),
+    );
+  });
+  const nodeSupertags = nodeSupertagRows;
 
   const sortFieldValueByNode = new Map(
     sortFieldId
@@ -588,9 +750,10 @@ export async function POST(request: NextRequest) {
 
   const filteredNodeIds = new Set(nodes.map((node) => node.id));
   const taskFieldValues = filteredNodeIds.size > 0
-    ? await listDocsTaskSyntheticFieldValues({
+      ? await listDocsTaskSyntheticFieldValues({
         nodeIds: Array.from(filteredNodeIds),
         fields: taskSystemFields,
+        user,
       })
     : [];
   return NextResponse.json({

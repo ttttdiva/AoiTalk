@@ -28,6 +28,7 @@ import {
   UserX,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -86,6 +87,7 @@ type ManagedUser = {
   username: string;
   email: string | null;
   display_name: string | null;
+  avatar_url: string | null;
   role: string | null;
   is_active: boolean | null;
   status: "active" | "inactive" | "deleted";
@@ -102,9 +104,8 @@ type BlockingRelation = {
 };
 
 const ROLE_LABELS: Record<string, string> = {
-  admin: "管理者",
-  member: "メンバー",
-  viewer: "閲覧者",
+  admin: "admin",
+  user: "user",
 };
 
 const STATUS_LABELS: Record<ManagedUser["status"], string> = {
@@ -141,6 +142,10 @@ function formatDate(value: string | null) {
 
 function displayName(user: ManagedUser) {
   return user.display_name || user.username;
+}
+
+function avatarFallback(user: ManagedUser) {
+  return displayName(user).trim().charAt(0).toUpperCase() || "U";
 }
 
 function statusVariant(
@@ -203,14 +208,14 @@ export function UserManagementConsole({
     display_name: "",
     email: "",
     password: "",
-    role: "member",
+    role: "user",
     require_password_change: true,
   });
 
   const [editForm, setEditForm] = useState({
     display_name: "",
     email: "",
-    role: "member",
+    role: "user",
     status: "active",
   });
 
@@ -260,7 +265,7 @@ export function UserManagementConsole({
           user.username,
           user.display_name || "",
           user.email || "",
-          ROLE_LABELS[user.role || "member"] || "",
+          ROLE_LABELS[user.role || "user"] || user.role || "",
         ]
           .join(" ")
           .toLowerCase()
@@ -320,7 +325,7 @@ export function UserManagementConsole({
     setEditForm({
       display_name: user.display_name || "",
       email: user.email || "",
-      role: user.role || "member",
+      role: user.role || "user",
       status: user.status === "deleted" ? "inactive" : user.status,
     });
     setEditUser(user);
@@ -352,7 +357,7 @@ export function UserManagementConsole({
         display_name: "",
         email: "",
         password: "",
-        role: "member",
+        role: "user",
         require_password_change: true,
       });
       toast.success("ユーザーを追加しました");
@@ -548,7 +553,7 @@ export function UserManagementConsole({
 
   return (
     <>
-      <Card size="sm">
+      <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0">
         <CardHeader
           className="cursor-pointer select-none gap-3"
           onClick={() => setExpanded((v) => !v)}
@@ -655,9 +660,8 @@ export function UserManagementConsole({
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">すべてのロール</SelectItem>
-                <SelectItem value="admin">管理者</SelectItem>
-                <SelectItem value="member">メンバー</SelectItem>
-                <SelectItem value="viewer">閲覧者</SelectItem>
+                <SelectItem value="admin">admin</SelectItem>
+                <SelectItem value="user">user</SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -690,9 +694,17 @@ export function UserManagementConsole({
                     >
                       <TableCell>
                         <div className="flex items-center gap-3">
-                          <div className="flex size-8 items-center justify-center rounded-full bg-muted text-xs font-medium">
-                            {displayName(user).charAt(0).toUpperCase()}
-                          </div>
+                          <Avatar className="size-8">
+                            {user.avatar_url && (
+                              <AvatarImage
+                                src={user.avatar_url}
+                                alt={`${displayName(user)}のアイコン`}
+                              />
+                            )}
+                            <AvatarFallback className="text-xs font-medium">
+                              {avatarFallback(user)}
+                            </AvatarFallback>
+                          </Avatar>
                           <div className="min-w-0">
                             <div className="flex items-center gap-2">
                               <p className="truncate text-sm font-medium">
@@ -711,7 +723,7 @@ export function UserManagementConsole({
                       </TableCell>
                       <TableCell>
                         <Badge variant="outline">
-                          {ROLE_LABELS[user.role || "member"] || user.role}
+                          {ROLE_LABELS[user.role || "user"] || user.role || "user"}
                         </Badge>
                       </TableCell>
                       <TableCell>
@@ -753,7 +765,20 @@ export function UserManagementConsole({
           {selectedUser && (
             <>
               <SheetHeader>
-                <SheetTitle>{displayName(selectedUser)}</SheetTitle>
+                <SheetTitle className="flex items-center gap-2">
+                  <Avatar className="size-8">
+                    {selectedUser.avatar_url && (
+                      <AvatarImage
+                        src={selectedUser.avatar_url}
+                        alt={`${displayName(selectedUser)}のアイコン`}
+                      />
+                    )}
+                    <AvatarFallback className="text-xs font-medium">
+                      {avatarFallback(selectedUser)}
+                    </AvatarFallback>
+                  </Avatar>
+                  <span className="truncate">{displayName(selectedUser)}</span>
+                </SheetTitle>
                 <SheetDescription>
                   @{selectedUser.username} のアカウント状態とセキュリティ操作
                 </SheetDescription>
@@ -775,7 +800,7 @@ export function UserManagementConsole({
                       <Info label="メール" value={selectedUser.email || "-"} />
                       <Info
                         label="ロール"
-                        value={ROLE_LABELS[selectedUser.role || "member"] || "-"}
+                        value={ROLE_LABELS[selectedUser.role || "user"] || selectedUser.role || "-"}
                       />
                       <Info
                         label="状態"
@@ -878,7 +903,7 @@ export function UserManagementConsole({
       </Sheet>
 
       <Dialog open={recoveryOpen} onOpenChange={setRecoveryOpen}>
-        <DialogContent className="sm:max-w-2xl">
+        <DialogContent size="2xl">
           <DialogHeader>
             <DialogTitle>削除済みユーザーの復旧</DialogTitle>
             <DialogDescription>
@@ -903,14 +928,27 @@ export function UserManagementConsole({
                   {deletedUsers.map((user) => (
                     <TableRow key={user.id}>
                       <TableCell>
-                        <div className="min-w-0">
-                          <p className="truncate text-sm font-medium">
-                            {displayName(user)}
-                          </p>
-                          <p className="truncate text-xs text-muted-foreground">
-                            @{user.username}
-                            {user.email ? ` / ${user.email}` : ""}
-                          </p>
+                        <div className="flex items-center gap-3">
+                          <Avatar className="size-8">
+                            {user.avatar_url && (
+                              <AvatarImage
+                                src={user.avatar_url}
+                                alt={`${displayName(user)}のアイコン`}
+                              />
+                            )}
+                            <AvatarFallback className="text-xs font-medium">
+                              {avatarFallback(user)}
+                            </AvatarFallback>
+                          </Avatar>
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-medium">
+                              {displayName(user)}
+                            </p>
+                            <p className="truncate text-xs text-muted-foreground">
+                              @{user.username}
+                              {user.email ? ` / ${user.email}` : ""}
+                            </p>
+                          </div>
                         </div>
                       </TableCell>
                       <TableCell>{formatDate(user.deleted_at)}</TableCell>
@@ -958,7 +996,7 @@ export function UserManagementConsole({
       </Dialog>
 
       <Dialog open={createOpen} onOpenChange={setCreateOpen}>
-        <DialogContent className="sm:max-w-lg">
+        <DialogContent size="lg">
           <DialogHeader>
             <DialogTitle>ユーザー追加</DialogTitle>
             <DialogDescription>
@@ -1005,9 +1043,8 @@ export function UserManagementConsole({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="admin">管理者</SelectItem>
-                  <SelectItem value="member">メンバー</SelectItem>
-                  <SelectItem value="viewer">閲覧者</SelectItem>
+                <SelectItem value="admin">admin</SelectItem>
+                <SelectItem value="user">user</SelectItem>
                 </SelectContent>
               </Select>
             </Field>
@@ -1051,7 +1088,7 @@ export function UserManagementConsole({
       </Dialog>
 
       <Dialog open={!!editUser} onOpenChange={(open) => !open && setEditUser(null)}>
-        <DialogContent className="sm:max-w-lg">
+        <DialogContent size="lg">
           <DialogHeader>
             <DialogTitle>ユーザー編集</DialogTitle>
             <DialogDescription>
@@ -1090,9 +1127,8 @@ export function UserManagementConsole({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="admin">管理者</SelectItem>
-                  <SelectItem value="member">メンバー</SelectItem>
-                  <SelectItem value="viewer">閲覧者</SelectItem>
+                  <SelectItem value="admin">admin</SelectItem>
+                  <SelectItem value="user">user</SelectItem>
                 </SelectContent>
               </Select>
             </Field>
@@ -1139,7 +1175,7 @@ export function UserManagementConsole({
           }
         }}
       >
-        <DialogContent className="sm:max-w-lg">
+        <DialogContent size="lg">
           <DialogHeader>
             <DialogTitle>パスワード再設定</DialogTitle>
             <DialogDescription>
@@ -1200,7 +1236,7 @@ export function UserManagementConsole({
           }
         }}
       >
-        <DialogContent className="sm:max-w-lg">
+        <DialogContent size="lg">
           <DialogHeader>
             <DialogTitle>ユーザーを削除</DialogTitle>
             <DialogDescription>
@@ -1260,7 +1296,7 @@ export function UserManagementConsole({
           }
         }}
       >
-        <DialogContent className="sm:max-w-lg">
+        <DialogContent size="lg">
           <DialogHeader>
             <DialogTitle>ユーザーを完全削除</DialogTitle>
             <DialogDescription>

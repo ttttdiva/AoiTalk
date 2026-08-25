@@ -110,7 +110,7 @@ export function UserExportSection() {
               body: JSON.stringify({
                 username: user.username,
                 password: defaultPassword,
-                role: user.role || "member",
+                role: user.role || "user",
                 email: user.email || undefined,
                 display_name: user.display_name || undefined,
               }),
@@ -145,7 +145,7 @@ export function UserExportSection() {
   );
 
   return (
-    <Card size="sm">
+    <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0">
       <CardHeader
         className="cursor-pointer select-none"
         onClick={() => setExpanded((v) => !v)}

@@ -13,6 +13,8 @@ from pathlib import Path
 import yaml
 import logging
 
+from src.utils.startup_timing import get_startup_timer
+
 
 class WindowsOptimization:
     """Windows環境での最適化を管理するクラス"""
@@ -400,7 +402,11 @@ def apply_windows_optimizations() -> None:
     optimizer.pre_warm_components()
     
     # PostgreSQLサービスの起動確認
-    optimizer.ensure_postgresql_running()
+    # ``main`` 直後の再確認とは別スパンにして、二重チェックの実コストを
+    # 起動ログ上で分離できるようにする。計測は fail-open で、既存の呼出し
+    # 順序・例外意味・戻り値（None）は変更しない。
+    with get_startup_timer().phase("startup.windows.optimizations.postgresql.ensure"):
+        optimizer.ensure_postgresql_running()
     
     # 適用状況を表示
     optimizer.print_optimization_summary()

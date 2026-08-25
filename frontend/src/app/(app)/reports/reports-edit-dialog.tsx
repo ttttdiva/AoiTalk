@@ -46,6 +46,7 @@ export function ReportsEditDialog({
   currentEditingSpace,
   currentEditingProject,
   projectsForEditingSpace,
+  isProjectReadOnly,
   editStart,
   editEnd,
   editDate,
@@ -79,6 +80,7 @@ export function ReportsEditDialog({
   currentEditingSpace: Space | null;
   currentEditingProject: Project | null;
   projectsForEditingSpace: Project[];
+  isProjectReadOnly: (projectId: string | null | undefined) => boolean;
   editStart: string;
   editEnd: string;
   editDate: string;
@@ -103,6 +105,12 @@ export function ReportsEditDialog({
   handleEditMoveTaskSpace: (spaceId: string) => void | Promise<void>;
   handleEditMoveTaskProject: (projectId: string) => void | Promise<void>;
 }) {
+  const hasWritableProjectInSpace = (spaceId: string) =>
+    allProjects.some(
+      (project) =>
+        project.space_id === spaceId && !isProjectReadOnly(project.id),
+    );
+
   return (
     <Dialog
       open={!!editingEntry}
@@ -111,7 +119,8 @@ export function ReportsEditDialog({
       }}
     >
       <DialogContent
-        className="sm:max-w-lg p-4 gap-3"
+        size="lg"
+        className="p-4 gap-3"
         showCloseButton={false}
       >
         {/* ヘッダー: アクション群 */}
@@ -232,7 +241,11 @@ export function ReportsEditDialog({
                         ),
                       )
                       .map((space) => (
-                        <SelectItem key={space.id} value={space.id}>
+                        <SelectItem
+                          key={space.id}
+                          value={space.id}
+                          disabled={!hasWritableProjectInSpace(space.id)}
+                        >
                           {space.name}
                         </SelectItem>
                       ))}
@@ -264,7 +277,11 @@ export function ReportsEditDialog({
                           "スペースなし"}
                       </SelectLabel>
                       {projectsForEditingSpace.map((project) => (
-                        <SelectItem key={project.id} value={project.id}>
+                        <SelectItem
+                          key={project.id}
+                          value={project.id}
+                          disabled={isProjectReadOnly(project.id)}
+                        >
                           {project.name}
                         </SelectItem>
                       ))}
@@ -273,7 +290,11 @@ export function ReportsEditDialog({
                     <SelectGroup>
                       <SelectLabel>{"プロジェクト"}</SelectLabel>
                       {allProjects.map((project) => (
-                        <SelectItem key={project.id} value={project.id}>
+                        <SelectItem
+                          key={project.id}
+                          value={project.id}
+                          disabled={isProjectReadOnly(project.id)}
+                        >
                           {project.name}
                         </SelectItem>
                       ))}

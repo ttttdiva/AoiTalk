@@ -1,12 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSession } from "@/lib/auth";
-import { resolveToken, getFallbackToken } from "@/lib/hf/account";
+import { resolveTokenForUser } from "@/lib/hf/account";
 import {
   buildAuthHeaders,
   buildFileUrl,
   type RepoType,
 } from "@/lib/hf/client";
 import { getMediaType } from "@/lib/hf/api-utils";
+
+const MAX_TEXT_BYTES = 1024 * 1024;
+const PRIVATE_HEADERS = { "Cache-Control": "private, no-store" };
 
 /**
  * HFファイルをサーバー側でフェッチしてストリーミング返却する。
@@ -17,7 +20,7 @@ import { getMediaType } from "@/lib/hf/api-utils";
 export async function GET(request: NextRequest) {
   const user = await getSession();
   if (!user) {
-    return NextResponse.json({ detail: "認証が必要です" }, { status: 401 });
+    return NextResponse.json({ detail: "認証が必要です" }, { status: 401, headers: PRIVATE_HEADERS });
   }
 
   const sp = request.nextUrl.searchParams;
@@ -31,15 +34,31 @@ export async function GET(request: NextRequest) {
   if (!repoId || !path) {
     return NextResponse.json(
       { detail: "repoId, path は必須" },
-      { status: 400 },
+      { status: 400, headers: PRIVATE_HEADERS },
     );
   }
   if (repoType !== "model" && repoType !== "dataset") {
-    return NextResponse.json({ detail: "repoType 不正" }, { status: 400 });
+    return NextResponse.json({ detail: "repoType 不正" }, { status: 400, headers: PRIVATE_HEADERS });
   }
 
-  const resolved = accountId ? resolveToken(accountId) : null;
-  const token = resolved?.token ?? getFallbackToken();
+  let resolved: Awaited<ReturnType<typeof resolveTokenForUser>> = null;
+  try {
+    resolved = accountId
+      ? await resolveTokenForUser(String(user.id), accountId)
+      : null;
+  } catch {
+    return NextResponse.json(
+      { detail: "HFアカウントを解決できませんでした" },
+      { status: 503, headers: PRIVATE_HEADERS },
+    );
+  }
+  if (accountId && !resolved) {
+    return NextResponse.json(
+      { detail: "HFアカウントへのアクセス権がありません" },
+      { status: 403, headers: PRIVATE_HEADERS },
+    );
+  }
+  const token = resolved?.token;
 
   const url = buildFileUrl(repoId, path, repoType, revision);
   const headers: Record<string, string> = { ...buildAuthHeaders(token) };
@@ -48,11 +67,15 @@ export async function GET(request: NextRequest) {
 
   let upstream: Response;
   try {
-    upstream = await fetch(url, { headers, redirect: "follow" });
+    upstream = await fetch(url, {
+      headers,
+      redirect: "follow",
+      signal: request.signal,
+    });
   } catch (err) {
     return NextResponse.json(
       { detail: `HFフェッチ失敗: ${String(err)}` },
-      { status: 502 },
+      { status: 502, headers: PRIVATE_HEADERS },
     );
   }
 
@@ -62,21 +85,79 @@ export async function GET(request: NextRequest) {
       const t = await upstream.text().catch(() => "");
       return NextResponse.json(
         { detail: `HF ${upstream.status}: ${t.slice(0, 500)}` },
-        { status: upstream.status },
+        { status: upstream.status, headers: PRIVATE_HEADERS },
       );
     }
-    // サイズ上限 1MB でカット
-    const MAX = 1024 * 1024;
-    const buf = await upstream.arrayBuffer();
-    const truncated = buf.byteLength > MAX;
-    const slice = truncated ? buf.slice(0, MAX) : buf;
-    const text = new TextDecoder("utf-8", { fatal: false }).decode(slice);
+    // Read only a bounded prefix.  Calling arrayBuffer() first would allow a
+    // malicious/large text response to consume unbounded server memory before
+    // the 1 MB preview limit is applied.
+    const contentLengthHeader = upstream.headers.get("content-length");
+    const parsedLength = contentLengthHeader === null ? NaN : Number(contentLengthHeader);
+    const declaredLength = Number.isFinite(parsedLength) && parsedLength >= 0 ? parsedLength : null;
+    if (
+      declaredLength !== null &&
+      declaredLength > MAX_TEXT_BYTES &&
+      !upstream.body
+    ) {
+      return NextResponse.json(
+        { detail: "テキストプレビューが大きすぎます" },
+        { status: 413, headers: PRIVATE_HEADERS },
+      );
+    }
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    let truncated = declaredLength !== null && declaredLength > MAX_TEXT_BYTES;
+    if (upstream.body) {
+      const reader = upstream.body.getReader();
+      try {
+        while (!truncated || total < MAX_TEXT_BYTES) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const remaining = MAX_TEXT_BYTES - total;
+          if (value.byteLength > remaining) {
+            if (remaining > 0) chunks.push(value.slice(0, remaining));
+            total = MAX_TEXT_BYTES;
+            truncated = true;
+            break;
+          }
+          chunks.push(value);
+          total += value.byteLength;
+          // A response without Content-Length may be exactly the limit; read
+          // one more chunk to distinguish exact from truncated content.
+          if (total >= MAX_TEXT_BYTES) {
+            if (declaredLength !== null && declaredLength > MAX_TEXT_BYTES) {
+              truncated = true;
+              break;
+            }
+            // Even an absent or lying Content-Length must not make us retain
+            // an oversized response.  Probe one more chunk before deciding
+            // whether the prefix is complete.
+            const next = await reader.read();
+            if (!next.done) truncated = true;
+            break;
+          }
+        }
+      } finally {
+        if (truncated) await reader.cancel().catch(() => undefined);
+        reader.releaseLock();
+      }
+    }
+    const buf = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      buf.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const text = new TextDecoder("utf-8", { fatal: false }).decode(buf);
     return NextResponse.json({
       success: true,
       text,
       truncated,
-      size: buf.byteLength,
-    });
+      // Report bytes actually read rather than trusting a missing or
+      // malicious Content-Length.  This also keeps a null/empty response from
+      // claiming bytes that were never delivered.
+      size: total,
+    }, { headers: PRIVATE_HEADERS });
   }
 
   // バイナリ / メディアストリーム
@@ -84,14 +165,17 @@ export async function GET(request: NextRequest) {
     upstream.headers.get("content-type") || inferContentType(path);
   const respHeaders: Record<string, string> = {
     "content-type": upstreamCT,
-    "cache-control": "private, max-age=300",
+    // User-owned integrations must not be stored by a shared browser/proxy
+    // cache.  Even public repository responses are scoped by the session.
+    ...PRIVATE_HEADERS,
   };
   const cl = upstream.headers.get("content-length");
-  if (cl) respHeaders["content-length"] = cl;
+  const contentEncoding = upstream.headers.get("content-encoding");
+  if (cl && !contentEncoding) respHeaders["content-length"] = cl;
   const ar = upstream.headers.get("accept-ranges");
-  if (ar) respHeaders["accept-ranges"] = ar;
+  if (ar && !contentEncoding) respHeaders["accept-ranges"] = ar;
   const cr = upstream.headers.get("content-range");
-  if (cr) respHeaders["content-range"] = cr;
+  if (cr && !contentEncoding) respHeaders["content-range"] = cr;
 
   return new NextResponse(upstream.body, {
     status: upstream.status,

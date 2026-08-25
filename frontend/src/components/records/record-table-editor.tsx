@@ -1,5 +1,7 @@
 "use client";
 
+import { AppSelect } from "@/components/ui/app-select";
+
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Check,
@@ -11,6 +13,7 @@ import {
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import {
   Dialog,
@@ -106,7 +109,7 @@ function AddFieldDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="sm:max-w-sm">
+      <DialogContent>
         <DialogHeader>
           <DialogTitle>列を追加</DialogTitle>
         </DialogHeader>
@@ -120,7 +123,7 @@ function AddFieldDialog({
             placeholder="列名"
             autoFocus
           />
-          <select
+          <AppSelect
             value={fieldType}
             onChange={(event) => setFieldType(event.target.value)}
             className="h-9 w-full rounded-md border bg-background px-2 text-sm"
@@ -130,7 +133,7 @@ function AddFieldDialog({
                 {type.label}
               </option>
             ))}
-          </select>
+          </AppSelect>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => handleOpenChange(false)}>
@@ -481,11 +484,10 @@ export function RecordTableEditor({
                       <td key={field.id} className="border-b border-r p-0">
                         {field.fieldType === "checkbox" ? (
                           <label className="flex h-9 items-center px-3">
-                            <input
-                              type="checkbox"
+                            <Checkbox
                               checked={values[field.key] === true}
-                              onChange={(event) =>
-                                void saveCell(row, field, event.target.checked)
+                              onCheckedChange={(checked) =>
+                                void saveCell(row, field, checked === true)
                               }
                               className="size-4"
                             />
@@ -551,13 +553,12 @@ export function RecordTableEditor({
                   <td key={field.id} className="border-b border-r p-0">
                     {field.fieldType === "checkbox" ? (
                       <label className="flex h-9 items-center px-3">
-                        <input
-                          type="checkbox"
+                        <Checkbox
                           checked={draftRow[field.key] === true}
-                          onChange={(event) =>
+                          onCheckedChange={(checked) =>
                             setDraftRow((current) => ({
                               ...current,
-                              [field.key]: event.target.checked,
+                              [field.key]: checked === true,
                             }))
                           }
                           className="size-4"

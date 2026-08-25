@@ -10,6 +10,7 @@ AoiTalk mobile の自前配布APKと自動更新に関する標準。
 - APK asset名は `aoitalk-mobile.apk` に統一する。
 - APKビルドと公開は `scripts/build_apk.bat` または `scripts/build_apk.sh` を使う。
 - Androidの更新導線は日本語表示にする。
+- Windows の `scripts/build_apk.bat` は安定した配布対象の `arm64-v8a` を既定 ABI とする。追加 ABI が必要な場合だけ、ビルド前に `REACT_NATIVE_ARCHITECTURES`（例: `arm64-v8a,x86_64`）を明示する。
 
 ## latest.json
 

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { ScrollView, StyleSheet, View } from "react-native";
+import { StyleSheet, View } from "react-native";
 import { useRouter } from "expo-router";
 import {
   ActivityIndicator,
@@ -12,6 +12,8 @@ import {
 } from "react-native-paper";
 
 import { goBackOrReplace } from "../../../lib/navigation";
+import { ScreenHeader } from "../../../components/screen-header";
+import { ScreenShell } from "../../../components/screen-primitives";
 import {
   createRemoteServer,
   deleteRemoteServer,
@@ -129,24 +131,18 @@ export default function RemoteServersScreen() {
   };
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      <Surface style={styles.header} elevation={1}>
-        <View style={styles.headerRow}>
-          <IconButton
-            icon="arrow-left"
-            iconColor="#cdd6f4"
-            onPress={() => goBackOrReplace(router, "/(tabs)/settings")}
-          />
-          <View style={{ flex: 1 }}>
-            <Text variant="titleLarge" style={styles.headerTitle}>
-              外部AoiTalkサーバー接続
-            </Text>
-            <Text style={styles.headerSubtext}>
-              他のAoiTalkサーバーのタスクを表示・操作します。
-            </Text>
-          </View>
-        </View>
-      </Surface>
+    <ScreenShell
+      scroll
+      style={styles.container}
+      contentContainerStyle={styles.content}
+      header={
+        <ScreenHeader
+          title="外部AoiTalkサーバー接続"
+          subtitle="他のAoiTalkサーバーのタスクを表示・操作します。"
+          onBack={() => goBackOrReplace(router, "/(tabs)/settings")}
+        />
+      }
+    >
 
       {loading ? (
         <View style={styles.loadingWrap}>
@@ -263,22 +259,13 @@ export default function RemoteServersScreen() {
           追加
         </Button>
       </Surface>
-    </ScrollView>
+    </ScreenShell>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b" },
   content: { paddingBottom: 32 },
-  header: {
-    paddingTop: 52,
-    paddingHorizontal: 8,
-    paddingBottom: 16,
-    backgroundColor: "#1e1e2e",
-  },
-  headerRow: { flexDirection: "row", alignItems: "center" },
-  headerTitle: { color: "#cdd6f4", fontWeight: "bold" },
-  headerSubtext: { color: "#a6adc8", marginTop: 2, fontSize: 12 },
   loadingWrap: { paddingVertical: 24, alignItems: "center" },
   card: {
     backgroundColor: "#1e1e2e",

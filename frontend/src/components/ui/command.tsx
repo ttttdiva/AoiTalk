@@ -10,6 +10,7 @@ import {
   DialogDescription,
   DialogHeader,
   DialogTitle,
+  type DialogContentSize,
 } from "@/components/ui/dialog"
 import {
   InputGroup,
@@ -39,12 +40,14 @@ function CommandDialog({
   children,
   className,
   showCloseButton = false,
+  size,
   ...props
 }: Omit<React.ComponentProps<typeof Dialog>, "children"> & {
   title?: string
   description?: string
   className?: string
   showCloseButton?: boolean
+  size?: DialogContentSize
   children: React.ReactNode
 }) {
   return (
@@ -54,6 +57,7 @@ function CommandDialog({
         <DialogDescription>{description}</DialogDescription>
       </DialogHeader>
       <DialogContent
+        size={size}
         className={cn(
           "top-1/3 translate-y-0 overflow-hidden rounded-xl! p-0",
           className

@@ -16,15 +16,91 @@ import type {
   TagDraft,
 } from "./types";
 
+/**
+ * HTTP response errors from the Docs API retain the response status so callers
+ * can distinguish a confirmed server rejection from a transport interruption.
+ * Keep this shape deliberately small: callers may depend on the status and
+ * allowlisted scalar metadata, but not on a parsed response body or concrete
+ * Error subclass across mocked boundaries.
+ */
+export type ApiFetchHttpError = Error & {
+  readonly status: number;
+  readonly code?: string;
+  readonly retryable?: boolean;
+  readonly trace_id?: string;
+};
+
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const isFormDataBody =
+    typeof FormData !== "undefined" && init?.body instanceof FormData;
+  const headers = new Headers(init?.headers);
+  if (!isFormDataBody && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
   const res = await fetch(path, {
-    credentials: "include",
-    headers: { "Content-Type": "application/json", ...init?.headers },
     ...init,
+    credentials: init?.credentials ?? "include",
+    headers,
   });
   if (!res.ok) {
     const detail = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(detail.detail || res.statusText);
+    const payload = detail && typeof detail === "object"
+      ? detail as Record<string, unknown>
+      : null;
+    const nestedDetail = payload?.detail;
+    const nestedPayload = nestedDetail && typeof nestedDetail === "object" && !Array.isArray(nestedDetail)
+      ? nestedDetail as Record<string, unknown>
+      : null;
+    const nestedMessage = nestedPayload?.message;
+    const code = typeof nestedPayload?.code === "string" && nestedPayload.code.trim()
+      ? nestedPayload.code.trim()
+      : undefined;
+    const retryable = typeof nestedPayload?.retryable === "boolean"
+      ? nestedPayload.retryable
+      : undefined;
+    const traceId = typeof nestedPayload?.trace_id === "string" && nestedPayload.trace_id.trim()
+      ? nestedPayload.trace_id.trim()
+      : undefined;
+    const message = typeof nestedMessage === "string"
+      ? nestedMessage
+      : typeof payload?.detail === "string"
+        ? payload.detail
+        : typeof payload?.message === "string"
+          ? payload.message
+          : res.statusText;
+    const error = new Error(message || `API Error: ${res.status}`) as ApiFetchHttpError;
+    Object.defineProperty(error, "status", {
+      configurable: false,
+      enumerable: true,
+      value: res.status,
+      writable: false,
+    });
+    error.name = "ApiFetchHttpError";
+    if (code !== undefined) {
+      Object.defineProperty(error, "code", {
+        configurable: false,
+        enumerable: true,
+        value: code,
+        writable: false,
+      });
+    }
+    if (retryable !== undefined) {
+      Object.defineProperty(error, "retryable", {
+        configurable: false,
+        enumerable: true,
+        value: retryable,
+        writable: false,
+      });
+    }
+    if (traceId !== undefined) {
+      Object.defineProperty(error, "trace_id", {
+        configurable: false,
+        enumerable: true,
+        value: traceId,
+        writable: false,
+      });
+    }
+    throw error;
   }
   return res.json();
 }

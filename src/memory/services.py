@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any, Tuple
 from .config import MemoryConfig
 from .repository import ConversationRepository
+from .summary_validation import validate_generated_summary
 from .models import ConversationMessage, ConversationArchive
 from .cross_session_memory import get_cross_session_memory
 import os
@@ -22,8 +23,12 @@ class SummarizationService:
         # Pass enable_search to repository to avoid loading embedding model when search is disabled
         self.repository = ConversationRepository(enable_search=config.enable_search)
     
-    async def create_summary(self, messages: List[ConversationMessage], 
-                           llm_client = None) -> Optional[str]:
+    async def create_summary(
+        self,
+        messages: List[ConversationMessage],
+        llm_client=None,
+        previous_summary: Optional[str] = None,
+    ) -> Optional[str]:
         """Create summary from conversation messages
         
         Args:
@@ -37,23 +42,48 @@ class SummarizationService:
             return None
         
         # Use progressive summarization for long conversations
+        new_conversation_text = self._build_conversation_text(messages)
+        conversation_text = new_conversation_text
+        if previous_summary:
+            conversation_text = (
+                "既存の正本要約（必ず保持・統合すること）:\n"
+                f"{previous_summary.strip()}\n\n"
+                "今回追加する会話:\n"
+                f"{new_conversation_text}"
+            )
         if len(messages) > 10:
-            summary = await self.create_progressive_summary(messages, llm_client)
+            summary = await self.create_progressive_summary(
+                messages,
+                llm_client,
+                previous_summary=previous_summary,
+            )
         else:
-            # Build conversation text
-            conversation_text = self._build_conversation_text(messages)
-            
             # Generate summary using LLM
             summary = await self._generate_summary_with_llm(conversation_text, llm_client)
-        
-        if not summary:
-            # Fallback: create simple summary
-            summary = self._create_fallback_summary(messages)
-        
-        return summary
+
+        validation = validate_generated_summary(
+            summary,
+            source_text=conversation_text,
+            previous_summary=previous_summary or "",
+        )
+        if not validation.accepted:
+            if summary:
+                print(
+                    "[SummarizationService] Summary candidate discarded: "
+                    f"{validation.reason}"
+                )
+            # A lossy deterministic fallback would still delete the source
+            # messages at checkpoint time.  Fail open by retaining the source.
+            return None
+
+        return str(summary or "").strip() or None
     
-    async def create_progressive_summary(self, messages: List[ConversationMessage],
-                                       llm_client = None) -> Optional[str]:
+    async def create_progressive_summary(
+        self,
+        messages: List[ConversationMessage],
+        llm_client=None,
+        previous_summary: Optional[str] = None,
+    ) -> Optional[str]:
         """Create progressive summary for long conversations
         
         Args:
@@ -89,12 +119,19 @@ class SummarizationService:
                 
                 if chunk_summary and chunk_summary.strip():
                     summaries.append(chunk_summary.strip())
+                else:
+                    return None
             except Exception as e:
                 print(f"[SummarizationService] Chunk summarization error: {e}")
-                # Continue with other chunks
-        
+                return None
+
         # 最終統合要約
         if summaries:
+            if previous_summary:
+                summaries.insert(
+                    0,
+                    "既存の正本要約（保持必須）: " + previous_summary.strip(),
+                )
             return await self._create_final_summary(summaries, llm_client)
         
         return None
@@ -134,7 +171,7 @@ class SummarizationService:
             print(f"[SummarizationService] Final summarization error: {e}")
         
         # Fallback: concatenate chunk summaries
-        return " / ".join(summaries[:3])  # Use first 3 summaries
+        return " / ".join(summaries)
     
     def _build_conversation_text(self, messages: List[ConversationMessage]) -> str:
         """Build formatted conversation text from messages
@@ -238,8 +275,15 @@ class MemorySearchService:
         self.repository = ConversationRepository(enable_search=config.enable_search)
         
 
-    async def search_memory(self, user_id: str, character_name: str, query: str,
-                          time_range: str = "all", max_results: Optional[int] = None) -> List[Dict[str, Any]]:
+    async def search_conversation_memory(
+        self,
+        user_id: str,
+        character_name: str,
+        query: str,
+        time_range: str = "all",
+        max_results: Optional[int] = None,
+        project_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Search conversation memory
         
         Args:
@@ -248,6 +292,7 @@ class MemorySearchService:
             query: Search query
             time_range: Time range filter ("recent", "this_week", "this_month", "all")
             max_results: Maximum results to return
+            project_id: Project scope. None searches only non-project conversations.
             
         Returns:
             List[Dict[str, Any]]: Search results with relevance scores
@@ -272,6 +317,8 @@ class MemorySearchService:
                     user_id=user_id,
                     query=query,
                     limit=max_results,
+                    character_name=character_name,
+                    project_id=project_id,
                 ),
                 timeout=self.config.search_timeout,
             )

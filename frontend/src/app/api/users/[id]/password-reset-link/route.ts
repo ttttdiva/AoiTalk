@@ -1,8 +1,6 @@
-import { NextResponse } from "next/server";
-import { eq } from "drizzle-orm";
-import { db } from "@/db";
-import { users } from "@/db/schema";
+import { NextRequest, NextResponse } from "next/server";
 import { createPasswordResetToken, getSession } from "@/lib/auth";
+import { proxyRequestToPythonApi } from "@/lib/server/python-api-proxy";
 
 type RouteContext = {
   params: Promise<{ id: string }>;
@@ -18,7 +16,7 @@ function getRequestOrigin(request: Request) {
   return `${protocol}://${host}`;
 }
 
-export async function POST(request: Request, context: RouteContext) {
+export async function POST(request: NextRequest, context: RouteContext) {
   const admin = await getSession();
   if (!admin) {
     return NextResponse.json({ detail: "認証が必要です" }, { status: 401 });
@@ -28,26 +26,38 @@ export async function POST(request: Request, context: RouteContext) {
   }
 
   const { id } = await context.params;
-  const [target] = await db.select().from(users).where(eq(users.id, id)).limit(1);
-  if (!target) {
-    return NextResponse.json({ detail: "ユーザーが見つかりません" }, { status: 404 });
+  const response = await proxyRequestToPythonApi(request, {
+    path: ["users", encodeURIComponent(id), "password-reset-link"],
+    user: admin,
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    return NextResponse.json(body, {
+      status: response.status,
+      headers: { "cache-control": "no-store, no-cache, must-revalidate" },
+    });
   }
-  if (!target.isActive) {
+
+  const sessionVersion =
+    body && typeof body === "object" && !Array.isArray(body) &&
+    typeof body.session_version === "number"
+      ? body.session_version
+      : null;
+  if (!sessionVersion || sessionVersion < 1) {
     return NextResponse.json(
-      { detail: "無効または削除済みのユーザーには再設定リンクを発行できません" },
-      { status: 400 },
+      { detail: "再設定バージョンが不正です" },
+      { status: 502 },
     );
   }
 
-  await db
-    .update(users)
-    .set({ isPasswordResetRequired: true, updatedAt: new Date() })
-    .where(eq(users.id, id));
-
-  const token = await createPasswordResetToken(id);
+  const token = await createPasswordResetToken(id, sessionVersion);
   const baseUrl = getRequestOrigin(request);
-  return NextResponse.json({
-    reset_url: `${baseUrl}/reset-password?token=${encodeURIComponent(token)}`,
-    expires_in_hours: 24,
-  });
+  return NextResponse.json(
+    {
+      reset_url: `${baseUrl}/reset-password?token=${encodeURIComponent(token)}`,
+      expires_in_hours: 24,
+      session_version: sessionVersion,
+    },
+    { headers: { "cache-control": "no-store, no-cache, must-revalidate" } },
+  );
 }

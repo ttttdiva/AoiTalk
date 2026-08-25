@@ -34,18 +34,18 @@ class ToolRegistry:
         """全ツール名を取得"""
         return list(self._tools.keys())
 
-    def execute(self, name: str, **kwargs) -> Any:
+    def execute(self, tool_name: str, **kwargs) -> Any:
         """名前指定でツール実行"""
-        tool_def = self._tools.get(name)
+        tool_def = self._tools.get(tool_name)
         if not tool_def:
-            raise ValueError(f"Tool not found: {name}")
+            raise ValueError(f"Tool not found: {tool_name}")
         return tool_def.execute(**kwargs)
 
-    async def execute_async(self, name: str, **kwargs) -> Any:
+    async def execute_async(self, tool_name: str, **kwargs) -> Any:
         """名前指定でツール非同期実行"""
-        tool_def = self._tools.get(name)
+        tool_def = self._tools.get(tool_name)
         if not tool_def:
-            raise ValueError(f"Tool not found: {name}")
+            raise ValueError(f"Tool not found: {tool_name}")
         return await tool_def.execute_async(**kwargs)
 
     def __len__(self) -> int:

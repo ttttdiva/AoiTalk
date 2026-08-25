@@ -40,7 +40,8 @@ def upgrade() -> None:
                     IF NOT EXISTS (
                         SELECT 1
                         FROM information_schema.columns
-                        WHERE table_name = '{table}'
+                        WHERE table_schema = current_schema()
+                          AND table_name = '{table}'
                           AND column_name = 'deleted_at'
                     ) THEN
                         ALTER TABLE {table} ADD COLUMN deleted_at TIMESTAMP NULL;
@@ -65,7 +66,8 @@ def upgrade() -> None:
                 IF NOT EXISTS (
                     SELECT 1
                     FROM information_schema.columns
-                    WHERE table_name = 'conversation_messages'
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'conversation_messages'
                       AND column_name = 'updated_at'
                 ) THEN
                     ALTER TABLE conversation_messages ADD COLUMN updated_at TIMESTAMP NULL;

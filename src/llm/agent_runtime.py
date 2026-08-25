@@ -11,28 +11,36 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import re
 from types import SimpleNamespace
 from dataclasses import dataclass, field as dataclass_field
 from typing import Any, Callable, Sequence
 
 from ..tools.registry import ToolRegistry
-from .agentic_completion import agentic_max_rounds
-from .generation_policy import GenerationPolicy
+from .aoi_vocabulary import build_aoi_vocabulary_hint
+from .agentic_completion import agentic_max_rounds, response_looks_like_unfinished_work
+from .generation_policy import GenerationPolicy, GenerationProfile
 from .generation_policy import get_current_generation_policy
 from .orchestration import build_orchestration_guidance
+from .planning_policy import build_planning_system_guidance, get_current_planning_policy, get_current_planning_run_state
+from .tool_packs import LOAD_TOOL_PACK_TOOL_NAME, PROJECT_TABLE_TOOL_NAMES
 from .tool_policy import (
+    DOCS_MUTATION_TOOL_NAMES,
+    FILESYSTEM_MUTATION_TOOL_NAMES,
     FILESYSTEM_READ_TOOL_NAMES,
     FILESYSTEM_TOOL_NAMES,
+    PROJECT_COMMAND_CAPABILITIES,
     PROJECT_MANAGEMENT_MUTATION_TOOL_NAMES,
     PROJECT_MANAGEMENT_READ_TOOL_NAMES,
     PROJECT_MANAGEMENT_TOOL_NAMES,
     SEARCH_TOOL_NAMES,
-    looks_like_filesystem_request,
+    command_capabilities_from_text,
+    looks_like_docs_mutation_request,
+    looks_like_filesystem_mutation_request,
+    looks_like_managed_workspace_request,
     looks_like_media_request,
-    looks_like_project_management_request,
     project_progress_review_active,
     looks_like_search_request,
-    looks_like_utility_request,
 )
 from .unified_turn_runtime import run_openai_compatible_turn_loop
 
@@ -85,27 +93,26 @@ DIRECT_PROJECT_TOOL_HINT_NAMES: tuple[str, ...] = (
 
 DIRECT_SEARCH_TOOL_HINT_NAMES: tuple[str, ...] = (
     "web_search",
+    "x_search",
     "grok_x_search",
     "knowledge_search",
-    "search_memory",
+    "search_past_chats",
 )
 
-DIRECT_MEMORY_TOOL_HINT_NAMES: tuple[str, ...] = ("search_memory",)
+DIRECT_MEMORY_TOOL_HINT_NAMES: tuple[str, ...] = ("search_past_chats",)
 
 DIRECT_FILESYSTEM_TOOL_HINT_NAMES: tuple[str, ...] = (
-    "find_workspace_items",
-    "inspect_workspace_tree",
-    "read_workspace_file",
-    "view_file",
     "search_files",
     "list_directory",
+    "list_workspace_tree",
+    "read_file",
 )
-
 
 @dataclass(frozen=True)
 class ToolHintRule:
     tool_name: str
     detector: Callable[[str], bool]
+    pack_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -113,9 +120,12 @@ class OpenAIToolCallRecord:
     tool: str
     arguments: dict[str, Any]
     result: str
+    success: bool | None = None
 
     @property
     def successful(self) -> bool:
+        if self.success is not None:
+            return bool(self.success)
         lowered = self.result.strip().lower()
         return not (
             lowered.startswith("tool not found:")
@@ -130,6 +140,11 @@ class OpenAIToolCallLoopResult:
     final_output: str
     tool_calls: list[OpenAIToolCallRecord]
     messages: list[dict[str, Any]] = dataclass_field(default_factory=list)
+    stopped_reason: str = ""
+    rounds: int = 0
+    audit_tool_calls: list[OpenAIToolCallRecord] = dataclass_field(
+        default_factory=list
+    )
 
 
 @dataclass(frozen=True)
@@ -156,12 +171,9 @@ def reset_verified_tool_execution_claims(token: contextvars.Token) -> None:
 
 TOOL_HINT_RULES: tuple[ToolHintRule, ...] = (
     ToolHintRule(
-        tool_name="utility_assistant",
-        detector=looks_like_utility_request,
-    ),
-    ToolHintRule(
         tool_name="media_assistant",
         detector=looks_like_media_request,
+        pack_id="media",
     ),
 )
 
@@ -257,7 +269,7 @@ TOOL_EXECUTION_CLAIM_PATTERNS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]
         ),
     ),
     (
-        "utility_assistant",
+        "utility_tools",
         (
             "現在時刻を確認しました",
             "天気を確認しました",
@@ -289,21 +301,35 @@ def build_tool_hint_context_sync(
     if not policy.tool_hints_enabled:
         return ""
 
-    matched_rules: list[ToolHintRule] = []
-    for rule in TOOL_HINT_RULES:
-        if not _should_run_tool_hint_rule(rule, user_input, registry):
-            continue
-        matched_rules.append(rule)
+    matched_rules, deferred_rules = _collect_tool_hint_rules(user_input, registry)
 
     direct_search_hint = _should_hint_direct_search_tools(user_input, registry)
     direct_memory_hint = _should_hint_direct_memory_tools(user_input, registry)
     direct_filesystem_hint = _should_hint_direct_filesystem_tools(user_input, registry)
+    project_attachment_stewardship_hint = _should_hint_project_attachment_stewardship(
+        user_input,
+        registry,
+    )
+    available_filesystem_mutation_tools = tuple(
+        tool_name
+        for tool_name in (
+            "create_workspace_directory",
+            "move_workspace_item",
+            "copy_workspace_item",
+        )
+        if tool_name in registry
+    )
     direct_project_hint = _should_hint_direct_project_tools(user_input, registry)
     project_progress_review_hint = _should_hint_project_progress_review(
         user_input,
         registry,
     )
+    project_organizer_hint = "organize_project_information_from_folder" in registry
     knowledge_search_hint = "knowledge_search" in registry
+    aoi_vocabulary_hint = build_aoi_vocabulary_hint(
+        user_input,
+        inbox_search_available="inbox_search_items" in registry,
+    )
     return _build_context_block(
         matched_rules,
         user_input=user_input,
@@ -312,9 +338,18 @@ def build_tool_hint_context_sync(
         direct_search_hint=direct_search_hint,
         direct_memory_hint=direct_memory_hint,
         direct_filesystem_hint=direct_filesystem_hint,
+        project_attachment_stewardship_hint=project_attachment_stewardship_hint,
+        available_filesystem_mutation_tools=available_filesystem_mutation_tools,
         direct_project_hint=direct_project_hint,
         project_progress_review_hint=project_progress_review_hint,
+        project_organizer_hint=project_organizer_hint,
         knowledge_search_hint=knowledge_search_hint,
+        aoi_vocabulary_hint=aoi_vocabulary_hint,
+        deferred_pack_rules=deferred_rules,
+        project_tables_pack_hint=_project_tables_pack_hint_needed(
+            user_input,
+            registry,
+        ),
     )
 
 
@@ -330,21 +365,35 @@ async def build_tool_hint_context_async(
     if not policy.tool_hints_enabled:
         return ""
 
-    matched_rules: list[ToolHintRule] = []
-    for rule in TOOL_HINT_RULES:
-        if not _should_run_tool_hint_rule(rule, user_input, registry):
-            continue
-        matched_rules.append(rule)
+    matched_rules, deferred_rules = _collect_tool_hint_rules(user_input, registry)
 
     direct_search_hint = _should_hint_direct_search_tools(user_input, registry)
     direct_memory_hint = _should_hint_direct_memory_tools(user_input, registry)
     direct_filesystem_hint = _should_hint_direct_filesystem_tools(user_input, registry)
+    project_attachment_stewardship_hint = _should_hint_project_attachment_stewardship(
+        user_input,
+        registry,
+    )
+    available_filesystem_mutation_tools = tuple(
+        tool_name
+        for tool_name in (
+            "create_workspace_directory",
+            "move_workspace_item",
+            "copy_workspace_item",
+        )
+        if tool_name in registry
+    )
     direct_project_hint = _should_hint_direct_project_tools(user_input, registry)
     project_progress_review_hint = _should_hint_project_progress_review(
         user_input,
         registry,
     )
+    project_organizer_hint = "organize_project_information_from_folder" in registry
     knowledge_search_hint = "knowledge_search" in registry
+    aoi_vocabulary_hint = build_aoi_vocabulary_hint(
+        user_input,
+        inbox_search_available="inbox_search_items" in registry,
+    )
     return _build_context_block(
         matched_rules,
         user_input=user_input,
@@ -353,9 +402,18 @@ async def build_tool_hint_context_async(
         direct_search_hint=direct_search_hint,
         direct_memory_hint=direct_memory_hint,
         direct_filesystem_hint=direct_filesystem_hint,
+        project_attachment_stewardship_hint=project_attachment_stewardship_hint,
+        available_filesystem_mutation_tools=available_filesystem_mutation_tools,
         direct_project_hint=direct_project_hint,
         project_progress_review_hint=project_progress_review_hint,
+        project_organizer_hint=project_organizer_hint,
         knowledge_search_hint=knowledge_search_hint,
+        aoi_vocabulary_hint=aoi_vocabulary_hint,
+        deferred_pack_rules=deferred_rules,
+        project_tables_pack_hint=_project_tables_pack_hint_needed(
+            user_input,
+            registry,
+        ),
     )
 
 
@@ -412,7 +470,7 @@ def project_context_read_final_response_check(
     return _check
 
 
-def _combined_final_response_check(
+def combined_final_response_check(
     *,
     user_input: str | None,
     require_project_context_read: bool,
@@ -424,6 +482,7 @@ def _combined_final_response_check(
                 required=require_project_context_read,
             ),
             _project_progress_review_final_response_check(user_input),
+            _unfinished_work_final_response_check(user_input),
         )
         if check is not None
     ]
@@ -440,6 +499,63 @@ def _combined_final_response_check(
             if continuation:
                 return continuation
         return None
+
+    return _check
+
+
+def managed_workspace_evidence_missing(
+    user_input: str | None,
+    tool_results: Sequence[Any],
+) -> tuple[str, ...]:
+    """Return the high-level steps still missing for a managed workspace turn."""
+
+    text = str(user_input or "")
+    if not looks_like_managed_workspace_request(text):
+        return ()
+    successful = {
+        _tool_result_name(result)
+        for result in tool_results
+        if _tool_result_successful(result)
+    }
+    missing: list[str] = []
+    if looks_like_filesystem_mutation_request(text):
+        if not successful.intersection({"list_workspace_tree", "list_directory"}):
+            missing.append("inspect the target Project tree once with `list_workspace_tree`")
+        if not successful.intersection(
+            {"copy_workspace_item", "move_workspace_item", "docs_place_workspace_file"}
+        ):
+            missing.append(
+                "place the file with `copy_workspace_item`, `move_workspace_item`, "
+                "or `docs_place_workspace_file`"
+            )
+    if looks_like_docs_mutation_request(text) and not successful.intersection(
+        {"docs_attach_workspace_file", "docs_place_workspace_file"}
+    ):
+        missing.append(
+            "add the idempotent Docs link with `docs_attach_workspace_file`, or "
+            "prefer `docs_place_workspace_file` to place and attach in one call"
+        )
+    return tuple(missing)
+
+
+def _unfinished_work_final_response_check(
+    user_input: str | None,
+) -> Callable[[str, Sequence[Any], int], str | None] | None:
+    if not user_input:
+        return None
+
+    def _check(
+        final_output: str,
+        tool_results: Sequence[Any],
+        round_index: int,
+    ) -> str | None:
+        if not response_looks_like_unfinished_work(user_input, final_output):
+            return None
+        return (
+            "Do not return a plan-only final answer. Perform the remaining work "
+            "now with the AoiTalk tools already provided, then report the "
+            "confirmed result. Do not re-run successful tool calls."
+        )
 
     return _check
 
@@ -532,6 +648,15 @@ def _project_progress_review_continuation_prompt(
         and progress_payload.get("can_assess_progress") is False
         and "organize_project_information_from_folder" not in successful_tools
     ):
+        if get_current_generation_policy().profile == GenerationProfile.REVIEW:
+            return (
+                "Do not produce the final answer yet. `get_project_progress` says "
+                "stored progress evidence is insufficient. Continue with read-only "
+                "tool calls: inspect `list_project_information`, "
+                "`list_record_tables`, tasks, relevant project files, and public "
+                "web sources when external current facts are required. Do not "
+                "modify project information in review mode."
+            )
         return (
             "Do not produce the final answer yet. `get_project_progress` says "
             "stored progress evidence is insufficient. Continue with tool calls: "
@@ -587,15 +712,32 @@ def _tool_result_output(result: Any) -> str:
 
 
 def _tool_result_successful(result: Any) -> bool:
-    if hasattr(result, "success"):
-        return bool(getattr(result, "success"))
-    if hasattr(result, "successful"):
-        return bool(getattr(result, "successful"))
-    output = _tool_result_output(result).strip().lower()
+    if hasattr(result, "success") and not bool(getattr(result, "success")):
+        return False
+    if hasattr(result, "successful") and not bool(getattr(result, "successful")):
+        return False
+    raw_output = _tool_result_output(result).strip()
+    if raw_output.startswith("{") and raw_output.endswith("}"):
+        try:
+            payload = json.loads(raw_output)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict) and payload.get("success") is False:
+            return False
+    output = raw_output.lower()
     return not (
         output.startswith("error:")
         or output.startswith("tool not found:")
         or output.startswith("tool execution error:")
+    )
+
+
+def _openai_tool_call_record_from_unified(tool_result: Any) -> OpenAIToolCallRecord:
+    return OpenAIToolCallRecord(
+        tool=tool_result.call.tool,
+        arguments=dict(tool_result.call.arguments),
+        result=tool_result.model_output,
+        success=bool(tool_result.success),
     )
 
 
@@ -615,6 +757,9 @@ def run_openai_tool_call_loop(
     user_input: str | None = None,
     enforce_tool_policy: bool = True,
     require_project_context_read: bool = False,
+    skip_final_response_check_on_empty: bool = False,
+    event_callback: Callable[[str, dict[str, Any]], Any] | None = None,
+    restore_tool_arguments: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> str | OpenAIToolCallLoopResult:
     """Execute OpenAI-compatible tool calls and re-prompt until text output."""
     effective_user_input = user_input
@@ -650,24 +795,29 @@ def run_openai_tool_call_loop(
         config=config,
         user_input=effective_user_input,
         enforce_tool_policy=enforce_tool_policy,
-        final_response_check=_combined_final_response_check(
+        final_response_check=combined_final_response_check(
             user_input=effective_user_input,
             require_project_context_read=require_project_context_read,
         ),
+        skip_final_response_check_on_empty=skip_final_response_check_on_empty,
+        event_callback=event_callback,
+        restore_tool_arguments=restore_tool_arguments,
     )
     if not return_result:
         return result.final_output
     return OpenAIToolCallLoopResult(
         final_output=result.final_output,
         tool_calls=[
-            OpenAIToolCallRecord(
-                tool=tool_result.call.tool,
-                arguments=dict(tool_result.call.arguments),
-                result=tool_result.model_output,
-            )
+            _openai_tool_call_record_from_unified(tool_result)
             for tool_result in result.tool_results
         ],
         messages=[dict(message) for message in result.messages],
+        stopped_reason=result.stopped_reason,
+        rounds=result.rounds,
+        audit_tool_calls=[
+            _openai_tool_call_record_from_unified(tool_result)
+            for tool_result in result.audit_tool_results
+        ],
     )
 
 
@@ -677,12 +827,39 @@ def _message_content(message: Any, extractor: Callable[[Any], str] | None) -> st
     return str(getattr(message, "content", None) or "")
 
 
-def _should_run_tool_hint_rule(
-    rule: ToolHintRule,
+def _collect_tool_hint_rules(
+    user_input: str,
+    registry: ToolRegistry,
+) -> tuple[list[ToolHintRule], list[ToolHintRule]]:
+    """公開済みルールと、pack 未ロードで案内だけ出すルールに分ける。"""
+    matched: list[ToolHintRule] = []
+    deferred: list[ToolHintRule] = []
+    load_available = LOAD_TOOL_PACK_TOOL_NAME in registry
+    for rule in TOOL_HINT_RULES:
+        if not rule.detector(user_input):
+            continue
+        if rule.tool_name in registry:
+            matched.append(rule)
+        elif load_available and rule.pack_id:
+            deferred.append(rule)
+    return matched, deferred
+
+
+def _project_tables_pack_hint_needed(
     user_input: str,
     registry: ToolRegistry,
 ) -> bool:
-    return rule.tool_name in registry and rule.detector(user_input)
+    if LOAD_TOOL_PACK_TOOL_NAME not in registry:
+        return False
+    # A table/WBS pack is a command capability concern.  Ordinary mentions of
+    # "WBS", "DB", or "タスク" must remain available for the model's own
+    # selection rather than injecting a pack hint.
+    if not command_capabilities_from_text(user_input) & {
+        "project_db_update",
+        "wbs_sync",
+    }:
+        return False
+    return not any(name in registry for name in PROJECT_TABLE_TOOL_NAMES)
 
 
 def _should_hint_direct_search_tools(user_input: str, registry: ToolRegistry) -> bool:
@@ -692,21 +869,42 @@ def _should_hint_direct_search_tools(user_input: str, registry: ToolRegistry) ->
 
 
 def _should_hint_direct_memory_tools(user_input: str, registry: ToolRegistry) -> bool:
-    # search_memory は読み取り専用の深掘りツール。キーワード一致に依らず、
-    # 使えるなら常にヒントを添えてモデルが必要な時に自発的に呼べるようにする。
-    return any(
-        tool_name in registry for tool_name in DIRECT_MEMORY_TOOL_HINT_NAMES
-    )
+    # There is no natural-language memory capability.  Keep the normal tool
+    # catalog untouched and let the model choose `search_past_chats` when the
+    # request actually needs it.
+    return False
 
 
 def _should_hint_direct_filesystem_tools(user_input: str, registry: ToolRegistry) -> bool:
-    return looks_like_filesystem_request(user_input) and any(
-        tool_name in registry for tool_name in DIRECT_FILESYSTEM_TOOL_HINT_NAMES
+    # Files/Docs words alone do not establish that a filesystem tool is needed.
+    # Verified Project attachments use the dedicated stewardship hint below.
+    return False
+
+
+def _should_hint_project_attachment_stewardship(
+    user_input: str,
+    registry: ToolRegistry,
+) -> bool:
+    """Use only task-local server metadata for attachment stewardship."""
+    try:
+        from ..services.turn_context import get_turn_context
+
+        if not get_turn_context().verified_project_attachment:
+            return False
+    except Exception:
+        return False
+    return any(
+        tool_name in registry
+        for tool_name in (
+            *DIRECT_FILESYSTEM_TOOL_HINT_NAMES,
+            *FILESYSTEM_MUTATION_TOOL_NAMES,
+        )
     )
 
 
 def _should_hint_direct_project_tools(user_input: str, registry: ToolRegistry) -> bool:
-    return looks_like_project_management_request(user_input) and any(
+    capabilities = command_capabilities_from_text(user_input)
+    return bool(capabilities & PROJECT_COMMAND_CAPABILITIES) and any(
         tool_name in registry for tool_name in DIRECT_PROJECT_TOOL_HINT_NAMES
     )
 
@@ -726,9 +924,15 @@ def _build_context_block(
     direct_search_hint: bool = False,
     direct_memory_hint: bool = False,
     direct_filesystem_hint: bool = False,
+    project_attachment_stewardship_hint: bool = False,
+    available_filesystem_mutation_tools: Sequence[str] = (),
     direct_project_hint: bool = False,
     project_progress_review_hint: bool = False,
+    project_organizer_hint: bool = False,
     knowledge_search_hint: bool = False,
+    aoi_vocabulary_hint: str = "",
+    deferred_pack_rules: Sequence[ToolHintRule] = (),
+    project_tables_pack_hint: bool = False,
 ) -> str:
     autonomous_execution_guidance = (
         "## Autonomous Tool Execution\n"
@@ -739,36 +943,72 @@ def _build_context_block(
     )
     if (
         not rules
+        and not deferred_pack_rules
         and not direct_search_hint
         and not direct_memory_hint
         and not direct_filesystem_hint
+        and not project_attachment_stewardship_hint
         and not direct_project_hint
         and not project_progress_review_hint
+        and not aoi_vocabulary_hint
     ):
         return autonomous_execution_guidance
     tool_lines = [f"- Consider `{rule.tool_name}`." for rule in rules]
+    for rule in deferred_pack_rules:
+        tool_lines.append(
+            f"- `{rule.tool_name}` はまだロードされていません。"
+            f'`load_tool_pack` に pack="{rule.pack_id}" を渡してロードしてから使ってください。'
+        )
     if direct_search_hint:
         if knowledge_search_hint:
             tool_lines.append(
-                "- 公開Webや最新情報は `web_search`、X/Twitterは `grok_x_search`、"
+                "- 公開Webや最新情報は `web_search`、X/Twitterはまず `x_search`（Yahooリアルタイム検索）、"
+                "不足する場合だけ `grok_x_search`、"
                 "Knowledge Sourceは `knowledge_search` を使って確認してください。"
             )
         else:
             tool_lines.append(
                 "- 公開Webや最新情報は `web_search`、"
-                "X/Twitterは `grok_x_search` を使って確認してください。"
+                "X/Twitterはまず `x_search`（Yahooリアルタイム検索）、不足する場合だけ "
+                "`grok_x_search` を使って確認してください。"
             )
     if direct_memory_hint:
         tool_lines.append(
             "- ユーザーの好み・名前・過去の決定・以前の作業内容など、現在の会話に無い文脈が"
-            "必要になったら `search_memory` で過去会話を検索してください。"
-            "自動で添えられた過去会話の抜粋で足りない場合も `search_memory` で掘り下げてください。"
+            "必要になったら `search_past_chats` で過去会話を検索してください。"
+            "自動で添えられた過去会話の抜粋で足りない場合も `search_past_chats` で掘り下げてください。"
         )
     if direct_filesystem_hint:
         tool_lines.append(
-            "- ワークスペースやファイル確認は `find_workspace_items`、"
-            "`inspect_workspace_tree`、`read_workspace_file`、`view_file`、"
-            "`search_files`、`list_directory` を使って、必要なファイルまで読んでください。"
+            "- ワークスペースやファイル確認は `search_files`、`list_directory`、"
+            "`list_workspace_tree`、`read_file` を使ってください。配置先を選ぶ時は"
+            "同じ探索を繰り返さず、`list_workspace_tree` で既存構成を1回確認してください。"
+        )
+    if project_attachment_stewardship_hint:
+        if available_filesystem_mutation_tools:
+            mutation_step = (
+                "、".join(
+                    f"`{tool_name}`"
+                    for tool_name in available_filesystem_mutation_tools
+                )
+                + "で必要最小限の整理を行い、最後に一覧で確認してください。"
+            )
+        else:
+            mutation_step = (
+                "このターンではworkspace変更ツールが利用できないため、"
+                "分類と配置候補の確認までに留めてください。"
+            )
+        tool_lines.extend(
+            [
+                "- Project workspace内の添付を検出しました。これは会話専用の一時置き場ではなく、"
+                "継続管理するProject資産の候補です。テンプレート・参照資料・ソース・成果物などは"
+                "継続資産、今回だけの入力や一時出力は一時資料として分類してください。",
+                "- 継続資産なら、まず `list_workspace_tree` でProject workspaceの"
+                "既存構成を確認し、対応するフォルダを再利用してください。対応先がなければ"
+                f"{mutation_step}",
+                "- 一時資料は `attachments` に残し、無関係な既存ファイルは移動しないでください。"
+                "分類に必要な内容は `read_file` で確認し、名前や拡張子だけで推測しないでください。",
+            ]
         )
     if direct_project_hint:
         tool_lines.append(
@@ -779,23 +1019,65 @@ def _build_context_block(
         tool_lines.append(
             "- 進捗確認や状況確認は `get_project_progress` を起点にし、"
             "必要なら案件情報、台帳、タスク、予定、関連ファイルも確認してください。"
+            "進捗は期間内の活動量ではなく案件目標への到達度です。"
+        )
+        tool_lines.append(
+            "- タスク追加依頼は聞き返さず `create_task` を呼び、内容から簡潔なタイトルを作り、"
+            "日時は due_date / start_at / end_at、詳細は description に入れてください。"
+        )
+        tool_lines.append(
+            "- 新規タスクの作成前に、選択中Projectの既存タスクを `list_tasks`（必要なら search 付き）で"
+            "確認し、parent_task_id 階層を尊重してください。明確な既存の関連root/containerがあれば"
+            "そのsubtaskにし、なければ同一目的は1つのrootと実行可能なsubtasksにまとめ、独立成果だけを"
+            "別rootにしてください。タイトルの曖昧な類似だけで統合せず、横断的な関連・依存をcontainmentと"
+            "混同したり、重複containerを乱立させたりしないでください。"
+        )
+        tool_lines.append(
+            "- 案件情報Docsは正本です。書く前に `list_project_information` で読み、"
+            "見出し構造を保ったまま `patch_project_information_doc` で該当箇所だけを更新し、"
+            "change_summary と source_refs_json を残してください。"
+        )
+    if project_tables_pack_hint:
+        tool_lines.append(
+            "- 台帳 / WBS / 課題管理表の作成・更新・同期ツールは未ロードです。"
+            '`load_tool_pack` に pack="project_tables" を渡してロードしてから使ってください。'
         )
     if project_progress_review_hint:
         tool_lines.append(
             "- 進捗レビューでは `get_project_progress` から始め、回答に必要な根拠が揃うまで追加確認してください。"
         )
-        tool_lines.append(
+        evidence_line = (
             "- 根拠が不足、古い、または矛盾している場合は `list_project_information`、"
             "`list_record_tables`、タスク、予定、関連ファイルを確認してください。"
-            "選択中プロジェクトの資料が新しい根拠になり得る場合は "
-            "`organize_project_information_from_folder` を使ってください。"
         )
-        tool_lines.append(
-            "- 案件情報Docsや台帳を更新した場合は、最終回答前に `get_project_progress` を再実行してください。"
+        if project_organizer_hint:
+            evidence_line += (
+                "選択中プロジェクトの資料が新しい根拠になり得る場合は "
+                "`organize_project_information_from_folder` を使ってください。"
+            )
+        tool_lines.append(evidence_line)
+        if project_organizer_hint:
+            tool_lines.append(
+                "- 案件情報Docsや台帳を更新した場合は、最終回答前に "
+                "`get_project_progress` を再実行してください。"
+            )
+    block = (
+        "\n".join(["## Tool Hints", *tool_lines]).strip()
+        if tool_lines
+        else ""
+    )
+    if aoi_vocabulary_hint:
+        block = (
+            f"{block}\n\n{aoi_vocabulary_hint}"
+            if block
+            else aoi_vocabulary_hint
         )
-    block = "\n".join(["## Tool Hints", *tool_lines]).strip()
     if autonomous_execution_guidance:
-        block = f"{block}\n\n{autonomous_execution_guidance}"
+        block = (
+            f"{block}\n\n{autonomous_execution_guidance}"
+            if block
+            else autonomous_execution_guidance
+        )
     matched_tool_names = [rule.tool_name for rule in rules]
     if direct_search_hint:
         matched_tool_names.append("search_tools")
@@ -813,7 +1095,15 @@ def _build_context_block(
         policy=policy,
     )
     if guidance:
-        block = f"{block}\n\n{guidance}"
+        block = f"{block}\n\n{guidance}" if block else guidance
+    planning_state = get_current_planning_run_state()
+    planning_guidance = build_planning_system_guidance(
+        planning_policy=get_current_planning_policy(),
+        generation_policy=policy,
+        approved_plan=planning_state.plan if planning_state else None,
+    )
+    if planning_guidance:
+        block = f"{block}\n\n{planning_guidance}" if block else planning_guidance
     return _clip_text(block, max_result_chars)
 
 
@@ -898,6 +1188,8 @@ def _tool_execution_aliases(tool_name: str) -> set[str]:
         return FILESYSTEM_TOOL_NAMES
     if tool_name == "project_tools":
         return PROJECT_MANAGEMENT_TOOL_NAMES
+    if tool_name == "utility_tools":
+        return {"get_current_time", "get_weather_info", "calculate"}
     return {tool_name}
 
 

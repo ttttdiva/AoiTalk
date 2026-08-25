@@ -10,6 +10,53 @@ from .prompts import TASK_DECOMPOSITION_PROMPT
 
 logger = logging.getLogger(__name__)
 
+_SPOTIFY_TOOL_NAMES = frozenset(
+    {
+        "setup_spotify_auth",
+        "set_spotify_auth_code",
+        "search_spotify_activity",
+        "get_spotify_activity_stats",
+        "get_recent_spotify_activity",
+        "get_spotify_listening_patterns",
+        "search_spotify_music",
+        "play_spotify_track",
+        "play_song_now",
+        "queue_song",
+        "pause_spotify",
+        "skip_spotify_track",
+        "previous_track",
+        "get_spotify_status",
+        "show_queue",
+        "clear_spotify_queue",
+        "remove_from_queue",
+        "get_spotify_user_playlists",
+        "create_playlist",
+        "create_playlist_from_queue",
+        "add_tracks_to_playlist",
+        "add_queue_to_playlist",
+        "add_playlist_to_queue",
+        "remove_tracks_from_playlist",
+        "play_playlist",
+    }
+)
+
+
+def _spotify_enabled(config: Any) -> bool:
+    if not config:
+        return False
+    if isinstance(config, dict):
+        value: Any = config
+        for key in ("integrations", "spotify", "enabled"):
+            if not isinstance(value, dict) or key not in value:
+                return False
+            value = value[key]
+        return bool(value)
+    getter = getattr(config, "get", None)
+    if callable(getter):
+        value = getter("integrations.spotify.enabled", None)
+        return bool(value) if value is not None else False
+    return False
+
 
 class ReasoningPlanner:
     """タスクを実行可能なステップに分解するクラス"""
@@ -28,23 +75,23 @@ class ReasoningPlanner:
         self.step_patterns = {
             'search': {
                 'keywords': ['検索', '調べ', '探す', '確認', '取得'],
-                'tools': ['web_search', 'grok_x_search', 'search_memory']
+                'tools': ['web_search', 'grok_x_search', 'search_past_chats']
             },
             'create': {
                 'keywords': ['作成', '登録', '追加', '生成', '保存'],
-                'tools': ['create_task', 'patch_project_information_doc', 'create_record_table', 'spotify_assistant', 'create_file', 'media_assistant', 'invoke_skill']
+                'tools': ['create_task', 'patch_project_information_doc', 'create_record_table', 'create_file', 'media_assistant', 'invoke_skill']
             },
             'analyze': {
                 'keywords': ['分析', '解析', '評価', '判定', '比較'],
-                'tools': ['search_memory', 'utility_assistant']
+                'tools': ['search_past_chats', 'get_current_time', 'get_weather_info', 'calculate']
             },
             'fetch': {
                 'keywords': ['取得', '読み込み', 'ダウンロード', 'アクセス'],
-                'tools': ['find_workspace_items', 'read_workspace_file', 'view_file', 'list_project_information', 'spotify_assistant']
+                'tools': ['search_files', 'list_directory', 'read_file', 'list_project_information']
             },
             'transform': {
                 'keywords': ['変換', '整形', 'フォーマット', '加工', '抽出'],
-                'tools': ['search_files', 'read_workspace_file', 'edit_file', 'organize_project_information_from_folder', 'spotify_assistant', 'invoke_skill']
+                'tools': ['search_files', 'read_file', 'edit_file', 'organize_project_information_from_folder', 'invoke_skill']
             }
         }
     
@@ -196,7 +243,7 @@ class ReasoningPlanner:
         """ツールの説明を含む文字列を生成"""
         # 実際の実装では各ツールの説明を動的に取得
         tool_descriptions = {
-            'search_memory': '過去の会話履歴や記憶を検索',
+            'search_past_chats': '過去の会話履歴や記憶を検索',
             'WebSearch': 'インターネットから最新情報を検索',
             'web_search': 'General web search for fresh information',
             'grok_x_search': 'Fresh X/Twitter search via Grok',
@@ -205,14 +252,13 @@ class ReasoningPlanner:
             'patch_project_information_doc': 'Create or update the canonical project information Docs page',
             'organize_project_information_from_folder': 'Read project files and organize canonical project information Docs',
             'sync_wbs_tasks': 'Synchronize WBS tasks',
-            'spotify_assistant': 'Spotify auth, playback, queue, playlist, and activity operations',
-            'find_workspace_items': 'Find workspace files or folders by name',
-            'inspect_workspace_tree': 'Inspect a bounded workspace folder tree',
-            'read_workspace_file': 'Read a workspace file or document preview',
-            'view_file': 'Read a local file by path with optional line range',
+            'search_spotify_music': 'Spotify search (when the Spotify integration is enabled)',
+            'read_file': 'Read a file by workspace-relative or absolute path',
             'search_files': 'Search local files by name or content',
             'edit_file': 'Edit a local file by string replacement',
-            'utility_assistant': 'Time, weather, and calculation operations',
+            'get_current_time': 'Current local time lookup',
+            'get_weather_info': 'Current weather lookup for a location',
+            'calculate': 'Deterministic arithmetic and expression calculation',
             'media_assistant': 'Image generation and YouTube/NicoNico playback',
             'invoke_skill': 'Invoke installed skills for domain-specific tasks',
             'execute_file_operation': 'ローカルファイルの編集・参照（OS操作ツール）',
@@ -221,6 +267,8 @@ class ReasoningPlanner:
         
         descriptions = []
         for tool in available_tools:
+            if tool in _SPOTIFY_TOOL_NAMES and not _spotify_enabled(self.config):
+                continue
             desc = tool_descriptions.get(tool, f'{tool}: 詳細な説明は利用不可')
             descriptions.append(f"- {tool}: {desc}")
         
@@ -235,6 +283,8 @@ class ReasoningPlanner:
         
         # 推奨ツールから利用可能なものを選択
         for tool in available_tools:
+            if tool in _SPOTIFY_TOOL_NAMES and not _spotify_enabled(self.config):
+                continue
             for rec_tool in recommended:
                 if rec_tool.lower() in tool.lower() or tool.lower() in rec_tool.lower():
                     if tool not in required_tools:

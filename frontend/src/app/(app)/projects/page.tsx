@@ -1,35 +1,27 @@
 "use client";
 
+import { AppSelect } from "@/components/ui/app-select";
+
 import Link from "next/link";
 import {
   useState,
   useEffect,
   useCallback,
+  useMemo,
   useRef,
-  type ChangeEvent,
-  type DragEvent,
 } from "react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Separator } from "@/components/ui/separator";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import {
   FolderOpen,
   Plus,
   Users,
-  UserPlus,
   Loader2,
   Pencil,
   Trash2,
@@ -42,32 +34,41 @@ import {
   CheckCircle2,
   Circle,
   BookOpen,
-  RefreshCw,
   Settings2,
-  AlertTriangle,
   Tags,
-  Upload,
-  UploadCloud,
   FileText,
-  Folder,
-  Link2,
-  Unlink,
-  ChevronLeft,
   PanelLeftClose,
   PanelLeftOpen,
+  Boxes,
+  Brain,
+  Link2,
 } from "lucide-react";
 import { useProject } from "@/contexts/project-context";
 import { ProjectDashboard } from "@/components/project-dashboard";
 import { ProjectInformationPanel } from "@/components/projects/project-information-panel";
+import { ProjectDocsCandidatesPanel } from "@/components/projects/ProjectDocsCandidatesPanel";
+import { ProjectContextPackStatus } from "@/components/projects/ProjectContextPackStatus";
+import { ProjectManagementPanel } from "@/components/projects/project-management-panel";
+import { ProjectMembersPanel } from "@/components/projects/project-members-panel";
+import { ProjectMemoryPanel } from "@/components/projects/project-memory-panel";
+import { ProjectKnowledgePanel } from "@/components/projects/ProjectKnowledgePanel";
+import { useProjectManagementFiles } from "@/components/projects/hooks/use-project-management-files";
+import { useProjectMembers } from "@/components/projects/hooks/use-project-members";
 import { SpaceTagManagementPanel } from "@/components/projects/space-tag-management-panel";
+import { SpaceOverviewPanel } from "@/components/projects/space-overview-panel";
+import {
+  ProjectColorPicker,
+  ResourceColorPicker,
+} from "@/components/projects/resource-color-picker";
+import { ProjectAppsPanel } from "@/components/apps/project-apps-panel";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { formatBytes } from "@/lib/utils";
 import { useConfirm } from "@/hooks/use-confirm";
 import { useProjectsData } from "@/hooks/use-projects-data";
+import { useWorkspaceShellRegistration } from "@/components/layout/shell-context";
 
 async function apiFetch<T = unknown>(
   path: string,
@@ -85,316 +86,6 @@ async function apiFetch<T = unknown>(
   return res.json();
 }
 
-type ManagementFileKind = "wbs" | "issue" | "risk" | "request" | "attachment";
-type ManagementDocumentKind = Exclude<ManagementFileKind, "attachment">;
-
-type ManagementFileUploadResponse = {
-  success: boolean;
-  kind: ManagementFileKind;
-  name: string;
-  path: string;
-  size: number;
-  registered: boolean;
-  config: ManagementConfig;
-};
-
-type ProjectFilerDirectory = {
-  name: string;
-  path: string;
-  modifiedAt?: string;
-};
-
-type ProjectFilerFile = {
-  name: string;
-  path: string;
-  size: number;
-  modifiedAt: string;
-  extension: string;
-};
-
-type ProjectFilerListResponse = {
-  currentPath: string;
-  parentPath: string | null;
-  directories: ProjectFilerDirectory[];
-  files: ProjectFilerFile[];
-};
-
-type ManagementDocumentCardProps = {
-  title: string;
-  description: string;
-  value?: string | null;
-  values?: string[];
-  accept?: string;
-  multiple?: boolean;
-  uploading?: boolean;
-  onFiles: (files: File[]) => void;
-  onPickFromFiler: () => void;
-  onClear?: () => void;
-  onRemove?: (path: string) => void;
-};
-
-const PROJECT_COLOR_PRESETS = [
-  { name: "Crystal Cyan", value: "#0E7490" },
-  { name: "Lagoon Teal", value: "#0F766E" },
-  { name: "Emerald", value: "#047857" },
-  { name: "Cobalt Blue", value: "#2563EB" },
-  { name: "Lapis Indigo", value: "#4F46E5" },
-  { name: "Aurora Violet", value: "#7C3AED" },
-  { name: "Fuchsia", value: "#C026D3" },
-  { name: "Rose", value: "#DB2777" },
-  { name: "Crimson", value: "#BE123C" },
-  { name: "Coral", value: "#C2410C" },
-  { name: "Amber Brown", value: "#A16207" },
-  { name: "Slate", value: "#475569" },
-] as const;
-
-type ProjectColorPickerProps = {
-  value: string;
-  onChange: (value: string) => void;
-  inputClassName?: string;
-};
-
-function ProjectColorPicker({
-  value,
-  onChange,
-  inputClassName = "h-8",
-}: ProjectColorPickerProps) {
-  const currentColor = value || "#3b82f6";
-  const selectedColor = currentColor.toLowerCase();
-
-  return (
-    <div className="space-y-2 rounded border border-input px-2 py-1.5">
-      <div className="flex items-center gap-2">
-        <span className="text-xs text-muted-foreground">色</span>
-        <input
-          type="color"
-          value={currentColor}
-          onChange={(e) => onChange(e.target.value)}
-          className={`${inputClassName} w-10 cursor-pointer rounded border-0 bg-transparent p-0`}
-        />
-        <span className="text-[11px] text-muted-foreground">
-          {currentColor}
-        </span>
-      </div>
-      <div className="flex flex-wrap gap-1.5">
-        {PROJECT_COLOR_PRESETS.map((preset) => {
-          const isSelected = preset.value.toLowerCase() === selectedColor;
-
-          return (
-            <button
-              key={preset.value}
-              type="button"
-              title={`${preset.name} ${preset.value}`}
-              aria-label={`${preset.name} ${preset.value}`}
-              aria-pressed={isSelected}
-              onClick={() => onChange(preset.value)}
-              className={`size-6 rounded-full border border-white/70 shadow-sm transition hover:scale-105 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
-                isSelected
-                  ? "ring-2 ring-ring ring-offset-2 ring-offset-background"
-                  : ""
-              }`}
-              style={{ backgroundColor: preset.value }}
-            />
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-function fileNameFromPath(filePath: string): string {
-  const normalized = filePath.replace(/\\/g, "/");
-  return normalized.split("/").filter(Boolean).at(-1) || normalized;
-}
-
-function folderFromPath(filePath: string): string {
-  const normalized = filePath.replace(/\\/g, "/");
-  const parts = normalized.split("/").filter(Boolean);
-  parts.pop();
-  return parts.join("/") || "プロジェクトファイラー直下";
-}
-
-function acceptMatchesPath(filePath: string, accept?: string): boolean {
-  if (!accept) return true;
-  const extension =
-    `.${fileNameFromPath(filePath).split(".").pop() || ""}`.toLowerCase();
-  return accept
-    .split(",")
-    .map((item) => item.trim().toLowerCase())
-    .filter(Boolean)
-    .some((item) => item === extension || item === "*/*");
-}
-
-function ManagementDocumentCard({
-  title,
-  description,
-  value,
-  values,
-  accept,
-  multiple = false,
-  uploading = false,
-  onFiles,
-  onPickFromFiler,
-  onClear,
-  onRemove,
-}: ManagementDocumentCardProps) {
-  const inputRef = useRef<HTMLInputElement>(null);
-  const [dragging, setDragging] = useState(false);
-  const registeredFiles = multiple ? values || [] : value ? [value] : [];
-
-  const submitFiles = useCallback(
-    (files: FileList | File[]) => {
-      const list = Array.from(files);
-      if (list.length > 0) onFiles(list);
-    },
-    [onFiles],
-  );
-
-  const handleDrop = useCallback(
-    (event: DragEvent<HTMLDivElement>) => {
-      event.preventDefault();
-      event.stopPropagation();
-      setDragging(false);
-      submitFiles(event.dataTransfer.files);
-    },
-    [submitFiles],
-  );
-
-  const handleSelect = useCallback(
-    (event: ChangeEvent<HTMLInputElement>) => {
-      if (event.target.files) submitFiles(event.target.files);
-      event.target.value = "";
-    },
-    [submitFiles],
-  );
-
-  return (
-    <div
-      className={`rounded-md border p-4 transition-colors ${
-        dragging ? "border-primary bg-primary/5" : "border-border bg-card"
-      }`}
-      onDragOver={(event) => {
-        event.preventDefault();
-        setDragging(true);
-      }}
-      onDragLeave={() => setDragging(false)}
-      onDrop={handleDrop}
-    >
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <FileText className="size-4 text-muted-foreground" />
-            <h3 className="text-sm font-medium">{title}</h3>
-            {registeredFiles.length > 0 && (
-              <Badge variant="secondary" className="text-[11px]">
-                {multiple ? `${registeredFiles.length}件` : "登録済み"}
-              </Badge>
-            )}
-          </div>
-          <p className="mt-1 text-xs text-muted-foreground">{description}</p>
-        </div>
-      </div>
-
-      {registeredFiles.length > 0 ? (
-        <div className="mt-3 space-y-2">
-          {registeredFiles.map((filePath) => (
-            <div
-              key={filePath}
-              className="flex items-center justify-between gap-3 rounded-md border bg-muted/30 px-3 py-2"
-            >
-              <div className="min-w-0">
-                <div className="truncate text-sm font-medium">
-                  {fileNameFromPath(filePath)}
-                </div>
-                <div className="truncate text-[11px] text-muted-foreground">
-                  {folderFromPath(filePath)}
-                </div>
-              </div>
-              {multiple && onRemove ? (
-                <Button
-                  type="button"
-                  size="icon-sm"
-                  variant="ghost"
-                  onClick={() => onRemove(filePath)}
-                  aria-label={`${fileNameFromPath(filePath)} の登録を解除`}
-                >
-                  <X className="size-3.5" />
-                </Button>
-              ) : null}
-            </div>
-          ))}
-        </div>
-      ) : (
-        <button
-          type="button"
-          className="mt-3 flex min-h-24 w-full flex-col items-center justify-center rounded-md border border-dashed bg-muted/20 px-3 py-4 text-center transition-colors hover:border-primary hover:bg-primary/5"
-          onClick={() => inputRef.current?.click()}
-          disabled={uploading}
-        >
-          {uploading ? (
-            <Loader2 className="mb-2 size-5 animate-spin text-muted-foreground" />
-          ) : (
-            <UploadCloud className="mb-2 size-5 text-muted-foreground" />
-          )}
-          <span className="text-sm font-medium">
-            ファイルをドロップ、またはアップロード
-          </span>
-          <span className="mt-1 text-xs text-muted-foreground">
-            ローカルパスは保存しません
-          </span>
-        </button>
-      )}
-
-      <div className="mt-3 flex flex-wrap gap-2">
-        <Button
-          type="button"
-          size="sm"
-          variant="outline"
-          onClick={() => inputRef.current?.click()}
-          disabled={uploading}
-        >
-          {uploading ? (
-            <Loader2 className="mr-1 size-3 animate-spin" />
-          ) : (
-            <Upload className="mr-1 size-3" />
-          )}
-          アップロード
-        </Button>
-        <Button
-          type="button"
-          size="sm"
-          variant="outline"
-          onClick={onPickFromFiler}
-          disabled={uploading}
-        >
-          <Link2 className="mr-1 size-3" />
-          ファイラーから選択
-        </Button>
-        {registeredFiles.length > 0 && !multiple && onClear ? (
-          <Button
-            type="button"
-            size="sm"
-            variant="ghost"
-            onClick={onClear}
-            disabled={uploading}
-          >
-            <Unlink className="mr-1 size-3" />
-            解除
-          </Button>
-        ) : null}
-      </div>
-      <input
-        ref={inputRef}
-        type="file"
-        className="hidden"
-        accept={accept}
-        multiple={multiple}
-        onChange={handleSelect}
-      />
-    </div>
-  );
-}
-
 interface SpaceInfo {
   id: string;
   name: string;
@@ -402,6 +93,10 @@ interface SpaceInfo {
   description?: string | null;
   color?: string | null;
   sort_order?: number;
+  /** Remote resources are view-only in the local Projects workspace. */
+  source?: string;
+  /** Some resource providers expose an explicit write permission. */
+  can_write?: boolean;
 }
 
 interface ProjectInfo {
@@ -416,9 +111,15 @@ interface ProjectInfo {
     isInboxDefault?: boolean;
   };
   owner_id?: string;
+  can_manage_settings?: boolean;
   estimated_hours?: number | null;
   space_id?: string | null;
   is_completed?: boolean;
+  can_write?: boolean;
+  knowledge_node_id?: string | null;
+  /** API may explicitly mark a reverse pointer stale while it is repaired. */
+  knowledge_node_id_valid?: boolean;
+  knowledge_node_id_validated?: boolean;
   created_at?: string | null;
 }
 
@@ -426,83 +127,27 @@ interface ProjectInfo {
 const EMPTY_SPACES: SpaceInfo[] = [];
 const EMPTY_PROJECTS: ProjectInfo[] = [];
 
-interface ProjectMember {
-  id: string;
-  project_id: string;
-  user_id: string;
-  role: string | null;
-  joined_at: string | null;
-  username: string;
-  display_name: string | null;
-}
-
-interface SimpleUser {
-  id: string;
-  username: string;
-  display_name: string | null;
-}
-
-const ROLE_OPTIONS = [
-  { value: "owner", label: "オーナー" },
-  { value: "admin", label: "管理者" },
-  { value: "member", label: "メンバー" },
-  { value: "viewer", label: "閲覧者" },
-];
-
 const PROJECTS_PAGE_NAV_COLLAPSED_KEY = "projectsPageNavigationCollapsed";
 
-type RightTab = "dashboard" | "information" | "members" | "management" | "tags";
+type RightTab =
+  | "dashboard"
+  | "information"
+  | "knowledge"
+  | "memory"
+  | "members"
+  | "management"
+  | "tags"
+  | "apps";
 type SelectedScope =
   | { type: "project"; id: string }
   | { type: "space"; id: string };
 
-type ManagementConfig = {
-  wbsFile: string | null;
-  issueFile: string | null;
-  riskFile: string | null;
-  requestFiles: string[];
-};
-
-type WbsRowInfo = {
-  title: string;
-  wbsId: string | null;
-  status: string;
-  priority: string;
-  plannedEnd: string | null;
-  assignee: string | null;
-  requestText: string | null;
-  sheetName: string;
-  rowNumber: number;
-};
-
-type RequestItem = {
-  title: string;
-  target: string;
-  reason: string;
-  sourceType: string;
-  sourcePath: string;
-  sourceRef: string;
-  dueAt: string | null;
-  status: string;
-};
-
-type WbsScanResponse = {
-  config: ManagementConfig;
-  file_path: string | null;
-  upcoming: WbsRowInfo[];
-  requests: RequestItem[];
-  errors: string[];
-  summary: {
-    total: number;
-    open: number;
-    review: number;
-    overdue: number;
-    request_count: number;
-  };
-};
-
 export default function ProjectsPage() {
   const confirm = useConfirm();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const requestedProjectId = searchParams.get("project_id");
+  const requestedAppId = searchParams.get("app_id");
   const { refreshProjects, refreshSpaces } = useProject();
 
   // スペース一覧・プロジェクト一覧（取得は SWR に委譲）
@@ -510,6 +155,10 @@ export default function ProjectsPage() {
     spaces: spacesData,
     projects: projectsData,
     refresh: refreshProjectsData,
+    spacesError: spacesDataError,
+    projectsError: projectsDataError,
+    spacesLoaded: spacesDataLoaded,
+    projectsLoaded: projectsDataLoaded,
   } = useProjectsData<SpaceInfo, ProjectInfo>();
   const spaces = spacesData ?? EMPTY_SPACES;
   const [expandedSpaces, setExpandedSpaces] = useState<Set<string>>(new Set());
@@ -520,13 +169,28 @@ export default function ProjectsPage() {
 
   // プロジェクト一覧
   const projects = projectsData ?? EMPTY_PROJECTS;
+  // API ごとの取得結果を独立して扱う。古いテスト用モックなどが状態を返さない
+  // 場合は、データの有無から後方互換に推定する。
+  const spacesError = spacesDataError ?? null;
+  const projectsError = projectsDataError ?? null;
+  const spacesLoaded = spacesDataLoaded ?? spacesData !== undefined;
+  const projectsLoaded = projectsDataLoaded ?? projectsData !== undefined;
+  const resourcesReady = spacesLoaded && projectsLoaded;
+  const hasResourceError = Boolean(spacesError || projectsError);
+  const canShowEmptyState =
+    resourcesReady && !hasResourceError && spaces.length === 0 && projects.length === 0;
   const [loading, setLoading] = useState(true);
+  const fetchGenerationRef = useRef(0);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(
     null,
   );
   const [selectedScope, setSelectedScope] = useState<SelectedScope | null>(
     null,
   );
+  const projectMembers = useProjectMembers({
+    projectId: selectedScope?.type === "project" ? selectedScope.id : null,
+    confirm,
+  });
 
   // 右パネルタブ
   const [rightTab, setRightTab] = useState<RightTab>("dashboard");
@@ -539,6 +203,7 @@ export default function ProjectsPage() {
   // スペース編集
   const [editingSpaceId, setEditingSpaceId] = useState<string | null>(null);
   const [editSpaceName, setEditSpaceName] = useState("");
+  const [editSpaceColor, setEditSpaceColor] = useState("#3b82f6");
 
   // 新規プロジェクト作成
   const [showCreateForm, setShowCreateForm] = useState(false);
@@ -563,47 +228,16 @@ export default function ProjectsPage() {
     useState(false);
   const [saving, setSaving] = useState(false);
 
-  // 管理資料設定
-  const [wbsFile, setWbsFile] = useState("");
-  const [issueFile, setIssueFile] = useState("");
-  const [riskFile, setRiskFile] = useState("");
-  const [requestFiles, setRequestFiles] = useState<string[]>([]);
-  const [wbsScan, setWbsScan] = useState<WbsScanResponse | null>(null);
-  const [managementLoading, setManagementLoading] = useState(false);
-  const [managementSaving, setManagementSaving] = useState(false);
-  const [managementUploading, setManagementUploading] =
-    useState<ManagementFileKind | null>(null);
-  const [managementError, setManagementError] = useState("");
-  const [syncResult, setSyncResult] = useState<string | null>(null);
-  const [filePicker, setFilePicker] = useState<{
-    kind: ManagementDocumentKind;
-    title: string;
-    accept: string;
-  } | null>(null);
-  const [filePickerPath, setFilePickerPath] = useState("");
-  const [filePickerData, setFilePickerData] =
-    useState<ProjectFilerListResponse | null>(null);
-  const [filePickerLoading, setFilePickerLoading] = useState(false);
-  const [filePickerError, setFilePickerError] = useState("");
-
-  // メンバー管理
-  const [members, setMembers] = useState<ProjectMember[]>([]);
-  const [membersLoading, setMembersLoading] = useState(false);
-
-  // ユーザーリスト（メンバー追加用）
-  const [allUsers, setAllUsers] = useState<SimpleUser[]>([]);
-  const [selectedUserIds, setSelectedUserIds] = useState<Set<string>>(
-    new Set(),
-  );
-  const [addRole, setAddRole] = useState("member");
-  const [addingMembers, setAddingMembers] = useState(false);
-  const [addError, setAddError] = useState("");
-
   // データ取得（取得自体は SWR に委譲し、選択復元・展開などの副作用はここで実行）
   const fetchAll = useCallback(async () => {
+    const fetchGeneration = ++fetchGenerationRef.current;
+    const isCurrentFetch = () => fetchGenerationRef.current === fetchGeneration;
     setLoading(true);
     try {
       const result = await refreshProjectsData();
+      // A retry can settle before an earlier request. Only the latest result
+      // may restore selection/expanded state or end the loading indicator.
+      if (!isCurrentFetch()) return;
       const spacesList = result?.spaces ?? EMPTY_SPACES;
       const projectsList = result?.projects ?? EMPTY_PROJECTS;
       const activeProjects = projectsList.filter(
@@ -624,6 +258,13 @@ export default function ProjectsPage() {
         parsedScope = null;
       }
       if (
+        requestedProjectId &&
+        projectsList.some((project) => project.id === requestedProjectId)
+      ) {
+        setSelectedProjectId(requestedProjectId);
+        setSelectedScope({ type: "project", id: requestedProjectId });
+        if (requestedAppId) setRightTab("apps");
+      } else if (
         parsedScope?.type === "space" &&
         spacesList.some((s) => s.id === parsedScope.id)
       ) {
@@ -647,25 +288,23 @@ export default function ProjectsPage() {
         setSelectedScope({ type: "space", id: spacesList[0].id });
       }
     } catch (err) {
-      console.error("データ取得失敗:", err);
+      if (isCurrentFetch()) console.error("データ取得失敗:", err);
     } finally {
-      setLoading(false);
+      if (isCurrentFetch()) setLoading(false);
     }
-  }, [refreshProjectsData]);
-
-  const fetchUsers = useCallback(async () => {
-    try {
-      const data = await apiFetch<SimpleUser[]>("/api/users/list");
-      setAllUsers(data);
-    } catch (err) {
-      console.error("ユーザー取得失敗:", err);
-    }
-  }, []);
+  }, [refreshProjectsData, requestedAppId, requestedProjectId]);
 
   useEffect(() => {
     fetchAll();
-    fetchUsers();
-  }, [fetchAll, fetchUsers]);
+  }, [fetchAll]);
+
+  const retryDataFetch = useCallback(() => {
+    void fetchAll();
+  }, [fetchAll]);
+
+  useEffect(() => {
+    if (requestedAppId && selectedProjectId) setRightTab("apps");
+  }, [requestedAppId, selectedProjectId]);
 
   useEffect(() => {
     setIsNavigationCollapsed(
@@ -681,22 +320,6 @@ export default function ProjectsPage() {
     });
   }, []);
 
-  // メンバー一覧取得
-  const fetchMembers = useCallback(async (projectId: string) => {
-    setMembersLoading(true);
-    try {
-      const data = await apiFetch<ProjectMember[]>(
-        `/api/projects/${projectId}/members`,
-      );
-      setMembers(data);
-    } catch (err) {
-      console.error("メンバー取得失敗:", err);
-      setMembers([]);
-    } finally {
-      setMembersLoading(false);
-    }
-  }, []);
-
   useEffect(() => {
     if (selectedScope) {
       localStorage.setItem(
@@ -706,215 +329,9 @@ export default function ProjectsPage() {
     }
     if (selectedScope?.type === "project") {
       setSelectedProjectId(selectedScope.id);
-      fetchMembers(selectedScope.id);
       localStorage.setItem("projectsPageSelected", selectedScope.id);
-    } else {
-      setMembers([]);
     }
-  }, [selectedScope, fetchMembers]);
-
-  const applyManagementConfig = useCallback((config: ManagementConfig) => {
-    setWbsFile(config.wbsFile || "");
-    setIssueFile(config.issueFile || "");
-    setRiskFile(config.riskFile || "");
-    setRequestFiles(config.requestFiles || []);
-  }, []);
-
-  const fetchManagement = useCallback(
-    async (projectId: string) => {
-      setManagementLoading(true);
-      setManagementError("");
-      try {
-        const [configData, scanData] = await Promise.all([
-          apiFetch<{ config: ManagementConfig }>(
-            `/api/projects/${projectId}/management`,
-          ),
-          apiFetch<WbsScanResponse>(`/api/projects/${projectId}/wbs`),
-        ]);
-        applyManagementConfig(configData.config);
-        setWbsScan(scanData);
-      } catch (err) {
-        setManagementError(
-          err instanceof Error
-            ? err.message
-            : "管理資料設定の取得に失敗しました",
-        );
-      } finally {
-        setManagementLoading(false);
-      }
-    },
-    [applyManagementConfig],
-  );
-
-  useEffect(() => {
-    if (rightTab === "management" && selectedProjectId) {
-      fetchManagement(selectedProjectId);
-    }
-  }, [rightTab, selectedProjectId, fetchManagement]);
-
-  const saveManagementConfigPatch = useCallback(
-    async (
-      patch: Partial<{
-        wbs_file: string | null;
-        issue_file: string | null;
-        risk_file: string | null;
-        request_files: string[];
-      }>,
-    ) => {
-      if (!selectedProjectId) return null;
-      setManagementSaving(true);
-      setManagementError("");
-      setSyncResult(null);
-      try {
-        const data = await apiFetch<{ config: ManagementConfig }>(
-          `/api/projects/${selectedProjectId}/management`,
-          {
-            method: "PATCH",
-            body: JSON.stringify(patch),
-          },
-        );
-        applyManagementConfig(data.config);
-        await fetchManagement(selectedProjectId);
-        return data.config;
-      } catch (err) {
-        setManagementError(
-          err instanceof Error ? err.message : "案件資料の登録に失敗しました",
-        );
-        return null;
-      } finally {
-        setManagementSaving(false);
-      }
-    },
-    [selectedProjectId, applyManagementConfig, fetchManagement],
-  );
-
-  const handleRegisterExistingManagementFile = useCallback(
-    async (kind: ManagementDocumentKind, filePath: string) => {
-      const normalizedPath = filePath.trim();
-      if (!normalizedPath) return;
-      const nextRequestFiles =
-        kind === "request"
-          ? [...new Set([...requestFiles, normalizedPath])]
-          : requestFiles;
-      const config = await saveManagementConfigPatch({
-        wbs_file: kind === "wbs" ? normalizedPath : wbsFile || null,
-        issue_file: kind === "issue" ? normalizedPath : issueFile || null,
-        risk_file: kind === "risk" ? normalizedPath : riskFile || null,
-        request_files: nextRequestFiles,
-      });
-      if (config) {
-        setSyncResult(
-          kind === "wbs"
-            ? "WBSをプロジェクトファイラーから登録しました。"
-            : "資料をプロジェクトファイラーから登録しました。",
-        );
-      }
-    },
-    [issueFile, requestFiles, riskFile, saveManagementConfigPatch, wbsFile],
-  );
-
-  const handleClearManagementFile = useCallback(
-    async (kind: ManagementDocumentKind, filePath?: string) => {
-      const nextRequestFiles =
-        kind === "request" && filePath
-          ? requestFiles.filter((item) => item !== filePath)
-          : requestFiles;
-      await saveManagementConfigPatch({
-        wbs_file: kind === "wbs" ? null : wbsFile || null,
-        issue_file: kind === "issue" ? null : issueFile || null,
-        risk_file: kind === "risk" ? null : riskFile || null,
-        request_files: kind === "request" ? nextRequestFiles : requestFiles,
-      });
-    },
-    [issueFile, requestFiles, riskFile, saveManagementConfigPatch, wbsFile],
-  );
-
-  const openFilePicker = useCallback(
-    (kind: ManagementDocumentKind, title: string, accept: string) => {
-      setFilePicker({ kind, title, accept });
-      setFilePickerPath("");
-      setFilePickerData(null);
-      setFilePickerError("");
-    },
-    [],
-  );
-
-  const fetchProjectFilerFiles = useCallback(
-    async (path: string) => {
-      if (!selectedProjectId) return;
-      setFilePickerLoading(true);
-      setFilePickerError("");
-      try {
-        const data = await apiFetch<ProjectFilerListResponse>(
-          `/api/projects/${selectedProjectId}/management/files?path=${encodeURIComponent(path)}`,
-        );
-        setFilePickerData(data);
-      } catch (err) {
-        setFilePickerError(
-          err instanceof Error
-            ? err.message
-            : "ファイラーの読み込みに失敗しました",
-        );
-      } finally {
-        setFilePickerLoading(false);
-      }
-    },
-    [selectedProjectId],
-  );
-
-  useEffect(() => {
-    if (filePicker && selectedProjectId) {
-      fetchProjectFilerFiles(filePickerPath);
-    }
-  }, [filePicker, filePickerPath, fetchProjectFilerFiles, selectedProjectId]);
-
-  const handleUploadManagementFiles = useCallback(
-    async (kind: ManagementFileKind, files: File[]) => {
-      if (!selectedProjectId || files.length === 0) return;
-      setManagementUploading(kind);
-      setManagementError("");
-      setSyncResult(null);
-      try {
-        let latestConfig: ManagementConfig | null = null;
-        for (const file of files) {
-          const formData = new FormData();
-          formData.append("file", file);
-          formData.append("kind", kind);
-          formData.append("directory", "management");
-          const res = await fetch(
-            `/api/projects/${selectedProjectId}/management/files`,
-            {
-              method: "POST",
-              credentials: "include",
-              body: formData,
-            },
-          );
-          if (!res.ok) {
-            const detail = await res
-              .json()
-              .catch(() => ({ detail: "アップロードに失敗しました" }));
-            throw new Error(detail.detail || "アップロードに失敗しました");
-          }
-          const data = (await res.json()) as ManagementFileUploadResponse;
-          latestConfig = data.config;
-        }
-        if (latestConfig) applyManagementConfig(latestConfig);
-        setSyncResult(
-          kind === "wbs"
-            ? "WBSをプロジェクトファイラーへ登録しました。"
-            : "資料をプロジェクトファイラーへ登録しました。",
-        );
-        await fetchManagement(selectedProjectId);
-      } catch (err) {
-        setManagementError(
-          err instanceof Error ? err.message : "アップロードに失敗しました",
-        );
-      } finally {
-        setManagementUploading(null);
-      }
-    },
-    [selectedProjectId, applyManagementConfig, fetchManagement],
-  );
+  }, [selectedScope]);
 
   // === スペース操作 ===
   const handleCreateSpace = useCallback(async () => {
@@ -941,7 +358,10 @@ export default function ProjectsPage() {
     try {
       await apiFetch(`/api/spaces/${editingSpaceId}`, {
         method: "PATCH",
-        body: JSON.stringify({ name: editSpaceName.trim() }),
+        body: JSON.stringify({
+          name: editSpaceName.trim(),
+          color: editSpaceColor || null,
+        }),
       });
       setEditingSpaceId(null);
       await fetchAll();
@@ -949,7 +369,7 @@ export default function ProjectsPage() {
     } catch (err) {
       console.error("スペース更新失敗:", err);
     }
-  }, [editingSpaceId, editSpaceName, fetchAll, refreshSpaces]);
+  }, [editingSpaceId, editSpaceName, editSpaceColor, fetchAll, refreshSpaces]);
 
   const handleDeleteSpace = useCallback(
     async (id: string) => {
@@ -1077,7 +497,6 @@ export default function ProjectsPage() {
         if (selectedProjectId === id) {
           setSelectedProjectId(null);
           setSelectedScope(null);
-          setMembers([]);
         }
         await fetchAll();
         refreshProjects();
@@ -1088,81 +507,7 @@ export default function ProjectsPage() {
     [selectedProjectId, fetchAll, refreshProjects, confirm],
   );
 
-  // === メンバー操作 ===
-  const handleAddMembers = useCallback(async () => {
-    if (!selectedProjectId || selectedUserIds.size === 0) return;
-    setAddingMembers(true);
-    setAddError("");
-    try {
-      const promises = Array.from(selectedUserIds).map((userId) =>
-        apiFetch(`/api/projects/${selectedProjectId}/members`, {
-          method: "POST",
-          body: JSON.stringify({ user_id: userId, role: addRole }),
-        }),
-      );
-      await Promise.all(promises);
-      setSelectedUserIds(new Set());
-      setAddRole("member");
-      await fetchMembers(selectedProjectId);
-    } catch (err) {
-      setAddError(err instanceof Error ? err.message : "追加に失敗しました");
-    } finally {
-      setAddingMembers(false);
-    }
-  }, [selectedProjectId, selectedUserIds, addRole, fetchMembers]);
-
-  const handleRemoveMember = useCallback(
-    async (memberId: string, displayName: string) => {
-      if (!selectedProjectId) return;
-      if (
-        !(await confirm({
-          description: `${displayName} をプロジェクトから除外しますか？`,
-          destructive: true,
-        }))
-      )
-        return;
-      try {
-        await apiFetch(`/api/projects/${selectedProjectId}/members`, {
-          method: "DELETE",
-          body: JSON.stringify({ member_id: memberId }),
-        });
-        await fetchMembers(selectedProjectId);
-      } catch (err) {
-        console.error("メンバー除外失敗:", err);
-      }
-    },
-    [selectedProjectId, fetchMembers, confirm],
-  );
-
-  const handleChangeRole = useCallback(
-    async (memberId: string, newRole: string) => {
-      if (!selectedProjectId) return;
-      try {
-        await apiFetch(`/api/projects/${selectedProjectId}/members`, {
-          method: "PATCH",
-          body: JSON.stringify({ member_id: memberId, role: newRole }),
-        });
-        await fetchMembers(selectedProjectId);
-      } catch (err) {
-        console.error("ロール変更失敗:", err);
-      }
-    },
-    [selectedProjectId, fetchMembers],
-  );
-
-  const toggleUser = (userId: string) => {
-    setSelectedUserIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(userId)) {
-        next.delete(userId);
-      } else {
-        next.add(userId);
-      }
-      return next;
-    });
-  };
-
-  const toggleSpace = (spaceId: string) => {
+  const toggleSpace = useCallback((spaceId: string) => {
     setExpandedSpaces((prev) => {
       const next = new Set(prev);
       if (next.has(spaceId)) {
@@ -1172,9 +517,9 @@ export default function ProjectsPage() {
       }
       return next;
     });
-  };
+  }, []);
 
-  const toggleClosedSpace = (spaceId: string) => {
+  const toggleClosedSpace = useCallback((spaceId: string) => {
     setExpandedClosedSpaces((prev) => {
       const next = new Set(prev);
       if (next.has(spaceId)) {
@@ -1184,20 +529,27 @@ export default function ProjectsPage() {
       }
       return next;
     });
-  };
+  }, []);
 
-  const memberUserIds = new Set(members.map((m) => m.user_id));
-  const availableUsers = allUsers.filter((u) => !memberUserIds.has(u.id));
-  const selectProject = (projectId: string) => {
+  const selectProject = useCallback((projectId: string) => {
     setSelectedProjectId(projectId);
     setSelectedScope({ type: "project", id: projectId });
     setRightTab("dashboard");
-  };
+    const params = new URLSearchParams(searchParams.toString());
+    params.set("project_id", projectId);
+    params.delete("app_id");
+    router.replace(`/projects?${params.toString()}`, { scroll: false });
+  }, [router, searchParams]);
 
-  const selectSpace = (spaceId: string) => {
+  const selectSpace = useCallback((spaceId: string) => {
     setSelectedScope({ type: "space", id: spaceId });
     setRightTab("dashboard");
-  };
+    const params = new URLSearchParams(searchParams.toString());
+    params.delete("project_id");
+    params.delete("app_id");
+    const query = params.toString();
+    router.replace(query ? `/projects?${query}` : "/projects", { scroll: false });
+  }, [router, searchParams]);
 
   const selectedProject =
     selectedScope?.type === "project"
@@ -1209,40 +561,71 @@ export default function ProjectsPage() {
       : undefined;
   const selectedProjectIsInbox = selectedProject?.metadata?.isInboxDefault === true
     || selectedProject?.slug === `inbox-project-${selectedProject?.owner_id ?? ""}`;
+  // The Projects page is backed by the Next.js `/api/projects` route, which
+  // serializes the effective project write permission for the current user.
+  // Keep management controls/actions behind that canonical value; do not
+  // infer write access from an absent field (Python Project.to_dict() does not
+  // carry this field).
+  const selectedProjectCanWrite = selectedProject?.can_write === true;
+  const projectManagementFiles = useProjectManagementFiles({
+    projectId: selectedScope?.type === "project" ? selectedScope.id : null,
+    enabled:
+      rightTab === "management" &&
+      selectedProjectCanWrite &&
+      !selectedProjectIsInbox,
+  });
+  const canonicalProjectDocsNodeId = typeof selectedProject?.knowledge_node_id === "string"
+    ? selectedProject.knowledge_node_id.trim() || null
+    : null;
+  const canonicalProjectDocsPointerValid = Boolean(
+    canonicalProjectDocsNodeId
+      && selectedProject?.knowledge_node_id_valid !== false
+      && selectedProject?.knowledge_node_id_validated !== false,
+  );
 
-  // スペースごとにプロジェクトをグループ化（space_idの無いレガシーレコードは表示しない）
-  const activeProjectsBySpace = new Map<string, ProjectInfo[]>();
-  const closedProjectsBySpace = new Map<string, ProjectInfo[]>();
-  for (const p of projects) {
-    if (!p.space_id) continue;
-    const target = p.is_completed
-      ? closedProjectsBySpace
-      : activeProjectsBySpace;
-    const list = target.get(p.space_id) || [];
-    list.push(p);
-    target.set(p.space_id, list);
-  }
-
-  if (loading) {
-    return (
-      <div className="p-4 space-y-4">
-        {Array.from({ length: 3 }).map((_, i) => (
-          <Skeleton key={i} className="h-24 w-full rounded-xl" />
-        ))}
-      </div>
-    );
-  }
+  // スペースごとにプロジェクトをグループ化する。スペース取得に失敗した
+  // 場合でも、成功したプロジェクト一覧を「未分類」として表示する。
+  const {
+    activeProjectsBySpace,
+    closedProjectsBySpace,
+    activeProjectsWithoutKnownSpace,
+    closedProjectsWithoutKnownSpace,
+  } = useMemo(() => {
+    const active = new Map<string, ProjectInfo[]>();
+    const closed = new Map<string, ProjectInfo[]>();
+    const activeWithoutKnownSpace: ProjectInfo[] = [];
+    const closedWithoutKnownSpace: ProjectInfo[] = [];
+    const knownSpaceIds = new Set(spaces.map((space) => space.id));
+    for (const p of projects) {
+      if (!p.space_id || !knownSpaceIds.has(p.space_id)) {
+        (p.is_completed ? closedWithoutKnownSpace : activeWithoutKnownSpace).push(p);
+        continue;
+      }
+      const target = p.is_completed ? closed : active;
+      const list = target.get(p.space_id) || [];
+      list.push(p);
+      target.set(p.space_id, list);
+    }
+    return {
+      activeProjectsBySpace: active,
+      closedProjectsBySpace: closed,
+      activeProjectsWithoutKnownSpace: activeWithoutKnownSpace,
+      closedProjectsWithoutKnownSpace: closedWithoutKnownSpace,
+    };
+  }, [projects, spaces]);
 
   // プロジェクトカードのレンダリング
-  const renderProjectCard = (project: ProjectInfo) => (
-    <div
+  const renderProjectCard = useCallback((project: ProjectInfo) => {
+    const isSelected =
+      selectedScope?.type === "project" && selectedScope.id === project.id;
+    return (
+    <li
       key={project.id}
-      className={`rounded-lg border p-3 cursor-pointer transition-colors ${
-        selectedScope?.type === "project" && selectedScope.id === project.id
-          ? "border-primary bg-accent"
-          : "hover:bg-accent/50"
+      className={`group/project relative cursor-pointer rounded-md border-l-2 px-3 py-2.5 transition-colors ${
+        isSelected
+          ? "border-primary bg-surface-container-high text-on-surface shadow-sm"
+          : "border-transparent text-on-surface-variant hover:bg-surface-container"
       }`}
-      onClick={() => selectProject(project.id)}
     >
       {editingId === project.id ? (
         <div className="space-y-2" onClick={(e) => e.stopPropagation()}>
@@ -1277,7 +660,7 @@ export default function ProjectsPage() {
             min="0"
             step="0.5"
           />
-          <select
+          <AppSelect
             value={editSpaceIdField}
             onChange={(e) => setEditSpaceIdField(e.target.value)}
             className="h-7 w-full rounded border border-input bg-transparent px-2 text-xs outline-none"
@@ -1288,19 +671,19 @@ export default function ProjectsPage() {
                 {s.name}
               </option>
             ))}
-          </select>
+          </AppSelect>
           <label className="flex cursor-pointer items-start gap-2 rounded border border-amber-500/30 bg-amber-500/5 p-2">
             <Checkbox
               checked={editWorkspaceToolsEnabled}
               onCheckedChange={(checked) =>
                 setEditWorkspaceToolsEnabled(checked === true)
               }
-              aria-label="Workspaceツールを有効にする"
+              aria-label="プロジェクトツールを有効にする"
               className="mt-0.5"
             />
             <span className="min-w-0">
               <span className="block text-xs font-medium">
-                Workspaceツールを有効にする
+                プロジェクトツールを有効にする
               </span>
               <span className="mt-0.5 block text-[11px] leading-relaxed text-muted-foreground">
                 tools/ 配下のプログラムをエージェントが実行できるようにします。信頼できるツールだけを配置してください。
@@ -1309,19 +692,23 @@ export default function ProjectsPage() {
           </label>
           <div className="flex gap-1">
             <Button
-              size="sm"
+              type="button"
+              size="icon-sm"
               variant="ghost"
-              className="h-6 px-2"
               onClick={handleUpdate}
               disabled={saving}
+              aria-label={`${project.name}を保存`}
+              title={`${project.name}を保存`}
             >
               <Check className="size-3" />
             </Button>
             <Button
-              size="sm"
+              type="button"
+              size="icon-sm"
               variant="ghost"
-              className="h-6 px-2"
               onClick={() => setEditingId(null)}
+              aria-label={`${project.name}の編集をキャンセル`}
+              title={`${project.name}の編集をキャンセル`}
             >
               <X className="size-3" />
             </Button>
@@ -1329,17 +716,28 @@ export default function ProjectsPage() {
         </div>
       ) : (
         <>
+          <button
+            type="button"
+            aria-current={isSelected ? "page" : undefined}
+            aria-label={`${project.name}を選択`}
+            className="absolute inset-0 z-0 rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface-charcoal"
+            onClick={() => selectProject(project.id)}
+          />
+          <div className="pointer-events-none relative z-10">
           <div className="flex items-start justify-between gap-2">
-            <div className="flex items-center gap-2 min-w-0">
-              <span
-                className="size-2.5 shrink-0 rounded-full border border-black/10"
-                style={{ backgroundColor: project.color || "#94a3b8" }}
-              />
+            <div className="flex min-w-0 flex-1 items-center gap-2">
               <FolderOpen
-                className={`size-4 shrink-0 ${project.is_completed ? "text-green-500" : "text-muted-foreground"}`}
+                className={`size-3.5 shrink-0 ${project.is_completed ? "text-green-500" : "text-on-surface-variant"}`}
+                style={
+                  project.color
+                    ? { color: project.color }
+                    : undefined
+                }
               />
               <span
-                className={`text-sm font-medium truncate ${project.is_completed ? "line-through text-muted-foreground" : ""}`}
+                className={`min-w-0 flex-1 truncate text-[13px] font-medium ${
+                  isSelected ? "font-semibold text-on-surface" : ""
+                } ${project.is_completed ? "line-through text-muted-foreground" : ""}`}
               >
                 {project.name}
               </span>
@@ -1349,15 +747,21 @@ export default function ProjectsPage() {
                 </span>
               )}
             </div>
-            <div className="flex gap-0.5 shrink-0">
+            <div className="pointer-events-auto flex shrink-0 gap-0.5 text-on-surface-variant">
               <Button
-                size="sm"
+                type="button"
+                size="icon-sm"
                 variant="ghost"
-                className={`h-6 w-6 p-0 ${project.is_completed ? "text-green-500" : "text-muted-foreground"}`}
+                className={project.is_completed ? "text-green-500" : "text-on-surface-variant"}
                 title={
                   project.is_completed
-                    ? "完了済み（クリックで解除）"
-                    : "完了としてマーク"
+                    ? `${project.name}の完了を解除`
+                    : `${project.name}を完了としてマーク`
+                }
+                aria-label={
+                  project.is_completed
+                    ? `${project.name}の完了を解除`
+                    : `${project.name}を完了としてマーク`
                 }
                 onClick={async (e) => {
                   e.stopPropagation();
@@ -1382,9 +786,11 @@ export default function ProjectsPage() {
                 )}
               </Button>
               <Button
-                size="sm"
+                type="button"
+                size="icon-sm"
                 variant="ghost"
-                className="h-6 w-6 p-0"
+                aria-label={`${project.name}を編集`}
+                title={`${project.name}を編集`}
                 onClick={(e) => {
                   e.stopPropagation();
                   setEditingId(project.id);
@@ -1406,9 +812,12 @@ export default function ProjectsPage() {
                 <Pencil className="size-3" />
               </Button>
               <Button
-                size="sm"
+                type="button"
+                size="icon-sm"
                 variant="ghost"
-                className="h-6 w-6 p-0 text-destructive"
+                className="text-destructive"
+                aria-label={`${project.name}を削除`}
+                title={`${project.name}を削除`}
                 onClick={(e) => {
                   e.stopPropagation();
                   handleDelete(project.id);
@@ -1423,7 +832,7 @@ export default function ProjectsPage() {
               {project.aliases.map((alias) => (
                 <span
                   key={alias}
-                  className="inline-block rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+                  className="inline-block rounded bg-surface-container-high px-1.5 py-0.5 text-[10px] text-on-surface-variant"
                 >
                   {alias}
                 </span>
@@ -1440,15 +849,49 @@ export default function ProjectsPage() {
               {project.description}
             </p>
           )}
+          </div>
         </>
       )}
-    </div>
-  );
+    </li>
+    );
+  }, [
+    editAliases,
+    editColor,
+    editDesc,
+    editEstHours,
+    editName,
+    editSpaceIdField,
+    editWorkspaceToolsEnabled,
+    editingId,
+    fetchAll,
+    handleDelete,
+    handleUpdate,
+    refreshProjects,
+    saving,
+    selectProject,
+    selectedScope,
+    spaces,
+  ]);
 
-  return (
-    <div className="flex h-full flex-col overflow-auto p-4">
-      <div className="mb-4 flex items-center justify-between gap-3">
-        <h1 className="text-lg font-bold">プロジェクト</h1>
+
+  const projectNavigation = useMemo(() => (
+    <aside
+      className="ao-workspace-nav-panel"
+      data-shell-slot="workspace-navigation"
+      data-workspace="projects"
+    >
+      <div className="flex h-full min-h-0 flex-col overflow-auto bg-surface-charcoal text-on-surface">
+      <div className="border-b border-border-subtle bg-surface-charcoal px-4 py-4">
+        <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="grid size-7 shrink-0 place-items-center rounded border border-border-subtle bg-surface-container-high text-primary">
+              <Layers className="size-3.5" aria-hidden="true" />
+            </span>
+            <h1 className="truncate text-base font-semibold tracking-tight">Projects</h1>
+          </div>
+          <p className="mt-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-on-surface-variant">Space navigation</p>
+        </div>
         <Tooltip>
           <TooltipTrigger
             render={
@@ -1461,6 +904,8 @@ export default function ProjectsPage() {
                     ? "スペースとプロジェクトのリストを表示"
                     : "スペースとプロジェクトのリストを畳む"
                 }
+                aria-expanded={!isNavigationCollapsed}
+                aria-controls="projects-navigation-list"
                 onClick={toggleNavigationCollapsed}
               >
                 {isNavigationCollapsed ? (
@@ -1478,23 +923,22 @@ export default function ProjectsPage() {
           </TooltipContent>
         </Tooltip>
       </div>
+      </div>
 
-      <div className="flex flex-1 flex-col gap-4 lg:min-h-0 lg:flex-row">
-        {/* 左: スペース + プロジェクト一覧 */}
-        {/* space-y-2でblock積み重ね＋overflow-autoでスクロール。flex-colを避けてflex-shrinkによるCard縮小クリップを防止 */}
         <div
           className={
             isNavigationCollapsed
               ? "hidden"
-              : "w-full space-y-2 overflow-visible lg:w-72 lg:shrink-0 lg:overflow-auto"
+              : "w-full min-h-0 flex-1 space-y-3 overflow-auto px-3 py-4"
           }
+          id="projects-navigation-list"
         >
           {/* スペース作成ボタン */}
-          <div className="flex gap-2">
+          <div className="grid grid-cols-2 gap-2">
             <Button
               variant="outline"
               size="sm"
-              className="flex-1"
+              className="h-8 border-border-subtle bg-surface-container-low px-2 text-[11px] text-on-surface hover:bg-surface-container-high"
               onClick={() => setShowCreateSpace(!showCreateSpace)}
             >
               <Layers className="size-3.5 mr-1" />
@@ -1503,7 +947,7 @@ export default function ProjectsPage() {
             <Button
               variant="outline"
               size="sm"
-              className="flex-1"
+              className="h-8 border-border-subtle bg-surface-container-low px-2 text-[11px] text-on-surface hover:bg-surface-container-high"
               onClick={() => {
                 setShowCreateForm(!showCreateForm);
                 if (spaces.length > 0 && !createSpaceId) {
@@ -1518,7 +962,7 @@ export default function ProjectsPage() {
 
           {/* スペース作成フォーム */}
           {showCreateSpace && (
-            <Card size="sm">
+            <Card size="sm" className="border-border-subtle bg-surface-container-low">
               <CardContent className="space-y-2 pt-4">
                 <Input
                   placeholder="スペース名"
@@ -1556,12 +1000,12 @@ export default function ProjectsPage() {
 
           {/* プロジェクト作成フォーム */}
           {showCreateForm && (
-            <Card size="sm">
+            <Card size="sm" className="border-border-subtle bg-surface-container-low">
               <CardContent className="space-y-2 pt-4">
                 {createError ? (
                   <p className="text-sm text-destructive">{createError}</p>
                 ) : null}
-                <select
+                <AppSelect
                   value={createSpaceId || ""}
                   onChange={(e) => setCreateSpaceId(e.target.value || null)}
                   className="h-8 w-full rounded border border-input bg-transparent px-2 text-sm outline-none"
@@ -1572,7 +1016,7 @@ export default function ProjectsPage() {
                       {s.name}
                     </option>
                   ))}
-                </select>
+                </AppSelect>
                 <Input
                   placeholder="プロジェクト名"
                   value={newName}
@@ -1635,6 +1079,32 @@ export default function ProjectsPage() {
           )}
 
           {/* スペースごとのプロジェクト一覧 */}
+          <nav aria-label="スペースとプロジェクト" className="space-y-3">
+          {(hasResourceError || !resourcesReady) && (
+            <div
+              role="alert"
+              className="mb-3 space-y-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs"
+            >
+              <p className="font-medium">
+                {hasResourceError ? "一覧を取得できませんでした" : "一覧を読み込み中です…"}
+              </p>
+              {spacesError && (
+                <p>スペース: {spacesError.message || "取得に失敗しました"}</p>
+              )}
+              {projectsError && (
+                <p>プロジェクト: {projectsError.message || "取得に失敗しました"}</p>
+              )}
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="h-7 px-2 text-xs"
+                onClick={retryDataFetch}
+              >
+                再取得
+              </Button>
+            </div>
+          )}
           {spaces.map((space) => {
             const activeProjects = activeProjectsBySpace.get(space.id) || [];
             const closedProjects = closedProjectsBySpace.get(space.id) || [];
@@ -1644,47 +1114,111 @@ export default function ProjectsPage() {
             return (
               <div
                 key={space.id}
-                className={`border rounded-lg ${
+                className={`group/space overflow-hidden rounded-lg border bg-surface-container-low transition-colors ${
                   selectedScope?.type === "space" &&
                   selectedScope.id === space.id
-                    ? "border-primary bg-accent/40"
-                    : ""
+                    ? "border-primary/70 shadow-sm"
+                    : "border-border-subtle"
                 }`}
               >
                 {/* スペースヘッダー */}
-                <div className="flex items-center justify-between px-3 py-2 bg-muted/30">
-                  <button
-                    className="flex items-center gap-1.5 text-sm font-medium flex-1 text-left"
-                    onClick={() => selectSpace(space.id)}
-                  >
-                    <Layers className="size-3.5 text-muted-foreground" />
-                    {editingSpaceId === space.id ? (
-                      <Input
-                        value={editSpaceName}
-                        onChange={(e) => setEditSpaceName(e.target.value)}
-                        className="h-6 text-sm flex-1"
-                        autoFocus
-                        onClick={(e) => e.stopPropagation()}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") handleUpdateSpace();
-                          if (e.key === "Escape") setEditingSpaceId(null);
-                        }}
-                      />
-                    ) : (
-                      <span>{space.name}</span>
-                    )}
-                    <Badge
-                      variant="secondary"
-                      className="text-[10px] px-1.5 py-0"
+                <div
+                  className={`flex items-center justify-between border-b border-border-subtle/70 px-3 py-2.5 ${
+                    selectedScope?.type === "space" &&
+                    selectedScope.id === space.id
+                      ? "bg-surface-container-high"
+                      : "bg-surface-container"
+                  }`}
+                >
+                  {editingSpaceId === space.id ? (
+                    <div className="min-w-0 flex-1 space-y-1.5 text-sm font-medium">
+                      <div className="flex min-w-0 items-center gap-1.5">
+                        <Layers
+                          className="size-3.5 shrink-0 text-muted-foreground"
+                          style={
+                            editSpaceColor
+                              ? { color: editSpaceColor }
+                              : undefined
+                          }
+                        />
+                        <Input
+                          value={editSpaceName}
+                          onChange={(e) => setEditSpaceName(e.target.value)}
+                          className="h-6 min-w-0 flex-1 text-sm"
+                          autoFocus
+                          onClick={(e) => e.stopPropagation()}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") handleUpdateSpace();
+                            if (e.key === "Escape") setEditingSpaceId(null);
+                          }}
+                        />
+                        <Badge
+                          variant="secondary"
+                          className="shrink-0 px-1.5 py-0 text-[10px]"
+                        >
+                          {activeProjects.length}
+                        </Badge>
+                      </div>
+                      <div className="flex min-w-0 items-start gap-1.5 pl-5">
+                        <span className="pt-1 text-[10px] text-muted-foreground">
+                          色
+                        </span>
+                        <ResourceColorPicker
+                          value={editSpaceColor}
+                          onChange={setEditSpaceColor}
+                          inputClassName="h-6"
+                          compact
+                          showLabel={false}
+                        />
+                      </div>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-1 py-1 text-left text-sm font-semibold text-on-surface outline-none transition-colors hover:text-primary focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface-charcoal"
+                      onClick={() => selectSpace(space.id)}
+                      aria-current={
+                        selectedScope?.type === "space" &&
+                        selectedScope.id === space.id
+                          ? "page"
+                          : undefined
+                      }
                     >
-                      {activeProjects.length}
-                    </Badge>
-                  </button>
-                  <div className="flex gap-0.5">
+                      <span
+                        aria-hidden="true"
+                        className="size-1.5 shrink-0 rounded-full bg-primary/60"
+                        style={space.color ? { backgroundColor: space.color } : undefined}
+                      />
+                      <Layers
+                        className="size-4 shrink-0 text-on-surface-variant"
+                        style={space.color ? { color: space.color } : undefined}
+                      />
+                      <span className="min-w-0 truncate">{space.name}</span>
+                      <Badge
+                        variant="secondary"
+                        className="text-[10px] px-1.5 py-0"
+                      >
+                        {activeProjects.length}
+                      </Badge>
+                    </button>
+                  )}
+                  <div className="flex gap-0.5 text-on-surface-variant">
                     <Button
-                      size="sm"
+                      type="button"
+                      size="icon-sm"
                       variant="ghost"
-                      className="h-5 w-5 p-0"
+                      aria-label={
+                        isExpanded
+                          ? `${space.name}のプロジェクトを折り畳む`
+                          : `${space.name}のプロジェクトを展開`
+                      }
+                      title={
+                        isExpanded
+                          ? `${space.name}のプロジェクトを折り畳む`
+                          : `${space.name}のプロジェクトを展開`
+                      }
+                      aria-expanded={isExpanded}
+                      aria-controls={`space-projects-${space.id}`}
                       onClick={(e) => {
                         e.stopPropagation();
                         toggleSpace(space.id);
@@ -1699,18 +1233,22 @@ export default function ProjectsPage() {
                     {editingSpaceId === space.id ? (
                       <>
                         <Button
-                          size="sm"
+                          type="button"
+                          size="icon-sm"
                           variant="ghost"
-                          className="h-5 w-5 p-0"
                           onClick={handleUpdateSpace}
+                          aria-label={`${space.name}を保存`}
+                          title={`${space.name}を保存`}
                         >
                           <Check className="size-3" />
                         </Button>
                         <Button
-                          size="sm"
+                          type="button"
+                          size="icon-sm"
                           variant="ghost"
-                          className="h-5 w-5 p-0"
                           onClick={() => setEditingSpaceId(null)}
+                          aria-label={`${space.name}の編集をキャンセル`}
+                          title={`${space.name}の編集をキャンセル`}
                         >
                           <X className="size-3" />
                         </Button>
@@ -1718,21 +1256,27 @@ export default function ProjectsPage() {
                     ) : (
                       <>
                         <Button
-                          size="sm"
+                          type="button"
+                          size="icon-sm"
                           variant="ghost"
-                          className="h-5 w-5 p-0"
+                          aria-label={`${space.name}を編集`}
+                          title={`${space.name}を編集`}
                           onClick={(e) => {
                             e.stopPropagation();
                             setEditingSpaceId(space.id);
                             setEditSpaceName(space.name);
+                            setEditSpaceColor(space.color || "#3b82f6");
                           }}
                         >
                           <Pencil className="size-3" />
                         </Button>
                         <Button
-                          size="sm"
+                          type="button"
+                          size="icon-sm"
                           variant="ghost"
-                          className="h-5 w-5 p-0 text-destructive"
+                          className="text-destructive"
+                          aria-label={`${space.name}を削除`}
+                          title={`${space.name}を削除`}
                           onClick={(e) => {
                             e.stopPropagation();
                             handleDeleteSpace(space.id);
@@ -1747,68 +1291,310 @@ export default function ProjectsPage() {
 
                 {/* プロジェクトリスト */}
                 {isExpanded && (
-                  <div className="p-2 space-y-2">
-                    {activeProjects.length === 0 &&
-                    closedProjects.length === 0 ? (
-                      <p className="text-xs text-muted-foreground px-2 py-1">
-                        プロジェクトなし
-                      </p>
-                    ) : (
-                      activeProjects.map(renderProjectCard)
-                    )}
-
-                    {closedProjects.length > 0 && (
-                      <div className="space-y-2">
-                        <button
-                          className="flex w-full items-center justify-between rounded-md border border-dashed px-2.5 py-2 text-left text-xs text-muted-foreground transition-colors hover:bg-accent/50"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            toggleClosedSpace(space.id);
-                          }}
-                        >
-                          <span className="flex min-w-0 items-center gap-1.5 font-medium">
-                            {isClosedExpanded ? (
-                              <ChevronDown className="size-3 shrink-0" />
-                            ) : (
-                              <ChevronRight className="size-3 shrink-0" />
-                            )}
-                            <CheckCircle2 className="size-3.5 shrink-0 text-green-500" />
-                            <span className="truncate">Closed</span>
-                          </span>
-                          <Badge
-                            variant="secondary"
-                            className="text-[10px] px-1.5 py-0"
-                          >
-                            {closedProjects.length}
-                          </Badge>
-                        </button>
-
-                        {isClosedExpanded && (
-                          <div className="space-y-2 pl-3">
-                            {closedProjects.map(renderProjectCard)}
-                          </div>
+                  <div
+                    id={`space-projects-${space.id}`}
+                    className="space-y-3 bg-surface-container-lowest px-3 py-3"
+                  >
+                    <div className="space-y-3 border-l border-border-subtle/70 pl-3">
+                      <ul
+                        className="space-y-1"
+                        aria-label={`${space.name}のプロジェクト`}
+                      >
+                        {activeProjects.length === 0 &&
+                        closedProjects.length === 0 ? (
+                          <li className="px-2 py-1 text-xs text-muted-foreground">
+                            プロジェクトなし
+                          </li>
+                        ) : (
+                          activeProjects.map(renderProjectCard)
                         )}
-                      </div>
-                    )}
+                      </ul>
+
+                      {closedProjects.length > 0 && (
+                        <div className="space-y-2">
+                          <button
+                            type="button"
+                            className="flex w-full items-center justify-between rounded-md border border-border-subtle bg-surface-container px-2.5 py-2 text-left text-xs text-on-surface-variant transition-colors hover:bg-surface-container-high focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                            aria-expanded={isClosedExpanded}
+                            aria-controls={`space-closed-projects-${space.id}`}
+                            aria-label={`${space.name}の完了プロジェクトを${isClosedExpanded ? "折り畳む" : "展開"}`}
+                            title={`${space.name}の完了プロジェクトを${isClosedExpanded ? "折り畳む" : "展開"}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              toggleClosedSpace(space.id);
+                            }}
+                          >
+                            <span className="flex min-w-0 items-center gap-1.5 font-medium">
+                              {isClosedExpanded ? (
+                                <ChevronDown className="size-3 shrink-0" />
+                              ) : (
+                                <ChevronRight className="size-3 shrink-0" />
+                              )}
+                              <CheckCircle2 className="size-3.5 shrink-0 text-green-500" />
+                              <span className="truncate">Closed</span>
+                            </span>
+                            <Badge
+                              variant="secondary"
+                              className="bg-surface-container-high px-1.5 py-0 text-[10px] text-on-surface-variant"
+                            >
+                              {closedProjects.length}
+                            </Badge>
+                          </button>
+
+                          {isClosedExpanded && (
+                            <ul
+                              id={`space-closed-projects-${space.id}`}
+                              className="space-y-1 border-l border-border-subtle/70 pl-3"
+                              aria-label={`${space.name}の完了プロジェクト`}
+                            >
+                              {closedProjects.map(renderProjectCard)}
+                            </ul>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>
             );
           })}
 
-          {spaces.length === 0 && projects.length === 0 && (
-            <p className="text-sm text-muted-foreground px-2">
+          {(activeProjectsWithoutKnownSpace.length > 0 ||
+            closedProjectsWithoutKnownSpace.length > 0) && (
+            <div className="rounded-lg border border-border-subtle bg-surface-container-low p-3">
+              <div className="flex items-center gap-2 px-1 py-1 text-sm font-semibold text-on-surface">
+                <FolderOpen className="size-3.5 text-on-surface-variant" />
+                <span className="truncate">スペース未分類</span>
+                <Badge
+                  variant="secondary"
+                  className="bg-surface-container-high px-1.5 py-0 text-[10px] text-on-surface-variant"
+                >
+                  {activeProjectsWithoutKnownSpace.length +
+                    closedProjectsWithoutKnownSpace.length}
+                </Badge>
+              </div>
+              <div className="mt-2 border-l border-border-subtle/70 pl-3">
+                <ul className="space-y-1" aria-label="スペース未分類のプロジェクト">
+                  {activeProjectsWithoutKnownSpace.map(renderProjectCard)}
+                  {closedProjectsWithoutKnownSpace.map(renderProjectCard)}
+                </ul>
+              </div>
+            </div>
+          )}
+
+          {canShowEmptyState && (
+            <p className="px-2 text-sm text-muted-foreground">
               スペースまたはプロジェクトを作成してください
             </p>
           )}
+          </nav>
         </div>
 
+      </div>
+    </aside>
+  ), [
+    activeProjectsBySpace,
+    activeProjectsWithoutKnownSpace,
+    canShowEmptyState,
+    closedProjectsBySpace,
+    closedProjectsWithoutKnownSpace,
+    createError,
+    createSpaceId,
+    creating,
+    creatingSpace,
+    editingSpaceId,
+    editSpaceColor,
+    editSpaceName,
+    expandedClosedSpaces,
+    expandedSpaces,
+    hasResourceError,
+    isNavigationCollapsed,
+    newAliases,
+    newColor,
+    newDesc,
+    newEstHours,
+    newName,
+    newSpaceName,
+    projectsError,
+    resourcesReady,
+    renderProjectCard,
+    retryDataFetch,
+    selectSpace,
+    selectedScope,
+    showCreateForm,
+    showCreateSpace,
+    spaces,
+    spacesError,
+    toggleClosedSpace,
+    toggleNavigationCollapsed,
+    toggleSpace,
+    handleCreate,
+    handleCreateSpace,
+    handleDeleteSpace,
+    handleUpdateSpace,
+  ]);
+
+  const projectContextRail = useMemo(() => {
+    if (selectedProject) {
+      const toolsEnabled = selectedProject.metadata?.workspace_tools_enabled === true;
+      return (
+        <div className="flex h-full min-h-0 flex-col bg-card text-card-foreground">
+          <div className="border-b border-border px-4 py-5">
+            <p className="text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground">
+              Project details
+            </p>
+            <h2 className="mt-2 truncate text-lg font-semibold">{selectedProject.name}</h2>
+            {selectedProject.description ? (
+              <p className="mt-2 text-sm leading-5 text-muted-foreground">{selectedProject.description}</p>
+            ) : null}
+          </div>
+          <div className="space-y-4 overflow-auto px-4 py-5">
+            <dl className="space-y-3 text-sm">
+              {selectedProject.owner_id ? (
+                <div>
+                  <dt className="text-xs uppercase tracking-[0.1em] text-muted-foreground">Owner</dt>
+                  <dd className="mt-1 truncate">{selectedProject.owner_id}</dd>
+                </div>
+              ) : null}
+              {selectedProject.created_at ? (
+                <div>
+                  <dt className="text-xs uppercase tracking-[0.1em] text-muted-foreground">Created</dt>
+                  <dd className="mt-1">{new Date(selectedProject.created_at).toLocaleDateString("ja-JP")}</dd>
+                </div>
+              ) : null}
+              {selectedProject.estimated_hours != null ? (
+                <div>
+                  <dt className="text-xs uppercase tracking-[0.1em] text-muted-foreground">Estimate</dt>
+                  <dd className="mt-1">{selectedProject.estimated_hours}h</dd>
+                </div>
+              ) : null}
+              <div>
+                <dt className="text-xs uppercase tracking-[0.1em] text-muted-foreground">Workspace tools</dt>
+                <dd className="mt-1">{toolsEnabled ? "Enabled" : "Disabled"}</dd>
+              </div>
+            </dl>
+            <div className="border-t border-border pt-4">
+              <p className="text-xs uppercase tracking-[0.1em] text-muted-foreground">Actions</p>
+              <div className="mt-3 grid gap-2">
+                <button
+                  type="button"
+                  className="rounded border border-border px-3 py-2 text-left text-sm transition-colors hover:border-primary hover:text-primary"
+                  onClick={() => setRightTab("information")}
+                >
+                  Open project information
+                </button>
+                {selectedProjectCanWrite && !selectedProjectIsInbox && (
+                  <button
+                    type="button"
+                    className="rounded border border-border px-3 py-2 text-left text-sm transition-colors hover:border-primary hover:text-primary"
+                    onClick={() => setRightTab("management")}
+                  >
+                    Open management
+                  </button>
+                )}
+                {canonicalProjectDocsPointerValid ? (
+                  <Link
+                    href={`/docs/${encodeURIComponent(canonicalProjectDocsNodeId ?? "")}`}
+                    className="rounded border border-border px-3 py-2 text-left text-sm transition-colors hover:border-primary hover:text-primary"
+                  >
+                    Open canonical Docs
+                  </Link>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+    if (selectedSpace) {
+      const spaceProjects = projects.filter((project) => project.space_id === selectedSpace.id);
+      return (
+        <div className="flex h-full min-h-0 flex-col bg-card text-card-foreground">
+          <div className="border-b border-border px-4 py-5">
+            <p className="text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground">Space details</p>
+            <h2 className="mt-2 truncate text-lg font-semibold">{selectedSpace.name}</h2>
+            {selectedSpace.description ? (
+              <p className="mt-2 text-sm leading-5 text-muted-foreground">{selectedSpace.description}</p>
+            ) : null}
+          </div>
+          <div className="space-y-4 overflow-auto px-4 py-5">
+            <dl className="space-y-3 text-sm">
+              <div className="flex items-center justify-between gap-3 border-b border-border pb-2">
+                <dt className="text-muted-foreground">Projects</dt>
+                <dd className="tabular-nums">{spaceProjects.length}</dd>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <dt className="text-muted-foreground">Active</dt>
+                <dd className="tabular-nums">{spaceProjects.filter((project) => !project.is_completed).length}</dd>
+              </div>
+            </dl>
+            <button
+              type="button"
+              className="w-full rounded border border-border px-3 py-2 text-left text-sm transition-colors hover:border-primary hover:text-primary"
+              onClick={() => setRightTab("tags")}
+            >
+              Manage Space tags
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return null;
+  }, [
+    canonicalProjectDocsNodeId,
+    canonicalProjectDocsPointerValid,
+    projects,
+    selectedProject,
+    selectedProjectCanWrite,
+    selectedProjectIsInbox,
+    selectedSpace,
+  ]);
+
+  useWorkspaceShellRegistration({
+    id: "projects-workspace",
+    workspaceNavigation: projectNavigation,
+    contextRail: projectContextRail,
+    priority: 20,
+  });
+
+  if (loading) {
+    return (
+      <div className="p-4 space-y-4">
+        {Array.from({ length: 3 }).map((_, i) => (
+          <Skeleton key={i} className="h-24 w-full rounded-xl" />
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-full min-w-0 flex-col overflow-auto bg-background px-4 py-5 lg:px-6">
         {/* 右: ダッシュボード / 詳細管理 */}
         <div className="min-w-0 flex-1 overflow-visible lg:overflow-auto">
           {selectedScope && (selectedProject || selectedSpace) ? (
-            <div className="flex flex-col h-full">
+            <div className="flex h-full flex-col">
+              <div className="mb-4 flex flex-wrap items-end justify-between gap-3 border-b border-border pb-4">
+                <div className="min-w-0">
+                  <p className="text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground">
+                    Projects / {selectedProject ? "Project" : "Space"}
+                  </p>
+                  <h1 className="mt-1 truncate text-2xl font-semibold tracking-tight">
+                    {selectedProject?.name || selectedSpace?.name}
+                  </h1>
+                  {(selectedProject?.description || selectedSpace?.description) ? (
+                    <p className="mt-1 max-w-3xl truncate text-sm text-muted-foreground">
+                      {selectedProject?.description || selectedSpace?.description}
+                    </p>
+                  ) : null}
+                </div>
+                {selectedProject?.can_write === false ? (
+                  <span className="rounded border border-border px-2 py-1 text-xs text-muted-foreground">
+                    Read-only
+                  </span>
+                ) : null}
+              </div>
               {/* タブヘッダー */}
-              <div className="flex items-center gap-1 mb-4 border-b">
+              <div className="mb-5 flex flex-wrap items-center gap-1 border-b border-border">
                 <button
                   className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium border-b-2 transition-colors ${
                     rightTab === "dashboard"
@@ -1823,6 +1609,19 @@ export default function ProjectsPage() {
                 {selectedProject && !selectedProjectIsInbox && (
                   <button
                     className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium border-b-2 transition-colors ${
+                      rightTab === "memory"
+                        ? "border-primary text-primary"
+                        : "border-transparent text-muted-foreground hover:text-foreground"
+                    }`}
+                    onClick={() => setRightTab("memory")}
+                  >
+                    <Brain className="size-3.5" />
+                    メモリ
+                  </button>
+                )}
+                {selectedProject && (
+                  <button
+                    className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium border-b-2 transition-colors ${
                       rightTab === "information"
                         ? "border-primary text-primary"
                         : "border-transparent text-muted-foreground hover:text-foreground"
@@ -1831,6 +1630,19 @@ export default function ProjectsPage() {
                   >
                     <BookOpen className="size-3.5" />
                     案件情報
+                  </button>
+                )}
+                {selectedProject && !selectedProjectIsInbox && (
+                  <button
+                    className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium border-b-2 transition-colors ${
+                      rightTab === "knowledge"
+                        ? "border-primary text-primary"
+                        : "border-transparent text-muted-foreground hover:text-foreground"
+                    }`}
+                    onClick={() => setRightTab("knowledge")}
+                  >
+                    <Link2 className="size-3.5" />
+                    Knowledge
                   </button>
                 )}
                 {selectedProject && (
@@ -1844,6 +1656,32 @@ export default function ProjectsPage() {
                   >
                     <Users className="size-3.5" />
                     メンバー
+                    </button>
+                )}
+                {selectedProject && selectedProjectCanWrite && !selectedProjectIsInbox && (
+                  <button
+                    className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium border-b-2 transition-colors ${
+                      rightTab === "management"
+                        ? "border-primary text-primary"
+                        : "border-transparent text-muted-foreground hover:text-foreground"
+                    }`}
+                    onClick={() => setRightTab("management")}
+                  >
+                    <Settings2 className="size-3.5" />
+                    管理
+                  </button>
+                )}
+                {selectedProject && !selectedProjectIsInbox && (
+                  <button
+                    className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium border-b-2 transition-colors ${
+                      rightTab === "apps"
+                        ? "border-primary text-primary"
+                        : "border-transparent text-muted-foreground hover:text-foreground"
+                    }`}
+                    onClick={() => setRightTab("apps")}
+                  >
+                    <Boxes className="size-3.5" />
+                    アプリ
                   </button>
                 )}
                 {selectedSpace && (
@@ -1860,582 +1698,99 @@ export default function ProjectsPage() {
                   </button>
                 )}
                 {selectedProject && !selectedProjectIsInbox && (
-                  <Link
-                    href={`/docs?project_id=${encodeURIComponent(selectedProject.id)}`}
-                    className="ml-auto flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                  >
-                    <FileText className="size-3.5" />
-                    Docs
-                  </Link>
+                  canonicalProjectDocsPointerValid ? (
+                    <Link
+                      href={`/docs/${encodeURIComponent(canonicalProjectDocsNodeId ?? "")}`}
+                      className="ml-auto flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                    >
+                      <FileText className="size-3.5" />
+                      Docs
+                    </Link>
+                  ) : (
+                    <button
+                      type="button"
+                      className="ml-auto flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                      onClick={() => setRightTab("information")}
+                      title="案件情報タブを開く"
+                    >
+                      <FileText className="size-3.5" />
+                      Docs
+                    </button>
+                  )
                 )}
               </div>
 
               {/* タブコンテンツ */}
               {rightTab === "dashboard" ? (
                 <div className="flex-1 overflow-auto">
-                  <ProjectDashboard scope={selectedScope} />
+                  {selectedSpace ? (
+                    <SpaceOverviewPanel
+                      space={selectedSpace}
+                      projects={projects.filter(
+                        (project) => project.space_id === selectedSpace.id,
+                      )}
+                      onSelectProject={selectProject}
+                      onOpenTags={() => setRightTab("tags")}
+                    />
+                  ) : (
+                    <ProjectDashboard scope={selectedScope} />
+                  )}
                 </div>
               ) : rightTab === "information" && selectedProject && !selectedProjectIsInbox ? (
                 <div className="flex-1 overflow-auto">
-                  <ProjectInformationPanel project={selectedProject} />
+                  <div className="flex min-h-0 flex-col gap-4 pb-8">
+                    <ProjectInformationPanel project={selectedProject} />
+                    <ProjectContextPackStatus
+                      key={`context-pack-${selectedProject.id}`}
+                      projectId={selectedProject.id}
+                      canManageSettings={selectedProject.can_manage_settings === true}
+                    />
+                    <ProjectDocsCandidatesPanel
+                      key={selectedProject.id}
+                      projectId={selectedProject.id}
+                      canManageSettings={selectedProject.can_manage_settings === true}
+                    />
+                  </div>
+                </div>
+              ) : rightTab === "knowledge" && selectedProject && !selectedProjectIsInbox ? (
+                <div className="flex-1 overflow-auto">
+                  <ProjectKnowledgePanel
+                    projectId={selectedProject.id}
+                    projectName={selectedProject.name}
+                    canManageSettings={selectedProject.can_manage_settings === true}
+                  />
+                </div>
+              ) : rightTab === "memory" && selectedProject && !selectedProjectIsInbox ? (
+                <div className="flex-1 overflow-auto">
+                  <ProjectMemoryPanel
+                    projectId={selectedProject.id}
+                    projectName={selectedProject.name}
+                    canWrite={selectedProject.can_write !== false}
+                  />
                 </div>
               ) : rightTab === "tags" && selectedSpace ? (
                 <div className="flex-1 overflow-auto">
                   <SpaceTagManagementPanel
                     space={selectedSpace}
                     spaces={spaces}
+                    readOnly={
+                      selectedSpace.source === "remote" ||
+                      selectedSpace.can_write === false
+                    }
                   />
                 </div>
-              ) : rightTab === "management" && selectedProject ? (
-                <div className="flex-1 overflow-auto space-y-4">
-                  <section className="space-y-4">
-                    <div className="flex items-center gap-2 text-sm font-medium">
-                      <Settings2 className="size-4" />
-                      案件資料: {selectedProject.name}
-                    </div>
-                    <div className="space-y-4">
-                      <div className="grid gap-3 md:grid-cols-2">
-                        <div className="md:col-span-2 rounded-md border bg-muted/30 p-3 text-xs text-muted-foreground">
-                          案件資料はプロジェクトファイラーで管理します。新規アップロードするか、既にファイラーにあるファイルを選択してください。ローカルPCの絶対パスは保存しません。
-                        </div>
-                        <ManagementDocumentCard
-                          title="WBS"
-                          description="ExcelのWBSを登録します。アップロードするとプロジェクトファイラーの management/ に保存されます。"
-                          value={wbsFile}
-                          accept=".xlsx,.xlsm,.xls"
-                          uploading={
-                            managementUploading === "wbs" || managementSaving
-                          }
-                          onFiles={(files) =>
-                            handleUploadManagementFiles("wbs", files)
-                          }
-                          onPickFromFiler={() =>
-                            openFilePicker(
-                              "wbs",
-                              "WBSを選択",
-                              ".xlsx,.xlsm,.xls",
-                            )
-                          }
-                          onClear={() => handleClearManagementFile("wbs")}
-                        />
-                        <ManagementDocumentCard
-                          title="課題管理表"
-                          description="課題一覧として扱うExcel/CSVを登録します。"
-                          value={issueFile}
-                          accept=".xlsx,.xlsm,.xls,.csv,.tsv"
-                          uploading={
-                            managementUploading === "issue" || managementSaving
-                          }
-                          onFiles={(files) =>
-                            handleUploadManagementFiles("issue", files)
-                          }
-                          onPickFromFiler={() =>
-                            openFilePicker(
-                              "issue",
-                              "課題管理表を選択",
-                              ".xlsx,.xlsm,.xls,.csv,.tsv",
-                            )
-                          }
-                          onClear={() => handleClearManagementFile("issue")}
-                        />
-                        <ManagementDocumentCard
-                          title="リスク管理表"
-                          description="リスク一覧として扱うExcel/CSVを登録します。"
-                          value={riskFile}
-                          accept=".xlsx,.xlsm,.xls,.csv,.tsv"
-                          uploading={
-                            managementUploading === "risk" || managementSaving
-                          }
-                          onFiles={(files) =>
-                            handleUploadManagementFiles("risk", files)
-                          }
-                          onPickFromFiler={() =>
-                            openFilePicker(
-                              "risk",
-                              "リスク管理表を選択",
-                              ".xlsx,.xlsm,.xls,.csv,.tsv",
-                            )
-                          }
-                          onClear={() => handleClearManagementFile("risk")}
-                        />
-                        <ManagementDocumentCard
-                          title="補助資料・議事録"
-                          description="確認事項、議事録、補足資料を複数登録できます。"
-                          values={requestFiles}
-                          accept=".md,.txt,.csv,.tsv,.xlsx,.xlsm,.xls,.docx,.pdf"
-                          multiple
-                          uploading={
-                            managementUploading === "request" ||
-                            managementSaving
-                          }
-                          onFiles={(files) =>
-                            handleUploadManagementFiles("request", files)
-                          }
-                          onPickFromFiler={() =>
-                            openFilePicker(
-                              "request",
-                              "補助資料・議事録を選択",
-                              ".md,.txt,.csv,.tsv,.xlsx,.xlsm,.xls,.docx,.pdf",
-                            )
-                          }
-                          onRemove={(path) =>
-                            handleClearManagementFile("request", path)
-                          }
-                        />
-                      </div>
-                      <div className="flex flex-wrap items-center gap-2">
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() =>
-                            selectedProjectId &&
-                            fetchManagement(selectedProjectId)
-                          }
-                          disabled={managementLoading}
-                        >
-                          <RefreshCw
-                            className={`size-3 mr-1 ${managementLoading ? "animate-spin" : ""}`}
-                          />
-                          再読込
-                        </Button>
-                      </div>
-                      {managementError && (
-                        <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 p-2 text-xs text-destructive">
-                          <AlertTriangle className="size-3.5 shrink-0 mt-0.5" />
-                          <span>{managementError}</span>
-                        </div>
-                      )}
-                      {syncResult && (
-                        <p className="text-xs text-muted-foreground">
-                          {syncResult}
-                        </p>
-                      )}
-                    </div>
-                  </section>
-
-                  <Dialog
-                    open={!!filePicker}
-                    onOpenChange={(open) => {
-                      if (!open) setFilePicker(null);
-                    }}
-                  >
-                    <DialogContent className="max-w-2xl">
-                      <DialogHeader>
-                        <DialogTitle>
-                          {filePicker?.title || "ファイラーから選択"}
-                        </DialogTitle>
-                        <DialogDescription>
-                          プロジェクトファイラー内のファイルを案件資料として登録します。
-                        </DialogDescription>
-                      </DialogHeader>
-                      <div className="space-y-3">
-                        <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                          <FolderOpen className="size-3.5" />
-                          <span className="truncate">
-                            {filePickerData?.currentPath ||
-                              "プロジェクトファイラー直下"}
-                          </span>
-                        </div>
-                        <div className="max-h-[420px] overflow-auto rounded-md border">
-                          {filePickerLoading ? (
-                            <div className="flex items-center justify-center gap-2 p-8 text-sm text-muted-foreground">
-                              <Loader2 className="size-4 animate-spin" />
-                              読み込み中
-                            </div>
-                          ) : filePickerError ? (
-                            <div className="p-4 text-sm text-destructive">
-                              {filePickerError}
-                            </div>
-                          ) : (
-                            <div className="divide-y">
-                              {filePickerData &&
-                                filePickerData.parentPath !== null && (
-                                  <button
-                                    type="button"
-                                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-muted"
-                                    onClick={() =>
-                                      setFilePickerPath(
-                                        filePickerData?.parentPath || "",
-                                      )
-                                    }
-                                  >
-                                    <ChevronLeft className="size-4 text-muted-foreground" />
-                                    上のフォルダ
-                                  </button>
-                                )}
-                              {filePickerData?.directories.map((directory) => (
-                                <button
-                                  key={directory.path}
-                                  type="button"
-                                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-muted"
-                                  onClick={() =>
-                                    setFilePickerPath(directory.path)
-                                  }
-                                >
-                                  <Folder className="size-4 text-muted-foreground" />
-                                  <span className="min-w-0 truncate">
-                                    {directory.name}
-                                  </span>
-                                </button>
-                              ))}
-                              {filePickerData?.files
-                                .filter((file) =>
-                                  acceptMatchesPath(
-                                    file.path,
-                                    filePicker?.accept,
-                                  ),
-                                )
-                                .map((file) => (
-                                  <button
-                                    key={file.path}
-                                    type="button"
-                                    className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left hover:bg-muted"
-                                    onClick={async () => {
-                                      if (!filePicker) return;
-                                      await handleRegisterExistingManagementFile(
-                                        filePicker.kind,
-                                        file.path,
-                                      );
-                                      setFilePicker(null);
-                                    }}
-                                  >
-                                    <span className="flex min-w-0 items-center gap-2">
-                                      <FileText className="size-4 shrink-0 text-muted-foreground" />
-                                      <span className="min-w-0">
-                                        <span className="block truncate text-sm">
-                                          {file.name}
-                                        </span>
-                                        <span className="block truncate text-[11px] text-muted-foreground">
-                                          {folderFromPath(file.path)}
-                                        </span>
-                                      </span>
-                                    </span>
-                                    <span className="shrink-0 text-[11px] text-muted-foreground">
-                                      {formatBytes(file.size)}
-                                    </span>
-                                  </button>
-                                ))}
-                              {filePickerData &&
-                                filePickerData.directories.length === 0 &&
-                                filePickerData.files.filter((file) =>
-                                  acceptMatchesPath(
-                                    file.path,
-                                    filePicker?.accept,
-                                  ),
-                                ).length === 0 && (
-                                  <div className="p-4 text-sm text-muted-foreground">
-                                    選択できるファイルがありません
-                                  </div>
-                                )}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    </DialogContent>
-                  </Dialog>
-
-                  <div className="grid gap-4 lg:grid-cols-2">
-                    <Card>
-                      <CardHeader>
-                        <CardTitle className="text-sm">WBS状況</CardTitle>
-                      </CardHeader>
-                      <CardContent className="space-y-3">
-                        {wbsScan ? (
-                          <>
-                            <div className="grid grid-cols-4 gap-2 text-center">
-                              <div className="rounded-md border p-2">
-                                <div className="text-lg font-semibold">
-                                  {wbsScan.summary.total}
-                                </div>
-                                <div className="text-[11px] text-muted-foreground">
-                                  総数
-                                </div>
-                              </div>
-                              <div className="rounded-md border p-2">
-                                <div className="text-lg font-semibold">
-                                  {wbsScan.summary.open}
-                                </div>
-                                <div className="text-[11px] text-muted-foreground">
-                                  未完了
-                                </div>
-                              </div>
-                              <div className="rounded-md border p-2">
-                                <div className="text-lg font-semibold">
-                                  {wbsScan.summary.review}
-                                </div>
-                                <div className="text-[11px] text-muted-foreground">
-                                  確認待ち
-                                </div>
-                              </div>
-                              <div className="rounded-md border p-2">
-                                <div className="text-lg font-semibold">
-                                  {wbsScan.summary.overdue}
-                                </div>
-                                <div className="text-[11px] text-muted-foreground">
-                                  超過
-                                </div>
-                              </div>
-                            </div>
-                            {wbsScan.errors.length > 0 && (
-                              <div className="rounded-md border p-2 text-xs text-muted-foreground">
-                                {wbsScan.errors.join(" / ")}
-                              </div>
-                            )}
-                            <div className="space-y-2">
-                              {wbsScan.upcoming.length > 0 ? (
-                                wbsScan.upcoming.slice(0, 8).map((row) => (
-                                  <div
-                                    key={`${row.sheetName}-${row.rowNumber}`}
-                                    className="rounded-md border p-2"
-                                  >
-                                    <div className="flex items-start justify-between gap-2">
-                                      <div className="min-w-0">
-                                        <p className="truncate text-sm font-medium">
-                                          {row.title}
-                                        </p>
-                                        <p className="text-xs text-muted-foreground">
-                                          {row.wbsId ||
-                                            `${row.sheetName}:${row.rowNumber}`}
-                                          {row.assignee
-                                            ? ` / ${row.assignee}`
-                                            : ""}
-                                        </p>
-                                      </div>
-                                      <Badge
-                                        variant={
-                                          row.priority === "urgent"
-                                            ? "destructive"
-                                            : "secondary"
-                                        }
-                                      >
-                                        {row.plannedEnd || "期限なし"}
-                                      </Badge>
-                                    </div>
-                                  </div>
-                                ))
-                              ) : (
-                                <p className="text-sm text-muted-foreground">
-                                  直近のWBSタスクはありません
-                                </p>
-                              )}
-                            </div>
-                          </>
-                        ) : (
-                          <p className="text-sm text-muted-foreground">
-                            管理資料設定を読み込んでください
-                          </p>
-                        )}
-                      </CardContent>
-                    </Card>
-
-                    <Card>
-                      <CardHeader>
-                        <CardTitle className="text-sm">
-                          要依頼・要確認事項
-                        </CardTitle>
-                      </CardHeader>
-                      <CardContent className="space-y-2">
-                        {wbsScan?.requests && wbsScan.requests.length > 0 ? (
-                          wbsScan.requests.slice(0, 10).map((item) => (
-                            <div
-                              key={`${item.sourcePath}-${item.sourceRef}-${item.title}`}
-                              className="rounded-md border p-2"
-                            >
-                              <div className="flex items-start justify-between gap-2">
-                                <p className="text-sm font-medium">
-                                  {item.title}
-                                </p>
-                                <Badge variant="outline">{item.target}</Badge>
-                              </div>
-                              <p className="mt-1 text-xs text-muted-foreground">
-                                {item.reason}
-                              </p>
-                              <p className="mt-1 truncate text-[11px] text-muted-foreground">
-                                {item.sourceType}: {item.sourceRef}
-                                {item.dueAt ? ` / ${item.dueAt}` : ""}
-                              </p>
-                            </div>
-                          ))
-                        ) : (
-                          <p className="text-sm text-muted-foreground">
-                            要依頼事項は検出されていません
-                          </p>
-                        )}
-                      </CardContent>
-                    </Card>
-                  </div>
-                </div>
+              ) : rightTab === "apps" && selectedProject && !selectedProjectIsInbox ? (
+                <ProjectAppsPanel projectId={selectedProject.id} projectName={selectedProject.name} canWrite={selectedProject.can_write !== false} />
+              ) : rightTab === "management" && selectedProject && selectedProjectCanWrite && !selectedProjectIsInbox ? (
+                <ProjectManagementPanel
+                  projectName={selectedProject.name}
+                  controller={projectManagementFiles}
+                />
               ) : rightTab === "members" && selectedProject ? (
-                <Card className="flex-1">
-                  <CardHeader>
-                    <CardTitle className="flex items-center gap-2 text-sm">
-                      <Users className="size-4" />
-                      メンバー管理: {selectedProject.name}
-                    </CardTitle>
-                  </CardHeader>
-                  <CardContent className="space-y-4">
-                    {/* 現在のメンバー */}
-                    {membersLoading ? (
-                      <div className="space-y-2">
-                        {Array.from({ length: 3 }).map((_, i) => (
-                          <Skeleton
-                            key={i}
-                            className="h-10 w-full rounded-lg"
-                          />
-                        ))}
-                      </div>
-                    ) : members.length > 0 ? (
-                      <div className="space-y-2">
-                        {members.map((member) => (
-                          <div
-                            key={member.id}
-                            className="flex items-center justify-between rounded-lg border p-2.5"
-                          >
-                            <div className="flex items-center gap-3">
-                              <div className="flex size-8 items-center justify-center rounded-full bg-muted text-xs font-medium">
-                                {(member.display_name || member.username)
-                                  .charAt(0)
-                                  .toUpperCase()}
-                              </div>
-                              <div>
-                                <p className="text-sm font-medium">
-                                  {member.display_name || member.username}
-                                </p>
-                                <p className="text-xs text-muted-foreground">
-                                  @{member.username}
-                                </p>
-                              </div>
-                            </div>
-                            <div className="flex items-center gap-2">
-                              <select
-                                value={member.role || "member"}
-                                onChange={(e) =>
-                                  handleChangeRole(member.id, e.target.value)
-                                }
-                                className="h-7 rounded-md border border-input bg-transparent px-2 text-xs outline-none focus-visible:border-ring focus-visible:ring-1 focus-visible:ring-ring/50 dark:bg-input/30"
-                              >
-                                {ROLE_OPTIONS.map((opt) => (
-                                  <option key={opt.value} value={opt.value}>
-                                    {opt.label}
-                                  </option>
-                                ))}
-                              </select>
-                              {member.joined_at && (
-                                <span className="text-xs text-muted-foreground">
-                                  {new Date(
-                                    member.joined_at,
-                                  ).toLocaleDateString("ja-JP")}
-                                </span>
-                              )}
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                className="h-6 w-6 p-0 text-destructive hover:text-destructive"
-                                onClick={() =>
-                                  handleRemoveMember(
-                                    member.id,
-                                    member.display_name || member.username,
-                                  )
-                                }
-                              >
-                                <X className="size-3" />
-                              </Button>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <p className="text-sm text-muted-foreground">
-                        メンバーがいません
-                      </p>
-                    )}
-
-                    {/* メンバー追加 */}
-                    <Separator />
-                    <div className="space-y-3">
-                      <Label className="flex items-center gap-1.5">
-                        <UserPlus className="size-3.5" />
-                        メンバー追加
-                      </Label>
-
-                      {availableUsers.length > 0 ? (
-                        <>
-                          <div className="max-h-48 overflow-auto rounded-lg border p-2 space-y-1">
-                            {availableUsers.map((user) => (
-                              <label
-                                key={user.id}
-                                className="flex items-center gap-3 rounded-md px-2 py-1.5 hover:bg-accent cursor-pointer"
-                              >
-                                <Checkbox
-                                  checked={selectedUserIds.has(user.id)}
-                                  onCheckedChange={() => toggleUser(user.id)}
-                                />
-                                <div className="flex items-center gap-2 min-w-0">
-                                  <div className="flex size-6 items-center justify-center rounded-full bg-muted text-xs font-medium shrink-0">
-                                    {(user.display_name || user.username)
-                                      .charAt(0)
-                                      .toUpperCase()}
-                                  </div>
-                                  <span className="text-sm truncate">
-                                    {user.display_name || user.username}
-                                  </span>
-                                  <span className="text-xs text-muted-foreground truncate">
-                                    @{user.username}
-                                  </span>
-                                </div>
-                              </label>
-                            ))}
-                          </div>
-
-                          <div className="flex items-center gap-2">
-                            <div className="space-y-1">
-                              <Label className="text-xs text-muted-foreground">
-                                ロール
-                              </Label>
-                              <select
-                                value={addRole}
-                                onChange={(e) => setAddRole(e.target.value)}
-                                className="h-8 w-32 rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
-                              >
-                                {ROLE_OPTIONS.map((opt) => (
-                                  <option key={opt.value} value={opt.value}>
-                                    {opt.label}
-                                  </option>
-                                ))}
-                              </select>
-                            </div>
-                            <div className="pt-5">
-                              <Button
-                                size="sm"
-                                onClick={handleAddMembers}
-                                disabled={
-                                  addingMembers || selectedUserIds.size === 0
-                                }
-                              >
-                                {addingMembers ? (
-                                  <Loader2 className="size-3 animate-spin mr-1" />
-                                ) : (
-                                  <Plus className="size-3 mr-1" />
-                                )}
-                                {selectedUserIds.size > 0
-                                  ? `${selectedUserIds.size}人を追加`
-                                  : "追加"}
-                              </Button>
-                            </div>
-                          </div>
-                        </>
-                      ) : (
-                        <p className="text-xs text-muted-foreground">
-                          追加可能なユーザーがいません
-                        </p>
-                      )}
-
-                      {addError && (
-                        <p className="text-xs text-destructive">{addError}</p>
-                      )}
-                    </div>
-                  </CardContent>
-                </Card>
+                <ProjectMembersPanel
+                  projectName={selectedProject.name}
+                  controller={projectMembers}
+                />
               ) : (
                 <div className="flex-1 overflow-auto">
                   <ProjectDashboard scope={selectedScope} />
@@ -2443,12 +1798,29 @@ export default function ProjectsPage() {
               )}
             </div>
           ) : (
-            <div className="flex items-center justify-center h-full text-muted-foreground">
-              <p className="text-sm">プロジェクトを選択してください</p>
+            <div className="flex h-full items-center justify-center text-muted-foreground">
+              {hasResourceError ? (
+                <div
+                  role="alert"
+                  className="max-w-md space-y-3 rounded-md border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm"
+                >
+                  <p className="font-medium">一覧を取得できませんでした</p>
+                  {spacesError && <p>スペース: {spacesError.message}</p>}
+                  {projectsError && <p>プロジェクト: {projectsError.message}</p>}
+                  <Button type="button" size="sm" onClick={retryDataFetch}>
+                    再取得
+                  </Button>
+                </div>
+              ) : !resourcesReady ? (
+                <p className="text-sm">一覧を読み込み中です…</p>
+              ) : canShowEmptyState ? (
+                <p className="text-sm">スペースまたはプロジェクトを作成してください</p>
+              ) : (
+                <p className="text-sm">プロジェクトを選択してください</p>
+              )}
             </div>
           )}
         </div>
-      </div>
     </div>
   );
 }

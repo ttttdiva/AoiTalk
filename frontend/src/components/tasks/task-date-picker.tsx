@@ -1,5 +1,7 @@
 "use client";
 
+import { AppSelect } from "@/components/ui/app-select";
+
 import {
   useEffect,
   useMemo,
@@ -10,14 +12,21 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { Calendar } from "@/components/ui/calendar";
+import { Checkbox } from "@/components/ui/checkbox";
 import { CalendarIcon, X, Repeat, ChevronLeft } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { RecurrenceRule } from "@/lib/task-api";
 import { computeUpcomingOccurrences } from "@/lib/recurrence-preview";
+import type { RecurrenceSkipMode } from "@/lib/recurrence-preview";
 import { formatTaskDateLabel } from "@/lib/task-date-label";
 import { isDateOnlyDateTimeValue, parseLocalDateTime } from "@/lib/date-time";
 import {
+  getTaskDatePresets,
+  type TaskDatePreset,
+} from "@/components/tasks/task-date-presets";
+import {
   recurrenceLabel,
+  supportsSkipWeekend,
   RECURRENCE_FREQ_OPTIONS as FREQ_OPTIONS,
   RECURRENCE_WEEKDAYS as WEEKDAYS,
 } from "@/lib/recurrence-rrule";
@@ -302,65 +311,6 @@ function adjustEndDateWithStartTime(
 
 // ─── Presets ───
 
-interface Preset {
-  label: string;
-  subLabel: string;
-  getDate: () => Date;
-}
-
-function getPresets(): Preset[] {
-  const now = new Date();
-  const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-  const fmtShort = (d: Date) => `${d.getMonth() + 1}/${d.getDate()}`;
-
-  const make = (label: string, d: Date, sub?: string): Preset => ({
-    label,
-    subLabel: sub ?? dayNames[d.getDay()],
-    getDate: () => new Date(d),
-  });
-
-  const today = new Date(now);
-  today.setHours(9, 0, 0, 0);
-  const tomorrow = new Date(now);
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  tomorrow.setHours(9, 0, 0, 0);
-
-  const thisWeekend = new Date(now);
-  const daysUntilSat = (6 - now.getDay() + 7) % 7 || 7;
-  thisWeekend.setDate(thisWeekend.getDate() + daysUntilSat);
-  thisWeekend.setHours(0, 0, 0, 0);
-
-  const nextMonday = new Date(now);
-  nextMonday.setDate(
-    nextMonday.getDate() + (now.getDay() === 0 ? 1 : 8 - now.getDay()),
-  );
-  nextMonday.setHours(9, 0, 0, 0);
-
-  const nextWeekend = new Date(now);
-  nextWeekend.setDate(
-    nextWeekend.getDate() +
-      (daysUntilSat < 7 ? daysUntilSat + 7 : daysUntilSat),
-  );
-  nextWeekend.setHours(0, 0, 0, 0);
-
-  const twoWeeks = new Date(now);
-  twoWeeks.setDate(twoWeeks.getDate() + 14);
-  twoWeeks.setHours(9, 0, 0, 0);
-  const fourWeeks = new Date(now);
-  fourWeeks.setDate(fourWeeks.getDate() + 28);
-  fourWeeks.setHours(9, 0, 0, 0);
-
-  return [
-    make("Today", today),
-    make("Tomorrow", tomorrow),
-    make("This weekend", thisWeekend),
-    make("Next week", nextMonday, fmtShort(nextMonday)),
-    make("Next weekend", nextWeekend, fmtShort(nextWeekend)),
-    make("In 2 weeks", twoWeeks, fmtShort(twoWeeks)),
-    make("In 4 weeks", fourWeeks, fmtShort(fourWeeks)),
-  ];
-}
-
 // ─── Suggestions ───
 
 const SUGGEST_KEYWORDS = [
@@ -471,6 +421,7 @@ export interface RecurrenceConfig {
   endDate: string | null;
   skipWeekend: boolean;
   skipHoliday: boolean;
+  skipMode: RecurrenceSkipMode;
   saving: boolean;
   onFreqChange: (v: string) => void;
   onIntervalChange: (v: number) => void;
@@ -483,6 +434,7 @@ export interface RecurrenceConfig {
   onEndDateChange: (v: string | null) => void;
   onSkipWeekendChange: (v: boolean) => void;
   onSkipHolidayChange: (v: boolean) => void;
+  onSkipModeChange: (v: RecurrenceSkipMode) => void;
   onSave: () => void;
   onDelete: () => void;
 }
@@ -498,6 +450,7 @@ function RecurrenceInlinePanel({
   endDate,
   skipWeekend,
   skipHoliday,
+  skipMode,
   saving,
   hasExisting,
   onFreqChange,
@@ -510,6 +463,7 @@ function RecurrenceInlinePanel({
   onEndDateChange,
   onSkipWeekendChange,
   onSkipHolidayChange,
+  onSkipModeChange,
   onSave,
   onDelete,
   onBack,
@@ -524,6 +478,7 @@ function RecurrenceInlinePanel({
   endDate: string | null;
   skipWeekend: boolean;
   skipHoliday: boolean;
+  skipMode: RecurrenceSkipMode;
   saving: boolean;
   hasExisting: boolean;
   onFreqChange: (v: string) => void;
@@ -536,6 +491,7 @@ function RecurrenceInlinePanel({
   onEndDateChange: (v: string | null) => void;
   onSkipWeekendChange: (v: boolean) => void;
   onSkipHolidayChange: (v: boolean) => void;
+  onSkipModeChange: (v: RecurrenceSkipMode) => void;
   onSave: () => void;
   onDelete: () => void;
   onBack: () => void;
@@ -559,9 +515,10 @@ function RecurrenceInlinePanel({
       <div className="px-2 pb-2 space-y-2">
         {/* 頻度 + 間隔 */}
         <div className="flex items-center gap-1.5">
-          <select
+          <AppSelect
             value={freq}
             onChange={(e) => onFreqChange(e.target.value)}
+            positionerClassName="z-[210]"
             className="h-7 rounded-md border border-input bg-background px-1.5 text-xs outline-none"
           >
             {FREQ_OPTIONS.map((f) => (
@@ -569,7 +526,7 @@ function RecurrenceInlinePanel({
                 {f.label}
               </option>
             ))}
-          </select>
+          </AppSelect>
           <input
             type="number"
             min={1}
@@ -605,28 +562,42 @@ function RecurrenceInlinePanel({
           </div>
         )}
 
-        {/* DAILY: 週末スキップ / 全頻度: 祝日スキップ */}
+        {/* 曜日指定の毎週以外: 土日スキップ / 全頻度: 祝日スキップ */}
         <div className="space-y-1">
-          {freq === "DAILY" && (
+          {supportsSkipWeekend(freq, byDay) && (
             <label className="flex items-center gap-1.5 text-xs cursor-pointer">
-              <input
-                type="checkbox"
+              <Checkbox
                 checked={skipWeekend}
-                onChange={(e) => onSkipWeekendChange(e.target.checked)}
+                onCheckedChange={(checked) => onSkipWeekendChange(checked === true)}
                 className="size-3.5 accent-primary"
               />
-              週末をスキップ
+              土日をスキップ
             </label>
           )}
           <label className="flex items-center gap-1.5 text-xs cursor-pointer">
-            <input
-              type="checkbox"
+            <Checkbox
               checked={skipHoliday}
-              onChange={(e) => onSkipHolidayChange(e.target.checked)}
+              onCheckedChange={(checked) => onSkipHolidayChange(checked === true)}
               className="size-3.5 accent-primary"
             />
-            祝日をスキップ
+            祝日をスキップ（土日は含まない）
           </label>
+
+          {/* 該当日に当たった回を次の平日にずらすか、その回を実施しないか */}
+          {(skipWeekend || skipHoliday) && (
+            <label className="flex items-center gap-1.5 text-xs cursor-pointer pt-0.5">
+              <Checkbox
+                checked={skipMode === "shift_forward"}
+                onCheckedChange={(checked) =>
+                  onSkipModeChange(
+                    checked === true ? "shift_forward" : "omit",
+                  )
+                }
+                className="size-3.5 accent-primary"
+              />
+              該当日に当たった回を次の平日にずらす
+            </label>
+          )}
         </div>
 
         <div className="border-t border-border/60 my-1" />
@@ -634,9 +605,10 @@ function RecurrenceInlinePanel({
         {/* トリガー */}
         <div className="space-y-1">
           <label className="text-[10px] text-muted-foreground">トリガー</label>
-          <select
+          <AppSelect
             value={triggerStatus}
             onChange={(e) => onTriggerStatusChange(e.target.value)}
+            positionerClassName="z-[210]"
             className="h-7 w-full rounded-md border border-input bg-background px-1.5 text-xs outline-none"
           >
             {STATUS_OPTIONS.map((s) => (
@@ -644,25 +616,23 @@ function RecurrenceInlinePanel({
                 {s.label}になった時
               </option>
             ))}
-          </select>
+          </AppSelect>
         </div>
 
         {/* チェックボックス群 */}
         <label className="flex items-center gap-1.5 text-xs cursor-pointer">
-          <input
-            type="checkbox"
+          <Checkbox
             checked={createNew}
-            onChange={(e) => onCreateNewChange(e.target.checked)}
+            onCheckedChange={(checked) => onCreateNewChange(checked === true)}
             className="size-3.5 accent-primary"
           />
           新しいタスクを作成
         </label>
 
         <label className="flex items-center gap-1.5 text-xs cursor-pointer">
-          <input
-            type="checkbox"
+          <Checkbox
             checked={recurForever}
-            onChange={(e) => onRecurForeverChange(e.target.checked)}
+            onCheckedChange={(checked) => onRecurForeverChange(checked === true)}
             className="size-3.5 accent-primary"
           />
           永続的に繰り返す
@@ -753,6 +723,9 @@ interface TaskDatePickerProps {
   endPlaceholder?: string;
   startButtonClassName?: string;
   endButtonClassName?: string;
+  /** Compact list views may expose only one of the two date columns. */
+  showStartDate?: boolean;
+  showEndDate?: boolean;
   recurrence?: RecurrenceConfig;
   onOpenChange?: (open: boolean) => void;
 }
@@ -769,6 +742,8 @@ export function TaskDatePicker({
   endPlaceholder = "Due Date",
   startButtonClassName,
   endButtonClassName,
+  showStartDate = true,
+  showEndDate = true,
   recurrence,
   onOpenChange,
 }: TaskDatePickerProps) {
@@ -789,6 +764,10 @@ export function TaskDatePicker({
   const dropdownRef = useRef<HTMLDivElement>(null);
   const startInputRef = useRef<HTMLInputElement>(null);
   const endInputRef = useRef<HTMLInputElement>(null);
+  const textDirtyRef = useRef<Record<ActiveField, boolean>>({
+    start: false,
+    end: false,
+  });
   const isAdvancingToEndRef = useRef(false);
   const endFocusTimeoutRef = useRef<number | null>(null);
   const [dropdownWidth, setDropdownWidth] = useState(520);
@@ -880,8 +859,10 @@ export function TaskDatePicker({
       formatDisplay(
         value,
         inferAllDay(
-          nextValues?.startAt ?? draftStartAt,
-          nextValues?.endAt ?? draftEndAt,
+          nextValues?.startAt !== undefined
+            ? nextValues.startAt
+            : draftStartAt,
+          nextValues?.endAt !== undefined ? nextValues.endAt : draftEndAt,
           Boolean(allDay),
         ),
       ),
@@ -920,13 +901,21 @@ export function TaskDatePicker({
 
   const setOpenWithCommit = useCallback(
     (nextOpen: boolean, nextValues?: Partial<DraftValues>) => {
-      if (open && !nextOpen && isAdvancingToEndRef.current) {
+      // Start → Due の自動遷移中でも、遅延確定のドラフトは閉じる時に保存する。
+      if (
+        open &&
+        !nextOpen &&
+        isAdvancingToEndRef.current &&
+        !deferCommitUntilClose
+      ) {
         return;
       }
       if (open && !nextOpen && deferCommitUntilClose) {
         commitDrafts(
-          nextValues?.startAt ?? draftStartAt,
-          nextValues?.endAt ?? draftEndAt,
+          nextValues?.startAt !== undefined
+            ? nextValues.startAt
+            : draftStartAt,
+          nextValues?.endAt !== undefined ? nextValues.endAt : draftEndAt,
         );
       }
       setOpen(nextOpen);
@@ -957,6 +946,7 @@ export function TaskDatePicker({
         byDay: recurrence.byDay,
         skipWeekend: recurrence.skipWeekend,
         skipHoliday: recurrence.skipHoliday,
+        skipMode: recurrence.skipMode,
         endCount: recurrence.endCount,
         endDate: recurrence.endDate,
       },
@@ -965,7 +955,7 @@ export function TaskDatePicker({
   }, [showRecurrence, recurrence, draftStartAt]);
   const nextOccurrence = upcomingOccurrences[0];
 
-  const presets = useMemo(() => getPresets(), []);
+  const presets = useMemo(() => getTaskDatePresets(), []);
 
   const activeSuggestions = useMemo(() => {
     if (!editingField) return [];
@@ -984,6 +974,7 @@ export function TaskDatePicker({
     (keyword: string, field: ActiveField) => {
       const hasTimeInSuggestion = /\d{1,2}:\d{2}$/.test(keyword);
       const newText = hasTimeInSuggestion ? keyword : keyword + " ";
+      textDirtyRef.current[field] = true;
       if (field === "start") setStartText(newText);
       else setEndText(newText);
       setSuggestIndex(-1);
@@ -1001,6 +992,7 @@ export function TaskDatePicker({
       setEndText(
         formatDisplay(endAt, inferAllDay(startAt, endAt, Boolean(allDay))),
       );
+      textDirtyRef.current = { start: false, end: false };
       setEditingField(null);
       setActiveField(field);
       setOpen(true);
@@ -1015,12 +1007,22 @@ export function TaskDatePicker({
   // 開始日時確定後、自動で終了日時に遷移する共通ロジック
   const autoAdvanceOrClose = useCallback(
     (nextValues?: Partial<DraftValues>) => {
+      // showStartDate / showEndDate は外側トリガー（セルボタン）の可視性専用。
+      // ポップアップ内は常に Start / Due 両 input を持つため、activeField が
+      // start のときは Due へ進み、end のときだけ保存して閉じる。
       if (activeField === "start") {
         // 開始日時 → 終了日時に自動遷移
         isAdvancingToEndRef.current = true;
         setActiveField("end");
         setEditingField(null);
-        setEndText(getDisplayText(nextValues?.endAt ?? draftEndAt, nextValues));
+        setEndText(
+          getDisplayText(
+            nextValues?.endAt !== undefined
+              ? nextValues.endAt
+              : draftEndAt,
+            nextValues,
+          ),
+        );
         focusEndInput();
       } else {
         // 終了日時確定 → 閉じる
@@ -1028,7 +1030,13 @@ export function TaskDatePicker({
         setOpenWithCommit(false, nextValues);
       }
     },
-    [activeField, draftEndAt, focusEndInput, getDisplayText, setOpenWithCommit],
+    [
+      activeField,
+      draftEndAt,
+      focusEndInput,
+      getDisplayText,
+      setOpenWithCommit,
+    ],
   );
 
   const handleSelectDate = useCallback(
@@ -1069,7 +1077,7 @@ export function TaskDatePicker({
   );
 
   const handlePreset = useCallback(
-    (preset: Preset) => {
+    (preset: TaskDatePreset) => {
       const d = preset.getDate();
       if (activeValue) {
         const existing = parseTaskDateValue(activeValue);
@@ -1113,12 +1121,33 @@ export function TaskDatePicker({
 
   const handleTextCommit = useCallback(
     (field: ActiveField) => {
+      if (!textDirtyRef.current[field]) return;
+      textDirtyRef.current[field] = false;
       const text = field === "start" ? startText : endText;
       const onChange = field === "start" ? onStartAtChange : onEndAtChange;
       const trimmed = text.trim();
       if (!trimmed) {
+        // 空入力は「未変更」ではなく、対象フィールドを明示的に解除する
+        // 操作として扱う。close 時に draft が旧値のまま残ると、Task List
+        // の別 picker で削除した値を再保存してしまうため、次の範囲値を
+        // 作って通常の確定フローへ渡す。
+        const nextValues = {
+          startAt: field === "start" ? null : draftStartAt,
+          endAt: field === "end" ? null : draftEndAt,
+        };
+        setDraftStartAt(nextValues.startAt);
+        setDraftEndAt(nextValues.endAt);
+        setStartText(getDisplayText(nextValues.startAt, nextValues));
+        setEndText(getDisplayText(nextValues.endAt, nextValues));
         setEditingField(null);
-        return;
+        if (!deferCommitUntilClose) {
+          if (onRangeChange) {
+            onRangeChange(nextValues);
+          } else {
+            onChange(null);
+          }
+        }
+        return nextValues;
       }
       const parsed =
         applyTimeOnlyToBaseDate(
@@ -1181,6 +1210,45 @@ export function TaskDatePicker({
     ],
   );
 
+  const handleInputFocus = useCallback(
+    (field: ActiveField) => {
+      const committedValues =
+        editingField && editingField !== field
+          ? handleTextCommit(editingField)
+          : undefined;
+      const nextStartAt =
+        committedValues?.startAt !== undefined
+          ? committedValues.startAt
+          : draftStartAt;
+      const nextEndAt =
+        committedValues?.endAt !== undefined
+          ? committedValues.endAt
+          : draftEndAt;
+
+      setActiveField(field);
+      if (editingField !== field) {
+        textDirtyRef.current[field] = false;
+      }
+      if (field === "start") {
+        setStartText(
+          getDisplayText(nextStartAt, {
+            startAt: nextStartAt,
+            endAt: nextEndAt,
+          }),
+        );
+      } else {
+        setEndText(
+          getDisplayText(nextEndAt, {
+            startAt: nextStartAt,
+            endAt: nextEndAt,
+          }),
+        );
+      }
+      setEditingField(field);
+    },
+    [draftEndAt, draftStartAt, editingField, getDisplayText, handleTextCommit],
+  );
+
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent, field: ActiveField) => {
       if (activeSuggestions.length > 0) {
@@ -1212,6 +1280,7 @@ export function TaskDatePicker({
         }
       }
       if (e.key === "Escape") {
+        textDirtyRef.current = { start: false, end: false };
         setEditingField(null);
         setDraftStartAt(startAt);
         setDraftEndAt(endAt);
@@ -1250,9 +1319,16 @@ export function TaskDatePicker({
         const committedValues = editingField
           ? handleTextCommit(editingField)
           : null;
-        const nextStartAt = committedValues?.startAt ?? draftStartAt;
-        const nextEndAt = committedValues?.endAt ?? draftEndAt;
+        const nextStartAt =
+          committedValues?.startAt !== undefined
+            ? committedValues.startAt
+            : draftStartAt;
+        const nextEndAt =
+          committedValues?.endAt !== undefined
+            ? committedValues.endAt
+            : draftEndAt;
         setOpenWithCommit(false, committedValues ?? undefined);
+        textDirtyRef.current = { start: false, end: false };
         setEditingField(null);
         setStartText(
           getDisplayText(nextStartAt, {
@@ -1290,8 +1366,18 @@ export function TaskDatePicker({
     (e: React.MouseEvent, field: ActiveField) => {
       e.stopPropagation();
       e.preventDefault();
-      const nextStart = field === "start" ? null : draftStartAt;
-      const nextEnd = field === "end" ? null : draftEndAt;
+      // 閉じているpickerは以前開いた時の古いdraftを保持している場合が
+      // ある。Task ListではStartとDueが別インスタンスなので、一方を削除
+      // してcontrolled propsが更新されても、もう一方は古いdraftのままに
+      // なる。閉じている間は最新propsを使い、削除済み日付の再保存を防ぐ。
+      // 開いている間は従来通りdraftを使い、未確定の編集を保持する。
+      const currentStartAt = open ? draftStartAt : startAt;
+      const currentEndAt = open ? draftEndAt : endAt;
+      const nextStart = field === "start" ? null : currentStartAt;
+      const nextEnd = field === "end" ? null : currentEndAt;
+      // クリアボタンでdraftを直接解除した場合は、直前のテキスト編集を
+      // close時にもう一度確定しない。
+      textDirtyRef.current[field] = false;
       if (field === "start") {
         setDraftStartAt(null);
         setStartText("");
@@ -1303,7 +1389,15 @@ export function TaskDatePicker({
         commitDrafts(nextStart, nextEnd);
       }
     },
-    [commitDrafts, deferCommitUntilClose, draftEndAt, draftStartAt, open],
+    [
+      commitDrafts,
+      deferCommitUntilClose,
+      draftEndAt,
+      draftStartAt,
+      endAt,
+      open,
+      startAt,
+    ],
   );
 
   return (
@@ -1313,78 +1407,87 @@ export function TaskDatePicker({
       onClick={(e) => e.stopPropagation()}
     >
       {/* Two trigger buttons side by side */}
-      <div className="grid grid-cols-2 gap-2">
+      <div
+        className={cn(
+          "grid gap-2",
+          showStartDate && showEndDate ? "grid-cols-2" : "grid-cols-1",
+        )}
+      >
         {/* Start date trigger */}
-        <button
-          type="button"
-          title={
-            displayedStartAt
-              ? formatDisplay(displayedStartAt, displayAllDay)
-              : startPlaceholder
-          }
-          className={cn(
-            "flex h-9 w-full min-w-0 items-center gap-1.5 rounded-md border px-2.5 text-left text-sm transition-colors",
-            open && activeField === "start"
-              ? "border-primary ring-2 ring-primary/30 bg-background"
-              : displayedStartAt
-                ? "border-input bg-background hover:bg-accent/50"
-                : "border-dashed border-muted-foreground/40 text-muted-foreground hover:border-input hover:bg-accent/30",
-            startButtonClassName,
-          )}
-          onClick={() => handleOpen("start")}
-        >
-          <CalendarIcon className="size-3.5 shrink-0" />
-          <span className="truncate min-w-0 flex-1">
-            {displayedStartAt
-              ? formatDisplay(displayedStartAt, displayAllDay)
-              : startPlaceholder}
-          </span>
-          {displayedStartAt && (
-            <span
-              role="button"
-              className="shrink-0 p-0.5 rounded-sm hover:bg-accent"
-              onClick={(e) => handleClear(e, "start")}
-            >
-              <X className="size-3 text-muted-foreground" />
+        {showStartDate && (
+          <button
+            type="button"
+            title={
+              displayedStartAt
+                ? formatDisplay(displayedStartAt, displayAllDay)
+                : startPlaceholder
+            }
+            className={cn(
+              "flex h-9 w-full min-w-0 items-center gap-1.5 rounded-md border px-2.5 text-left text-sm transition-colors",
+              open && activeField === "start"
+                ? "border-primary ring-2 ring-primary/30 bg-background"
+                : displayedStartAt
+                  ? "border-input bg-background hover:bg-accent/50"
+                  : "border-dashed border-muted-foreground/40 text-muted-foreground hover:border-input hover:bg-accent/30",
+              startButtonClassName,
+            )}
+            onClick={() => handleOpen("start")}
+          >
+            <CalendarIcon className="size-3.5 shrink-0" />
+            <span className="truncate min-w-0 flex-1">
+              {displayedStartAt
+                ? formatDisplay(displayedStartAt, displayAllDay)
+                : startPlaceholder}
             </span>
-          )}
-        </button>
+            {displayedStartAt && (
+              <span
+                role="button"
+                className="shrink-0 p-0.5 rounded-sm hover:bg-accent"
+                onClick={(e) => handleClear(e, "start")}
+              >
+                <X className="size-3 text-muted-foreground" />
+              </span>
+            )}
+          </button>
+        )}
 
         {/* End date trigger */}
-        <button
-          type="button"
-          title={
-            displayedEndAt
-              ? formatDisplay(displayedEndAt, displayAllDay)
-              : endPlaceholder
-          }
-          className={cn(
-            "flex h-9 w-full min-w-0 items-center gap-1.5 rounded-md border px-2.5 text-left text-sm transition-colors",
-            open && activeField === "end"
-              ? "border-primary ring-2 ring-primary/30 bg-background"
-              : displayedEndAt
-                ? "border-input bg-background hover:bg-accent/50"
-                : "border-dashed border-muted-foreground/40 text-muted-foreground hover:border-input hover:bg-accent/30",
-            endButtonClassName,
-          )}
-          onClick={() => handleOpen("end")}
-        >
-          <CalendarIcon className="size-3.5 shrink-0" />
-          <span className="truncate min-w-0 flex-1">
-            {displayedEndAt
-              ? formatDisplay(displayedEndAt, displayAllDay)
-              : endPlaceholder}
-          </span>
-          {displayedEndAt && (
-            <span
-              role="button"
-              className="shrink-0 p-0.5 rounded-sm hover:bg-accent"
-              onClick={(e) => handleClear(e, "end")}
-            >
-              <X className="size-3 text-muted-foreground" />
+        {showEndDate && (
+          <button
+            type="button"
+            title={
+              displayedEndAt
+                ? formatDisplay(displayedEndAt, displayAllDay)
+                : endPlaceholder
+            }
+            className={cn(
+              "flex h-9 w-full min-w-0 items-center gap-1.5 rounded-md border px-2.5 text-left text-sm transition-colors",
+              open && activeField === "end"
+                ? "border-primary ring-2 ring-primary/30 bg-background"
+                : displayedEndAt
+                  ? "border-input bg-background hover:bg-accent/50"
+                  : "border-dashed border-muted-foreground/40 text-muted-foreground hover:border-input hover:bg-accent/30",
+              endButtonClassName,
+            )}
+            onClick={() => handleOpen("end")}
+          >
+            <CalendarIcon className="size-3.5 shrink-0" />
+            <span className="truncate min-w-0 flex-1">
+              {displayedEndAt
+                ? formatDisplay(displayedEndAt, displayAllDay)
+                : endPlaceholder}
             </span>
-          )}
-        </button>
+            {displayedEndAt && (
+              <span
+                role="button"
+                className="shrink-0 p-0.5 rounded-sm hover:bg-accent"
+                onClick={(e) => handleClear(e, "end")}
+              >
+                <X className="size-3 text-muted-foreground" />
+            </span>
+            )}
+          </button>
+        )}
       </div>
 
       {/* Dropdown panel (portal to avoid overflow clipping) */}
@@ -1411,7 +1514,8 @@ export function TaskDatePicker({
                 t instanceof HTMLInputElement ||
                 t instanceof HTMLSelectElement ||
                 t instanceof HTMLTextAreaElement ||
-                t instanceof HTMLOptionElement;
+                t instanceof HTMLOptionElement ||
+                (t instanceof Element && t.closest('[data-slot="select-trigger"]') !== null);
               if (!isFormControl) e.preventDefault();
             }}
           >
@@ -1428,14 +1532,11 @@ export function TaskDatePicker({
                       : formatDisplay(displayedStartAt, displayAllDay)
                   }
                   onChange={(e) => {
+                    textDirtyRef.current.start = true;
                     setEditingField("start");
                     setStartText(e.target.value);
                   }}
-                  onFocus={() => {
-                    setActiveField("start");
-                    setStartText(getDisplayText(draftStartAt));
-                    setEditingField("start");
-                  }}
+                  onFocus={() => handleInputFocus("start")}
                   onKeyDown={(e) => handleKeyDown(e, "start")}
                   placeholder="Start Date"
                   className={`w-full h-8 pl-8 pr-2 text-sm rounded-md border bg-background outline-none transition-colors ${
@@ -1482,14 +1583,11 @@ export function TaskDatePicker({
                       : formatDisplay(displayedEndAt, displayAllDay)
                   }
                   onChange={(e) => {
+                    textDirtyRef.current.end = true;
                     setEditingField("end");
                     setEndText(e.target.value);
                   }}
-                  onFocus={() => {
-                    setActiveField("end");
-                    setEndText(getDisplayText(draftEndAt));
-                    setEditingField("end");
-                  }}
+                  onFocus={() => handleInputFocus("end")}
                   onKeyDown={(e) => handleKeyDown(e, "end")}
                   placeholder="Due Date"
                   className={`w-full h-8 pl-8 pr-2 text-sm rounded-md border bg-background outline-none transition-colors ${
@@ -1540,6 +1638,7 @@ export function TaskDatePicker({
                     endDate={recurrence.endDate}
                     skipWeekend={recurrence.skipWeekend}
                     skipHoliday={recurrence.skipHoliday}
+                    skipMode={recurrence.skipMode}
                     saving={recurrence.saving}
                     hasExisting={!!recurrence.recurrenceRule}
                     onFreqChange={recurrence.onFreqChange}
@@ -1552,6 +1651,7 @@ export function TaskDatePicker({
                     onEndDateChange={recurrence.onEndDateChange}
                     onSkipWeekendChange={recurrence.onSkipWeekendChange}
                     onSkipHolidayChange={recurrence.onSkipHolidayChange}
+                    onSkipModeChange={recurrence.onSkipModeChange}
                     onSave={() => {
                       recurrence.onSave();
                       setShowRecurrence(false);

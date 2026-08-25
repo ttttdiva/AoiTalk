@@ -36,7 +36,7 @@ export async function POST(request: NextRequest) {
     const nodes = await db
       .select()
       .from(knowledgeNodes)
-      .where(and(eq(knowledgeNodes.workspaceId, workspace.id), isNull(knowledgeNodes.archivedAt)))
+      .where(and(eq(knowledgeNodes.docsLibraryId, workspace.id), isNull(knowledgeNodes.archivedAt)))
       .orderBy(asc(knowledgeNodes.sortOrder));
     const children = new Map<string | null, typeof nodes>();
     for (const node of nodes) {
@@ -77,7 +77,7 @@ export async function POST(request: NextRequest) {
     const [row] = await db
       .insert(knowledgeAiSuggestions)
       .values({
-        workspaceId: workspace.id,
+        docsLibraryId: workspace.id,
         nodeId,
         suggestionType: "docs_command:generate_minutes",
         payloadJson: payload,
@@ -124,7 +124,7 @@ export async function POST(request: NextRequest) {
   const [row] = await db
     .insert(knowledgeAiSuggestions)
     .values({
-      workspaceId: workspace.id,
+      docsLibraryId: workspace.id,
       nodeId,
       suggestionType: `docs_command:${command}`,
       payloadJson: payload,

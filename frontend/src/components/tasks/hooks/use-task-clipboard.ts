@@ -127,6 +127,7 @@ export function useTaskClipboard({
               start_at: task.start_at ?? null,
               end_at: task.end_at ?? null,
               all_day: task.all_day,
+              ...(task.auto_close_on_due ? { auto_close_on_due: true } : {}),
               notifications_enabled: task.notifications_enabled,
               metadata: task.metadata ?? {},
             };

@@ -3,282 +3,157 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
-  Ban,
-  Check,
+  Brain,
   ChevronDown,
-  Circle,
-  FilePenLine,
   Loader2,
-  RefreshCw,
-  Search,
-  Terminal,
-  Users,
-  Wrench,
-  X,
+  PanelRight,
 } from "lucide-react";
+import type { Components } from "react-markdown";
+import type { AgentRunTimelineItem } from "@/lib/chat-api";
+import { useAgentRun } from "@/hooks/use-agent-run";
 import {
-  chatApi,
-  type AgentRun,
-  type AgentRunTimelineItem,
-} from "@/lib/chat-api";
-import {
-  isTerminalAgentRunStatus,
   initialAgentRunTimelineExpanded,
   nextAgentRunTimelineExpanded,
   shouldPollAgentRunTimeline,
 } from "@/lib/agent-run-timeline-state";
+import {
+  hasMeaningfulDetails,
+  agentRunElapsedMs,
+  agentRunUsage,
+  formatAgentRunTokens,
+  formatSeconds,
+  isFileEdit,
+  operationCommand,
+  operationMeta,
+  operationPaths,
+  operationStatusLabel,
+  operationUrls,
+  payloadValue,
+  toolRowSummary,
+} from "@/lib/agent-run-timeline-format";
+import {
+  collapseAgentLifecycleRows,
+  isDisplayableTimelineItem,
+  isOperationRow,
+  liveTimelineActivityLabel,
+  resolveChildRunId,
+  thinkingRowLabel,
+  timelineItemTitle,
+  timelineRowKind,
+  timelineDisplayTextContent,
+} from "@/lib/agent-run-timeline-rows";
+import {
+  operationIcon,
+  operationTypeIcon,
+} from "@/components/chat/agent-run-timeline-icons";
+import {
+  AgentRunDetailSheet,
+  type AgentRunDetailView,
+} from "@/components/chat/agent-run-detail-sheet";
+import { BorderBeam } from "@/components/magicui/border-beam";
+import { MarkdownContent } from "@/components/ui/markdown-content";
 import { cn } from "@/lib/utils";
 
 type AgentRunTimelineProps = {
   runId?: string | null;
   live?: boolean;
+  generationKey?: string | null;
+  generationStartedAt?: string | null;
+  activityMessage?: string | null;
   onContentChange?: () => boolean | void;
 };
 
-const HISTORICAL_PENDING_POLL_TIMEOUT_MS = 30_000;
+/** 途中経過テキストはタイムライン内の小さめ文字に合わせて描画する */
+const TIMELINE_TEXT_MARKDOWN: Partial<Components> = {
+  p: ({ children }) => (
+    <p className="mb-1.5 max-w-full [overflow-wrap:anywhere] last:mb-0">
+      {children}
+    </p>
+  ),
+  li: ({ children }) => <li className="text-xs">{children}</li>,
+  pre: ({ children }) => (
+    <pre className="my-1.5 max-w-full overflow-x-auto rounded-md bg-black/20 p-2 text-[11px]">
+      {children}
+    </pre>
+  ),
+  code: ({ className, children, ...props }) => {
+    const isInline = !className;
+    if (isInline) {
+      return (
+        <code
+          className="rounded bg-black/20 px-1 py-0.5 text-[11px] [overflow-wrap:anywhere]"
+          {...props}
+        >
+          {children}
+        </code>
+      );
+    }
+    return (
+      <code className={cn("max-w-full", className)} {...props}>
+        {children}
+      </code>
+    );
+  },
+};
 
-// ─── 表示対象の判定 ───
-// Codex CLI 風に、意味のある動作行だけを 1 列で並べる。
-// run.* / stream.stream_start / stream.stream_end / reasoning_progress /
-// steering_update / 記録などのライフサイクル行は一切表示しない。
+const SAFE_AGENT_FAILURE_MESSAGE =
+  "応答の生成に失敗しました。もう一度お試しください。";
+const SAFE_OPERATION_FAILURE_MESSAGE =
+  "操作に失敗しました。もう一度お試しください。";
+const SAFE_LOG_FAILURE_MESSAGE = "実行ログを取得できませんでした。";
 
-/** ツール実行行（検索・URL 取得・コマンド実行など） */
-function isToolRow(item: AgentRunTimelineItem): boolean {
-  return item.source === "tool_call" || item.event_type === "tool_operation";
-}
-
-/** サブエージェント行（agent_team.instance_started/succeeded/failed） */
-function isAgentTeamRow(item: AgentRunTimelineItem): boolean {
-  if (item.source !== "event") return false;
-  const eventType = item.event_type ?? "";
+/**
+ * Technical provider/stack details belong in the audit sheet only.  The
+ * compact timeline is a user-facing status surface, so redact known internal
+ * errors (and multiline stack traces) before rendering them there.
+ */
+function containsTechnicalFailureDetail(value: string): boolean {
   return (
-    eventType === "agent_operation" ||
-    eventType.startsWith("agent_team.") ||
-    item.actor_type === "agent_team"
+    /assistant generation returned no response/i.test(value) ||
+    /(?:^|\n)\s*(?:traceback|at\s+[^\n(]+\(|caused by:)/i.test(value) ||
+    /(?:^|\n)\s*File\s+".+",\s*line\s+\d+/i.test(value) ||
+    /(?:^|\n)\s*at\s+\S+.*:\d+:\d+/i.test(value) ||
+    /(?:^|\n)\s*(?:Error|Exception):/i.test(value) ||
+    /\b(?:stack trace|internal server error|exception)\b/i.test(value)
   );
 }
 
-/** 検証ループ行（agentic_review / 進捗検証系の status_update） */
-function isReviewRow(item: AgentRunTimelineItem): boolean {
-  if (item.source !== "event") return false;
-  const eventType = item.event_type ?? "";
-  if (eventType === "stream.agentic_review") return true;
-  if (eventType === "stream.status_update") {
-    const status = String(item.payload?.status ?? "").toLowerCase();
-    return status === "agentic_review" || status === "agentic_continue";
+function safeTimelineOperationError(value: string): string {
+  const normalized = value.trim();
+  if (!normalized) return "";
+  if (containsTechnicalFailureDetail(normalized)) {
+    return SAFE_OPERATION_FAILURE_MESSAGE;
   }
-  return false;
+  return normalized;
 }
 
-type TimelineRowKind = "tool" | "agent" | "review";
-
-function timelineRowKind(item: AgentRunTimelineItem): TimelineRowKind | null {
-  if (isToolRow(item)) return "tool";
-  if (isAgentTeamRow(item)) return "agent";
-  if (isReviewRow(item)) return "review";
-  return null;
-}
-
-function isDisplayableTimelineItem(item: AgentRunTimelineItem): boolean {
-  return timelineRowKind(item) !== null;
-}
-
-/** 秒数を「12秒」「1分05秒」形式へ */
-function formatSeconds(totalSeconds: number): string {
-  const safe = Math.max(0, Math.floor(totalSeconds));
-  if (safe < 60) return `${safe}秒`;
-  const minutes = Math.floor(safe / 60);
-  const seconds = safe % 60;
-  return `${minutes}分${seconds.toString().padStart(2, "0")}秒`;
-}
-
-// ─── ツール引数の 1 行要約 ───
-
-const ARGUMENT_PRIORITY_KEYS = [
-  "query",
-  "q",
-  "search",
-  "url",
-  "uri",
-  "command",
-  "cmd",
-  "path",
-  "file_path",
-  "pattern",
-  "input",
-  "text",
-  "prompt",
-  "name",
-];
-
-function toolArgumentSummary(args?: Record<string, unknown>): string {
-  if (!args) return "";
-  for (const key of ARGUMENT_PRIORITY_KEYS) {
-    const value = args[key];
-    if (typeof value === "string" && value.trim()) return value.trim();
-    if (typeof value === "number") return String(value);
-  }
-  for (const value of Object.values(args)) {
-    if (typeof value === "string" && value.trim()) return value.trim();
-  }
-  return "";
-}
-
-function displayModel(model?: string | null): string {
-  const value = String(model ?? "").trim();
-  if (!value || value.toLowerCase() === "default") return "";
-  return value;
-}
-
-function formatDuration(durationMs?: number | null): string {
-  if (typeof durationMs !== "number" || durationMs < 0) return "";
-  if (durationMs < 1000) return `${Math.round(durationMs)}ms`;
-  if (durationMs < 10_000) return `${(durationMs / 1000).toFixed(1)}秒`;
-  return formatSeconds(durationMs / 1000);
-}
-
-function operationMeta(item: AgentRunTimelineItem): string {
-  const groupId = String(item.group_id ?? payloadValue(item, "group_id") ?? "").trim();
-  const groupLabel = groupId === "heavy" ? "高負荷" : groupId === "light" ? "軽量" : groupId;
-  const provider = String(item.provider ?? payloadValue(item, "provider") ?? "").trim();
-  const providerModel = [provider, displayModel(item.model)].filter(Boolean).join("/");
-  const mode = String(item.mode ?? "").trim();
-  const pool = String(item.pool ?? payloadValue(item, "pool", "pool_id") ?? "").trim();
-  const candidate = String(item.candidate ?? payloadValue(item, "candidate", "candidate_id") ?? "").trim();
-  const credential = String(item.credential_profile ?? payloadValue(item, "credential_profile", "credential_profile_id") ?? "").trim();
-  const fallbackCount = Number(item.fallback_count ?? payloadValue(item, "fallback_count") ?? 0);
-  return [
-    formatDuration(item.duration_ms),
-    groupLabel,
-    pool ? `pool:${pool}` : "",
-    providerModel,
-    mode,
-    candidate ? `candidate:${candidate}` : "",
-    credential ? `credential:${credential}` : "",
-    fallbackCount > 0 ? `fallback:${fallbackCount}` : "",
-  ]
-    .filter(Boolean)
-    .join(" · ");
-}
-
-function payloadValue(item: AgentRunTimelineItem, ...keys: string[]): unknown {
-  for (const key of keys) {
-    const value = item.payload?.[key];
-    if (value !== undefined && value !== null && value !== "") return value;
-  }
-  return undefined;
-}
-
-function operationCommand(item: AgentRunTimelineItem): string {
-  const command = item.arguments?.command ?? item.arguments?.cmd;
-  return typeof command === "string" ? command.trim() : "";
-}
-
-function operationPaths(item: AgentRunTimelineItem): string[] {
-  const values: string[] = [];
-  for (const value of [item.arguments?.file_path, item.arguments?.path]) {
-    if (typeof value === "string" && value.trim()) values.push(value.trim());
-  }
-  for (const key of ["paths", "files"] as const) {
-    const paths = item.arguments?.[key];
-    if (Array.isArray(paths)) {
-      for (const path of paths) {
-        if (typeof path === "string" && path.trim()) values.push(path.trim());
-      }
-    }
-  }
-  const changes = item.arguments?.changes;
-  if (Array.isArray(changes)) {
-    for (const change of changes) {
-      if (change && typeof change === "object") {
-        const path = (change as { path?: unknown }).path;
-        if (typeof path === "string" && path.trim()) values.push(path.trim());
-      }
-    }
-  }
-  return [...new Set(values)];
-}
-
-function operationPath(item: AgentRunTimelineItem): string {
-  return operationPaths(item)[0] ?? "";
-}
-
-function isFileEdit(item: AgentRunTimelineItem): boolean {
-  const toolName = String(item.tool_name ?? "").toLowerCase();
-  return ["write_file", "edit_file", "apply_patch"].includes(toolName);
-}
-
-function hasMeaningfulDetails(item: AgentRunTimelineItem): boolean {
-  if (item.error) return true;
-  if (operationCommand(item) || operationPath(item)) return true;
-  if (Object.keys(item.arguments ?? {}).length > 0) {
-    const simpleToolNames = new Set([
-      "get_current_time",
-      "get_weather",
-      "calculate",
-    ]);
-    if (!simpleToolNames.has(String(item.tool_name ?? ""))) return true;
-  }
-  if (item.event_type === "agent_operation" && item.result) return true;
-  if (String(item.result ?? "").includes("\n")) return true;
-  return ["exit_code", "exit", "stdout", "stderr", "diff", "patch"].some(
-    (key) => payloadValue(item, key) !== undefined,
+function DetailButton({
+  label,
+  onClick,
+  className,
+}: {
+  label: string;
+  onClick: () => void;
+  className?: string;
+}) {
+  return (
+    <button
+      type="button"
+      title={label}
+      aria-label={label}
+      onClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        onClick();
+      }}
+      className={cn(
+        "shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:opacity-100",
+        className,
+      )}
+    >
+      <PanelRight className="size-3.5" />
+    </button>
   );
-}
-
-function toolRowSummary(item: AgentRunTimelineItem): string {
-  const input = toolArgumentSummary(item.arguments);
-  const result = String(item.result_preview ?? item.result ?? "").trim();
-  const simpleToolNames = new Set([
-    "get_current_time",
-    "get_weather",
-    "calculate",
-  ]);
-  if (simpleToolNames.has(String(item.tool_name ?? "")) && result) {
-    return input ? `${input} → ${result}` : result;
-  }
-  return input || result;
-}
-
-function operationIcon(item: AgentRunTimelineItem) {
-  const running =
-    item.display_status === "started" || item.status === "running";
-  const cancelled = item.status === "cancelled";
-  const failed =
-    item.success === false || item.status === "failed" || Boolean(item.error);
-  if (running) return <Loader2 className="size-3.5 animate-spin" />;
-  if (cancelled) return <Ban className="size-3.5" />;
-  if (failed) return <X className="size-3.5" />;
-  if (item.success === true || item.status === "succeeded") {
-    return <Check className="size-3.5" />;
-  }
-  return <Circle className="size-3.5" />;
-}
-
-function operationStatusLabel(item: AgentRunTimelineItem): string {
-  if (item.display_status === "started" || item.status === "running")
-    return "実行中";
-  if (item.status === "cancelled") return "キャンセル";
-  if (item.success === false || item.status === "failed" || item.error)
-    return "失敗";
-  if (item.success === true || item.status === "succeeded") return "成功";
-  return "記録済み";
-}
-
-function operationTypeIcon(item: AgentRunTimelineItem) {
-  if (isReviewRow(item)) return <RefreshCw className="size-3.5" />;
-  if (item.event_type === "agent_operation")
-    return <Users className="size-3.5" />;
-  if (operationCommand(item)) return <Terminal className="size-3.5" />;
-  if (isFileEdit(item)) return <FilePenLine className="size-3.5" />;
-  if (
-    String(item.tool_name ?? "")
-      .toLowerCase()
-      .includes("search")
-  ) {
-    return <Search className="size-3.5" />;
-  }
-  return <Wrench className="size-3.5" />;
 }
 
 function DetailBlock({ label, value }: { label: string; value: string }) {
@@ -297,16 +172,13 @@ function OperationDetails({ item }: { item: AgentRunTimelineItem }) {
   const command = operationCommand(item);
   const paths = operationPaths(item);
   const result = String(item.result ?? item.result_preview ?? "");
-  const error = String(item.error ?? payloadValue(item, "stderr") ?? "");
+  const error = safeTimelineOperationError(
+    String(item.error ?? payloadValue(item, "stderr") ?? ""),
+  );
   const stdout = String(payloadValue(item, "stdout") ?? "");
   const diff = String(payloadValue(item, "diff", "patch") ?? "");
   const exitCode = payloadValue(item, "exit_code", "exit");
-  const urls = Array.isArray(item.payload?.urls)
-    ? item.payload.urls.filter(
-        (url): url is string =>
-          typeof url === "string" && /^https?:\/\//i.test(url),
-      )
-    : [];
+  const urls = operationUrls(item);
   const remainingArguments = Object.fromEntries(
     Object.entries(item.arguments ?? {}).filter(
       ([key]) => !["command", "cmd", "path", "file_path"].includes(key),
@@ -356,31 +228,88 @@ function OperationDetails({ item }: { item: AgentRunTimelineItem }) {
   );
 }
 
-// ─── 1 論理作業の描画 ───
+// ─── 途中経過テキスト（地の文） ───
 
-function TimelineRow({
+function AssistantTextRow({ item }: { item: AgentRunTimelineItem }) {
+  const text = timelineDisplayTextContent(item);
+  if (!text) return null;
+  return (
+    <li className="min-w-0 py-1 text-xs leading-relaxed text-foreground/90">
+      <MarkdownContent
+        content={text}
+        components={TIMELINE_TEXT_MARKDOWN}
+        breaks
+      />
+    </li>
+  );
+}
+
+// ─── 思考（グレーの折りたたみ） ───
+
+function ThinkingRow({
   item,
   onContentChange,
 }: {
   item: AgentRunTimelineItem;
   onContentChange?: () => boolean | void;
 }) {
+  const text = timelineDisplayTextContent(item);
+  if (!text) return null;
+  return (
+    <li className="min-w-0">
+      <details
+        className="group min-w-0"
+        onToggle={(event) => {
+          if (!event.currentTarget.open) return;
+          requestAnimationFrame(() => onContentChange?.());
+        }}
+      >
+        <summary className="flex min-w-0 cursor-pointer list-none items-center gap-1.5 py-1 text-[11px] text-muted-foreground/70 transition-colors hover:text-muted-foreground">
+          <Brain className="size-3.5 shrink-0" />
+          <span className="min-w-0 flex-1 truncate">
+            {thinkingRowLabel(item)}
+          </span>
+          <ChevronDown className="size-3.5 shrink-0 transition-transform group-open:rotate-180" />
+        </summary>
+        <div className="whitespace-pre-wrap border-l border-border/50 py-1 pl-3 text-[11px] leading-relaxed text-muted-foreground/70 [overflow-wrap:anywhere]">
+          {text}
+        </div>
+      </details>
+    </li>
+  );
+}
+
+// ─── 1 論理作業の描画 ───
+
+function TimelineRow({
+  item,
+  onContentChange,
+  onOpenDetail,
+}: {
+  item: AgentRunTimelineItem;
+  onContentChange?: () => boolean | void;
+  onOpenDetail?: (item: AgentRunTimelineItem) => void;
+}) {
   const kind = timelineRowKind(item);
   if (!kind) return null;
+  if (kind === "text") return <AssistantTextRow item={item} />;
+  if (kind === "thinking") {
+    return <ThinkingRow item={item} onContentChange={onContentChange} />;
+  }
 
   const failed =
     item.success === false || item.status === "failed" || Boolean(item.error);
-  const title =
-    kind === "review"
-      ? item.message || item.action || "結果を検証"
-      : item.action || item.actor_label || item.tool_name || "処理を実行";
+  const title = timelineItemTitle(item);
   const summary = kind === "tool" ? toolRowSummary(item) : "";
   const meta = operationMeta(item);
   const details = hasMeaningfulDetails(item);
+  const detailLabel = resolveChildRunId(item)
+    ? "サブエージェントの実行ログを開く"
+    : "詳細を開く";
   const row = (
     <div
       className={cn(
-        "flex min-w-0 items-center gap-2 py-1 text-xs",
+        "group/row flex min-w-0 items-center gap-2 py-1 text-xs",
         failed ? "text-destructive" : "text-muted-foreground",
       )}
     >
@@ -410,6 +339,13 @@ function TimelineRow({
           {meta}
         </span>
       )}
+      {onOpenDetail && (
+        <DetailButton
+          label={detailLabel}
+          onClick={() => onOpenDetail(item)}
+          className="opacity-0 group-hover/row:opacity-100 focus:opacity-100"
+        />
+      )}
       {details && (
         <ChevronDown className="size-3.5 shrink-0 transition-transform group-open:rotate-180" />
       )}
@@ -435,8 +371,17 @@ function TimelineRow({
   );
 }
 
-function workSummary(items: AgentRunTimelineItem[], live: boolean): string {
-  if (items.length === 0) return live ? "実行を準備中" : "実行ログ";
+function workSummary(
+  items: AgentRunTimelineItem[],
+  live: boolean,
+  hasDisplayItems: boolean,
+  liveActivityLabel: string | null,
+): string {
+  if (items.length === 0) {
+    if (liveActivityLabel) return liveActivityLabel;
+    if (live && hasDisplayItems) return "実行中";
+    return live ? "実行を準備中" : "実行ログ";
+  }
   const commandCount = items.filter((item) =>
     Boolean(operationCommand(item)),
   ).length;
@@ -463,39 +408,66 @@ function workSummary(items: AgentRunTimelineItem[], live: boolean): string {
   return `${live ? "実行中" : "実行済み"} ${parts.join("、")}`;
 }
 
+function timelineRunFailureMessage(
+  status: string | undefined,
+  hasRunError: boolean,
+): string {
+  if (status === "cancelled") return "実行を停止しました。";
+  if (status === "failed" || hasRunError) return SAFE_AGENT_FAILURE_MESSAGE;
+  return SAFE_LOG_FAILURE_MESSAGE;
+}
+
 export function AgentRunTimeline({
   runId,
   live = false,
+  generationKey,
+  generationStartedAt,
+  activityMessage,
   onContentChange,
 }: AgentRunTimelineProps) {
+  const parsedGenerationStart = generationStartedAt
+    ? Date.parse(generationStartedAt)
+    : NaN;
   const [expanded, setExpanded] = useState(
     initialAgentRunTimelineExpanded(live, runId),
   );
-  const [run, setRun] = useState<AgentRun | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [detailViews, setDetailViews] = useState<AgentRunDetailView[]>([]);
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [detailKey, setDetailKey] = useState(0);
+  const [clientStartMs, setClientStartMs] = useState(() =>
+    Number.isFinite(parsedGenerationStart) ? parsedGenerationStart : Date.now(),
+  );
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const scrollBottomRef = useRef<HTMLDivElement>(null);
-  const historicalPendingPollStartedAtRef = useRef<number | null>(null);
+
+  const {
+    run,
+    error,
+    refresh: refreshRun,
+  } = useAgentRun(runId, {
+    // 同じRunを表示する右パネルと取得を共有し、terminalになるまでだけ更新する。
+    poll: Boolean(runId),
+    pollTimeoutMs: live ? null : 30_000,
+  });
 
   const shouldPollLive = shouldPollAgentRunTimeline(live, runId, run?.status);
+  const liveClockActive = live && (!runId || shouldPollLive);
   const hasRunError = Boolean(run?.error);
   const hasLoadedRun = run !== null;
-  const shouldPollHistoricalPending = Boolean(
-    !live &&
-    runId &&
-    hasLoadedRun &&
-    !hasRunError &&
-    !isTerminalAgentRunStatus(run?.status),
-  );
-  const shouldPollRun = shouldPollLive || shouldPollHistoricalPending;
 
-  // runId / live 変更時にローカル状態をリセットする（prop 変化に対する正当なリセット）
+  const lifecycleKey = generationKey ?? runId ?? null;
+  const lifecycleResetRunId = generationKey ? null : runId;
+  // generation単位でのみ開始時刻をリセットする。run idの後着では継続する。
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- prop 変化に伴う状態リセット
-    setRun(null);
-    setError(null);
-    setExpanded(initialAgentRunTimelineExpanded(live, runId));
-    historicalPendingPollStartedAtRef.current = null;
-  }, [live, runId]);
+    setExpanded(initialAgentRunTimelineExpanded(live, lifecycleResetRunId));
+    setDetailOpen(false);
+    const parsedStart = generationStartedAt
+      ? Date.parse(generationStartedAt)
+      : NaN;
+    setClientStartMs(Number.isFinite(parsedStart) ? parsedStart : Date.now());
+    setNowMs(Date.now());
+  }, [generationStartedAt, lifecycleKey, lifecycleResetRunId, live]);
 
   useEffect(() => {
     if (!runId) return;
@@ -512,79 +484,60 @@ export function AgentRunTimeline({
     );
   }, [hasRunError, live, run?.status, runId, shouldPollLive]);
 
-  const loadRun = useCallback(
-    async (isCancelled: () => boolean) => {
-      if (!runId) return;
-      // setState は await 後（非同期継続）でのみ行い、effect 内の同期 setState を避ける
-      try {
-        const response = await chatApi.getAgentRun(runId);
-        if (!isCancelled()) {
-          setRun(response.agent_run);
-          setError(null);
-        }
-      } catch (err) {
-        if (!isCancelled()) {
-          setError(
-            err instanceof Error
-              ? err.message
-              : "実行ログを取得できませんでした",
-          );
-        }
-      }
-    },
-    [runId],
-  );
-
-  // 保存済み（非 live）の初回ロード
+  // runId / live変更時の初回ロード。取得結果は本文タイムラインと右パネルで共有する。
   useEffect(() => {
-    if (!runId || live || hasLoadedRun) return;
-    let cancelled = false;
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- 初回データ取得
-    void loadRun(() => cancelled);
-    return () => {
-      cancelled = true;
-    };
-  }, [hasLoadedRun, live, loadRun, runId]);
+    if (!runId) return;
+    void refreshRun();
+  }, [live, refreshRun, runId]);
 
-  // ポーリング（2500ms 固定・既存挙動を踏襲）
+  // 経過時間表示だけを1秒ごとに更新し、既存のAPIポーリング周期は変えない。
   useEffect(() => {
-    if ((!expanded && !shouldPollRun) || !runId) return;
-    let cancelled = false;
-    let intervalId: number | undefined;
-    if (
-      shouldPollHistoricalPending &&
-      historicalPendingPollStartedAtRef.current === null
-    ) {
-      historicalPendingPollStartedAtRef.current = Date.now();
-    }
-    const pollTimeoutAt =
-      shouldPollHistoricalPending && historicalPendingPollStartedAtRef.current
-        ? historicalPendingPollStartedAtRef.current +
-          HISTORICAL_PENDING_POLL_TIMEOUT_MS
-        : null;
-
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- ポーリングによるデータ取得
-    void loadRun(() => cancelled);
-    if (shouldPollRun) {
-      intervalId = window.setInterval(() => {
-        if (pollTimeoutAt !== null && Date.now() > pollTimeoutAt) {
-          if (intervalId) window.clearInterval(intervalId);
-          return;
-        }
-        void loadRun(() => cancelled);
-      }, 2500);
-    }
-
-    return () => {
-      cancelled = true;
-      if (intervalId) window.clearInterval(intervalId);
-    };
-  }, [expanded, loadRun, runId, shouldPollHistoricalPending, shouldPollRun]);
+    if (!liveClockActive) return;
+    const updateNow = () => setNowMs(Date.now());
+    updateNow();
+    const intervalId = window.setInterval(updateNow, 1000);
+    return () => window.clearInterval(intervalId);
+  }, [lifecycleKey, liveClockActive]);
 
   const items = useMemo(() => run?.timeline ?? [], [run]);
   const displayItems = useMemo(
-    () => items.filter(isDisplayableTimelineItem),
+    () => collapseAgentLifecycleRows(items.filter(isDisplayableTimelineItem)),
     [items],
+  );
+  const liveActivityLabel = useMemo(
+    () => (shouldPollLive ? liveTimelineActivityLabel(items) : null),
+    [items, shouldPollLive],
+  );
+  // 「N件の操作」はツール・エージェント・検証行だけを数える
+  const operationItems = useMemo(
+    () => displayItems.filter(isOperationRow),
+    [displayItems],
+  );
+  const usage = useMemo(() => agentRunUsage(run, items), [items, run]);
+
+  const openDetail = useCallback((views: AgentRunDetailView[]) => {
+    setDetailViews(views);
+    setDetailKey((value) => value + 1);
+    setDetailOpen(true);
+  }, []);
+
+  const openRunDetail = useCallback(() => {
+    if (!runId) return;
+    openDetail([{ kind: "run", runId }]);
+  }, [openDetail, runId]);
+
+  const openItemDetail = useCallback(
+    (item: AgentRunTimelineItem) => {
+      if (!runId) return;
+      const childRunId = resolveChildRunId(item);
+      openDetail([
+        { kind: "run", runId },
+        childRunId
+          ? { kind: "run", runId: childRunId }
+          : { kind: "item", runId, itemId: item.id },
+      ]);
+    },
+    [openDetail, runId],
   );
 
   useEffect(() => {
@@ -596,28 +549,85 @@ export function AgentRunTimeline({
     });
   }, [expanded, displayItems.length, error, onContentChange]);
 
-  if (!runId) return null;
+  if (!runId) {
+    if (!live) return null;
+    const elapsed = Math.max(0, nowMs - clientStartMs);
+    return (
+      <div
+        className="relative mb-1.5 max-w-full overflow-hidden rounded-md border border-primary/20 bg-primary/[0.025]"
+        data-testid="agent-run-work-log"
+        data-agent-run-active="true"
+        data-generation-key={generationKey ?? undefined}
+      >
+        <BorderBeam
+          size={56}
+          duration={10}
+          borderWidth={1}
+          colorFrom="var(--primary)"
+          colorTo="var(--chart-2)"
+          className="pointer-events-none"
+        />
+        <div className="relative z-10 flex min-w-0 items-center gap-2 px-2 py-1 text-xs text-muted-foreground">
+          <Loader2 className="size-3 animate-spin" />
+          <span className="min-w-0 truncate">{activityMessage || "応答を準備しています"}</span>
+          <span className="shrink-0">{formatSeconds(elapsed / 1000)}</span>
+        </div>
+      </div>
+    );
+  }
 
   const failedRun =
     run?.status === "failed" || run?.status === "cancelled" || hasRunError;
+  const elapsedMs = agentRunElapsedMs(
+    run,
+    items,
+    nowMs,
+    clientStartMs,
+    shouldPollLive,
+  );
+  const hasRunMetrics = Boolean(usage) || elapsedMs !== null;
 
   // 表示可能アイテムが 0 件で終了済みの run はブロック自体を出さない。
   // live の間はヘッダだけでも出す。保存済みでロード前も出さない。
   if (!shouldPollLive) {
     if (!hasLoadedRun) return null;
-    if (displayItems.length === 0 && !failedRun) return null;
+    if (displayItems.length === 0 && !failedRun && !hasRunMetrics) return null;
   }
 
-  const headerLabel = failedRun
+  const detailSheet =
+    detailViews.length > 0 ? (
+      <AgentRunDetailSheet
+        key={detailKey}
+        open={detailOpen}
+        onOpenChange={setDetailOpen}
+        views={detailViews}
+        fallbackRun={run}
+      />
+    ) : null;
+
+  const headerSummary = failedRun
     ? run?.status === "cancelled"
       ? "実行を停止"
       : "実行に失敗"
-    : workSummary(displayItems, shouldPollLive);
+    : workSummary(
+        operationItems,
+        shouldPollLive,
+        displayItems.length > 0,
+        liveActivityLabel,
+      );
+  const headerDetails = [
+    elapsedMs !== null ? formatSeconds(elapsedMs / 1000) : "",
+    formatAgentRunTokens(usage),
+  ].filter(Boolean);
+  const headerLabel = [headerSummary, ...headerDetails].join("  ");
 
   if (
     displayItems.length === 1 &&
+    operationItems.length === 1 &&
     !hasMeaningfulDetails(displayItems[0]) &&
-    !failedRun
+    !failedRun &&
+    !shouldPollLive &&
+    !hasRunMetrics
   ) {
     return (
       <div
@@ -628,54 +638,61 @@ export function AgentRunTimeline({
           <TimelineRow
             item={displayItems[0]}
             onContentChange={onContentChange}
+            onOpenDetail={openItemDetail}
           />
         </ul>
+        {detailSheet}
       </div>
     );
   }
 
-  return (
-    <div className="mb-1.5 max-w-full text-xs" data-testid="agent-run-work-log">
-      <button
-        type="button"
-        onClick={() => setExpanded((value) => !value)}
-        aria-expanded={expanded}
-        className="flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 text-left text-[11px] text-muted-foreground transition-colors hover:text-foreground"
-      >
-        {shouldPollLive ? (
-          <Loader2 className="size-3.5 shrink-0 animate-spin" />
-        ) : (
-          <ChevronDown
-            className={cn(
-              "size-3.5 shrink-0 transition-transform",
-              expanded && "rotate-180",
-            )}
-          />
-        )}
-        <span
-          className={cn(
-            "min-w-0 flex-1 truncate font-medium",
-            failedRun && "text-destructive",
-          )}
+  const timelineBody = (
+    <>
+      <div className="flex w-full min-w-0 items-center gap-1">
+        <button
+          type="button"
+          onClick={() => setExpanded((value) => !value)}
+          aria-expanded={expanded}
+          className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md py-0.5 text-left text-[11px] text-muted-foreground transition-colors hover:text-foreground"
         >
-          {headerLabel}
-        </span>
-      </button>
+          {shouldPollLive ? (
+            <Loader2 className="size-3.5 shrink-0 animate-spin" />
+          ) : (
+            <ChevronDown
+              className={cn(
+                "size-3.5 shrink-0 transition-transform",
+                expanded && "rotate-180",
+              )}
+            />
+          )}
+          <span
+            className={cn(
+              "min-w-0 flex-1 truncate font-medium",
+              failedRun && "text-destructive",
+            )}
+          >
+            {headerLabel}
+          </span>
+        </button>
+        <DetailButton label="詳細・監査ログを開く" onClick={openRunDetail} />
+      </div>
 
       {expanded && (
         <div className="mt-1 border-l border-border/60 pl-3">
-          {failedRun && run?.error && (
+          {failedRun && (
             <div className="mb-1 flex items-start gap-1.5 text-destructive">
               <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
               <span className="min-w-0 [overflow-wrap:anywhere]">
-                {run.error}
+                {timelineRunFailureMessage(run?.status, hasRunError)}
               </span>
             </div>
           )}
           {error && (
             <div className="mb-1 flex items-start gap-1.5 text-destructive">
               <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
-              <span className="min-w-0 [overflow-wrap:anywhere]">{error}</span>
+              <span className="min-w-0 [overflow-wrap:anywhere]">
+                {SAFE_LOG_FAILURE_MESSAGE}
+              </span>
             </div>
           )}
           {displayItems.length > 0 ? (
@@ -685,6 +702,7 @@ export function AgentRunTimeline({
                   key={item.id}
                   item={item}
                   onContentChange={onContentChange}
+                  onOpenDetail={openItemDetail}
                 />
               ))}
             </ul>
@@ -692,13 +710,40 @@ export function AgentRunTimeline({
             shouldPollLive && (
               <div className="flex items-center gap-1.5 py-0.5 text-muted-foreground">
                 <Loader2 className="size-3 animate-spin" />
-                準備中
+                {liveActivityLabel ?? "準備中"}
               </div>
             )
           )}
           <div ref={scrollBottomRef} />
         </div>
       )}
+      {detailSheet}
+    </>
+  );
+
+  return (
+    <div
+      className={cn(
+        "relative mb-1.5 max-w-full text-xs",
+        shouldPollLive &&
+          "overflow-hidden rounded-md border border-primary/20 bg-primary/[0.025]",
+      )}
+      data-testid="agent-run-work-log"
+      data-agent-run-active={shouldPollLive ? "true" : undefined}
+    >
+      {shouldPollLive && (
+        <BorderBeam
+          size={72}
+          duration={10}
+          borderWidth={1}
+          colorFrom="var(--primary)"
+          colorTo="var(--chart-2)"
+          className="pointer-events-none"
+        />
+      )}
+      <div className={cn("relative z-10", shouldPollLive && "px-1.5 py-1")}>
+        {timelineBody}
+      </div>
     </div>
   );
 }

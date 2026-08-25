@@ -49,6 +49,9 @@ export function ReportsTimeline({
   dragState,
   dragForm,
   visibleScheduledTasks,
+  readOnly,
+  createReadOnly,
+  isEntryReadOnly,
   dayColRefs,
   handleDragMouseDown,
   handleDragMouseMove,
@@ -83,16 +86,19 @@ export function ReportsTimeline({
   dragState: DragState | null;
   dragForm: DragForm | null;
   visibleScheduledTasks: Task[];
+  readOnly: boolean;
+  createReadOnly: boolean;
+  isEntryReadOnly: (entry: TimeEntry) => boolean;
   dayColRefs: RefObject<Array<HTMLDivElement | null>>;
   handleDragMouseDown: (
-    e: React.MouseEvent<HTMLDivElement>,
+    e: React.PointerEvent<HTMLDivElement>,
     dayIndex: number,
   ) => void;
   handleDragMouseMove: (
-    e: React.MouseEvent<HTMLDivElement>,
+    e: React.PointerEvent<HTMLDivElement>,
     dayIndex: number,
   ) => void;
-  handleDragMouseUp: () => void;
+  handleDragMouseUp: (e?: React.PointerEvent<HTMLDivElement>) => void;
   isDraggingRef: RefObject<boolean>;
   isResizingRef: RefObject<boolean>;
   isMovingRef: RefObject<boolean>;
@@ -110,7 +116,7 @@ export function ReportsTimeline({
   resizeState: ResizeState | null;
   resolvedTheme: ProjectColorTheme;
   handleEntryMouseDown: (
-    e: React.MouseEvent<HTMLDivElement>,
+    e: React.PointerEvent<HTMLDivElement>,
     entry: TimeEntry,
     dayIndex: number,
   ) => void;
@@ -120,28 +126,36 @@ export function ReportsTimeline({
     entry: TimeEntry,
   ) => void;
   handleResizeMouseDown: (
-    e: React.MouseEvent<HTMLDivElement>,
+    e: React.PointerEvent<HTMLDivElement>,
     entry: TimeEntry,
     edge: "top" | "bottom",
     dayIndex: number,
   ) => void;
 }) {
   return (
-    <Card size="sm" className="overflow-visible">
-      <CardHeader>
-        <CardTitle className="text-sm">
-          週間タイムライン
-          <span className="ml-2 text-xs font-normal text-muted-foreground">
-            (クリック:編集 / ドラッグ:移動 / 上下端:リサイズ /
-            右クリック:メニュー)
+    <Card size="sm" className="overflow-hidden border-border/80 bg-card/80">
+      <CardHeader className="border-b border-border/80 bg-card/60 px-4 py-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <CardTitle className="text-base tracking-tight">週間タイムライン</CardTitle>
+          <span className="text-[11px] text-muted-foreground">
+            {readOnly
+              ? "リモートレポート · 読み取り専用"
+              : createReadOnly
+                ? "新規作成先 · 読み取り専用"
+              : "クリックで編集 · ドラッグで移動 · 右クリックでメニュー"}
           </span>
-        </CardTitle>
+        </div>
       </CardHeader>
-      <CardContent className="p-0">
-        <div className="min-w-[800px]">
+      <CardContent
+        className="overflow-x-auto p-0"
+        data-testid="reports-timeline-scroll"
+      >
+        <div className="min-w-[800px]" data-testid="reports-timeline-content">
           {/* 曜日ヘッダー */}
-          <div className="grid grid-cols-[60px_repeat(7,1fr)] border-b border-border">
-            <div className="p-2" />
+          <div className="sticky top-0 z-20 grid grid-cols-[88px_repeat(7,1fr)] border-b border-border bg-card">
+            <div className="p-3 text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+              Time
+            </div>
             {weekDays.map((day, i) => {
               const dateKey = toLocalYMD(day);
               const dayEntries = entriesByDay.get(dateKey) || [];
@@ -150,11 +164,11 @@ export function ReportsTimeline({
               return (
                 <div
                   key={dateKey}
-                  className={`p-2 text-center border-l border-border ${
+                  className={`border-l border-border p-3 text-center ${
                     isToday ? "bg-primary/10" : ""
                   }`}
                 >
-                  <div
+                    <div
                     className={`text-xs font-semibold ${
                       isToday
                         ? "text-primary"
@@ -165,11 +179,11 @@ export function ReportsTimeline({
                   >
                     {DAY_LABELS[i]}
                   </div>
-                  <div className="text-xs text-muted-foreground">
+                  <div className="text-[11px] text-muted-foreground">
                     {day.getMonth() + 1}/{day.getDate()}
                   </div>
                   {totalSec > 0 && (
-                    <div className="text-xs font-medium text-primary mt-0.5">
+                    <div className="mt-0.5 text-[10px] font-medium text-primary">
                       {formatHours(totalSec)}
                     </div>
                   )}
@@ -180,7 +194,7 @@ export function ReportsTimeline({
 
           {/* タイムグリッド */}
           <div
-            className="grid grid-cols-[60px_repeat(7,1fr)] relative"
+            className="relative grid grid-cols-[88px_repeat(7,1fr)]"
             style={{ height: `${TOTAL_HOURS * 48}px` }}
           >
             <div className="relative">
@@ -200,7 +214,7 @@ export function ReportsTimeline({
               let dayEntries = entriesByDay.get(dateKey) || [];
               const entryLayouts =
                 entryLayoutsByDay.get(dateKey) ?? new Map();
-              if (moveState?.moving) {
+                if (!readOnly && moveState?.moving) {
                 dayEntries = dayEntries.filter(
                   (e) => e.id !== moveState.entryId,
                 );
@@ -217,8 +231,9 @@ export function ReportsTimeline({
               }
               const isToday = dateKey === toLocalYMD(new Date());
 
+              const canCreate = !readOnly && !createReadOnly;
               const showDragPreview =
-                dragState && dragState.dayIndex === dayIndex;
+                canCreate && dragState && dragState.dayIndex === dayIndex;
               let dragPreviewTop = 0;
               let dragPreviewHeight = 0;
               if (showDragPreview && dragState) {
@@ -235,7 +250,7 @@ export function ReportsTimeline({
               }
 
               const showDragForm =
-                dragForm && dragForm.dayIndex === dayIndex;
+                canCreate && dragForm && dragForm.dayIndex === dayIndex;
               let dragFormTop = 0;
               let dragFormHeight = 0;
               if (showDragForm && dragForm) {
@@ -285,14 +300,23 @@ export function ReportsTimeline({
                   className={`relative border-l border-border select-none ${
                     isToday ? "bg-primary/5" : ""
                   }`}
-                  onMouseDown={(e) => handleDragMouseDown(e, dayIndex)}
-                  onMouseMove={(e) => handleDragMouseMove(e, dayIndex)}
-                  onMouseUp={handleDragMouseUp}
-                  onMouseLeave={() => {
-                    if (isDraggingRef.current) handleDragMouseUp();
-                  }}
+                  onPointerDown={
+                    canCreate ? (e) => handleDragMouseDown(e, dayIndex) : undefined
+                  }
+                  onPointerMove={
+                    canCreate ? (e) => handleDragMouseMove(e, dayIndex) : undefined
+                  }
+                  onPointerUp={canCreate ? handleDragMouseUp : undefined}
+                  onPointerCancel={canCreate ? handleDragMouseUp : undefined}
                   style={{
-                    cursor: isResizingRef.current
+                    // The scroll wrapper owns one-finger panning on the empty
+                    // timeline grid.  Reserving touch-action:none for actual
+                    // entry drag targets keeps horizontal/vertical mobile
+                    // scrolling available without regressing move/resize.
+                    touchAction: canCreate ? "pan-x pan-y" : undefined,
+                    cursor: !canCreate
+                      ? "default"
+                      : isResizingRef.current
                       ? "ns-resize"
                       : isMovingRef.current
                         ? "grabbing"
@@ -424,7 +448,7 @@ export function ReportsTimeline({
                                 handleDragFormCancel();
                               }
                             }}
-                            disabled={dragCreating}
+                            disabled={dragCreating || createReadOnly}
                           />
                           {selectedDragTask && (
                             <div className="mt-1 text-[10px] text-primary">
@@ -454,7 +478,7 @@ export function ReportsTimeline({
                                       setDragSelectedTaskId(task.id);
                                       setDragTaskName(task.title);
                                     }}
-                                    disabled={dragCreating}
+                                    disabled={dragCreating || createReadOnly}
                                   >
                                     {task.title}
                                   </button>
@@ -472,6 +496,7 @@ export function ReportsTimeline({
                               onClick={handleDragFormSubmit}
                               disabled={
                                 dragCreating ||
+                                createReadOnly ||
                                 (!dragSelectedTaskId &&
                                   !dragTaskName.trim())
                               }
@@ -481,7 +506,7 @@ export function ReportsTimeline({
                             <button
                               className="flex-1 text-[10px] bg-muted text-muted-foreground rounded px-2 py-0.5 hover:bg-muted/80"
                               onClick={handleDragFormCancel}
-                              disabled={dragCreating}
+                              disabled={dragCreating || createReadOnly}
                             >
                               キャンセル
                             </button>
@@ -551,13 +576,16 @@ export function ReportsTimeline({
                       entry.task_title || entry.note || "タスク";
                     const durSec = getEntryDurationSeconds(entry, now);
                     const durText = formatSeconds(durSec);
+                    const entryReadOnly = readOnly || isEntryReadOnly(entry);
                     const hoverText = [
                       `プロジェクト: ${entry.project_name || "未設定"}`,
                       `タスク: ${title}`,
                       `時間: ${formatTimeWindow(entry)}`,
                       `経過: ${durText}`,
                       entry.original_started_at
-                        ? "(編集済み — クリックで詳細)"
+                        ? entryReadOnly
+                          ? "(編集済み)"
+                          : "(編集済み — クリックで詳細)"
                         : "",
                     ]
                       .filter(Boolean)
@@ -569,7 +597,9 @@ export function ReportsTimeline({
                       columnCount: 1,
                     };
                     const columnWidthPct = 100 / layout.columnCount;
-                    const cursorCls = isActive
+                    const cursorCls = entryReadOnly
+                      ? "cursor-default"
+                      : isActive
                       ? "cursor-pointer"
                       : isMovingThis
                         ? "cursor-grabbing"
@@ -578,7 +608,14 @@ export function ReportsTimeline({
                       <div
                         key={entry.id}
                         data-entry
-                        className={`absolute z-10 ${cursorCls} overflow-hidden rounded border text-foreground transition-all hover:brightness-[0.98] dark:hover:brightness-110 ${
+                        role={entryReadOnly ? undefined : "button"}
+                        tabIndex={entryReadOnly ? undefined : 0}
+                        aria-label={
+                          entryReadOnly
+                            ? undefined
+                            : `${title}、${formatTimeWindow(entry)}、${durText}。Enterで編集`
+                        }
+                        className={`absolute z-10 ${cursorCls} overflow-hidden rounded border text-foreground transition-all hover:brightness-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring dark:hover:brightness-110 ${
                           isEdited ? "ring-1 ring-yellow-300/70" : ""
                         } ${isMovingThis ? "opacity-80 ring-2 ring-primary/60" : ""}`}
                         style={{
@@ -588,29 +625,51 @@ export function ReportsTimeline({
                           height: `${heightPct}%`,
                           minHeight: isActive ? "2px" : "18px",
                           transform: "translateY(-100%)",
+                          touchAction:
+                            !entryReadOnly && !isActive ? "none" : undefined,
                           ...timelineBlockStyle(colorTokens),
                         }}
                         title={hoverText}
-                        onMouseDown={(e) => {
-                          if (isActive) return;
-                          handleEntryMouseDown(e, entry, dayIndex);
-                        }}
-                        onClick={(e) => {
-                          if (isActive) {
-                            e.stopPropagation();
-                            openEditDialog(entry);
-                          }
-                        }}
-                        onContextMenu={(e) =>
-                          handleEntryContextMenu(e, entry)
+                        onPointerDown={
+                          entryReadOnly
+                            ? undefined
+                            : (e) => {
+                                if (isActive) return;
+                                handleEntryMouseDown(e, entry, dayIndex);
+                              }
+                        }
+                        onClick={
+                          entryReadOnly
+                            ? undefined
+                            : (e) => {
+                                if (isActive) {
+                                  e.stopPropagation();
+                                  openEditDialog(entry);
+                                }
+                              }
+                        }
+                        onKeyDown={
+                          entryReadOnly
+                            ? undefined
+                            : (e) => {
+                                if (e.key !== "Enter" && e.key !== " ") return;
+                                e.preventDefault();
+                                e.stopPropagation();
+                                openEditDialog(entry);
+                              }
+                        }
+                        onContextMenu={
+                          entryReadOnly
+                            ? undefined
+                            : (e) => handleEntryContextMenu(e, entry)
                         }
                       >
                         {/* 上端リサイズハンドル */}
-                        {!isActive && (
+                        {!entryReadOnly && !isActive && (
                           <div
                             data-resize-handle
                             className="absolute left-0 right-0 top-0 h-1.5 cursor-ns-resize hover:bg-white/40 z-10"
-                            onMouseDown={(e) =>
+                            onPointerDown={(e) =>
                               handleResizeMouseDown(
                                 e,
                                 entry,
@@ -644,11 +703,11 @@ export function ReportsTimeline({
                         </div>
 
                         {/* 下端リサイズハンドル */}
-                        {!isActive && (
+                        {!entryReadOnly && !isActive && (
                           <div
                             data-resize-handle
                             className="absolute left-0 right-0 bottom-0 h-1.5 cursor-ns-resize hover:bg-white/40 z-10"
-                            onMouseDown={(e) =>
+                            onPointerDown={(e) =>
                               handleResizeMouseDown(
                                 e,
                                 entry,
@@ -664,6 +723,15 @@ export function ReportsTimeline({
                 </div>
               );
             })}
+          </div>
+          <div className="flex items-center justify-end gap-6 border-t border-border bg-card px-4 py-3 text-xs text-muted-foreground">
+            <span className="uppercase tracking-[0.1em]">Total</span>
+            <span className="font-mono text-foreground">
+              {formatSeconds(timeEntries.reduce((sum, entry) => sum + getEntryDurationSeconds(entry, now), 0))}
+            </span>
+            {visibleScheduledTasks.length > 0 && (
+              <span>{visibleScheduledTasks.length}件の予定枠</span>
+            )}
           </div>
         </div>
       </CardContent>

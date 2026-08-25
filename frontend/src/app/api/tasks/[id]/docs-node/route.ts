@@ -11,7 +11,7 @@ import { getSession } from "@/lib/auth";
 import {
   appendKnowledgeRevision,
   cleanOptionalString,
-  ensureDocsWorkspace,
+  ensureProjectDocsWorkspace,
   ensureProjectWritable,
   serializeNode,
   syncKnowledgeNodeReferenceEdges,
@@ -57,7 +57,13 @@ export async function POST(
     );
   }
 
-  const workspace = await ensureDocsWorkspace(user);
+  const workspace = await ensureProjectDocsWorkspace(task.projectId, user);
+  if (!workspace) {
+    return NextResponse.json(
+      { detail: "Project Docs workspaceへの書き込み権限がありません" },
+      { status: 403 },
+    );
+  }
   if (isDefaultInboxProject(projectAccess.project)) {
     return NextResponse.json(
       { detail: "Inboxタスクは案件情報Docsへ変換できません。実案件へ移してから実行してください" },
@@ -65,7 +71,7 @@ export async function POST(
     );
   }
   const projectNode = await ensureProjectInformationHierarchyNode({
-    workspaceId: workspace.id,
+    docsLibraryId: workspace.id,
     userId: user.id,
     project: projectAccess.project,
   });
@@ -77,7 +83,7 @@ export async function POST(
       .where(
         and(
           eq(knowledgeNodes.id, task.knowledgeNodeId),
-          eq(knowledgeNodes.workspaceId, workspace.id),
+          eq(knowledgeNodes.docsLibraryId, workspace.id),
           isNull(knowledgeNodes.archivedAt),
         ),
       )
@@ -98,7 +104,7 @@ export async function POST(
     .from(knowledgeSupertags)
     .where(
       and(
-        eq(knowledgeSupertags.workspaceId, workspace.id),
+        eq(knowledgeSupertags.docsLibraryId, workspace.id),
         eq(knowledgeSupertags.systemKey, "task"),
       ),
     )
@@ -119,13 +125,13 @@ export async function POST(
       .from(knowledgeNodes)
       .where(
         and(
-          eq(knowledgeNodes.workspaceId, workspace.id),
+          eq(knowledgeNodes.docsLibraryId, workspace.id),
           parentId ? eq(knowledgeNodes.parentId, parentId) : isNull(knowledgeNodes.parentId),
         ),
       );
 
     const created = await insertDocsNode(tx, {
-        workspaceId: workspace.id,
+        docsLibraryId: workspace.id,
         parentId,
         rootPageId,
         projectId: task.projectId,
@@ -154,7 +160,7 @@ export async function POST(
     await upsertKnowledgeSearchIndex(tx, finalNode, finalNode.title);
     if (bodyText) {
       const detailNode = await insertDocsNode(tx, {
-        workspaceId: workspace.id,
+        docsLibraryId: workspace.id,
         parentId: finalNode.id,
         rootPageId: finalNode.rootPageId ?? finalNode.id,
         projectId: task.projectId,

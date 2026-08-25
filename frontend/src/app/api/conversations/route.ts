@@ -5,12 +5,20 @@ import {
   conversationParticipants,
   conversationSessions,
 } from "@/db/schema";
-import { eq, and, isNull, desc, sql, or, isNotNull } from "drizzle-orm";
+import { eq, and, inArray, isNull, desc, sql, or, isNotNull } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
 import { decryptTextIfNeeded, encryptText } from "@/lib/server/field-crypto";
-import { messageToSnake } from "@/lib/server/conversation-route-utils";
+import {
+  canReadProject,
+  canWriteProject,
+  ConversationScopeError,
+  messageToSnake,
+  validateAppConversationScope,
+} from "@/lib/server/conversation-route-utils";
 import { cleanupExpiredDeletedConversationsIfDue } from "@/lib/server/conversation-retention-cleanup";
 import { fetchPythonApi, type InternalPythonUser } from "@/lib/server/python-api-proxy";
+import { jsonWithConditional } from "@/lib/server/http-cache";
+import { getReadableProjectIds } from "@/lib/server/task-route-utils";
 
 class CharacterResolutionError extends Error {
   constructor(
@@ -108,6 +116,10 @@ function sessionToSnake(row: Record<string, unknown>): Record<string, unknown> {
     isActive: "is_active",
     deletedAt: "deleted_at",
     projectId: "project_id",
+    appId: "app_id",
+    appTargetId: "app_target_id",
+    developmentStatus: "development_status",
+    lastReadAt: "last_read_at",
     isGroupChat: "is_group_chat",
     groupCharacterNames: "group_character_names",
   };
@@ -121,16 +133,12 @@ function sessionToSnake(row: Record<string, unknown>): Record<string, unknown> {
   return out;
 }
 
-function isScenarioWorkflowSession(row: Record<string, unknown>): boolean {
+function isStoryWorkflowSession(row: Record<string, unknown>): boolean {
   const characterName = String(row.characterName ?? "");
   const title = String(row.title ?? "");
   return (
-    /^scenario_roleplay:[^:]+:[^:]+$/.test(characterName) ||
-    characterName.startsWith("scenario_") ||
-    characterName.startsWith("trpg_room_") ||
-    title.startsWith("[シナリオ]") ||
-    title.startsWith("[執筆]") ||
-    title.startsWith("[TRPG]")
+    characterName.startsWith("story_") ||
+    title.startsWith("[執筆]")
   );
 }
 
@@ -144,6 +152,41 @@ export async function GET(request: NextRequest) {
 
   const { searchParams } = new URL(request.url);
   const projectId = searchParams.get("project_id");
+  const appId = searchParams.get("app_id");
+  const appTargetId = searchParams.get("app_target_id");
+
+  let readableProjectIds: string[] | null = null;
+  if (projectId) {
+    try {
+      if (!(await canReadProject(projectId, user))) {
+        return NextResponse.json({ detail: "Projectを閲覧できません" }, { status: 403 });
+      }
+    } catch (error) {
+      if (error instanceof ConversationScopeError) {
+        return NextResponse.json({ detail: error.message }, { status: error.status });
+      }
+      throw error;
+    }
+  } else {
+    readableProjectIds = await getReadableProjectIds(user.id);
+  }
+
+  let appScope: Awaited<ReturnType<typeof validateAppConversationScope>> = null;
+  if (appId || appTargetId) {
+    try {
+      appScope = await validateAppConversationScope({
+        appId,
+        appTargetId,
+        projectId,
+        user,
+      });
+    } catch (error) {
+      if (error instanceof ConversationScopeError) {
+        return NextResponse.json({ detail: error.message }, { status: error.status });
+      }
+      throw error;
+    }
+  }
 
   const conditions = [
     or(
@@ -155,12 +198,26 @@ export async function GET(request: NextRequest) {
 
   if (projectId) {
     conditions.push(eq(conversationSessions.projectId, projectId));
+  } else if (readableProjectIds?.length) {
+    conditions.push(
+      or(
+        isNull(conversationSessions.projectId),
+        inArray(conversationSessions.projectId, readableProjectIds),
+      ),
+    );
+  } else {
+    conditions.push(isNull(conversationSessions.projectId));
+  }
+  if (appScope?.appId) {
+    conditions.push(eq(conversationSessions.appId, appScope.appId));
+  }
+  if (appScope?.appTargetId) {
+    conditions.push(eq(conversationSessions.appTargetId, appScope.appTargetId));
   }
 
   const rows = await db
     .select({
       session: conversationSessions,
-      lastMessageAt: sql<Date | null>`max(${conversationMessages.createdAt})`,
       actualMessageCount: sql<number>`count(${conversationMessages.id})`,
     })
     .from(conversationSessions)
@@ -170,10 +227,7 @@ export async function GET(request: NextRequest) {
         eq(conversationParticipants.sessionId, conversationSessions.id),
         eq(conversationParticipants.participantType, "user"),
         eq(conversationParticipants.participantId, user.id),
-        or(
-          eq(conversationParticipants.status, "joined"),
-          eq(conversationParticipants.status, "invited"),
-        ),
+        eq(conversationParticipants.status, "joined"),
       ),
     )
     .leftJoin(
@@ -183,10 +237,11 @@ export async function GET(request: NextRequest) {
     .where(and(...conditions))
     .groupBy(conversationSessions.id)
     .orderBy(
-      desc(
-        sql`coalesce(max(${conversationMessages.createdAt}), ${conversationSessions.sessionStart}, ${conversationSessions.lastActivity})`,
-      ),
-      desc(conversationSessions.sessionStart),
+      // last_activity is the durable activity boundary. Deriving this from
+      // message.created_at makes the list response disagree with resume (and
+      // causes a click-only session replacement to reorder the sidebar).
+      sql`coalesce(${conversationSessions.lastActivity}, ${conversationSessions.sessionStart}) desc nulls last`,
+      sql`${conversationSessions.sessionStart} desc nulls last`,
       desc(conversationSessions.id),
     );
 
@@ -194,19 +249,42 @@ export async function GET(request: NextRequest) {
     .filter(
       (r) =>
         Number(r.actualMessageCount ?? 0) > 0 &&
-        !isScenarioWorkflowSession(r.session as unknown as Record<string, unknown>),
+        !isStoryWorkflowSession(r.session as unknown as Record<string, unknown>),
     )
-    .map((r) =>
-      sessionToSnake({
+    .map((r) => {
+      const session = sessionToSnake({
         ...(r.session as unknown as Record<string, unknown>),
-        lastActivity:
-          r.lastMessageAt ??
-          r.session.sessionStart ??
-          r.session.lastActivity,
-      }),
-    );
+        // Keep the same activity source as the resume endpoint. Session
+        // activity changes only for a session/message/agent response event,
+        // not when the session is opened or its title/read state is changed.
+        lastActivity: r.session.lastActivity ?? r.session.sessionStart,
+      });
+      const lastActivity = session.last_activity;
+      const lastReadAt = session.last_read_at;
+      const activityMs =
+        lastActivity instanceof Date
+          ? lastActivity.getTime()
+          : typeof lastActivity === "string"
+            ? Date.parse(lastActivity)
+            : Number.NaN;
+      const readMs =
+        lastReadAt instanceof Date
+          ? lastReadAt.getTime()
+          : typeof lastReadAt === "string"
+            ? Date.parse(lastReadAt)
+            : Number.NaN;
+      const isUnread =
+        session.app_id != null &&
+        session.development_status === "waiting_for_user" &&
+        Number.isFinite(activityMs) &&
+        (!lastReadAt || !Number.isFinite(readMs) || activityMs > readMs);
+      return { ...session, is_unread: isUnread };
+    });
 
-  return NextResponse.json({ conversations: result, total: result.length });
+  return jsonWithConditional(request, {
+    conversations: result,
+    total: result.length,
+  });
 }
 
 export async function POST(request: NextRequest) {
@@ -217,6 +295,14 @@ export async function POST(request: NextRequest) {
 
   const body = await request.json();
   const { character_name, project_id } = body;
+  const appId =
+    typeof body?.app_id === "string" && body.app_id.trim()
+      ? body.app_id.trim()
+      : null;
+  const appTargetId =
+    typeof body?.app_target_id === "string" && body.app_target_id.trim()
+      ? body.app_target_id.trim()
+      : null;
   const initialMessage =
     body?.initial_message && typeof body.initial_message === "object"
       ? body.initial_message
@@ -233,6 +319,138 @@ export async function POST(request: NextRequest) {
       { detail: "character_nameは必須です" },
       { status: 400 }
     );
+  }
+
+  const requestedProjectId =
+    typeof project_id === "string" && project_id.trim()
+      ? project_id.trim()
+      : null;
+  if (project_id !== null && project_id !== undefined && !requestedProjectId) {
+    return NextResponse.json(
+      { detail: "project_idの形式が不正です" },
+      { status: 400 },
+    );
+  }
+  if (requestedProjectId) {
+    try {
+      if (!(await canWriteProject(requestedProjectId, user))) {
+        return NextResponse.json(
+          { detail: "プロジェクトへの書き込み権限がありません" },
+          { status: 403 },
+        );
+      }
+    } catch (error) {
+      if (error instanceof ConversationScopeError) {
+        return NextResponse.json(
+          { detail: error.message },
+          { status: error.status },
+        );
+      }
+      throw error;
+    }
+  }
+
+  // App開発チャットは、App/Target権限の検証と進行状態の初期化を
+  // Python側の正規作成経路に委譲する。通常チャットのBFF直書き経路とは
+  // 分けることで、権限検証を迂回して他ユーザーのAppを紐付けられないようにする。
+  if (appId || appTargetId) {
+    let response: Response;
+    try {
+      response = await fetchPythonApi("/api/conversations", {
+        method: "POST",
+        user,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          character_name,
+          project_id: requestedProjectId,
+          app_id: appId,
+          app_target_id: appTargetId,
+        }),
+      });
+    } catch (error) {
+      return NextResponse.json(
+        {
+          detail:
+            error instanceof Error
+              ? error.message
+              : "会話サービスに接続できません",
+        },
+        { status: 502 },
+      );
+    }
+    const responseBody = await response.text();
+    if (!response.ok || !initialContent.trim()) {
+      return new NextResponse(responseBody, {
+        status: response.status,
+        headers: {
+          "content-type":
+            response.headers.get("content-type") ?? "application/json",
+        },
+      });
+    }
+
+    // Python側でApp scopeを検証しつつ、Web composerが同じ本文を二重送信
+    // しないよう、任意の初回ユーザーメッセージを作成レスポンスへ戻す。
+    let created: {
+      session?: { id?: unknown };
+      [key: string]: unknown;
+    };
+    try {
+      created = JSON.parse(responseBody) as typeof created;
+    } catch {
+      return new NextResponse(responseBody, {
+        status: response.status,
+        headers: {
+          "content-type":
+            response.headers.get("content-type") ?? "application/json",
+        },
+      });
+    }
+    const createdSessionId =
+      typeof created.session?.id === "string" ? created.session.id : null;
+    if (!createdSessionId) {
+      return NextResponse.json(created, { status: response.status });
+    }
+
+    let messageResponse: Response;
+    try {
+      messageResponse = await fetchPythonApi(
+        `/api/conversations/${encodeURIComponent(createdSessionId)}/messages`,
+        {
+          method: "POST",
+          user,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            role: "user",
+            content: initialContent,
+            client_message_id: initialClientMessageId,
+          }),
+        },
+      );
+    } catch {
+      return NextResponse.json(
+        { detail: "初回メッセージを保存できませんでした" },
+        { status: 502 },
+      );
+    }
+    const messageBody = await messageResponse.text();
+    if (!messageResponse.ok) {
+      return new NextResponse(messageBody, {
+        status: messageResponse.status,
+        headers: {
+          "content-type":
+            messageResponse.headers.get("content-type") ?? "application/json",
+        },
+      });
+    }
+    try {
+      const added = JSON.parse(messageBody) as { message?: unknown };
+      if (added.message) created.initial_message = added.message;
+    } catch {
+      // セッション作成レスポンスは有効なまま返し、次のメッセージ取得で
+      // 保存済みの初回ユーザーメッセージを同期できるようにする。
+    }
+    return NextResponse.json(created, { status: response.status });
   }
 
   let characterSlug: string | null;
@@ -261,7 +479,7 @@ export async function POST(request: NextRequest) {
       .values({
         userId: user.id,
         characterName: characterSlug,
-        projectId: project_id || null,
+        projectId: requestedProjectId,
         sessionStart: now,
         lastActivity: now,
         messageCount: initialContent.trim() ? 1 : 0,

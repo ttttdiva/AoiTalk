@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aoitalk.local/contracts/product-contract.schema.json",
+  "title": "AoiTalk Mobile Product Contract",
+  "description": "Machine-readable conformance contract for the native AoiTalk mobile client.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "product", "navigation", "capabilities"],
+  "properties": {
+    "$schema": {"type": "string"},
+    "contract_version": {"type": "string", "const": "mobile-product-contract/v1"},
+    "product": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "client", "source_of_truth"],
+      "properties": {
+        "name": {"type": "string", "const": "AoiTalk"},
+        "client": {"type": "string", "const": "mobile"},
+        "source_of_truth": {"type": "string", "const": "contracts/product-contract.json"},
+        "version": {"type": "string"}
+      }
+    },
+    "navigation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tabs", "tab_routes", "routes", "entry_points"],
+      "properties": {
+        "tabs": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"},
+          "uniqueItems": true,
+          "minItems": 1
+        },
+        "tab_routes": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true,
+          "minItems": 1
+        },
+        "routes": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/route"},
+          "uniqueItems": true,
+          "minItems": 1
+        },
+        "entry_points": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/entry_point"},
+          "uniqueItems": true,
+          "minItems": 1
+        }
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/capability"},
+      "uniqueItems": true,
+      "minItems": 1
+    }
+  },
+  "$defs": {
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "path", "kind", "auth_required", "tab", "entry_points"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*$"},
+        "path": {"type": "string", "minLength": 1},
+        "kind": {"type": "string", "enum": ["root", "auth", "tab", "detail", "settings", "workspace", "deep_link"]},
+        "auth_required": {"type": "boolean"},
+        "tab": {"type": "boolean"},
+        "entry_points": {"type": "array", "items": {"type": "string"}, "uniqueItems": true, "minItems": 1},
+        "notes": {"type": "string"}
+      }
+    },
+    "entry_point": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "target"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*$"},
+        "kind": {"type": "string", "enum": ["bootstrap", "auth", "tab", "sidebar", "settings", "parent", "deep_link", "system"]},
+        "target": {"type": "string"},
+        "from": {"type": "string"},
+        "notes": {"type": "string"}
+      }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "transport"],
+      "properties": {
+        "operation_id": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$"},
+        "transport": {"type": "string", "enum": ["fastapi", "sync", "local", "external", "next_bff"]},
+        "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "LOCAL"]},
+        "role": {"type": "string", "enum": ["read", "create", "update", "delete", "command", "local"]}
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "visibility"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["public", "auth_user", "personal", "space", "project", "space_project", "conversation", "task", "story_work", "trpg_session"]},
+        "visibility": {"type": "string", "enum": ["public", "auth_user", "acl_read", "acl_write", "owner_or_member", "participant", "owner_only"]},
+        "project_parameter": {"type": ["string", "null"]},
+        "space_parameter": {"type": ["string", "null"]},
+        "notes": {"type": "string"}
+      }
+    },
+    "offline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["read", "mutation", "reconnect"],
+      "properties": {
+        "read": {"type": "string", "enum": ["forbidden", "cache", "local"]},
+        "mutation": {"type": "string", "enum": ["forbidden", "queue", "local", "direct_online"]},
+        "reconnect": {"type": "string", "enum": ["none", "refresh", "replay_outbox", "resume"]}
+      }
+    },
+    "acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "given", "when", "then"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*$"},
+        "given": {"type": "string", "minLength": 1},
+        "when": {"type": "string", "minLength": 1},
+        "then": {"type": "string", "minLength": 1}
+      }
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "domain", "criticality", "transport", "operations", "mobile", "roles", "permissions", "scope", "offline", "persistence", "mutation", "acceptance"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*$"},
+        "domain": {"type": "string", "enum": ["auth", "navigation", "chat", "memory", "tasks", "projects", "files", "docs", "story", "trpg", "settings"]},
+        "criticality": {"type": "string", "enum": ["p0", "p1", "p2"]},
+        "transport": {"type": "string", "enum": ["fastapi", "sync", "local", "external", "next_bff"]},
+        "operations": {"type": "array", "items": {"$ref": "#/$defs/operation"}, "uniqueItems": true},
+        "mobile": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["routes", "entry_points", "implementation"],
+          "properties": {
+            "routes": {"type": "array", "items": {"type": "string"}, "uniqueItems": true, "minItems": 1},
+            "entry_points": {"type": "array", "items": {"type": "string"}, "uniqueItems": true, "minItems": 1},
+            "implementation": {"type": "string", "minLength": 1}
+          }
+        },
+        "roles": {"type": "array", "items": {"type": "string", "enum": ["anonymous", "user", "member", "owner", "admin", "gm", "participant"]}, "uniqueItems": true, "minItems": 1},
+        "permissions": {"type": "array", "items": {"type": "string", "enum": ["public", "read", "write", "create", "update", "delete", "manage", "execute"]}, "uniqueItems": true, "minItems": 1},
+        "scope": {"$ref": "#/$defs/scope"},
+        "offline": {"$ref": "#/$defs/offline"},
+        "persistence": {"type": "string", "enum": ["none", "server", "sqlite_cache", "outbox", "sqlite_and_outbox"]},
+        "mutation": {"type": "string", "enum": ["none", "direct_online", "local_first", "outbox_replay", "local_only"]},
+        "acceptance": {"type": "array", "items": {"$ref": "#/$defs/acceptance"}, "uniqueItems": true, "minItems": 1},
+        "notes": {"type": "string"}
+      }
+    }
+  }
+}

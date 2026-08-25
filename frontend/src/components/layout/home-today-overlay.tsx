@@ -30,9 +30,10 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
+import { NumberTicker } from "@/components/magicui/number-ticker";
 import {
-  buildTaskAgentPrompt,
-  buildTaskAgentSessionTitle,
+  buildTaskChatDraft,
+  buildTaskChatSessionTitle,
 } from "@/lib/task-agent";
 import { taskApi, type Task, type TaskOccurrence } from "@/lib/task-api";
 import { formatTaskDateLabel } from "@/lib/task-date-label";
@@ -340,7 +341,11 @@ function SummaryMetric({
         <span>{label}</span>
       </div>
       <div className={cn("text-xl font-semibold tabular-nums", tone)}>
-        {value}
+        <NumberTicker
+          value={value}
+          decimalPlaces={0}
+          className="tabular-nums text-inherit tracking-normal"
+        />
       </div>
     </div>
   );
@@ -533,10 +538,10 @@ export function HomeTodayOverlay() {
         const sessionId = created.session.id;
         await chatApi.updateSessionTitle(
           sessionId,
-          buildTaskAgentSessionTitle(launchTask.title),
+          buildTaskChatSessionTitle(launchTask.title),
         );
         await chatApi.dispatchMessage(sessionId, {
-          message: buildTaskAgentPrompt(launchTask),
+          message: buildTaskChatDraft(launchTask),
           project_id: launchTask.project_id || undefined,
           generation_profile: "assisted_work",
         });

@@ -17,6 +17,27 @@ logger = logging.getLogger(__name__)
 _SentenceTransformer = None
 
 
+def _is_cuda_available() -> bool:
+    """Return whether the active PyTorch runtime can use CUDA.
+
+    PyTorch is intentionally imported lazily because the RAG embedding path is
+    optional.  A missing/broken CPU-only torch install is treated as CUDA
+    unavailable; the caller decides whether that should fall back to CPU or
+    fail without constructing the model.
+    """
+    try:
+        import torch
+    except Exception:
+        logger.debug("Failed to import PyTorch while checking CUDA", exc_info=True)
+        return False
+
+    try:
+        return bool(torch.cuda.is_available())
+    except Exception:
+        logger.debug("Failed to inspect PyTorch CUDA availability", exc_info=True)
+        return False
+
+
 def _load_sentence_transformer():
     """Lazy load sentence-transformers library."""
     global _SentenceTransformer
@@ -49,6 +70,66 @@ class BgeM3Embedding:
         self._initialized = False
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._dimension = 1024  # Default for bge-m3
+        self.configured_device = getattr(config, "device", "cuda")
+        self.effective_device = self.configured_device
+        self.fallback_reason: Optional[str] = None
+
+    def _resolve_device(self) -> Optional[str]:
+        """Resolve the configured device against the active PyTorch runtime.
+
+        ``sentence-transformers`` accepts arbitrary device strings, so only
+        CUDA devices need capability detection.  Keeping the configured value
+        unchanged preserves existing configuration/API behavior while exposing
+        the effective value used for the model constructor.
+        """
+        configured_device = self.configured_device
+        normalized_device = str(configured_device or "").strip().lower()
+        self.fallback_reason = None
+        self.effective_device = configured_device
+
+        if not normalized_device.startswith("cuda"):
+            logger.info(
+                "Embedding device resolved: configured=%s effective=%s",
+                configured_device,
+                self.effective_device,
+            )
+            return self.effective_device
+
+        if _is_cuda_available():
+            logger.info(
+                "Embedding device resolved: configured=%s effective=%s",
+                configured_device,
+                self.effective_device,
+            )
+            return self.effective_device
+
+        fallback_enabled = bool(
+            getattr(self.config, "allow_cpu_fallback", True)
+        )
+        if fallback_enabled:
+            self.effective_device = "cpu"
+            self.fallback_reason = (
+                "configured CUDA device is unavailable "
+                "(torch.cuda.is_available() is false)"
+            )
+            logger.warning(
+                "Embedding device fallback: configured=%s effective=%s reason=%s",
+                configured_device,
+                self.effective_device,
+                self.fallback_reason,
+            )
+            return self.effective_device
+
+        self.effective_device = None
+        self.fallback_reason = (
+            "configured CUDA device is unavailable and CPU fallback is disabled"
+        )
+        logger.error(
+            "Embedding device unavailable: configured=%s effective=None reason=%s",
+            configured_device,
+            self.fallback_reason,
+        )
+        return None
     
     async def initialize(self) -> bool:
         """Initialize the embedding model.
@@ -58,9 +139,17 @@ class BgeM3Embedding:
         """
         if self._initialized:
             return True
+
+        effective_device = self._resolve_device()
+        if effective_device is None:
+            self.model = None
+            self._initialized = False
+            return False
         
         SentenceTransformer = _load_sentence_transformer()
         if SentenceTransformer is None:
+            self.model = None
+            self._initialized = False
             return False
         
         try:
@@ -71,7 +160,7 @@ class BgeM3Embedding:
             def _load_model():
                 model = SentenceTransformer(
                     self.config.model,
-                    device=self.config.device
+                    device=effective_device
                 )
                 return model
             
@@ -81,11 +170,24 @@ class BgeM3Embedding:
             self._dimension = self.model.get_sentence_embedding_dimension()
             
             self._initialized = True
-            logger.info(f"Embedding model loaded: dim={self._dimension}")
+            logger.info(
+                "Embedding model loaded: dim=%s configured_device=%s effective_device=%s",
+                self._dimension,
+                self.configured_device,
+                self.effective_device,
+            )
             return True
             
         except Exception as e:
-            logger.error(f"Failed to load embedding model: {e}")
+            self.model = None
+            self._initialized = False
+            logger.error(
+                "Failed to load embedding model (configured_device=%s "
+                "effective_device=%s): %s",
+                self.configured_device,
+                self.effective_device,
+                e,
+            )
             return False
     
     async def embed(self, texts: List[str]) -> List[List[float]]:

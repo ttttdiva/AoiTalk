@@ -49,13 +49,13 @@ function isoWeekNumber(date: Date) {
   return Math.ceil(((utc.getTime() - yearStart.getTime()) / 86400000 + 1) / 7);
 }
 
-async function ensureSystemNode(workspaceId: string, title: string, parentId: string | null, sortOrder: number, userId: string) {
+async function ensureSystemNode(docsLibraryId: string, title: string, parentId: string | null, sortOrder: number, userId: string) {
   const [existing] = await db
     .select()
     .from(knowledgeNodes)
     .where(
       and(
-        eq(knowledgeNodes.workspaceId, workspaceId),
+        eq(knowledgeNodes.docsLibraryId, docsLibraryId),
         eq(knowledgeNodes.title, title),
         parentId ? eq(knowledgeNodes.parentId, parentId) : isNull(knowledgeNodes.parentId),
         isNull(knowledgeNodes.archivedAt),
@@ -65,7 +65,7 @@ async function ensureSystemNode(workspaceId: string, title: string, parentId: st
     .limit(1);
   if (existing) return existing;
   const created = await insertDocsNode(db, {
-      workspaceId,
+      docsLibraryId,
       parentId,
       rootPageId: parentId,
       title,
@@ -102,13 +102,13 @@ export async function GET(request: NextRequest) {
     const [existing] = await tx
       .select()
       .from(knowledgeSupertags)
-      .where(and(eq(knowledgeSupertags.workspaceId, workspace.id), eq(knowledgeSupertags.name, "Day")))
+      .where(and(eq(knowledgeSupertags.docsLibraryId, workspace.id), eq(knowledgeSupertags.name, "Day")))
       .limit(1);
     if (existing) return existing;
     const [created] = await tx
       .insert(knowledgeSupertags)
       .values({
-        workspaceId: workspace.id,
+        docsLibraryId: workspace.id,
         name: "Day",
         baseType: "note",
         description: "Daily note",
@@ -132,7 +132,7 @@ export async function GET(request: NextRequest) {
     .from(knowledgeNodes)
     .where(
       and(
-        eq(knowledgeNodes.workspaceId, workspace.id),
+        eq(knowledgeNodes.docsLibraryId, workspace.id),
         eq(knowledgeNodes.dayDate, today),
         isNull(knowledgeNodes.archivedAt),
       ),
@@ -149,9 +149,21 @@ export async function GET(request: NextRequest) {
           }) ?? existingDay
         : existingDay;
     const tags = await db
-      .select()
+      .select({
+        relation: knowledgeNodeSupertags,
+        supertagWorkspaceId: knowledgeSupertags.docsLibraryId,
+      })
       .from(knowledgeNodeSupertags)
-      .where(eq(knowledgeNodeSupertags.nodeId, normalizedDay.id));
+      .innerJoin(knowledgeSupertags, eq(knowledgeNodeSupertags.supertagId, knowledgeSupertags.id))
+      .where(
+        and(
+          eq(knowledgeNodeSupertags.nodeId, normalizedDay.id),
+          eq(knowledgeSupertags.docsLibraryId, workspace.id),
+        ),
+      )
+      .then((rows) => rows
+        .filter((row) => row.supertagWorkspaceId === workspace.id)
+        .map((row) => row.relation));
     return NextResponse.json({
       node: serializeNode(normalizedDay),
       supertag: serializeSupertag(dayTag),
@@ -165,7 +177,7 @@ export async function GET(request: NextRequest) {
     .where(eq(knowledgeNodes.parentId, weekRoot.id));
   const node = await db.transaction(async (tx) => {
     const created = await insertDocsNode(tx, {
-      workspaceId: workspace.id,
+      docsLibraryId: workspace.id,
       parentId: weekRoot.id,
       rootPageId: dailyRoot.id,
       title,

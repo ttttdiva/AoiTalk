@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID
@@ -11,6 +11,11 @@ from uuid import UUID
 from sqlalchemy import select
 
 from ...tools.core import tool
+from ...services.project_qa_candidate_service import (
+    _normalized_question_hash,
+    find_existing_project_qa_entry,
+    is_project_qa_entry_closed,
+)
 from .common import (
     _clean_text,
     _json,
@@ -20,14 +25,23 @@ from .common import (
     _parse_datetime,
     _parse_optional_uuid,
     _project_reference_match_score,
+    _get_project_reference_candidates,
     _resolve_actor_and_project,
     _resolve_operator_user_id,
     _resolve_project,
     _run_async,
 )
 
+logger = logging.getLogger(__name__)
 
-project_qa_statuses = {"unanswered", "answered", "stale", "archived"}
+
+project_qa_statuses = {
+    "unanswered",
+    "answered",
+    "stale",
+    "cancelled",
+    "archived",
+}
 project_qa_review_states = {"candidate", "accepted", "rejected"}
 
 
@@ -69,11 +83,6 @@ def _bounded_project_info_limit(value: object, default: int) -> int:
     return max(1, min(parsed, 50))
 
 
-def _normalized_project_question_hash(value: str) -> str:
-    normalized = " ".join(str(value or "").strip().lower().split())
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-
-
 def _json_array(value: str) -> list:
     if not str(value or "").strip():
         return []
@@ -81,6 +90,36 @@ def _json_array(value: str) -> list:
     if not isinstance(parsed, list):
         raise ValueError("JSON value must be an array.")
     return parsed
+
+
+def _apply_project_qa_content_update(
+    entry,
+    *,
+    is_new_entry: bool,
+    target_answer: str | None,
+    answer_was_provided: bool,
+    clear_answer: bool,
+    status: str,
+    review_state: str,
+) -> None:
+    """Apply explicit tool fields without implicitly reopening or erasing closed Q&A."""
+    was_closed = not is_new_entry and is_project_qa_entry_closed(entry)
+    if is_new_entry or answer_was_provided or clear_answer:
+        entry.answer = target_answer
+    if is_new_entry or status.strip() or (
+        not was_closed and (answer_was_provided or clear_answer)
+    ):
+        entry.status = _one_of(
+            status,
+            project_qa_statuses,
+            "answered" if target_answer else "unanswered",
+        )
+    if is_new_entry or review_state.strip() or not was_closed:
+        entry.review_state = _one_of(
+            review_state,
+            project_qa_review_states,
+            "accepted",
+        )
 
 
 def _compact_project_information_payload(
@@ -144,39 +183,72 @@ def _compact_project_information_payload(
     }
 
 
+def _empty_project_information_node() -> dict:
+    """Return the read-compatible empty shape used before a Docs node exists."""
+    return {
+        "id": None,
+        "docs_library_id": None,
+        "parent_id": None,
+        "root_page_id": None,
+        "project_id": None,
+        "title": "",
+        "body_json": {},
+        "body_text": "",
+        "display_props": {},
+        "query_json": None,
+        "view_json": {},
+        "day_date": None,
+        "sort_order": None,
+        "created_by": None,
+        "updated_by": None,
+        "created_at": None,
+        "updated_at": None,
+        "archived_at": None,
+    }
+
+
 def build_project_info_tools() -> list:
     """Docs正本の案件情報ツール群を生成して返す。"""
 
     @tool
     def get_project_context(project_id: str = "") -> str:
-        """Get the active project context or a specific project context/name."""
+        """Get the currently selected Project context or a specific Project."""
         from ...memory.database import get_database_manager
         from ...services.project_context import (
             ProjectContextResolver,
             format_project_context_for_prompt,
             get_runtime_project_context,
         )
+        from ...services.turn_context import get_turn_context
 
-        if not project_id:
-            context = get_runtime_project_context()
-            return (
-                format_project_context_for_prompt(context)
-                if context
-                else "No active project context."
-            )
+        turn_project_id = str(get_turn_context().project_id or "").strip()
+        runtime_project_id = str(
+            (get_runtime_project_context() or {}).get("id") or ""
+        ).strip()
+        if not project_id and not runtime_project_id and not turn_project_id:
+            return "No active project context."
 
         async def _resolve_context():
             db_manager = get_database_manager()
             session = await db_manager.get_session()
             try:
-                project = await _resolve_project(session, project_id)
-                if not project:
+                user_id = await _resolve_operator_user_id(session)
+                project_ref = project_id or runtime_project_id or turn_project_id
+                if not project_ref:
                     return None
+                project = await _resolve_project(
+                    session,
+                    project_ref,
+                    user_id=user_id,
+                    permission="read",
+                )
             finally:
                 await session.close()
 
             resolver = ProjectContextResolver(db_manager=db_manager)
-            return await resolver.get_project_context(str(project.id))
+            return await resolver.get_project_context(
+                str(project.id), user_id=str(user_id)
+            )
 
         context = _run_async(_resolve_context())
         if not context:
@@ -187,17 +259,16 @@ def build_project_info_tools() -> list:
     def list_projects(project: str = "") -> str:
         """List accessible projects and optionally filter by UUID, slug, or project name."""
         from ...memory.database import get_database_manager
-        from ...memory.models import Project
-        from ...memory.project_repository import ProjectRepository
 
         async def _list():
             db = get_database_manager()
             session = await db.get_session()
             try:
                 operator_user_id = await _resolve_operator_user_id(session)
-                projects = await ProjectRepository.get_user_projects(
+                projects = await _get_project_reference_candidates(
                     session,
-                    user_id=operator_user_id,
+                    operator_user_id,
+                    permission="read",
                 )
                 project_filter = (project or "").strip()
                 if not project_filter:
@@ -210,15 +281,7 @@ def build_project_info_tools() -> list:
                 if matches:
                     return matches
 
-                fallback_result = await session.execute(
-                    select(Project).where(Project.deleted_at.is_(None)).limit(200)
-                )
-                return [
-                    item.to_dict()
-                    for item in fallback_result.scalars().all()
-                    if _project_reference_match_score(item.to_dict(), project_filter)
-                    > 0
-                ]
+                return []
             finally:
                 await session.close()
 
@@ -235,9 +298,8 @@ def build_project_info_tools() -> list:
     ) -> str:
         """Read the canonical project information Docs source of truth before answering or editing project facts. Prefer detail_level='full' before a write. The response includes Docs body, accepted/candidate Q&A, record tables, and references; use it as grounded evidence and do not invent missing facts."""
         from ...memory.database import get_database_manager
-        from ...memory.models import Project, ProjectQaEntry, RecordTable
+        from ...memory.models import KnowledgeNode, Project, ProjectQaEntry, RecordTable
         from ...services.project_information_docs import (
-            ensure_project_information_doc,
             serialize_project_information_node,
         )
 
@@ -249,6 +311,7 @@ def build_project_info_tools() -> list:
                     session,
                     project=project,
                     project_id=project_id,
+                    permission="read",
                 )
                 if resolved_project_id is None:
                     raise ValueError("No project could be resolved.")
@@ -256,11 +319,28 @@ def build_project_info_tools() -> list:
                 if project_obj is None:
                     raise ValueError("Project not found.")
 
-                node = await ensure_project_information_doc(
-                    session,
-                    project=project_obj,
-                    user_id=user_id,
-                )
+                node = None
+                knowledge_node_id = getattr(project_obj, "knowledge_node_id", None)
+                if knowledge_node_id:
+                    node = await session.get(KnowledgeNode, knowledge_node_id)
+                    if node and (
+                        node.project_id != resolved_project_id
+                        or node.archived_at is not None
+                    ):
+                        node = None
+                if node is None:
+                    node_result = await session.execute(
+                        select(KnowledgeNode)
+                        .where(
+                            KnowledgeNode.project_id == resolved_project_id,
+                            KnowledgeNode.system_key
+                            == f"project_information:{resolved_project_id}",
+                            KnowledgeNode.archived_at.is_(None),
+                        )
+                        .order_by(KnowledgeNode.updated_at.desc())
+                        .limit(1)
+                    )
+                    node = node_result.scalar_one_or_none()
 
                 record_tables_result = await session.execute(
                     select(RecordTable)
@@ -279,10 +359,13 @@ def build_project_info_tools() -> list:
                 qa_entries_result = await session.execute(
                     qa_stmt.order_by(ProjectQaEntry.updated_at.desc())
                 )
-                await session.commit()
                 payload = {
                     "project": project_obj.to_dict(),
-                    "node": serialize_project_information_node(node),
+                    "node": (
+                        serialize_project_information_node(node)
+                        if node
+                        else _empty_project_information_node()
+                    ),
                     "management_documents": _management_documents_from_project(project_obj),
                     "record_tables": [
                         {
@@ -333,8 +416,7 @@ def build_project_info_tools() -> list:
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
 
-    @tool
-    def patch_project_information_doc(
+    def _patch_project_information_doc_impl(
         project: str = "",
         project_id: str = "",
         title: str = "",
@@ -362,6 +444,7 @@ def build_project_info_tools() -> list:
                     session,
                     project=project,
                     project_id=project_id,
+                    permission="write",
                 )
                 if resolved_project_id is None:
                     raise ValueError("No project could be resolved.")
@@ -388,6 +471,23 @@ def build_project_info_tools() -> list:
                     source_refs=source_refs,
                 )
                 await session.commit()
+                # Schedule projection rebuild only after the canonical Docs
+                # mutation commits; a queue failure must not hide the tool's
+                # successful write result.
+                from ...services.project_context_pack_job_service import (
+                    enqueue_project_context_pack_rebuild,
+                )
+
+                try:
+                    await enqueue_project_context_pack_rebuild(
+                        resolved_project_id,
+                        user_id,
+                        "project_information_doc_patched",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to enqueue ProjectContextPack rebuild after tool Docs patch"
+                    )
                 return {
                     "success": True,
                     "node": serialize_project_information_node(node),
@@ -402,6 +502,33 @@ def build_project_info_tools() -> list:
             return _json(_run_async(_patch()))
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
+
+    @tool
+    def patch_project_information_doc(
+        project: str = "",
+        project_id: str = "",
+        title: str = "",
+        body_text: str = "",
+        append_text: str = "",
+        section_heading: str = "",
+        operation: str = "append",
+        change_summary: str = "",
+        source_refs_json: str = "",
+        update_reason: str = "案件情報Docs正本を更新",
+    ) -> str:
+        """Patch the canonical project information Docs source of truth. Respect existing headings; use section_heading with operation='append' or 'replace' for section/block edits, and only use body_text for deliberate full-document replacement. Always provide change_summary and source_refs_json (JSON array) when evidence exists; unsupported claims belong in a 要確認 section or a candidate Q&A entry."""
+        return _patch_project_information_doc_impl(
+            project=project,
+            project_id=project_id,
+            title=title,
+            body_text=body_text,
+            append_text=append_text,
+            section_heading=section_heading,
+            operation=operation,
+            change_summary=change_summary,
+            source_refs_json=source_refs_json,
+            update_reason=update_reason,
+        )
 
     @tool
     def attach_project_information_reference(
@@ -426,7 +553,7 @@ def build_project_info_tools() -> list:
                 "",
             ]
         )
-        return patch_project_information_doc(
+        return _patch_project_information_doc_impl(
             project=project,
             project_id=project_id,
             append_text=append_text,
@@ -458,6 +585,7 @@ def build_project_info_tools() -> list:
                     session,
                     project=project,
                     project_id=project_id,
+                    permission="write",
                 )
                 if resolved_project_id is None:
                     raise ValueError("No project could be resolved.")
@@ -526,6 +654,7 @@ def build_project_info_tools() -> list:
                     session,
                     project=project,
                     project_id=project_id,
+                    permission="write",
                 )
                 if resolved_project_id is None:
                     raise ValueError("No project could be resolved.")
@@ -592,11 +721,12 @@ def build_project_info_tools() -> list:
     def upsert_project_qa_entry(
         question: str,
         answer: str = "",
+        clear_answer: bool = False,
         project: str = "",
         project_id: str = "",
         qa_entry_id: str = "",
         status: str = "",
-        review_state: str = "accepted",
+        review_state: str = "",
         confidence: float = 1.0,
         source_session_id: str = "",
         source_message_ids_json: str = "",
@@ -617,6 +747,7 @@ def build_project_info_tools() -> list:
                     session,
                     project=project,
                     project_id=project_id,
+                    permission="write",
                 )
                 if resolved_project_id is None:
                     raise ValueError("No project could be resolved.")
@@ -632,25 +763,25 @@ def build_project_info_tools() -> list:
                 if not target_question:
                     raise ValueError("question is required.")
                 target_answer = _nullable_text(answer)
-                question_hash = _normalized_project_question_hash(target_question)
+                question_hash = _normalized_question_hash(target_question)
 
+                matching_entry = await find_existing_project_qa_entry(
+                    session,
+                    project_id=resolved_project_id,
+                    question=target_question,
+                    question_hash=question_hash,
+                )
                 entry = None
                 parsed_entry_id = _parse_optional_uuid(qa_entry_id)
                 if parsed_entry_id is not None:
                     entry = await session.get(ProjectQaEntry, parsed_entry_id)
                     if entry and entry.project_id != resolved_project_id:
                         raise ValueError("qa_entry_id belongs to another project.")
+                if entry is not None and matching_entry is not None and matching_entry.id != entry.id:
+                    raise ValueError("The same project question already exists.")
                 if entry is None:
-                    existing_result = await session.execute(
-                        select(ProjectQaEntry)
-                        .where(
-                            ProjectQaEntry.project_id == resolved_project_id,
-                            ProjectQaEntry.deleted_at.is_(None),
-                            ProjectQaEntry.normalized_question_hash == question_hash,
-                        )
-                        .limit(1)
-                    )
-                    entry = existing_result.scalar_one_or_none()
+                    entry = matching_entry
+                is_new_entry = entry is None
                 if entry is None:
                     entry = ProjectQaEntry(
                         project_id=resolved_project_id,
@@ -663,17 +794,15 @@ def build_project_info_tools() -> list:
                 now = datetime.utcnow()
                 entry.knowledge_node_id = node.id
                 entry.question = target_question
-                entry.answer = target_answer
                 entry.normalized_question_hash = question_hash
-                entry.status = _one_of(
-                    status,
-                    project_qa_statuses,
-                    "answered" if target_answer else "unanswered",
-                )
-                entry.review_state = _one_of(
-                    review_state,
-                    project_qa_review_states,
-                    "accepted",
+                _apply_project_qa_content_update(
+                    entry,
+                    is_new_entry=is_new_entry,
+                    target_answer=target_answer,
+                    answer_was_provided=bool(answer.strip()),
+                    clear_answer=clear_answer,
+                    status=status,
+                    review_state=review_state,
                 )
                 entry.confidence = max(0.0, min(1.0, float(confidence or 1.0)))
                 entry.asked_count = max(1, int(entry.asked_count or 0) + 1)
@@ -720,6 +849,7 @@ def build_project_info_tools() -> list:
                 await _resolve_actor_and_project(
                     session,
                     project_id=str(entry.project_id),
+                    permission="write",
                 )
                 now = datetime.utcnow()
                 entry.status = "archived"
@@ -757,6 +887,7 @@ def build_project_info_tools() -> list:
                     session,
                     project=project,
                     project_id=project_id,
+                    permission="read",
                 )
                 if resolved_project_id is None:
                     raise ValueError("No project could be resolved.")

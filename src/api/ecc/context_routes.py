@@ -33,7 +33,9 @@ def build_context_router(
     ):
         """LLMに渡す統合コンテキストをプレビューする。"""
         try:
-            user_id = payload.user_id or await get_user_id(request)
+            # The authenticated principal is authoritative. A preview payload
+            # must never impersonate another user.
+            user_id = await get_user_id(request)
             bundle = await ContextBuilder().build_context(
                 user_id=user_id,
                 message=payload.message,
@@ -42,6 +44,8 @@ def build_context_router(
                 session_id=payload.session_id,
                 max_chars=payload.max_chars,
             )
+            if payload.project_id and bundle.debug.get("project_scope_authorized") is False:
+                raise HTTPException(status_code=403, detail="project access denied")
             return JSONResponse(
                 content={
                     "success": True,
@@ -49,6 +53,8 @@ def build_context_router(
                     "debug": bundle.debug,
                 }
             )
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error("コンテキストプレビュー生成エラー: %s", e)
             raise HTTPException(status_code=500, detail=str(e))

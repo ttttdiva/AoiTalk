@@ -5,15 +5,30 @@ server.py から移設。ロジックは一切変更していない。
 """
 
 from ..server_shared import *  # noqa: F401,F403
+from ...tools.external_llm_permission import get_permission_request_scope
+from ...features import Features
+from ...services.agent_run_service import get_current_agent_run_id
+from uuid import uuid4
 
 
 class MessagingMixin:
     """WebChatServer のメッセージング/ライフサイクル系メソッド群。"""
 
-    async def _handle_clear_chat(self):
+    async def _handle_clear_chat(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        admin_only: bool = False,
+    ):
         """Handle clear chat request"""
         self.manager.clear_history()
-        await self.manager.broadcast({"type": "chat_cleared"})
+        await self.manager.broadcast(
+            {"type": "chat_cleared"},
+            user_id=user_id,
+            session_id=session_id,
+            admin_only=admin_only,
+        )
         logger.info("Chat history cleared")
 
         # Call the clear chat callback to start a new session
@@ -36,6 +51,19 @@ class MessagingMixin:
 
             # Set broadcast callback
             async def broadcast_permission_request(message: dict):
+                permission_user_id, permission_session_id = (
+                    get_permission_request_scope()
+                )
+                scoped_message = dict(message)
+                if permission_session_id:
+                    nested_data = scoped_message.get("data")
+                    if isinstance(nested_data, dict):
+                        scoped_message["data"] = {
+                            **nested_data,
+                            "session_id": permission_session_id,
+                        }
+                    else:
+                        scoped_message["session_id"] = permission_session_id
                 target_loop = self._permission_broadcast_loop
                 current_loop = asyncio.get_running_loop()
                 if (
@@ -44,12 +72,20 @@ class MessagingMixin:
                     and target_loop is not current_loop
                 ):
                     future = asyncio.run_coroutine_threadsafe(
-                        self.manager.broadcast(message),
+                        self.manager.broadcast(
+                            scoped_message,
+                            user_id=permission_user_id,
+                            session_id=permission_session_id,
+                        ),
                         target_loop,
                     )
                     await asyncio.wrap_future(future)
                     return
-                await self.manager.broadcast(message)
+                await self.manager.broadcast(
+                    scoped_message,
+                    user_id=permission_user_id,
+                    session_id=permission_session_id,
+                )
 
             self._external_llm_permission_manager.set_broadcast_callback(
                 broadcast_permission_request
@@ -62,7 +98,93 @@ class MessagingMixin:
         except Exception as e:
             logger.error(f"Failed to initialize external LLM permission manager: {e}")
 
-    async def _handle_external_llm_permission_response(self, data: dict):
+    def _init_human_interaction_manager(self):
+        """Initialize unified human interaction transport."""
+        try:
+            from ...services.human_interaction import (
+                HumanInteractionManager,
+                set_human_interaction_manager,
+            )
+
+            self._human_interaction_manager = HumanInteractionManager()
+
+            async def broadcast_human_interaction(message: dict):
+                permission_user_id, permission_session_id = (
+                    get_permission_request_scope()
+                )
+                scoped_message = dict(message)
+                if permission_session_id:
+                    nested_data = scoped_message.get("data")
+                    if isinstance(nested_data, dict):
+                        scoped_message["data"] = {
+                            **nested_data,
+                            "session_id": permission_session_id,
+                        }
+                    else:
+                        scoped_message["session_id"] = permission_session_id
+                target_loop = self._permission_broadcast_loop
+                current_loop = asyncio.get_running_loop()
+                if (
+                    target_loop
+                    and target_loop.is_running()
+                    and target_loop is not current_loop
+                ):
+                    future = asyncio.run_coroutine_threadsafe(
+                        self.manager.broadcast(
+                            scoped_message,
+                            user_id=permission_user_id,
+                            session_id=permission_session_id,
+                        ),
+                        target_loop,
+                    )
+                    await asyncio.wrap_future(future)
+                    return
+                await self.manager.broadcast(
+                    scoped_message,
+                    user_id=permission_user_id,
+                    session_id=permission_session_id,
+                )
+
+            self._human_interaction_manager.set_broadcast_callback(
+                broadcast_human_interaction
+            )
+            set_human_interaction_manager(self._human_interaction_manager)
+            logger.info("[WebChatServer] Human interaction manager initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize human interaction manager: {e}")
+
+    async def _handle_human_interaction_response(
+        self,
+        data: dict,
+        *,
+        requester_user_id: Optional[str] = None,
+        requester_session_id: Optional[str] = None,
+    ):
+        manager = getattr(self, "_human_interaction_manager", None)
+        if manager is None:
+            logger.warning("Human interaction manager not available")
+            return
+        request_id = str(data.get("request_id") or "").strip()
+        if not request_id:
+            logger.warning("Human interaction response missing request_id")
+            return
+        revision = data.get("revision")
+        expected_revision = int(revision) if revision is not None else None
+        manager.handle_response(
+            request_id,
+            dict(data),
+            requester_user_id=requester_user_id,
+            requester_session_id=requester_session_id,
+            expected_revision=expected_revision,
+        )
+
+    async def _handle_external_llm_permission_response(
+        self,
+        data: dict,
+        *,
+        requester_user_id: Optional[str] = None,
+        requester_session_id: Optional[str] = None,
+    ):
         """Handle user response to external LLM permission request"""
         if not self._external_llm_permission_manager:
             logger.warning("External LLM permission manager not available")
@@ -70,19 +192,34 @@ class MessagingMixin:
 
         request_id = data.get("request_id")
         approved = data.get("approved", False)
+        # scope: "once"（今回だけ）/ "session"（このセッション中は許可）
+        scope = str(data.get("scope") or "once")
 
         if not request_id:
             logger.warning("Permission response missing request_id")
             return
 
         self._external_llm_permission_manager.handle_permission_response(
-            request_id, approved
+            request_id,
+            approved,
+            scope,
+            requester_user_id=requester_user_id,
+            requester_session_id=requester_session_id,
         )
         logger.info(
-            f"External LLM permission response: {request_id} -> {'approved' if approved else 'denied'}"
+            "External LLM permission response: %s -> %s (scope=%s)",
+            request_id,
+            "approved" if approved else "denied",
+            scope,
         )
 
-    async def _handle_external_model_prompt_response(self, data: dict):
+    async def _handle_external_model_prompt_response(
+        self,
+        data: dict,
+        *,
+        requester_user_id: Optional[str] = None,
+        requester_session_id: Optional[str] = None,
+    ):
         """Handle approval or edited prompt for an external model call."""
         if not self._external_llm_permission_manager:
             logger.warning("External LLM permission manager not available")
@@ -100,6 +237,8 @@ class MessagingMixin:
             request_id,
             approved,
             prompt,
+            requester_user_id=requester_user_id,
+            requester_session_id=requester_session_id,
         )
         logger.info(
             "External model prompt response: %s -> %s",
@@ -133,6 +272,11 @@ class MessagingMixin:
                 _apply_config("claude_cli.reasoning_effort", mode)
             elif provider == "openai":
                 _apply_config("openai.reasoning_effort", mode)
+            elif provider == "openai_compatible_local":
+                _apply_config(
+                    "openai_compatible_local.llama_cpp.reasoning_effort",
+                    mode,
+                )
             from ...llm.manager import create_llm_client
 
             self.set_llm_client(create_llm_client(self.config))
@@ -158,23 +302,127 @@ class MessagingMixin:
 
     async def broadcast_stream_event(self, event_type: str, data: dict):
         """Broadcast streaming events (stream_start, stream_token, tool_start, etc.)"""
+        event_data = data if isinstance(data, dict) else {}
+        session_id = event_data.get("session_id")
+        nested_data = event_data.get("data")
+        if not session_id and isinstance(nested_data, dict):
+            session_id = nested_data.get("session_id")
+        if not session_id and event_type == "generated_image":
+            session_id = getattr(
+                getattr(self, "_llm_client", None), "current_session_id", None
+            )
+        agent_run_id = event_data.get("agent_run_id")
+        if not agent_run_id and isinstance(nested_data, dict):
+            agent_run_id = nested_data.get("agent_run_id")
+        if not agent_run_id and session_id:
+            agent_run_id = get_current_agent_run_id()
+        is_cancellation_event = event_type == "stream_cancelled" and str(
+            event_data.get("status") or ""
+        ) in {"cancellation_pending", "cancelled", "cancellation_failed"}
+        is_rejected_steering_event = (
+            event_type == "steering_update"
+            and str(event_data.get("status") or "") == "rejected"
+        )
+        if (
+            self._is_fenced_generation_run(session_id, agent_run_id)
+            and not is_cancellation_event
+            and not is_rejected_steering_event
+        ):
+            logger.warning(
+                "Dropping fenced generation event: event_type=%s run=%s",
+                event_type,
+                agent_run_id,
+            )
+            return
+        if Features.is_enterprise() and not session_id:
+            logger.error(
+                "Dropping unscoped Enterprise stream event: event_type=%s",
+                event_type,
+            )
+            return
         self._update_generation_status_from_stream_event(event_type, data)
-        await self.manager.broadcast({"type": event_type, **data})
+        sequence_key = f"{session_id or 'global'}:{agent_run_id or 'runless'}"
+        sequence_store = getattr(self, "_websocket_event_sequences", None)
+        if sequence_store is None:
+            sequence_store = {}
+            self._websocket_event_sequences = sequence_store
+        event_sequence = int(sequence_store.get(sequence_key, 0)) + 1
+        sequence_store[sequence_key] = event_sequence
+
+        # All generation events leave through this method.  Additive envelope
+        # fields keep older clients compatible while giving newer clients a
+        # durable deduplication key and a monotonic ordering hint per session/run.
+        payload = dict(event_data)
+        nested_data = payload.get("data")
+        nested_record = nested_data if isinstance(nested_data, dict) else {}
+        if session_id and not payload.get("session_id"):
+            payload["session_id"] = session_id
+        if agent_run_id and not payload.get("agent_run_id"):
+            payload["agent_run_id"] = agent_run_id
+        if session_id and agent_run_id and not payload.get("client_message_id"):
+            generation_status = self._ensure_generation_status_store().get(
+                self._generation_status_key(session_id), {}
+            )
+            status_run_id = str(
+                generation_status.get("agent_run_id") or ""
+            ).strip()
+            status_client_message_id = str(
+                generation_status.get("client_message_id") or ""
+            ).strip()
+            if status_run_id == str(agent_run_id).strip() and status_client_message_id:
+                payload["client_message_id"] = status_client_message_id
+        payload["event_id"] = str(
+            payload.get("event_id")
+            or nested_record.get("event_id")
+            or f"ws:{event_type}:{session_id or 'global'}:{agent_run_id or 'runless'}:{event_sequence}"
+        )
+        payload["event_sequence"] = event_sequence
+        await self.manager.broadcast({"type": event_type, **payload})
+
+    async def _broadcast_new_message(self, entry: dict):
+        """Broadcast a message envelope with a stable additive event identity."""
+        payload = dict(entry)
+        session_id = str(payload.get("session_id") or "global")
+        event_id = payload.get("event_id")
+        if not event_id:
+            event_id = f"new_message:{session_id}:{uuid4()}"
+        await self.manager.broadcast(
+            {
+                "type": "new_message",
+                "data": payload,
+                "event_id": str(event_id),
+            }
+        )
 
     async def add_assistant_message(
         self, message: str, session_id: Optional[str] = None
     ):
         """Add assistant message"""
+        if Features.is_enterprise() and not session_id:
+            logger.error("Dropping unscoped Enterprise assistant message")
+            return
+        effective_session_id = session_id or getattr(
+            getattr(self, "_llm_client", None), "current_session_id", None
+        )
+        agent_run_id = get_current_agent_run_id()
+        if self._is_fenced_generation_run(effective_session_id, agent_run_id):
+            logger.warning(
+                "Dropping fenced assistant message: session=%s run=%s",
+                effective_session_id,
+                agent_run_id,
+            )
+            return
         entry = {
             "type": "assistant",
             "message": message,
             "character": self.character_name,
             "timestamp": datetime.now().strftime("%H:%M:%S"),
-            "session_id": session_id,
+            "session_id": effective_session_id,
+            "agent_run_id": agent_run_id,
         }
 
         self.manager.add_to_history(entry)
-        await self.manager.broadcast({"type": "new_message", "data": entry})
+        await self._broadcast_new_message(entry)
         logger.info(f"Assistant: {message}")
 
     async def add_system_message(self, message: str):
@@ -186,7 +434,7 @@ class MessagingMixin:
         }
 
         self.manager.add_to_history(entry)
-        await self.manager.broadcast({"type": "new_message", "data": entry})
+        await self._broadcast_new_message(entry)
         logger.info(f"System: {message}")
 
     async def add_user_message(self, message: str):
@@ -211,7 +459,7 @@ class MessagingMixin:
         }
 
         self.manager.add_to_history(entry)
-        await self.manager.broadcast({"type": "new_message", "data": entry})
+        await self._broadcast_new_message(entry)
         logger.info(f"User (voice): {message}")
 
     def set_user_input_callback(self, callback, event_loop=None):
@@ -244,7 +492,12 @@ class MessagingMixin:
         # HeartbeatRunnerにもLLMクライアントとブロードキャスト関数を注入
         if self._heartbeat_runner:
             self._heartbeat_runner.set_llm_client(llm_client)
+
+            async def _heartbeat_admin_notify(message: Dict[str, Any]) -> None:
+                await self.manager.broadcast(message, admin_only=True)
+
             self._heartbeat_runner.set_broadcast_fn(self.manager.broadcast)
+            self._heartbeat_runner.set_admin_notify_fn(_heartbeat_admin_notify)
     def _register_character_switch_callback(self):
         """キャラクター切り替え通知を登録"""
         try:

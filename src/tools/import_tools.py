@@ -8,22 +8,142 @@ import json
 import logging
 import os
 import re
-import uuid
+import time
+from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
+from uuid import UUID
 
 import aiofiles
+from sqlalchemy import select
 
 from .core import tool
+from ..memory.database import get_db_session
+from ..memory.models.story import (
+    StoryCharacter,
+    StoryEpisode,
+    StoryNote,
+    StoryWork,
+    StoryWorkCharacter,
+)
+from ..services.story_studio import StoryEpisodeService
+from ..llm.conversation_context import normalize_usage, persist_usage_sync
+from ..services.outbound_privacy_service import (
+    OutboundPrivacyGateway,
+    PrivacyError,
+    get_privacy_policy_context,
+)
+from ..services.turn_context import get_turn_context
 
 logger = logging.getLogger(__name__)
+
+
+def persist_usage_sync(*args, **kwargs):
+    """Lazy usage persistence avoids importing database services eagerly."""
+
+    from ..llm.conversation_context import persist_usage_sync as _persist
+
+    return bool(_persist(*args, **kwargs))
+
+_RECORDED_IMPORT_RESPONSES: list[object] = []
+
+
+def _usage_client(context=None):
+    """Return a persist_usage_sync-compatible context for import tools."""
+
+    if context is not None and (
+        hasattr(context, "current_session_id")
+        or hasattr(context, "current_project_id")
+        or callable(getattr(context, "_get_session_user_id", None))
+    ):
+        return context
+    try:
+        from ..services.turn_context import get_turn_context
+
+        turn = get_turn_context()
+    except Exception:
+        turn = None
+
+    def _value(name, default=None):
+        if isinstance(context, Mapping):
+            value = context.get(name)
+            if value is not None:
+                return value
+        value = getattr(context, name, None)
+        if value is not None:
+            return value
+        return getattr(turn, name, default) if turn is not None else default
+
+    user_id = _value("user_id")
+    return SimpleNamespace(
+        current_session_id=_value("current_session_id", _value("session_id")),
+        current_project_id=_value("current_project_id", _value("project_id")),
+        character_name=_value("character_name"),
+        _get_session_user_id=lambda: user_id,
+    )
+
+
+def _mark_response_recorded(response: object) -> bool:
+    try:
+        if getattr(response, "_aoitalk_usage_recorded", False):
+            return True
+        object.__setattr__(response, "_aoitalk_usage_recorded", True)
+        return False
+    except Exception:
+        if any(item is response for item in _RECORDED_IMPORT_RESPONSES):
+            return True
+        _RECORDED_IMPORT_RESPONSES.append(response)
+        del _RECORDED_IMPORT_RESPONSES[:-16]
+        return False
+
+
+def _record_import_usage(
+    response,
+    *,
+    usage_context=None,
+    model: str | None = None,
+    started: float | None = None,
+) -> bool:
+    raw_usage = response.get("usage") if isinstance(response, Mapping) else getattr(response, "usage", None)
+    if raw_usage is None:
+        return False
+    usage = normalize_usage(
+        raw_usage,
+        provider="openai",
+        resolved_model=(
+            response.get("model") if isinstance(response, Mapping) else getattr(response, "model", None)
+        ),
+    )
+    if usage.get("input_tokens") is None and usage.get("output_tokens") is None:
+        return False
+    if _mark_response_recorded(response):
+        return False
+    try:
+        persist_usage_sync(
+            _usage_client(usage_context),
+            provider="openai",
+            model=str(model or "gpt-5.6-luna"),
+            usage=usage,
+            request_type="import",
+            latency_ms=(
+                max(0, int((time.monotonic() - started) * 1000))
+                if started is not None
+                else 0
+            ),
+            is_streaming=False,
+        )
+        return True
+    except Exception:
+        logger.debug("インポートLLMのusage記録に失敗しました", exc_info=True)
+        return False
 
 # ────────────────────────────────────────────
 # LLM抽出ヘルパー
 # ────────────────────────────────────────────
 
 
-async def _llm_extract(prompt: str, text: str) -> str:
+async def _llm_extract(prompt: str, text: str, usage_context=None) -> str:
     """LLMを使ってテキストから構造化データを抽出する。
 
     OpenAI APIを直接使用（抽出用なので軽量モデル）。
@@ -35,14 +155,124 @@ async def _llm_extract(prompt: str, text: str) -> str:
         raise RuntimeError("OPENAI_API_KEY が設定されていません")
 
     client = AsyncOpenAI(api_key=api_key)
-    response = await client.responses.create(
-        model="gpt-4o-mini",
-        instructions=prompt,
-        input=text[:8000],
-        temperature=0.1,
-        text={"format": {"type": "json_object"}},
+    started = time.monotonic()
+    inherited = get_privacy_policy_context()
+
+    def _value(name: str, *aliases: str):
+        keys = (name, *aliases)
+        if isinstance(usage_context, Mapping):
+            for key in keys:
+                value = usage_context.get(key)
+                if value is not None:
+                    return value
+        for key in keys:
+            value = getattr(usage_context, key, None)
+            if value is not None:
+                return value
+        return None
+
+    privacy_config = _value("config", "privacy_config")
+    if privacy_config is None:
+        try:
+            from ..config import Config
+
+            privacy_config = Config()
+        except Exception as exc:
+            raise PrivacyError(
+                "インポート抽出のプライバシー設定を解決できないため生成を停止しました"
+            ) from exc
+    try:
+        turn = get_turn_context()
+    except Exception:
+        turn = None
+    session_context = _value("session_context", "privacy_context")
+    project_metadata = _value("project_metadata", "project_context")
+    if not isinstance(session_context, Mapping):
+        session_context = inherited.session_context
+    if not isinstance(project_metadata, Mapping):
+        project_metadata = inherited.project_metadata
+    user_id = _value("user_id", "session_user_id") or getattr(turn, "user_id", None)
+    session_id = _value("current_session_id", "session_id") or getattr(
+        turn, "session_id", None
     )
-    return getattr(response, "output_text", "") or ""
+    gateway = OutboundPrivacyGateway(
+        privacy_config,
+        user_id=str(user_id or ""),
+        session_id=str(session_id or ""),
+        session_context=session_context if isinstance(session_context, Mapping) else None,
+        project_metadata=project_metadata if isinstance(project_metadata, Mapping) else None,
+    )
+    def _config_value(key: str, default: Any = None) -> Any:
+        getter = getattr(privacy_config, "get", None)
+        if callable(getter):
+            try:
+                value = getter(key, default)
+            except TypeError:
+                value = getter(key)
+            if value is not None:
+                return value
+        if isinstance(privacy_config, Mapping):
+            current: Any = privacy_config
+            for part in key.split("."):
+                if not isinstance(current, Mapping) or part not in current:
+                    return default
+                current = current[part]
+            return current
+        return default
+
+    model = str(
+        _config_value("llm_model", "")
+        or _config_value("openai.model", "")
+        or "gpt-5.6-luna"
+    ).strip()
+    model_leaf = model.lower().rsplit("/", 1)[-1]
+    effort = str(_config_value("openai.reasoning_effort", "") or "").strip().lower()
+    if not effort and model_leaf.startswith("gpt-5.6-luna"):
+        effort = "max"
+    try:
+        from ..services.llm_model_catalog import reasoning_effort_options_for_model
+
+        if effort not in reasoning_effort_options_for_model("openai", model):
+            effort = ""
+    except Exception:
+        effort = ""
+
+    try:
+        request_kwargs = {
+            "model": model,
+            "instructions": prompt,
+            "input": text[:8000],
+            "text": {"format": {"type": "json_object"}},
+        }
+        if effort:
+            # Reasoning models reject the legacy temperature control; carry
+            # the configured effort through the Responses payload instead.
+            request_kwargs["reasoning"] = {"effort": effort, "summary": "auto"}
+        else:
+            request_kwargs["temperature"] = 0.1
+        protected = await gateway.protect(
+            request_kwargs,
+            provider="openai",
+            base_url=str(getattr(client, "base_url", "") or ""),
+            source_kind="import_model_request",
+        )
+        response = await client.responses.create(
+            **protected.payload
+        )
+        _record_import_usage(
+            response,
+            usage_context=usage_context,
+            model=model,
+            started=started,
+        )
+        return gateway.restore(getattr(response, "output_text", "") or "")
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                await close()
+            except Exception:
+                pass
 
 
 # ────────────────────────────────────────────
@@ -228,14 +458,53 @@ async def analyze_import_files(directory_path: str) -> str:
         return f"ディレクトリ分析中にエラーが発生しました: {e}"
 
 
+async def _save_story_characters(work_id: str, payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """抽出済み payload を Story の共有キャラ + 作品参加へ保存する。"""
+
+    async with await get_db_session() as session:
+        work = await session.get(StoryWork, UUID(str(work_id)))
+        if work is None:
+            raise ValueError("作品が見つかりません")
+        result: list[dict[str, Any]] = []
+        for index, payload in enumerate(payloads):
+            name = str(payload.get("name") or "").strip()
+            if not name:
+                continue
+            character = StoryCharacter(
+                user_id=work.user_id,
+                name=name,
+                aliases=list(payload.get("aliases") or []),
+                summary=payload.get("summary") or payload.get("personality_summary"),
+                description=payload.get("description"),
+                notes=payload.get("notes"),
+                ai_mode=payload.get("ai_mode") or "keyword",
+                keywords=list(payload.get("keywords") or []),
+            )
+            session.add(character)
+            await session.flush()
+            role = payload.get("role")
+            role_note = str(role) if role else None
+            session.add(
+                StoryWorkCharacter(
+                    work_id=work.id,
+                    character_id=character.id,
+                    role_note=role_note,
+                    position=float(payload.get("sort_order", index) or index),
+                )
+            )
+            result.append(character.to_dict())
+        await session.commit()
+        return result
+
+
 @tool
 async def import_file_as_character(
-    scenario_id: str, file_path: str, llm_extract: bool = True
+    work_id: str, file_path: str, llm_extract: bool = True
 ) -> str:
-    """ファイルからキャラクター設定を抽出してScenarioCharacterに追加する。
+    """ファイルからキャラクター設定を抽出して StoryCharacter に追加する。
 
     Args:
-        scenario_id: インポート先のシナリオID
+        work_id: インポート先の StoryWork ID
         file_path: インポートするファイルのパス
         llm_extract: LLMを使って構造化データを抽出するかどうか（デフォルト: True）
 
@@ -258,7 +527,6 @@ async def import_file_as_character(
         if not content.strip():
             return f"エラー: ファイルが空です: {file_path}"
 
-        from ..services.scenario_service import add_scenario_character
         from ..services.screenplay_character_import import build_character_payloads
 
         if path.name == "キャラ倉庫.md":
@@ -266,10 +534,8 @@ async def import_file_as_character(
             if not payloads:
                 return f"エラー: キャラ倉庫からキャラクターを抽出できませんでした: {file_path}"
 
-            imported_names = []
-            for payload in payloads:
-                result = await add_scenario_character(scenario_id, payload)
-                imported_names.append(result.get("name", payload["name"]))
+            saved = await _save_story_characters(work_id, payloads)
+            imported_names = [item.get("name", "") for item in saved]
 
             return (
                 f"キャラ倉庫から{len(imported_names)}件のキャラクターを"
@@ -305,7 +571,7 @@ async def import_file_as_character(
                     "description": content,
                 }
 
-            # ScenarioCharacterに変換
+            # StoryCharacter に変換
             name = extracted.get("name", "") or path.stem
             role_map = {
                 "protagonist": "npc",
@@ -363,9 +629,11 @@ async def import_file_as_character(
                 "description": content,
             }
 
-        result = await add_scenario_character(scenario_id, char_data)
-        char_name = result.get("name", "不明")
-        return f"キャラクター「{char_name}」をシナリオにインポートしました。(ID: {result.get('id', '?')})"
+        saved = await _save_story_characters(work_id, [char_data])
+        if not saved:
+            return "エラー: キャラクター名が空です"
+        char_name = saved[0].get("name", "不明")
+        return f"キャラクター「{char_name}」を作品にインポートしました。(ID: {saved[0].get('id', '?')})"
 
     except Exception as e:
         logger.error("キャラクターインポートエラー: %s", e)
@@ -374,12 +642,12 @@ async def import_file_as_character(
 
 @tool
 async def import_file_as_lore(
-    scenario_id: str, file_path: str, category: str = "established"
+    work_id: str, file_path: str, category: str = "established"
 ) -> str:
-    """ファイルから世界設定を抽出してCanonエントリに追加する。
+    """ファイルから世界設定を抽出して StoryNote に追加する。
 
     Args:
-        scenario_id: インポート先のシナリオID
+        work_id: インポート先の StoryWork ID
         file_path: インポートするファイルのパス
         category: デフォルトカテゴリ（geography, timeline, magic, character_facts, political, cultural, established）
 
@@ -438,12 +706,11 @@ async def import_file_as_lore(
         if not facts:
             return f"ファイルから確定事実を抽出できませんでした: {file_path}"
 
-        # Canon エントリに追加
-        from ..memory.database import get_db_session
-        from ..models.ecc_models import ScenarioCanonEntry
-
         added_count = 0
         async with await get_db_session() as session:
+            work = await session.get(StoryWork, UUID(str(work_id)))
+            if work is None:
+                return "エラー: 作品が見つかりません"
             for fact_data in facts:
                 if not isinstance(fact_data, dict):
                     continue
@@ -451,11 +718,13 @@ async def import_file_as_lore(
                 if not fact_text:
                     continue
 
-                entry = ScenarioCanonEntry(
-                    id=uuid.uuid4(),
-                    scenario_id=uuid.UUID(str(scenario_id)),
-                    category=fact_data.get("category", category),
-                    fact=fact_text,
+                entry = StoryNote(
+                    work_id=work.id,
+                    title=str(fact_data.get("category", category) or category),
+                    content=fact_text,
+                    ai_mode="always",
+                    keywords=[],
+                    position=float(added_count),
                 )
                 session.add(entry)
                 added_count += 1
@@ -464,7 +733,7 @@ async def import_file_as_lore(
 
         return (
             f"ファイル「{path.name}」から {added_count} 件の確定事実を"
-            f"Canonにインポートしました。"
+            f"StoryNote にインポートしました。"
         )
 
     except ImportError as e:
@@ -477,14 +746,14 @@ async def import_file_as_lore(
 
 @tool
 async def import_file_as_scene(
-    scenario_id: str, file_path: str, episode_id: Optional[str] = None
+    work_id: str, file_path: str, episode_id: Optional[str] = None
 ) -> str:
-    """ファイルからシーンを作成してシナリオに追加する。
+    """ファイルから StoryEpisode を作成して作品に追加する。
 
     Args:
-        scenario_id: インポート先のシナリオID
+        work_id: インポート先の StoryWork ID
         file_path: インポートするファイルのパス
-        episode_id: 紐づけるエピソードID（省略可）
+        episode_id: 続き元エピソードID（省略可）
 
     Returns:
         インポート結果のメッセージ
@@ -537,57 +806,32 @@ scene_type は以下から選んでください:
             scene_type = "normal"
             description = ""
 
-        # シーンタイプのバリデーション
-        valid_types = {"normal", "combat", "dialogue", "cutscene"}
-        if scene_type not in valid_types:
-            scene_type = "normal"
-
-        from ..services.scenario_service import add_scenario_scene
-
-        # sort_orderを計算（既存シーンの末尾に追加）
-        from ..services.scenario_service import get_scenario
-
-        scenario_data = await get_scenario(scenario_id, include_children=True)
-        existing_scenes = scenario_data.get("scenes", [])
-        max_order = max((s.get("sort_order", 0) for s in existing_scenes), default=-1)
-
-        scene_data: Dict[str, Any] = {
-            "title": title,
-            "description": description,
-            "scene_type": scene_type,
-            "sort_order": max_order + 1,
-        }
-
-        result = await add_scenario_scene(scenario_id, scene_data)
-        scene_id = result.get("id", "?")
-
-        # シーンのcontentを保存
-        try:
-            from ..services.scenario_service import save_scene_content
-
-            await save_scene_content(
-                scene_id=scene_id,
-                content=content,
-                create_version=False,
+        async with await get_db_session() as session:
+            work = await session.get(StoryWork, UUID(str(work_id)))
+            if work is None:
+                return "エラー: 作品が見つかりません"
+            episodes = list((await session.scalars(
+                select(StoryEpisode).where(StoryEpisode.work_id == work.id)
+            )).all())
+            sort_hint = max((float(item.sort_hint or 0) for item in episodes), default=-1) + 1
+            episode = await StoryEpisodeService(session).create(
+                work,
+                {
+                    "title": title,
+                    "plot": description,
+                    "body": content,
+                    "status": "draft",
+                    "sort_hint": sort_hint,
+                },
+                after_episode_id=UUID(str(episode_id)) if episode_id else None,
             )
-        except ImportError:
-            # scenario_serviceの保存ヘルパーが使えない場合、直接DBに保存
-            try:
-                from ..memory.database import get_db_session
-                from ..models.ecc_models import ScenarioScene
-
-                async with await get_db_session() as session:
-                    scene = await session.get(ScenarioScene, uuid.UUID(str(scene_id)))
-                    if scene and hasattr(scene, "content"):
-                        scene.content = content
-                        await session.commit()
-            except Exception as e:
-                logger.warning("シーンcontent保存フォールバックも失敗: %s", e)
+            await session.commit()
+            episode_id_result = str(episode.id)
 
         char_count = len(content)
         return (
-            f"シーン「{title}」（{scene_type}）をシナリオにインポートしました。"
-            f"（{char_count:,}文字、ID: {scene_id}）"
+            f"エピソード「{title}」を作品にインポートしました。"
+            f"（{char_count:,}文字、ID: {episode_id_result}）"
         )
 
     except Exception as e:

@@ -1,7 +1,8 @@
 """WebSocket 接続管理 (server.py から移設)"""
 
+import asyncio
 import logging
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 
 from fastapi import WebSocket
 
@@ -22,6 +23,25 @@ class ConnectionManager:
         # Per-user sessions for multi-user support
         # Maps user_id -> WebSession (when WEB_SESSION_AVAILABLE)
         self.user_sessions: Dict[str, Any] = {}
+        self._authorization_checker: Optional[
+            Callable[[WebSocket], Awaitable[bool]]
+        ] = None
+        self._admin_role_checker: Optional[
+            Callable[[WebSocket], Awaitable[bool]]
+        ] = None
+        self._owner_loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def set_authorization_checker(
+        self, checker: Optional[Callable[[WebSocket], Awaitable[bool]]]
+    ) -> None:
+        """Set the callback used to revalidate authenticated push recipients."""
+        self._authorization_checker = checker
+
+    def set_admin_role_checker(
+        self, checker: Optional[Callable[[WebSocket], Awaitable[bool]]]
+    ) -> None:
+        """Set the callback used to evaluate admin role at push time."""
+        self._admin_role_checker = checker
 
     async def connect(
         self,
@@ -29,13 +49,17 @@ class ConnectionManager:
         *,
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        is_admin: bool = False,
+        include_shared_history: bool = True,
     ) -> None:
         """Accept new WebSocket connection"""
         await websocket.accept()
+        self._owner_loop = asyncio.get_running_loop()
         self.active_connections.add(websocket)
         self.connection_contexts[websocket] = {
             "user_id": user_id,
             "session_id": session_id,
+            "is_admin": is_admin,
         }
         if session_id:
             self._latest_session_id = session_id
@@ -44,18 +68,48 @@ class ConnectionManager:
         )
 
         # Send chat history to new client
-        await websocket.send_json({"type": "chat_history", "data": self.chat_history})
+        if include_shared_history:
+            await websocket.send_json({"type": "chat_history", "data": self.chat_history})
+        else:
+            # Authenticated clients load only their authorized session through
+            # the HTTP conversation API. Never replay the legacy global buffer.
+            await websocket.send_json({"type": "chat_history", "data": []})
 
     def disconnect(self, websocket: WebSocket) -> None:
         """Remove WebSocket connection"""
         context = self.connection_contexts.get(websocket, {})
         self.active_connections.discard(websocket)
         self.connection_contexts.pop(websocket, None)
+        if not self.active_connections:
+            self._owner_loop = None
         if context.get("session_id") == self._latest_session_id:
             self._latest_session_id = self._resolve_any_active_session_id()
         logger.info(
             f"Client disconnected. Total connections: {len(self.active_connections)}"
         )
+
+    async def disconnect_user(self, user_id: str, code: int = 1008) -> None:
+        """Close every WebSocket owned by a user on the socket owner loop."""
+        current_loop = asyncio.get_running_loop()
+        owner_loop = self._owner_loop
+        if owner_loop and owner_loop.is_running() and owner_loop is not current_loop:
+            future = asyncio.run_coroutine_threadsafe(
+                self._disconnect_user_on_owner_loop(user_id, code), owner_loop
+            )
+            await asyncio.wrap_future(future)
+            return
+        await self._disconnect_user_on_owner_loop(user_id, code)
+
+    async def _disconnect_user_on_owner_loop(self, user_id: str, code: int) -> None:
+        for connection in list(self.active_connections):
+            context = self.connection_contexts.get(connection, {})
+            if str(context.get("user_id")) != str(user_id):
+                continue
+            try:
+                await connection.close(code=code)
+            except Exception:
+                pass
+            self.disconnect(connection)
 
     def _resolve_any_active_session_context(self) -> Optional[Dict[str, Optional[str]]]:
         for context in self.connection_contexts.values():
@@ -91,21 +145,69 @@ class ConnectionManager:
         *,
         session_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        admin_only: bool = False,
     ) -> None:
         """Send message to matching connected clients."""
+        current_loop = asyncio.get_running_loop()
+        owner_loop = self._owner_loop
+        if owner_loop and owner_loop.is_running() and owner_loop is not current_loop:
+            future = asyncio.run_coroutine_threadsafe(
+                self._broadcast_on_owner_loop(
+                    message,
+                    session_id=session_id,
+                    user_id=user_id,
+                    admin_only=admin_only,
+                ),
+                owner_loop,
+            )
+            await asyncio.wrap_future(future)
+            return
+        await self._broadcast_on_owner_loop(
+            message,
+            session_id=session_id,
+            user_id=user_id,
+            admin_only=admin_only,
+        )
+
+    async def _broadcast_on_owner_loop(
+        self,
+        message: dict,
+        *,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        admin_only: bool = False,
+    ) -> None:
+        """Broadcast while running on the loop that owns WebSocket objects."""
         target_session_id = session_id
         if target_session_id is None:
             target_session_id = message.get("session_id")
         if target_session_id is None and isinstance(message.get("data"), dict):
             target_session_id = message["data"].get("session_id")
         disconnected = []
-        for connection in self.active_connections:
+        for connection in list(self.active_connections):
             context = self.connection_contexts.get(connection, {})
+            if admin_only:
+                if self._admin_role_checker is None:
+                    logger.error(
+                        "admin_only broadcast requested without admin_role_checker"
+                    )
+                    continue
+                if not await self._admin_role_checker(connection):
+                    continue
             if target_session_id and context.get("session_id") != target_session_id:
                 continue
             if user_id and context.get("user_id") != user_id:
                 continue
             try:
+                if self._authorization_checker is not None and not await self._authorization_checker(
+                    connection
+                ):
+                    try:
+                        await connection.close(code=1008)
+                    except Exception:
+                        pass
+                    disconnected.append(connection)
+                    continue
                 await connection.send_json(message)
             except (OSError, ConnectionError) as e:
                 logger.info(f"Client connection lost during broadcast: {e}")

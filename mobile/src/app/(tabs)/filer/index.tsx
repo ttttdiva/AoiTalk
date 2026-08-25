@@ -3,12 +3,10 @@ import {
   Alert,
   BackHandler,
   FlatList,
-  Image,
-  type LayoutChangeEvent,
   Modal,
-  PanResponder,
   Pressable,
   RefreshControl,
+  ScrollView,
   StyleSheet,
   View,
 } from "react-native";
@@ -34,7 +32,7 @@ import {
   Text,
   TextInput,
 } from "react-native-paper";
-import { useFocusEffect } from "expo-router";
+import { useFocusEffect, useRouter } from "expo-router";
 import { useAuth } from "../../../contexts/AuthContext";
 import { useProject } from "../../../contexts/ProjectContext";
 import { useProjectStore } from "../../../stores/project";
@@ -42,12 +40,12 @@ import {
   filesApi,
   formatDisplayPath,
   getFilesMediaKind,
+  type FilesBookmarkScope,
   type FilesBookmark,
   type FilesEntry,
   type FilesScope,
   type FilesSource,
   getParentPath,
-  isTextEntry,
 } from "../../../lib/files-api";
 import {
   filesLocationCache,
@@ -60,500 +58,45 @@ import {
   loadAudioPlayerSettings,
   type AudioPlayerSettings,
 } from "../../../lib/audio-player-settings";
+import {
+  isServerKnownUnreachable,
+  useNetworkStore,
+} from "../../../stores/network";
 import { ScreenHeader } from "../../../components/screen-header";
+import {
+  SOURCE_LABELS,
+  SCOPE_LABELS,
+  formatScopedServerPath,
+  formatTime,
+  initialHistories,
+  initialLocationMetas,
+  initialPaths,
+  isAudioEntry,
+  isViewableMedia,
+  locationKey,
+  resolveFilesOpenKind,
+  sortAudioEntries,
+  type AudioState,
+  type ClipboardOperation,
+  type ClipboardState,
+  type HistoryState,
+  type LocationKey,
+  type LocationMetaState,
+  type LocationState,
+  type ViewMode,
+} from "../../../features/files/file-browser-model";
+import {
+  FileMetadata,
+  FileThumbnail,
+} from "../../../features/files/file-thumbnail";
+import { ZoomableImage } from "../../../features/files/zoomable-image";
+import { FileNameDialog } from "../../../features/files/file-name-dialog";
+import { filesTextEditorParams } from "../../../features/files/files-text-editor-route";
 
-const SOURCE_LABELS: Record<FilesSource, string> = {
-  local: "ローカル",
-  server: "サーバー",
-};
-
-const SCOPE_LABELS: Record<FilesScope, string> = {
-  workspace: "ワークスペース",
-  user: "ユーザー",
-};
-
-const FILE_ICONS: Record<string, string> = {
-  directory: "folder",
-  image: "file-image-outline",
-  video: "file-video-outline",
-  audio: "file-music-outline",
-  pdf: "file-pdf-box",
-  text: "file-document-edit-outline",
-  default: "file-outline",
-};
-
-type LocationKey = `${FilesSource}:${FilesScope}`;
-type LocationState = Record<LocationKey, string>;
-type HistoryState = Record<LocationKey, string[]>;
-type LocationMeta = {
-  parentPath: string | null;
-  canGoUp: boolean;
-  isAdminMode: boolean;
-};
-type LocationMetaState = Record<LocationKey, LocationMeta>;
-type ClipboardOperation = "copy" | "move";
-type ClipboardState = {
-  operation: ClipboardOperation;
-  entry: FilesEntry;
-  source: FilesSource;
-  scope: FilesScope;
-  // サーバー・ワークスペースでコピー／移動対象にした時点のプロジェクトルート。
-  // 別プロジェクトへ切り替えた後の貼り付けを防ぐために保持する。
-  projectRoot: string | null;
-};
-type ViewMode = "grid" | "list";
 type MediaSource = Awaited<ReturnType<typeof filesApi.getMediaSource>>;
-type AudioState = {
-  track: FilesEntry | null;
-  playlist: FilesEntry[];
-  index: number;
-  scope: FilesScope;
-  rootPath: string;
-  loading: boolean;
-  playing: boolean;
-  positionMillis: number;
-  durationMillis: number;
-};
-
-const initialPaths: LocationState = {
-  "local:workspace": "",
-  "local:user": "",
-  "server:workspace": "",
-  "server:user": "",
-};
-
-const initialHistories: HistoryState = {
-  "local:workspace": [],
-  "local:user": [],
-  "server:workspace": [],
-  "server:user": [],
-};
-
-const initialLocationMetas: LocationMetaState = {
-  "local:workspace": { parentPath: null, canGoUp: false, isAdminMode: false },
-  "local:user": { parentPath: null, canGoUp: false, isAdminMode: false },
-  "server:workspace": { parentPath: null, canGoUp: false, isAdminMode: false },
-  "server:user": { parentPath: null, canGoUp: false, isAdminMode: false },
-};
-
-function locationKey(source: FilesSource, scope: FilesScope): LocationKey {
-  return `${source}:${scope}`;
-}
-
-function getFileIcon(entry: FilesEntry): string {
-  if (entry.type === "directory") return FILE_ICONS.directory;
-  const kind = getFilesMediaKind(entry);
-  if (kind === "image") return FILE_ICONS.image;
-  if (kind === "video") return FILE_ICONS.video;
-  if (kind === "audio") return FILE_ICONS.audio;
-  if (kind === "pdf") return FILE_ICONS.pdf;
-  if (isTextEntry(entry)) return FILE_ICONS.text;
-  return FILE_ICONS.default;
-}
-
-function formatSize(bytes?: number): string {
-  if (!bytes) return "";
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024)
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-}
-
-function formatScopedServerPath(path: string, rootPath: string): string {
-  if (!path || path === rootPath) return "/";
-  if (path === "__drives__") return "/drives";
-  if (/^[A-Za-z]:[\\/]/.test(path)) return path.replace(/\\/g, "/");
-  const normalizedRoot = rootPath.replace(/\/+$/, "");
-  const relative = normalizedRoot && path.startsWith(normalizedRoot)
-    ? path.slice(normalizedRoot.length).replace(/^\/+/, "")
-    : path.replace(/^\/+/, "");
-  return relative ? `/${relative}` : "/";
-}
-
-function formatTime(ms?: number): string {
-  if (!ms || ms < 0) return "0:00";
-  const totalSeconds = Math.floor(ms / 1000);
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
-}
-
-function isViewableMedia(entry: FilesEntry): boolean {
-  const kind = getFilesMediaKind(entry);
-  return kind === "image" || kind === "video";
-}
-
-function isAudioEntry(entry: FilesEntry): boolean {
-  return getFilesMediaKind(entry) === "audio";
-}
-
-function sortAudioEntries(entries: FilesEntry[]): FilesEntry[] {
-  const seen = new Set<string>();
-  return entries
-    .filter((entry) => {
-      if (seen.has(entry.path)) return false;
-      seen.add(entry.path);
-      return true;
-    })
-    .sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true }));
-}
-
-function FileThumbnail({
-  entry,
-  size,
-}: {
-  entry: FilesEntry;
-  size: number;
-}) {
-  const [source, setSource] = useState<MediaSource | null>(null);
-  const [failed, setFailed] = useState(false);
-  const kind = getFilesMediaKind(entry);
-
-  useEffect(() => {
-    let cancelled = false;
-    setFailed(false);
-    setSource(null);
-    if (entry.type === "directory" || (kind !== "image" && kind !== "video")) {
-      return () => {
-        cancelled = true;
-      };
-    }
-    void filesApi
-      .getMediaSource(entry, { thumbnail: true, size: Math.max(160, size * 2) })
-      .then((nextSource) => {
-        if (!cancelled) setSource(nextSource);
-      })
-      .catch(() => {
-        if (!cancelled) setFailed(true);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [entry, kind, size]);
-
-  if (entry.type === "directory" || !source || failed) {
-    return (
-      <View
-        style={[
-          styles.thumbnailFallback,
-          { width: size, height: size },
-          entry.type === "directory" ? styles.thumbnailFolder : null,
-        ]}
-      >
-        <IconButton
-          icon={getFileIcon(entry)}
-          iconColor={entry.type === "directory" ? "#f9e2af" : "#89b4fa"}
-          size={Math.min(44, size * 0.38)}
-          style={styles.thumbnailIcon}
-        />
-      </View>
-    );
-  }
-
-  return (
-    <View style={[styles.thumbnailFrame, { width: size, height: size }]}>
-      <Image
-        source={source}
-        style={styles.thumbnailImage}
-        resizeMode="cover"
-        onError={() => setFailed(true)}
-      />
-      {kind === "video" ? (
-        <View style={styles.videoBadge}>
-          <IconButton
-            icon="play"
-            iconColor="#ffffff"
-            size={16}
-            style={styles.videoBadgeIcon}
-          />
-        </View>
-      ) : null}
-    </View>
-  );
-}
-
-function FileMetadata({
-  entry,
-  grid = false,
-}: {
-  entry: FilesEntry;
-  grid?: boolean;
-}) {
-  const [size, setSize] = useState(entry.size);
-
-  useEffect(() => {
-    let cancelled = false;
-    setSize(entry.size);
-    if (entry.type === "file") {
-      void filesApi.getMetadata(entry).then((metadata) => {
-        if (!cancelled) setSize(metadata.size);
-      });
-    }
-    return () => {
-      cancelled = true;
-    };
-  }, [entry]);
-
-  return (
-    <Text style={grid ? styles.gridFileMeta : styles.fileMeta} numberOfLines={1}>
-      {entry.type === "directory"
-        ? "フォルダー"
-        : grid
-          ? formatSize(size)
-          : `${entry.mimeType || "ファイル"}${size ? ` ・ ${formatSize(size)}` : ""}`}
-    </Text>
-  );
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
-
-function touchDistance(touches: Array<{ pageX: number; pageY: number }>): number {
-  if (touches.length < 2) return 0;
-  const [first, second] = touches;
-  return Math.hypot(second.pageX - first.pageX, second.pageY - first.pageY);
-}
-
-function ZoomableImage({
-  source,
-  onError,
-  onSwipeLeft,
-  onSwipeRight,
-}: {
-  source: MediaSource;
-  onError: () => void;
-  onSwipeLeft: () => void;
-  onSwipeRight: () => void;
-}) {
-  const [scale, setScale] = useState(1);
-  const [translate, setTranslate] = useState({ x: 0, y: 0 });
-  const [viewport, setViewport] = useState({ width: 1, height: 1 });
-  const scaleRef = useRef(1);
-  const translateRef = useRef({ x: 0, y: 0 });
-  const gestureRef = useRef({
-    startDistance: 0,
-    startScale: 1,
-    startX: 0,
-    startY: 0,
-    startTranslateX: 0,
-    startTranslateY: 0,
-  });
-
-  const clampTranslate = useCallback(
-    (nextScale: number, x: number, y: number) => {
-      if (nextScale <= 1) return { x: 0, y: 0 };
-      const maxX = (viewport.width * (nextScale - 1)) / 2;
-      const maxY = (viewport.height * (nextScale - 1)) / 2;
-      return {
-        x: clamp(x, -maxX, maxX),
-        y: clamp(y, -maxY, maxY),
-      };
-    },
-    [viewport.height, viewport.width],
-  );
-
-  const applyTransform = useCallback(
-    (nextScale: number, x: number, y: number) => {
-      const boundedScale = clamp(nextScale, 1, 5);
-      const boundedTranslate = clampTranslate(boundedScale, x, y);
-      scaleRef.current = boundedScale;
-      translateRef.current = boundedTranslate;
-      setScale(boundedScale);
-      setTranslate(boundedTranslate);
-    },
-    [clampTranslate],
-  );
-
-  const resetZoom = useCallback(() => {
-    applyTransform(1, 0, 0);
-  }, [applyTransform]);
-
-  useEffect(() => {
-    resetZoom();
-  }, [resetZoom, source.uri]);
-
-  const panResponder = useMemo(
-    () =>
-      PanResponder.create({
-        onStartShouldSetPanResponder: (event) =>
-          event.nativeEvent.touches.length >= 2 || scaleRef.current > 1,
-        onMoveShouldSetPanResponder: (event, gesture) =>
-          event.nativeEvent.touches.length >= 2 ||
-          (scaleRef.current > 1 &&
-            (Math.abs(gesture.dx) > 2 || Math.abs(gesture.dy) > 2)) ||
-          (scaleRef.current <= 1 &&
-            Math.abs(gesture.dx) > 12 &&
-            Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.4),
-        onPanResponderGrant: (event) => {
-          const touches = event.nativeEvent.touches;
-          gestureRef.current = {
-            startDistance: touchDistance(touches),
-            startScale: scaleRef.current,
-            startX: touches[0]?.pageX ?? 0,
-            startY: touches[0]?.pageY ?? 0,
-            startTranslateX: translateRef.current.x,
-            startTranslateY: translateRef.current.y,
-          };
-        },
-        onPanResponderMove: (event, gesture) => {
-          const touches = event.nativeEvent.touches;
-          const gestureStart = gestureRef.current;
-
-          if (touches.length >= 2 && gestureStart.startDistance > 0) {
-            const ratio = touchDistance(touches) / gestureStart.startDistance;
-            applyTransform(
-              gestureStart.startScale * ratio,
-              gestureStart.startTranslateX,
-              gestureStart.startTranslateY,
-            );
-            return;
-          }
-
-          if (scaleRef.current > 1) {
-            applyTransform(
-              scaleRef.current,
-              gestureStart.startTranslateX + gesture.dx,
-              gestureStart.startTranslateY + gesture.dy,
-            );
-          }
-        },
-        onPanResponderRelease: (_, gesture) => {
-          if (scaleRef.current <= 1.03) {
-            if (
-              Math.abs(gesture.dx) > 50 &&
-              Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.4
-            ) {
-              if (gesture.dx < 0) onSwipeLeft();
-              else onSwipeRight();
-              return;
-            }
-            resetZoom();
-            return;
-          }
-          if (Math.abs(gesture.dx) < 6 && Math.abs(gesture.dy) < 6) {
-            return;
-          }
-          const currentScale = scaleRef.current;
-          const currentTranslate = translateRef.current;
-          applyTransform(currentScale, currentTranslate.x, currentTranslate.y);
-        },
-        onPanResponderTerminationRequest: () => false,
-      }),
-    [applyTransform, onSwipeLeft, onSwipeRight, resetZoom],
-  );
-
-  const handleLayout = (event: LayoutChangeEvent) => {
-    const { width, height } = event.nativeEvent.layout;
-    setViewport({ width: Math.max(1, width), height: Math.max(1, height) });
-  };
-
-  return (
-    <Pressable
-      style={styles.zoomSurface}
-      onLayout={handleLayout}
-      onLongPress={resetZoom}
-      {...panResponder.panHandlers}
-    >
-      <Image
-        source={source}
-        style={[
-          styles.viewerImage,
-          {
-            transform: [
-              { translateX: translate.x },
-              { translateY: translate.y },
-              { scale },
-            ],
-          },
-        ]}
-        resizeMode="contain"
-        onError={onError}
-      />
-    </Pressable>
-  );
-}
-
-type FileNameDialogProps = {
-  visible: boolean;
-  title: string;
-  label: string;
-  helperText?: string;
-  initialValue?: string;
-  submitLabel: string;
-  onDismiss: () => void;
-  onSubmit: (name: string) => void | Promise<void>;
-};
-
-function FileNameDialog({
-  visible,
-  title,
-  label,
-  helperText,
-  initialValue = "",
-  submitLabel,
-  onDismiss,
-  onSubmit,
-}: FileNameDialogProps) {
-  const [draft, setDraft] = useState(initialValue);
-  const [submitting, setSubmitting] = useState(false);
-
-  useEffect(() => {
-    if (visible) {
-      setDraft(initialValue);
-      setSubmitting(false);
-    }
-  }, [initialValue, visible]);
-
-  const trimmedDraft = draft.trim();
-
-  const submit = async () => {
-    if (!trimmedDraft || submitting) return;
-    setSubmitting(true);
-    try {
-      await onSubmit(trimmedDraft);
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <Dialog visible={visible} onDismiss={onDismiss} style={styles.dialog}>
-      <Dialog.Title style={styles.dialogTitle}>{title}</Dialog.Title>
-      <Dialog.Content>
-        {helperText ? (
-          <Text style={styles.dialogLabel} numberOfLines={2}>
-            {helperText}
-          </Text>
-        ) : null}
-        <TextInput
-          mode="outlined"
-          label={label}
-          value={draft}
-          onChangeText={setDraft}
-          style={styles.dialogInput}
-          autoCorrect={false}
-          autoCapitalize="none"
-        />
-      </Dialog.Content>
-      <Dialog.Actions>
-        <Button onPress={onDismiss} textColor="#a6adc8" disabled={submitting}>
-          キャンセル
-        </Button>
-        <Button
-          onPress={() => void submit()}
-          textColor="#7c3aed"
-          disabled={!trimmedDraft || submitting}
-        >
-          {submitLabel}
-        </Button>
-      </Dialog.Actions>
-    </Dialog>
-  );
-}
 
 export default function FilesScreen() {
+  const router = useRouter();
   const { isAuthenticated, user } = useAuth();
   const authScope = isAuthenticated
     ? `auth:${user?.user_id ?? "unknown"}`
@@ -568,10 +111,17 @@ export default function FilesScreen() {
   const projectsLoaded = useProjectStore((s) => s.loaded);
   const isAdmin = user?.role === "admin";
 
+  // Project selection is the canonical source of Space identity on mobile.
+  // Selecting a project clears selectedSpaceId in the legacy store, so retain
+  // the selected project's relation as a compatibility fallback while the
+  // store transition settles.
+  const effectiveSpaceId = selectedSpaceId ?? selectedProject?.space_id ?? null;
+
   const [projectMenuVisible, setProjectMenuVisible] = useState(false);
 
   const [source, setSource] = useState<FilesSource>("local");
-  const [scope, setScope] = useState<FilesScope>("workspace");
+  // ローカルは workspace 区分を廃止し user 固定。初期表示も user とする。
+  const [scope, setScope] = useState<FilesScope>("user");
   const [paths, setPaths] = useState<LocationState>(initialPaths);
   const [histories, setHistories] = useState<HistoryState>(initialHistories);
   const [locationMetas, setLocationMetas] =
@@ -589,7 +139,7 @@ export default function FilesScreen() {
   const [createFileVisible, setCreateFileVisible] = useState(false);
   const [createFolderVisible, setCreateFolderVisible] = useState(false);
   const [renameVisible, setRenameVisible] = useState(false);
-  const [editorVisible, setEditorVisible] = useState(false);
+  const [actionTarget, setActionTarget] = useState<FilesEntry | null>(null);
   const [viewerVisible, setViewerVisible] = useState(false);
   const [viewerFile, setViewerFile] = useState<FilesEntry | null>(null);
   const [viewerSource, setViewerSource] = useState<MediaSource | null>(null);
@@ -599,18 +149,14 @@ export default function FilesScreen() {
   const [videoLoading, setVideoLoading] = useState(false);
   const videoRef = useRef<VideoRef>(null);
   const audioRef = useRef<Audio.Sound | null>(null);
+  const audioRequestGenerationRef = useRef(0);
   const audioAdvancingRef = useRef(false);
   const audioEndedHandlerRef = useRef<() => void>(() => {});
 
   const [renameTarget, setRenameTarget] = useState<FilesEntry | null>(null);
-  const [editorTarget, setEditorTarget] = useState<FilesEntry | null>(null);
-  const [editorSessionKey, setEditorSessionKey] = useState(0);
-  const [editorInitialContent, setEditorInitialContent] = useState("");
-  const [editorContent, setEditorContent] = useState("");
-  const [editorLoading, setEditorLoading] = useState(false);
-  const [editorSaving, setEditorSaving] = useState(false);
   const [clipboard, setClipboard] = useState<ClipboardState | null>(null);
   const [transferring, setTransferring] = useState(false);
+  const [downloadingPath, setDownloadingPath] = useState<string | null>(null);
   const [audioState, setAudioState] = useState<AudioState>({
     track: null,
     playlist: [],
@@ -626,11 +172,43 @@ export default function FilesScreen() {
     useState<AudioPlayerSettings>(DEFAULT_AUDIO_PLAYER_SETTINGS);
   const activeRequestKeyRef = useRef<string | null>(null);
   const displayedRequestKeyRef = useRef<string | null>(null);
+  const bookmarkRequestGenerationRef = useRef(0);
+  const bookmarkScopeKeyRef = useRef<string | null>(null);
+
+  // サーバー一覧をオフラインキャッシュから表示している間の最終同期時刻。
+  // null の間はオンライン（もしくはローカル）で、書き込み操作を許可する。
+  const [staleCachedAt, setStaleCachedAt] = useState<string | null>(null);
+  const staleActive = staleCachedAt !== null;
+
+  const networkOnline = useNetworkStore((s) => s.online);
+  const networkServerReachable = useNetworkStore((s) => s.serverReachable);
+  const networkCheckedAt = useNetworkStore((s) => s.serverCheckedAt);
+  const isOffline = useMemo(
+    () => isServerKnownUnreachable() || !networkOnline,
+    // serverReachable / checkedAt の変化で再評価するため依存に含める。
+    [networkOnline, networkServerReachable, networkCheckedAt],
+  );
 
   const activeKey = locationKey(source, scope);
   const activePath = paths[activeKey];
   const activeHistory = histories[activeKey];
   const activeMeta = locationMetas[activeKey];
+
+  const bookmarkCollection = useMemo<FilesBookmarkScope | null>(() => {
+    if (!isAuthenticated) return null;
+    if (source === "server" && scope === "workspace") {
+      return effectiveSpaceId
+        ? { scope: "shared", spaceId: effectiveSpaceId }
+        : null;
+    }
+    return { scope: "personal" };
+  }, [effectiveSpaceId, isAuthenticated, scope, source]);
+  const bookmarkScopeKey = useMemo(() => {
+    if (!bookmarkCollection) return `${authScope}:none`;
+    return bookmarkCollection.scope === "shared"
+      ? `${authScope}:shared:${bookmarkCollection.spaceId}`
+      : `${authScope}:personal`;
+  }, [authScope, bookmarkCollection]);
 
   const getServerRootPath = useCallback(
     (nextScope: FilesScope, projectIdOverride?: string | null) => {
@@ -715,6 +293,7 @@ export default function FilesScreen() {
       const clearLocation = (message: string | null) => {
         activeRequestKeyRef.current = null;
         displayedRequestKeyRef.current = null;
+        setStaleCachedAt(null);
         setItems([]);
         setPathForLocation(nextSource, nextScope, "");
         setLocationMetas((prev) => ({
@@ -818,6 +397,9 @@ export default function FilesScreen() {
             isAdminMode: result.isAdminMode,
           },
         }));
+        // オフラインキャッシュ表示中は最終同期時刻を保持し、書き込みを無効化する。
+        setStaleCachedAt(loaded.stale ? loaded.cachedAt ?? "" : null);
+        setError(null);
       } catch (loadError) {
         if (
           requestKeys.length > 0 &&
@@ -826,10 +408,17 @@ export default function FilesScreen() {
           return;
         }
         if (displayedRequestKeyRef.current === null) setItems([]);
+        setStaleCachedAt(null);
+        const offlineNow =
+          nextSource === "server" &&
+          (isServerKnownUnreachable() ||
+            !useNetworkStore.getState().online);
         setError(
-          loadError instanceof Error
-            ? loadError.message
-            : "ファイル一覧の取得に失敗しました",
+          offlineNow
+            ? "オフラインのため一覧を取得できません"
+            : loadError instanceof Error
+              ? loadError.message
+              : "ファイル一覧の取得に失敗しました",
         );
       } finally {
         if (
@@ -851,17 +440,50 @@ export default function FilesScreen() {
   );
 
   const loadBookmarks = useCallback(async () => {
-    if (!isAuthenticated) {
+    const collection = bookmarkCollection;
+    const scopeKey = bookmarkScopeKey;
+    const requestGeneration = bookmarkRequestGenerationRef.current + 1;
+    bookmarkRequestGenerationRef.current = requestGeneration;
+    bookmarkScopeKeyRef.current = scopeKey;
+
+    // A Space transition must not leave the previous collection visible while
+    // the new request is in flight.  It also intentionally clears the state
+    // for an unauthenticated/admin-without-space screen instead of falling
+    // back to a user-wide collection.
+    if (!isAuthenticated || !collection) {
       setBookmarks([]);
       return;
     }
+
     try {
-      const result = await filesApi.listBookmarks();
+      const result = await filesApi.listBookmarks(collection);
+      if (
+        bookmarkRequestGenerationRef.current !== requestGeneration ||
+        bookmarkScopeKeyRef.current !== scopeKey
+      ) {
+        return;
+      }
       setBookmarks(result.bookmarks || []);
     } catch {
+      if (
+        bookmarkRequestGenerationRef.current !== requestGeneration ||
+        bookmarkScopeKeyRef.current !== scopeKey
+      ) {
+        return;
+      }
       setBookmarks([]);
     }
-  }, [isAuthenticated]);
+  }, [bookmarkCollection, bookmarkScopeKey, isAuthenticated]);
+
+  // Keep collection identity separate from Files location identity.  A stale
+  // Space A response must never populate Space B, even if the request began
+  // before ProjectContext finished switching its selected project.
+  useEffect(() => {
+    bookmarkRequestGenerationRef.current += 1;
+    bookmarkScopeKeyRef.current = bookmarkScopeKey;
+    setBookmarks([]);
+    void loadBookmarks();
+  }, [bookmarkScopeKey, loadBookmarks]);
 
   useEffect(() => {
     void loadEntries(source, scope, activePath || undefined);
@@ -886,6 +508,7 @@ export default function FilesScreen() {
   useEffect(() => {
     if (!isAuthenticated && source === "server") {
       setSource("local");
+      setScope("user");
     }
   }, [isAuthenticated, source]);
 
@@ -905,6 +528,10 @@ export default function FilesScreen() {
       Alert.alert("Files", locationUnavailableMessage(scope));
       return;
     }
+    // ローカルは常に user 区分を使う（workspace 区分は廃止）。
+    if (nextSource === "local") {
+      setScope("user");
+    }
     setSource(nextSource);
   };
 
@@ -921,7 +548,7 @@ export default function FilesScreen() {
   // ルートへ移動する。nextProjectId が null の場合、管理者は管理者ルート、
   // 一般ユーザーはプロジェクト未選択状態になる。
   const applyProjectSelection = useCallback(
-    (nextProjectId: string | null) => {
+    async (nextProjectId: string | null) => {
       setProjectMenuVisible(false);
       if (
         nextProjectId === selectedProjectId &&
@@ -942,12 +569,13 @@ export default function FilesScreen() {
       // 旧プロジェクトのクリップボード・検索・編集／プレビュー状態を破棄する。
       setClipboard(null);
       setQuery("");
-      setEditorVisible(false);
-      setEditorTarget(null);
       setViewerVisible(false);
       setViewerFile(null);
 
-      setSelectedProjectId(nextProjectId);
+      // The store updates synchronously, while persistence is asynchronous.
+      // Awaiting the canonical setter lets bookmark navigation apply its path
+      // only after the target Project selection has been committed.
+      await setSelectedProjectId(nextProjectId);
       setSource("server");
       setScope("workspace");
     },
@@ -1064,26 +692,30 @@ export default function FilesScreen() {
     [],
   );
 
-  const updateAudioStatus = (status: AVPlaybackStatus) => {
-    if (!status.isLoaded) {
+  const updateAudioStatus = useCallback(
+    (status: AVPlaybackStatus, requestGeneration: number) => {
+      if (audioRequestGenerationRef.current !== requestGeneration) return;
+      if (!status.isLoaded) {
+        setAudioState((prev) => ({
+          ...prev,
+          loading: false,
+          playing: false,
+        }));
+        return;
+      }
       setAudioState((prev) => ({
         ...prev,
         loading: false,
-        playing: false,
+        playing: status.isPlaying,
+        positionMillis: status.positionMillis,
+        durationMillis: status.durationMillis ?? 0,
       }));
-      return;
-    }
-    setAudioState((prev) => ({
-      ...prev,
-      loading: false,
-      playing: status.isPlaying,
-      positionMillis: status.positionMillis,
-      durationMillis: status.durationMillis ?? 0,
-    }));
-    if (status.didJustFinish) {
-      audioEndedHandlerRef.current();
-    }
-  };
+      if (status.didJustFinish) {
+        audioEndedHandlerRef.current();
+      }
+    },
+    [],
+  );
 
   const playAudioAt = useCallback(
     async (
@@ -1094,6 +726,8 @@ export default function FilesScreen() {
     ) => {
       const track = playlist[index];
       if (!track) return;
+      const requestGeneration = audioRequestGenerationRef.current + 1;
+      audioRequestGenerationRef.current = requestGeneration;
       const nextRootPath = rootPath ?? getAudioRootPath(track, trackScope);
       setAudioState((prev) => ({
         ...prev,
@@ -1108,19 +742,26 @@ export default function FilesScreen() {
         durationMillis: 0,
       }));
       try {
-        if (audioRef.current) {
-          await audioRef.current.unloadAsync();
-          audioRef.current = null;
+        const previousSound = audioRef.current;
+        audioRef.current = null;
+        if (previousSound) {
+          await previousSound.unloadAsync();
         }
         const uri = await filesApi.getPlayableUri(track);
+        if (audioRequestGenerationRef.current !== requestGeneration) return;
         const { sound, status } = await Audio.Sound.createAsync(
           { uri },
           { shouldPlay: true },
-          updateAudioStatus,
+          (nextStatus) => updateAudioStatus(nextStatus, requestGeneration),
         );
+        if (audioRequestGenerationRef.current !== requestGeneration) {
+          await sound.unloadAsync();
+          return;
+        }
         audioRef.current = sound;
-        updateAudioStatus(status);
+        updateAudioStatus(status, requestGeneration);
       } catch (audioError) {
+        if (audioRequestGenerationRef.current !== requestGeneration) return;
         setAudioState((prev) => ({ ...prev, loading: false, playing: false }));
         Alert.alert(
           "Audio",
@@ -1130,7 +771,7 @@ export default function FilesScreen() {
         );
       }
     },
-    [getAudioRootPath, scope],
+    [getAudioRootPath, scope, updateAudioStatus],
   );
 
   const playAudioEntry = useCallback(
@@ -1158,10 +799,9 @@ export default function FilesScreen() {
   };
 
   const stopAudio = async () => {
-    if (audioRef.current) {
-      await audioRef.current.unloadAsync();
-      audioRef.current = null;
-    }
+    audioRequestGenerationRef.current += 1;
+    const sound = audioRef.current;
+    audioRef.current = null;
     setAudioState({
       track: null,
       playlist: [],
@@ -1173,6 +813,9 @@ export default function FilesScreen() {
       positionMillis: 0,
       durationMillis: 0,
     });
+    if (sound) {
+      await sound.unloadAsync();
+    }
   };
 
   const nextAudio = async () => {
@@ -1186,6 +829,7 @@ export default function FilesScreen() {
   const advanceAudio = async (direction: 1 | -1, wrap: boolean) => {
     const track = audioState.track;
     if (!track || audioAdvancingRef.current) return;
+    const requestGeneration = audioRequestGenerationRef.current;
     audioAdvancingRef.current = true;
     try {
       const settings = audioPlayerSettings;
@@ -1201,6 +845,7 @@ export default function FilesScreen() {
           audioState.scope,
           audioState.rootPath || getAudioRootPath(track, audioState.scope),
         );
+        if (audioRequestGenerationRef.current !== requestGeneration) return;
       }
       if (playlist.length === 0) return;
 
@@ -1230,7 +875,9 @@ export default function FilesScreen() {
     const track = audioState.track;
     if (!track) return;
 
-    const targetScope = audioState.scope;
+    // ローカルは user 区分固定。サーバーのみ再生時の scope を引き継ぐ。
+    const targetScope: FilesScope =
+      track.source === "local" ? "user" : audioState.scope;
     if (!canOpenLocation(track.source)) {
       Alert.alert("Files", locationUnavailableMessage(targetScope));
       return;
@@ -1258,8 +905,11 @@ export default function FilesScreen() {
 
   useEffect(() => {
     return () => {
-      if (audioRef.current) {
-        void audioRef.current.unloadAsync();
+      audioRequestGenerationRef.current += 1;
+      const sound = audioRef.current;
+      audioRef.current = null;
+      if (sound) {
+        void sound.unloadAsync();
       }
     };
   }, []);
@@ -1313,46 +963,22 @@ export default function FilesScreen() {
     };
   }, [viewerFile, viewerVisible]);
 
-  const openTextEditor = async (entry: FilesEntry) => {
-    setEditorSessionKey((key) => key + 1);
-    setEditorVisible(true);
-    setEditorTarget(entry);
-    setEditorInitialContent("");
-    setEditorContent("");
-    setEditorLoading(true);
-    try {
-      const content = await filesApi.readText(entry.source, entry.path);
-      setEditorInitialContent(content);
-      setEditorContent(content);
-    } catch (readError) {
-      Alert.alert(
-        "Files",
-        readError instanceof Error
-          ? readError.message
-          : "テキスト読み込みに失敗しました。",
-      );
-      setEditorVisible(false);
-      setEditorTarget(null);
-    } finally {
-      setEditorLoading(false);
-    }
-  };
-
   const handleOpenEntry = async (entry: FilesEntry) => {
-    if (entry.type === "directory") {
+    const kind = resolveFilesOpenKind(entry);
+    if (kind === "directory") {
       await navigateTo(entry.path);
       return;
     }
-    if (isAudioEntry(entry)) {
+    if (kind === "audio") {
       await playAudioEntry(entry);
       return;
     }
-    if (isViewableMedia(entry)) {
+    if (kind === "media") {
       openMediaViewer(entry);
       return;
     }
-    if (isTextEntry(entry)) {
-      await openTextEditor(entry);
+    if (kind === "text") {
+      router.push(filesTextEditorParams(entry));
       return;
     }
 
@@ -1475,6 +1101,29 @@ export default function FilesScreen() {
     );
   };
 
+  const downloadEntry = async (entry: FilesEntry) => {
+    if (entry.type !== "file" || downloadingPath) return;
+    setDownloadingPath(entry.path);
+    try {
+      const result = await filesApi.download(entry);
+      if (result.status === "saved") {
+        Alert.alert(
+          "ダウンロード完了",
+          `${entry.name} を選択したフォルダーに保存しました。`,
+        );
+      }
+    } catch (downloadError) {
+      Alert.alert(
+        "ダウンロードに失敗",
+        downloadError instanceof Error
+          ? downloadError.message
+          : "ファイルを保存できませんでした。",
+      );
+    } finally {
+      setDownloadingPath(null);
+    }
+  };
+
   const setClipboardEntry = (
     entry: FilesEntry,
     operation: ClipboardOperation,
@@ -1549,71 +1198,14 @@ export default function FilesScreen() {
   };
 
   const showEntryActions = (entry: FilesEntry) => {
-    const pasteDestination = entry.type === "directory" ? entry.path : activePath;
-    const canPasteHere =
-      clipboardMatchesCurrent() &&
-      Boolean(pasteDestination) &&
-      canMutateCurrentPath;
-
-    Alert.alert(
-      entry.name,
-      entry.type === "directory" ? "フォルダー" : entry.mimeType || "ファイル",
-      [
-        { text: "開く", onPress: () => void handleOpenEntry(entry) },
-        {
-          text: "名前を変更",
-          onPress: () => {
-            setRenameTarget(entry);
-            setRenameVisible(true);
-          },
-        },
-        {
-          text: "コピー",
-          onPress: () => setClipboardEntry(entry, "copy"),
-        },
-        {
-          text: "移動",
-          onPress: () => setClipboardEntry(entry, "move"),
-        },
-        ...(canPasteHere
-          ? [
-              {
-                text:
-                  entry.type === "directory"
-                    ? "このフォルダーへ貼り付け"
-                    : "ここに貼り付け",
-                onPress: () => void pasteClipboard(pasteDestination),
-              },
-            ]
-          : []),
-        { text: "削除", style: "destructive", onPress: () => deleteEntry(entry) },
-        { text: "キャンセル", style: "cancel" },
-      ],
-      { cancelable: true },
-    );
+    setActionTarget(entry);
   };
 
-  const saveEditor = async () => {
-    if (!editorTarget) return;
-    setEditorSaving(true);
-    try {
-      await filesApi.saveText(
-        editorTarget.source,
-        editorTarget.path,
-        editorContent,
-      );
-      setEditorVisible(false);
-      await loadEntries(source, scope, activePath, undefined, {
-        revalidate: true,
-      });
-    } catch (saveError) {
-      Alert.alert(
-        "Files",
-        saveError instanceof Error ? saveError.message : "保存に失敗しました。",
-      );
-    } finally {
-      setEditorSaving(false);
-    }
+  const dismissEntryActions = () => setActionTarget(null);
+
+  const runEntryAction = (action: () => void) => {
+    dismissEntryActions();
+    action();
   };
 
   const uploadFile = async () => {
@@ -1660,25 +1252,64 @@ export default function FilesScreen() {
     }
   };
 
+  const normalizeServerPath = useCallback((path: string) => {
+    return path.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
+  }, []);
+
+  const projectForWorkspacePath = useCallback(
+    (path: string) => {
+      const normalized = normalizeServerPath(path);
+      if (!normalized || !effectiveSpaceId) return null;
+      return (
+        projects.find((project) => {
+          if (project.space_id !== effectiveSpaceId) return false;
+          const root = `_projects/project_${project.id}`;
+          return normalized === root || normalized.startsWith(`${root}/`);
+        }) ?? null
+      );
+    },
+    [effectiveSpaceId, normalizeServerPath, projects],
+  );
+
+  const canBookmarkActivePath = useMemo(() => {
+    if (!isAuthenticated || !activePath || !bookmarkCollection) return false;
+    if (source !== "server" || scope !== "workspace") return true;
+    return Boolean(projectForWorkspacePath(activePath));
+  }, [activePath, bookmarkCollection, isAuthenticated, projectForWorkspacePath, scope, source]);
+
   const isBookmarked = useMemo(
-    () => bookmarks.some((bookmark) => bookmark.path === activePath),
-    [activePath, bookmarks],
+    () =>
+      canBookmarkActivePath &&
+      bookmarks.some((bookmark) => bookmark.path === activePath),
+    [activePath, bookmarks, canBookmarkActivePath],
   );
 
   const toggleBookmark = async () => {
-    if (!isAuthenticated || !activePath) {
+    if (!isAuthenticated || !activePath || !bookmarkCollection) {
       Alert.alert("Files", "ブックマークはログイン中のみ利用できます。");
+      return;
+    }
+    if (!canBookmarkActivePath) {
+      Alert.alert(
+        "Files",
+        "選択中Spaceに属するProject Filesのみブックマークできます。",
+      );
       return;
     }
     try {
       if (isBookmarked) {
-        await filesApi.removeBookmark(activePath);
+        await filesApi.removeBookmark(activePath, bookmarkCollection);
       } else {
         const name =
           activePath.split(/[\\/]/).filter(Boolean).pop() ||
           currentDisplayPath ||
           "Bookmark";
-        await filesApi.addBookmark(name, activePath);
+        await filesApi.addBookmark(
+          name,
+          activePath,
+          "📁",
+          bookmarkCollection,
+        );
       }
       await loadBookmarks();
     } catch (bookmarkError) {
@@ -1690,6 +1321,40 @@ export default function FilesScreen() {
       );
     }
   };
+
+  const navigateBookmark = useCallback(
+    async (bookmark: FilesBookmark) => {
+      if (!bookmark.path) return;
+      if (source === "server" && scope === "workspace") {
+        const targetProject = projectForWorkspacePath(bookmark.path);
+        if (!targetProject) {
+          Alert.alert(
+            "Files",
+            "このブックマークのProjectは選択中Spaceから利用できません。",
+          );
+          return;
+        }
+        if (targetProject.id !== selectedProjectId) {
+          // applyProjectSelection is the canonical ProjectContext bridge.  It
+          // clears the old root/history and updates the store before this
+          // bookmark path is applied, avoiding a header/path mismatch.
+          await applyProjectSelection(targetProject.id);
+          setPathForLocation("server", "workspace", bookmark.path);
+          return;
+        }
+      }
+      navigateTo(bookmark.path);
+    },
+    [
+      applyProjectSelection,
+      navigateTo,
+      projectForWorkspacePath,
+      scope,
+      selectedProjectId,
+      setPathForLocation,
+      source,
+    ],
+  );
 
   const currentDisplayPath = useMemo(() => {
     const prefix = `${SOURCE_LABELS[source]} / ${SCOPE_LABELS[scope]}`;
@@ -1786,10 +1451,6 @@ export default function FilesScreen() {
             setViewerVisible(false);
             return true;
           }
-          if (editorVisible) {
-            setEditorVisible(false);
-            return true;
-          }
           if (activeHistory.length > 0) {
             void goBack();
             return true;
@@ -1802,30 +1463,48 @@ export default function FilesScreen() {
         },
       );
       return () => subscription.remove();
-    }, [activeHistory.length, activeMeta.canGoUp, editorVisible, goBack, goUp, viewerVisible]),
+    }, [
+      activeHistory.length,
+      activeMeta.canGoUp,
+      goBack,
+      goUp,
+      viewerVisible,
+    ]),
   );
 
   const bookmarkItems = useMemo(() => {
     if (source === "local") return [];
     const withPath = bookmarks.filter((bookmark) => bookmark.path);
     if (scope !== "workspace") return withPath;
-    // 管理者ルート選択中は従来どおり全ブックマークを表示する。
-    if (isAdmin && !selectedProjectId) return withPath;
-    const root = getServerRootPath("workspace");
-    if (!root) return [];
-    const prefix = root.replace(/\/+$/, "");
-    // 選択中プロジェクト配下のブックマークだけに絞り込む。
-    return withPath.filter((bookmark) => {
-      const normalized = bookmark.path
-        .replace(/\\/g, "/")
-        .replace(/^\/+/, "");
-      return normalized === prefix || normalized.startsWith(`${prefix}/`);
-    });
-  }, [bookmarks, getServerRootPath, isAdmin, scope, selectedProjectId, source]);
+    // Shared bookmarks are scoped to the selected Space, not the currently
+    // selected Project.  Derive valid roots from ProjectContext's canonical
+    // project list; never infer Space membership from a path alone.
+    if (!effectiveSpaceId) return [];
+    return withPath.filter((bookmark) => Boolean(projectForWorkspacePath(bookmark.path)));
+  }, [bookmarks, effectiveSpaceId, projectForWorkspacePath, scope, source]);
 
   const canMutateCurrentPath =
+    !staleActive &&
+    // キャッシュ未取得のオフライン（stale 表示にすらならないケース）でも
+    // サーバーへの書き込み操作は成功しないため無効化する。
+    !(isOffline && source === "server") &&
     (source === "local" || isAuthenticated) &&
     (Boolean(activePath) || (source === "server" && activeMeta.isAdminMode));
+
+  const staleSyncedAtLabel = useMemo(() => {
+    if (!staleCachedAt) return "";
+    const parsed = new Date(staleCachedAt);
+    if (Number.isNaN(parsed.getTime())) return "";
+    return parsed.toLocaleString();
+  }, [staleCachedAt]);
+
+  const actionPasteDestination =
+    actionTarget?.type === "directory" ? actionTarget.path : activePath;
+  const canPasteToActionTarget =
+    Boolean(actionTarget) &&
+    clipboardMatchesCurrent() &&
+    Boolean(actionPasteDestination) &&
+    canMutateCurrentPath;
 
   const renderListItem = ({ item }: { item: FilesEntry }) => (
     <Pressable
@@ -1895,26 +1574,30 @@ export default function FilesScreen() {
             </Chip>
           ))}
         </View>
-        <View style={styles.segmentRow}>
-          {(["workspace", "user"] as FilesScope[]).map((value) => {
-            // ワークスペースはプロジェクト未選択でも開けるようにするため、
-            // サーバー利用時は未ログインの場合のみ無効化する。
-            const disabled = source === "server" && !isAuthenticated;
-            return (
-              <Chip
-                key={value}
-                compact
-                selected={scope === value}
-                style={scope === value ? styles.scopeChipActive : styles.segmentChip}
-                textStyle={styles.segmentChipText}
-                disabled={disabled}
-                onPress={() => void changeScope(value)}
-              >
-                {SCOPE_LABELS[value]}
-              </Chip>
-            );
-          })}
-        </View>
+        {source === "server" ? (
+          <View style={styles.segmentRow}>
+            {(["workspace", "user"] as FilesScope[]).map((value) => {
+              // ワークスペースはプロジェクト未選択でも開けるようにするため、
+              // 未ログインの場合のみ無効化する。
+              const disabled = !isAuthenticated;
+              return (
+                <Chip
+                  key={value}
+                  compact
+                  selected={scope === value}
+                  style={
+                    scope === value ? styles.scopeChipActive : styles.segmentChip
+                  }
+                  textStyle={styles.segmentChipText}
+                  disabled={disabled}
+                  onPress={() => void changeScope(value)}
+                >
+                  {SCOPE_LABELS[value]}
+                </Chip>
+              );
+            })}
+          </View>
+        ) : null}
         {showProjectSelector ? (
           <View style={styles.projectSelectorRow}>
             <Menu
@@ -1989,7 +1672,7 @@ export default function FilesScreen() {
         <IconButton
           icon={isBookmarked ? "star" : "star-outline"}
           iconColor={isBookmarked ? "#f9e2af" : "#a6adc8"}
-          disabled={!isAuthenticated || !activePath}
+          disabled={!canBookmarkActivePath}
           onPress={() => void toggleBookmark()}
         />
         <IconButton
@@ -2028,6 +1711,22 @@ export default function FilesScreen() {
         />
       </View>
 
+      {source === "server" && isOffline ? (
+        <View style={styles.offlineBanner}>
+          <IconButton
+            icon="cloud-off-outline"
+            iconColor="#f9e2af"
+            size={16}
+            style={styles.offlineBannerIcon}
+          />
+          <Text style={styles.offlineBannerText} numberOfLines={1}>
+            {staleSyncedAtLabel
+              ? `オフライン（最終同期: ${staleSyncedAtLabel}）`
+              : "オフライン"}
+          </Text>
+        </View>
+      ) : null}
+
       {bookmarkItems.length > 0 ? (
         <View style={styles.bookmarkRow}>
           {bookmarkItems.map((bookmark) => (
@@ -2041,7 +1740,7 @@ export default function FilesScreen() {
                   : styles.bookmarkChip
               }
               textStyle={styles.bookmarkText}
-              onPress={() => void navigateTo(bookmark.path)}
+              onPress={() => void navigateBookmark(bookmark)}
             >
               {bookmark.name}
             </Chip>
@@ -2161,6 +1860,142 @@ export default function FilesScreen() {
       ) : null}
 
       <Portal>
+        <Dialog
+          visible={Boolean(actionTarget)}
+          onDismiss={dismissEntryActions}
+          style={styles.actionDialog}
+        >
+          <Dialog.Title style={styles.dialogTitle} numberOfLines={1}>
+            {actionTarget?.name || "ファイル操作"}
+          </Dialog.Title>
+          <Dialog.Content>
+            <Text style={styles.dialogLabel} numberOfLines={1}>
+              {staleActive
+                ? "オフライン表示中のため、開くのみ利用できます。"
+                : actionTarget?.type === "directory"
+                  ? "フォルダー"
+                  : actionTarget?.mimeType || "ファイル"}
+            </Text>
+          </Dialog.Content>
+          {actionTarget ? (
+            <Dialog.ScrollArea style={styles.actionScrollArea}>
+              <ScrollView contentContainerStyle={styles.actionList}>
+                <Button
+                  icon="folder-open-outline"
+                  mode="text"
+                  textColor="#cdd6f4"
+                  contentStyle={styles.actionButtonContent}
+                  labelStyle={styles.actionButtonLabel}
+                  onPress={() =>
+                    runEntryAction(() => void handleOpenEntry(actionTarget))
+                  }
+                >
+                  開く
+                </Button>
+                {!staleActive && actionTarget.type === "file" ? (
+                  <Button
+                    icon="download"
+                    mode="text"
+                    textColor="#cdd6f4"
+                    contentStyle={styles.actionButtonContent}
+                    labelStyle={styles.actionButtonLabel}
+                    loading={downloadingPath === actionTarget.path}
+                    disabled={Boolean(downloadingPath)}
+                    onPress={() =>
+                      runEntryAction(() => void downloadEntry(actionTarget))
+                    }
+                  >
+                    ダウンロード
+                  </Button>
+                ) : null}
+                {!staleActive ? (
+                  <>
+                    <Button
+                      icon="rename-box-outline"
+                      mode="text"
+                      textColor="#cdd6f4"
+                      contentStyle={styles.actionButtonContent}
+                      labelStyle={styles.actionButtonLabel}
+                      onPress={() =>
+                        runEntryAction(() => {
+                          setRenameTarget(actionTarget);
+                          setRenameVisible(true);
+                        })
+                      }
+                    >
+                      名前を変更
+                    </Button>
+                    <Button
+                      icon="content-copy"
+                      mode="text"
+                      textColor="#cdd6f4"
+                      contentStyle={styles.actionButtonContent}
+                      labelStyle={styles.actionButtonLabel}
+                      onPress={() =>
+                        runEntryAction(() =>
+                          setClipboardEntry(actionTarget, "copy"),
+                        )
+                      }
+                    >
+                      コピー
+                    </Button>
+                    <Button
+                      icon="file-move-outline"
+                      mode="text"
+                      textColor="#cdd6f4"
+                      contentStyle={styles.actionButtonContent}
+                      labelStyle={styles.actionButtonLabel}
+                      onPress={() =>
+                        runEntryAction(() =>
+                          setClipboardEntry(actionTarget, "move"),
+                        )
+                      }
+                    >
+                      移動
+                    </Button>
+                    {canPasteToActionTarget ? (
+                      <Button
+                        icon="content-paste"
+                        mode="text"
+                        textColor="#cdd6f4"
+                        contentStyle={styles.actionButtonContent}
+                        labelStyle={styles.actionButtonLabel}
+                        onPress={() =>
+                          runEntryAction(
+                            () =>
+                              void pasteClipboard(actionPasteDestination),
+                          )
+                        }
+                      >
+                        {actionTarget.type === "directory"
+                          ? "このフォルダーへ貼り付け"
+                          : "ここに貼り付け"}
+                      </Button>
+                    ) : null}
+                    <Button
+                      icon="delete-outline"
+                      mode="text"
+                      textColor="#f38ba8"
+                      contentStyle={styles.actionButtonContent}
+                      labelStyle={styles.actionButtonLabel}
+                      onPress={() =>
+                        runEntryAction(() => deleteEntry(actionTarget))
+                      }
+                    >
+                      削除
+                    </Button>
+                  </>
+                ) : null}
+              </ScrollView>
+            </Dialog.ScrollArea>
+          ) : null}
+          <Dialog.Actions>
+            <Button onPress={dismissEntryActions} textColor="#a6adc8">
+              キャンセル
+            </Button>
+          </Dialog.Actions>
+        </Dialog>
+
         <FileNameDialog
           visible={createFileVisible}
           title="テキストファイルを作成"
@@ -2192,45 +2027,6 @@ export default function FilesScreen() {
           onSubmit={submitRename}
         />
 
-        <Dialog
-          visible={editorVisible}
-          onDismiss={() => setEditorVisible(false)}
-          style={styles.editorDialog}
-        >
-          <Dialog.Title style={styles.dialogTitle}>
-            {editorTarget?.name || "Editor"}
-          </Dialog.Title>
-          <Dialog.Content>
-            {editorLoading ? (
-              <View style={styles.editorLoading}>
-                <ActivityIndicator size="small" color="#7c3aed" />
-              </View>
-            ) : (
-              <TextInput
-                key={`editor-${editorSessionKey}`}
-                mode="outlined"
-                multiline
-                defaultValue={editorInitialContent}
-                onChangeText={setEditorContent}
-                style={styles.editorInput}
-                autoCorrect={false}
-                autoCapitalize="none"
-              />
-            )}
-          </Dialog.Content>
-          <Dialog.Actions>
-            <Button onPress={() => setEditorVisible(false)} textColor="#a6adc8">
-              閉じる
-            </Button>
-            <Button
-              onPress={() => void saveEditor()}
-              textColor="#7c3aed"
-              disabled={editorLoading || editorSaving || !editorTarget}
-            >
-              保存
-            </Button>
-          </Dialog.Actions>
-        </Dialog>
       </Portal>
 
       <Modal
@@ -2350,6 +2146,18 @@ const styles = StyleSheet.create({
   bookmarkChip: { backgroundColor: "#313244" },
   bookmarkChipActive: { backgroundColor: "#4c1d95" },
   bookmarkText: { color: "#cdd6f4", fontSize: 11 },
+  offlineBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingLeft: 8,
+    paddingRight: 12,
+    paddingVertical: 4,
+    backgroundColor: "#2a2418",
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: "#4d3f1a",
+  },
+  offlineBannerIcon: { margin: 0 },
+  offlineBannerText: { color: "#f9e2af", fontSize: 12, flex: 1 },
   fileItem: {
     flexDirection: "row",
     alignItems: "center",
@@ -2362,7 +2170,6 @@ const styles = StyleSheet.create({
   fileIcon: { margin: 0, marginRight: 10 },
   fileInfo: { flex: 1 },
   fileName: { color: "#cdd6f4", fontSize: 15 },
-  fileMeta: { color: "#a6adc8", fontSize: 11, marginTop: 3 },
   gridContent: { padding: 8 },
   gridItemWrap: { width: "33.333%", padding: 4 },
   gridItem: {
@@ -2379,37 +2186,6 @@ const styles = StyleSheet.create({
     marginTop: 8,
     textAlign: "center",
   },
-  gridFileMeta: {
-    color: "#a6adc8",
-    fontSize: 10,
-    marginTop: 4,
-    textAlign: "center",
-  },
-  thumbnailFrame: {
-    overflow: "hidden",
-    borderRadius: 8,
-    backgroundColor: "#181825",
-  },
-  thumbnailImage: { width: "100%", height: "100%" },
-  thumbnailFallback: {
-    alignItems: "center",
-    justifyContent: "center",
-    borderRadius: 8,
-    backgroundColor: "#181825",
-  },
-  thumbnailFolder: { backgroundColor: "#241f2f" },
-  thumbnailIcon: { margin: 0 },
-  videoBadge: {
-    position: "absolute",
-    left: 0,
-    right: 0,
-    top: 0,
-    bottom: 0,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "rgba(0, 0, 0, 0.18)",
-  },
-  videoBadgeIcon: { margin: 0, backgroundColor: "rgba(0,0,0,0.45)" },
   divider: { backgroundColor: "#313244", marginHorizontal: 12 },
   center: {
     flex: 1,
@@ -2418,21 +2194,13 @@ const styles = StyleSheet.create({
     padding: 24,
   },
   emptyText: { color: "#585b70", fontSize: 14, textAlign: "center" },
-  dialog: { backgroundColor: "#1e1e2e" },
+  actionDialog: { backgroundColor: "#1e1e2e", maxHeight: "92%" },
+  actionScrollArea: { maxHeight: 390, paddingHorizontal: 0 },
+  actionList: { gap: 2, paddingVertical: 4 },
+  actionButtonContent: { minHeight: 42, justifyContent: "flex-start" },
+  actionButtonLabel: { flexGrow: 1, textAlign: "left" },
   dialogTitle: { color: "#cdd6f4" },
   dialogLabel: { color: "#a6adc8", fontSize: 12, marginBottom: 12 },
-  dialogInput: { backgroundColor: "#1e1e2e" },
-  editorDialog: { backgroundColor: "#1e1e2e", maxHeight: "92%" },
-  editorInput: {
-    minHeight: 320,
-    maxHeight: 460,
-    backgroundColor: "#1e1e2e",
-  },
-  editorLoading: {
-    height: 120,
-    alignItems: "center",
-    justifyContent: "center",
-  },
   audioBar: {
     flexDirection: "row",
     alignItems: "center",
@@ -2465,14 +2233,6 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     padding: 8,
   },
-  zoomSurface: {
-    flex: 1,
-    alignSelf: "stretch",
-    overflow: "hidden",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  viewerImage: { width: "100%", height: "100%" },
   viewerVideo: { width: "100%", height: "100%" },
   viewerError: { color: "#fca5a5", fontSize: 14, textAlign: "center" },
   viewerFooter: {

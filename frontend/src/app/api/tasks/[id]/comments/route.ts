@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
-import { taskComments } from "@/db/schema";
+import { taskComments, tasks } from "@/db/schema";
+import { and, eq, isNull } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
 import { decryptTextIfNeeded, encryptText } from "@/lib/server/field-crypto";
+import { canWriteProjectId } from "@/lib/server/task-route-utils";
 
 export async function POST(
   request: NextRequest,
@@ -15,6 +17,18 @@ export async function POST(
 
   const { id } = await params;
   const body = await request.json();
+
+  const [task] = await db
+    .select({ projectId: tasks.projectId })
+    .from(tasks)
+    .where(and(eq(tasks.id, id), isNull(tasks.deletedAt)))
+    .limit(1);
+  if (!task) {
+    return NextResponse.json({ detail: "タスクが見つかりません" }, { status: 404 });
+  }
+  if (!(await canWriteProjectId(user, task.projectId))) {
+    return NextResponse.json({ detail: "権限がありません" }, { status: 403 });
+  }
 
   if (!body.content) {
     return NextResponse.json(

@@ -1,5 +1,7 @@
 "use client";
 
+import { AppSelect } from "@/components/ui/app-select";
+
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Loader2, RefreshCcw, Save, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
@@ -45,7 +47,8 @@ type QuotaPool = {
   status: string;
 };
 
-type ModelGroup = {
+type LlmProfile = {
+  profile_id?: string;
   name?: string;
   target_type?: "inherit" | "static" | "pool";
   pool_id?: string;
@@ -53,19 +56,16 @@ type ModelGroup = {
   model?: string;
   effort_policy?: string;
   effort?: string;
+  routing_profile_id?: string;
 };
 
 type FreeTeamProfile = {
   display_name: string;
   enabled: boolean;
   main_pool_id: string;
-  agent_team_enabled: boolean;
   max_fallbacks: number;
   pools: Record<string, { candidate_ids?: string[] }>;
-  agent_team: {
-    model_groups: Record<string, ModelGroup>;
-    members?: Record<string, unknown>;
-  };
+  llm_profiles: Record<string, LlmProfile>;
 };
 
 type FreeTeamResponse = {
@@ -174,10 +174,9 @@ export function FreeTeamSettingsPanel() {
         body: JSON.stringify({
           enabled: data.profile.enabled,
           main_pool_id: data.profile.main_pool_id,
-          agent_team_enabled: true,
           max_fallbacks: data.profile.max_fallbacks,
           pools: data.profile.pools,
-          agent_team: data.profile.agent_team,
+          llm_profiles: data.profile.llm_profiles ?? {},
         }),
       });
       setData((current) => current ? { ...current, profile: response.profile } : current);
@@ -210,17 +209,14 @@ export function FreeTeamSettingsPanel() {
   const updateProfile = (patch: Partial<FreeTeamProfile>) => {
     setData((current) => current ? { ...current, profile: { ...current.profile, ...patch } } : current);
   };
-  const updateGroup = (groupId: string, patch: Partial<ModelGroup>) => {
+  const updateLlmProfile = (profileId: string, patch: Partial<LlmProfile>) => {
     setData((current) => current ? {
       ...current,
       profile: {
         ...current.profile,
-        agent_team: {
-          ...current.profile.agent_team,
-          model_groups: {
-            ...current.profile.agent_team.model_groups,
-            [groupId]: { ...current.profile.agent_team.model_groups[groupId], ...patch },
-          },
+        llm_profiles: {
+          ...(current.profile.llm_profiles ?? {}),
+          [profileId]: { ...current.profile.llm_profiles?.[profileId], ...patch },
         },
       },
     } : current);
@@ -251,20 +247,23 @@ export function FreeTeamSettingsPanel() {
           />
           <span>無料Teamを有効化</span>
         </label>
-        <label className="space-y-1 text-xs"><span className="text-muted-foreground">メインプール</span><select value={data.profile.main_pool_id} onChange={(event) => updateProfile({ main_pool_id: event.target.value })} className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm">{poolIds.map((id) => <option key={id} value={id}>{id}</option>)}</select></label>
+        <label className="space-y-1 text-xs"><span className="text-muted-foreground">メインプール</span><AppSelect value={data.profile.main_pool_id} onChange={(event) => updateProfile({ main_pool_id: event.target.value })} className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm">{poolIds.map((id) => <option key={id} value={id}>{id}</option>)}</AppSelect></label>
         <label className="space-y-1 text-xs"><span className="text-muted-foreground">最大フォールバック回数</span><Input type="number" min={0} max={10} value={data.profile.max_fallbacks} onChange={(event) => updateProfile({ max_fallbacks: Number(event.target.value) })} className="h-8" /></label>
         <div className="space-y-1 text-xs"><span className="text-muted-foreground">超過時の動作</span><div className="flex h-8 items-center"><Badge variant="outline">停止（有料移行なし）</Badge></div></div>
       </div>
 
       <section className="space-y-2">
-        <div className="text-xs font-medium">Agent Teamモデルグループ</div>
+        <div className="text-xs font-medium">LLM Profile</div>
+        <p className="text-[11px] text-muted-foreground">Agent TeamのSubagentが参照するProfileに対して、無料候補プールへのroutingだけを重ねます。TeamやSubagentの構成はここでは変更しません。</p>
         <div className="grid gap-2 lg:grid-cols-2">
-          {Object.entries(data.profile.agent_team.model_groups).map(([groupId, group]) => (
-            <div key={groupId} className="space-y-2 rounded border p-2">
-              <div className="flex items-center justify-between gap-2"><span className="text-xs font-medium">{group.name || groupId}</span><Badge variant="outline">{groupId}</Badge></div>
+          {Object.entries(data.profile.llm_profiles ?? {}).map(([profileId, profile]) => (
+            <div key={profileId} className="space-y-2 rounded border p-2">
+              <div className="flex items-center justify-between gap-2"><span className="text-xs font-medium">{profile.name || profileId}</span><Badge variant="outline">LLM Profile</Badge></div>
               <div className="grid gap-2 sm:grid-cols-2">
-                <label className="space-y-1 text-[10px] text-muted-foreground"><span>対象</span><select value={group.target_type || (group.pool_id ? "pool" : group.provider ? "static" : "inherit")} onChange={(event) => updateGroup(groupId, { target_type: event.target.value as ModelGroup["target_type"] })} className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"><option value="inherit">メインを継承</option><option value="static">固定モデル</option><option value="pool">無料Teamの候補プール</option></select></label>
-                {(group.target_type || "pool") === "pool" ? <label className="space-y-1 text-[10px] text-muted-foreground"><span>プール</span><select value={group.pool_id || ""} onChange={(event) => updateGroup(groupId, { pool_id: event.target.value })} className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm">{poolIds.map((id) => <option key={id} value={id}>{id}</option>)}</select></label> : group.target_type === "static" ? <div className="grid grid-cols-2 gap-1"><Input value={group.provider || ""} onChange={(event) => updateGroup(groupId, { provider: event.target.value })} placeholder="provider" className="h-8" /><Input value={group.model || ""} onChange={(event) => updateGroup(groupId, { model: event.target.value })} placeholder="model" className="h-8" /></div> : null}
+                <label className="space-y-1 text-[10px] text-muted-foreground"><span>対象</span><AppSelect value={profile.target_type || (profile.pool_id ? "pool" : profile.provider ? "static" : "inherit")} onChange={(event) => updateLlmProfile(profileId, { target_type: event.target.value as LlmProfile["target_type"] })} className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"><option value="inherit">メインを継承</option><option value="static">固定モデル</option><option value="pool">無料Teamの候補プール</option></AppSelect></label>
+                {(profile.target_type || "pool") === "pool" ? <label className="space-y-1 text-[10px] text-muted-foreground"><span>プール</span><AppSelect value={profile.pool_id || ""} onChange={(event) => updateLlmProfile(profileId, { pool_id: event.target.value })} className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm">{poolIds.map((id) => <option key={id} value={id}>{id}</option>)}</AppSelect></label> : profile.target_type === "static" ? <div className="grid grid-cols-2 gap-1"><Input value={profile.provider || ""} onChange={(event) => updateLlmProfile(profileId, { provider: event.target.value })} placeholder="provider" className="h-8" /><Input value={profile.model || ""} onChange={(event) => updateLlmProfile(profileId, { model: event.target.value })} placeholder="model" className="h-8" /></div> : null}
+                <label className="space-y-1 text-[10px] text-muted-foreground"><span>effort policy</span><AppSelect value={profile.effort_policy || "same"} onChange={(event) => updateLlmProfile(profileId, { effort_policy: event.target.value })} className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"><option value="same">メインと同じ</option><option value="lower">低い設定</option><option value="explicit">明示</option><option value="default">既定値</option></AppSelect></label>
+                {profile.effort_policy === "explicit" ? <label className="space-y-1 text-[10px] text-muted-foreground"><span>explicit effort</span><Input value={profile.effort || ""} onChange={(event) => updateLlmProfile(profileId, { effort: event.target.value })} placeholder="effort" className="h-8" /></label> : null}
               </div>
             </div>
           ))}

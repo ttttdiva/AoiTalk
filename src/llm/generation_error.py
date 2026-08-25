@@ -32,14 +32,15 @@ class GenerationErrorKind:
     TIMEOUT = "timeout"
     SERVER_ERROR = "server_error"
     EMPTY_RESPONSE = "empty_response"
+    LLM_NOT_CONFIGURED = "llm_not_configured"
     UNKNOWN = "unknown"
 
 
 # ユーザー向け文言（原因と次の行動が分かることを最優先にする）
 _USER_MESSAGES: Dict[str, str] = {
     GenerationErrorKind.INSUFFICIENT_QUOTA: (
-        "OpenAI APIのクレジットが不足しています。"
-        "OpenAIの請求設定（platform.openai.com の Billing）を確認してください。"
+        "OpenAI APIプロジェクトの利用上限またはクレジットに問題があります。"
+        "OpenAIのProject Limits / Billingを確認してください。"
     ),
     GenerationErrorKind.RATE_LIMIT: (
         "OpenAI APIのレート制限に達しました。"
@@ -78,10 +79,20 @@ _USER_MESSAGES: Dict[str, str] = {
     GenerationErrorKind.EMPTY_RESPONSE: (
         "モデルから応答が返りませんでした。しばらく待ってから再試行してください。"
     ),
+    GenerationErrorKind.LLM_NOT_CONFIGURED: (
+        "クリップ取り込み用LLMが設定されていません。"
+        "管理者にLLM設定を確認してください。"
+    ),
 }
 
 # 分類できない場合に使う既定文言（詳細は握り潰さず末尾へ付ける）
 DEFAULT_GENERATION_FAILURE_MESSAGE = "応答生成に失敗しました。"
+
+
+def user_message_for_generation_kind(kind: str) -> str | None:
+    """Return the canonical user message for an allowlisted failure kind."""
+
+    return _USER_MESSAGES.get(str(kind or "").strip().lower())
 
 
 @dataclass(frozen=True)
@@ -174,7 +185,13 @@ def _classify_by_code(code: str) -> Optional[str]:
     """error.code / error.type から種別を決める。429 の分岐はここが要。"""
     if not code:
         return None
-    if code in {"insufficient_quota", "billing_hard_limit_reached", "quota_exceeded"}:
+    if code in {
+        "insufficient_quota",
+        "billing_hard_limit_reached",
+        "project_spend_limit_exceeded",
+        "organization_spend_limit_exceeded",
+        "quota_exceeded",
+    }:
         return GenerationErrorKind.INSUFFICIENT_QUOTA
     if code in {"rate_limit_exceeded", "requests", "tokens"}:
         return GenerationErrorKind.RATE_LIMIT

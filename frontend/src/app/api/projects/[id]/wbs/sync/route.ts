@@ -24,6 +24,7 @@ import {
   type WbsRow,
 } from "@/lib/server/project-workspace-management";
 import { toDbLocalTimestamp } from "@/lib/server/db-time";
+import { canReadProjectId } from "@/lib/server/task-route-utils";
 
 type JsonRecord = Record<string, unknown>;
 const AI_GENERATED_TAG_NAME = "ai_generated";
@@ -395,6 +396,9 @@ export async function POST(
         },
         { status: 400 },
       );
+    }
+    if (!dryRun && hasNewTasks && !(await canReadProjectId(user, id))) {
+      return NextResponse.json({ detail: "権限がありません" }, { status: 403 });
     }
 
     const [minRow] = await db

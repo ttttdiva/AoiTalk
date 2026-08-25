@@ -1,16 +1,19 @@
 "use client";
 
+import { AppSelect } from "@/components/ui/app-select";
+
 import type { Dispatch, SetStateAction } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
   providerSelection,
+  reasoningEffortOptionsForModel,
   type LlmModelCatalogResponse,
   type ModelClassDraft,
 } from "./llm-model-section-types";
 
-type ClassDraftMap = Record<"vision" | "audio", ModelClassDraft>;
+type ClassDraftMap = Record<"vision" | "audio" | "video" | "clip_ingest", ModelClassDraft>;
 
 export type ConnectionSettingsProps = {
   selectedModelId: string;
@@ -60,13 +63,17 @@ export function LlmModelGroupsPanel({
     showReasoningEffort,
     handleProviderSettingsSave,
   } = connection;
+  const reasoningEffortOptions = reasoningEffortOptionsForModel(
+    selectedProvider,
+    selectedModelId,
+  );
   return (
     <div className="space-y-3 rounded-md border p-3">
       <div className="hidden">
         <div className="space-y-2 rounded border p-2">
           <div className="flex items-center justify-between gap-2">
             <div className="text-xs font-medium">画像認識</div>
-            <select
+            <AppSelect
               value={imageMode}
               onChange={(event) => setImageMode(event.target.value as "auto" | "always" | "off")}
               disabled={savingRouting}
@@ -75,10 +82,10 @@ export function LlmModelGroupsPanel({
               <option value="auto">auto</option>
               <option value="always">always</option>
               <option value="off">off</option>
-            </select>
+            </AppSelect>
           </div>
           <div className="grid gap-2 md:grid-cols-2">
-            <select
+            <AppSelect
               value={classDrafts.vision.provider}
               onChange={(event) => {
                 const nextProvider = event.target.value;
@@ -93,10 +100,10 @@ export function LlmModelGroupsPanel({
               className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none dark:bg-input/30"
             >
               <option value="">未設定</option>
-              {(catalog?.providers ?? []).filter((item) => !item.id.endsWith("-cli")).map((item) => (
+              {(catalog?.providers ?? []).filter((item) => !item.id.endsWith("-cli") && item.id !== "deepseek").map((item) => (
                 <option key={item.id} value={item.id}>{item.label}</option>
               ))}
-            </select>
+            </AppSelect>
             <Input
               value={classDrafts.vision.customModel || classDrafts.vision.model}
               onChange={(event) =>
@@ -140,7 +147,7 @@ export function LlmModelGroupsPanel({
 
         <div className="space-y-2 rounded border p-2">
           <div className="text-xs font-medium">音声認識</div>
-          <select
+          <AppSelect
             value={classDrafts.audio.engine ?? "speech_recognition"}
             onChange={(event) =>
               setClassDrafts((current) => ({
@@ -154,10 +161,10 @@ export function LlmModelGroupsPanel({
             <option value="speech_recognition">既存STT</option>
             <option value="llm">LLM</option>
             <option value="off">無効</option>
-          </select>
+          </AppSelect>
           {classDrafts.audio.engine === "llm" && (
             <div className="grid gap-2 md:grid-cols-2">
-              <select
+              <AppSelect
                 value={classDrafts.audio.provider}
                 onChange={(event) => {
                   const nextProvider = event.target.value;
@@ -177,7 +184,7 @@ export function LlmModelGroupsPanel({
                   .map((item) => (
                     <option key={item.id} value={item.id}>{item.label}</option>
                   ))}
-              </select>
+              </AppSelect>
               <Input
                 value={classDrafts.audio.customModel || classDrafts.audio.model}
                 onChange={(event) =>
@@ -254,20 +261,20 @@ export function LlmModelGroupsPanel({
       {showReasoningEffort && (
         <div className="max-w-xs space-y-1">
           <Label className="text-xs">Effort</Label>
-          <select
+          <AppSelect
             value={reasoningEffort}
             onChange={(event) => setReasoningEffort(event.target.value)}
             disabled={saving}
             className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
           >
-            {(selectedProvider?.settings?.reasoning_effort_options ?? ["medium"]).map(
+            {(reasoningEffortOptions.length ? reasoningEffortOptions : ["medium"]).map(
               (item) => (
                 <option key={item} value={item}>
                   {item}
                 </option>
               ),
             )}
-          </select>
+          </AppSelect>
         </div>
       )}
 

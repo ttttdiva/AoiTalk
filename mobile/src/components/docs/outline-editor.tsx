@@ -11,6 +11,7 @@ import { FlatList, Keyboard, Pressable, StyleSheet, View } from "react-native";
 import {
   Button,
   Dialog,
+  Icon,
   IconButton,
   Portal,
   Surface,
@@ -20,9 +21,11 @@ import {
 import { docsRepo } from "../../repositories/docs";
 import type { DocsNode } from "../../types/api";
 import { flattenVisibleOutline } from "./outline-editor-model";
+import { DocBlockEditor, isDocBlockNode } from "./verbatim-blocks";
 
 export type OutlineEditorHandle = {
   focusFirstOrCreate: () => Promise<void>;
+  reloadFromRepository: () => Promise<void>;
 };
 
 type Props = {
@@ -40,12 +43,6 @@ type PaperInput = { focus: () => void };
 const TITLE_DOUBLE_TAP_MS = 300;
 
 type TitleTap = { nodeId: string; at: number };
-type ActiveTitlePress = {
-  nodeId: string;
-  startedAt: number;
-  isSecondTap: boolean;
-  cancelled: boolean;
-};
 
 export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
   function OutlineEditor(
@@ -62,40 +59,71 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
   ) {
     const [nodes, setNodes] = useState<DocsNode[]>([]);
     const [loading, setLoading] = useState(true);
-    const [collapsedIds, setCollapsedIds] = useState<Set<string>>(new Set());
+    const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
     const [selectedId, setSelectedId] = useState<string | null>(null);
     const [editingId, setEditingId] = useState<string | null>(null);
     const [pendingFocusId, setPendingFocusId] = useState<string | null>(null);
     const [keyboardVisible, setKeyboardVisible] = useState(false);
     const [moreTargetId, setMoreTargetId] = useState<string | null>(null);
+    const nodesRef = useRef<DocsNode[]>([]);
     const listRef = useRef<FlatList>(null);
     const inputRefs = useRef(new Map<string, PaperInput>());
     const draftsRef = useRef(new Map<string, string>());
+    const savingTitlesRef = useRef(new Map<string, string>());
     const saveTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
     const saveChainsRef = useRef(new Map<string, Promise<void>>());
     const siblingCreatesRef = useRef(new Set<string>());
     const openingIdsRef = useRef(new Set<string>());
     const lastTitleTapRef = useRef<TitleTap | null>(null);
     const titleTapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const activeTitlePressRef = useRef<ActiveTitlePress | null>(null);
     const suppressTitleTapUntilRef = useRef(0);
     const loadRequestRef = useRef(0);
+    const activeRootIdRef = useRef(rootNodeId);
+    activeRootIdRef.current = rootNodeId;
+    nodesRef.current = nodes;
 
     const load = useCallback(async () => {
+      const requestedRootId = rootNodeId;
+      if (activeRootIdRef.current !== requestedRootId) return;
       const requestId = ++loadRequestRef.current;
       try {
-        const nextNodes = await docsRepo.listOutline(rootNodeId, true);
-        if (requestId === loadRequestRef.current) setNodes(nextNodes);
+        const loadedNodes = await docsRepo.listOutline(requestedRootId, true);
+        if (
+          activeRootIdRef.current === requestedRootId &&
+          requestId === loadRequestRef.current
+        ) {
+          setNodes(
+            loadedNodes.map((node) => {
+              const optimisticTitle =
+                draftsRef.current.get(node.id) ??
+                savingTitlesRef.current.get(node.id);
+              return optimisticTitle === undefined
+                ? node
+                : { ...node, title: optimisticTitle };
+            }),
+          );
+        }
       } catch {
-        if (requestId === loadRequestRef.current) setNodes([]);
+        if (
+          activeRootIdRef.current === requestedRootId &&
+          requestId === loadRequestRef.current
+        ) {
+          setNodes([]);
+        }
       } finally {
-        if (requestId === loadRequestRef.current) setLoading(false);
+        if (
+          activeRootIdRef.current === requestedRootId &&
+          requestId === loadRequestRef.current
+        ) {
+          setLoading(false);
+        }
       }
     }, [rootNodeId]);
 
     useEffect(() => {
       loadRequestRef.current += 1;
       setNodes([]);
+      setExpandedIds(new Set());
       setLoading(true);
     }, [rootNodeId]);
 
@@ -113,8 +141,8 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
     }, []);
 
     const rows = useMemo(
-      () => flattenVisibleOutline(nodes, rootNodeId, collapsedIds, showArchived),
-      [collapsedIds, nodes, rootNodeId, showArchived],
+      () => flattenVisibleOutline(nodes, rootNodeId, expandedIds, showArchived),
+      [expandedIds, nodes, rootNodeId, showArchived],
     );
 
     const beginEditing = useCallback((nodeId: string) => {
@@ -131,25 +159,17 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
 
     const cancelTitleTap = useCallback(() => {
       clearTitleTapCandidate();
-      if (activeTitlePressRef.current) {
-        activeTitlePressRef.current.cancelled = true;
-      }
     }, [clearTitleTapCandidate]);
 
-    const rememberTitleTap = useCallback(
-      (nodeId: string, at = Date.now()) => {
-        clearTitleTapCandidate();
-        lastTitleTapRef.current = { nodeId, at };
-        titleTapTimerRef.current = setTimeout(() => {
-          const current = lastTitleTapRef.current;
-          if (current?.nodeId === nodeId && current.at === at) {
-            lastTitleTapRef.current = null;
-          }
-          titleTapTimerRef.current = null;
-        }, TITLE_DOUBLE_TAP_MS);
-      },
-      [clearTitleTapCandidate],
-    );
+    const toggleExpanded = useCallback((nodeId: string) => {
+      cancelTitleTap();
+      setExpandedIds((current) => {
+        const next = new Set(current);
+        if (next.has(nodeId)) next.delete(nodeId);
+        else next.add(nodeId);
+        return next;
+      });
+    }, [cancelTitleTap]);
 
     const flushDraft = useCallback((nodeId: string) => {
       const timer = saveTimersRef.current.get(nodeId);
@@ -161,11 +181,50 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
       }
       draftsRef.current.delete(nodeId);
       const normalized = draft.replace(/[\r\n]+/g, " ").slice(0, 500);
+      savingTitlesRef.current.set(nodeId, normalized);
       const previous = saveChainsRef.current.get(nodeId) ?? Promise.resolve();
       const next = previous
         .catch(() => undefined)
         .then(async () => {
-          await docsRepo.updateNode(nodeId, { title: normalized });
+          try {
+            const currentNode = nodesRef.current.find((node) => node.id === nodeId);
+            const currentBody = currentNode?.body_json;
+            const isBlock = currentBody?.format === "doc_block"
+              && (currentBody.block_type === "markdown" || currentBody.block_type === "code");
+            const patch = isBlock
+              ? {
+                  title: normalized,
+                  bodyText: normalized,
+                  bodyJson: { ...currentBody, label: normalized },
+                }
+              : { title: normalized };
+            const updated = await docsRepo.updateNode(nodeId, patch);
+            if (isBlock) {
+              setNodes((current) => current.map((node) =>
+                node.id === nodeId
+                  ? {
+                      ...node,
+                      title: normalized,
+                      body_text: normalized,
+                      body_json: updated.body_json,
+                    }
+                  : node,
+              ));
+            }
+          } catch (error) {
+            if (
+              saveChainsRef.current.get(nodeId) === next &&
+              !draftsRef.current.has(nodeId)
+            ) {
+              draftsRef.current.set(nodeId, normalized);
+            }
+            throw error;
+          }
+        })
+        .finally(() => {
+          if (saveChainsRef.current.get(nodeId) === next) {
+            savingTitlesRef.current.delete(nodeId);
+          }
         });
       saveChainsRef.current.set(nodeId, next);
       return next;
@@ -186,16 +245,18 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
 
     const openNode = useCallback(
       async (nodeId: string) => {
+        const actionRootId = rootNodeId;
         if (openingIdsRef.current.has(nodeId)) return;
         openingIdsRef.current.add(nodeId);
         try {
           await waitForNodeSave(nodeId);
+          if (activeRootIdRef.current !== actionRootId) return;
           onOpen(nodeId);
         } finally {
           openingIdsRef.current.delete(nodeId);
         }
       },
-      [onOpen, waitForNodeSave],
+      [onOpen, rootNodeId, waitForNodeSave],
     );
 
     const requestOpenNode = useCallback(
@@ -205,7 +266,7 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
       [openNode],
     );
 
-    const recordDisplayTitleTap = useCallback(
+    const handleDisplayTitlePress = useCallback(
       (nodeId: string) => {
         const now = Date.now();
         if (now < suppressTitleTapUntilRef.current) return;
@@ -219,46 +280,17 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
           requestOpenNode(nodeId);
           return;
         }
-        rememberTitleTap(nodeId, now);
+        clearTitleTapCandidate();
+        lastTitleTapRef.current = { nodeId, at: now };
+        titleTapTimerRef.current = setTimeout(() => {
+          const current = lastTitleTapRef.current;
+          if (current?.nodeId !== nodeId || current.at !== now) return;
+          titleTapTimerRef.current = null;
+          lastTitleTapRef.current = null;
+          beginEditing(nodeId);
+        }, TITLE_DOUBLE_TAP_MS);
       },
-      [clearTitleTapCandidate, rememberTitleTap, requestOpenNode],
-    );
-
-    const handleEditingTitlePressIn = useCallback((nodeId: string) => {
-      const now = Date.now();
-      const previous = lastTitleTapRef.current;
-      activeTitlePressRef.current = {
-        nodeId,
-        startedAt: now,
-        isSecondTap:
-          now >= suppressTitleTapUntilRef.current &&
-          previous?.nodeId === nodeId &&
-          now - previous.at <= TITLE_DOUBLE_TAP_MS,
-        cancelled:
-          now < suppressTitleTapUntilRef.current ||
-          openingIdsRef.current.has(nodeId),
-      };
-    }, []);
-
-    const handleEditingTitlePressOut = useCallback(
-      (nodeId: string) => {
-        const press = activeTitlePressRef.current;
-        activeTitlePressRef.current = null;
-        if (!press || press.nodeId !== nodeId || press.cancelled) return;
-        const now = Date.now();
-        if (now - press.startedAt > TITLE_DOUBLE_TAP_MS) {
-          clearTitleTapCandidate();
-          return;
-        }
-        if (press.isSecondTap) {
-          clearTitleTapCandidate();
-          suppressTitleTapUntilRef.current = now + TITLE_DOUBLE_TAP_MS;
-          requestOpenNode(nodeId);
-          return;
-        }
-        rememberTitleTap(nodeId, now);
-      },
-      [clearTitleTapCandidate, rememberTitleTap, requestOpenNode],
+      [beginEditing, clearTitleTapCandidate, requestOpenNode],
     );
 
     const scheduleSave = useCallback(
@@ -279,7 +311,6 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
         for (const timer of saveTimersRef.current.values()) clearTimeout(timer);
         for (const nodeId of draftsRef.current.keys()) void flushDraft(nodeId);
         clearTitleTapCandidate();
-        activeTitlePressRef.current = null;
       },
       [clearTitleTapCandidate, flushDraft],
     );
@@ -308,34 +339,40 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
 
     const addChild = useCallback(
       async (parentId: string) => {
+        const actionRootId = rootNodeId;
         await flushDraft(parentId);
+        if (activeRootIdRef.current !== actionRootId) return;
         const parent = nodes.find((node) => node.id === parentId);
         const created = await docsRepo.createNode({
           parentId,
           projectId: parent?.project_id ?? null,
           title: "",
         });
+        if (activeRootIdRef.current !== actionRootId) return;
         setNodes((current) => [...current, created]);
-        setCollapsedIds((current) => {
+        setExpandedIds((current) => {
           const next = new Set(current);
-          next.delete(parentId);
+          next.add(parentId);
           return next;
         });
         setPendingFocusId(created.id);
         onChanged?.();
       },
-      [flushDraft, nodes, onChanged],
+      [flushDraft, nodes, onChanged, rootNodeId],
     );
 
     const addSibling = useCallback(
       async (nodeId: string) => {
+        const actionRootId = rootNodeId;
         // Android IME によっては同じ確定操作で submit が重複通知されるため、
         // 元ノード単位で作成を直列化して空行の二重作成を防ぐ。
         if (siblingCreatesRef.current.has(nodeId)) return;
         siblingCreatesRef.current.add(nodeId);
         try {
           await flushDraft(nodeId);
+          if (activeRootIdRef.current !== actionRootId) return;
           const created = await docsRepo.createSiblingAfter(nodeId, "");
+          if (activeRootIdRef.current !== actionRootId) return;
           setNodes((current) => [...current, created]);
           setPendingFocusId(created.id);
           onChanged?.();
@@ -343,45 +380,77 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
           siblingCreatesRef.current.delete(nodeId);
         }
       },
-      [flushDraft, onChanged],
+      [flushDraft, onChanged, rootNodeId],
     );
 
     const focusFirstOrCreate = useCallback(async () => {
-      const latest = await docsRepo.listOutline(rootNodeId, true);
+      const actionRootId = rootNodeId;
+      const latest = await docsRepo.listOutline(actionRootId, true);
+      if (activeRootIdRef.current !== actionRootId) return;
       setNodes(latest);
       const first = latest
-        .filter((node) => node.parent_id === rootNodeId && !node.archived_at)
+        .filter((node) => node.parent_id === actionRootId && !node.archived_at)
         .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0))[0];
       if (first) {
         setPendingFocusId(first.id);
         return;
       }
-      const root = await docsRepo.getNode(rootNodeId);
+      const root = await docsRepo.getNode(actionRootId);
+      if (activeRootIdRef.current !== actionRootId) return;
       const created = await docsRepo.createNode({
-        parentId: rootNodeId,
+        parentId: actionRootId,
         projectId: root?.project_id ?? null,
         title: "",
       });
+      if (activeRootIdRef.current !== actionRootId) return;
       setNodes([...latest, created]);
       setPendingFocusId(created.id);
       onChanged?.();
     }, [onChanged, rootNodeId]);
 
-    useImperativeHandle(ref, () => ({ focusFirstOrCreate }), [focusFirstOrCreate]);
+    const reloadFromRepository = useCallback(async () => {
+      const pendingNodeIds = new Set([
+        ...draftsRef.current.keys(),
+        ...saveChainsRef.current.keys(),
+      ]);
+      await Promise.all(
+        [...pendingNodeIds].map((nodeId) => waitForNodeSave(nodeId)),
+      );
+      await load();
+    }, [load, waitForNodeSave]);
+
+    useImperativeHandle(
+      ref,
+      () => ({ focusFirstOrCreate, reloadFromRepository }),
+      [focusFirstOrCreate, reloadFromRepository],
+    );
 
     const runStructureChange = useCallback(
       async (action: "indent" | "outdent", nodeId: string) => {
+        const actionRootId = rootNodeId;
         await flushDraft(nodeId);
-        if (action === "indent") await docsRepo.indentNode(nodeId);
-        else await docsRepo.outdentNode(nodeId);
+        if (activeRootIdRef.current !== actionRootId) return;
+        let indentParentId: string | null = null;
+        if (action === "indent") {
+          await docsRepo.indentNode(nodeId);
+          indentParentId = (await docsRepo.getNode(nodeId))?.parent_id ?? null;
+        } else {
+          await docsRepo.outdentNode(nodeId);
+        }
+        if (activeRootIdRef.current !== actionRootId) return;
+        if (indentParentId) {
+          setExpandedIds((current) => new Set(current).add(indentParentId));
+        }
         await load();
         setPendingFocusId(nodeId);
         onChanged?.();
       },
-      [flushDraft, load, onChanged],
+      [flushDraft, load, onChanged, rootNodeId],
     );
 
     const selectedRow = rows.find((row) => row.node.id === selectedId) ?? null;
+    const moreTargetRow =
+      rows.find((row) => row.node.id === moreTargetId) ?? null;
 
     return (
       <View style={styles.container}>
@@ -423,7 +492,19 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
               <Pressable
                 testID={`outline-gutter-${row.node.id}`}
                 style={styles.gutter}
+                accessibilityRole={row.hasChildren ? "button" : undefined}
+                accessibilityLabel={
+                  row.hasChildren
+                    ? `${expandedIds.has(row.node.id) ? "格納" : "展開"}: ${row.node.title || "空のノード"}`
+                    : undefined
+                }
+                hitSlop={4}
                 onPressIn={cancelTitleTap}
+                onPress={
+                  row.hasChildren
+                    ? () => toggleExpanded(row.node.id)
+                    : undefined
+                }
                 onLongPress={() => {
                   cancelTitleTap();
                   setMoreTargetId(row.node.id);
@@ -431,26 +512,22 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
                 delayLongPress={300}
               >
                 {row.hasChildren ? (
-                  <IconButton
+                  <View
                     testID={`outline-chevron-${row.node.id}`}
-                    icon={collapsedIds.has(row.node.id) ? "chevron-right" : "chevron-down"}
-                    size={17}
-                    iconColor="#a6adc8"
+                    pointerEvents="none"
                     style={styles.chevron}
-                    onPress={() => {
-                      cancelTitleTap();
-                      setCollapsedIds((current) => {
-                        const next = new Set(current);
-                        if (next.has(row.node.id)) next.delete(row.node.id);
-                        else next.add(row.node.id);
-                        return next;
-                      });
-                    }}
-                  />
+                  >
+                    <Icon
+                      source={expandedIds.has(row.node.id) ? "chevron-down" : "chevron-right"}
+                      size={17}
+                      color="#a6adc8"
+                    />
+                  </View>
                 ) : (
                   <View style={styles.bullet} />
                 )}
               </Pressable>
+              <View style={styles.rowContent}>
               {editingId === row.node.id ? (
                 <TextInput
                   ref={(input: PaperInput | null) => {
@@ -467,8 +544,6 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
                     scheduleSave(row.node.id, title);
                   }}
                   onFocus={() => setSelectedId(row.node.id)}
-                  onPressIn={() => handleEditingTitlePressIn(row.node.id)}
-                  onPressOut={() => handleEditingTitlePressOut(row.node.id)}
                   onBlur={() => {
                     void flushDraft(row.node.id);
                     setEditingId((current) =>
@@ -494,10 +569,7 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
                   accessibilityRole="button"
                   accessibilityLabel={`編集: ${row.node.title || "空のノード"}`}
                   style={styles.displayTitle}
-                  onPress={() => {
-                    recordDisplayTitleTap(row.node.id);
-                    beginEditing(row.node.id);
-                  }}
+                  onPress={() => handleDisplayTitlePress(row.node.id)}
                 >
                   <Text
                     style={
@@ -510,6 +582,32 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
                   </Text>
                 </Pressable>
               )}
+              {isDocBlockNode(row.node) ? (
+                <DocBlockEditor
+                  node={row.node}
+                  testIdPrefix="docs-block"
+                  onSaved={(updated) => {
+                    setNodes((current) => current.map((node) =>
+                      node.id === updated.id ? updated : node,
+                    ));
+                    onChanged?.();
+                  }}
+                />
+              ) : null}
+              </View>
+              <IconButton
+                testID={`outline-actions-${row.node.id}`}
+                accessibilityLabel={`ノード操作: ${row.node.title || "空のノード"}`}
+                icon="dots-vertical"
+                size={19}
+                iconColor="#a6adc8"
+                style={styles.rowActions}
+                onPress={() => {
+                  cancelTitleTap();
+                  setSelectedId(row.node.id);
+                  setMoreTargetId(row.node.id);
+                }}
+              />
             </View>
           )}
         />
@@ -578,6 +676,38 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
                 ノードを開く
               </Button>
               <Button
+                icon="subdirectory-arrow-right"
+                onPress={() => {
+                  const target = moreTargetId;
+                  setMoreTargetId(null);
+                  if (target) void addChild(target);
+                }}
+              >
+                子ノードを追加
+              </Button>
+              <Button
+                icon="format-indent-increase"
+                disabled={!moreTargetRow || moreTargetRow.siblingIndex === 0}
+                onPress={() => {
+                  const target = moreTargetId;
+                  setMoreTargetId(null);
+                  if (target) void runStructureChange("indent", target);
+                }}
+              >
+                字下げ
+              </Button>
+              <Button
+                icon="format-indent-decrease"
+                disabled={!moreTargetRow || moreTargetRow.depth === 0}
+                onPress={() => {
+                  const target = moreTargetId;
+                  setMoreTargetId(null);
+                  if (target) void runStructureChange("outdent", target);
+                }}
+              >
+                字下げを戻す
+              </Button>
+              <Button
                 icon="folder-move-outline"
                 onPress={() => {
                   const target = moreTargetId;
@@ -625,8 +755,9 @@ const styles = StyleSheet.create({
   loadingText: { color: "#a6adc8", fontSize: 13 },
   row: { flexDirection: "row", alignItems: "flex-start", borderRadius: 8 },
   rowSelected: { backgroundColor: "#181825" },
-  gutter: { width: 30, minHeight: 44, alignItems: "center", justifyContent: "center" },
-  chevron: { margin: 0 },
+  rowContent: { flex: 1, minWidth: 0 },
+  gutter: { width: 44, minHeight: 44, alignItems: "center", justifyContent: "center" },
+  chevron: { width: 24, height: 24, alignItems: "center", justifyContent: "center" },
   bullet: { width: 5, height: 5, borderRadius: 3, backgroundColor: "#7c3aed" },
   input: {
     flex: 1,
@@ -644,6 +775,7 @@ const styles = StyleSheet.create({
   },
   displayTitleText: { color: "#cdd6f4", fontSize: 15, lineHeight: 21 },
   displayPlaceholder: { color: "#6c7086", fontSize: 15, lineHeight: 21 },
+  rowActions: { width: 48, height: 48, margin: 0 },
   toolbar: {
     position: "absolute",
     left: 8,

@@ -2,6 +2,8 @@
 
 import type React from "react";
 
+import { FolderOpen } from "lucide-react";
+
 import type { Project } from "@/lib/task-api";
 import { cn } from "@/lib/utils";
 
@@ -24,7 +26,7 @@ export function TaskProjectTabs({
   onSelectTab: (tab: string) => void;
 }) {
   return (
-    <div className="flex min-h-8 items-center border-b">
+    <div className="flex min-h-9 items-center border-b border-border">
       <div
         data-testid="task-project-tabs"
         className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto overflow-y-hidden whitespace-nowrap [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
@@ -37,14 +39,18 @@ export function TaskProjectTabs({
           }}
           onClick={() => onSelectTab("all")}
           className={cn(
-            "shrink-0 px-3 py-1.5 text-sm font-medium border-b-2 transition-colors",
+            "inline-flex shrink-0 items-center gap-1.5 px-3 py-2 text-xs font-medium border-b-2 transition-colors",
             projectTab === "all"
               ? "border-primary text-foreground"
               : "border-transparent text-muted-foreground hover:text-foreground",
           )}
         >
+          <FolderOpen
+            className="size-3.5 shrink-0"
+            aria-hidden="true"
+          />
           全て
-          <span className="ml-1.5 text-xs tabular-nums text-muted-foreground">
+          <span className="text-xs tabular-nums text-muted-foreground">
             {allCount}
           </span>
         </button>
@@ -56,14 +62,19 @@ export function TaskProjectTabs({
             }}
             onClick={() => onSelectTab(p.id)}
             className={cn(
-              "shrink-0 px-3 py-1.5 text-sm font-medium border-b-2 transition-colors",
+              "inline-flex shrink-0 items-center gap-1.5 px-3 py-2 text-xs font-medium border-b-2 transition-colors",
               projectTab === p.id
                 ? "border-primary text-foreground"
                 : "border-transparent text-muted-foreground hover:text-foreground",
             )}
           >
+            <FolderOpen
+              className="size-3.5 shrink-0"
+              aria-hidden="true"
+              style={p.color ? { color: p.color } : undefined}
+            />
             {p.name}
-            <span className="ml-1.5 text-xs tabular-nums text-muted-foreground">
+            <span className="text-xs tabular-nums text-muted-foreground">
               {projectTaskCounts.get(p.id) || 0}
             </span>
           </button>

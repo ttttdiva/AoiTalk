@@ -1,0 +1,2383 @@
+{
+  "before": {
+    "00bbfa4e-4be2-45ac-8b2d-466448a38c28": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "関連ディスカッション（内容未整理）",
+      "created_at": "2026-08-17T08:25:23.194597",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "00bbfa4e-4be2-45ac-8b2d-466448a38c28",
+      "latest_revision_id": "6d4cf0ec-9522-4010-ae3e-edc0566a8cdb",
+      "parent_id": "71019796-9c90-4f1b-9686-68c7f47cfdb5",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 18.0,
+      "source_refs": [],
+      "title": "関連ディスカッション（内容未整理）",
+      "updated_at": "2026-08-22T13:25:36.030045"
+    },
+    "02f07181-1a4b-4676-b2f1-0b54aa7960cc": {
+      "archived_at": "2026-08-22T13:25:36.143675",
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3",
+      "created_at": "2026-08-20T14:49:29.389278",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "02f07181-1a4b-4676-b2f1-0b54aa7960cc",
+      "latest_revision_id": "eeb64d3a-e378-409a-be36-0cc25934c5f1",
+      "parent_id": "6ad736eb-55db-4edb-9164-2444b1ddb21c",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3",
+      "updated_at": "2026-08-22T13:25:36.143675"
+    },
+    "0c03bc37-18d4-456d-9420-b2b88ec207d2": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "Hugging Faceモデル配布ページ（内容未整理）",
+      "created_at": "2026-08-21T14:21:07.591839",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "0c03bc37-18d4-456d-9420-b2b88ec207d2",
+      "latest_revision_id": "c5f9d45e-09cf-4a32-9c36-0de5915b0b94",
+      "parent_id": "5db7f4c2-e7a6-4e3a-972a-c38d4b8b4575",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 37.0,
+      "source_refs": [],
+      "title": "Hugging Faceモデル配布ページ（内容未整理）",
+      "updated_at": "2026-08-22T13:25:36.098158"
+    },
+    "0cdec5fa-4a2c-5ce6-bce3-0c3e1d56a13c": {
+      "archived_at": null,
+      "body_json_digest": "90bf081aeca05d9c9008bbfb8f39b0d8ca9e9919ac0c2ba892cbdfd520b8d4e7",
+      "body_text": "MiniMax H3参照素材プロンプト構文（未整理）",
+      "created_at": "2026-08-22T11:05:30.378318",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "0cdec5fa-4a2c-5ce6-bce3-0c3e1d56a13c",
+      "latest_revision_id": "917a11c6-84e8-46c9-90da-a7d9c9e4b163",
+      "parent_id": "fa98bb58-6f64-5563-bb58-bbb153ddb19f",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 24.5,
+      "source_refs": [],
+      "title": "MiniMax H3参照素材プロンプト構文（未整理）",
+      "updated_at": "2026-08-22T13:25:31.743047"
+    },
+    "0e28e5c6-9885-423a-b9b0-180e71ac49e2": {
+      "archived_at": "2026-08-22T13:25:36.182643",
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://civitai.red/models/2861921/minimax-h3-dasiwa-continue-from-clip-nativeaddguidespectrumfastpreview?modelVersionId=3232954",
+      "created_at": "2026-08-21T14:31:04.314014",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "0e28e5c6-9885-423a-b9b0-180e71ac49e2",
+      "latest_revision_id": "9c706e7d-762e-4536-9ea2-34c7c5d41211",
+      "parent_id": "aef0ffc4-2d28-4b7b-8dcf-9b8f05156639",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://civitai.red/models/2861921/minimax-h3-dasiwa-continue-from-clip-nativeaddguidespectrumfastpreview?modelVersionId=3232954",
+      "updated_at": "2026-08-22T13:25:36.182643"
+    },
+    "17919297-c453-450c-b6b1-65cdcb96dd0d": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "Civitaiワークフロー配布ページ（内容未整理）",
+      "created_at": "2026-08-18T14:24:46.782193",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "17919297-c453-450c-b6b1-65cdcb96dd0d",
+      "latest_revision_id": "3dc00728-73e5-4b87-87c6-623bb3f50c62",
+      "parent_id": "e67bfbf2-d3e4-4025-b953-4d1e6044cf1a",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 20.0,
+      "source_refs": [],
+      "title": "Civitaiワークフロー配布ページ（内容未整理）",
+      "updated_at": "2026-08-22T13:25:36.058043"
+    },
+    "1a6cfe34-4440-4116-b700-03a45922ab73": {
+      "archived_at": "2026-08-22T13:25:36.156676",
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://civitai.red/models/2868392/10erosmaxint8ref2vabeta2?modelVersionId=3240646",
+      "created_at": "2026-08-21T10:13:53.880460",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "1a6cfe34-4440-4116-b700-03a45922ab73",
+      "latest_revision_id": "01a38e96-7de0-4a09-bf73-5719fa5d2e7d",
+      "parent_id": "38726611-319e-48de-952e-020f1aaeeebb",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://civitai.red/models/2868392/10erosmaxint8ref2vabeta2?modelVersionId=3240646",
+      "updated_at": "2026-08-22T13:25:36.156676"
+    },
+    "2ba28918-e937-426b-85ec-7d256d190e48": {
+      "archived_at": null,
+      "body_json_digest": "c754504470f603113ccfbcf71f1e7c29835d5dcc409c7784c3f5cdec2061b54e",
+      "body_text": "H3LT X2 Riding POV I2Vモデル",
+      "created_at": "2026-08-22T08:26:21.201420",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "2ba28918-e937-426b-85ec-7d256d190e48",
+      "latest_revision_id": "aedf73f4-299d-4a54-be4a-ba413303ac68",
+      "parent_id": "539bbaaa-c1a3-5189-9a78-057e42c8a333",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 22.0,
+      "source_refs": [],
+      "title": "H3LT X2 Riding POV I2Vモデル",
+      "updated_at": "2026-08-22T13:24:46.263129"
+    },
+    "2dbf88e4-a1a8-4545-b990-0ea6fcfe379b": {
+      "archived_at": "2026-08-22T13:25:36.227152",
+      "body_json_digest": "6c8f57ea891fd5f642004e546318bcb3e0a668a233a6d4afa89c8b9c90b20549",
+      "body_text": "QA MiniMax H3 - explicit target topic A — 2026-08-22 restart",
+      "created_at": "2026-08-22T11:36:59.166768",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "2dbf88e4-a1a8-4545-b990-0ea6fcfe379b",
+      "latest_revision_id": "4c8b6c9b-24f4-42f2-b3f1-7216e2e716b5",
+      "parent_id": "4a3c2921-1a3a-4242-aab3-74b5794e9d7f",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 9.0,
+      "source_refs": [],
+      "title": "QA MiniMax H3 - explicit target topic A — 2026-08-22 restart",
+      "updated_at": "2026-08-22T13:25:36.227152"
+    },
+    "2f137dd5-fcfb-5f50-80d8-a68497e532e0": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "10Eros_Max beta2をMiniMax H3のRef2VA向けにINT8 ConvRot化した実験的モデル。video referenceを使う用途を想定した配布物として公開されている。",
+      "created_at": "2026-08-22T13:25:09.418759",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "2f137dd5-fcfb-5f50-80d8-a68497e532e0",
+      "latest_revision_id": "70fd68f9-27d6-4df5-ba85-bc55bbbb4fd9",
+      "parent_id": "6ce7dbe4-adef-4cb8-a140-7efa8edbfb08",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 0.0,
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "civitai_api",
+          "source_type": "direct",
+          "url": "https://civitai.red/models/2868392/10erosmaxint8ref2vabeta2?modelVersionId=3240646",
+          "used": true
+        }
+      ],
+      "title": "10Eros_Max beta2をMiniMax H3のRef2VA向けにINT8 ConvRot化した実験的モデル。video referenceを使う用途を想定した配布物として公開されている。",
+      "updated_at": "2026-08-22T13:25:09.418759"
+    },
+    "3025dabd-fed9-5b9e-9229-e12321ac657e": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "ワークフロー",
+      "created_at": "2026-08-22T13:24:32.485028",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "3025dabd-fed9-5b9e-9229-e12321ac657e",
+      "latest_revision_id": "f9c259c1-5209-4226-a252-147292c9b1fa",
+      "parent_id": "4a3c2921-1a3a-4242-aab3-74b5794e9d7f",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 18.5,
+      "source_refs": [],
+      "title": "ワークフロー",
+      "updated_at": "2026-08-22T13:24:32.485028"
+    },
+    "3116007b-4cf0-46e9-8215-04e1e871ad71": {
+      "archived_at": "2026-08-22T13:25:36.216641",
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://www.reddit.com/r/comfyui/comments/1vinc36/testing_character_swap_with_minimax_h3",
+      "created_at": "2026-08-20T14:46:35.022116",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "3116007b-4cf0-46e9-8215-04e1e871ad71",
+      "latest_revision_id": "0cdb152c-b056-493f-a3e1-e380c52b2260",
+      "parent_id": "97337e1e-6b05-4fba-8961-091423722703",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://www.reddit.com/r/comfyui/comments/1vinc36/testing_character_swap_with_minimax_h3",
+      "updated_at": "2026-08-22T13:25:36.216641"
+    },
+    "329e8fa1-4811-5ddc-bce3-ef1045f829be": {
+      "archived_at": null,
+      "body_json_digest": "f486ef14e90179ab4cd5ce2689ab17a435e676becbff2fcf3184b273488fe1fd",
+      "body_text": "MiniMax H3キャラクター入れ替えテスト",
+      "created_at": "2026-08-22T11:04:31.796452",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "329e8fa1-4811-5ddc-bce3-ef1045f829be",
+      "latest_revision_id": "bec82821-2583-403b-9ca8-13055912ac99",
+      "parent_id": "4f908cd3-a78d-544b-817b-d0b5642992e6",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 25.0,
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "x_oembed",
+          "source_type": "direct",
+          "url": "https://x.com/i/status/2086006928845787574",
+          "used": true
+        },
+        {
+          "acquisition_status": "empty_body",
+          "source_type": "direct",
+          "url": "https://www.reddit.com/r/comfyui/comments/1vinc36/testing_character_swap_with_minimax_h3",
+          "used": false
+        }
+      ],
+      "title": "MiniMax H3キャラクター入れ替えテスト",
+      "updated_at": "2026-08-22T13:24:55.599160"
+    },
+    "332e518b-5d1b-4be2-a874-f73fa6edca1a": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "学習画像は24枚で、既存画像20枚と補助画像4枚で構成する。",
+      "created_at": "2026-08-21T14:52:59.449989",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "332e518b-5d1b-4be2-a874-f73fa6edca1a",
+      "latest_revision_id": "1d736f0f-c953-4397-be41-82c2ce050fa8",
+      "parent_id": "6cc990c1-686f-4903-af9d-8d4baea2fe47",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 42.0,
+      "source_refs": [],
+      "title": "学習画像は24枚で、既存画像20枚と補助画像4枚で構成する。",
+      "updated_at": "2026-08-22T08:26:21.493082"
+    },
+    "3437ee3c-1a69-4d15-baa4-4c76880c35ac": {
+      "archived_at": null,
+      "body_json_digest": "c5af38bdbac9de965f6bb8579f64aa35383192b6c794e7ef5a70603a206006a9",
+      "body_text": "Subjectと参照素材の指定例",
+      "created_at": "2026-08-22T11:15:42.519989",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "3437ee3c-1a69-4d15-baa4-4c76880c35ac",
+      "latest_revision_id": "20d55129-d2b1-4b52-9033-3abba76c2dd3",
+      "parent_id": "0cdec5fa-4a2c-5ce6-bce3-0c3e1d56a13c",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "Subjectと参照素材の指定例",
+      "updated_at": "2026-08-22T11:27:55.730000"
+    },
+    "3670b7cd-1c61-48cc-aef6-da44c9575fb9": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "Hugging Face配布元",
+      "created_at": "2026-08-17T08:25:23.230599",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "3670b7cd-1c61-48cc-aef6-da44c9575fb9",
+      "latest_revision_id": "ac675bf5-95bf-4781-89ca-697502dc263a",
+      "parent_id": "71019796-9c90-4f1b-9686-68c7f47cfdb5",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 19.0,
+      "source_refs": [],
+      "title": "Hugging Face配布元",
+      "updated_at": "2026-08-22T13:25:36.036045"
+    },
+    "36cadf1c-8552-5143-b696-d0fc48b326d1": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "後加工",
+      "created_at": "2026-08-22T13:24:32.571073",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "36cadf1c-8552-5143-b696-d0fc48b326d1",
+      "latest_revision_id": "dd1888f8-1b90-4eac-b381-e49782ca76c7",
+      "parent_id": "4a3c2921-1a3a-4242-aab3-74b5794e9d7f",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 35.5,
+      "source_refs": [],
+      "title": "後加工",
+      "updated_at": "2026-08-22T13:24:32.571073"
+    },
+    "37fd866f-b48a-4a0f-8241-a8e2747a7494": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "Civitaiモデルページ",
+      "created_at": "2026-08-20T14:42:59.293466",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "37fd866f-b48a-4a0f-8241-a8e2747a7494",
+      "latest_revision_id": "36e5c8f2-b359-4711-aacd-5893fe18644c",
+      "parent_id": "2ba28918-e937-426b-85ec-7d256d190e48",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 22.0,
+      "source_refs": [],
+      "title": "Civitaiモデルページ",
+      "updated_at": "2026-08-22T13:25:36.068393"
+    },
+    "38726611-319e-48de-952e-020f1aaeeebb": {
+      "archived_at": "2026-08-22T13:25:36.164675",
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "出典",
+      "created_at": "2026-08-21T10:13:53.876461",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "38726611-319e-48de-952e-020f1aaeeebb",
+      "latest_revision_id": "e9964725-9867-4d6b-b2d5-bc4c8f874a4d",
+      "parent_id": "6ce7dbe4-adef-4cb8-a140-7efa8edbfb08",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 36.0,
+      "source_refs": [],
+      "title": "出典",
+      "updated_at": "2026-08-22T13:25:36.164675"
+    },
+    "3af3f1a2-f198-4fa2-847c-ceb68322b5b9": {
+      "archived_at": null,
+      "body_json_digest": "16f9e568678cd628db2a968af077791de0447e654938abb1135787d34110602e",
+      "body_text": "開始用プロンプト例",
+      "created_at": "2026-08-22T11:15:41.782703",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "3af3f1a2-f198-4fa2-847c-ceb68322b5b9",
+      "latest_revision_id": "81d660a0-30cc-4857-aaf7-a4827ef763d8",
+      "parent_id": "2ba28918-e937-426b-85ec-7d256d190e48",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 24.0,
+      "source_refs": [
+        {
+          "legacy_key": "verbatim_blocks",
+          "migration_id": "docs-verbatim-content-to-typed-blocks-v1",
+          "sha256": "b4592ec241d852c1d03963011604e7992de5b61696dd54195324519b855c5419",
+          "source_index": 0,
+          "source_node_id": "2ba28918-e937-426b-85ec-7d256d190e48",
+          "type": "verbatim_content_materialization"
+        }
+      ],
+      "title": "開始用プロンプト例",
+      "updated_at": "2026-08-22T11:15:41.782703"
+    },
+    "3c1fd0ef-7917-5357-bc7a-5468b17be56c": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "Qwen3-VL-4Bの埋め込みを学習済み線形変換で32B互換5120次元へ変換するPoC。保存済み記録ではテキストエンコーダVRAMが約15.7GB→5.2GB、32B固有知識や多言語音声性能の一部喪失が報告されている。",
+      "created_at": "2026-08-22T13:25:05.845997",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "3c1fd0ef-7917-5357-bc7a-5468b17be56c",
+      "latest_revision_id": "345bbe38-3cd4-4c18-9a2a-a077ab9b5e77",
+      "parent_id": "8b5e5e3d-52b7-489d-ad29-762b94a220e3",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 0.0,
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "huggingface_api",
+          "source_type": "direct",
+          "url": "https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3",
+          "used": true
+        }
+      ],
+      "title": "Qwen3-VL-4Bの埋め込みを学習済み線形変換で32B互換5120次元へ変換するPoC。保存済み記録ではテキストエンコーダVRAMが約15.7GB→5.2GB、32B固有知識や多言語音声性能の一部喪失が報告されている。",
+      "updated_at": "2026-08-22T13:25:05.845997"
+    },
+    "3df1c986-786f-5fd9-990c-3024bf365e38": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "MiniMax-AI公式repositoryとh3-prompt-writingスキルの導入情報。保存済みinstall commandを改変せず実行用資料として残す。",
+      "created_at": "2026-08-22T13:24:55.593163",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "3df1c986-786f-5fd9-990c-3024bf365e38",
+      "latest_revision_id": "feee4103-7213-4d20-a424-eb0eab8d97a4",
+      "parent_id": "dcc72c6b-d026-4851-8084-19b8d095272a",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 0.0,
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "github_api",
+          "source_type": "direct",
+          "url": "https://github.com/MiniMax-AI/MiniMax-H3",
+          "used": true
+        }
+      ],
+      "title": "MiniMax-AI公式repositoryとh3-prompt-writingスキルの導入情報。保存済みinstall commandを改変せず実行用資料として残す。",
+      "updated_at": "2026-08-22T13:24:55.593163"
+    },
+    "4713b64d-c7ae-5802-a83d-fed6efa8ada0": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "MiniMax H3で既存clipから生成を継続する用途として公開されたDaSiWaのCivitaiワークフロー。保存済み証拠から詳細手順までは復元しない。",
+      "created_at": "2026-08-22T13:25:18.446724",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "4713b64d-c7ae-5802-a83d-fed6efa8ada0",
+      "latest_revision_id": "a438820f-144b-404c-a625-40542d46c840",
+      "parent_id": "ed402bdb-385d-43c0-be1b-69555f40ae5f",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 0.0,
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "civitai_api",
+          "source_type": "direct",
+          "url": "https://civitai.red/models/2861921/minimax-h3-dasiwa-continue-from-clip-nativeaddguidespectrumfastpreview?modelVersionId=3232954",
+          "used": true
+        }
+      ],
+      "title": "MiniMax H3で既存clipから生成を継続する用途として公開されたDaSiWaのCivitaiワークフロー。保存済み証拠から詳細手順までは復元しない。",
+      "updated_at": "2026-08-22T13:25:18.446724"
+    },
+    "4a3c2921-1a3a-4242-aab3-74b5794e9d7f": {
+      "archived_at": null,
+      "body_json_digest": "6c8f57ea891fd5f642004e546318bcb3e0a668a233a6d4afa89c8b9c90b20549",
+      "body_text": "MiniMax H3",
+      "created_at": "2026-08-03T09:55:21.582257",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "4a3c2921-1a3a-4242-aab3-74b5794e9d7f",
+      "latest_revision_id": "57bb7bd0-61bc-49ad-9352-9c97ceb44033",
+      "parent_id": "24df0958-b0d2-4cc2-815a-2d15714d7df1",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 9.0,
+      "source_refs": [],
+      "title": "MiniMax H3",
+      "updated_at": "2026-08-22T12:11:16.510000"
+    },
+    "4f908cd3-a78d-544b-817b-d0b5642992e6": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "参考・未確認",
+      "created_at": "2026-08-22T13:24:31.381683",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "4f908cd3-a78d-544b-817b-d0b5642992e6",
+      "latest_revision_id": "ab625328-2b2e-472d-93c0-2dc27bec0bb0",
+      "parent_id": "4a3c2921-1a3a-4242-aab3-74b5794e9d7f",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 16.5,
+      "source_refs": [],
+      "title": "参考・未確認",
+      "updated_at": "2026-08-22T13:24:31.381683"
+    },
+    "50610985-4885-45cc-8118-92a4ea4bb3ec": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "Hugging Face配布ページ",
+      "created_at": "2026-08-20T14:49:29.377270",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "50610985-4885-45cc-8118-92a4ea4bb3ec",
+      "latest_revision_id": "696e2fcb-ebb5-4628-9646-aca93cd5dcaa",
+      "parent_id": "8b5e5e3d-52b7-489d-ad29-762b94a220e3",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 33.0,
+      "source_refs": [],
+      "title": "Hugging Face配布ページ",
+      "updated_at": "2026-08-22T13:25:36.090159"
+    },
+    "532e459d-4074-4df4-aaed-9ca1657f4343": {
+      "archived_at": null,
+      "body_json_digest": "14132a72d7359e8f880ca25a95a02b31858ad97f1f10779cc1442fb7f9fc42f4",
+      "body_text": "Gitによるインストールコマンド",
+      "created_at": "2026-08-22T11:15:42.458993",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "532e459d-4074-4df4-aaed-9ca1657f4343",
+      "latest_revision_id": "852b279c-4aa9-4e38-98e0-1359e426330d",
+      "parent_id": "94b6330a-3073-40a4-a6d3-aed49b9a15e8",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 47.0,
+      "source_refs": [
+        {
+          "legacy_key": "verbatim_blocks",
+          "migration_id": "docs-verbatim-content-to-typed-blocks-v1",
+          "sha256": "7d0c19e87d5d389ca9df5f9397146ab5840cbe2103340e8ce61589dd94ca98d9",
+          "source_index": 0,
+          "source_node_id": "94b6330a-3073-40a4-a6d3-aed49b9a15e8",
+          "type": "verbatim_content_materialization"
+        }
+      ],
+      "title": "Gitによるインストールコマンド",
+      "updated_at": "2026-08-22T11:15:42.458993"
+    },
+    "539bbaaa-c1a3-5189-9a78-057e42c8a333": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "モデル",
+      "created_at": "2026-08-22T13:24:32.559073",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "539bbaaa-c1a3-5189-9a78-057e42c8a333",
+      "latest_revision_id": "201c488b-69db-431b-a754-cca3b057b8f3",
+      "parent_id": "4a3c2921-1a3a-4242-aab3-74b5794e9d7f",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 20.5,
+      "source_refs": [],
+      "title": "モデル",
+      "updated_at": "2026-08-22T13:24:32.559073"
+    },
+    "550a41f4-abcd-4ef0-8103-8cc57f5d2524": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://www.reddit.com/r/comfyui/comments/1vinc36/testing_character_swap_with_minimax_h3/",
+      "created_at": "2026-08-20T14:46:35.004541",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "550a41f4-abcd-4ef0-8103-8cc57f5d2524",
+      "latest_revision_id": "4177c991-4db2-4730-9979-fd32c2710793",
+      "parent_id": "cd245f05-32a6-48d8-8346-7d28bfc4cec0",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://www.reddit.com/r/comfyui/comments/1vinc36/testing_character_swap_with_minimax_h3/",
+      "updated_at": "2026-08-20T14:46:35.004541"
+    },
+    "581dcc7b-016a-4c7d-a22c-a093e30fe8cd": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://civitai.com/models/2831976/minimax-h3-ez-or-turbo-optimal-rtx-upscale-ltx-refine?modelVersionId=3208667",
+      "created_at": "2026-08-18T14:24:46.813567",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "581dcc7b-016a-4c7d-a22c-a093e30fe8cd",
+      "latest_revision_id": "6667ba39-a7e6-4dc3-b5f7-d2a77e0c5285",
+      "parent_id": "c24b9fbb-8fc1-4ecd-a492-6c2e4f1cfa05",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://civitai.com/models/2831976/minimax-h3-ez-or-turbo-optimal-rtx-upscale-ltx-refine?modelVersionId=3208667",
+      "updated_at": "2026-08-18T14:24:46.813567"
+    },
+    "5db7f4c2-e7a6-4e3a-972a-c38d4b8b4575": {
+      "archived_at": null,
+      "body_json_digest": "d8a33ca3fc3e5797daf27d94704153f0c37ceba47c6a12cc3974ff13711cbf0c",
+      "body_text": "MiniMax H3 Latent Upscaler",
+      "created_at": "2026-08-22T08:26:21.389149",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "5db7f4c2-e7a6-4e3a-972a-c38d4b8b4575",
+      "latest_revision_id": "93a40dec-32b7-4308-914e-3a3eb689d18e",
+      "parent_id": "36cadf1c-8552-5143-b696-d0fc48b326d1",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 37.0,
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "huggingface_api",
+          "source_type": "direct",
+          "url": "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler",
+          "used": true
+        }
+      ],
+      "title": "MiniMax H3 Latent Upscaler",
+      "updated_at": "2026-08-22T13:25:09.454833"
+    },
+    "5ee90035-f410-4eee-8c57-41e3c2b363d6": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "現時点ではまだPoC段階である。",
+      "created_at": "2026-08-20T14:49:29.373269",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "5ee90035-f410-4eee-8c57-41e3c2b363d6",
+      "latest_revision_id": "64692c00-07c7-45ba-b81f-49dadcdcb2a2",
+      "parent_id": "8b5e5e3d-52b7-489d-ad29-762b94a220e3",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 32.0,
+      "source_refs": [],
+      "title": "現時点ではまだPoC段階である。",
+      "updated_at": "2026-08-22T08:26:21.316541"
+    },
+    "6ad736eb-55db-4edb-9164-2444b1ddb21c": {
+      "archived_at": "2026-08-22T13:25:36.149675",
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "出典",
+      "created_at": "2026-08-20T14:49:29.385277",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "6ad736eb-55db-4edb-9164-2444b1ddb21c",
+      "latest_revision_id": "b6eb58f2-3377-418f-af47-8e665b54ee0b",
+      "parent_id": "8b5e5e3d-52b7-489d-ad29-762b94a220e3",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 34.0,
+      "source_refs": [],
+      "title": "出典",
+      "updated_at": "2026-08-22T13:25:36.149675"
+    },
+    "6cc990c1-686f-4903-af9d-8d4baea2fe47": {
+      "archived_at": null,
+      "body_json_digest": "ab4c650217ac5a2bf8db22a27e599c9258f0d95b0742b831a3cd4825fa1b6815",
+      "body_text": "MiniMax H3キャラクターLoRA学習（AI Toolkit）",
+      "created_at": "2026-08-22T08:26:21.466803",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "6cc990c1-686f-4903-af9d-8d4baea2fe47",
+      "latest_revision_id": "1e4bc4ac-1822-4b1d-ab51-cb63e428c339",
+      "parent_id": "73b32961-f22c-5000-a8e5-0460c588e1d2",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 41.0,
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "x_oembed",
+          "source_type": "direct",
+          "url": "https://x.com/AIiswonder/status/2086927792659378414",
+          "used": true
+        }
+      ],
+      "title": "MiniMax H3キャラクターLoRA学習（AI Toolkit）",
+      "updated_at": "2026-08-22T13:25:18.454725"
+    },
+    "6ce588d5-315b-4569-8ae6-3b88e338a19c": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "Civitaiモデルページ（内容未整理）",
+      "created_at": "2026-08-21T10:13:53.858461",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "6ce588d5-315b-4569-8ae6-3b88e338a19c",
+      "latest_revision_id": "c81f5c63-2d08-4412-b982-8c2ac8dc903d",
+      "parent_id": "6ce7dbe4-adef-4cb8-a140-7efa8edbfb08",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 35.0,
+      "source_refs": [],
+      "title": "Civitaiモデルページ（内容未整理）",
+      "updated_at": "2026-08-22T13:25:36.094159"
+    },
+    "6ce7dbe4-adef-4cb8-a140-7efa8edbfb08": {
+      "archived_at": null,
+      "body_json_digest": "6d05bdcd9fb2456c7436fce3dbb4b1ba48d1d5c3d50bc842ed5867efaccf6f68",
+      "body_text": "10eros Max INT8 Ref2VAモデル",
+      "created_at": "2026-08-22T08:26:21.354684",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "6ce7dbe4-adef-4cb8-a140-7efa8edbfb08",
+      "latest_revision_id": "5eb82c48-f45d-4032-9c66-bf68df760c1e",
+      "parent_id": "539bbaaa-c1a3-5189-9a78-057e42c8a333",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 35.0,
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "civitai_api",
+          "source_type": "direct",
+          "url": "https://civitai.red/models/2868392/10erosmaxint8ref2vabeta2?modelVersionId=3240646",
+          "used": true
+        }
+      ],
+      "title": "10eros Max INT8 Ref2VAモデル",
+      "updated_at": "2026-08-22T13:25:05.852001"
+    },
+    "7099430e-1e36-4c9b-9af1-809be63ec7a7": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler",
+      "created_at": "2026-08-22T06:33:59.612974",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "7099430e-1e36-4c9b-9af1-809be63ec7a7",
+      "latest_revision_id": "b6c283c3-ca6b-4047-9fa3-8befff8758b6",
+      "parent_id": "eb8a6065-b8f4-4c71-b911-3596bf486bfb",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler",
+      "updated_at": "2026-08-22T06:33:59.612974"
+    },
+    "71019796-9c90-4f1b-9686-68c7f47cfdb5": {
+      "archived_at": null,
+      "body_json_digest": "29c4e6b9cb2d9af888c0d67ca16f8d5e55453bf5406abbdb201aff072cc668c0",
+      "body_text": "Kijai MiniMax H3 / ComfyUIディスカッション",
+      "created_at": "2026-08-22T08:26:21.087219",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "71019796-9c90-4f1b-9686-68c7f47cfdb5",
+      "latest_revision_id": "76d491ff-3921-4482-b0bb-34a26208d0c0",
+      "parent_id": "4f908cd3-a78d-544b-817b-d0b5642992e6",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 18.0,
+      "source_refs": [],
+      "title": "Kijai MiniMax H3 / ComfyUIディスカッション",
+      "updated_at": "2026-08-22T13:24:32.588584"
+    },
+    "73b32961-f22c-5000-a8e5-0460c588e1d2": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "LoRA",
+      "created_at": "2026-08-22T13:24:32.575585",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "73b32961-f22c-5000-a8e5-0460c588e1d2",
+      "latest_revision_id": "f4b793c4-6305-496b-8e18-689c344fa34b",
+      "parent_id": "4a3c2921-1a3a-4242-aab3-74b5794e9d7f",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 39.5,
+      "source_refs": [],
+      "title": "LoRA",
+      "updated_at": "2026-08-22T13:24:32.575585"
+    },
+    "74c07964-99a2-4492-99df-48f468037aac": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "GitHubリポジトリ",
+      "created_at": "2026-08-21T14:59:26.795339",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "74c07964-99a2-4492-99df-48f468037aac",
+      "latest_revision_id": "4cc5c2b2-68a6-473b-b1c1-3452189d992d",
+      "parent_id": "94b6330a-3073-40a4-a6d3-aed49b9a15e8",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 45.0,
+      "source_refs": [],
+      "title": "GitHubリポジトリ",
+      "updated_at": "2026-08-22T08:26:21.546088"
+    },
+    "78e40a1a-db63-5afb-9f5e-2eb5a5262b73": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "保存済み記録ではAI Toolkit 0.12.8を使用し、学習画像24枚（既存20＋補助4）、LoRA rank/alphaはいずれも16。これら3 factをそのままtopic直下に置く。",
+      "created_at": "2026-08-22T13:25:23.202901",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "78e40a1a-db63-5afb-9f5e-2eb5a5262b73",
+      "latest_revision_id": "720d960b-1271-4fa7-9de2-fff2569d65bf",
+      "parent_id": "6cc990c1-686f-4903-af9d-8d4baea2fe47",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 0.0,
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "x_oembed",
+          "source_type": "direct",
+          "url": "https://x.com/AIiswonder/status/2086927792659378414",
+          "used": true
+        }
+      ],
+      "title": "保存済み記録ではAI Toolkit 0.12.8を使用し、学習画像24枚（既存20＋補助4）、LoRA rank/alphaはいずれも16。これら3 factをそのままtopic直下に置く。",
+      "updated_at": "2026-08-22T13:25:23.202901"
+    },
+    "7f034735-bfdb-4655-9afb-e9a5353ea62e": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://huggingface.co/Kijai/MiniMax-H3_comfy/discussions/1#6a76008c52e2e58fe11280f9",
+      "created_at": "2026-08-17T08:25:23.225596",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "7f034735-bfdb-4655-9afb-e9a5353ea62e",
+      "latest_revision_id": "a687342f-e595-4e01-b7a9-36342cd4830b",
+      "parent_id": "00bbfa4e-4be2-45ac-8b2d-466448a38c28",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://huggingface.co/Kijai/MiniMax-H3_comfy/discussions/1#6a76008c52e2e58fe11280f9",
+      "updated_at": "2026-08-17T08:25:23.225596"
+    },
+    "7f65079a-61c7-5a32-a890-bff52adb89ba": {
+      "archived_at": null,
+      "body_json_digest": "676698f7fee8933f11cb73bf4fd9f46fb5672c2713b8bd2a5fa332218a952bda",
+      "body_text": "DaSiWaワークフロー補助リソース（Spectrum／Motion Context／Latent Upscaler）",
+      "created_at": "2026-08-22T11:05:03.771348",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "7f65079a-61c7-5a32-a890-bff52adb89ba",
+      "latest_revision_id": "91f4ede6-1a07-43a0-b400-fdeed7c06332",
+      "parent_id": "f1375624-f4d2-5f93-b01a-2fd5f0bcf59c",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 47.0,
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "civitai_api",
+          "source_type": "direct",
+          "url": "https://civitai.red/models/2861921/minimax-h3-dasiwa-continue-from-clip-nativeaddguidespectrumfastpreview?modelVersionId=3232954",
+          "used": true
+        }
+      ],
+      "title": "DaSiWaワークフロー補助リソース（Spectrum／Motion Context／Latent Upscaler）",
+      "updated_at": "2026-08-22T13:25:27.019057"
+    },
+    "815e2dc4-bc71-401a-a959-f6da347c5a01": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "Latent Upscaler ComfyUIノードリポジトリ",
+      "created_at": "2026-08-22T06:33:59.598019",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "815e2dc4-bc71-401a-a959-f6da347c5a01",
+      "latest_revision_id": "8b570139-1d32-4667-bd4b-47faececb26a",
+      "parent_id": "7f65079a-61c7-5a32-a890-bff52adb89ba",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 49.0,
+      "source_refs": [],
+      "title": "Latent Upscaler ComfyUIノードリポジトリ",
+      "updated_at": "2026-08-22T13:25:36.118675"
+    },
+    "8b5e5e3d-52b7-489d-ad29-762b94a220e3": {
+      "archived_at": null,
+      "body_json_digest": "6dfc1ef5b14316d086cd53b95523a4ec978e23fc7e534a3c8be5f0e39b170eec",
+      "body_text": "ClipProj-MiniMax-H3埋め込みアダプタ",
+      "created_at": "2026-08-22T08:26:21.256998",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "8b5e5e3d-52b7-489d-ad29-762b94a220e3",
+      "latest_revision_id": "ea6a25cf-b3b3-47c6-80c1-eb3f23e7d4f6",
+      "parent_id": "539bbaaa-c1a3-5189-9a78-057e42c8a333",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 29.0,
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "huggingface_api",
+          "source_type": "direct",
+          "url": "https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3",
+          "used": true
+        }
+      ],
+      "title": "ClipProj-MiniMax-H3埋め込みアダプタ",
+      "updated_at": "2026-08-22T13:25:01.780972"
+    },
+    "90fcb1f6-115b-4c78-bc87-4c7f1f1e1737": {
+      "archived_at": "2026-08-22T13:25:36.137676",
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "出典",
+      "created_at": "2026-08-20T14:42:59.305465",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "90fcb1f6-115b-4c78-bc87-4c7f1f1e1737",
+      "latest_revision_id": "9c8e2a95-238c-423f-a939-5d3aff3d6203",
+      "parent_id": "2ba28918-e937-426b-85ec-7d256d190e48",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 23.0,
+      "source_refs": [],
+      "title": "出典",
+      "updated_at": "2026-08-22T13:25:36.137676"
+    },
+    "9246fa00-6578-4cc4-8861-052c182362aa": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://civitai.red/models/2868392/10erosmaxint8ref2vabeta2?modelVersionId=3240646",
+      "created_at": "2026-08-21T10:13:53.871460",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "9246fa00-6578-4cc4-8861-052c182362aa",
+      "latest_revision_id": "53010aa9-22e0-41c5-a50d-5847b80ed605",
+      "parent_id": "6ce588d5-315b-4569-8ae6-3b88e338a19c",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://civitai.red/models/2868392/10erosmaxint8ref2vabeta2?modelVersionId=3240646",
+      "updated_at": "2026-08-21T10:13:53.871460"
+    },
+    "94b6330a-3073-40a4-a6d3-aed49b9a15e8": {
+      "archived_at": null,
+      "body_json_digest": "ab590e3e4fe9554e0767e2507475fe435b1d7b97d36ecc367b342549fc9cc3dc",
+      "body_text": "ComfyUI-H3-Multishotリポジトリ",
+      "created_at": "2026-08-22T08:26:21.533938",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "94b6330a-3073-40a4-a6d3-aed49b9a15e8",
+      "latest_revision_id": "ae5db34c-87d1-477e-9f35-3951a5874c3c",
+      "parent_id": "efdd3bfe-5e6c-52d1-ba4b-69e6221d4731",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 45.0,
+      "source_refs": [
+        {
+          "migration_id": "docs-verbatim-content-to-typed-blocks-v1",
+          "source_node_id": "94b6330a-3073-40a4-a6d3-aed49b9a15e8",
+          "type": "verbatim_content_materialization"
+        },
+        {
+          "legacy_key": "verbatim_blocks",
+          "migration_id": "docs-verbatim-content-to-typed-blocks-v1",
+          "sha256": "7d0c19e87d5d389ca9df5f9397146ab5840cbe2103340e8ce61589dd94ca98d9",
+          "source_index": 0,
+          "source_node_id": "94b6330a-3073-40a4-a6d3-aed49b9a15e8",
+          "type": "verbatim_content_materialization"
+        }
+      ],
+      "title": "ComfyUI-H3-Multishotリポジトリ",
+      "updated_at": "2026-08-22T13:25:23.209901"
+    },
+    "952c5bff-98da-57fb-b9fe-b105a1da8f69": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "SubjectとPicture/Video参照を対応付ける入力例と、「参照画像をkeyframeとして使わない」指定を保存する。構文仕様として公式確認できていないため未整理を維持する。",
+      "created_at": "2026-08-22T13:25:36.025045",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "952c5bff-98da-57fb-b9fe-b105a1da8f69",
+      "latest_revision_id": "c665b22d-1b94-4a96-8196-e5005bf51fe9",
+      "parent_id": "0cdec5fa-4a2c-5ce6-bce3-0c3e1d56a13c",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 0.0,
+      "source_refs": [],
+      "title": "SubjectとPicture/Video参照を対応付ける入力例と、「参照画像をkeyframeとして使わない」指定を保存する。構文仕様として公式確認できていないため未整理を維持する。",
+      "updated_at": "2026-08-22T13:25:36.025045"
+    },
+    "97337e1e-6b05-4fba-8961-091423722703": {
+      "archived_at": "2026-08-22T13:25:36.221152",
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "元リンク（本文を取得できず内容は未確認）",
+      "created_at": "2026-08-20T14:46:35.018118",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "97337e1e-6b05-4fba-8961-091423722703",
+      "latest_revision_id": "f39cf3b9-6a87-4c38-b04a-ca0d040c394a",
+      "parent_id": "329e8fa1-4811-5ddc-bce3-ef1045f829be",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 28.0,
+      "source_refs": [],
+      "title": "元リンク（本文を取得できず内容は未確認）",
+      "updated_at": "2026-08-22T13:25:36.221152"
+    },
+    "973e01a4-6ed2-494a-8bca-8f0518c57d03": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://huggingface.co/Kijai/MiniMax-H3_comfy",
+      "created_at": "2026-08-17T08:25:23.234600",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "973e01a4-6ed2-494a-8bca-8f0518c57d03",
+      "latest_revision_id": "e77e1e7d-f767-43f4-acff-d55e0c559c12",
+      "parent_id": "3670b7cd-1c61-48cc-aef6-da44c9575fb9",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://huggingface.co/Kijai/MiniMax-H3_comfy",
+      "updated_at": "2026-08-17T08:25:23.234600"
+    },
+    "985c5899-739a-4ba2-9a60-999993718c61": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://x.com/AIiswonder/status/2086927792659378414",
+      "created_at": "2026-08-21T14:52:59.463509",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "985c5899-739a-4ba2-9a60-999993718c61",
+      "latest_revision_id": "e4dbd508-ba14-477b-9a99-1f8c0d25ef96",
+      "parent_id": "b6f737d3-d67d-409c-a900-85dfcfe0928f",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://x.com/AIiswonder/status/2086927792659378414",
+      "updated_at": "2026-08-21T14:52:59.463509"
+    },
+    "9b97b92c-27a2-58b3-ac95-6485b9c7ed87": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "Riding POV系I2V向けとして保存されたモデル項目。モデル説明とは別に、取得済みの開始用prompt例を再利用可能な原文として保持する。",
+      "created_at": "2026-08-22T13:24:50.548588",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "9b97b92c-27a2-58b3-ac95-6485b9c7ed87",
+      "latest_revision_id": "a5581e9d-f812-458d-b603-f661c5594432",
+      "parent_id": "2ba28918-e937-426b-85ec-7d256d190e48",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 0.0,
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "civitai_api",
+          "source_type": "direct",
+          "url": "https://civitai.red/models/2446218/h3ltx2-riding-pov-i2v?modelVersionId=3203205",
+          "used": true
+        }
+      ],
+      "title": "Riding POV系I2V向けとして保存されたモデル項目。モデル説明とは別に、取得済みの開始用prompt例を再利用可能な原文として保持する。",
+      "updated_at": "2026-08-22T13:24:50.548588"
+    },
+    "9c54a88b-a874-4e7a-a5a6-e9e9ed30acfe": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "X投稿（内容未整理）",
+      "created_at": "2026-08-20T14:46:34.981541",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "9c54a88b-a874-4e7a-a5a6-e9e9ed30acfe",
+      "latest_revision_id": "20933760-554a-41bc-8ac5-648849784b4e",
+      "parent_id": "329e8fa1-4811-5ddc-bce3-ef1045f829be",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 25.0,
+      "source_refs": [],
+      "title": "X投稿（内容未整理）",
+      "updated_at": "2026-08-22T13:25:36.081168"
+    },
+    "9f54b0b3-95c0-4b13-87b5-a65baa899217": {
+      "archived_at": "2026-08-22T13:25:36.130674",
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://civitai.red/models/2446218/h3ltx2-riding-pov-i2v?modelVersionId=3203205",
+      "created_at": "2026-08-20T14:42:59.309467",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "9f54b0b3-95c0-4b13-87b5-a65baa899217",
+      "latest_revision_id": "92efe4ed-7a7c-4e09-8f04-43a67976cbbc",
+      "parent_id": "90fcb1f6-115b-4c78-bc87-4c7f1f1e1737",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://civitai.red/models/2446218/h3ltx2-riding-pov-i2v?modelVersionId=3203205",
+      "updated_at": "2026-08-22T13:25:36.130674"
+    },
+    "9f9fa354-6125-4c52-be09-903afc76c65c": {
+      "archived_at": null,
+      "body_json_digest": "76d25afbf1c3c5ef138ab613eba35ad3d73b57d801edef00dc1ae9ec3b94e7f0",
+      "body_text": "h3-prompt-writingのインストールコマンド",
+      "created_at": "2026-08-22T11:15:42.394579",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "9f9fa354-6125-4c52-be09-903afc76c65c",
+      "latest_revision_id": "13411a75-3448-48bb-b926-168fc5ec59cc",
+      "parent_id": "dcc72c6b-d026-4851-8084-19b8d095272a",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 25.0,
+      "source_refs": [
+        {
+          "legacy_key": "verbatim_blocks",
+          "migration_id": "docs-verbatim-content-to-typed-blocks-v1",
+          "sha256": "a338b514110b0e4e4975e87d0681b247be648ef7aaafdb2302c9e1f35275e2ec",
+          "source_index": 0,
+          "source_node_id": "dcc72c6b-d026-4851-8084-19b8d095272a",
+          "type": "verbatim_content_materialization"
+        }
+      ],
+      "title": "h3-prompt-writingのインストールコマンド",
+      "updated_at": "2026-08-22T11:15:42.394579"
+    },
+    "a5668969-8192-47e5-809b-7d7158102bd0": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3",
+      "created_at": "2026-08-20T14:49:29.381279",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "a5668969-8192-47e5-809b-7d7158102bd0",
+      "latest_revision_id": "fa306929-a2c9-4163-833f-3c6cc9dbfdf5",
+      "parent_id": "50610985-4885-45cc-8118-92a4ea4bb3ec",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3",
+      "updated_at": "2026-08-20T14:49:29.381279"
+    },
+    "a6a33960-982b-5236-83fb-da2ee65d6e60": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "DaSiWaのMiniMax H3 workflowで利用する補助リソース群。Spectrum、Motion Context / Masked AV continuation、LBH Latent Upscalerのnode/modelを、workflowを補助する関連実装としてまとめて管理する。",
+      "created_at": "2026-08-22T13:25:31.734998",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "a6a33960-982b-5236-83fb-da2ee65d6e60",
+      "latest_revision_id": "6d493cc9-14ae-430d-8349-5f657fdfe589",
+      "parent_id": "7f65079a-61c7-5a32-a890-bff52adb89ba",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 0.0,
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "civitai_api",
+          "source_type": "direct",
+          "url": "https://civitai.red/models/2861921/minimax-h3-dasiwa-continue-from-clip-nativeaddguidespectrumfastpreview?modelVersionId=3232954",
+          "used": true
+        }
+      ],
+      "title": "DaSiWaのMiniMax H3 workflowで利用する補助リソース群。Spectrum、Motion Context / Masked AV continuation、LBH Latent Upscalerのnode/modelを、workflowを補助する関連実装としてまとめて管理する。",
+      "updated_at": "2026-08-22T13:25:31.734998"
+    },
+    "a7d46456-825d-402a-be3b-8de0bdf901e5": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "LoRA rankとalphaはそれぞれ16に設定する。",
+      "created_at": "2026-08-21T14:52:59.453991",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "a7d46456-825d-402a-be3b-8de0bdf901e5",
+      "latest_revision_id": "55dfbb16-4cb8-4c0d-902d-0914c4846c4f",
+      "parent_id": "6cc990c1-686f-4903-af9d-8d4baea2fe47",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 43.0,
+      "source_refs": [],
+      "title": "LoRA rankとalphaはそれぞれ16に設定する。",
+      "updated_at": "2026-08-22T08:26:21.510185"
+    },
+    "a9c18863-89d6-446e-962c-cd435ae22b3d": {
+      "archived_at": "2026-08-22T13:25:36.205641",
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://x.com/i/status/2086006928845787574",
+      "created_at": "2026-08-20T14:46:35.014118",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "a9c18863-89d6-446e-962c-cd435ae22b3d",
+      "latest_revision_id": "b2af8a0c-8cfc-41ea-b07a-2441af53a2d3",
+      "parent_id": "e58f5e1c-d72c-4ba3-8b8c-b89fc3ac63b0",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://x.com/i/status/2086006928845787574",
+      "updated_at": "2026-08-22T13:25:36.205641"
+    },
+    "a9dde08d-a87a-407d-a9c5-45cc823f52d6": {
+      "archived_at": "2026-08-22T13:25:36.194636",
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://github.com/jlucasmcrell/ComfyUI-H3-Multishot",
+      "created_at": "2026-08-21T14:59:26.824006",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "a9dde08d-a87a-407d-a9c5-45cc823f52d6",
+      "latest_revision_id": "0162fa83-990c-49f3-857e-cf3b01e648de",
+      "parent_id": "c43d267e-08cc-4c56-86b1-3174e1e47b9e",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://github.com/jlucasmcrell/ComfyUI-H3-Multishot",
+      "updated_at": "2026-08-22T13:25:36.194636"
+    },
+    "aa674e28-6712-4762-aad7-614f9a73cdab": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler",
+      "created_at": "2026-08-22T06:33:59.604775",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "aa674e28-6712-4762-aad7-614f9a73cdab",
+      "latest_revision_id": "72169e2a-4315-4c4f-b3c0-bfee77ec61ec",
+      "parent_id": "815e2dc4-bc71-401a-a959-f6da347c5a01",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler",
+      "updated_at": "2026-08-22T06:33:59.604775"
+    },
+    "aef0ffc4-2d28-4b7b-8dcf-9b8f05156639": {
+      "archived_at": "2026-08-22T13:25:36.188637",
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "出典",
+      "created_at": "2026-08-21T14:31:04.308735",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "aef0ffc4-2d28-4b7b-8dcf-9b8f05156639",
+      "latest_revision_id": "7db1d430-e1f1-4c18-943c-1d4b2d81cd13",
+      "parent_id": "ed402bdb-385d-43c0-be1b-69555f40ae5f",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 40.0,
+      "source_refs": [],
+      "title": "出典",
+      "updated_at": "2026-08-22T13:25:36.188637"
+    },
+    "b00f3de7-ae61-452b-b6a8-435feed81b29": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "Civitaiワークフロー配布ページ（内容未整理）",
+      "created_at": "2026-08-21T14:31:04.298733",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "b00f3de7-ae61-452b-b6a8-435feed81b29",
+      "latest_revision_id": "ac5b1bd8-5741-4b38-9888-71bce99acb2e",
+      "parent_id": "ed402bdb-385d-43c0-be1b-69555f40ae5f",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 39.0,
+      "source_refs": [],
+      "title": "Civitaiワークフロー配布ページ（内容未整理）",
+      "updated_at": "2026-08-22T13:25:36.102160"
+    },
+    "b597836b-07d4-4fd3-a080-d601d28b81cc": {
+      "archived_at": "2026-08-22T13:25:36.176644",
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "出典",
+      "created_at": "2026-08-21T14:21:07.605592",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "b597836b-07d4-4fd3-a080-d601d28b81cc",
+      "latest_revision_id": "27d64197-966b-494a-b8b3-3d8fbd87a887",
+      "parent_id": "5db7f4c2-e7a6-4e3a-972a-c38d4b8b4575",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 38.0,
+      "source_refs": [],
+      "title": "出典",
+      "updated_at": "2026-08-22T13:25:36.176644"
+    },
+    "b6f737d3-d67d-409c-a900-85dfcfe0928f": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "X出典",
+      "created_at": "2026-08-21T14:52:59.459504",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "b6f737d3-d67d-409c-a900-85dfcfe0928f",
+      "latest_revision_id": "ba002408-280d-4343-8171-966d7a0ae058",
+      "parent_id": "6cc990c1-686f-4903-af9d-8d4baea2fe47",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 44.0,
+      "source_refs": [],
+      "title": "X出典",
+      "updated_at": "2026-08-22T13:25:36.106166"
+    },
+    "b77bc7a6-ea55-488d-911d-fc37635bef7f": {
+      "archived_at": null,
+      "body_json_digest": "931e885f96c46bbd7ab5b298bd3a060d5471a7e11623d9bf6cf2087f218fbdd5",
+      "body_text": "画像をキーフレームとして使わない指定",
+      "created_at": "2026-08-22T11:15:42.530989",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "b77bc7a6-ea55-488d-911d-fc37635bef7f",
+      "latest_revision_id": "7ff8faff-6d11-4e4e-85b2-77f9bff15e5b",
+      "parent_id": "0cdec5fa-4a2c-5ce6-bce3-0c3e1d56a13c",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 2.0,
+      "source_refs": [
+        {
+          "legacy_key": "verbatim_blocks",
+          "migration_id": "docs-verbatim-content-to-typed-blocks-v1",
+          "sha256": "99d7e6a4dab022a557436f52f10950ad4a8b1b81e722536531fe05ef70cccbfb",
+          "source_index": 1,
+          "source_node_id": "0cdec5fa-4a2c-5ce6-bce3-0c3e1d56a13c",
+          "type": "verbatim_content_materialization"
+        }
+      ],
+      "title": "画像をキーフレームとして使わない指定",
+      "updated_at": "2026-08-22T11:15:42.530989"
+    },
+    "bb1df6f6-1bc3-57b6-b743-613ccf00b746": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "MiniMax H3向けにRTX UpscaleとLTX Refineを組み合わせるCivitaiワークフロー。EZ/Turbo構成を掲げているが、倍率・速度・画質差は根拠不足なので書かない。",
+      "created_at": "2026-08-22T13:24:46.257129",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "bb1df6f6-1bc3-57b6-b743-613ccf00b746",
+      "latest_revision_id": "add86415-b83c-41d6-967f-71412d11ff9b",
+      "parent_id": "e67bfbf2-d3e4-4025-b953-4d1e6044cf1a",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 0.0,
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "civitai_api",
+          "source_type": "direct",
+          "url": "https://civitai.com/models/2831976/minimax-h3-ez-or-turbo-optimal-rtx-upscale-ltx-refine?modelVersionId=3208667",
+          "used": true
+        }
+      ],
+      "title": "MiniMax H3向けにRTX UpscaleとLTX Refineを組み合わせるCivitaiワークフロー。EZ/Turbo構成を掲げているが、倍率・速度・画質差は根拠不足なので書かない。",
+      "updated_at": "2026-08-22T13:24:46.257129"
+    },
+    "bb461cb4-18fc-4dd4-996d-8d1154e081c7": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "Motion Context / Masked AV継続リポジトリ",
+      "created_at": "2026-08-22T06:33:59.585869",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "bb461cb4-18fc-4dd4-996d-8d1154e081c7",
+      "latest_revision_id": "434337a5-2136-4fe3-8c55-c4917db91aa9",
+      "parent_id": "7f65079a-61c7-5a32-a890-bff52adb89ba",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 48.0,
+      "source_refs": [],
+      "title": "Motion Context / Masked AV継続リポジトリ",
+      "updated_at": "2026-08-22T13:25:36.114176"
+    },
+    "bf83c21d-4447-4d47-96ce-c223d0d2a323": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "テキストエンコーダのVRAM使用量を約15.7GBから5.2GBまで削減し、生成品質もかなり近いと報告されている。",
+      "created_at": "2026-08-20T14:49:29.364271",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "bf83c21d-4447-4d47-96ce-c223d0d2a323",
+      "latest_revision_id": "729c99a1-208b-4864-acd6-387dfd8d0eb4",
+      "parent_id": "8b5e5e3d-52b7-489d-ad29-762b94a220e3",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 30.0,
+      "source_refs": [],
+      "title": "テキストエンコーダのVRAM使用量を約15.7GBから5.2GBまで削減し、生成品質もかなり近いと報告されている。",
+      "updated_at": "2026-08-22T08:26:21.287404"
+    },
+    "c1e2233e-e5cf-58ef-8f15-6c1d1fd46a40": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "MiniMax H3の24-channel latentをlatent spaceのままアップスケールするためのモデル。低解像度生成→latent upscale→refineという流れを想定し、途中のVAE decode/encodeによるround-tripを避ける構成になっている。",
+      "created_at": "2026-08-22T13:25:14.005607",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "c1e2233e-e5cf-58ef-8f15-6c1d1fd46a40",
+      "latest_revision_id": "91674df2-5d93-44f0-a31c-25c775746dc2",
+      "parent_id": "5db7f4c2-e7a6-4e3a-972a-c38d4b8b4575",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 0.0,
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "huggingface_api",
+          "source_type": "direct",
+          "url": "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler",
+          "used": true
+        }
+      ],
+      "title": "MiniMax H3の24-channel latentをlatent spaceのままアップスケールするためのモデル。低解像度生成→latent upscale→refineという流れを想定し、途中のVAE decode/encodeによるround-tripを避ける構成になっている。",
+      "updated_at": "2026-08-22T13:25:14.005607"
+    },
+    "c24b9fbb-8fc1-4ecd-a492-6c2e4f1cfa05": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "対象modelVersion 3208667",
+      "created_at": "2026-08-18T14:24:46.807550",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "c24b9fbb-8fc1-4ecd-a492-6c2e4f1cfa05",
+      "latest_revision_id": "9606287b-5ee6-4a7f-bdee-7b2ed4f2f2c3",
+      "parent_id": "e67bfbf2-d3e4-4025-b953-4d1e6044cf1a",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 21.0,
+      "source_refs": [],
+      "title": "対象modelVersion 3208667",
+      "updated_at": "2026-08-22T13:25:36.063371"
+    },
+    "c43d267e-08cc-4c56-86b1-3174e1e47b9e": {
+      "archived_at": "2026-08-22T13:25:36.199636",
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "出典",
+      "created_at": "2026-08-21T14:59:26.818005",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "c43d267e-08cc-4c56-86b1-3174e1e47b9e",
+      "latest_revision_id": "171cd768-8491-4a72-a38e-aea14854c84a",
+      "parent_id": "94b6330a-3073-40a4-a6d3-aed49b9a15e8",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 46.0,
+      "source_refs": [],
+      "title": "出典",
+      "updated_at": "2026-08-22T13:25:36.199636"
+    },
+    "cd245f05-32a6-48d8-8346-7d28bfc4cec0": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "Reddit投稿（本文未取得）",
+      "created_at": "2026-08-20T14:46:34.998541",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "cd245f05-32a6-48d8-8346-7d28bfc4cec0",
+      "latest_revision_id": "5181f148-b800-470b-acee-fa7876d8113d",
+      "parent_id": "329e8fa1-4811-5ddc-bce3-ef1045f829be",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 26.0,
+      "source_refs": [],
+      "title": "Reddit投稿（本文未取得）",
+      "updated_at": "2026-08-22T13:25:36.086167"
+    },
+    "ce99c299-b02f-42ac-954f-c66782cebae2": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://civitai.red/models/2446218/h3ltx2-riding-pov-i2v?modelVersionId=3203205",
+      "created_at": "2026-08-20T14:42:59.300466",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "ce99c299-b02f-42ac-954f-c66782cebae2",
+      "latest_revision_id": "9299ae03-a965-40cb-9059-d74a82925946",
+      "parent_id": "37fd866f-b48a-4a0f-8241-a8e2747a7494",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://civitai.red/models/2446218/h3ltx2-riding-pov-i2v?modelVersionId=3203205",
+      "updated_at": "2026-08-20T14:42:59.300466"
+    },
+    "d5336184-da99-4dc5-a6da-d78c463703d4": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "Spectrum MiniMax H3リポジトリ",
+      "created_at": "2026-08-22T06:33:59.562802",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "d5336184-da99-4dc5-a6da-d78c463703d4",
+      "latest_revision_id": "45cebb6c-785b-4ae9-a4f9-a36e1d30d9f3",
+      "parent_id": "7f65079a-61c7-5a32-a890-bff52adb89ba",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 47.0,
+      "source_refs": [],
+      "title": "Spectrum MiniMax H3リポジトリ",
+      "updated_at": "2026-08-22T13:25:36.110178"
+    },
+    "d72527b1-1265-4226-9844-f5447cfbdd7b": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "AI Toolkit 0.12.8を使用してMiniMax H3用のキャラクターLoRAを学習する。",
+      "created_at": "2026-08-21T14:52:59.442988",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "d72527b1-1265-4226-9844-f5447cfbdd7b",
+      "latest_revision_id": "f8a5ad63-840a-420e-b9cd-c6f10d099674",
+      "parent_id": "6cc990c1-686f-4903-af9d-8d4baea2fe47",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 41.0,
+      "source_refs": [],
+      "title": "AI Toolkit 0.12.8を使用してMiniMax H3用のキャラクターLoRAを学習する。",
+      "updated_at": "2026-08-22T08:26:21.478313"
+    },
+    "d92153ce-f247-4df0-9592-bfc465591120": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "Qwen3-VL-4Bの埋め込みを学習済み線形変換でQwen3-VL-32B互換の5120次元表現へ変換する。",
+      "created_at": "2026-08-20T14:49:29.358277",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "d92153ce-f247-4df0-9592-bfc465591120",
+      "latest_revision_id": "1c1f35da-b11a-4283-8bf1-5fdd4f196665",
+      "parent_id": "8b5e5e3d-52b7-489d-ad29-762b94a220e3",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 29.0,
+      "source_refs": [],
+      "title": "Qwen3-VL-4Bの埋め込みを学習済み線形変換でQwen3-VL-32B互換の5120次元表現へ変換する。",
+      "updated_at": "2026-08-22T08:26:21.272024"
+    },
+    "d9b46785-715c-4bdd-b37f-47ed56576925": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler",
+      "created_at": "2026-08-21T14:21:07.599839",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "d9b46785-715c-4bdd-b37f-47ed56576925",
+      "latest_revision_id": "1fec397e-21ce-4b53-b9aa-bc0e9f95b960",
+      "parent_id": "0c03bc37-18d4-456d-9420-b2b88ec207d2",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler",
+      "updated_at": "2026-08-21T14:21:07.599839"
+    },
+    "db291b46-5220-4281-8ead-f0cae79c4540": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "元ワークフロー出典",
+      "created_at": "2026-08-22T06:33:59.618130",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "db291b46-5220-4281-8ead-f0cae79c4540",
+      "latest_revision_id": "0a63735b-176a-4fcc-b1ac-9a1da375e894",
+      "parent_id": "7f65079a-61c7-5a32-a890-bff52adb89ba",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 51.0,
+      "source_refs": [],
+      "title": "元ワークフロー出典",
+      "updated_at": "2026-08-22T13:25:36.127677"
+    },
+    "dc0cf58c-e230-5ac2-8e87-2dff57a3726c": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "KijaiのMiniMax-H3_comfy配布ページと関連discussionをまとめる参照項目。具体的な議論内容は保存済み本文から確定できないため要約しない。",
+      "created_at": "2026-08-22T13:24:36.947801",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "dc0cf58c-e230-5ac2-8e87-2dff57a3726c",
+      "latest_revision_id": "052c943f-7124-4f45-aebf-0b2ee1d815de",
+      "parent_id": "71019796-9c90-4f1b-9686-68c7f47cfdb5",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 0.0,
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "huggingface_api",
+          "source_type": "direct",
+          "url": "https://huggingface.co/Kijai/MiniMax-H3_comfy",
+          "used": true
+        }
+      ],
+      "title": "KijaiのMiniMax-H3_comfy配布ページと関連discussionをまとめる参照項目。具体的な議論内容は保存済み本文から確定できないため要約しない。",
+      "updated_at": "2026-08-22T13:24:36.947801"
+    },
+    "dc665906-00d2-5b3e-861d-a0a6cbf8cf06": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "MiniMax H3で複数shotを連続生成するmulti-shot chain向けのComfyUI repository。複数のshotをつないで扱う実装として公開されている。",
+      "created_at": "2026-08-22T13:25:27.011586",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "dc665906-00d2-5b3e-861d-a0a6cbf8cf06",
+      "latest_revision_id": "106545af-8056-480a-a7ab-c8af8091f68d",
+      "parent_id": "94b6330a-3073-40a4-a6d3-aed49b9a15e8",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 0.0,
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "github_api",
+          "source_type": "direct",
+          "url": "https://github.com/jlucasmcrell/ComfyUI-H3-Multishot",
+          "used": true
+        }
+      ],
+      "title": "MiniMax H3で複数shotを連続生成するmulti-shot chain向けのComfyUI repository。複数のshotをつないで扱う実装として公開されている。",
+      "updated_at": "2026-08-22T13:25:27.011586"
+    },
+    "dcc72c6b-d026-4851-8084-19b8d095272a": {
+      "archived_at": null,
+      "body_json_digest": "00138b5ed0f6329a597602ea3f14e4b68e697f8be68807b31d99305e97cbd6b9",
+      "body_text": "MiniMax H3公式リポジトリ／prompt-writingスキル",
+      "created_at": "2026-08-22T08:26:21.234963",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "dcc72c6b-d026-4851-8084-19b8d095272a",
+      "latest_revision_id": "2756c6a8-9e14-48c8-b014-ef7ff939b00a",
+      "parent_id": "efdd3bfe-5e6c-52d1-ba4b-69e6221d4731",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 24.0,
+      "source_refs": [],
+      "title": "MiniMax H3公式リポジトリ／prompt-writingスキル",
+      "updated_at": "2026-08-22T13:24:50.555589"
+    },
+    "dfc64847-e19b-56ee-95d9-d31b475e182a": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "MiniMax H3でのキャラクター入れ替えテストに関するX/Reddit参照。Xは取得履歴があるがsemantic本文が未整理、Redditは本文取得不能のため内容を推測しない。",
+      "created_at": "2026-08-22T13:25:01.773971",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "dfc64847-e19b-56ee-95d9-d31b475e182a",
+      "latest_revision_id": "06794e88-652d-4728-ae27-166ec7bb1ced",
+      "parent_id": "329e8fa1-4811-5ddc-bce3-ef1045f829be",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 0.0,
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "x_oembed",
+          "source_type": "direct",
+          "url": "https://x.com/i/status/2086006928845787574",
+          "used": true
+        },
+        {
+          "acquisition_status": "empty_body",
+          "source_type": "direct",
+          "url": "https://www.reddit.com/r/comfyui/comments/1vinc36/testing_character_swap_with_minimax_h3",
+          "used": false
+        }
+      ],
+      "title": "MiniMax H3でのキャラクター入れ替えテストに関するX/Reddit参照。Xは取得履歴があるがsemantic本文が未整理、Redditは本文取得不能のため内容を推測しない。",
+      "updated_at": "2026-08-22T13:25:01.773971"
+    },
+    "e2e5c724-bfda-498f-b7c4-8ef4318ea16d": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://github.com/MiniMax-AI/MiniMax-H3",
+      "created_at": "2026-08-20T14:43:53.432862",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "e2e5c724-bfda-498f-b7c4-8ef4318ea16d",
+      "latest_revision_id": "117a5b58-62f6-4784-8ba7-4da7d0247b5b",
+      "parent_id": "fcb72e7c-ea29-49bf-800c-7fc60072307c",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://github.com/MiniMax-AI/MiniMax-H3",
+      "updated_at": "2026-08-20T14:43:53.432862"
+    },
+    "e393e69a-18d2-4b7b-aa28-ac451442197a": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3",
+      "created_at": "2026-08-22T06:33:59.581199",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "e393e69a-18d2-4b7b-aa28-ac451442197a",
+      "latest_revision_id": "7425402a-018a-4d79-a1fb-b043a9c4f3c8",
+      "parent_id": "d5336184-da99-4dc5-a6da-d78c463703d4",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3",
+      "updated_at": "2026-08-22T06:33:59.581199"
+    },
+    "e3c0d6ea-5510-4ef3-8360-c71f7d09b487": {
+      "archived_at": "2026-08-22T13:25:36.233152",
+      "body_json_digest": "6c8f57ea891fd5f642004e546318bcb3e0a668a233a6d4afa89c8b9c90b20549",
+      "body_text": "QA MiniMax H3 explicit target topic B - 2026-08-22 restart",
+      "created_at": "2026-08-22T11:39:44.188182",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "e3c0d6ea-5510-4ef3-8360-c71f7d09b487",
+      "latest_revision_id": "0bdd4ae5-8bbd-4350-b6a0-89a43b5eede0",
+      "parent_id": "4a3c2921-1a3a-4242-aab3-74b5794e9d7f",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 8.0,
+      "source_refs": [],
+      "title": "QA MiniMax H3 explicit target topic B - 2026-08-22 restart",
+      "updated_at": "2026-08-22T13:25:36.233152"
+    },
+    "e3ee3217-42c9-43d7-8d6f-4c560221e71d": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://github.com/jlucasmcrell/ComfyUI-H3-Multishot",
+      "created_at": "2026-08-21T14:59:26.810004",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "e3ee3217-42c9-43d7-8d6f-4c560221e71d",
+      "latest_revision_id": "6de84eb7-e704-4e0a-86c4-7a325b16b9e9",
+      "parent_id": "74c07964-99a2-4492-99df-48f468037aac",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://github.com/jlucasmcrell/ComfyUI-H3-Multishot",
+      "updated_at": "2026-08-21T14:59:26.810004"
+    },
+    "e46ec92c-83f2-4b20-9983-de609c1f89d5": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://x.com/i/status/2086006928845787574",
+      "created_at": "2026-08-20T14:46:34.993541",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "e46ec92c-83f2-4b20-9983-de609c1f89d5",
+      "latest_revision_id": "c530ee27-cb3a-42cb-b30a-21b832b060af",
+      "parent_id": "9c54a88b-a874-4e7a-a5a6-e9e9ed30acfe",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://x.com/i/status/2086006928845787574",
+      "updated_at": "2026-08-20T14:46:34.993541"
+    },
+    "e58f5e1c-d72c-4ba3-8b8c-b89fc3ac63b0": {
+      "archived_at": "2026-08-22T13:25:36.211641",
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "出典",
+      "created_at": "2026-08-20T14:46:35.009549",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "e58f5e1c-d72c-4ba3-8b8c-b89fc3ac63b0",
+      "latest_revision_id": "0b7dd676-c1d0-43bd-a144-dc4e39e3770b",
+      "parent_id": "329e8fa1-4811-5ddc-bce3-ef1045f829be",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 27.0,
+      "source_refs": [],
+      "title": "出典",
+      "updated_at": "2026-08-22T13:25:36.211641"
+    },
+    "e67bfbf2-d3e4-4025-b953-4d1e6044cf1a": {
+      "archived_at": null,
+      "body_json_digest": "2d2e70de1815dda44b1278ea54e6307c8c0b4224a5d4ad9d55913cf03ea42eca",
+      "body_text": "MiniMax H3 EZ/Turbo RTXアップスケール・LTX Refineワークフロー",
+      "created_at": "2026-08-22T08:26:21.166765",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "e67bfbf2-d3e4-4025-b953-4d1e6044cf1a",
+      "latest_revision_id": "c2f57276-45f9-4ff8-a8c1-f4de139db572",
+      "parent_id": "3025dabd-fed9-5b9e-9229-e12321ac657e",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 20.0,
+      "source_refs": [],
+      "title": "MiniMax H3 EZ/Turbo RTXアップスケール・LTX Refineワークフロー",
+      "updated_at": "2026-08-22T13:24:36.953812"
+    },
+    "eb8a6065-b8f4-4c71-b911-3596bf486bfb": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "Latent Upscalerモデル（Hugging Face）",
+      "created_at": "2026-08-22T06:33:59.608872",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "eb8a6065-b8f4-4c71-b911-3596bf486bfb",
+      "latest_revision_id": "2c68e844-ded4-4b41-a0cf-2fd31cd16092",
+      "parent_id": "7f65079a-61c7-5a32-a890-bff52adb89ba",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 50.0,
+      "source_refs": [],
+      "title": "Latent Upscalerモデル（Hugging Face）",
+      "updated_at": "2026-08-22T13:25:36.123675"
+    },
+    "ec739db6-8f0a-4127-9f19-efaeae16c042": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://github.com/seitanism/ComfyUI-H3-Motion-Context-MultiRef",
+      "created_at": "2026-08-22T06:33:59.590894",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "ec739db6-8f0a-4127-9f19-efaeae16c042",
+      "latest_revision_id": "10cac3b0-9d1e-4a0e-8934-3ea2a503bb8b",
+      "parent_id": "bb461cb4-18fc-4dd4-996d-8d1154e081c7",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://github.com/seitanism/ComfyUI-H3-Motion-Context-MultiRef",
+      "updated_at": "2026-08-22T06:33:59.590894"
+    },
+    "ed402bdb-385d-43c0-be1b-69555f40ae5f": {
+      "archived_at": null,
+      "body_json_digest": "611f83d1f65d48c92ef0ccc3a066517bff73909aac015d17010126852634b121",
+      "body_text": "DaSiWa MiniMax H3 continue-from-clipワークフロー",
+      "created_at": "2026-08-22T08:26:21.430436",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "ed402bdb-385d-43c0-be1b-69555f40ae5f",
+      "latest_revision_id": "c6944965-b2f2-4d8c-af6f-c160f6ef8576",
+      "parent_id": "3025dabd-fed9-5b9e-9229-e12321ac657e",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 39.0,
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "civitai_api",
+          "source_type": "direct",
+          "url": "https://civitai.red/models/2861921/minimax-h3-dasiwa-continue-from-clip-nativeaddguidespectrumfastpreview?modelVersionId=3232954",
+          "used": true
+        }
+      ],
+      "title": "DaSiWa MiniMax H3 continue-from-clipワークフロー",
+      "updated_at": "2026-08-22T13:25:14.011205"
+    },
+    "efb7117d-5a22-4f11-bab4-c6273a161102": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "32B固有の知識や多言語音声性能は一部失われる。",
+      "created_at": "2026-08-20T14:49:29.368277",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "efb7117d-5a22-4f11-bab4-c6273a161102",
+      "latest_revision_id": "629c210b-1156-4fd9-b2bf-5c95dc6b48f3",
+      "parent_id": "8b5e5e3d-52b7-489d-ad29-762b94a220e3",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 31.0,
+      "source_refs": [],
+      "title": "32B固有の知識や多言語音声性能は一部失われる。",
+      "updated_at": "2026-08-22T08:26:21.302037"
+    },
+    "efdd3bfe-5e6c-52d1-ba4b-69e6221d4731": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "公式・実装",
+      "created_at": "2026-08-22T13:24:32.563086",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "efdd3bfe-5e6c-52d1-ba4b-69e6221d4731",
+      "latest_revision_id": "1ffbf050-30fb-48f1-8b8e-374334d96fea",
+      "parent_id": "4a3c2921-1a3a-4242-aab3-74b5794e9d7f",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 22.5,
+      "source_refs": [],
+      "title": "公式・実装",
+      "updated_at": "2026-08-22T13:24:32.563086"
+    },
+    "f1375624-f4d2-5f93-b01a-2fd5f0bcf59c": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "後加工・補助リソース",
+      "created_at": "2026-08-22T13:24:32.578586",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "f1375624-f4d2-5f93-b01a-2fd5f0bcf59c",
+      "latest_revision_id": "ff3e2210-63c4-43fb-bfee-6c960b272bc0",
+      "parent_id": "4a3c2921-1a3a-4242-aab3-74b5794e9d7f",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 45.5,
+      "source_refs": [],
+      "title": "後加工・補助リソース",
+      "updated_at": "2026-08-22T13:24:32.578586"
+    },
+    "f2a6dfdd-5785-468c-86f4-e34cd9b7919c": {
+      "archived_at": "2026-08-22T13:25:36.170675",
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler",
+      "created_at": "2026-08-21T14:21:07.611592",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "f2a6dfdd-5785-468c-86f4-e34cd9b7919c",
+      "latest_revision_id": "836bf558-63b3-4367-b18f-9234025419ad",
+      "parent_id": "b597836b-07d4-4fd3-a080-d601d28b81cc",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler",
+      "updated_at": "2026-08-22T13:25:36.170675"
+    },
+    "fa98bb58-6f64-5563-bb58-bbb153ddb19f": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "プロンプト・制作技法",
+      "created_at": "2026-08-22T13:24:32.567074",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "fa98bb58-6f64-5563-bb58-bbb153ddb19f",
+      "latest_revision_id": "c0a8e0ff-0583-4f1f-90fd-a651857dd572",
+      "parent_id": "4a3c2921-1a3a-4242-aab3-74b5794e9d7f",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 23.25,
+      "source_refs": [],
+      "title": "プロンプト・制作技法",
+      "updated_at": "2026-08-22T13:24:32.567074"
+    },
+    "fbb9e443-5239-44b6-b073-075f65ca921f": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://civitai.red/models/2861921/minimax-h3-dasiwa-continue-from-clip-nativeaddguidespectrumfastpreview?modelVersionId=3232954",
+      "created_at": "2026-08-22T06:33:59.622654",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "fbb9e443-5239-44b6-b073-075f65ca921f",
+      "latest_revision_id": "6f1bf13b-1416-45f3-9392-f084f17ccd03",
+      "parent_id": "db291b46-5220-4281-8ead-f0cae79c4540",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://civitai.red/models/2861921/minimax-h3-dasiwa-continue-from-clip-nativeaddguidespectrumfastpreview?modelVersionId=3232954",
+      "updated_at": "2026-08-22T06:33:59.622654"
+    },
+    "fc8270de-5d3e-44cd-9284-32c998d0c8ef": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://civitai.red/models/2861921/minimax-h3-dasiwa-continue-from-clip-nativeaddguidespectrumfastpreview?modelVersionId=3232954",
+      "created_at": "2026-08-21T14:31:04.303733",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "fc8270de-5d3e-44cd-9284-32c998d0c8ef",
+      "latest_revision_id": "3de9e3d4-5f28-4b70-81ef-fc51e0248253",
+      "parent_id": "b00f3de7-ae61-452b-b6a8-435feed81b29",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://civitai.red/models/2861921/minimax-h3-dasiwa-continue-from-clip-nativeaddguidespectrumfastpreview?modelVersionId=3232954",
+      "updated_at": "2026-08-21T14:31:04.303733"
+    },
+    "fcb72e7c-ea29-49bf-800c-7fc60072307c": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "MiniMax H3公式リポジトリ",
+      "created_at": "2026-08-20T14:43:53.425861",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "fcb72e7c-ea29-49bf-800c-7fc60072307c",
+      "latest_revision_id": "a8b0c9c8-e69a-4169-918f-b921a56d60f5",
+      "parent_id": "dcc72c6b-d026-4851-8084-19b8d095272a",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 24.0,
+      "source_refs": [],
+      "title": "MiniMax H3公式リポジトリ",
+      "updated_at": "2026-08-22T13:25:36.076393"
+    },
+    "ff3cd58f-51fa-4c48-aee9-05c515f5d882": {
+      "archived_at": null,
+      "body_json_digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "body_text": "https://civitai.com/models/2831976/minimax-h3-ez-or-turbo-optimal-rtx-upscale-ltx-refine",
+      "created_at": "2026-08-18T14:24:46.802551",
+      "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "id": "ff3cd58f-51fa-4c48-aee9-05c515f5d882",
+      "latest_revision_id": "95622f6c-6fd1-4eb8-8069-2a36c6dd8b39",
+      "parent_id": "17919297-c453-450c-b6b1-65cdcb96dd0d",
+      "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+      "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "sort_order": 1.0,
+      "source_refs": [],
+      "title": "https://civitai.com/models/2831976/minimax-h3-ez-or-turbo-optimal-rtx-upscale-ltx-refine",
+      "updated_at": "2026-08-18T14:24:46.802551"
+    }
+  },
+  "categories": {
+    "LoRA": {
+      "exists": true,
+      "id": "73b32961-f22c-5000-a8e5-0460c588e1d2",
+      "sort_order": 39.5,
+      "title": "LoRA"
+    },
+    "プロンプト・制作技法": {
+      "exists": true,
+      "id": "fa98bb58-6f64-5563-bb58-bbb153ddb19f",
+      "sort_order": 23.25,
+      "title": "プロンプト・制作技法"
+    },
+    "モデル": {
+      "exists": true,
+      "id": "539bbaaa-c1a3-5189-9a78-057e42c8a333",
+      "sort_order": 20.5,
+      "title": "モデル"
+    },
+    "ワークフロー": {
+      "exists": true,
+      "id": "3025dabd-fed9-5b9e-9229-e12321ac657e",
+      "sort_order": 18.5,
+      "title": "ワークフロー"
+    },
+    "公式・実装": {
+      "exists": true,
+      "id": "efdd3bfe-5e6c-52d1-ba4b-69e6221d4731",
+      "sort_order": 22.5,
+      "title": "公式・実装"
+    },
+    "参考・未確認": {
+      "exists": true,
+      "id": "4f908cd3-a78d-544b-817b-d0b5642992e6",
+      "sort_order": 16.5,
+      "title": "参考・未確認"
+    },
+    "後加工": {
+      "exists": true,
+      "id": "36cadf1c-8552-5143-b696-d0fc48b326d1",
+      "sort_order": 35.5,
+      "title": "後加工"
+    },
+    "後加工・補助リソース": {
+      "exists": true,
+      "id": "f1375624-f4d2-5f93-b01a-2fd5f0bcf59c",
+      "sort_order": 45.5,
+      "title": "後加工・補助リソース"
+    }
+  },
+  "child_renames": {
+    "00bbfa4e-4be2-45ac-8b2d-466448a38c28": {
+      "group": "G01",
+      "new": "関連ディスカッション（内容未整理）",
+      "old": "関連ディスカッション"
+    },
+    "0c03bc37-18d4-456d-9420-b2b88ec207d2": {
+      "group": "G08",
+      "new": "Hugging Faceモデル配布ページ（内容未整理）",
+      "old": "モデル配布ページ"
+    },
+    "17919297-c453-450c-b6b1-65cdcb96dd0d": {
+      "group": "G02",
+      "new": "Civitaiワークフロー配布ページ（内容未整理）",
+      "old": "ワークフロー配布ページ"
+    },
+    "3670b7cd-1c61-48cc-aef6-da44c9575fb9": {
+      "group": "G01",
+      "new": "Hugging Face配布元",
+      "old": "出典"
+    },
+    "37fd866f-b48a-4a0f-8241-a8e2747a7494": {
+      "group": "G03",
+      "new": "Civitaiモデルページ",
+      "old": "モデルページ"
+    },
+    "50610985-4885-45cc-8118-92a4ea4bb3ec": {
+      "group": "G06",
+      "new": "Hugging Face配布ページ",
+      "old": "ClipProj-MiniMax-H3"
+    },
+    "6ce588d5-315b-4569-8ae6-3b88e338a19c": {
+      "group": "G07",
+      "new": "Civitaiモデルページ（内容未整理）",
+      "old": "モデルページ"
+    },
+    "74c07964-99a2-4492-99df-48f468037aac": {
+      "group": "G11",
+      "new": "GitHubリポジトリ",
+      "old": "GitHubリポジトリ"
+    },
+    "815e2dc4-bc71-401a-a959-f6da347c5a01": {
+      "group": "G12",
+      "new": "Latent Upscaler ComfyUIノードリポジトリ",
+      "old": "Latent Upscalerノードリポジトリ"
+    },
+    "9c54a88b-a874-4e7a-a5a6-e9e9ed30acfe": {
+      "group": "G05",
+      "new": "X投稿（内容未整理）",
+      "old": "X投稿"
+    },
+    "b00f3de7-ae61-452b-b6a8-435feed81b29": {
+      "group": "G09",
+      "new": "Civitaiワークフロー配布ページ（内容未整理）",
+      "old": "ワークフローURL"
+    },
+    "b6f737d3-d67d-409c-a900-85dfcfe0928f": {
+      "group": "G10",
+      "new": "X出典",
+      "old": "出典"
+    },
+    "bb461cb4-18fc-4dd4-996d-8d1154e081c7": {
+      "group": "G12",
+      "new": "Motion Context / Masked AV継続リポジトリ",
+      "old": "Masked AV継続リポジトリ"
+    },
+    "c24b9fbb-8fc1-4ecd-a492-6c2e4f1cfa05": {
+      "group": "G02",
+      "new": "対象modelVersion 3208667",
+      "old": "出典"
+    },
+    "cd245f05-32a6-48d8-8346-7d28bfc4cec0": {
+      "group": "G05",
+      "new": "Reddit投稿（本文未取得）",
+      "old": "Reddit投稿"
+    },
+    "d5336184-da99-4dc5-a6da-d78c463703d4": {
+      "group": "G12",
+      "new": "Spectrum MiniMax H3リポジトリ",
+      "old": "Spectrumリポジトリ"
+    },
+    "db291b46-5220-4281-8ead-f0cae79c4540": {
+      "group": "G12",
+      "new": "元ワークフロー出典",
+      "old": "出典"
+    },
+    "eb8a6065-b8f4-4c71-b911-3596bf486bfb": {
+      "group": "G12",
+      "new": "Latent Upscalerモデル（Hugging Face）",
+      "old": "Latent Upscalerモデル"
+    },
+    "fcb72e7c-ea29-49bf-800c-7fc60072307c": {
+      "group": "G04",
+      "new": "MiniMax H3公式リポジトリ",
+      "old": "出典"
+    }
+  },
+  "duplicate_archive": {
+    "38726611-319e-48de-952e-020f1aaeeebb": {
+      "child_id": "1a6cfe34-4440-4116-b700-03a45922ab73",
+      "child_title": "https://civitai.red/models/2868392/10erosmaxint8ref2vabeta2?modelVersionId=3240646",
+      "title": "出典"
+    },
+    "6ad736eb-55db-4edb-9164-2444b1ddb21c": {
+      "child_id": "02f07181-1a4b-4676-b2f1-0b54aa7960cc",
+      "child_title": "https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3",
+      "title": "出典"
+    },
+    "90fcb1f6-115b-4c78-bc87-4c7f1f1e1737": {
+      "child_id": "9f54b0b3-95c0-4b13-87b5-a65baa899217",
+      "child_title": "https://civitai.red/models/2446218/h3ltx2-riding-pov-i2v?modelVersionId=3203205",
+      "title": "出典"
+    },
+    "97337e1e-6b05-4fba-8961-091423722703": {
+      "child_id": "3116007b-4cf0-46e9-8215-04e1e871ad71",
+      "child_title": "https://www.reddit.com/r/comfyui/comments/1vinc36/testing_character_swap_with_minimax_h3",
+      "title": "元リンク（本文を取得できず内容は未確認）"
+    },
+    "aef0ffc4-2d28-4b7b-8dcf-9b8f05156639": {
+      "child_id": "0e28e5c6-9885-423a-b9b0-180e71ac49e2",
+      "child_title": "https://civitai.red/models/2861921/minimax-h3-dasiwa-continue-from-clip-nativeaddguidespectrumfastpreview?modelVersionId=3232954",
+      "title": "出典"
+    },
+    "b597836b-07d4-4fd3-a080-d601d28b81cc": {
+      "child_id": "f2a6dfdd-5785-468c-86f4-e34cd9b7919c",
+      "child_title": "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler",
+      "title": "出典"
+    },
+    "c43d267e-08cc-4c56-86b1-3174e1e47b9e": {
+      "child_id": "a9dde08d-a87a-407d-a9c5-45cc823f52d6",
+      "child_title": "https://github.com/jlucasmcrell/ComfyUI-H3-Multishot",
+      "title": "出典"
+    },
+    "e58f5e1c-d72c-4ba3-8b8c-b89fc3ac63b0": {
+      "child_id": "a9c18863-89d6-446e-962c-cd435ae22b3d",
+      "child_title": "https://x.com/i/status/2086006928845787574",
+      "title": "出典"
+    }
+  },
+  "explanations": {
+    "G01": {
+      "exists": true,
+      "id": "dc0cf58c-e230-5ac2-8e87-2dff57a3726c",
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "huggingface_api",
+          "source_type": "direct",
+          "url": "https://huggingface.co/Kijai/MiniMax-H3_comfy",
+          "used": true
+        }
+      ],
+      "title": "KijaiのMiniMax-H3_comfy配布ページと関連discussionをまとめる参照項目。具体的な議論内容は保存済み本文から確定できないため要約しない。"
+    },
+    "G02": {
+      "exists": true,
+      "id": "bb1df6f6-1bc3-57b6-b743-613ccf00b746",
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "civitai_api",
+          "source_type": "direct",
+          "url": "https://civitai.com/models/2831976/minimax-h3-ez-or-turbo-optimal-rtx-upscale-ltx-refine?modelVersionId=3208667",
+          "used": true
+        }
+      ],
+      "title": "MiniMax H3向けにRTX UpscaleとLTX Refineを組み合わせるCivitaiワークフロー。EZ/Turbo構成を掲げているが、倍率・速度・画質差は根拠不足なので書かない。"
+    },
+    "G03": {
+      "exists": true,
+      "id": "9b97b92c-27a2-58b3-ac95-6485b9c7ed87",
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "civitai_api",
+          "source_type": "direct",
+          "url": "https://civitai.red/models/2446218/h3ltx2-riding-pov-i2v?modelVersionId=3203205",
+          "used": true
+        }
+      ],
+      "title": "Riding POV系I2V向けとして保存されたモデル項目。モデル説明とは別に、取得済みの開始用prompt例を再利用可能な原文として保持する。"
+    },
+    "G04": {
+      "exists": true,
+      "id": "3df1c986-786f-5fd9-990c-3024bf365e38",
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "github_api",
+          "source_type": "direct",
+          "url": "https://github.com/MiniMax-AI/MiniMax-H3",
+          "used": true
+        }
+      ],
+      "title": "MiniMax-AI公式repositoryとh3-prompt-writingスキルの導入情報。保存済みinstall commandを改変せず実行用資料として残す。"
+    },
+    "G05": {
+      "exists": true,
+      "id": "dfc64847-e19b-56ee-95d9-d31b475e182a",
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "x_oembed",
+          "source_type": "direct",
+          "url": "https://x.com/i/status/2086006928845787574",
+          "used": true
+        },
+        {
+          "acquisition_status": "empty_body",
+          "source_type": "direct",
+          "url": "https://www.reddit.com/r/comfyui/comments/1vinc36/testing_character_swap_with_minimax_h3",
+          "used": false
+        }
+      ],
+      "title": "MiniMax H3でのキャラクター入れ替えテストに関するX/Reddit参照。Xは取得履歴があるがsemantic本文が未整理、Redditは本文取得不能のため内容を推測しない。"
+    },
+    "G06": {
+      "exists": true,
+      "id": "3c1fd0ef-7917-5357-bc7a-5468b17be56c",
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "huggingface_api",
+          "source_type": "direct",
+          "url": "https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3",
+          "used": true
+        }
+      ],
+      "title": "Qwen3-VL-4Bの埋め込みを学習済み線形変換で32B互換5120次元へ変換するPoC。保存済み記録ではテキストエンコーダVRAMが約15.7GB→5.2GB、32B固有知識や多言語音声性能の一部喪失が報告されている。"
+    },
+    "G07": {
+      "exists": true,
+      "id": "2f137dd5-fcfb-5f50-80d8-a68497e532e0",
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "civitai_api",
+          "source_type": "direct",
+          "url": "https://civitai.red/models/2868392/10erosmaxint8ref2vabeta2?modelVersionId=3240646",
+          "used": true
+        }
+      ],
+      "title": "10Eros_Max beta2をMiniMax H3のRef2VA向けにINT8 ConvRot化した実験的モデル。video referenceを使う用途を想定した配布物として公開されている。"
+    },
+    "G08": {
+      "exists": true,
+      "id": "c1e2233e-e5cf-58ef-8f15-6c1d1fd46a40",
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "huggingface_api",
+          "source_type": "direct",
+          "url": "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler",
+          "used": true
+        }
+      ],
+      "title": "MiniMax H3の24-channel latentをlatent spaceのままアップスケールするためのモデル。低解像度生成→latent upscale→refineという流れを想定し、途中のVAE decode/encodeによるround-tripを避ける構成になっている。"
+    },
+    "G09": {
+      "exists": true,
+      "id": "4713b64d-c7ae-5802-a83d-fed6efa8ada0",
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "civitai_api",
+          "source_type": "direct",
+          "url": "https://civitai.red/models/2861921/minimax-h3-dasiwa-continue-from-clip-nativeaddguidespectrumfastpreview?modelVersionId=3232954",
+          "used": true
+        }
+      ],
+      "title": "MiniMax H3で既存clipから生成を継続する用途として公開されたDaSiWaのCivitaiワークフロー。保存済み証拠から詳細手順までは復元しない。"
+    },
+    "G10": {
+      "exists": true,
+      "id": "78e40a1a-db63-5afb-9f5e-2eb5a5262b73",
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "x_oembed",
+          "source_type": "direct",
+          "url": "https://x.com/AIiswonder/status/2086927792659378414",
+          "used": true
+        }
+      ],
+      "title": "保存済み記録ではAI Toolkit 0.12.8を使用し、学習画像24枚（既存20＋補助4）、LoRA rank/alphaはいずれも16。これら3 factをそのままtopic直下に置く。"
+    },
+    "G11": {
+      "exists": true,
+      "id": "dc665906-00d2-5b3e-861d-a0a6cbf8cf06",
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "github_api",
+          "source_type": "direct",
+          "url": "https://github.com/jlucasmcrell/ComfyUI-H3-Multishot",
+          "used": true
+        }
+      ],
+      "title": "MiniMax H3で複数shotを連続生成するmulti-shot chain向けのComfyUI repository。複数のshotをつないで扱う実装として公開されている。"
+    },
+    "G12": {
+      "exists": true,
+      "id": "a6a33960-982b-5236-83fb-da2ee65d6e60",
+      "source_refs": [
+        {
+          "acquisition_status": "success",
+          "provider": "civitai_api",
+          "source_type": "direct",
+          "url": "https://civitai.red/models/2861921/minimax-h3-dasiwa-continue-from-clip-nativeaddguidespectrumfastpreview?modelVersionId=3232954",
+          "used": true
+        }
+      ],
+      "title": "DaSiWaのMiniMax H3 workflowで利用する補助リソース群。Spectrum、Motion Context / Masked AV continuation、LBH Latent Upscalerのnode/modelを、workflowを補助する関連実装としてまとめて管理する。"
+    },
+    "G13": {
+      "exists": true,
+      "id": "952c5bff-98da-57fb-b9fe-b105a1da8f69",
+      "source_refs": [],
+      "title": "SubjectとPicture/Video参照を対応付ける入力例と、「参照画像をkeyframeとして使わない」指定を保存する。構文仕様として公式確認できていないため未整理を維持する。"
+    }
+  },
+  "fact_titles": {
+    "332e518b-5d1b-4be2-a874-f73fa6edca1a": "学習画像は24枚で、既存画像20枚と補助画像4枚で構成する。",
+    "5ee90035-f410-4eee-8c57-41e3c2b363d6": "現時点ではまだPoC段階である。",
+    "a7d46456-825d-402a-be3b-8de0bdf901e5": "LoRA rankとalphaはそれぞれ16に設定する。",
+    "bf83c21d-4447-4d47-96ce-c223d0d2a323": "テキストエンコーダのVRAM使用量を約15.7GBから5.2GBまで削減し、生成品質もかなり近いと報告されている。",
+    "d72527b1-1265-4226-9844-f5447cfbdd7b": "AI Toolkit 0.12.8を使用してMiniMax H3用のキャラクターLoRAを学習する。",
+    "d92153ce-f247-4df0-9592-bfc465591120": "Qwen3-VL-4Bの埋め込みを学習済み線形変換でQwen3-VL-32B互換の5120次元表現へ変換する。",
+    "efb7117d-5a22-4f11-bab4-c6273a161102": "32B固有の知識や多言語音声性能は一部失われる。"
+  },
+  "g05_moves": {},
+  "g14": {
+    "action": "metadata_only_fold",
+    "independent_topic": false,
+    "topic_count": 0
+  },
+  "generated_at": "2026-08-22T13:28:45.837366+00:00",
+  "mode": "dry_run",
+  "move_revision_policy": "DocsGraphService.move_node structural revision is followed by a provenance revision with original source_refs; latest source_refs remain exact",
+  "no_new_summary_nodes": true,
+  "qa_archive": {
+    "2dbf88e4-a1a8-4545-b990-0ea6fcfe379b": "QA MiniMax H3 - explicit target topic A — 2026-08-22 restart",
+    "e3c0d6ea-5510-4ef3-8360-c71f7d09b487": "QA MiniMax H3 explicit target topic B - 2026-08-22 restart"
+  },
+  "root_before": {
+    "archived_at": null,
+    "body_json_digest": "6c8f57ea891fd5f642004e546318bcb3e0a668a233a6d4afa89c8b9c90b20549",
+    "body_text": "MiniMax H3",
+    "created_at": "2026-08-03T09:55:21.582257",
+    "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+    "id": "4a3c2921-1a3a-4242-aab3-74b5794e9d7f",
+    "parent_id": "24df0958-b0d2-4cc2-815a-2d15714d7df1",
+    "project_id": "0b45037b-d1e4-48e6-aac2-6121177c9ef6",
+    "root_page_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+    "sort_order": 9.0,
+    "title": "MiniMax H3",
+    "updated_at": "2026-08-22T12:11:16.510000"
+  },
+  "root_id": "4a3c2921-1a3a-4242-aab3-74b5794e9d7f",
+  "semantic_confidence": {
+    "G01": "medium",
+    "G02": "medium",
+    "G03": "medium",
+    "G04": "medium",
+    "G05": "medium",
+    "G06": "medium",
+    "G07": "medium",
+    "G08": "medium",
+    "G09": "medium",
+    "G10": "medium",
+    "G11": "medium",
+    "G12": "high",
+    "G13": "low"
+  },
+  "source_association_confidence": {
+    "G12": "medium"
+  },
+  "status": "already_applied",
+  "topic_paths": {
+    "G01": "MiniMax H3 / 参考・未確認",
+    "G02": "MiniMax H3 / ワークフロー",
+    "G03": "MiniMax H3 / モデル",
+    "G04": "MiniMax H3 / 公式・実装",
+    "G05": "MiniMax H3 / 参考・未確認",
+    "G06": "MiniMax H3 / モデル",
+    "G07": "MiniMax H3 / モデル",
+    "G08": "MiniMax H3 / 後加工",
+    "G09": "MiniMax H3 / ワークフロー",
+    "G10": "MiniMax H3 / LoRA",
+    "G11": "MiniMax H3 / 公式・実装",
+    "G12": "MiniMax H3 / 後加工・補助リソース",
+    "G13": "MiniMax H3 / プロンプト・制作技法"
+  },
+  "topic_titles": {
+    "G01": "Kijai MiniMax H3 / ComfyUIディスカッション",
+    "G02": "MiniMax H3 EZ/Turbo RTXアップスケール・LTX Refineワークフロー",
+    "G03": "H3LT X2 Riding POV I2Vモデル",
+    "G04": "MiniMax H3公式リポジトリ／prompt-writingスキル",
+    "G05": "MiniMax H3キャラクター入れ替えテスト",
+    "G06": "ClipProj-MiniMax-H3埋め込みアダプタ",
+    "G07": "10eros Max INT8 Ref2VAモデル",
+    "G08": "MiniMax H3 Latent Upscaler",
+    "G09": "DaSiWa MiniMax H3 continue-from-clipワークフロー",
+    "G10": "MiniMax H3キャラクターLoRA学習（AI Toolkit）",
+    "G11": "ComfyUI-H3-Multishotリポジトリ",
+    "G12": "DaSiWaワークフロー補助リソース（Spectrum／Motion Context／Latent Upscaler）",
+    "G13": "MiniMax H3参照素材プロンプト構文（未整理）"
+  },
+  "typed_blocks": {
+    "2a6f5e05771afa5560275f066a4ab6624cf0b8e8d6cc58f16a2abb6a968fc224": {
+      "block_type": "markdown",
+      "content": "<Subject 1> is 誰 comes from <Picture 1> and <Picture 2>, and whose 部位 comes from <Picture 3>〜.\n<Subject 2> is a camera angle and movement comes from <Video 1>.\n<Subject 2> is 〜 from <Picture 5>.",
+      "label": "Subjectと参照素材の指定例",
+      "node_id": "3437ee3c-1a69-4d15-baa4-4c76880c35ac",
+      "sha256": "2a6f5e05771afa5560275f066a4ab6624cf0b8e8d6cc58f16a2abb6a968fc224"
+    },
+    "7d0c19e87d5d389ca9df5f9397146ab5840cbe2103340e8ce61589dd94ca98d9": {
+      "block_type": "code",
+      "content": "```bash\ncd ComfyUI/custom_nodes\ngit clone https://github.com/jlucasmcrell/ComfyUI-H3-Multishot\n```",
+      "label": "Gitによるインストールコマンド",
+      "node_id": "532e459d-4074-4df4-aaed-9ca1657f4343",
+      "sha256": "7d0c19e87d5d389ca9df5f9397146ab5840cbe2103340e8ce61589dd94ca98d9"
+    },
+    "99d7e6a4dab022a557436f52f10950ad4a8b1b81e722536531fe05ef70cccbfb": {
+      "block_type": "markdown",
+      "content": "Don't use any of these pictures as keyframe.",
+      "label": "画像をキーフレームとして使わない指定",
+      "node_id": "b77bc7a6-ea55-488d-911d-fc37635bef7f",
+      "sha256": "99d7e6a4dab022a557436f52f10950ad4a8b1b81e722536531fe05ef70cccbfb"
+    },
+    "a338b514110b0e4e4975e87d0681b247be648ef7aaafdb2302c9e1f35275e2ec": {
+      "block_type": "markdown",
+      "content": "npx skills add https://github.com/MiniMax-AI/MiniMax-H3 --skill h3-prompt-writing",
+      "label": "h3-prompt-writingのインストールコマンド",
+      "node_id": "9f9fa354-6125-4c52-be09-903afc76c65c",
+      "sha256": "a338b514110b0e4e4975e87d0681b247be648ef7aaafdb2302c9e1f35275e2ec"
+    },
+    "b4592ec241d852c1d03963011604e7992de5b61696dd54195324519b855c5419": {
+      "block_type": "markdown",
+      "content": "Start with\nRiding backshot animation.\n/\nRiding frontshot animation.\n+ text.",
+      "label": "開始用プロンプト例",
+      "node_id": "3af3f1a2-f198-4fa2-847c-ceb68322b5b9",
+      "sha256": "b4592ec241d852c1d03963011604e7992de5b61696dd54195324519b855c5419"
+    }
+  },
+  "typed_sha256": [
+    "2a6f5e05771afa5560275f066a4ab6624cf0b8e8d6cc58f16a2abb6a968fc224",
+    "7d0c19e87d5d389ca9df5f9397146ab5840cbe2103340e8ce61589dd94ca98d9",
+    "99d7e6a4dab022a557436f52f10950ad4a8b1b81e722536531fe05ef70cccbfb",
+    "a338b514110b0e4e4975e87d0681b247be648ef7aaafdb2302c9e1f35275e2ec",
+    "b4592ec241d852c1d03963011604e7992de5b61696dd54195324519b855c5419"
+  ],
+  "unresolved": {
+    "G01": false,
+    "G02": false,
+    "G03": false,
+    "G04": false,
+    "G05": false,
+    "G06": false,
+    "G07": false,
+    "G08": false,
+    "G09": false,
+    "G10": false,
+    "G11": false,
+    "G12": false,
+    "G13": true
+  }
+}

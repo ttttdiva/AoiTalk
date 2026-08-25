@@ -30,6 +30,10 @@ export async function POST(
   if (!parentNodeId) {
     return NextResponse.json({ detail: "parent_node_idは必須です" }, { status: 400 });
   }
+  const parentAccess = await requireDocsNode(parentNodeId, user, "write");
+  if (!parentAccess || parentAccess.workspace.id !== access.workspace.id) {
+    return NextResponse.json({ detail: "配置先nodeへの書き込み権限がありません" }, { status: 403 });
+  }
   if (parentNodeId === access.node.id) {
     return NextResponse.json({ detail: "自分自身へ参照配置できません" }, { status: 400 });
   }
@@ -41,7 +45,7 @@ export async function POST(
   const [parent] = await db
     .select()
     .from(knowledgeNodes)
-    .where(and(eq(knowledgeNodes.id, parentNodeId), eq(knowledgeNodes.workspaceId, access.workspace.id)))
+    .where(and(eq(knowledgeNodes.id, parentNodeId), eq(knowledgeNodes.docsLibraryId, access.workspace.id)))
     .limit(1);
   if (!parent) {
     return NextResponse.json({ detail: "配置先nodeが見つかりません" }, { status: 404 });
@@ -89,6 +93,10 @@ export async function DELETE(
   const parentNodeId = cleanOptionalString(request.nextUrl.searchParams.get("parent_node_id"), 80);
   if (!parentNodeId) {
     return NextResponse.json({ detail: "parent_node_idは必須です" }, { status: 400 });
+  }
+  const parentAccess = await requireDocsNode(parentNodeId, user, "write");
+  if (!parentAccess || parentAccess.workspace.id !== access.workspace.id) {
+    return NextResponse.json({ detail: "配置先nodeへの書き込み権限がありません" }, { status: 403 });
   }
   await db
     .delete(knowledgeNodePlacements)

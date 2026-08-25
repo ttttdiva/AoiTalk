@@ -23,6 +23,15 @@ from .provider_capabilities import ProviderCapabilities
 StreamCallback = Callable[[str, Dict[str, Any]], Awaitable[None]]
 SteeringCallback = Callable[[], Awaitable[list[str]]]
 
+# Plain clip planning is intentionally restricted to Codex CLI when a route
+# lease selects a CLI candidate.  The other CLI providers do not expose a
+# verified tool-disable mode, so untrusted page text must not reach them.
+_UNVERIFIED_PLAIN_CLI_PROVIDERS = {
+    "antigravity-cli",
+    "claude-cli",
+    "grok-cli",
+}
+
 def disable_target_tools(target: Any) -> None:
     """tool-free候補でtoolが偶発実行されないよう空registryを固定する。"""
 
@@ -52,7 +61,7 @@ def _error_class(exc: BaseException) -> str:
         return "429"
     if status and 500 <= int(status) < 600:
         return "5xx"
-    if "timeout" in text or isinstance(exc, TimeoutError):
+    if "timeout" in text or isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
         return "timeout"
     if "connect" in text or "network" in text:
         return "connection"
@@ -97,6 +106,13 @@ async def _call_target_method(
 
     method = getattr(target, method_name, None)
     if not callable(method):
+        if method_name in {
+            "generate_plain_text_async",
+            "generate_memory_extraction_async",
+        }:
+            raise AttributeError(
+                f"無料Team候補が履歴非保存APIに対応していません: {method_name}"
+            )
         method = getattr(target, "generate_response_async")
     parameters = inspect.signature(method).parameters
     accepts_kwargs = any(
@@ -225,6 +241,9 @@ class FreeTeamRoutingClient:
 
     def set_character(self, character_name: str) -> None:
         self.character_name = character_name
+        # キャラクター切替後は起動時キャラの system prompt を再利用せず、
+        # 次のルーティング先へ選択キャラの統合プロンプトを渡す。
+        self.system_prompt = ""
 
     def update_character(self, character_name: str) -> None:
         self.set_character(character_name)
@@ -258,11 +277,14 @@ class FreeTeamRoutingClient:
             "session_user_id",
             "session_metadata",
             "generation_policy",
-            "character_name",
             "system_prompt",
         ):
             if hasattr(target, field):
                 setattr(target, field, getattr(self, field))
+        if hasattr(target, "set_character"):
+            target.set_character(self.character_name)
+        elif hasattr(target, "character_name"):
+            target.character_name = self.character_name
         if hasattr(target, "history_manager"):
             target.history_manager = self.history_manager
         if hasattr(target, "_model_transcript"):
@@ -312,11 +334,13 @@ class FreeTeamRoutingClient:
         # 自然文keywordでは判定せず、poolの明示tool intentを優先する。
         tool_mode = str(intent.tool_mode or "auto").lower()
         explicit_tool_required = getattr(self, "current_tool_required", None)
-        tools_required = (
-            bool(explicit_tool_required)
-            if isinstance(explicit_tool_required, bool)
-            else tools_enabled and tool_mode != "disabled"
-        )
+        tools_required = False
+        if method_name == "generate_response_async":
+            tools_required = (
+                bool(explicit_tool_required)
+                if isinstance(explicit_tool_required, bool)
+                else tools_enabled and tool_mode != "disabled"
+            )
         if tools_required:
             required.add("tools")
         profile = free_team_profile(self.config)
@@ -379,6 +403,14 @@ class FreeTeamRoutingClient:
             try:
                 self._last_route_metadata = lease.safe_metadata()
                 await self._publish_route_metadata(lease)
+                if (
+                    method_name == "generate_plain_text_async"
+                    and str(lease.provider or "").strip().lower()
+                    in _UNVERIFIED_PLAIN_CLI_PROVIDERS
+                ):
+                    raise FreeTeamUnavailableError(
+                        "CLIクリップ取り込みは、ツール無効化を検証済みのCodex CLIでのみ利用できます"
+                    )
                 target = create_llm_client_for_target(
                     self.config,
                     provider=lease.provider,
@@ -531,6 +563,28 @@ class FreeTeamRoutingClient:
             return
 
     async def generate_response_async(
+        self,
+        user_input: str,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        image_data: dict | None = None,
+        stream_callback: Optional[StreamCallback] = None,
+        steering_callback: Optional[SteeringCallback] = None,
+    ) -> str:
+        from ..services.session_llm_generation import run_session_aware_generation
+
+        return await run_session_aware_generation(
+            self,
+            self.config,
+            user_input,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            image_data=image_data,
+            stream_callback=stream_callback,
+            steering_callback=steering_callback,
+        )
+
+    async def _generate_response_async_impl(
         self,
         user_input: str,
         temperature: float = 0.7,

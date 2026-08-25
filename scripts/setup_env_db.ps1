@@ -304,7 +304,7 @@ if ($isNewEnv) {
 }
 
 $content = [System.IO.File]::ReadAllText($envFilePath, [System.Text.Encoding]::UTF8)
-foreach ($key in @("NEXTAUTH_SECRET", "AOITALK_WEB_AUTH_SECRET", "AOITALK_JWT_SECRET", "INTERNAL_API_KEY")) {
+foreach ($key in @("NEXTAUTH_SECRET", "AOITALK_WEB_AUTH_SECRET", "AOITALK_JWT_SECRET", "INTERNAL_API_KEY", "AOITALK_CADDY_GATE_KEY")) {
     $values = Read-DotEnv $envFilePath
     if (-not $values.ContainsKey($key) -or [string]::IsNullOrWhiteSpace([string]$values[$key])) {
         $content = Set-DotEnvValue $content $key (New-RandomSecret)

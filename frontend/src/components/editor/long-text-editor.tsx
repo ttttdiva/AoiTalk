@@ -11,6 +11,7 @@ import { oneDark } from "@codemirror/theme-one-dark";
 import { cn } from "@/lib/utils";
 import {
   createLinkEmbedPlugin,
+  updateLinkEmbedConfigEffect,
   type LinkDisplayModeChangeHandler,
   type LinkDisplayModeMap,
 } from "./link-embed-plugin";
@@ -21,6 +22,9 @@ import {
   textEditorTheme,
   type EditorLanguage,
 } from "./code-mirror-shared";
+import type { EditorImageInsertHandler } from "./image-insert-extension";
+
+export type { EditorImageInsertHandler } from "./image-insert-extension";
 
 type LongTextEditorProps = {
   id?: string;
@@ -40,6 +44,14 @@ type LongTextEditorProps = {
   onLinkDisplayModeChange?: LinkDisplayModeChangeHandler;
   onSubmitIntent?: (value: string) => void;
   onArrowUpFromStart?: () => void;
+  onImageInsert?: EditorImageInsertHandler;
+  onSelectionChange?: (
+    selection: {
+      from: number;
+      to: number;
+      text: string;
+    } | null,
+  ) => void;
 };
 
 export type LongTextEditorHandle = {
@@ -68,6 +80,8 @@ export const LongTextEditor = forwardRef<
     onLinkDisplayModeChange,
     onSubmitIntent,
     onArrowUpFromStart,
+    onImageInsert,
+    onSelectionChange,
   },
   ref,
 ) {
@@ -76,9 +90,14 @@ export const LongTextEditor = forwardRef<
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const linkEmbedCompartmentRef = useRef(new Compartment());
+  const linkEmbedInstalledRef = useRef(false);
+  const readOnlyCompartmentRef = useRef(new Compartment());
   const onChangeRef = useRef(onChange);
   const onSubmitIntentRef = useRef(onSubmitIntent);
   const onArrowUpFromStartRef = useRef(onArrowUpFromStart);
+  const onImageInsertRef = useRef(onImageInsert);
+  const readOnlyRef = useRef(readOnly);
+  const onSelectionChangeRef = useRef(onSelectionChange);
   const externalValueRef = useRef(value);
 
   useEffect(() => {
@@ -92,6 +111,18 @@ export const LongTextEditor = forwardRef<
   useEffect(() => {
     onArrowUpFromStartRef.current = onArrowUpFromStart;
   }, [onArrowUpFromStart]);
+
+  useEffect(() => {
+    onImageInsertRef.current = onImageInsert;
+  }, [onImageInsert]);
+
+  useEffect(() => {
+    readOnlyRef.current = readOnly;
+  }, [readOnly]);
+
+  useEffect(() => {
+    onSelectionChangeRef.current = onSelectionChange;
+  }, [onSelectionChange]);
 
   useImperativeHandle(
     ref,
@@ -109,12 +140,29 @@ export const LongTextEditor = forwardRef<
     const state = EditorState.create({
       doc: value,
       extensions: [
-        ...baseTextEditorExtensions({ language }),
+        ...baseTextEditorExtensions({
+          language,
+          imageInsertHandler: (files, source) =>
+            onImageInsertRef.current?.(files, source) ?? null,
+          imageInsertEnabled: () => Boolean(onImageInsertRef.current),
+          imageInsertReadOnly: () => readOnlyRef.current,
+        }),
         EditorView.updateListener.of((update) => {
-          if (!update.docChanged) return;
-          const nextValue = update.state.doc.toString();
-          externalValueRef.current = nextValue;
-          onChangeRef.current(nextValue);
+          if (update.selectionSet || update.docChanged) {
+            const selection = update.state.selection.main;
+            onSelectionChangeRef.current?.(
+              {
+                from: selection.from,
+                to: selection.to,
+                text: update.state.sliceDoc(selection.from, selection.to),
+              },
+            );
+          }
+          if (update.docChanged) {
+            const nextValue = update.state.doc.toString();
+            externalValueRef.current = nextValue;
+            onChangeRef.current(nextValue);
+          }
         }),
         Prec.high(
           keymap.of([
@@ -143,17 +191,19 @@ export const LongTextEditor = forwardRef<
           ]),
         ),
         ...(placeholder ? [cmPlaceholder(placeholder)] : []),
-        ...(linkPreviews
-          ? [
-              linkEmbedCompartmentRef.current.of(
-                createLinkEmbedPlugin(editorLinkDefaultDisplayMode, {
-                  displayModes: linkDisplayModes,
-                  onDisplayModeChange: onLinkDisplayModeChange,
-                }),
-              ),
-            ]
-          : []),
-        ...(readOnly ? [EditorState.readOnly.of(true)] : []),
+        // Keep the compartment mounted even when previews are disabled so a
+        // later linkPreviews toggle can add/remove the plugin without
+        // recreating the EditorView.
+        linkEmbedCompartmentRef.current.of(
+          linkPreviews
+            ? createLinkEmbedPlugin(editorLinkDefaultDisplayMode, {
+                displayModes: linkDisplayModes,
+                onDisplayModeChange: onLinkDisplayModeChange,
+                readOnly,
+              })
+            : [],
+        ),
+        readOnlyCompartmentRef.current.of(EditorState.readOnly.of(readOnly)),
         ...(resolvedTheme === "dark" ? [oneDark] : []),
         textEditorTheme({
           minHeight,
@@ -167,31 +217,66 @@ export const LongTextEditor = forwardRef<
 
     const view = new EditorView({ state, parent: containerRef.current });
     viewRef.current = view;
+    linkEmbedInstalledRef.current = linkPreviews;
 
     return () => {
       view.destroy();
       viewRef.current = null;
+      linkEmbedInstalledRef.current = false;
     };
     // Recreate only for static editor options and theme; content is synchronized below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [resolvedTheme]);
 
   useEffect(() => {
-    if (!linkPreviews || !viewRef.current) return;
-    viewRef.current.dispatch({
-      effects: linkEmbedCompartmentRef.current.reconfigure(
-        createLinkEmbedPlugin(editorLinkDefaultDisplayMode, {
+    const view = viewRef.current;
+    if (!view) return;
+
+    // The compartment is only reconfigured when the extension is actually
+    // added or removed.  Runtime option churn is delivered to the existing
+    // ViewPlugin so its DOM (notably an active X widget) can be retained.
+    if (linkPreviews !== linkEmbedInstalledRef.current) {
+      view.dispatch({
+        effects: linkEmbedCompartmentRef.current.reconfigure(
+          linkPreviews
+            ? createLinkEmbedPlugin(editorLinkDefaultDisplayMode, {
+                displayModes: linkDisplayModes,
+                onDisplayModeChange: onLinkDisplayModeChange,
+                readOnly,
+              })
+            : [],
+        ),
+      });
+      linkEmbedInstalledRef.current = linkPreviews;
+      return;
+    }
+
+    if (linkPreviews) {
+      view.dispatch({
+        effects: updateLinkEmbedConfigEffect.of({
+          defaultDisplayMode: editorLinkDefaultDisplayMode,
           displayModes: linkDisplayModes,
           onDisplayModeChange: onLinkDisplayModeChange,
+          readOnly,
         }),
-      ),
-    });
+      });
+    }
   }, [
     editorLinkDefaultDisplayMode,
     linkDisplayModes,
     linkPreviews,
     onLinkDisplayModeChange,
+    readOnly,
   ]);
+
+  useEffect(() => {
+    if (!viewRef.current) return;
+    viewRef.current.dispatch({
+      effects: readOnlyCompartmentRef.current.reconfigure(
+        EditorState.readOnly.of(readOnly),
+      ),
+    });
+  }, [readOnly]);
 
   useEffect(() => {
     if (!viewRef.current) return;

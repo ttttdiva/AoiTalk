@@ -160,9 +160,9 @@ export function GoogleCalendarSection() {
   }, [reminderMinutes, mutateGcal]);
 
   return (
-    <Card size="sm">
+    <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0" data-settings-surface="google-calendar">
       <CardHeader
-        className="cursor-pointer select-none"
+        className="cursor-pointer select-none border-b border-border dark:border-[#333335] px-3 py-3 transition-colors hover:bg-muted dark:bg-[#242426]"
         onClick={() => setExpanded((v) => !v)}
       >
         <CardTitle className="flex items-center justify-between text-sm">
@@ -183,7 +183,7 @@ export function GoogleCalendarSection() {
         </CardTitle>
       </CardHeader>
       {expanded && (
-      <CardContent className="space-y-3">
+      <CardContent className="space-y-3 px-3 py-3">
         {loading ? (
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <Loader2 className="size-3 animate-spin" />

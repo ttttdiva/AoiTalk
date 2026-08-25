@@ -34,7 +34,6 @@ def normalize_settings(config: Dict[str, Any]) -> Dict[str, Any]:
         "quantization": str(raw.get("quantization") or "int8"),
         "confidence_threshold": max(0.0, min(1.0, float(raw.get("confidence_threshold", 0.5)))),
         "log_detections": bool(raw.get("log_detections", True)),
-        "cache_dir": raw.get("cache_dir"),
         "revision": raw.get("revision") or "main",
         "local_files_only": bool(raw.get("local_files_only", False)),
         "policies": raw.get("policies", {}) or {},

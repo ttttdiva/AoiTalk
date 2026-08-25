@@ -1,30 +1,37 @@
 import { NextRequest, NextResponse } from "next/server";
 import fs from "node:fs";
 import path from "node:path";
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull, or } from "drizzle-orm";
 import { db } from "@/db";
 import {
-  conversationParticipants,
   conversationMessages,
-  conversationSessions,
   knowledgeNodes,
-  knowledgeWorkspaces,
+  projects,
   taskAttachments,
   taskReferences,
+  taskRelations,
   tasks,
 } from "@/db/schema";
+import { docsLibraries } from "@/lib/server/docs-library-schema";
 import { getSession } from "@/lib/auth";
 import {
-  canWriteMembership,
-  getProjectMembership,
+  canReadProjectId,
+  canWriteProjectId,
   type SessionUser,
 } from "@/lib/server/task-route-utils";
 import { ensureProjectStorageRoot } from "@/lib/server/project-workspace-management";
+import { getLiveConversationSession } from "@/lib/server/conversation-route-utils";
+import {
+  canonicalizeTaskRelationIds,
+  relatedTaskId,
+  taskRelationReferenceId,
+} from "@/lib/server/task-relations";
 
 const REFERENCE_TYPES = new Set([
   "conversation_session",
   "conversation_message",
   "docs_node",
+  "task",
   "workspace_file",
   "url",
 ]);
@@ -41,7 +48,7 @@ function missingReference(displayName?: string | null) {
 
 async function canReadProject(user: SessionUser, projectId: string | null) {
   if (!projectId) return true;
-  return Boolean(user.role === "admin" || (await getProjectMembership(user.id, projectId)));
+  return canReadProjectId(user, projectId);
 }
 
 async function loadTask(taskId: string) {
@@ -56,11 +63,10 @@ async function loadTask(taskId: string) {
 async function requireTaskAccess(taskId: string, user: SessionUser, write = false) {
   const task = await loadTask(taskId);
   if (!task) return { task: null, response: NextResponse.json({ detail: "タスクが見つかりません" }, { status: 404 }) };
-  const membership = await getProjectMembership(user.id, task.projectId);
-  if (!membership && user.role !== "admin") {
+  if (!(await canReadProjectId(user, task.projectId))) {
     return { task: null, response: NextResponse.json({ detail: "タスクが見つかりません" }, { status: 404 }) };
   }
-  if (write && !canWriteMembership(user, membership)) {
+  if (write && !(await canWriteProjectId(user, task.projectId))) {
     return { task: null, response: NextResponse.json({ detail: "権限がありません" }, { status: 403 }) };
   }
   return { task, response: null };
@@ -94,35 +100,9 @@ async function serializeReference(
 
   if (row.referenceType === "conversation_session" || row.referenceType === "conversation_message") {
     const targetSessionId = row.targetId && UUID_RE.test(row.targetId) ? row.targetId : null;
-    const [participant] = targetSessionId
-      ? await db
-          .select({ sessionId: conversationParticipants.sessionId })
-          .from(conversationParticipants)
-          .where(
-            and(
-              eq(conversationParticipants.sessionId, targetSessionId),
-              eq(conversationParticipants.participantType, "user"),
-              eq(conversationParticipants.participantId, user.id),
-              eq(conversationParticipants.status, "joined"),
-            ),
-          )
-          .limit(1)
-      : [];
-    const [session] = targetSessionId
-      ? await db
-          .select()
-          .from(conversationSessions)
-          .where(
-            and(
-              eq(conversationSessions.id, targetSessionId),
-              isNull(conversationSessions.deletedAt),
-              participant
-                ? eq(conversationSessions.id, participant.sessionId)
-                : eq(conversationSessions.userId, user.id),
-            ),
-          )
-          .limit(1)
-      : [];
+    const session = targetSessionId
+      ? await getLiveConversationSession(targetSessionId, user.id)
+      : null;
     if (!session) return { ...base, ...missingReference(null) };
     const messageId = row.referenceType === "conversation_message"
       ? String((row.referenceMetadata as Record<string, unknown> | null)?.message_id ?? "")
@@ -153,9 +133,9 @@ async function serializeReference(
   if (row.referenceType === "docs_node") {
     const [node] = row.targetId && UUID_RE.test(row.targetId)
       ? await db
-          .select({ node: knowledgeNodes, workspaceOwner: knowledgeWorkspaces.ownerUserId })
+          .select({ node: knowledgeNodes, workspaceOwner: docsLibraries.ownerUserId })
           .from(knowledgeNodes)
-          .innerJoin(knowledgeWorkspaces, eq(knowledgeNodes.workspaceId, knowledgeWorkspaces.id))
+          .innerJoin(docsLibraries, eq(knowledgeNodes.docsLibraryId, docsLibraries.id))
           .where(and(eq(knowledgeNodes.id, row.targetId), isNull(knowledgeNodes.archivedAt)))
           .limit(1)
       : [];
@@ -197,6 +177,59 @@ async function serializeReference(
     subtitle: "URL",
     exists: Boolean(row.targetUrl),
     open: { id: null, path: null, url: row.targetUrl },
+  };
+}
+
+async function serializeTaskRelation(
+  row: typeof taskRelations.$inferSelect,
+  currentTaskId: string,
+  user: SessionUser,
+  canRemove: boolean,
+) {
+  const targetId = relatedTaskId(currentTaskId, row);
+  const base = {
+    id: taskRelationReferenceId(row.id),
+    reference_type: "task",
+    relation_type: row.relationType,
+    display_name: "参照先が見つかりません",
+    subtitle: "参照先が見つかりません",
+    target_id: null as string | null,
+    target_path: null,
+    target_url: null,
+    metadata: {},
+    created_by: row.createdBy,
+    created_at: row.createdAt,
+    can_remove: canRemove,
+    exists: false,
+    open: {
+      id: null as string | null,
+      path: null as string | null,
+      url: null,
+    },
+  };
+  if (!targetId) return base;
+
+  const [target] = await db
+    .select({ task: tasks, projectName: projects.name })
+    .from(tasks)
+    .innerJoin(projects, eq(tasks.projectId, projects.id))
+    .where(and(eq(tasks.id, targetId), isNull(tasks.deletedAt)))
+    .limit(1);
+  if (!target || !(await canReadProject(user, target.task.projectId))) {
+    return base;
+  }
+
+  return {
+    ...base,
+    display_name: target.task.title,
+    subtitle: `${target.projectName} · ${target.task.status}`,
+    target_id: target.task.id,
+    exists: true,
+    open: {
+      id: target.task.id,
+      path: `/tasks?detail=${encodeURIComponent(target.task.id)}`,
+      url: null,
+    },
   };
 }
 
@@ -248,16 +281,21 @@ export async function GET(
   const { id } = await params;
   const access = await requireTaskAccess(id, user);
   if (access.response) return access.response;
-  const membership = access.task
-    ? await getProjectMembership(user.id, access.task.projectId)
-    : null;
-  const canRemove = Boolean(user.role === "admin" || canWriteMembership(user, membership));
-  const [refs, attachments] = await Promise.all([
+  const canRemove = access.task
+    ? await canWriteProjectId(user, access.task.projectId)
+    : false;
+  const [refs, relations, attachments] = await Promise.all([
     db.select().from(taskReferences).where(eq(taskReferences.taskId, id)).orderBy(desc(taskReferences.createdAt)),
+    db
+      .select()
+      .from(taskRelations)
+      .where(or(eq(taskRelations.taskAId, id), eq(taskRelations.taskBId, id)))
+      .orderBy(desc(taskRelations.createdAt)),
     db.select().from(taskAttachments).where(eq(taskAttachments.taskId, id)).orderBy(desc(taskAttachments.createdAt)),
   ]);
   const result = [
     ...(await Promise.all(refs.map((row) => serializeReference(row, user, canRemove)))),
+    ...(await Promise.all(relations.map((row) => serializeTaskRelation(row, id, user, canRemove)))),
     ...(await Promise.all(attachments.map((row) => serializeAttachment(row, canRemove)))),
   ];
   if (access.task?.knowledgeNodeId) {
@@ -266,10 +304,10 @@ export async function GET(
         id: knowledgeNodes.id,
         title: knowledgeNodes.title,
         projectId: knowledgeNodes.projectId,
-        workspaceOwner: knowledgeWorkspaces.ownerUserId,
+        workspaceOwner: docsLibraries.ownerUserId,
       })
       .from(knowledgeNodes)
-      .innerJoin(knowledgeWorkspaces, eq(knowledgeNodes.workspaceId, knowledgeWorkspaces.id))
+      .innerJoin(docsLibraries, eq(knowledgeNodes.docsLibraryId, docsLibraries.id))
       .where(and(eq(knowledgeNodes.id, access.task.knowledgeNodeId), isNull(knowledgeNodes.archivedAt)))
       .limit(1);
     const canRead = node
@@ -315,7 +353,7 @@ export async function POST(
   const targetId = typeof body.target_id === "string" && body.target_id.trim() ? body.target_id.trim() : null;
   const targetPath = typeof body.target_path === "string" && body.target_path.trim() ? body.target_path.trim() : null;
   const targetUrl = typeof body.target_url === "string" && body.target_url.trim() ? body.target_url.trim() : null;
-  if ((referenceType === "conversation_session" || referenceType === "conversation_message" || referenceType === "docs_node") && !targetId) {
+  if ((referenceType === "conversation_session" || referenceType === "conversation_message" || referenceType === "docs_node" || referenceType === "task") && !targetId) {
     return NextResponse.json({ detail: "target_idは必須です" }, { status: 400 });
   }
   if (referenceType === "workspace_file" && !targetPath) {
@@ -330,30 +368,70 @@ export async function POST(
   if (referenceType === "url" && (!targetUrl || !/^https?:\/\//i.test(targetUrl))) {
     return NextResponse.json({ detail: "http(s) URLを指定してください" }, { status: 400 });
   }
+  if (referenceType === "task") {
+    if (relationType !== "related") {
+      return NextResponse.json({ detail: "タスクには関連のみ指定できます" }, { status: 400 });
+    }
+    if (!targetId || !UUID_RE.test(targetId)) {
+      return NextResponse.json({ detail: "参照先IDが不正です" }, { status: 400 });
+    }
+    const canonicalIds = canonicalizeTaskRelationIds(id, targetId);
+    if (!canonicalIds) {
+      return NextResponse.json({ detail: "同じタスクは関連付けできません" }, { status: 400 });
+    }
+    const targetTask = await loadTask(targetId);
+    if (!targetTask || !(await canReadProject(user, targetTask.projectId))) {
+      return NextResponse.json({ detail: "参照先が見つからないか権限がありません" }, { status: 404 });
+    }
+    const [taskAId, taskBId] = canonicalIds;
+    const [created] = await db
+      .insert(taskRelations)
+      .values({
+        taskAId,
+        taskBId,
+        relationType: "related",
+        createdBy: user.id,
+      })
+      .onConflictDoNothing({
+        target: [
+          taskRelations.taskAId,
+          taskRelations.taskBId,
+          taskRelations.relationType,
+        ],
+      })
+      .returning();
+    if (created) {
+      return NextResponse.json(
+        await serializeTaskRelation(created, id, user, true),
+        { status: 201 },
+      );
+    }
+    const [existing] = await db
+      .select()
+      .from(taskRelations)
+      .where(
+        and(
+          eq(taskRelations.taskAId, taskAId),
+          eq(taskRelations.taskBId, taskBId),
+          eq(taskRelations.relationType, "related"),
+        ),
+      )
+      .limit(1);
+    if (!existing) {
+      return NextResponse.json({ detail: "関連付けの作成に失敗しました" }, { status: 500 });
+    }
+    return NextResponse.json(
+      await serializeTaskRelation(existing, id, user, true),
+    );
+  }
   if (referenceType === "conversation_session" || referenceType === "conversation_message") {
     if (!targetId || !UUID_RE.test(targetId)) {
       return NextResponse.json({ detail: "参照先IDが不正です" }, { status: 400 });
     }
-    const [session] = targetId
-      ? await db
-          .select()
-          .from(conversationSessions)
-          .where(and(eq(conversationSessions.id, targetId), isNull(conversationSessions.deletedAt)))
-          .limit(1)
-      : [];
-    const [participant] = session && session.userId !== user.id
-      ? await db
-          .select({ id: conversationParticipants.id })
-          .from(conversationParticipants)
-          .where(and(
-            eq(conversationParticipants.sessionId, session.id),
-            eq(conversationParticipants.participantType, "user"),
-            eq(conversationParticipants.participantId, user.id),
-            eq(conversationParticipants.status, "joined"),
-          ))
-          .limit(1)
-      : [];
-    if (!session || (session.userId !== user.id && !participant)) {
+    const session = targetId
+      ? await getLiveConversationSession(targetId, user.id)
+      : null;
+    if (!session) {
       return NextResponse.json({ detail: "参照先が見つからないか権限がありません" }, { status: 404 });
     }
     if (referenceType === "conversation_message") {
@@ -377,9 +455,9 @@ export async function POST(
     }
     const [node] = targetId
       ? await db
-          .select({ node: knowledgeNodes, workspaceOwner: knowledgeWorkspaces.ownerUserId })
+          .select({ node: knowledgeNodes, workspaceOwner: docsLibraries.ownerUserId })
           .from(knowledgeNodes)
-          .innerJoin(knowledgeWorkspaces, eq(knowledgeNodes.workspaceId, knowledgeWorkspaces.id))
+          .innerJoin(docsLibraries, eq(knowledgeNodes.docsLibraryId, docsLibraries.id))
           .where(and(eq(knowledgeNodes.id, targetId), isNull(knowledgeNodes.archivedAt)))
           .limit(1)
       : [];

@@ -298,7 +298,7 @@ def create_group_chat_router(require_auth, get_current_user, config=None) -> API
                 raise HTTPException(
                     status_code=404, detail="セッションが見つかりません"
                 )
-            if not await repo.user_has_session_access(session_id, user_id):
+            if not await repo.user_has_session_write_access(session_id, user_id):
                 raise HTTPException(status_code=403, detail="アクセス拒否")
             if not session.is_group_chat:
                 raise HTTPException(
@@ -336,7 +336,20 @@ def create_group_chat_router(require_auth, get_current_user, config=None) -> API
             from ..llm.group_chat_manager import GroupChatManager
 
             character_slugs = session.group_character_names or []
-            manager = GroupChatManager(config=config, character_slugs=character_slugs)
+            manager = GroupChatManager(
+                config=config,
+                character_slugs=character_slugs,
+                # Usage persistence must use the authenticated API principal
+                # and the conversation's durable scope, not the manager's
+                # legacy ``default_user``/NULL fallback.
+                user_id=user_id,
+                session_id=str(session.id),
+                project_id=(
+                    str(getattr(session, "project_id", None))
+                    if getattr(session, "project_id", None)
+                    else None
+                ),
+            )
             responses = await manager.generate_responses(
                 user_message=payload.message,
                 history=history,

@@ -37,6 +37,23 @@ class FileSystemError(Exception):
     pass
 
 
+def _run_scoped_read_path(path: str) -> Path:
+    """Resolve a read path through the active AgentRunScope, if present."""
+
+    try:
+        from ...security.agent_run_scope import RunScopeViolation, get_current_run_scope
+    except ImportError:  # pragma: no cover - defensive for stripped builds
+        return Path(path).resolve()
+
+    scope = get_current_run_scope()
+    if scope is None:
+        return Path(path).resolve()
+    try:
+        return scope.assert_read_allowed(path)
+    except RunScopeViolation as exc:
+        raise FileSystemError(str(exc)) from exc
+
+
 class FileSystem:
     """
     File system operations utility.
@@ -86,7 +103,7 @@ class FileSystem:
             
     def _validate_path(self, path: str) -> Path:
         """Validate and resolve a path."""
-        resolved = Path(path).resolve()
+        resolved = _run_scoped_read_path(path)
         
         if self.allowed_paths:
             allowed = False
@@ -143,6 +160,15 @@ class FileSystem:
                     if not show_hidden and item.name.startswith("."):
                         continue
                         
+                    # A recursive listing can encounter a symlink/junction
+                    # even when the requested root itself was safe.  Under an
+                    # active run scope, do not inspect or recurse through a
+                    # component that leaves the read roots.
+                    try:
+                        _run_scoped_read_path(str(item))
+                    except FileSystemError:
+                        continue
+
                     # Skip common uninteresting directories
                     if item.is_dir() and item.name in self.SKIP_DIRS:
                         continue
@@ -270,6 +296,11 @@ class FileSystem:
                     return results
                     
                 filepath = Path(root) / filename
+
+                try:
+                    _run_scoped_read_path(str(filepath))
+                except FileSystemError:
+                    continue
                 
                 # Check extension filter
                 if extensions:
@@ -308,6 +339,11 @@ class FileSystem:
                     return results
                     
                 filepath = Path(root) / filename
+
+                try:
+                    _run_scoped_read_path(str(filepath))
+                except FileSystemError:
+                    continue
                 
                 # Skip binary files
                 if filepath.suffix.lower() in self.BINARY_EXTENSIONS:

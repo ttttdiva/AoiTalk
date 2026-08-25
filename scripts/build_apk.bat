@@ -1,13 +1,21 @@
 @echo off
 setlocal
 
-set PROJECT_DIR=%~dp0..
+for %%I in ("%~dp0..") do set "PROJECT_DIR=%%~fI"
 set MOBILE_DIR=%PROJECT_DIR%\mobile
-set SHORT_BUILD_ROOT=C:\tmp\aoitalk-mobile-build
-set KC_STAGE=C:\tmp\k
+for /f "delims=" %%G in ('powershell -NoProfile -Command "[guid]::NewGuid().ToString('N').Substring(0, 8)"') do set "BUILD_ID=%%G"
+if not defined BUILD_ID (
+  echo [ERROR] Failed to allocate a unique build workspace id.
+  exit /b 1
+)
+set SHORT_BUILD_ROOT=C:\tmp\a-%BUILD_ID%
+set KC_STAGE=C:\tmp\k-%BUILD_ID%
 set ANDROID_DIR=%SHORT_BUILD_ROOT%\android
 set APK_NAME=aoitalk-mobile.apk
 set RELEASE_REPO=ttttdiva/AoiTalk
+rem The public release repository is separate from the source checkout.  Do
+rem not let gh infer the local HEAD (which is not present in the public repo).
+if not defined RELEASE_TARGET set "RELEASE_TARGET=main"
 
 if not defined JAVA_HOME (
   for /f "delims=" %%J in ('powershell -NoProfile -Command "$root = Join-Path $env:ProgramFiles 'Microsoft'; if (Test-Path $root) { Get-ChildItem $root -Directory -Filter 'jdk-17*' | Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty FullName }"') do set "JAVA_HOME=%%J"
@@ -21,10 +29,21 @@ if not defined ANDROID_SDK_ROOT set "ANDROID_SDK_ROOT=%ANDROID_HOME%"
 set _JAVA_OPTIONS=-Djdk.net.unixdomain.tmpdir=C:\tmp
 set GRADLE_OPTS=-Djdk.net.unixdomain.tmpdir=C:\tmp
 set NODE_ENV=production
+rem Native CMake builds for multiple ABIs can fail nondeterministically on Windows
+rem (long generated paths and parallel prefab compilation).  arm64-v8a is the
+rem supported distribution ABI; callers may opt into additional ABIs explicitly.
+if not defined REACT_NATIVE_ARCHITECTURES set "REACT_NATIVE_ARCHITECTURES=arm64-v8a"
 set RELEASE_EXISTS=0
 
 for /f "delims=" %%V in ('node -e "console.log(require('./mobile/app.json').expo.version)"') do set VERSION=%%V
+for /f "delims=" %%C in ('node -e "console.log(require('./mobile/app.json').expo.android.versionCode)"') do set VERSION_CODE=%%C
 for /f "delims=" %%D in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd"') do set TODAY=%%D
+set "ARTIFACT_DIR=%PROJECT_DIR%\artifacts\releases\mobile\v%VERSION%"
+set "APK_PATH=%ARTIFACT_DIR%\%APK_NAME%"
+if not exist "%ARTIFACT_DIR%" (
+  mkdir "%ARTIFACT_DIR%"
+  if errorlevel 1 exit /b 1
+)
 
 gh auth status -h github.com >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
@@ -48,15 +67,22 @@ if not exist "C:\tmp" mkdir "C:\tmp"
 echo [INFO] Preparing a short-path Android build workspace...
 powershell -NoProfile -Command ^
   "$path = [System.IO.Path]::GetFullPath('%SHORT_BUILD_ROOT%');" ^
-  "if ($path -ne 'C:\tmp\aoitalk-mobile-build') { throw 'Unexpected short build path: ' + $path };" ^
+  "if ($path -notlike 'C:\tmp\a-*') { throw 'Unexpected short build path: ' + $path };" ^
   "if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force };" ^
   "New-Item -ItemType Directory -Path $path -Force | Out-Null"
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
-robocopy "%MOBILE_DIR%" "%SHORT_BUILD_ROOT%" /E /XD node_modules android .expo >nul
+rem Never exclude a directory named "android": it would also remove native Expo modules.
+rem Expo prebuild --clean replaces the copied top-level android directory in the next step.
+robocopy "%MOBILE_DIR%" "%SHORT_BUILD_ROOT%" /E /XD node_modules .expo "%MOBILE_DIR%\modules\apk-installer\android\build" >nul
 if %ERRORLEVEL% GEQ 8 (
   echo [ERROR] Failed to copy the mobile workspace to %SHORT_BUILD_ROOT%.
   exit /b %ERRORLEVEL%
+)
+
+if not exist "%SHORT_BUILD_ROOT%\modules\apk-installer\android\src\main\java\expo\modules\apkinstaller\ApkInstallerModule.kt" (
+  echo [ERROR] The apk-installer Android source was omitted from the short-path workspace.
+  exit /b 1
 )
 
 echo [INFO] Installing dependencies in the short-path workspace...
@@ -76,7 +102,7 @@ if %PREBUILD_RESULT% NEQ 0 exit /b %PREBUILD_RESULT%
 echo [INFO] Applying stable Gradle settings...
 powershell -NoProfile -Command ^
   "$stage = [System.IO.Path]::GetFullPath('%KC_STAGE%');" ^
-  "if ($stage -ne 'C:\tmp\k') { throw 'Unexpected keyboard-controller stage path: ' + $stage };" ^
+  "if ($stage -notlike 'C:\tmp\k-*') { throw 'Unexpected keyboard-controller stage path: ' + $stage };" ^
   "if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }"
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
@@ -114,26 +140,37 @@ if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
 pushd "%ANDROID_DIR%"
 call .\gradlew.bat --stop
-call .\gradlew.bat assembleRelease --no-daemon --max-workers=1 -Pkotlin.incremental=false -PreactNativeArchitectures=arm64-v8a,x86_64
+call .\gradlew.bat assembleRelease --no-daemon --max-workers=1 -Pkotlin.incremental=false -PreactNativeArchitectures=%REACT_NATIVE_ARCHITECTURES%
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
-copy /Y "app\build\outputs\apk\release\app-release.apk" "%PROJECT_DIR%\%APK_NAME%" >nul
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_DIR%\scripts\verify_mobile_apk.ps1" -ApkPath "%ANDROID_DIR%\app\build\outputs\apk\release\app-release.apk" -ExpectedVersion "%VERSION%" -ExpectedVersionCode "%VERSION_CODE%"
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+copy /Y "app\build\outputs\apk\release\app-release.apk" "%APK_PATH%" >nul
+set COPY_RESULT=%ERRORLEVEL%
+if not "%COPY_RESULT%"=="0" (
+  echo [ERROR] Failed to copy the verified APK to %APK_PATH%.
+  exit /b %COPY_RESULT%
+)
 popd
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_DIR%\scripts\verify_mobile_apk.ps1" -ApkPath "%APK_PATH%" -ExpectedVersion "%VERSION%" -ExpectedVersionCode "%VERSION_CODE%"
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
 powershell -NoProfile -Command ^
   "$stage = [System.IO.Path]::GetFullPath('%KC_STAGE%');" ^
-  "if ($stage -ne 'C:\tmp\k') { throw 'Unexpected keyboard-controller stage path: ' + $stage };" ^
+  "if ($stage -notlike 'C:\tmp\k-*') { throw 'Unexpected keyboard-controller stage path: ' + $stage };" ^
   "if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }; " ^
   "$path = [System.IO.Path]::GetFullPath('%SHORT_BUILD_ROOT%');" ^
-  "if ($path -ne 'C:\tmp\aoitalk-mobile-build') { throw 'Unexpected short build path: ' + $path };" ^
+  "if ($path -notlike 'C:\tmp\a-*') { throw 'Unexpected short build path: ' + $path };" ^
   "if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }"
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
 if "%RELEASE_EXISTS%"=="1" (
-  gh release upload "v%VERSION%" "%APK_NAME%" --clobber --repo %RELEASE_REPO%
+  gh release upload "v%VERSION%" "%APK_PATH%" --clobber --repo %RELEASE_REPO%
+  if errorlevel 1 exit /b 1
 ) else (
-  gh release create "v%VERSION%" "%APK_NAME%" --repo %RELEASE_REPO% --title "v%VERSION%" --notes "v%VERSION% リリース"
+  gh release create "v%VERSION%" "%APK_PATH%" --repo %RELEASE_REPO% --target "%RELEASE_TARGET%" --title "v%VERSION%" --notes "v%VERSION% リリース"
+  if errorlevel 1 exit /b 1
 )
-if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
 rem 日本語 notes を cmd 経由で渡すと codepage 不一致で文字化けするため、
 rem latest.json の生成と更新は UTF-8 (BOM付き) の PowerShell script に委譲する。
@@ -145,4 +182,4 @@ if defined NOTES_FILE (
 )
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
-echo Built local %APK_NAME% and published v%VERSION%
+echo Built %APK_PATH% and published v%VERSION%

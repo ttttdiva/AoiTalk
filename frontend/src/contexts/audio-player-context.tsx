@@ -91,6 +91,7 @@ export function AudioPlayerProvider({ children }: { children: React.ReactNode })
   const [volume, setVolumeState] = useState(loadSavedVolume);
   const seekingRef = useRef(false);
   const settingsRef = useRef(audioPlayerSettings);
+  const playbackGenerationRef = useRef(0);
 
   useEffect(() => {
     settingsRef.current = audioPlayerSettings;
@@ -150,7 +151,11 @@ export function AudioPlayerProvider({ children }: { children: React.ReactNode })
   }, []);
 
   const pickAdjacentTrack = useCallback(
-    async (direction: 1 | -1, wrap: boolean): Promise<AudioTrack | null> => {
+    async (
+      direction: 1 | -1,
+      wrap: boolean,
+      playbackGeneration: number,
+    ): Promise<AudioTrack | null> => {
       if (!track) return null;
       const audio = audioRef.current;
       if (direction === -1 && audio && audio.currentTime > 3) {
@@ -164,6 +169,7 @@ export function AudioPlayerProvider({ children }: { children: React.ReactNode })
       let candidates = playlist;
       if (direction === 1 && settings.playbackScope === "global_next") {
         const globalPlaylist = await loadGlobalPlaylist(track).catch(() => null);
+        if (playbackGeneration !== playbackGenerationRef.current) return null;
         if (globalPlaylist?.length) {
           candidates = globalPlaylist;
           setPlaylist(globalPlaylist);
@@ -196,7 +202,9 @@ export function AudioPlayerProvider({ children }: { children: React.ReactNode })
     const onPlay = () => setIsPlaying(true);
     const onPause = () => setIsPlaying(false);
     const onEnded = () => {
-      void pickAdjacentTrack(1, true).then((nextTrack) => {
+      const playbackGeneration = ++playbackGenerationRef.current;
+      void pickAdjacentTrack(1, true, playbackGeneration).then((nextTrack) => {
+        if (playbackGeneration !== playbackGenerationRef.current) return;
         if (nextTrack) playTrack(nextTrack);
         else setIsPlaying(false);
       });
@@ -218,6 +226,7 @@ export function AudioPlayerProvider({ children }: { children: React.ReactNode })
   }, [pickAdjacentTrack, playTrack]);
 
   const play = useCallback((newTrack: AudioTrack, newPlaylist?: AudioTrack[]) => {
+    playbackGenerationRef.current += 1;
     const first = newPlaylist?.[0];
     const normalizedTrack = {
       ...newTrack,
@@ -229,14 +238,17 @@ export function AudioPlayerProvider({ children }: { children: React.ReactNode })
   }, [playTrack]);
 
   const pause = useCallback(() => {
+    playbackGenerationRef.current += 1;
     audioRef.current?.pause();
   }, []);
 
   const resume = useCallback(() => {
+    playbackGenerationRef.current += 1;
     audioRef.current?.play().catch(() => {});
   }, []);
 
   const stop = useCallback(() => {
+    playbackGenerationRef.current += 1;
     const audio = audioRef.current;
     if (audio) {
       audio.pause();
@@ -249,13 +261,17 @@ export function AudioPlayerProvider({ children }: { children: React.ReactNode })
   }, []);
 
   const next = useCallback(() => {
-    void pickAdjacentTrack(1, true).then((nextTrack) => {
+    const playbackGeneration = ++playbackGenerationRef.current;
+    void pickAdjacentTrack(1, true, playbackGeneration).then((nextTrack) => {
+      if (playbackGeneration !== playbackGenerationRef.current) return;
       if (nextTrack) playTrack(nextTrack);
     });
   }, [pickAdjacentTrack, playTrack]);
 
   const prev = useCallback(() => {
-    void pickAdjacentTrack(-1, false).then((prevTrack) => {
+    const playbackGeneration = ++playbackGenerationRef.current;
+    void pickAdjacentTrack(-1, false, playbackGeneration).then((prevTrack) => {
+      if (playbackGeneration !== playbackGenerationRef.current) return;
       if (prevTrack) playTrack(prevTrack);
     });
   }, [pickAdjacentTrack, playTrack]);

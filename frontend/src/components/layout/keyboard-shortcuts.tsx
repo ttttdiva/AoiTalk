@@ -3,6 +3,7 @@
 import { useEffect } from "react";
 import { usePathname } from "next/navigation";
 import { APP_ALT_SHORTCUTS } from "@/lib/app-navigation";
+import { OPEN_DOCS_CLIP_INGEST_EVENT } from "@/lib/clip-ingest-shortcut";
 
 export function KeyboardShortcuts() {
   const pathname = usePathname();
@@ -18,7 +19,25 @@ export function KeyboardShortcuts() {
       return false;
     }
 
+    function handleOpenClipIngest() {
+      window.dispatchEvent(new Event(OPEN_DOCS_CLIP_INGEST_EVENT));
+    }
+
     function handleKeydown(e: KeyboardEvent) {
+      // Ctrl+Alt+I: どの画面からでもDocsのクリップ取り込みを開く
+      if (
+        e.ctrlKey
+        && e.altKey
+        && !e.shiftKey
+        && !e.metaKey
+        && !e.repeat
+        && e.key.toLowerCase() === "i"
+      ) {
+        e.preventDefault();
+        handleOpenClipIngest();
+        return;
+      }
+
       // Ctrl+Shift+O: 新規チャット開始
       if (e.ctrlKey && e.shiftKey && (e.key === "o" || e.key === "O")) {
         e.preventDefault();
@@ -35,7 +54,10 @@ export function KeyboardShortcuts() {
       }
 
       // Ctrl+J: チャット入力欄にフォーカス
+      // Files のインクリメンタル検索が「次の一致」として claim（preventDefault）した
+      // 場合は譲る。claim されていない画面・コンテキストでは従来どおり処理する。
       if (e.ctrlKey && (e.key === "j" || e.key === "J")) {
+        if (e.defaultPrevented) return;
         e.preventDefault();
         if (pathname.startsWith("/tasks")) {
           window.dispatchEvent(new Event("tasks-focus-first-row"));
@@ -67,6 +89,19 @@ export function KeyboardShortcuts() {
 
       // Alt+キー: 既存ショートカット（入力欄フォーカス中でも発火）
       if (e.altKey) {
+        // Alt+P（修飾キーなし）: グローバルメモ帳を開閉
+        // Alt+Shift+P はチャットの Project context 代替キーに譲る。
+        if (
+          !e.ctrlKey &&
+          !e.metaKey &&
+          !e.shiftKey &&
+          (e.key === "p" || e.key === "P")
+        ) {
+          e.preventDefault();
+          window.dispatchEvent(new Event("global-open-memo"));
+          return;
+        }
+
         // Alt+T: タスク作成ダイアログを開く
         if (e.key === "t" || e.key === "T") {
           e.preventDefault();

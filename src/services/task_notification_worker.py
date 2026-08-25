@@ -21,11 +21,20 @@ class TaskNotificationWorker:
         self._task: Optional[asyncio.Task] = None
         self._running = False
 
-    async def run_once(self) -> dict[str, int]:
+    async def run_once(self, *, now=None) -> dict[str, int]:
         service = TaskManagementService(broadcaster=self._broadcaster)
         session = await self._db_manager.get_session()
         try:
-            return await service.deliver_due_notifications(session)
+            # Auto-close runs before notification generation.  A task that was
+            # completed at its due instant must not emit an overdue notice in
+            # the same tick; row locks and the status guard keep this pass
+            # idempotent when multiple workers overlap.
+            close_stats = await service.auto_close_due_tasks(session, now=now)
+            notification_stats = await service.deliver_due_notifications(
+                session, now=now
+            )
+            stats = {**close_stats, **notification_stats}
+            return stats
         finally:
             await session.close()
 

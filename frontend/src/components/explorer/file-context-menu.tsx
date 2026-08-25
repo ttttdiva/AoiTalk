@@ -9,23 +9,21 @@ import {
 import { useExplorer } from "@/contexts/explorer-context";
 import { useContextMenuPosition } from "@/hooks/use-context-menu-position";
 import {
-  explorerDownloadUrl,
   explorerDownloadPaths,
-  explorerDelete,
-  explorerCopy,
-  explorerMove,
   explorerErrorMessage,
   explorerSetFolderThumbnail,
   explorerClearFolderThumbnail,
   type ExplorerDirectory,
   type ExplorerFile,
 } from "@/lib/explorer-api";
+import {
+  useFilerOperations,
+  useFilerUndoState,
+} from "@/hooks/use-filer-operations";
+import { toFilerDeleteTarget } from "@/lib/explorer/filer-operations";
 import { isHfPath } from "@/lib/hf/virtual-path";
 import { isHydrusPath } from "@/lib/hydrus/virtual-path";
-import {
-  deleteProjectRecordTable,
-  isRecordTableFile,
-} from "@/lib/record-tables-api";
+import { isRecordTableFile } from "@/lib/record-tables-api";
 import {
   FolderOpen,
   Download,
@@ -40,6 +38,8 @@ import {
   RefreshCw,
   Image as ImageIcon,
   ImageOff,
+  Undo2,
+  Redo2,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -74,6 +74,11 @@ const TEXT_EXTS = new Set([
   ".sql",
   ".ini",
   ".cfg",
+  ".bat",
+  ".cmd",
+  ".sh",
+  ".ps1",
+  ".vbs",
 ]);
 
 interface FileContextMenuProps {
@@ -85,6 +90,7 @@ interface FileContextMenuProps {
   onOpen?: (item: ExplorerDirectory | ExplorerFile) => void;
   onNewFolder?: () => void;
   onNewTextFile?: () => void;
+  activeSelectionPaths?: string[];
 }
 
 function isDir(item: ExplorerDirectory | ExplorerFile): boolean {
@@ -100,6 +106,7 @@ export function FileContextMenu({
   onOpen,
   onNewFolder,
   onNewTextFile,
+  activeSelectionPaths,
 }: FileContextMenuProps) {
   const {
     currentPath,
@@ -110,8 +117,14 @@ export function FileContextMenu({
     clearSelection,
     clipboard,
     setClipboard,
-    isAbsoluteFilerPath,
+    isRemoteWorkspace,
+    capabilities,
   } = useExplorer();
+  const { deleteTargets, transfer, undo, redo } = useFilerOperations({
+    capabilities,
+    refresh,
+  });
+  const { canUndo, canRedo } = useFilerUndoState();
   const { ref: menuRef, style: menuStyle } = useContextMenuPosition(position, {
     fallbackWidth: item ? 180 : 200,
     fallbackHeight: item ? 320 : 160,
@@ -133,23 +146,26 @@ export function FileContextMenu({
 
   // ── 背景右クリック（アイテムなし）──
   if (!item) {
-    const canWrite = !isAbsoluteFilerPath;
+    const canPasteHere =
+      clipboard &&
+      (clipboard.operation === "cut"
+        ? capabilities.canMove
+        : capabilities.canCopy);
     const handlePasteBackground = async () => {
       if (!clipboard) return;
-      for (const src of clipboard.paths) {
-        if (clipboard.operation === "cut") {
-          await explorerMove(src, currentPath);
-        } else {
-          await explorerCopy(src, currentPath);
-        }
-      }
-      if (clipboard.operation === "cut") setClipboard(null);
-      refresh();
+      await transfer({
+        paths: clipboard.paths,
+        destDir: currentPath,
+        operation: clipboard.operation === "cut" ? "move" : "copy",
+        onTransferred: () => {
+          if (clipboard.operation === "cut") setClipboard(null);
+        },
+      });
       onClose();
     };
 
     const backgroundItems = [
-      ...(canWrite
+      ...(capabilities.canCreate
         ? [
             {
               icon: FolderPlus,
@@ -171,13 +187,39 @@ export function FileContextMenu({
             },
           ]
         : []),
-      ...(clipboard && canWrite
+      ...(canPasteHere
         ? [
             {
               icon: ClipboardPaste,
               label: "貼り付け",
               mnemonic: "P",
               action: handlePasteBackground,
+            },
+          ]
+        : []),
+      ...(canUndo
+        ? [
+            {
+              icon: Undo2,
+              label: "元に戻す (Ctrl+Z)",
+              mnemonic: "Z",
+              action: () => {
+                void undo();
+                onClose();
+              },
+            },
+          ]
+        : []),
+      ...(canRedo
+        ? [
+            {
+              icon: Redo2,
+              label: "やり直す (Ctrl+Y)",
+              mnemonic: "Y",
+              action: () => {
+                void redo();
+                onClose();
+              },
             },
           ]
         : []),
@@ -195,7 +237,7 @@ export function FileContextMenu({
     return createPortal(
       <MenuMnemonicSurface
         ref={menuRef}
-        className="fixed z-50 min-w-48 rounded-lg border bg-popover p-1 shadow-md"
+        className="fixed z-50 min-w-48 rounded-md border border-border bg-popover p-1 shadow-lg"
         style={menuStyle}
         onContextMenu={(e) => e.preventDefault()}
       >
@@ -203,7 +245,7 @@ export function FileContextMenu({
           <MenuMnemonicButton
             key={mi.label}
             mnemonic={mi.mnemonic}
-            className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-accent"
+            className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-xs hover:bg-muted"
             onClick={mi.action}
           >
             <mi.icon className="size-3.5" />
@@ -219,7 +261,7 @@ export function FileContextMenu({
   const isDirectory = isDir(item);
   const isRecordTable = !isDirectory && isRecordTableFile(item as ExplorerFile);
   const activePaths = selectedItems.has(item.path)
-    ? Array.from(selectedItems)
+    ? (activeSelectionPaths ?? Array.from(selectedItems))
     : [item.path];
   const findItemByPath = (path: string) =>
     browseData
@@ -245,11 +287,11 @@ export function FileContextMenu({
   const isVirtualPath =
     isHfPath(item.path) || isHydrusPath(item.path) || isRecordTable;
   const canSetFolderThumb =
-    isImageFile && !isVirtualPath && !isAbsoluteFilerPath && !!currentPath;
+    isImageFile && !isVirtualPath && !isRemoteWorkspace && !!currentPath;
   const canClearFolderThumb =
     isDirectory &&
     !isVirtualPath &&
-    !isAbsoluteFilerPath &&
+    !isRemoteWorkspace &&
     !!(item as ExplorerDirectory).has_explicit_thumb;
 
   const handleSetFolderThumb = async () => {
@@ -289,13 +331,12 @@ export function FileContextMenu({
     }
 
     try {
-      if (activeRegularPaths.length === 1) {
-        const url = explorerDownloadUrl(activeRegularPaths[0]);
-        window.open(url, "_blank");
-      } else {
-        await explorerDownloadPaths(activeRegularPaths);
-        toast.success(`${activeRegularPaths.length}件をダウンロードします`);
-      }
+      await explorerDownloadPaths(activeRegularPaths);
+      toast.success(
+        activeRegularPaths.length === 1
+          ? "ダウンロードを開始しました"
+          : `${activeRegularPaths.length}件をダウンロードします`,
+      );
     } catch (error) {
       toast.error(`ダウンロードに失敗しました: ${explorerErrorMessage(error)}`);
     }
@@ -319,42 +360,36 @@ export function FileContextMenu({
   const handlePaste = async () => {
     if (!clipboard) return;
     const dest = isDirectory ? item.path : currentPath;
-    for (const src of clipboard.paths) {
-      if (clipboard.operation === "cut") {
-        await explorerMove(src, dest);
-      } else {
-        await explorerCopy(src, dest);
-      }
-    }
-    if (clipboard.operation === "cut") setClipboard(null);
-    refresh();
+    await transfer({
+      paths: clipboard.paths,
+      destDir: dest,
+      operation: clipboard.operation === "cut" ? "move" : "copy",
+      onTransferred: () => {
+        if (clipboard.operation === "cut") setClipboard(null);
+      },
+    });
     onClose();
   };
 
   const handleDelete = async () => {
-    try {
-      for (const path of activePaths) {
-        const target = findItemByPath(path);
-        if (!target || !("type" in target) || !isRecordTableFile(target)) {
-          await explorerDelete(path);
-          continue;
-        }
-        const file = target;
-        if (file.project_id && file.record_table_id) {
-          await deleteProjectRecordTable(file.project_id, file.record_table_id);
-        }
-      }
-      clearSelection();
-      refresh();
-      toast.success("削除しました");
-    } catch (error) {
-      toast.error(`削除に失敗しました: ${explorerErrorMessage(error)}`);
-    }
+    // 実行・確認・Undo登録は filer-operations 側へ集約
+    const targets = activePaths.map((path) => {
+      const target = findItemByPath(path) ?? (path === item.path ? item : null);
+      if (target) return toFilerDeleteTarget(target);
+      // 一覧から見つからない場合のみ最低限の情報で組み立てる
+      return {
+        path,
+        name: path.split(/[/\\|]/).pop() || path,
+        isDirectory: false,
+      };
+    });
+    await deleteTargets(targets, { onDeleted: clearSelection });
     onClose();
   };
 
-  // 絶対パス閲覧時はwrite操作を無効化
-  const canWrite = !isAbsoluteFilerPath;
+  const canPaste =
+    clipboard &&
+    (clipboard.operation === "cut" ? capabilities.canMove : capabilities.canCopy);
 
   const menuItems = [
     // 開く: フォルダは常に、ファイルはonOpenがある場合
@@ -394,7 +429,8 @@ export function FileContextMenu({
           },
         ]
       : []),
-    ...(canWrite && isRecordTable
+    // リネーム: HF / Hydrus / 絶対パスでは不可（従来は空振りするメニューが出ていた）
+    ...(capabilities.canRename
       ? [
           {
             icon: Pencil,
@@ -404,39 +440,34 @@ export function FileContextMenu({
               onRename(item);
               onClose();
             },
-          },
-          {
-            icon: Trash2,
-            label: "削除",
-            mnemonic: "D",
-            action: handleDelete,
-            destructive: true,
           },
         ]
       : []),
-    ...(canWrite && !isRecordTable
+    ...(capabilities.canCopy && !isRecordTable
+      ? [{ icon: Copy, label: "コピー", mnemonic: "C", action: handleCopy }]
+      : []),
+    ...(capabilities.canMove && !isRecordTable
       ? [
           {
-            icon: Pencil,
-            label: "リネーム",
-            mnemonic: "R",
-            action: () => {
-              onRename(item);
-              onClose();
-            },
+            icon: Scissors,
+            label: "切り取り",
+            mnemonic: "K",
+            action: handleCut,
           },
-          { icon: Copy, label: "コピー", mnemonic: "C", action: handleCopy },
-          { icon: Scissors, label: "切り取り", mnemonic: "K", action: handleCut },
-          ...(clipboard
-            ? [
-                {
-                  icon: ClipboardPaste,
-                  label: "貼り付け",
-                  mnemonic: "P",
-                  action: handlePaste,
-                },
-              ]
-            : []),
+        ]
+      : []),
+    ...(canPaste && !isRecordTable
+      ? [
+          {
+            icon: ClipboardPaste,
+            label: "貼り付け",
+            mnemonic: "P",
+            action: handlePaste,
+          },
+        ]
+      : []),
+    ...(capabilities.canDelete
+      ? [
           {
             icon: Trash2,
             label: "削除",
@@ -464,15 +495,21 @@ export function FileContextMenu({
   return createPortal(
     <MenuMnemonicSurface
       ref={menuRef}
-      className="fixed z-50 min-w-40 rounded-lg border bg-popover p-1 shadow-md"
+      className="fixed z-50 min-w-40 rounded-md border border-border bg-popover p-1 shadow-lg"
       style={menuStyle}
       onContextMenu={(e) => e.preventDefault()}
+      onKeyDown={(event) => {
+        if (event.key !== "Escape") return;
+        event.preventDefault();
+        event.stopPropagation();
+        onClose();
+      }}
     >
       {menuItems.map((mi) => (
         <MenuMnemonicButton
           key={mi.label}
           mnemonic={mi.mnemonic}
-          className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-accent ${
+          className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-xs hover:bg-muted ${
             "destructive" in mi ? "text-destructive" : ""
           }`}
           onClick={mi.action}

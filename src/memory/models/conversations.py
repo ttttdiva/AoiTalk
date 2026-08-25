@@ -11,7 +11,9 @@ from sqlalchemy import (
     Integer,
     DateTime,
     JSON,
+    CheckConstraint,
     ForeignKey,
+    ForeignKeyConstraint,
     Boolean,
     UniqueConstraint,
     Index,
@@ -35,6 +37,17 @@ def _public_message_metadata(value: Any) -> Any:
     return value
 
 
+def public_session_context(value: Any) -> Any:
+    """Hide provider-owned continuation handles from API/sync payloads."""
+    if not isinstance(value, dict):
+        return value
+    return {
+        key: value_item
+        for key, value_item in value.items()
+        if key != "cli_native_sessions"
+    }
+
+
 class ConversationSession(Base):
     """Active conversation session"""
 
@@ -56,11 +69,34 @@ class ConversationSession(Base):
     is_active = Column(Boolean, default=True)
     deleted_at = Column(
         DateTime, nullable=True, index=True
-    )  # ソフトデリート用（3ヶ月後に実削除）
+    )  # ソフトデリート用（共通保持期間後に実削除、既定30日）
 
     # Project association
     project_id = Column(
         UUID(as_uuid=True), ForeignKey("projects.id"), nullable=True, index=True
+    )
+    app_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("apps.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # Target は (app_id, app_target_id) の複合 FK で App に閉じ込める。
+    app_target_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    # App開発チャットだけが持つ進行状態。通常のChatはNULLのままにする。
+    development_status = Column(String(32), nullable=True, index=True)
+    # ユーザーが最後に開いた時刻。App開発チャットの完了応答を未読判定する。
+    last_read_at = Column(DateTime, nullable=True, index=True)
+    parent_session_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("conversation_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    forked_from_message_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("conversation_messages.id", ondelete="SET NULL", use_alter=True),
+        nullable=True,
     )
 
     # グループチャット
@@ -74,7 +110,10 @@ class ConversationSession(Base):
 
     # Relationships
     messages = relationship(
-        "ConversationMessage", back_populates="session", cascade="all, delete-orphan"
+        "ConversationMessage",
+        back_populates="session",
+        cascade="all, delete-orphan",
+        foreign_keys="ConversationMessage.session_id",
     )
     participants = relationship(
         "ConversationParticipant",
@@ -83,6 +122,27 @@ class ConversationSession(Base):
     )
     project = relationship(
         "Project", backref="conversation_sessions", passive_deletes=True
+    )
+    app = relationship("App", foreign_keys=[app_id], backref="conversation_sessions")
+    app_target = relationship(
+        "AppTarget",
+        primaryjoin="ConversationSession.app_target_id == AppTarget.id",
+        foreign_keys=[app_target_id],
+    )
+
+    __table_args__ = (
+        # 実 DB は ON DELETE SET NULL (app_target_id)。app_id は巻き込まない。
+        ForeignKeyConstraint(
+            ["app_id", "app_target_id"],
+            ["app_targets.app_id", "app_targets.id"],
+            name="fk_conversation_sessions_app_target_app",
+            ondelete="SET NULL",
+        ),
+        # 複合 FK は MATCH SIMPLE のため app_id が NULL だと検査されない。
+        CheckConstraint(
+            "app_target_id IS NULL OR app_id IS NOT NULL",
+            name="ck_conversation_sessions_app_target_requires_app",
+        ),
     )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -98,11 +158,25 @@ class ConversationSession(Base):
                 self.last_activity.isoformat() if self.last_activity else None
             ),
             "message_count": self.message_count,
-            "context": self.context,
+            "context": public_session_context(self.context),
             "current_summary": self.current_summary,
             "is_active": self.is_active,
             "deleted_at": self.deleted_at.isoformat() if self.deleted_at else None,
             "project_id": str(self.project_id) if self.project_id else None,
+            "app_id": str(self.app_id) if self.app_id else None,
+            "app_target_id": str(self.app_target_id) if self.app_target_id else None,
+            "development_status": self.development_status,
+            "last_read_at": (
+                self.last_read_at.isoformat() if self.last_read_at else None
+            ),
+            "parent_session_id": (
+                str(self.parent_session_id) if self.parent_session_id else None
+            ),
+            "forked_from_message_id": (
+                str(self.forked_from_message_id)
+                if self.forked_from_message_id
+                else None
+            ),
             "is_group_chat": self.is_group_chat or False,
             "group_character_names": self.group_character_names or [],
             "participants": [
@@ -199,7 +273,11 @@ class ConversationMessage(Base):
     is_active_branch = Column(Boolean, default=True)  # Currently displayed branch
 
     # Relationship to session
-    session = relationship("ConversationSession", back_populates="messages")
+    session = relationship(
+        "ConversationSession",
+        back_populates="messages",
+        foreign_keys=[session_id],
+    )
 
     def to_dict(self) -> Dict[str, Any]:
         return {

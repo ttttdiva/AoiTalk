@@ -3,6 +3,10 @@ import { SignJWT } from "jose";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import postgres from "postgres";
+
+const DEFAULT_E2E_USER_ID = "00000000-0000-4000-8000-000000000001";
+const E2E_USERNAME = "__playwright_e2e__";
 
 function readEnvValue(key: string) {
   const envPath = resolve(process.cwd(), ".env");
@@ -22,8 +26,81 @@ const SECRET = new TextEncoder().encode(
     "fallback-secret",
 );
 
-export async function createSessionToken(userId = "user-1") {
-  return await new SignJWT({ sub: userId, username: "tester", role: "admin" })
+export const E2E_USER_ID = process.env.E2E_USER_ID || DEFAULT_E2E_USER_ID;
+
+function resolveTestUserId(userId?: string) {
+  // Older E2E specs passed the non-UUID placeholder `user-1`. Keep those
+  // callers compatible while ensuring proxy's UUID-backed DB lookup is valid.
+  return !userId || userId === "user-1" ? E2E_USER_ID : userId;
+}
+
+function getDatabaseUrl() {
+  const configured = process.env.DATABASE_URL || readEnvValue("DATABASE_URL");
+  if (configured) return configured;
+  const user = process.env.POSTGRES_USER || readEnvValue("POSTGRES_USER") || "aoitalk";
+  const password = process.env.POSTGRES_PASSWORD || readEnvValue("POSTGRES_PASSWORD") || "";
+  const host = process.env.POSTGRES_HOST || readEnvValue("POSTGRES_HOST") || "127.0.0.1";
+  const port = process.env.POSTGRES_PORT || readEnvValue("POSTGRES_PORT") || "5432";
+  const database = process.env.POSTGRES_DB || readEnvValue("POSTGRES_DB") || "aoitalk_memory";
+  return `postgresql://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}/${encodeURIComponent(database)}`;
+}
+
+export async function ensureE2EUser() {
+  const sql = postgres(getDatabaseUrl(), { max: 1 });
+  try {
+    const existing = await sql<{ username: string }[]>`
+      select username from users where id = ${E2E_USER_ID}::uuid
+    `;
+    if (existing[0] && existing[0].username !== E2E_USERNAME) {
+      throw new Error(
+        `E2E user id ${E2E_USER_ID} is already owned by ${existing[0].username}`,
+      );
+    }
+    await sql`
+      insert into users (
+        id, username, password_hash, display_name, role, is_active,
+        is_password_reset_required, session_version, created_at, updated_at
+      ) values (
+        ${E2E_USER_ID}::uuid, ${E2E_USERNAME}, ${"e2e-not-a-login-password"},
+        ${"Playwright E2E"}, ${"admin"}, true, false, 1, now(), now()
+      )
+      on conflict (id) do update set
+        role = excluded.role,
+        is_active = true,
+        is_password_reset_required = false,
+        session_version = 1,
+        updated_at = now()
+    `;
+  } finally {
+    await sql.end();
+  }
+}
+
+export async function deactivateE2EUser() {
+  const sql = postgres(getDatabaseUrl(), { max: 1 });
+  try {
+    // E2E-created rows can legitimately retain created_by/updated_by foreign
+    // keys to this reserved fixture user. Keep the identity reusable instead
+    // of deleting referenced data, but make its session unusable between runs.
+    await sql`
+      update users
+      set is_active = false, updated_at = now()
+      where id = ${E2E_USER_ID}::uuid and username = ${E2E_USERNAME}
+    `;
+  } finally {
+    await sql.end();
+  }
+}
+
+export async function createSessionToken(userId = E2E_USER_ID) {
+  const resolvedUserId = resolveTestUserId(userId);
+  return await new SignJWT({
+    sub: resolvedUserId,
+    username: E2E_USERNAME,
+    role: "admin",
+    session_version: 1,
+    password_reset_required: false,
+  })
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()
     .setJti(randomUUID())
@@ -31,13 +108,13 @@ export async function createSessionToken(userId = "user-1") {
     .sign(SECRET);
 }
 
-export async function addAuthCookie(page: Page, userId = "user-1") {
+export async function addAuthCookie(page: Page, userId = E2E_USER_ID) {
   const host = process.env.PLAYWRIGHT_HOST ?? "127.0.0.1";
   const port = process.env.PLAYWRIGHT_PORT ?? "3002";
   await page.context().addCookies([
     {
       name: "aoitalk_session",
-      value: await createSessionToken(userId),
+      value: await createSessionToken(resolveTestUserId(userId)),
       url: `http://${host}:${port}`,
     },
   ]);
@@ -52,7 +129,7 @@ export async function mockAuthenticatedApis(page: Page) {
       await route.fulfill({
         json: {
           authenticated: true,
-          user: { id: "user-1", username: "tester", role: "admin" },
+          user: { id: E2E_USER_ID, username: E2E_USERNAME, role: "admin" },
         },
       });
       return;
@@ -111,6 +188,25 @@ export async function mockAuthenticatedApis(page: Page) {
           import_items: [],
           attachments: [],
           edges: [],
+          projects: [],
+        },
+      });
+      return;
+    }
+
+    if (url.pathname === "/api/docs/bootstrap") {
+      await route.fulfill({
+        json: {
+          nodes: [],
+          supertags: [],
+          node_supertags: [],
+          supertag_fields: [],
+          placements: [],
+          fields: [],
+          field_values: [],
+          attachments: [],
+          views: [],
+          ai_suggestions: [],
           projects: [],
         },
       });
@@ -217,6 +313,21 @@ export async function mockAuthenticatedApis(page: Page) {
 
     if (url.pathname === "/api/python-proxy/runtime/features") {
       await route.fulfill({ json: { features: {} } });
+      return;
+    }
+
+    if (url.pathname === "/api/python-proxy/mobile/commands") {
+      await route.fulfill({ json: { enabled: false, commands: [] } });
+      return;
+    }
+
+    if (url.pathname === "/api/python-proxy/crawler/status") {
+      await route.fulfill({ json: { crawlers: [] } });
+      return;
+    }
+
+    if (url.pathname === "/api/python-proxy/settings") {
+      await route.fulfill({ json: {} });
       return;
     }
 

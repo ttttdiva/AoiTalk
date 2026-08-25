@@ -1,5 +1,8 @@
 "use client";
 
+import { AppSelect } from "@/components/ui/app-select";
+import { Checkbox } from "@/components/ui/checkbox";
+
 import {
   Input,
 } from "@/components/ui/input";
@@ -31,6 +34,7 @@ export function SupertagConfigPanel({
   onCreateField,
   onUpdateSupertag,
   onUpdateField,
+  readOnly = false,
 }: {
   tag: DocsSupertag;
   tags: DocsSupertag[];
@@ -38,6 +42,7 @@ export function SupertagConfigPanel({
   onCreateField: (tagId: string, name: string, fieldType: string) => void;
   onUpdateSupertag: (tagId: string, patch: Partial<Pick<DocsSupertag, "name" | "description" | "color" | "icon" | "template_json" | "config_json" | "title_template" | "ai_instructions" | "parent_supertag_id">>) => void;
   onUpdateField: (fieldId: string, patch: Partial<Pick<DocsField, "name" | "field_type" | "required" | "options_json" | "sort_order">> & { default_value_json?: unknown }) => void;
+  readOnly?: boolean;
 }) {
   const config = readConfigRecord(tag.config_json);
   const optionsFields = fields.filter((field) => docsFieldType(field) === "options");
@@ -51,6 +56,7 @@ export function SupertagConfigPanel({
   const relatedTagId = tagIdsFromRelatedConfig(tag)[0] ?? "";
 
   const updateConfig = (patch: Record<string, unknown>) => {
+    if (readOnly) return;
     onUpdateSupertag(tag.id, { config_json: { ...config, ...patch } });
   };
 
@@ -59,16 +65,18 @@ export function SupertagConfigPanel({
       <section className="space-y-2">
         <div className="flex items-center gap-2">
           <span className="rounded border px-2 py-1 text-xs" style={tagColorStyle(tag.color)}>#{tag.name}</span>
-          <Input defaultValue={tag.color ?? ""} onBlur={(event) => onUpdateSupertag(tag.id, { color: event.target.value })} className="h-8" placeholder="Color" />
+          <Input defaultValue={tag.color ?? ""} onBlur={(event) => onUpdateSupertag(tag.id, { color: event.target.value })} className="h-8" placeholder="Color" disabled={readOnly} />
         </div>
-        <Input defaultValue={tag.description ?? ""} onBlur={(event) => onUpdateSupertag(tag.id, { description: event.target.value })} className="h-8" placeholder="Description" />
+        <Input defaultValue={tag.description ?? ""} onBlur={(event) => onUpdateSupertag(tag.id, { description: event.target.value })} className="h-8" placeholder="Description" disabled={readOnly} />
       </section>
 
       <section className="space-y-2">
         <div className="text-xs font-medium text-muted-foreground">Content template</div>
         <TemplateOutlineEditor
           value={tag.template_json ?? {}}
-          onSave={(templateJson) => onUpdateSupertag(tag.id, { template_json: templateJson })}
+          onSave={(templateJson) => {
+            if (!readOnly) onUpdateSupertag(tag.id, { template_json: templateJson });
+          }}
         />
       </section>
 
@@ -77,18 +85,19 @@ export function SupertagConfigPanel({
         <div className="space-y-2">
           {fields.map((field) => (
             <div key={field.id} className="grid grid-cols-[minmax(0,1fr)_92px_auto] items-center gap-1 rounded border px-2 py-1">
-              <Input defaultValue={field.name} onBlur={(event) => onUpdateField(field.id, { name: event.target.value })} className="h-8 rounded border bg-background px-2" />
-              <select
+              <Input defaultValue={field.name} onBlur={(event) => onUpdateField(field.id, { name: event.target.value })} className="h-8 rounded border bg-background px-2" disabled={readOnly} />
+              <AppSelect
                 defaultValue={docsFieldType(field)}
                 onChange={(event) => onUpdateField(field.id, { field_type: event.target.value })}
                 className="h-7 rounded border bg-background px-1 text-xs"
+                disabled={readOnly}
               >
                 {["text", "long_text", "options", "date", "checkbox", "reference", "number", "url", "email", "user"].map((type) => (
                   <option key={type} value={type}>{type}</option>
                 ))}
-              </select>
+              </AppSelect>
               <label className="flex items-center gap-1 text-[11px] text-muted-foreground">
-                <input type="checkbox" defaultChecked={field.required} onChange={(event) => onUpdateField(field.id, { required: event.target.checked })} />
+                <Checkbox defaultChecked={field.required} onCheckedChange={(checked) => onUpdateField(field.id, { required: checked === true })} disabled={readOnly} />
                 req
               </label>
               {docsFieldType(field) === "options" ? (
@@ -97,51 +106,55 @@ export function SupertagConfigPanel({
                   onBlur={(event) => onUpdateField(field.id, { options_json: { values: event.target.value.split(",").map((item) => item.trim()).filter(Boolean) } })}
                   className="col-span-3 h-8 rounded border bg-background px-2 text-xs outline-none focus:ring-2 focus:ring-ring"
                   placeholder="options"
+                  disabled={readOnly}
                 />
               ) : null}
             </div>
           ))}
         </div>
-        <FieldCreator tagId={tag.id} onCreateField={onCreateField} />
+        {!readOnly ? <FieldCreator tagId={tag.id} onCreateField={onCreateField} /> : null}
       </section>
 
       <section className="space-y-2 border-t pt-3">
         <label className="flex items-center justify-between gap-2 text-xs">
           <span>Show checkbox</span>
-          <input type="checkbox" defaultChecked={config.show_checkbox === true} onChange={(event) => updateConfig({ show_checkbox: event.target.checked })} />
+          <Checkbox defaultChecked={config.show_checkbox === true} onCheckedChange={(checked) => updateConfig({ show_checkbox: checked === true })} disabled={readOnly} />
         </label>
         <div className="grid grid-cols-[1fr_1fr] gap-2">
-          <select
+          <AppSelect
             value={selectedDoneField?.id ?? ""}
             onChange={(event) => updateConfig({ done_state_mapping: { ...doneMapping, field_id: event.target.value } })}
             className="h-8 rounded border bg-background px-2 text-xs"
+            disabled={readOnly}
           >
             <option value="">Done field</option>
             {optionsFields.map((field) => <option key={field.id} value={field.id}>{field.name}</option>)}
-          </select>
-          <select
+          </AppSelect>
+          <AppSelect
             value={doneValue}
             onChange={(event) => updateConfig({ done_state_mapping: { ...doneMapping, done_value: event.target.value, field_id: selectedDoneField?.id ?? "" } })}
             className="h-8 rounded border bg-background px-2 text-xs"
+            disabled={readOnly}
           >
             <option value="">Checked value</option>
             {(selectedDoneField ? fieldOptions(selectedDoneField) : []).map((value) => <option key={value} value={value}>{value}</option>)}
-          </select>
+          </AppSelect>
         </div>
       </section>
 
       <section className="space-y-2 border-t pt-3">
         <div className="text-xs font-medium text-muted-foreground">Advanced options</div>
-        <Input defaultValue={tag.title_template ?? ""} onBlur={(event) => onUpdateSupertag(tag.id, { title_template: event.target.value })} className="h-8" placeholder="Title expression" />
-        <select
+        <Input defaultValue={tag.title_template ?? ""} onBlur={(event) => onUpdateSupertag(tag.id, { title_template: event.target.value })} className="h-8" placeholder="Title expression" disabled={readOnly} />
+        <AppSelect
           value={typeof config.default_child_supertag_id === "string" ? config.default_child_supertag_id : ""}
           onChange={(event) => updateConfig({ default_child_supertag_id: event.target.value || null })}
           className="h-8 w-full rounded border bg-background px-2 text-xs"
+          disabled={readOnly}
         >
           <option value="">Default child supertag</option>
           {tags.map((item) => <option key={item.id} value={item.id}>#{item.name}</option>)}
-        </select>
-        <select
+        </AppSelect>
+        <AppSelect
           value={relatedTagId}
           onChange={(event) => updateConfig({
             related_content: event.target.value
@@ -149,10 +162,11 @@ export function SupertagConfigPanel({
               : null,
           })}
           className="h-8 w-full rounded border bg-background px-2 text-xs"
+          disabled={readOnly}
         >
           <option value="">Related content tag</option>
           {tags.map((item) => <option key={item.id} value={item.id}>#{item.name}</option>)}
-        </select>
+        </AppSelect>
       </section>
     </div>
   );

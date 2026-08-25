@@ -7,6 +7,7 @@ from .notifications import NotificationMixin
 from .occurrences import OccurrenceMixin
 from .tasks import TaskCrudMixin
 from .time_tracking import TimeTrackingMixin
+from .due_completion import DueCompletionMixin
 
 
 class TaskManagementService(
@@ -15,6 +16,7 @@ class TaskManagementService(
     OccurrenceMixin,
     TimeTrackingMixin,
     NotificationMixin,
+    DueCompletionMixin,
 ):
     """Stateful service for the task system."""
 

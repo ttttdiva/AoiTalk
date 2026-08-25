@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from ...memory.database import get_database_manager
 from ...memory.project_repository import ProjectRepository
 from ...services.agent_run_service import AgentRunService
+from ...services.project_context import has_project_read_access
 from ..router_helpers import cookie_auth_dependency
 
 if TYPE_CHECKING:
@@ -33,17 +34,19 @@ def register_agent_run_routes(app: FastAPI, server: "WebChatServer") -> None:
             raise HTTPException(status_code=403, detail="Access denied")
 
     async def _assert_project_access(project_id: str, user_info: dict) -> None:
-        if str(user_info.get("role") or "") == "admin":
-            return
         db_manager = get_database_manager()
         session = await db_manager.get_session()
         try:
-            member = await ProjectRepository.get_member(
+            project_uuid = UUID(project_id)
+            project = await ProjectRepository.get_by_id(session, project_uuid)
+            if project is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            if not await has_project_read_access(
                 session,
-                project_id=UUID(project_id),
-                user_id=UUID(str(user_info["id"])),
-            )
-            if member is None:
+                project,
+                user_id=str(user_info.get("id") or ""),
+                user_role=str(user_info.get("role") or "") or None,
+            ):
                 raise HTTPException(status_code=403, detail="Access denied")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="Invalid project id") from exc
@@ -72,8 +75,14 @@ def register_agent_run_routes(app: FastAPI, server: "WebChatServer") -> None:
         if run is None:
             raise HTTPException(status_code=404, detail="Agent run not found")
         await _assert_session_access(run.get("session_id"), str(user_info["id"]))
-        if run.get("project_id") and not run.get("session_id"):
+        if run.get("project_id"):
             await _assert_project_access(str(run["project_id"]), user_info)
+        elif not run.get("session_id"):
+            if (
+                str(user_info.get("role") or "") != "admin"
+                and str(run.get("user_id") or "") != str(user_info["id"])
+            ):
+                raise HTTPException(status_code=403, detail="Access denied")
         return JSONResponse({"success": True, "agent_run": run})
 
     @app.get("/api/conversations/{session_id}/agent-runs")
@@ -91,6 +100,14 @@ def register_agent_run_routes(app: FastAPI, server: "WebChatServer") -> None:
             status=status,
             limit=limit,
         )
+        for run in runs:
+            if run.get("project_id"):
+                await _assert_project_access(str(run["project_id"]), user_info)
+            elif not run.get("session_id") and (
+                str(user_info.get("role") or "") != "admin"
+                and str(run.get("user_id") or "") != str(user_info["id"])
+            ):
+                raise HTTPException(status_code=403, detail="Access denied")
         return JSONResponse(
             {
                 "success": True,

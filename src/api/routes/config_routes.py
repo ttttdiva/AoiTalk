@@ -7,27 +7,44 @@ from typing import TYPE_CHECKING
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from ...config_errors import (
+    CharacterLookupError,
+    CharacterNotFoundError,
+    add_character_lookup_context,
+    character_lookup_http_detail,
+    character_lookup_http_status,
+)
 from ..router_helpers import cookie_auth_dependency
+from ...features import Features
+from ...services.character_service import canonicalize_character_slug
 from .payloads import SettingsPayload
 from ...services.agent_team_service import (
-    AGENT_TEAM_MEMBER_KEYS,
     AGENT_TEAM_PROVIDERS,
-    BUILTIN_AGENT_TEAM_MODEL_GROUPS,
-    MODEL_ROUTE_CLASS_BY_ROUTE,
-    RESERVED_AGENT_TEAM_MODEL_GROUP_IDS,
-    SCALABLE_MEMBER_KEYS,
-    AGENT_HARNESS_PROVIDERS,
     MODEL_ROUTING_PROVIDERS,
-    agent_team_confirm_prompt,
-    agent_team_delegation_enabled,
-    agent_team_member_for,
-    agent_team_member_configured_group_id,
-    agent_team_member_mode,
-    agent_team_member_requires_external_approval,
-    agent_team_member_settings,
-    agent_team_notify,
-    agent_team_roster,
-    resolve_agent_team_member_mode,
+    AGENT_TEAM_SCHEMA_VERSION,
+    AGENT_TEAM_CAPABILITY_CATALOG,
+    AGENT_TEAM_CONTEXT_TAGS,
+    normalize_agent_team_v3,
+    agent_team_v3_teams,
+    agent_team_v3_subagents,
+    resolve_agent_team_v3_route,
+)
+from ...services.execution_profile_service import (
+    validate_execution_route,
+    validate_team_execution_profile,
+)
+from ...llm.sglang_url import enforce_enterprise_sglang_model
+from ...agent_harness.config import public_agent_harness_settings
+from ...security.settings_public import (
+    format_setting_log_value,
+    is_admin_only_setting_key,
+    mask_model_routing_classes,
+    mask_secret_dict,
+    public_setting_patch_payload,
+)
+from ...services.character_scope import (
+    resolve_request_character_name,
+    update_user_preferred_character,
 )
 
 # Import CharacterSwitchManager (server.py と同じフォールバック付き)
@@ -46,12 +63,49 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _request_correlation_ids(request: Request | None) -> tuple[str | None, str | None]:
+    """Read optional correlation headers without echoing their raw values."""
+
+    if request is None:
+        return None, None
+    headers = request.headers
+    return (
+        headers.get("x-request-id") or headers.get("x-correlation-id"),
+        headers.get("x-trace-id"),
+    )
+
+
+def _character_lookup_http_exception(
+    exc: BaseException,
+    *,
+    request: Request | None = None,
+    not_found_status: int = 404,
+) -> HTTPException:
+    """Map a character lookup failure to a secret-free HTTP exception."""
+
+    if isinstance(exc, CharacterNotFoundError):
+        return HTTPException(
+            status_code=not_found_status,
+            detail="Character not found",
+        )
+    request_id, trace_id = _request_correlation_ids(request)
+    typed = add_character_lookup_context(
+        exc,
+        request_id=request_id,
+        trace_id=trace_id,
+    )
+    return HTTPException(
+        status_code=character_lookup_http_status(typed),
+        detail=character_lookup_http_detail(typed),
+    )
+
+
 def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
     """config / voice_status / characters / settings / character 切替ルートを登録する"""
     require_auth = cookie_auth_dependency(server._enforce_cookie_auth)
 
     @app.get("/api/config")
-    async def get_config():
+    async def get_config(request: Request, _: None = Depends(require_auth)):
         """Get configuration"""
         # Handle both dict and Config object
         if hasattr(server.config, "config"):
@@ -84,6 +138,7 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         from ...utils.app_session import get_session_id
 
         session_id = get_session_id()
+        character_name = await resolve_request_character_name(server, request)
 
         # Debug logging
         logger.info(
@@ -92,7 +147,7 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
 
         return JSONResponse(
             {
-                "character_name": server.character_name,
+                "character_name": character_name,
                 "max_history": server.manager.max_history,
                 "llm_model": llm_model,
                 "llm_provider": llm_provider,
@@ -103,7 +158,7 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         )
 
     @app.get("/api/voice_status")
-    async def get_voice_status():
+    async def get_voice_status(_: None = Depends(require_auth)):
         """Get voice recognition status"""
         return JSONResponse(
             {
@@ -114,34 +169,106 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         )
 
     @app.get("/api/characters")
-    async def get_characters():
+    async def get_characters(
+        request: Request,
+        _: None = Depends(require_auth),
+    ):
         """Get list of available characters"""
         try:
             characters = server.config.get_available_characters()
-            return JSONResponse(
-                {"characters": characters, "current": server.character_name}
+            option_loader = getattr(
+                server.config, "get_available_character_options", None
             )
-        except Exception as e:
-            logger.error(f"Failed to get characters: {e}")
-            return JSONResponse(
-                {"characters": [], "current": server.character_name, "error": str(e)},
-                status_code=500,
+            character_options = (
+                option_loader()
+                if callable(option_loader)
+                else [{"slug": name, "name": name} for name in characters]
             )
+            current_character = await resolve_request_character_name(server, request)
+            if any(
+                option.get("slug") == "project_manager"
+                for option in character_options
+                if isinstance(option, dict)
+            ):
+                current_character = canonicalize_character_slug(current_character)
+            return JSONResponse(
+                {
+                    "characters": characters,
+                    "character_options": character_options,
+                    "current": current_character,
+                }
+            )
+        except CharacterLookupError as exc:
+            logger.error(
+                "Character list lookup failed: category=%s trace_id=%s request_id=%s",
+                exc.category,
+                exc.trace_id,
+                exc.request_id or _request_correlation_ids(request)[0] or "-",
+            )
+            raise _character_lookup_http_exception(exc, request=request) from None
+        except Exception as exc:
+            # Custom/local config providers may still raise a raw DBAPI error;
+            # classify it here rather than echoing ``str(exc)`` in JSON.
+            logger.error(
+                "Failed to get characters: exception_type=%s",
+                type(exc).__name__,
+            )
+            raise _character_lookup_http_exception(exc, request=request) from None
 
     # ── Settings API Endpoints ──────────────────────────────────────────
     # Allowed settings that can be modified via WebUI
     ALLOWED_SETTINGS = {
         "external_llm.auto_approve": {"type": "bool"},
-        "agent_team.delegation_enabled": {"type": "bool"},
-        "agent_team.confirm_prompt": {"type": "bool"},
-        "agent_team.notify": {"type": "bool"},
-        "agent_team.redaction_terms": {"type": "str_list"},
-        "agent_team.strategy": {
+        "agent_team.orchestration_mode": {
             "type": "enum",
-            "values": ["adaptive", "fanout", "judge"],
+            "values": ["standard", "director"],
         },
-        "agent_team.model_groups": {"type": "object"},
-        "agent_team.members": {"type": "object"},
+        "agent_team.delegation_enabled": {"type": "bool"},
+        "integrations.spotify.enabled": {"type": "bool"},
+        # Team/Subagent/Profile topology is edited atomically through
+        # /api/agent-team/config.  The old members/templates/model_groups
+        # dotted settings are intentionally not accepted here.
+        # 外部送信ポリシーは Agent Team のモデル分担と独立させる。
+        "external_model_privacy.mode": {
+            "type": "enum",
+            "values": ["direct", "protected", "local_only"],
+        },
+        "external_model_privacy.review_policy": {
+            "type": "enum",
+            "values": ["never", "high_risk", "always"],
+        },
+        "external_model_privacy.notify": {"type": "bool"},
+        "external_model_privacy.semantic_redaction_enabled": {"type": "bool"},
+        "external_model_privacy.local_provider": {
+            "type": "enum",
+            "values": ["ollama", "sglang", "openai_compatible_local"],
+        },
+        "external_model_privacy.local_model": {"type": "str"},
+        "external_model_privacy.redaction_terms": {"type": "str_list"},
+        "external_model_privacy.trusted_local_hosts": {"type": "str_list"},
+        "external_model_privacy.raw_media_policy": {
+            "type": "enum",
+            "values": ["block", "confirm"],
+        },
+        "external_model_privacy.cache_enabled": {"type": "bool"},
+        "chatgpt_web.profile_dir": {"type": "str"},
+        "chatgpt_web.response_timeout_seconds": {
+            "type": "int",
+            "min": 1,
+            "max": 3600,
+        },
+        "chatgpt_web.max_rounds_per_turn": {
+            "type": "int",
+            "min": 1,
+            "max": 100,
+        },
+        # OpenAI データ共有インセンティブ（無料枠）の推定設定
+        "openai.data_sharing_incentive_enabled": {"type": "bool"},
+        "openai.usage_tier": {
+            "type": "enum",
+            "values": ["tier_1_2", "tier_3_plus"],
+        },
+        "openai.billing_scope_id": {"type": "str"},
         "search.knowledge_enabled": {"type": "bool"},
         "reasoning.enabled": {"type": "bool"},
         "reasoning.display_mode": {
@@ -152,12 +279,11 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             "type": "enum",
             "values": ["openai", "local"],
         },
+        "search.openai_model": {"type": "str"},
         # Agent/Tool toggles
         "agents.filesystem.enabled": {"type": "bool"},
         "agents.project_management.enabled": {"type": "bool"},
         "mcp_enabled": {"type": "bool"},
-        "agents.spotify.enabled": {"type": "bool"},
-        "spotify.enabled": {"type": "bool"},
         "tts.yomi_linter.enabled": {"type": "bool"},
         "tts.yomi_linter.model_id": {"type": "str"},
         "tts.yomi_linter.device": {
@@ -178,11 +304,49 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             "type": "enum",
             "values": ["auto", "always", "off"],
         },
+        "model_routing.media.video_mode": {
+            "type": "enum",
+            "values": ["auto", "off"],
+        },
+        "mage_vl.enabled": {"type": "bool"},
+        "mage_vl.managed": {"type": "bool"},
+        "mage_vl.preload_on_start": {"type": "bool"},
+        "mage_vl.model": {"type": "str"},
+        "mage_vl.base_url": {"type": "str"},
+        "mage_vl.api_key": {"type": "str"},
+        "mage_vl.server_command": {"type": "str"},
+        "mage_vl.startup_timeout_seconds": {"type": "int", "min": 1, "max": 3600},
+        "mage_vl.inference_timeout_seconds": {"type": "int", "min": 1, "max": 7200},
+        "mage_vl.max_video_bytes": {
+            "type": "int",
+            "min": 1,
+            "max": 524288000,
+        },
+        "mage_vl.max_video_duration_seconds": {
+            "type": "int",
+            "min": 0,
+            "max": 86400,
+        },
+        "mage_vl.video_backend": {
+            "type": "enum",
+            "values": ["frames"],
+        },
+        "mage_vl.codec_engine": {
+            "type": "enum",
+            "values": ["traditional", "neural"],
+        },
+        "mage_vl.num_frames": {"type": "int", "min": 1, "max": 128},
+        "mage_vl.max_pixels": {"type": "int", "min": 0, "max": 4000000},
+        "mage_vl.max_new_tokens": {"type": "int", "min": 1, "max": 8192},
     }
     class_provider_values = {
-        "vision": [""] + sorted(MODEL_ROUTING_PROVIDERS - {"claude-cli", "grok-cli"}),
+        "vision": [""] + sorted(MODEL_ROUTING_PROVIDERS - {"claude-cli", "grok-cli", "deepseek"}),
+        # 専用client factoryが生成できるproviderだけを許可する。
+        # claude/grok はメディア向け互換APIでは使えるが、target factory未対応。
+        "clip_ingest": [""] + sorted(AGENT_TEAM_PROVIDERS),
+        "video": ["", "mage_vl"],
     }
-    for route_class in ("vision",):
+    for route_class in ("vision", "clip_ingest", "video"):
         ALLOWED_SETTINGS[f"model_routing.classes.{route_class}.inherit"] = {"type": "bool"}
         ALLOWED_SETTINGS[f"model_routing.classes.{route_class}.provider"] = {
             "type": "enum",
@@ -193,6 +357,10 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         ALLOWED_SETTINGS[f"model_routing.classes.{route_class}.api_key"] = {"type": "str"}
     ALLOWED_SETTINGS["model_routing.classes.vision.reasoning_effort"] = {"type": "str"}
     ALLOWED_SETTINGS["model_routing.classes.vision.mode"] = {"type": "str"}
+    ALLOWED_SETTINGS["model_routing.classes.clip_ingest.reasoning_effort"] = {"type": "str"}
+    ALLOWED_SETTINGS["model_routing.classes.clip_ingest.mode"] = {"type": "str"}
+    ALLOWED_SETTINGS["model_routing.classes.video.reasoning_effort"] = {"type": "str"}
+    ALLOWED_SETTINGS["model_routing.classes.video.mode"] = {"type": "str"}
     ALLOWED_SETTINGS["model_routing.classes.audio.engine"] = {
         "type": "enum",
         "values": ["speech_recognition", "llm", "off"],
@@ -209,88 +377,37 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             if field == "provider"
             else {"type": "str"}
         )
-    for member_key in sorted(AGENT_TEAM_MEMBER_KEYS):
-        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.enabled"] = {"type": "bool"}
-        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.group_id"] = {"type": "str"}
-        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.override.effort_policy"] = {
-            "type": "enum", "values": ["same", "lower", "explicit", "default"]
-        }
-        ALLOWED_SETTINGS[f"agent_team.members.{member_key}.override.effort"] = {"type": "str"}
-        provider_values = (
-            sorted(AGENT_HARNESS_PROVIDERS)
-            if member_key == "agent_harness"
-            else sorted(AGENT_TEAM_PROVIDERS)
-        )
-        ALLOWED_SETTINGS[f"model_routing.overrides.{member_key}.provider"] = {
-            "type": "enum",
-            "values": [""] + provider_values,
-        }
-        for field in ("provider", "model", "runner"):
-            ALLOWED_SETTINGS[f"agent_team.members.{member_key}.override.{field}"] = {"type": "str"}
-        for field in ("model", "mode", "reasoning_effort", "runner"):
-            ALLOWED_SETTINGS[f"model_routing.overrides.{member_key}.{field}"] = {
-                "type": "str"
-            }
-        ALLOWED_SETTINGS[f"model_routing.overrides.{member_key}.default_instances"] = {
-            "type": "int",
-            "min": 0,
-            "max": 32,
-        }
-        ALLOWED_SETTINGS[f"model_routing.overrides.{member_key}.max_instances"] = {
-            "type": "int",
-            "min": 1,
-            "max": 32,
-        }
-
     @app.get("/api/settings")
-    async def get_settings(_: None = Depends(require_auth)):
+    async def get_settings(
+        request: Request,
+        _: None = Depends(require_auth),
+    ):
         """Get configurable settings"""
         try:
-            def _member_payload(member_key: str) -> dict:
-                member = agent_team_member_settings(server.config, member_key)
-                target = agent_team_member_for(server.config, member_key)
-                raw = server.config.get(f"agent_team.members.{member_key}", {}) or {}
-                return {
-                    "enabled": bool(raw.get("enabled", member.get("enabled", False))),
-                    "group_id": agent_team_member_configured_group_id(
-                        server.config,
-                        member_key,
-                    ),
-                    "override": dict(raw.get("override") or {}),
-                    "effective_provider": str((target or {}).get("provider") or member.get("provider") or ""),
-                    "effective_model": str((target or {}).get("model") or member.get("model") or ""),
-                    "effective_effort": resolve_agent_team_member_mode(
-                        server.config,
-                        member_key=member_key,
-                        provider=str((target or {}).get("provider") or member.get("provider") or ""),
-                        model=str((target or {}).get("model") or member.get("model") or ""),
-                    ),
-                    "provider": str(member.get("provider") or ""),
-                    "model": str(member.get("model") or ""),
-                    "mode": agent_team_member_mode(
-                        server.config,
-                        member_key,
-                        "medium",
-                    ),
-                    "reasoning_effort": agent_team_member_mode(
-                        server.config,
-                        member_key,
-                        "medium",
-                    ),
-                    "external": agent_team_member_requires_external_approval(
-                        target or {
-                            "provider": str(member.get("provider") or ""),
-                            "model": str(member.get("model") or ""),
-                        }
-                    ),
-                    "label": str(member.get("label") or ""),
-                    "role": str(member.get("role") or member_key),
-                    "runner": str(member.get("runner") or ""),
-                    "scalable": bool(member.get("scalable", False)),
-                    "default_instances": int(member.get("default_instances") or 0),
-                    "max_instances": int(member.get("max_instances") or 1),
-                    "tools": list(member.get("tools") or []),
-                }
+            is_admin = await server._is_admin_user(request)
+            raw_mage_vl = server.config.get("mage_vl", {}) or {}
+            safe_mage_vl = mask_secret_dict(
+                dict(raw_mage_vl) if isinstance(raw_mage_vl, dict) else {},
+                is_admin=is_admin,
+            )
+            try:
+                from ...services.mage_vl_service import get_mage_vl_service
+
+                safe_mage_vl["state"] = get_mage_vl_service(server.config).status()
+            except Exception as exc:
+                logger.warning("Mage-VL status could not be read: %s", exc)
+                safe_mage_vl["state"] = {"state": "error", "error": str(exc)}
+
+            raw_model_routing = server.config.get("model_routing", {}) or {}
+            safe_model_routing = (
+                dict(raw_model_routing) if isinstance(raw_model_routing, dict) else {}
+            )
+            raw_classes = safe_model_routing.get("classes", {}) or {}
+            if isinstance(raw_classes, dict):
+                safe_model_routing["classes"] = mask_model_routing_classes(
+                    raw_classes,
+                    is_admin=is_admin,
+                )
 
             settings = {
                 "external_llm": {
@@ -299,26 +416,66 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                     )
                 },
                 "agent_team": {
-                    "delegation_enabled": agent_team_delegation_enabled(server.config),
-                    "confirm_prompt": agent_team_confirm_prompt(server.config),
-                    "notify": agent_team_notify(server.config),
-                    "redaction_terms": server.config.get(
-                        "agent_team.redaction_terms", []
+                    **normalize_agent_team_v3(
+                        server.config.get("agent_team", {}) or {},
+                        global_execution_profiles=server.config.get("execution_profiles"),
                     ),
-                    "strategy": server.config.get(
-                        "agent_team.strategy", "adaptive"
-                    ),
-                    "member_settings_initialized": server.config.get(
-                        "agent_team.member_settings_initialized", False
-                    ),
-                    "model_groups": server.config.get("agent_team.model_groups", {}),
-                    "members": {
-                        member_key: _member_payload(member_key)
-                        for member_key in sorted(AGENT_TEAM_MEMBER_KEYS)
+                    # Read-only presentation metadata is deliberately kept
+                    # outside the persisted canonical envelope.
+                    "main_effective_route": {
+                        "provider": str(server.config.get("llm_provider", "") or ""),
+                        "model": str(server.config.get("llm_model", "") or ""),
                     },
-                    "roster": agent_team_roster(server.config),
+                    "capability_catalog": AGENT_TEAM_CAPABILITY_CATALOG,
                 },
-                "model_routing": server.config.get("model_routing", {}),
+                "external_model_privacy": {
+                    "mode": server.config.get(
+                        "external_model_privacy.mode", "direct"
+                    ),
+                    "review_policy": server.config.get(
+                        "external_model_privacy.review_policy", "high_risk"
+                    ),
+                    "notify": bool(
+                        server.config.get("external_model_privacy.notify", True)
+                    ),
+                    "semantic_redaction_enabled": bool(
+                        server.config.get(
+                            "external_model_privacy.semantic_redaction_enabled", True
+                        )
+                    ),
+                    "local_provider": server.config.get(
+                        "external_model_privacy.local_provider",
+                        "openai_compatible_local",
+                    ),
+                    "local_model": server.config.get(
+                        "external_model_privacy.local_model", ""
+                    ),
+                    "redaction_terms": server.config.get(
+                        "external_model_privacy.redaction_terms", []
+                    ),
+                    "trusted_local_hosts": server.config.get(
+                        "external_model_privacy.trusted_local_hosts", []
+                    ),
+                    "raw_media_policy": server.config.get(
+                        "external_model_privacy.raw_media_policy", "block"
+                    ),
+                    "cache_enabled": bool(
+                        server.config.get("external_model_privacy.cache_enabled", True)
+                    ),
+                },
+                "chatgpt_web": {
+                    "profile_dir": server.config.get(
+                        "chatgpt_web.profile_dir", ""
+                    ),
+                    "response_timeout_seconds": server.config.get(
+                        "chatgpt_web.response_timeout_seconds", 900
+                    ),
+                    "max_rounds_per_turn": server.config.get(
+                        "chatgpt_web.max_rounds_per_turn", 20
+                    ),
+                },
+                "model_routing": safe_model_routing,
+                "mage_vl": safe_mage_vl,
                 "speech_recognition": server.config.get("speech_recognition", {}),
                 "knowledge": {
                     "enabled": server.config.get("search.knowledge_enabled", False)
@@ -331,6 +488,9 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                 },
                 "search": {
                     "provider": server.config.get("search.provider", "openai"),
+                    "openai_model": str(
+                        server.config.get("search.openai_model") or ""
+                    ).strip(),
                     "knowledge_enabled": server.config.get(
                         "search.knowledge_enabled", False
                     ),
@@ -346,12 +506,29 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                             "agents.project_management.enabled", True
                         )
                     },
-                    "mcp": {"enabled": server.config.get("mcp_enabled", True)},
+                    "mcp": {
+                        "enabled": (
+                            not Features.is_enterprise()
+                            and server.config.get("mcp_enabled", True)
+                        )
+                    },
                     "spotify": {
-                        "enabled": server.config.get("agents.spotify.enabled", True)
+                        "enabled": server.config.get(
+                            "integrations.spotify.enabled",
+                            server.config.get("spotify.enabled", False),
+                        )
                     },
                 },
-                "spotify": {"enabled": server.config.get("spotify.enabled", True)},
+                "integrations": {
+                    "spotify": {
+                        "enabled": server.config.get(
+                            "integrations.spotify.enabled", False
+                        )
+                    }
+                },
+                "spotify": {
+                    "enabled": server.config.get("integrations.spotify.enabled", False)
+                },
                 "tts": {
                     "yomi_linter": {
                         "enabled": server.config.get("tts.yomi_linter.enabled", False),
@@ -377,6 +554,376 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             logger.error(f"Failed to get settings: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
+    @app.get("/api/agent-team/config")
+    async def get_agent_team_config(
+        request: Request,
+        _: None = Depends(require_auth),
+    ):
+        """Return the canonical Agent Team schema-v3 envelope.
+
+        Teams own Subagent membership and Team-scoped Execution Profiles.
+        Subagents are role/capability definitions only.  Compatibility
+        roster/templates/model-groups and user-facing LLM Profiles are omitted.
+        """
+        section = normalize_agent_team_v3(
+            server.config.get("agent_team", {}) or {},
+            global_execution_profiles=server.config.get("execution_profiles"),
+        )
+        envelope = {
+            "schema_version": AGENT_TEAM_SCHEMA_VERSION,
+            "delegation_enabled": bool(section.get("delegation_enabled", False)),
+            "orchestration_mode": str(section.get("orchestration_mode") or "standard"),
+            "teams": {
+                str(team.get("team_id")): team
+                for team in agent_team_v3_teams(server.config)
+            },
+            "subagents": {
+                str(subagent.get("subagent_id")): {
+                    **subagent,
+                    "effective_route": resolve_agent_team_v3_route(
+                        server.config,
+                        str(subagent.get("subagent_id") or ""),
+                    ),
+                }
+                for subagent in agent_team_v3_subagents(server.config)
+            },
+            "main_effective_route": {
+                "provider": str(server.config.get("llm_provider", "") or ""),
+                "model": str(server.config.get("llm_model", "") or ""),
+            },
+            "capability_catalog": AGENT_TEAM_CAPABILITY_CATALOG,
+        }
+        return JSONResponse(
+            {
+                "success": True,
+                "schema_version": AGENT_TEAM_SCHEMA_VERSION,
+                "agent_team": envelope,
+                "harness": {
+                    "independent": True,
+                    "settings": public_agent_harness_settings(
+                        server.config.get("agent_harness", {}) or {}
+                    ),
+                },
+            }
+        )
+
+    @app.put("/api/agent-team/config")
+    async def update_agent_team_config(
+        request: Request,
+        _: None = Depends(require_auth),
+    ):
+        """Validate and atomically persist the canonical Agent Team v3 graph."""
+        if not await server._is_admin_user(request):
+            raise HTTPException(status_code=403, detail="Administrator privileges required")
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="JSON payload is required") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Agent Team config must be an object")
+        raw = payload.get("agent_team") if isinstance(payload.get("agent_team"), dict) else payload
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail="agent_team must be an object")
+
+        # Only canonical schema-v3 fields may be written.  GET-only metadata is
+        # accepted for a read/modify/write client but is discarded below.
+        writable_fields = {
+            "schema_version",
+            "delegation_enabled",
+            "orchestration_mode",
+            "teams",
+            "subagents",
+        }
+        readonly_fields = {
+            "main_effective_route",
+            "capability_catalog",
+            "provider_model",
+            "effective_route",
+            "llm_profiles",
+        }
+        unknown = set(raw) - writable_fields - readonly_fields
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported Agent Team field: {sorted(str(item) for item in unknown)[0]}",
+            )
+        try:
+            schema_version = int(raw.get("schema_version", AGENT_TEAM_SCHEMA_VERSION))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="schema_version must be 3") from exc
+        if schema_version != AGENT_TEAM_SCHEMA_VERSION:
+            raise HTTPException(status_code=400, detail="Only Agent Team schema_version 3 is supported")
+        if "delegation_enabled" in raw and not isinstance(raw.get("delegation_enabled"), bool):
+            raise HTTPException(status_code=400, detail="delegation_enabled must be boolean")
+        orchestration_mode = str(raw.get("orchestration_mode", "standard") or "standard").strip().lower()
+        if orchestration_mode not in {"standard", "director"}:
+            raise HTTPException(status_code=400, detail="Invalid orchestration_mode")
+
+        teams_raw = raw.get("teams")
+        subagents_raw = raw.get("subagents")
+        if not isinstance(teams_raw, dict) or not isinstance(subagents_raw, dict):
+            raise HTTPException(status_code=400, detail="teams and subagents must be objects")
+
+        id_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+        for collection_name, collection in (("team", teams_raw), ("subagent", subagents_raw)):
+            for key in collection:
+                clean = str(key).strip()
+                if not id_pattern.fullmatch(clean):
+                    raise HTTPException(status_code=400, detail=f"Invalid {collection_name} id: {key}")
+
+        allowed_team_fields = {
+            "team_id", "name", "description", "enabled", "sort_order", "activation",
+            "subagent_ids", "execution_profiles",
+        }
+        allowed_activation_fields = {"mode", "contexts"}
+        allowed_subagent_fields = {
+            "subagent_id", "name", "description", "instructions", "enabled",
+            "capability_ids", "scalable", "default_instances", "max_instances",
+            "max_workspace_access", "allow_cli_native_tools",
+        }
+        readonly_subagent_fields = {"team_ids", "effective_route", "llm_profile_id"}
+        allowed_execution_profile_fields = {
+            "profile_id", "name", "display_name", "enabled", "default_route", "overrides",
+        }
+        allowed_execution_route_fields = {
+            "inherit_model", "provider", "model", "effort_policy", "effort",
+        }
+        for key, team in teams_raw.items():
+            if not isinstance(team, dict):
+                raise HTTPException(status_code=400, detail=f"Invalid Team: {key}")
+            extra = set(team) - allowed_team_fields
+            if extra:
+                raise HTTPException(status_code=400, detail=f"Unsupported Team field for {key}: {sorted(str(item) for item in extra)[0]}")
+            if team.get("team_id") is not None and str(team.get("team_id")).strip() != str(key).strip():
+                raise HTTPException(status_code=400, detail=f"Team id mismatch: {key}")
+            if "enabled" in team and not isinstance(team.get("enabled"), bool):
+                raise HTTPException(status_code=400, detail=f"Team enabled must be boolean: {key}")
+            if "sort_order" in team and (isinstance(team.get("sort_order"), bool) or not isinstance(team.get("sort_order"), int)):
+                raise HTTPException(status_code=400, detail=f"Team sort_order must be integer: {key}")
+            activation = team.get("activation", {})
+            if not isinstance(activation, dict):
+                raise HTTPException(status_code=400, detail=f"Invalid activation for Team: {key}")
+            activation_extra = set(activation) - allowed_activation_fields
+            if activation_extra:
+                raise HTTPException(status_code=400, detail=f"Unsupported activation field for {key}: {sorted(str(item) for item in activation_extra)[0]}")
+            mode = str(activation.get("mode") or "always").strip().lower()
+            if mode not in {"always", "contextual", "manual"}:
+                raise HTTPException(status_code=400, detail=f"Invalid activation mode for {key}")
+            contexts = activation.get("contexts", [])
+            if not isinstance(contexts, list) or any(not isinstance(item, str) for item in contexts):
+                raise HTTPException(status_code=400, detail=f"activation.contexts must be string[]: {key}")
+            normalized_contexts = {str(item).strip().lower() for item in contexts if str(item).strip()}
+            unknown_contexts = normalized_contexts - set(AGENT_TEAM_CONTEXT_TAGS)
+            if unknown_contexts:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown activation context for {key}: {sorted(unknown_contexts)[0]}",
+                )
+            if mode == "contextual" and not normalized_contexts:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Contextual Team requires at least one activation context: {key}",
+                )
+            refs = team.get("subagent_ids", [])
+            if not isinstance(refs, list) or any(not isinstance(item, str) for item in refs):
+                raise HTTPException(status_code=400, detail=f"subagent_ids must be string[]: {key}")
+            invalid_refs = [
+                str(item).strip()
+                for item in refs
+                if not id_pattern.fullmatch(str(item).strip())
+            ]
+            if invalid_refs:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid Subagent reference in {key}: {invalid_refs[0]}",
+                )
+            execution_profiles = team.get("execution_profiles")
+            if execution_profiles is None:
+                continue
+            if not isinstance(execution_profiles, dict):
+                raise HTTPException(status_code=400, detail=f"execution_profiles must be an object: {key}")
+            for profile_key, profile in execution_profiles.items():
+                if not id_pattern.fullmatch(str(profile_key).strip()):
+                    raise HTTPException(status_code=400, detail=f"Invalid execution profile id: {profile_key}")
+                if not isinstance(profile, dict):
+                    raise HTTPException(status_code=400, detail=f"Invalid Execution Profile: {profile_key}")
+                extra_ep = set(profile) - allowed_execution_profile_fields
+                if extra_ep:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unsupported Execution Profile field for {profile_key}: {sorted(str(item) for item in extra_ep)[0]}",
+                    )
+                if profile.get("profile_id") is not None and str(profile.get("profile_id")).strip() != str(profile_key).strip():
+                    raise HTTPException(status_code=400, detail=f"Execution Profile id mismatch: {profile_key}")
+                if "enabled" in profile and not isinstance(profile.get("enabled"), bool):
+                    raise HTTPException(status_code=400, detail=f"Execution Profile enabled must be boolean: {profile_key}")
+                default_route = profile.get("default_route")
+                if default_route not in (None, "") and not isinstance(default_route, dict):
+                    raise HTTPException(status_code=400, detail=f"default_route must be an object: {profile_key}")
+                if isinstance(default_route, dict):
+                    extra_route = set(default_route) - allowed_execution_route_fields
+                    if extra_route:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Unsupported ExecutionRoute field for {profile_key}: {sorted(str(item) for item in extra_route)[0]}",
+                        )
+                overrides = profile.get("overrides")
+                if overrides is None:
+                    continue
+                if not isinstance(overrides, dict):
+                    raise HTTPException(status_code=400, detail=f"overrides must be an object: {profile_key}")
+                for override_key, override in overrides.items():
+                    if not id_pattern.fullmatch(str(override_key).strip()):
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Invalid Execution Profile override key in {profile_key}: {override_key}",
+                        )
+                    if not isinstance(override, dict):
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"overrides[{override_key}] must be an object: {profile_key}",
+                        )
+                    extra_override = set(override) - allowed_execution_route_fields
+                    if extra_override:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Unsupported ExecutionRoute field for {profile_key}.overrides[{override_key}]: {sorted(str(item) for item in extra_override)[0]}",
+                        )
+
+        for key, subagent in subagents_raw.items():
+            if not isinstance(subagent, dict):
+                raise HTTPException(status_code=400, detail=f"Invalid Subagent: {key}")
+            extra = set(subagent) - allowed_subagent_fields - readonly_subagent_fields
+            if extra:
+                raise HTTPException(status_code=400, detail=f"Unsupported Subagent field for {key}: {sorted(str(item) for item in extra)[0]}")
+            if subagent.get("subagent_id") is not None and str(subagent.get("subagent_id")).strip() != str(key).strip():
+                raise HTTPException(status_code=400, detail=f"Subagent id mismatch: {key}")
+            if "enabled" in subagent and not isinstance(subagent.get("enabled"), bool):
+                raise HTTPException(status_code=400, detail=f"Subagent enabled must be boolean: {key}")
+            if "scalable" in subagent and not isinstance(subagent.get("scalable"), bool):
+                raise HTTPException(status_code=400, detail=f"Subagent scalable must be boolean: {key}")
+            if "allow_cli_native_tools" in subagent and not isinstance(subagent.get("allow_cli_native_tools"), bool):
+                raise HTTPException(status_code=400, detail=f"allow_cli_native_tools must be boolean: {key}")
+            for field_name in ("default_instances", "max_instances"):
+                if field_name in subagent and (isinstance(subagent.get(field_name), bool) or not isinstance(subagent.get(field_name), int)):
+                    raise HTTPException(status_code=400, detail=f"{field_name} must be integer: {key}")
+            default_instances = subagent.get("default_instances", 1)
+            max_instances = subagent.get("max_instances", 1)
+            if default_instances < 0 or max_instances < 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Subagent instance limits must be non-negative/default and positive/max: {key}",
+                )
+            if default_instances > max_instances:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"default_instances must be <= max_instances: {key}",
+                )
+            access = str(subagent.get("max_workspace_access") or "none").strip().lower()
+            if access not in {"none", "read", "write"}:
+                raise HTTPException(status_code=400, detail=f"Invalid max_workspace_access for {key}")
+            capabilities = subagent.get("capability_ids", [])
+            if not isinstance(capabilities, list) or any(not isinstance(item, str) for item in capabilities):
+                raise HTTPException(status_code=400, detail=f"capability_ids must be string[]: {key}")
+            if any(not str(item).strip() for item in capabilities):
+                raise HTTPException(status_code=400, detail=f"capability_ids cannot contain empty values: {key}")
+            unknown_capabilities = {item.strip() for item in capabilities if item.strip() not in AGENT_TEAM_CAPABILITY_CATALOG}
+            if unknown_capabilities:
+                raise HTTPException(status_code=400, detail=f"Unknown capability for {key}: {', '.join(sorted(unknown_capabilities))}")
+
+        # Cross-reference validation intentionally happens before normalization:
+        # deleting a Subagent requires removing its Team references in this
+        # same atomic update, while deleting a Team never deletes Subagents.
+        subagent_ids = {str(key).strip() for key in subagents_raw}
+        for team_id, team in teams_raw.items():
+            unknown_refs = {str(item).strip() for item in team.get("subagent_ids", []) if str(item).strip() not in subagent_ids}
+            if unknown_refs:
+                raise HTTPException(status_code=400, detail=f"Unknown Subagent reference in {team_id}: {sorted(unknown_refs)[0]}")
+            team_member_ids = {
+                str(item).strip()
+                for item in team.get("subagent_ids", [])
+                if str(item).strip()
+            }
+            execution_profiles = team.get("execution_profiles")
+            if not isinstance(execution_profiles, dict):
+                continue
+            for profile_key, profile in execution_profiles.items():
+                if not isinstance(profile, dict):
+                    continue
+                errors = validate_team_execution_profile(
+                    server.config,
+                    {
+                        **profile,
+                        "profile_id": str(profile.get("profile_id") or profile_key).strip(),
+                    },
+                    source_profile_id=str(profile_key),
+                    known_subagent_ids=team_member_ids,
+                )
+                if errors:
+                    raise HTTPException(status_code=400, detail=errors[0])
+                default_route = profile.get("default_route")
+                if isinstance(default_route, dict):
+                    provider = str(default_route.get("provider") or "").strip().lower()
+                    if provider and provider not in (MODEL_ROUTING_PROVIDERS | {"routing-profile"}):
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Unsupported provider for Execution Profile {profile_key}",
+                        )
+                    if Features.is_enterprise() and provider == "sglang" and str(default_route.get("model") or "").strip():
+                        try:
+                            enforce_enterprise_sglang_model(
+                                server.config,
+                                provider,
+                                str(default_route.get("model") or "").strip(),
+                            )
+                        except (RuntimeError, ValueError) as exc:
+                            raise HTTPException(status_code=400, detail=f"Execution Profile {profile_key}: {exc}") from exc
+                overrides = profile.get("overrides") if isinstance(profile.get("overrides"), dict) else {}
+                for override_key, override in overrides.items():
+                    if str(override_key).strip() not in team_member_ids:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Unknown Subagent override in {team_id}/{profile_key}: {override_key}",
+                        )
+                    if not isinstance(override, dict):
+                        continue
+                    route_errors = validate_execution_route(
+                        server.config,
+                        override,
+                        label=f"{team_id}.execution_profiles[{profile_key}].overrides[{override_key}]",
+                    )
+                    if route_errors:
+                        raise HTTPException(status_code=400, detail=route_errors[0])
+                    provider = str(override.get("provider") or "").strip().lower()
+                    if provider and provider not in (MODEL_ROUTING_PROVIDERS | {"routing-profile"}):
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Unsupported provider for {team_id}/{profile_key}/{override_key}",
+                        )
+
+        candidate = normalize_agent_team_v3(
+            {
+                "schema_version": AGENT_TEAM_SCHEMA_VERSION,
+                "delegation_enabled": bool(raw.get("delegation_enabled", False)),
+                "orchestration_mode": orchestration_mode,
+                "teams": teams_raw,
+                "subagents": subagents_raw,
+            },
+            global_execution_profiles=server.config.get("execution_profiles"),
+        )
+        if hasattr(server.config, "save_to_file"):
+            if not server.config.save_to_file("agent_team", candidate):
+                raise HTTPException(status_code=500, detail="Failed to persist Agent Team config")
+        else:
+            server.config.set("agent_team", candidate)
+        return JSONResponse(
+            {
+                "success": True,
+                "schema_version": AGENT_TEAM_SCHEMA_VERSION,
+                "agent_team": candidate,
+            }
+        )
+
     @app.patch("/api/settings")
     async def update_setting(
         payload: SettingsPayload,
@@ -388,7 +935,14 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         value = payload.value
         persist = payload.persist
 
-        if key.startswith("tts.yomi_linter.") and not await server._is_admin_user(request):
+        if getattr(server, "auth_enabled", True) and not await server._is_admin_user(
+            request
+        ):
+            raise HTTPException(
+                status_code=403, detail="Administrator privileges required"
+            )
+
+        if is_admin_only_setting_key(key) and not await server._is_admin_user(request):
             raise HTTPException(
                 status_code=403, detail="Administrator privileges required"
             )
@@ -418,13 +972,30 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                         f"Value must be one of: {setting_schema['values']}"
                     )
             elif setting_schema["type"] == "str":
+                if key == "search.openai_model" and (
+                    not isinstance(value, str) or not value.strip()
+                ):
+                    raise ValueError("OpenAI検索モデルを指定してください")
                 value = str(value).strip()
+                if key == "chatgpt_web.profile_dir" and not value:
+                    raise ValueError("ChatGPT会話プロファイルの保存先を指定してください")
             elif setting_schema["type"] == "int":
-                value = int(value)
+                if isinstance(value, bool):
+                    raise ValueError(f"Setting '{key}' must be an integer")
+                if isinstance(value, float) and not value.is_integer():
+                    raise ValueError(f"Setting '{key}' must be an integer")
+                try:
+                    value = int(value)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(f"Setting '{key}' must be an integer") from exc
                 if "min" in setting_schema and value < setting_schema["min"]:
-                    raise ValueError(f"Value must be >= {setting_schema['min']}")
+                    raise ValueError(
+                        f"Setting '{key}' must be >= {setting_schema['min']}"
+                    )
                 if "max" in setting_schema and value > setting_schema["max"]:
-                    raise ValueError(f"Value must be <= {setting_schema['max']}")
+                    raise ValueError(
+                        f"Setting '{key}' must be <= {setting_schema['max']}"
+                    )
             elif setting_schema["type"] == "str_list":
                 if isinstance(value, str):
                     value = [
@@ -443,122 +1014,90 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             elif setting_schema["type"] == "object":
                 if not isinstance(value, dict):
                     raise ValueError("Value must be an object")
-                if key == "agent_team.model_groups":
-                    missing_builtin = set(BUILTIN_AGENT_TEAM_MODEL_GROUPS) - set(value)
-                    if missing_builtin:
-                        raise ValueError(
-                            f"Built-in model groups cannot be deleted: {sorted(missing_builtin)}"
-                        )
-                    for group_id, group in value.items():
-                        clean_group_id = str(group_id).strip()
-                        if not clean_group_id or not isinstance(group, dict):
-                            raise ValueError("Each model group must be an object with a non-empty id")
-                        if not re.fullmatch(r"[A-Za-z0-9_-]+", clean_group_id):
-                            raise ValueError(f"Invalid model group id: {clean_group_id}")
-                        if (
-                            clean_group_id in RESERVED_AGENT_TEAM_MODEL_GROUP_IDS
-                            and clean_group_id not in BUILTIN_AGENT_TEAM_MODEL_GROUPS
-                        ):
-                            raise ValueError(f"Reserved model group id: {clean_group_id}")
-                        builtin = BUILTIN_AGENT_TEAM_MODEL_GROUPS.get(clean_group_id)
-                        if builtin and str(group.get("name") or "") != builtin["name"]:
-                            raise ValueError(
-                                f"Built-in model group name cannot be changed: {clean_group_id}"
-                            )
-                        provider = str(group.get("provider") or "")
-                        if provider and provider not in AGENT_TEAM_PROVIDERS:
-                            raise ValueError(f"Invalid Agent Team provider: {provider}")
-                        model = str(group.get("model") or "").strip()
-                        if provider and not model:
-                            raise ValueError(
-                                f"Model group {clean_group_id} must select a model for its provider"
-                            )
-                        effort_policy = str(group.get("effort_policy") or "same")
-                        if effort_policy not in {"same", "lower", "explicit", "default"}:
-                            raise ValueError("Invalid effort policy")
-                        if effort_policy == "explicit":
-                            from ...services.llm_model_catalog import (
-                                reasoning_effort_options_for_model,
-                            )
-
-                            effective_provider = provider or str(
-                                server.config.get("llm_provider", "") or ""
-                            )
-                            effective_model = model or str(
-                                server.config.get("llm_model", "") or ""
-                            )
-                            options = reasoning_effort_options_for_model(
-                                effective_provider,
-                                effective_model,
-                            )
-                            effort = str(group.get("effort") or "").strip()
-                            if not options:
-                                raise ValueError(
-                                    f"Model group {clean_group_id} uses a model without effort support"
-                                )
-                            if effort not in options:
-                                raise ValueError(
-                                    f"Invalid effort for model group {clean_group_id}: {effort or '(not selected)'}"
-                                )
-                elif key == "agent_team.members":
-                    unknown = set(value) - AGENT_TEAM_MEMBER_KEYS
-                    if unknown:
-                        raise ValueError(f"Unknown Agent Team members: {sorted(unknown)}")
-                    for member_key, member in value.items():
-                        if not isinstance(member, dict) or not isinstance(member.get("enabled"), bool):
-                            raise ValueError(f"Invalid Agent Team member: {member_key}")
-                        group_id = str(member.get("group_id") or "").strip()
-                        if group_id == "auto" and member_key not in SCALABLE_MEMBER_KEYS:
-                            raise ValueError(
-                                f"Automatic model grouping is not supported for {member_key}"
-                            )
-                        model_groups = server.config.get("agent_team.model_groups", {}) or {}
-                        if group_id and group_id != "auto" and group_id not in model_groups:
-                            raise ValueError(
-                                f"Unknown model group for {member_key}: {group_id}"
-                            )
-                        override = member.get("override") or {}
-                        if not isinstance(override, dict):
-                            raise ValueError(f"Invalid member override: {member_key}")
-                        provider = str(override.get("provider") or "")
-                        allowed = AGENT_HARNESS_PROVIDERS if member_key == "agent_harness" else AGENT_TEAM_PROVIDERS
-                        if provider and provider not in allowed:
-                            raise ValueError(f"Invalid provider for {member_key}: {provider}")
-                        if str(override.get("effort_policy") or "same") not in {"same", "lower", "explicit", "default"}:
-                            raise ValueError(f"Invalid effort policy for {member_key}")
+            if key == "agent_team.orchestration_mode" and value == "director":
+                if (
+                    str(server.config.get("llm_provider", "") or "")
+                    == "routing-profile"
+                    and str(server.config.get("llm_model", "") or "")
+                    == "free-team"
+                ):
+                    raise ValueError(
+                        "Directorモードは無料Teamルーティングプロファイルでは利用できません"
+                    )
+                profile_dir = str(
+                    server.config.get("chatgpt_web.profile_dir", "") or ""
+                ).strip()
+                timeout = int(
+                    server.config.get(
+                        "chatgpt_web.response_timeout_seconds", 900
+                    )
+                    or 0
+                )
+                max_rounds = int(
+                    server.config.get("chatgpt_web.max_rounds_per_turn", 20)
+                    or 0
+                )
+                if not profile_dir or timeout < 1 or max_rounds < 1:
+                    raise ValueError(
+                        "Directorモードを有効にする前にChatGPT接続設定を完成させてください"
+                    )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+        # Enterprise SGLang is a paired Compose service, not a user-selectable
+        # arbitrary OpenAI-compatible endpoint.  Reject route values at the
+        # settings boundary as well as in the client factory, so clip ingest
+        # and Agent Team cannot persist a model that the server does not serve.
+        if Features.is_enterprise():
+            route_prefix = None
+            route_field = None
+            parts = key.split(".")
+            if (
+                len(parts) == 4
+                and parts[:2] == ["model_routing", "classes"]
+                and parts[-1] in {"provider", "model"}
+            ):
+                route_prefix = ".".join(parts[:3])
+                route_field = parts[-1]
+            elif (
+                len(parts) == 4
+                and parts[:2] == ["model_routing", "overrides"]
+                and parts[-1] in {"provider", "model"}
+            ):
+                route_prefix = ".".join(parts[:3])
+                route_field = parts[-1]
+            if route_prefix and route_field:
+                provider = (
+                    str(value or "").strip()
+                    if route_field == "provider"
+                    else str(server.config.get(f"{route_prefix}.provider", "") or "").strip()
+                )
+                model = (
+                    str(value or "").strip()
+                    if route_field == "model"
+                    else str(server.config.get(f"{route_prefix}.model", "") or "").strip()
+                )
+                if provider.lower() == "sglang" and model:
+                    try:
+                        enforce_enterprise_sglang_model(
+                            server.config, provider, model
+                        )
+                    except (RuntimeError, ValueError) as exc:
+                        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        if Features.is_enterprise() and (
+            key in {
+                "mcp_enabled",
+            }
+            or key.startswith("model_routing.media.")
+        ) and value is not False:
+            raise HTTPException(
+                status_code=403,
+                detail="This setting is disabled in the Enterprise profile",
+            )
+
         # Apply the setting
         try:
-            if key == "agent_team.delegation_enabled" and value and not server.config.get(
-                "agent_team.member_settings_initialized", False
-            ):
-                initial_members = {
-                    member_key: {
-                        "enabled": member_key != "advanced_reasoning",
-                        "group_id": MODEL_ROUTE_CLASS_BY_ROUTE.get(member_key, ""),
-                        "override": {},
-                    }
-                    for member_key in sorted(AGENT_TEAM_MEMBER_KEYS)
-                }
-                # Harness cannot safely inherit an arbitrary main provider.
-                harness_provider = str(server.config.get("agent_team.members.agent_harness.override.provider", "") or "")
-                if harness_provider not in AGENT_HARNESS_PROVIDERS:
-                    harness_provider = "claude-cli" if server.config.get("agent_harness.codex.runner", "") == "claude_code" else "codex-cli"
-                harness_model_key = "agent_harness.claude.model" if harness_provider == "claude-cli" else "agent_harness.codex.model"
-                initial_members["agent_harness"]["override"].update({
-                    "provider": harness_provider,
-                    "model": str(server.config.get(harness_model_key, "") or ("sonnet" if harness_provider == "claude-cli" else "gpt-5-codex")),
-                    "runner": "claude_code" if harness_provider == "claude-cli" else "codex_exec",
-                })
-                setter = server.config.save_to_file if persist else server.config.set
-                setter("agent_team.members", initial_members)
-                setter("agent_team.member_settings_initialized", True)
-            if key == "agent_team.members":
-                (server.config.save_to_file if persist else server.config.set)(
-                    "agent_team.member_settings_initialized", True
-                )
             if persist:
                 # Save to both memory and DB
                 success = server.config.save_to_file(key, value)
@@ -571,13 +1110,27 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                 # Only update in memory
                 server.config.set(key, value)
 
-            logger.info(f"Setting updated: {key} = {value} (persist={persist})")
-            return JSONResponse(
-                {"success": True, "key": key, "value": value, "persisted": persist}
+            logger.info(
+                "Setting updated: %s = %s (persist=%s)",
+                key,
+                format_setting_log_value(key, value),
+                persist,
             )
-        except Exception as e:
-            logger.error(f"Failed to update setting: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+            return JSONResponse(
+                public_setting_patch_payload(key, value, persisted=persist)
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Failed to update setting: key=%s exception_type=%s",
+                key,
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to update setting",
+            ) from None
 
     @app.post("/api/character/{character_name}")
     async def switch_character(
@@ -587,50 +1140,75 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
     ):
         """Switch to a different character"""
         try:
-            # Get character switch manager
-            character_manager = CharacterSwitchManager()
-
-            # Try to get character config to validate it exists
+            # Validate character exists before mutating user/session state.
             char_config = server.config.get_character_config(character_name)
             db_character = char_config.get("_db_character", {})
             canonical_character_name = (
                 str(db_character.get("slug") or character_name).strip()
             )
 
-            # Switch character
-            success = character_manager.switch_character(
-                character_name,
-                canonical_character_name,
-            )
+            auth_enabled = bool(getattr(server, "auth_enabled", True))
+            is_admin = await server._is_admin_user(request)
+            user_info = await server._get_user_info_from_request(request)
+            user_id = str(
+                (user_info or {}).get("id")
+                or ("default_user" if not auth_enabled else "")
+            ).strip()
+
+            if auth_enabled is False or is_admin:
+                character_manager = CharacterSwitchManager()
+                success = character_manager.switch_character(
+                    character_name,
+                    canonical_character_name,
+                )
+                if not success:
+                    raise HTTPException(
+                        status_code=500, detail="Failed to switch character"
+                    )
+            else:
+                success = True
 
             if success:
-                if hasattr(server.config, "save_to_file"):
-                    if not server.config.save_to_file(
-                        "default_character", character_name
-                    ):
-                        raise RuntimeError("Failed to persist default_character")
-                else:
-                    server.config.set("default_character", character_name)
+                if auth_enabled is False or is_admin:
+                    if hasattr(server.config, "save_to_file"):
+                        if not server.config.save_to_file(
+                            "default_character", character_name
+                        ):
+                            raise RuntimeError("Failed to persist default_character")
+                    else:
+                        server.config.set("default_character", character_name)
 
-                # Update server's character name
-                server.character_name = character_name
+                    # Update server's character name
+                    server.character_name = character_name
+
+                if user_id:
+                    try:
+                        await update_user_preferred_character(
+                            user_id,
+                            canonical_character_name,
+                        )
+                    except Exception as exc:
+                        if auth_enabled and not is_admin:
+                            raise HTTPException(
+                                status_code=503,
+                                detail="Failed to persist preferred character",
+                            ) from exc
+                        logger.warning(
+                            "Failed to persist preferred_character for user %s: %s",
+                            user_id,
+                            exc,
+                        )
 
                 # The selected header character also becomes the character for
                 # the currently active normal chat session. Scenario/group
-                # sessions remain isolated from the global character switch.
+                # writing/group sessions remain isolated from the global character switch.
                 session_synchronized = False
                 session_sync_required = False
                 try:
-                    user_info = await server._get_user_info_from_request(request)
-                    auth_enabled = bool(getattr(server, "auth_enabled", True))
                     if user_info is None and auth_enabled:
                         raise PermissionError(
                             "認証済みユーザーを解決できないため、セッションを同期できません"
                         )
-                    user_id = str(
-                        (user_info or {}).get("id")
-                        or ("default_user" if not auth_enabled else "")
-                    ).strip()
                     if not user_id:
                         raise PermissionError("セッション同期対象のユーザーがありません")
 
@@ -647,13 +1225,7 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                         session_title = str(getattr(session, "title", "") or "")
                         return bool(
                             getattr(session, "is_group_chat", False)
-                            or session_character.startswith(
-                                (
-                                    "scenario_roleplay:",
-                                    "scenario_",
-                                    "trpg_room_",
-                                )
-                            )
+                            or session_character.startswith(("story_", "trpg_"))
                             or session_title.startswith(
                                 ("[シナリオ]", "[執筆]", "[TRPG]")
                             )
@@ -728,10 +1300,28 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
 
         except HTTPException:
             raise
-        except FileNotFoundError:
-            raise HTTPException(
-                status_code=404, detail=f"Character not found: {character_name}"
+        except CharacterNotFoundError as exc:
+            raise _character_lookup_http_exception(
+                exc,
+                request=request,
+                not_found_status=404,
+            ) from None
+        except CharacterLookupError as exc:
+            logger.error(
+                "Character lookup failed during switch: category=%s trace_id=%s request_id=%s",
+                exc.category,
+                exc.trace_id,
+                exc.request_id or _request_correlation_ids(request)[0] or "-",
             )
-        except Exception as e:
-            logger.error(f"Failed to switch character: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise _character_lookup_http_exception(exc, request=request) from None
+        except Exception as exc:
+            # Keep unrelated switch failures generic; in particular, do not
+            # echo a raw SQLAlchemy/DBAPI message that may contain a DSN.
+            logger.error(
+                "Failed to switch character: exception_type=%s",
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to switch character",
+            ) from None

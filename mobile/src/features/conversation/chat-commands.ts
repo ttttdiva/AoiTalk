@@ -1,7 +1,6 @@
 export type ChatCommandCapability =
   | "web_search"
   | "image_generation"
-  | "docs_ingest"
   | "work_intake"
   | "project_db_update"
   | "project_progress_review"
@@ -23,7 +22,6 @@ export type SkillSlashCommand = {
 
 export const MOBILE_CHAT_COMMANDS: MobileChatCommand[] = [
   { command: "/inbox", label: "Work Inbox", description: "メールやテキストを整理し、メールは保存して必要なものだけタスク化する", capability: "work_intake" },
-  { command: "/clip", label: "Docs取り込み", description: "貼り付けた情報を既存Docsへ整理して統合する", capability: "docs_ingest" },
   { command: "/search", label: "Web検索", description: "次の送信でWeb検索を必ず使う", capability: "web_search" },
   { command: "/image", label: "画像生成", description: "次の送信を画像生成として扱う", capability: "image_generation" },
   { command: "/db", label: "Project Docs", description: "案件情報Docsの更新を扱う", capability: "project_db_update" },
@@ -81,9 +79,6 @@ export function resolveMobileCommandSubmission(
 
   if (inline && activeCommand && inline.capability !== activeCommand.capability) {
     return { content, capabilities, error: "複数の組み込みコマンドを同時には実行できません" };
-  }
-  if (selected?.capability === "docs_ingest" && !content) {
-    return { content, capabilities, error: "取り込む情報を入力してください" };
   }
   if (selected?.capability === "work_intake" && !content) {
     return { content, capabilities, error: "処理するテキストを入力してください" };

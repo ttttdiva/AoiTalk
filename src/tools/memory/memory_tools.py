@@ -1,10 +1,9 @@
-"""Memory search tools for function calling."""
+"""Memory search helpers for the past-chat search tool."""
 
 import re
 from contextvars import ContextVar
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..core import tool
 from src.memory.config import MemoryConfig
 from src.memory.manager import ConversationMemoryManager
 from src.services.context_memory_service import _keywords
@@ -38,6 +37,15 @@ def get_memory_manager() -> ConversationMemoryManager:
 
 
 def _resolve_current_user_id(explicit_user_id: Optional[str]) -> Tuple[str, str]:
+    try:
+        from src.services.turn_context import get_turn_context
+
+        user_id = get_turn_context().user_id
+        if user_id:
+            return str(user_id), "turn_context"
+    except Exception:
+        pass
+
     try:
         from src.tools.os_operations.tools import get_current_user_context
 
@@ -141,33 +149,54 @@ async def _search_dreaming_memories(
     max_results: int,
 ) -> List[Dict[str, Any]]:
     from src.services import dreaming_memory_service
+    from src.services.scoped_memory_service import ScopedMemoryService
+    from src.services.turn_context import get_turn_context, is_project_context_enabled
 
-    terms = _query_terms(query)
-    memories = await dreaming_memory_service.list_memories(user_id)
-    scored: List[Tuple[float, Dict[str, Any]]] = []
-    for memory in memories:
-        memory_user_id = memory.get("user_id")
-        if memory_user_id is not None and str(memory_user_id) != str(user_id):
-            continue
-        score = _score_dreaming_memory(memory, terms)
-        if score <= 0:
-            continue
-        scored.append((score, memory))
-
-    scored.sort(
-        key=lambda item: (
-            item[0],
-            1 if item[1].get("is_pinned") else 0,
-            int(item[1].get("importance") or 0),
-            str(item[1].get("updated_at") or item[1].get("created_at") or ""),
-        ),
-        reverse=True,
+    context = get_turn_context()
+    scoped_project_id = (
+        context.project_id if is_project_context_enabled(context) else None
     )
+    memories: list[dict[str, Any]] = []
+    try:
+        compatibility_rows = await dreaming_memory_service.list_memories(user_id)
+    except Exception:
+        compatibility_rows = []
+    memories.extend(compatibility_rows)
+    if scoped_project_id or context.session_id or not compatibility_rows:
+        try:
+            scoped_rows = await ScopedMemoryService().search(
+                actor_id=str(user_id),
+                query=query,
+                project_id=scoped_project_id,
+                session_id=context.session_id,
+                limit=max_results,
+            )
+        except Exception:
+            scoped_rows = []
+        known_ids = {str(item.get("id")) for item in memories}
+        memories.extend(
+            item for item in scoped_rows if str(item.get("id")) not in known_ids
+        )
+    terms = _query_terms(query)
 
     results: List[Dict[str, Any]] = []
-    for score, memory in scored[:max_results]:
-        results.append(
-            {
+    for memory in memories:
+        memory_user_id = memory.get("user_id")
+        if (
+            memory.get("scope_type") in (None, "global", "user")
+            and memory_user_id is not None
+            and str(memory_user_id) != str(user_id)
+        ):
+            continue
+        if memory.get("retrieval_score") is not None:
+            score = float(memory["retrieval_score"])
+        else:
+            # Durable facts get a modest trust prior, while still competing in
+            # the same numeric score space as conversation fragments.
+            score = min(1.0, _score_dreaming_memory(memory, terms) + 0.2)
+        if score <= 0:
+            continue
+        result = {
                 "type": "dreaming_memory",
                 "id": memory.get("id"),
                 "title": memory.get("title"),
@@ -177,7 +206,11 @@ async def _search_dreaming_memories(
                 "timestamp": memory.get("updated_at") or memory.get("created_at"),
                 "source_type": memory.get("source_type"),
             }
-        )
+        if memory.get("scope_type") is not None:
+            result["scope"] = memory.get("scope_type")
+        if memory.get("selection_reason") is not None:
+            result["selection_reason"] = memory.get("selection_reason")
+        results.append(result)
     return results
 
 
@@ -189,6 +222,11 @@ def _format_conversation_result(result: Dict[str, Any]) -> Dict[str, Any]:
         "timestamp": result.get("timestamp"),
     }
 
+    # session_id を落とすと read_chat_session でその会話を開けなくなる。
+    session_id = result.get("session_id")
+    if session_id:
+        formatted_result["session_id"] = str(session_id)
+
     if result["type"] == "archived_summary":
         formatted_result["message_count"] = result.get("message_count", 0)
     elif result["type"] == "active_message":
@@ -197,20 +235,19 @@ def _format_conversation_result(result: Dict[str, Any]) -> Dict[str, Any]:
     return formatted_result
 
 
-@tool
-async def search_memory(
+async def semantic_memory_search(
     query: str,
     time_range: str = "all",
     max_results: int = 10,
     user_id: Optional[str] = None,
     character_name: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """過去会話メモリを検索する読み取り専用ツール。
+    """過去会話メモリを意味検索する読み取り専用の実装。
 
-    現在の会話コンテキストに無い情報（ユーザーの好み・名前・過去の決定・
-    以前の作業内容や約束など）が必要になったら、自分の判断でいつでも呼んでよい。
-    毎ターン自動で添えられる過去会話の抜粋で不足する場合の深掘りにも使う。
-    キーワードが明示されていなくても、必要と判断すれば呼び出してよい。
+    `search_past_chats(mode="semantic")` の実体。dreaming memory と
+    conversation memory を横断して関連する断片を返す。各ヒットには元の
+    会話の `session_id` が付くので、断片で足りない場合は `read_chat_session`
+    に渡して会話本文を開ける。
 
     Args:
         query: 検索クエリ（探したい話題・人物・決定事項などを簡潔に）。
@@ -253,6 +290,8 @@ async def search_memory(
                 ).strip()
             except Exception:
                 pass
+        # Keep the public source label stable while the implementation behind
+        # it is the Scoped Memory adapter.
         searched_sources = ["dreaming_memory", "conversation_memory"]
         source_errors: Dict[str, str] = {}
 
@@ -267,12 +306,24 @@ async def search_memory(
             dreaming_results = []
 
         try:
-            raw_conversation_results = await memory_manager.search_memory(
+            from src.services.turn_context import (
+                get_turn_context,
+                is_project_context_enabled,
+            )
+
+            context = get_turn_context()
+            current_project_id = (
+                context.project_id
+                if is_project_context_enabled(context)
+                else None
+            )
+            raw_conversation_results = await memory_manager.search_conversation_memory(
                 user_id=resolved_user_id,
                 character_name=resolved_character_name,
                 query=query,
                 time_range=time_range,
                 max_results=max_results,
+                project_id=current_project_id,
             )
             formatted_conversation_results = [
                 _format_conversation_result(result)
@@ -281,10 +332,14 @@ async def search_memory(
         except Exception as e:
             source_errors["conversation_memory"] = str(e)
             formatted_conversation_results = []
-        combined_results = [
-            *dreaming_results,
-            *formatted_conversation_results,
-        ][:max_results]
+        combined_results = sorted(
+            [*dreaming_results, *formatted_conversation_results],
+            key=lambda item: (
+                float(item.get("relevance_score") or 0.0),
+                str(item.get("timestamp") or ""),
+            ),
+            reverse=True,
+        )[:max_results]
         result_count_by_source = {
             "dreaming_memory": sum(
                 1
@@ -337,4 +392,4 @@ async def search_memory(
         }
 
 
-# ToolDefinition created by @tool decorator
+

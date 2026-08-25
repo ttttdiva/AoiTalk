@@ -1,11 +1,11 @@
 "use client";
 
+import { AppSelect } from "@/components/ui/app-select";
+
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { observeElementRect as observeVirtualElementRect, useVirtualizer } from "@tanstack/react-virtual";
 import {
   CalendarDays,
-  ChevronDown,
-  ChevronRight,
   Columns2,
   KanbanSquare,
   ListFilter,
@@ -34,11 +34,11 @@ import {
   SEARCH_FIELD_FILTER_OPS,
   SEARCH_SORT_OPTIONS,
   mergeById,
+  normalizeSearchQuery,
   nodeText,
   renderNodeTitleTemplate,
   searchFieldFilter,
   searchGroupBy,
-  searchProjectScope,
   searchSort,
   searchTagIds,
   searchTextFilter,
@@ -46,7 +46,6 @@ import {
   tagSetByNodeId,
   withSearchFieldFilter,
   withSearchGroupBy,
-  withSearchProjectScope,
   withSearchTextFilter,
   type DocsApiFetch,
   type DocsQueryResponse,
@@ -115,6 +114,7 @@ export function SearchNodeResults({
   fieldsByTag,
   allSupertagFields,
   context = "zoom",
+  documentExpanded = false,
   onSetView,
   onSetSort,
   onSetQuery,
@@ -134,6 +134,7 @@ export function SearchNodeResults({
   fieldsByTag: Map<string, DocsField[]>;
   allSupertagFields: DocsState["supertag_fields"];
   context?: "document" | "zoom";
+  documentExpanded?: boolean;
   onSetView: (view: SearchView) => void;
   onSetSort?: (sort: SearchSort) => void;
   onSetQuery?: (query: Record<string, unknown>) => void;
@@ -144,7 +145,6 @@ export function SearchNodeResults({
   const tagIds = searchTagIds(node);
   const textFilter = searchTextFilter(node);
   const fieldFilter = searchFieldFilter(node);
-  const projectScope = searchProjectScope(node);
   const [textFilterDraft, setTextFilterDraft] = useState(textFilter);
   const [fieldFilterValueDraft, setFieldFilterValueDraft] = useState(fieldFilter.value);
   const [queryState, setQueryState] = useState<Pick<DocsState, "nodes" | "node_supertags" | "field_values">>({
@@ -157,16 +157,16 @@ export function SearchNodeResults({
   const [notingTaskIds, setNotingTaskIds] = useState<Set<string>>(
     () => new Set(),
   );
-  const [documentExpanded, setDocumentExpanded] = useState(false);
   const [queryEditorOpen, setQueryEditorOpen] = useState(false);
   const [creatingRow, setCreatingRow] = useState(false);
   const queryCacheKeyRef = useRef<string | null>(null);
   const queryResultCacheRef = useRef(new Map<string, DocsQueryResponse>());
   const queryInFlightRef = useRef(new Map<string, Promise<DocsQueryResponse>>());
-  const queryKey = useMemo(
-    () => (node.query_json ? JSON.stringify(node.query_json) : null),
+  const queryJson = useMemo(
+    () => (node.query_json ? normalizeSearchQuery(node.query_json) : null),
     [node.query_json],
   );
+  const queryKey = useMemo(() => (queryJson ? JSON.stringify(queryJson) : null), [queryJson]);
   const latestQueryKeyRef = useRef(queryKey);
   latestQueryKeyRef.current = queryKey;
 
@@ -182,7 +182,6 @@ export function SearchNodeResults({
   }, [queryKey]);
 
   useEffect(() => {
-    const queryJson = node.query_json;
     if (!queryJson) {
       queryCacheKeyRef.current = null;
       setLoading(false);
@@ -235,17 +234,17 @@ export function SearchNodeResults({
         if (queryInFlightRef.current.get(queryKey) === request) queryInFlightRef.current.delete(queryKey);
         if (latestQueryKeyRef.current === queryKey) setLoading(false);
       });
-  }, [apiFetch, context, documentExpanded, node.query_json, queryKey]);
+  }, [apiFetch, context, documentExpanded, queryJson, queryKey]);
 
   const loadMore = async () => {
-    if (!node.query_json || !nextCursor || loading) return;
+    if (!queryJson || !nextCursor || loading) return;
     setLoading(true);
     try {
       const data = await apiFetch<DocsQueryResponse>("/api/docs/query", {
         method: "POST",
         body: JSON.stringify({
-          query_json: node.query_json,
-          limit: typeof node.query_json.limit === "number" ? node.query_json.limit : 100,
+          query_json: queryJson,
+          limit: typeof queryJson.limit === "number" ? queryJson.limit : 100,
           cursor: nextCursor,
         }),
       });
@@ -525,7 +524,7 @@ export function SearchNodeResults({
 
   // zoom / document 双方で再利用するクエリ編集UIパーツ。
   const sortSelect = onSetSort ? (
-    <select
+    <AppSelect
       value={sort}
       onChange={(event) => onSetSort(event.target.value as SearchSort)}
       className="h-7 rounded border bg-background px-2 text-[11px]"
@@ -536,11 +535,11 @@ export function SearchNodeResults({
           {option.label}
         </option>
       ))}
-    </select>
+    </AppSelect>
   ) : null;
 
   const queryFilterGrid = onSetQuery ? (
-    <div className="grid gap-2 rounded border bg-muted/20 p-2 text-[11px] md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)] xl:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)_minmax(0,0.8fr)_minmax(0,1.6fr)]">
+    <div className="grid gap-2 rounded-md border border-border bg-card p-3 text-[11px] md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)] xl:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)_minmax(0,1.6fr)]">
       <label className="flex min-w-0 items-center gap-1.5">
         <Search className="size-3.5 shrink-0 text-muted-foreground" />
         <Input
@@ -558,24 +557,8 @@ export function SearchNodeResults({
         />
       </label>
       <label className="flex min-w-0 items-center gap-1.5">
-        <span className="shrink-0 text-muted-foreground">Scope</span>
-        <select
-          value={projectScope}
-          onChange={(event) => onSetQuery(withSearchProjectScope(node.query_json, event.target.value))}
-          className="h-7 min-w-0 flex-1 rounded border bg-background px-2 text-[11px]"
-          title="Project scope"
-        >
-          <option value="">All projects</option>
-          {(projects ?? []).map((project) => (
-            <option key={project.id} value={project.id}>
-              {project.name}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label className="flex min-w-0 items-center gap-1.5">
         <span className="shrink-0 text-muted-foreground">Group</span>
-        <select
+        <AppSelect
           value={selectedGroupField?.id ?? ""}
           onChange={(event) => onSetQuery(withSearchGroupBy(node.query_json, event.target.value))}
           className="h-7 min-w-0 flex-1 rounded border bg-background px-2 text-[11px]"
@@ -587,10 +570,10 @@ export function SearchNodeResults({
               {field.name}
             </option>
           ))}
-        </select>
+        </AppSelect>
       </label>
       <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_84px_minmax(0,1fr)_auto] gap-1">
-        <select
+        <AppSelect
           value={fieldFilter.fieldId}
           onChange={(event) => {
             setFieldFilterValueDraft("");
@@ -605,8 +588,8 @@ export function SearchNodeResults({
               {field.name}
             </option>
           ))}
-        </select>
-        <select
+        </AppSelect>
+        <AppSelect
           value={fieldFilter.op}
           disabled={!fieldFilter.fieldId}
           onChange={(event) => persistFieldFilter({ op: event.target.value as SearchFieldFilterOp })}
@@ -618,7 +601,7 @@ export function SearchNodeResults({
               {option.label}
             </option>
           ))}
-        </select>
+        </AppSelect>
         <Input
           value={fieldFilterValueDraft}
           disabled={!fieldFilter.fieldId || !fieldFilterNeedsValue}
@@ -651,21 +634,14 @@ export function SearchNodeResults({
   ) : null;
 
   if (context === "document") {
+    if (!documentExpanded) return null;
     return (
       <div className="my-1 space-y-1" style={{ paddingLeft: depth * 24 + 28 }}>
         <div
-          data-testid="docs-search-node-summary"
-          className="flex min-h-7 w-full max-w-3xl items-center gap-2 rounded px-2 text-xs hover:bg-accent"
+          data-testid="docs-search-node-controls"
+          className="flex min-h-7 w-full max-w-3xl items-center justify-end gap-2 border-b border-border px-2 pb-1 text-xs"
         >
-          <button
-            type="button"
-            className="flex min-w-0 flex-1 items-center gap-2 text-left"
-            onClick={() => setDocumentExpanded((current) => !current)}
-          >
-            {documentExpanded ? <ChevronDown className="size-3.5 shrink-0" /> : <ChevronRight className="size-3.5 shrink-0" />}
-            <span className="min-w-0 flex-1 truncate font-medium">{node.title}</span>
-          </button>
-          <span className="shrink-0 rounded border px-1.5 py-0.5 text-[11px] text-muted-foreground">
+           <span className="shrink-0 rounded border border-border bg-card px-1.5 py-0.5 text-xs text-muted-foreground">
             {loading ? "..." : `${results.length}件`}
           </span>
           {onSetQuery ? (
@@ -689,50 +665,48 @@ export function SearchNodeResults({
             {queryFilterGrid}
           </div>
         ) : null}
-        {documentExpanded ? (
-          <div className="ml-5 max-w-3xl space-y-0.5">
-            {loading ? <div className="px-2 text-xs text-muted-foreground">Loading query...</div> : null}
-            {!loading && results.length === 0 ? <div className="px-2 text-xs text-muted-foreground">No matching nodes</div> : null}
-            <VirtualizedSearchList
-              items={results}
-              estimateSize={30}
-              renderItem={(item) => {
-                const status = compactFieldValue(item, statusField);
-                const due = compactFieldValue(item, dueField).slice(0, 10);
-                return (
-                  <button
-                    type="button"
-                    className="grid min-h-7 w-full grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-2 rounded px-2 text-left text-xs hover:bg-accent"
-                    onClick={() => onOpenNode(item.id)}
-                  >
-                    <span className="min-w-0 truncate">{displayTitleFor(item)}</span>
-                    {status ? <span className="shrink-0 rounded border px-1.5 py-0.5 text-[11px] text-muted-foreground">{status}</span> : null}
-                    {due ? <span className="shrink-0 rounded border px-1.5 py-0.5 text-[11px] text-muted-foreground">期日 {due}</span> : null}
-                  </button>
-                );
-              }}
-            />
-            {nextCursor ? (
-              <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" disabled={loading} onClick={() => void loadMore()}>
-                Load more
-              </Button>
-            ) : null}
-          </div>
-        ) : null}
+        <div data-testid="docs-search-node-results" className="ml-5 max-w-3xl space-y-1">
+           {loading ? <div className="rounded-md border border-dashed border-border p-3 text-sm text-muted-foreground">Loading query...</div> : null}
+           {!loading && results.length === 0 ? <div className="rounded-md border border-dashed border-border p-3 text-sm text-muted-foreground">No matching nodes</div> : null}
+          <VirtualizedSearchList
+            items={results}
+            estimateSize={28}
+            renderItem={(item) => {
+              const status = compactFieldValue(item, statusField);
+              const due = compactFieldValue(item, dueField).slice(0, 10);
+              return (
+                <button
+                  type="button"
+                   className="grid min-h-8 w-full grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-1.5 rounded-md border border-border bg-card px-3 text-left text-sm transition-colors hover:border-primary/50 hover:bg-muted/50"
+                  onClick={() => onOpenNode(item.id)}
+                >
+                  <span className="min-w-0 truncate">{displayTitleFor(item)}</span>
+                   {status ? <span className="shrink-0 rounded border border-border bg-background px-1.5 py-0.5 text-xs text-muted-foreground">{status}</span> : null}
+                   {due ? <span className="shrink-0 rounded border border-border bg-background px-1.5 py-0.5 text-xs text-muted-foreground">期日 {due}</span> : null}
+                </button>
+              );
+            }}
+          />
+          {nextCursor ? (
+            <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" disabled={loading} onClick={() => void loadMore()}>
+              Load more
+            </Button>
+          ) : null}
+        </div>
       </div>
     );
   }
 
   return (
     <div className="my-2 space-y-2" style={{ paddingLeft: depth * 24 + 28 }}>
-      <div className="flex flex-wrap items-center gap-1">
+      <div className="flex flex-wrap items-center gap-1 rounded-md border border-border bg-card p-2">
         {viewButtons.map((item) => {
           const Icon = item.icon;
           return (
             <button
               key={item.view}
               type="button"
-              className={cn("flex items-center gap-1 rounded border px-2 py-1 text-[11px] hover:bg-accent", view === item.view && "bg-accent")}
+              className={cn("flex items-center gap-1 rounded border border-border px-2 py-1 text-[11px] transition-colors hover:border-primary/50 hover:bg-muted/50", view === item.view && "border-primary/50 bg-primary/5 text-primary")}
               onClick={() => onSetView(item.view)}
               title={item.label}
             >
@@ -750,20 +724,20 @@ export function SearchNodeResults({
         ) : null}
       </div>
       {queryFilterGrid}
-      {loading ? <div className="text-xs text-muted-foreground">Loading query...</div> : null}
-      {!loading && results.length === 0 ? <div className="text-xs text-muted-foreground">No matching nodes</div> : null}
+      {loading ? <div className="rounded-md border border-dashed border-border p-3 text-xs text-muted-foreground">Loading query...</div> : null}
+      {!loading && results.length === 0 ? <div className="rounded-md border border-dashed border-border p-3 text-xs text-muted-foreground">No matching nodes</div> : null}
       {view === "list" ? (
         <VirtualizedSearchList
           items={results}
           estimateSize={34}
-          renderItem={(item) => openButton(item, "flex min-h-7 w-full items-center gap-2 rounded border border-dashed px-2 py-1 text-left text-xs hover:bg-accent")}
+           renderItem={(item) => openButton(item, "flex min-h-9 w-full items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-left text-xs transition-colors hover:border-primary/50 hover:bg-muted/50")}
         />
       ) : null}
       {view === "table" ? (
-        <div className="overflow-x-auto rounded border text-xs">
+        <div className="overflow-x-auto rounded-md border border-border bg-card text-xs">
           <div className="min-w-max">
             <div
-              className="grid border-b bg-muted/30 font-medium"
+              className="grid border-b border-border bg-muted/30 font-medium"
               style={{ gridTemplateColumns: `minmax(240px, 1.5fr) repeat(${tableFields.length}, minmax(160px, 1fr))` }}
             >
               <div className="px-2 py-2">Title</div>
@@ -777,7 +751,7 @@ export function SearchNodeResults({
               className="min-w-max"
               renderItem={(item) => (
                 <div
-                  className="grid border-b last:border-b-0 hover:bg-accent/30"
+                   className="grid border-b border-border last:border-b-0 hover:bg-muted/40"
                   style={{ gridTemplateColumns: `minmax(240px, 1.5fr) repeat(${tableFields.length}, minmax(160px, 1fr))` }}
                 >
                   <div className="flex min-w-0 items-center gap-1 px-1 py-1">
@@ -824,12 +798,12 @@ export function SearchNodeResults({
       {view === "board" ? (
         <div className="grid gap-2 md:grid-cols-3">
           {Array.from(new Set(results.map(groupFor))).map((column) => (
-              <div key={column} className="min-h-20 rounded border bg-muted/20 p-2">
+               <div key={column} className="min-h-20 rounded-md border border-border bg-card p-2">
                 <div className="mb-2 text-[11px] font-medium text-muted-foreground">{column}</div>
                 <VirtualizedSearchList
                   items={results.filter((item) => groupFor(item) === column)}
                   estimateSize={34}
-                  renderItem={(item) => openButton(item, "block w-full truncate rounded border bg-background px-2 py-1 text-left text-xs hover:bg-accent")}
+                   renderItem={(item) => openButton(item, "block w-full truncate rounded border border-border bg-background px-2 py-1 text-left text-xs hover:border-primary/50 hover:bg-muted/50")}
                 />
               </div>
           ))}
@@ -847,7 +821,7 @@ export function SearchNodeResults({
             const taskId = virtualTaskId(item);
             if (taskId) {
               return (
-                <div className="min-h-20 rounded border p-2 text-left text-xs">
+                 <div className="min-h-20 rounded-md border border-border bg-card p-3 text-left text-xs">
                   <div className="flex items-center justify-between gap-2">
                     <div className="truncate font-medium">{displayTitleFor(item)}</div>
                     {noteButton(item)}
@@ -857,7 +831,7 @@ export function SearchNodeResults({
               );
             }
             return (
-              <button type="button" onClick={() => onOpenNode(item.id)} className="min-h-20 rounded border p-2 text-left text-xs hover:bg-accent">
+               <button type="button" onClick={() => onOpenNode(item.id)} className="min-h-20 rounded-md border border-border bg-card p-3 text-left text-xs transition-colors hover:border-primary/50 hover:bg-muted/50">
                 <div className="truncate font-medium">{displayTitleFor(item)}</div>
                 <div className="mt-2 line-clamp-2 text-muted-foreground">{item.description || item.body_text}</div>
               </button>
@@ -870,6 +844,66 @@ export function SearchNodeResults({
           Load more
         </Button>
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * Compact, data-backed query summary used by the Docs context rail.  The
+ * summary intentionally exposes only values persisted on the search node;
+ * it does not invent result statistics, AI suggestions, or export actions.
+ */
+export function SearchNodeMetadata({
+  node,
+  tags = [],
+}: {
+  node: DocsNode;
+  tags?: DocsSupertag[];
+}) {
+  const query = node.query_json ? normalizeSearchQuery(node.query_json) : null;
+  const text = searchTextFilter(node);
+  const field = searchFieldFilter(node);
+  const sort = searchSort(node);
+  const view = searchView(node);
+  const groupBy = searchGroupBy(node);
+  const tagNames = searchTagIds(node)
+    .map((tagId) => tags.find((tag) => tag.id === tagId)?.name ?? tagId)
+    .filter(Boolean);
+  const rows: Array<[string, string]> = [
+    ["View", view],
+    ["Sort", sort || "Default"],
+    ["Group", groupBy || "Auto"],
+  ];
+  if (text) rows.unshift(["Text", text]);
+  if (field.fieldId) rows.push([
+    "Field",
+    `${field.fieldId}${field.op ? ` ${field.op}` : ""}${field.value ? ` ${field.value}` : ""}`,
+  ]);
+  if (tagNames.length > 0) rows.push(["Tags", tagNames.map((name) => `#${name}`).join(", ")]);
+  if (typeof query?.limit === "number") rows.push(["Limit", String(query.limit)]);
+  return (
+    <div className="space-y-4 p-4 text-xs" data-docs-query-metadata>
+      <div className="flex items-center justify-between">
+        <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Query metadata</span>
+        <span className="inline-flex items-center gap-1 rounded border border-primary/30 bg-primary/5 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-primary">
+          <span className="size-1.5 rounded-full bg-primary" /> Live
+        </span>
+      </div>
+      <div className="space-y-1 rounded-md border border-border bg-card p-3">
+        <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Definition</div>
+        <div className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{node.id}</div>
+      </div>
+      <dl className="divide-y divide-border rounded-md border border-border bg-card">
+        {rows.map(([label, value]) => (
+          <div key={label} className="grid grid-cols-[4.5rem_minmax(0,1fr)] gap-2 px-3 py-2">
+            <dt className="text-muted-foreground">{label}</dt>
+            <dd className="min-w-0 break-words text-foreground">{value}</dd>
+          </div>
+        ))}
+      </dl>
+      <div className="border-t border-border pt-3 text-[11px] text-muted-foreground">
+        Query results are loaded from the Docs query endpoint when this node is expanded.
+      </div>
     </div>
   );
 }

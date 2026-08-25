@@ -26,38 +26,26 @@ COC_MECHANIC_KEYS: Dict[str, Dict[str, Any]] = {
     },
     "coc_skill_check": {
         "rule_domain": "skills",
-        "runtime_module": "src.services.trpg_play_service",
-        "runtime_function": "coc_skill_check",
         "keywords": ["skill", "d100", "development", "experience"],
     },
     "coc_attack_action": {
         "rule_domain": "combat",
-        "runtime_module": "src.services.trpg_play_service",
-        "runtime_function": "coc_attack_action",
         "keywords": ["combat", "attack", "damage", "weapon", "armor"],
     },
     "coc_resistance_check": {
         "rule_domain": "resistance",
-        "runtime_module": "src.services.trpg_play_service",
-        "runtime_function": "coc_resistance_check",
         "keywords": ["resistance", "opposed", "STR", "POW"],
     },
     "coc_apply_resource": {
         "rule_domain": "resources",
-        "runtime_module": "src.services.trpg_play_service",
-        "runtime_function": "coc_apply_resource",
         "keywords": ["HP", "MP", "SAN", "sanity", "resource", "damage"],
     },
     "coc_insanity_action": {
         "rule_domain": "insanity",
-        "runtime_module": "src.services.trpg_play_service",
-        "runtime_function": "coc_insanity_action",
         "keywords": ["insanity", "temporary", "indefinite", "SAN"],
     },
     "coc_spell_cost_action": {
         "rule_domain": "spells",
-        "runtime_module": "src.services.trpg_play_service",
-        "runtime_function": "coc_spell_cost_action",
         "keywords": ["spell", "magic", "MP", "POW", "SAN"],
     },
 }

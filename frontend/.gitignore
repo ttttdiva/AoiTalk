@@ -18,6 +18,8 @@
 
 # next.js
 /.next/
+# 別 distDir でビルドした場合の出力（例: 開発サーバーを止めずに検証するとき）
+/.next-*/
 /out/
 
 # production

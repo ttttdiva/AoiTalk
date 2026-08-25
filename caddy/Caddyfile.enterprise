@@ -1,0 +1,261 @@
+{
+	auto_https disable_redirects
+	# When an IP client omits SNI, use the configured site certificate instead
+	# of aborting the handshake with a TLS internal error. HTTP Host matching
+	# still selects the explicit catch-all below, so an unknown Host is rejected.
+	default_sni {$AOITALK_CADDY_SITE_ADDRESS:localhost}
+
+	log {
+		output file "{$AOITALK_CADDY_RUNTIME_LOG:logs/web/caddy-runtime.log}" {
+			roll_size 5MiB
+			roll_keep 5
+			{$AOITALK_CADDY_LOG_ROLL_EXTRA}
+		}
+		format console
+	}
+}
+
+# AoiTalk Enterprise reverse proxy.
+#
+# The localhost-only bootstrap listener is always available on its dedicated
+# host port.  The public listener is bound from first start but forward-auths
+# every request against the database-backed bootstrap state.  Changing the
+# bootstrap administrator password therefore unlocks LAN access immediately,
+# without restarting Docker or trusting client-supplied forwarding headers.
+
+(aoitalk_access_log) {
+	log {
+		output file "{$AOITALK_CADDY_ACCESS_LOG:logs/web/caddy-access.log}" {
+			roll_size 10MiB
+			roll_keep 5
+			{$AOITALK_CADDY_LOG_ROLL_EXTRA}
+		}
+		format filter {
+			wrap json
+			fields {
+				request>headers>Authorization delete
+				request>headers>Cookie delete
+				request>headers>Set-Cookie delete
+				request>headers>Proxy-Authorization delete
+			}
+		}
+	}
+}
+
+(enterprise_request_guards) {
+	# Do not reject missing/empty Authorization here: browser API and
+	# WebSocket requests authenticate with cookies.  The FastAPI application
+	# still rejects malformed explicit credentials on its direct routes.
+	@ambiguous_next_cookie {
+		expression `{http.request.header.Cookie}.matches('(?i)(^|[;,][[:space:]]*)aoitalk_session[[:space:]]*=.*[;,][[:space:]]*aoitalk_session[[:space:]]*=')`
+	}
+	@ambiguous_fastapi_cookie {
+		expression `{http.request.header.Cookie}.matches('(?i)(^|[;,][[:space:]]*)aoitalk_fastapi_session[[:space:]]*=.*[;,][[:space:]]*aoitalk_fastapi_session[[:space:]]*=')`
+	}
+	handle @ambiguous_next_cookie {
+		respond "Ambiguous session cookie" 400
+	}
+	handle @ambiguous_fastapi_cookie {
+		respond "Ambiguous FastAPI session cookie" 400
+	}
+}
+
+(proxy_client_headers) {
+	header_up -Forwarded
+	# These headers are reserved for the in-container Next.js BFF.  Never
+	# accept them from a client that reached the Enterprise boundary.
+	header_up -X-Internal-Auth
+	header_up -X-Forwarded-User
+	header_up -X-Forwarded-User-ID
+	header_up X-Forwarded-For {remote_host}
+	header_up X-Real-IP {remote_host}
+	header_up X-Forwarded-Proto {scheme}
+	header_up X-Forwarded-Host {http.request.hostport}
+}
+
+(enterprise_lan_gate) {
+	forward_auth {$AOITALK_CADDY_FASTAPI_UPSTREAM:aoitalk:3000} {
+		uri /internal/enterprise/lan-access
+		header_up -Cookie
+		header_up -Authorization
+		header_up -X-Internal-Auth
+		# The auth endpoint is ordinary HTTP.  Do not forward the browser's
+		# WebSocket upgrade vector into the forward-auth probe; the actual
+		# upgrade is preserved by the later reverse_proxy to /ws.
+		header_up -Connection
+		header_up -Upgrade
+		# Add, rather than set: forward_auth preserves the original request
+		# header vector. The FastAPI gate rejects duplicate/ambiguous values,
+		# so a client-supplied value cannot impersonate this assertion.
+		header_up +X-AoiTalk-Gate-Auth "{$AOITALK_CADDY_GATE_KEY}"
+	}
+}
+
+(enterprise_upstream_routes) {
+	handle /internal/* {
+		respond "Not found" 404
+	}
+
+	handle /api/auth/login/mobile {
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:aoitalk:3000} {
+			import proxy_client_headers
+		}
+	}
+	handle /api/auth/refresh {
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:aoitalk:3000} {
+			import proxy_client_headers
+		}
+	}
+	handle /api/auth/logout {
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:aoitalk:3000} {
+			import proxy_client_headers
+		}
+	}
+	handle /api/filer/* {
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:aoitalk:3000} {
+			import proxy_client_headers
+		}
+	}
+	handle /api/google-calendar/oauth/callback {
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:aoitalk:3000} {
+			import proxy_client_headers
+		}
+	}
+	handle /api/webex/oauth/callback {
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:aoitalk:3000} {
+			import proxy_client_headers
+		}
+	}
+	handle /api/agent-harness/* {
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:aoitalk:3000} {
+			import proxy_client_headers
+		}
+	}
+
+	# Public Next.js auth/bootstrap routes must bypass the FastAPI direct
+	# matcher, including when a client sends an empty Authorization header.
+	handle /api/auth/login {
+		reverse_proxy {$AOITALK_CADDY_NEXT_UPSTREAM:aoitalk:3002} {
+			import proxy_client_headers
+		}
+	}
+	handle /api/auth/login-form {
+		reverse_proxy {$AOITALK_CADDY_NEXT_UPSTREAM:aoitalk:3002} {
+			import proxy_client_headers
+		}
+	}
+	handle /api/auth/reset-password {
+		reverse_proxy {$AOITALK_CADDY_NEXT_UPSTREAM:aoitalk:3002} {
+			import proxy_client_headers
+		}
+	}
+	handle /api/auth/status {
+		reverse_proxy {$AOITALK_CADDY_NEXT_UPSTREAM:aoitalk:3002} {
+			import proxy_client_headers
+		}
+	}
+
+	# Unified Voice Session HTTP and WebSocket endpoints are authoritative in
+	# FastAPI, including cookie-authenticated browser requests without an
+	# Authorization header. reverse_proxy preserves WebSocket upgrades.
+	handle /api/voice-sessions* {
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:aoitalk:3000} {
+			import proxy_client_headers
+		}
+	}
+
+	# Only a non-empty Authorization header selects the FastAPI direct
+	# boundary. Missing/empty Authorization remains on the cookie-authenticated
+	# Next.js BFF path.
+	@fastapi_authorized_api {
+		path /api/*
+		header_regexp Authorization ".+"
+	}
+	handle @fastapi_authorized_api {
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:aoitalk:3000} {
+			import proxy_client_headers
+		}
+	}
+	handle /ws* {
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:aoitalk:3000} {
+			import proxy_client_headers
+		}
+	}
+	handle /api/* {
+		reverse_proxy {$AOITALK_CADDY_NEXT_UPSTREAM:aoitalk:3002} {
+			import proxy_client_headers
+		}
+	}
+	handle {
+		reverse_proxy {$AOITALK_CADDY_NEXT_UPSTREAM:aoitalk:3002} {
+			import proxy_client_headers
+		}
+	}
+}
+
+# Keep the bootstrap health entry point on a dedicated container-loopback
+# listener.  The public :80 listener below must not share this route: a client
+# on the LAN could otherwise send Host: 127.0.0.1 and select the health site.
+http://127.0.0.1:{$AOITALK_CADDY_HEALTH_PORT:8080} {
+	bind 127.0.0.1
+	handle /healthz {
+		rewrite * /login
+		reverse_proxy {$AOITALK_CADDY_NEXT_UPSTREAM:aoitalk:3002} {
+			import proxy_client_headers
+		}
+	}
+	handle {
+		redir https://localhost:{$AOITALK_BOOTSTRAP_HTTPS_PORT:8443}{uri} 308
+	}
+}
+
+# Remote HTTP is gated too, so the locked state does not disclose an otherwise
+# usable redirect path. ACME challenges are handled by Caddy before routes.
+http://{$AOITALK_CADDY_SITE_ADDRESS:localhost} {
+	import aoitalk_access_log
+	route {
+		import enterprise_request_guards
+		import enterprise_lan_gate
+		redir https://{$AOITALK_CADDY_SITE_ADDRESS:localhost}:{$AOITALK_CADDY_PORT:443}{uri} 308
+	}
+}
+
+# Initial setup path. Docker publishes this listener on 127.0.0.1 only.
+https://localhost:{$AOITALK_BOOTSTRAP_CADDY_PORT:8443} {
+	# Compose sets this to 0.0.0.0 inside the container so a host-loopback
+	# publish can reach the listener; the host port remains 127.0.0.1-only.
+	bind {$AOITALK_BOOTSTRAP_BIND_ADDRESS:127.0.0.1}
+	tls internal
+	encode zstd gzip
+	import aoitalk_access_log
+	import enterprise_request_guards
+	import enterprise_upstream_routes
+}
+
+# Company-facing path. The internal endpoint returns 204 only after the
+# bootstrap admin no longer requires a password reset; every other state is
+# fail-closed. Caddy injects the shared secret, so no X-Forwarded-For trust is
+# needed and a remote client cannot opt out of the gate.
+{$AOITALK_CADDY_SITE_ADDRESS:localhost}:{$AOITALK_CADDY_PORT:443} {
+	{$AOITALK_CADDY_TLS_DIRECTIVE:}
+	encode zstd gzip
+
+	import aoitalk_access_log
+
+	route {
+		import enterprise_request_guards
+		import enterprise_lan_gate
+		import enterprise_upstream_routes
+	}
+}
+
+# Explicit default sites keep an unknown HTTP Host or TLS SNI from inheriting
+# a future public route.  Caddy selects the host-specific sites above first.
+http:// {
+	respond "Not found" 404
+}
+
+https://:{$AOITALK_CADDY_PORT:443} {
+	tls internal
+	respond "Not found" 404
+}

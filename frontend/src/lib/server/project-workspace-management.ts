@@ -156,6 +156,96 @@ export function getProjectStorageRoot(projectId: string): string {
   );
 }
 
+export type ProjectStorageUsage = {
+  totalBytes: number;
+  totalMb: number;
+  fileCount: number;
+  dirCount: number;
+};
+
+const MAX_PROJECT_STORAGE_SCAN_ENTRIES = 100_000;
+
+function isStorageLink(stat: fs.Stats): boolean {
+  if (stat.isSymbolicLink()) return true;
+  const attributes = (stat as fs.Stats & { st_file_attributes?: number })
+    .st_file_attributes;
+  return typeof attributes === "number" && (attributes & 0x400) !== 0;
+}
+
+/**
+ * Calculate usage without following symlinks/junctions/reparse points.
+ *
+ * This intentionally fails closed on an unreadable or changing workspace so
+ * callers cannot turn a scan error into an unbounded quota bypass.
+ */
+export function calculateProjectStorageUsage(
+  storageRoot: string,
+): ProjectStorageUsage {
+  const root = path.resolve(storageRoot);
+  let rootStat: fs.Stats;
+  try {
+    rootStat = fs.lstatSync(root);
+  } catch (error) {
+    throw new Error(`Project storage root could not be inspected: ${root}`, {
+      cause: error,
+    });
+  }
+  if (isStorageLink(rootStat) || !rootStat.isDirectory()) {
+    throw new Error("Project storage root is not a real directory");
+  }
+
+  const pending = [root];
+  let scannedEntries = 0;
+  let totalBytes = 0;
+  let fileCount = 0;
+  let dirCount = 0;
+
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch (error) {
+      throw new Error(`Project storage directory could not be scanned: ${current}`, {
+        cause: error,
+      });
+    }
+
+    for (const entry of entries) {
+      scannedEntries += 1;
+      if (scannedEntries > MAX_PROJECT_STORAGE_SCAN_ENTRIES) {
+        throw new Error("Project storage contains too many entries to scan safely");
+      }
+
+      const candidate = path.join(current, entry.name);
+      let itemStat: fs.Stats;
+      try {
+        itemStat = fs.lstatSync(candidate);
+      } catch (error) {
+        throw new Error(`Project storage entry could not be inspected: ${candidate}`, {
+          cause: error,
+        });
+      }
+      if (isStorageLink(itemStat)) continue;
+
+      if (itemStat.isDirectory()) {
+        pending.push(candidate);
+        dirCount += 1;
+      } else if (itemStat.isFile()) {
+        totalBytes += itemStat.size;
+        fileCount += 1;
+      }
+    }
+  }
+
+  return {
+    totalBytes,
+    totalMb: Number((totalBytes / (1024 * 1024)).toFixed(2)),
+    fileCount,
+    dirCount,
+  };
+}
+
 export function normalizeProjectFilePath(
   value: unknown,
   projectId?: string,
@@ -200,8 +290,76 @@ export function normalizeProjectFilePath(
 
 export function ensureProjectStorageRoot(projectId: string): string {
   const root = getProjectStorageRoot(projectId);
+  const base = getWorkspacesBaseDir();
+  fs.mkdirSync(base, { recursive: true });
+  if (!isPathInsideProjectStorageRoot(base, root)) {
+    throw new Error("Project storage root crosses a symlink or escapes the workspace");
+  }
   fs.mkdirSync(root, { recursive: true });
+  if (!isPathInsideProjectStorageRoot(base, root)) {
+    throw new Error("Project storage root changed outside the workspace");
+  }
+  const relative = path.relative(fs.realpathSync(base), fs.realpathSync(root));
+  if (
+    relative === "" ||
+    relative.startsWith("..") ||
+    path.isAbsolute(relative) ||
+    path.basename(relative).toLowerCase() !== `project_${projectId}`.toLowerCase()
+  ) {
+    throw new Error("Project storage root escapes the workspace");
+  }
   return root;
+}
+
+/** Return false when a project-relative path resolves through a symlink. */
+export function isPathInsideProjectStorageRoot(
+  storageRoot: string,
+  candidate: string,
+): boolean {
+  const root = path.resolve(storageRoot);
+  const lexical = path.resolve(candidate);
+  const lexicalRelative = path.relative(root, lexical);
+  if (
+    lexicalRelative.startsWith("..") ||
+    path.isAbsolute(lexicalRelative)
+  ) {
+    return false;
+  }
+
+  let cursor = root;
+  let lastExisting = root;
+  try {
+    if (isStorageLink(fs.lstatSync(root))) return false;
+  } catch {
+    return false;
+  }
+
+  // Inspect every existing lexical component with lstat.  This catches a
+  // dangling symlink that existsSync would incorrectly treat as absent.
+  for (const component of lexicalRelative
+    ? lexicalRelative.split(path.sep).filter(Boolean)
+    : []) {
+    cursor = path.join(cursor, component);
+    try {
+      if (isStorageLink(fs.lstatSync(cursor))) return false;
+      lastExisting = cursor;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") break;
+      return false;
+    }
+  }
+
+  let realRoot: string;
+  let realExisting: string;
+  try {
+    realRoot = fs.realpathSync(root);
+    realExisting = fs.realpathSync(lastExisting);
+  } catch {
+    return false;
+  }
+  const relative = path.relative(realRoot, realExisting);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
 function coerceBool(value: unknown, fallback: boolean): boolean {
@@ -316,6 +474,7 @@ export function resolveManagedPath(
     relative === "" ||
     (!relative.startsWith("..") && !path.isAbsolute(relative))
   ) {
+    if (!isPathInsideProjectStorageRoot(storageRoot, resolved)) return null;
     return { absolutePath: resolved, relativePath };
   }
   return null;

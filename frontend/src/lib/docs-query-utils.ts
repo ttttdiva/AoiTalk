@@ -18,6 +18,10 @@ export function resolveDocsTagFilters(options: {
   tagIdBySystemKey: Map<string, string>;
   tagIdByName: Map<string, string>;
 }): DocsTagFilterResolution {
+  const bySystemKey = (value: string) =>
+    options.tagIdBySystemKey.get(value) ?? options.tagIdBySystemKey.get(value.toLowerCase());
+  const byName = (value: string) =>
+    options.tagIdByName.get(value.toLowerCase()) ?? options.tagIdByName.get(value);
   const tagFilters = options.explicitSupertagIds.map((tagId) => ({
     tagId,
     includeDescendants: true,
@@ -36,13 +40,13 @@ export function resolveDocsTagFilters(options: {
       typeof clause.tag === "string"
         ? options.tagIdSet.has(clause.tag)
           ? clause.tag
-          : options.tagIdBySystemKey.get(clause.tag) ?? options.tagIdByName.get(clause.tag.toLowerCase())
+          : bySystemKey(clause.tag) ?? byName(clause.tag)
         : typeof clause.tag_system_key === "string"
-          ? options.tagIdBySystemKey.get(clause.tag_system_key)
+          ? bySystemKey(clause.tag_system_key)
           : typeof clause.supertag_system_key === "string"
-            ? options.tagIdBySystemKey.get(clause.supertag_system_key)
+            ? bySystemKey(clause.supertag_system_key)
             : typeof clause.tag_name === "string"
-              ? options.tagIdByName.get(clause.tag_name.toLowerCase())
+              ? byName(clause.tag_name)
               : null;
     if (typeof tagId === "string" && tagId) {
       tagFilters.push({

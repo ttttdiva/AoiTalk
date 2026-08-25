@@ -12,14 +12,12 @@ import React, {
 import {
   Alert,
   FlatList,
-  GestureResponderEvent,
-  LayoutChangeEvent,
-  NativeSyntheticEvent,
+  PanResponder,
   Pressable,
   RefreshControl,
-  ScrollView,
   StyleSheet,
-  TextInputKeyPressEventData,
+  type GestureResponderEvent,
+  type LayoutChangeEvent,
   View,
 } from "react-native";
 import {
@@ -32,25 +30,29 @@ import {
   Portal,
   Snackbar,
   Surface,
-  Switch,
   Text,
   TextInput,
 } from "react-native-paper";
 import { useFocusEffect, useRouter } from "expo-router";
 import { tasksRepo } from "../../../repositories";
+import { runSync } from "../../../sync/engine";
+import { useProjectStore } from "../../../stores/project";
 import { useProject } from "../../../contexts/ProjectContext";
 import { useAuth } from "../../../contexts/AuthContext";
-import { taskApi } from "../../../lib/task-api";
-import type { Project, Tag, Task } from "../../../types/api";
+import type { Task } from "../../../types/api";
 import { formatTaskDateLabel } from "../../../lib/task-date-label";
-import {
-  isTaskDateOnlyInput,
-  toTaskWallClockIso,
-} from "../../../lib/task-datetime";
 import {
   COMPLETED_TASK_STATUSES,
   isFutureTask,
 } from "../../../lib/task-visibility";
+import {
+  getTaskStatusOption,
+  areTaskOrdersEqual,
+  reorderVisibleTaskIds,
+  resolveTaskPressAction,
+  sortTasksCanonical,
+  TASK_STATUS_OPTIONS,
+} from "../../../features/tasks/task-list-state";
 import {
   createTaskCompletionUndoEntry,
   enqueueTaskCompletionUndoBatch,
@@ -58,16 +60,8 @@ import {
   useTaskCompletionUndoStore,
 } from "../../../stores/task-completion-undo";
 import { ScreenHeader } from "../../../components/screen-header";
+import { ScopeSwitcher } from "../../../components/scope-switcher";
 
-const STATUS_COLORS: Record<string, string> = {
-  todo: "#a6adc8",
-  open: "#a6adc8",
-  in_progress: "#f38ba8",
-  on_hold: "#f5c2e7",
-  review: "#89dceb",
-  closed: "#a6e3a1",
-  cancelled: "#a6adc8",
-};
 const FILTERS = ["all", "open", "in_progress", "closed"] as const;
 const FILTER_LABELS: Record<string, string> = {
   all: "すべて",
@@ -75,66 +69,6 @@ const FILTER_LABELS: Record<string, string> = {
   in_progress: "進行中",
   closed: "完了済み",
 };
-const STATUS_OPTIONS = [
-  { value: "open", label: "未着手", icon: "circle-outline" },
-  { value: "in_progress", label: "進行中", icon: "progress-clock" },
-  { value: "on_hold", label: "保留", icon: "pause-circle-outline" },
-  { value: "review", label: "レビュー待ち", icon: "file-check-outline" },
-  { value: "closed", label: "完了", icon: "check-circle" },
-  { value: "cancelled", label: "取消", icon: "close-circle-outline" },
-];
-
-const PRIORITY_OPTIONS = [
-  { value: "urgent", label: "Urgent" },
-  { value: "high", label: "High" },
-  { value: "normal", label: "Normal" },
-  { value: "low", label: "Low" },
-  { value: "none", label: "None" },
-];
-const REMINDER_PRESETS = [
-  { value: 5, label: "5分前" },
-  { value: 15, label: "15分前" },
-  { value: 30, label: "30分前" },
-  { value: 60, label: "1時間前" },
-  { value: 1440, label: "1日前" },
-];
-const DISALLOWED_PLACEHOLDER_TITLES = new Set([
-  "無題のタスク",
-  "Untitled task",
-]);
-
-type RowLayout = { y: number; height: number };
-
-function reorderIds(
-  ids: string[],
-  draggedId: string,
-  targetId: string,
-  insertAfter: boolean,
-): string[] {
-  if (draggedId === targetId) return ids;
-  const next = ids.filter((id) => id !== draggedId);
-  const targetIndex = next.indexOf(targetId);
-  if (targetIndex === -1) return ids;
-  next.splice(targetIndex + (insertAfter ? 1 : 0), 0, draggedId);
-  return next;
-}
-
-function sameOrder(left: string[], right: string[]): boolean {
-  return (
-    left.length === right.length &&
-    left.every((id, index) => id === right[index])
-  );
-}
-
-type TaskCreateDialogProps = {
-  visible: boolean;
-  selectedProjectId: string | null;
-  selectedSpaceId: string | null;
-  projects: Project[];
-  onDismiss: () => void;
-  onSubmit: (data: Record<string, unknown>) => Promise<void>;
-};
-
 type TaskCommandDialogProps = {
   visible: boolean;
   targetTitle: string | null;
@@ -144,464 +78,6 @@ type TaskCommandDialogProps = {
   onSubmit: (value: string) => void;
   onChange: () => void;
 };
-
-// 旧ダイアログは移行中の互換参照として残す。作成導線は create route のみを使う。
-function _TaskCreateDialog({
-  visible,
-  selectedProjectId,
-  selectedSpaceId,
-  projects,
-  onDismiss,
-  onSubmit,
-}: TaskCreateDialogProps) {
-  const [sessionKey, setSessionKey] = useState(0);
-  const [projectDraft, setProjectDraft] = useState<string | null>(
-    selectedProjectId,
-  );
-  const [titleDraft, setTitleDraft] = useState("");
-  const [descriptionDraft, setDescriptionDraft] = useState("");
-  const [statusDraft, setStatusDraft] = useState("open");
-  const [priorityDraft, setPriorityDraft] = useState("normal");
-  const [startAtDraft, setStartAtDraft] = useState("");
-  const [endAtDraft, setEndAtDraft] = useState("");
-  const [estimatedHoursDraft, setEstimatedHoursDraft] = useState("");
-  const [allDayDraft, setAllDayDraft] = useState(false);
-  const [notificationsEnabled, setNotificationsEnabled] = useState(true);
-  const [reminderOffsets, setReminderOffsets] = useState<number[]>([]);
-  const [availableTags, setAvailableTags] = useState<Tag[]>([]);
-  const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
-  const [newTagDraft, setNewTagDraft] = useState("");
-  const [projectMenuVisible, setProjectMenuVisible] = useState(false);
-  const [statusMenuVisible, setStatusMenuVisible] = useState(false);
-  const [priorityMenuVisible, setPriorityMenuVisible] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
-  const [tagBusy, setTagBusy] = useState(false);
-  const [formError, setFormError] = useState<string | null>(null);
-  const descriptionInputRef = useRef<{ focus: () => void } | null>(null);
-  const scopedProjects = useMemo(
-    () =>
-      selectedSpaceId
-        ? projects.filter((project) => project.space_id === selectedSpaceId)
-        : projects,
-    [projects, selectedSpaceId],
-  );
-
-  useEffect(() => {
-    if (!visible) {
-      setProjectMenuVisible(false);
-      setStatusMenuVisible(false);
-      setPriorityMenuVisible(false);
-      setSubmitting(false);
-      setTagBusy(false);
-      return;
-    }
-    const initialProjectId = selectedProjectId ?? scopedProjects[0]?.id ?? null;
-    setSessionKey((key) => key + 1);
-    setProjectDraft(initialProjectId);
-    setTitleDraft("");
-    setDescriptionDraft("");
-    setStatusDraft("open");
-    setPriorityDraft("normal");
-    setStartAtDraft("");
-    setEndAtDraft("");
-    setEstimatedHoursDraft("");
-    setAllDayDraft(false);
-    setNotificationsEnabled(true);
-    setReminderOffsets([]);
-    setSelectedTagIds([]);
-    setNewTagDraft("");
-    setFormError(null);
-  }, [scopedProjects, selectedProjectId, visible]);
-
-  useEffect(() => {
-    if (!visible || !projectDraft) {
-      setAvailableTags([]);
-      setSelectedTagIds([]);
-      return;
-    }
-    let cancelled = false;
-    taskApi
-      .listTags(projectDraft)
-      .then((tags) => {
-        if (cancelled) return;
-        setAvailableTags(tags);
-        setSelectedTagIds((prev) =>
-          prev.filter((id) => tags.some((tag) => tag.id === id)),
-        );
-      })
-      .catch(() => {
-        if (!cancelled) setAvailableTags([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [projectDraft, visible]);
-
-  const selectedProject = projects.find(
-    (project) => project.id === projectDraft,
-  );
-  const priorityOpt = PRIORITY_OPTIONS.find(
-    (option) => option.value === priorityDraft,
-  );
-  const statusOpt = STATUS_OPTIONS.find(
-    (option) => option.value === statusDraft,
-  );
-  const normalizedTitle = titleDraft.trim();
-  const estimatedHoursValue = estimatedHoursDraft.trim()
-    ? Number(estimatedHoursDraft.trim())
-    : null;
-  const estimateInvalid =
-    estimatedHoursValue != null && !Number.isFinite(estimatedHoursValue);
-  const canSubmit =
-    Boolean(normalizedTitle) &&
-    Boolean(projectDraft) &&
-    !DISALLOWED_PLACEHOLDER_TITLES.has(normalizedTitle) &&
-    !estimateInvalid &&
-    !submitting;
-
-  const focusDescriptionInput = useCallback(() => {
-    descriptionInputRef.current?.focus();
-  }, []);
-
-  const handleTitleKeyPress = useCallback(
-    (event: NativeSyntheticEvent<TextInputKeyPressEventData>) => {
-      if (event.nativeEvent.key !== "ArrowDown") return;
-      focusDescriptionInput();
-    },
-    [focusDescriptionInput],
-  );
-
-  const toggleReminder = useCallback((offset: number) => {
-    setReminderOffsets((prev) =>
-      prev.includes(offset)
-        ? prev.filter((item) => item !== offset)
-        : [...prev, offset].sort((a, b) => a - b),
-    );
-  }, []);
-
-  const toggleTag = useCallback((tagId: string) => {
-    setSelectedTagIds((prev) =>
-      prev.includes(tagId)
-        ? prev.filter((item) => item !== tagId)
-        : [...prev, tagId],
-    );
-  }, []);
-
-  const handleCreateTag = useCallback(async () => {
-    const name = newTagDraft.trim();
-    if (!name || !projectDraft || tagBusy) return;
-    const existing = availableTags.find(
-      (tag) => tag.name.toLowerCase() === name.toLowerCase(),
-    );
-    if (existing) {
-      toggleTag(existing.id);
-      setNewTagDraft("");
-      return;
-    }
-    setTagBusy(true);
-    try {
-      const created = await taskApi.createTag(projectDraft, { name });
-      setAvailableTags((prev) => [...prev, created]);
-      setSelectedTagIds((prev) => [...prev, created.id]);
-      setNewTagDraft("");
-    } catch (error) {
-      setFormError(
-        error instanceof Error ? error.message : "タグ作成に失敗しました",
-      );
-    } finally {
-      setTagBusy(false);
-    }
-  }, [availableTags, newTagDraft, projectDraft, tagBusy, toggleTag]);
-
-  const submit = async () => {
-    if (!canSubmit || !projectDraft) return;
-    const data: Record<string, unknown> = {
-      title: normalizedTitle,
-      project_id: projectDraft,
-      status: statusDraft,
-      priority: priorityDraft,
-      start_at: startAtDraft ? toTaskWallClockIso(startAtDraft) : null,
-      end_at: endAtDraft ? toTaskWallClockIso(endAtDraft) : null,
-      all_day:
-        allDayDraft ||
-        isTaskDateOnlyInput(startAtDraft) ||
-        isTaskDateOnlyInput(endAtDraft),
-      estimated_hours: estimatedHoursValue,
-      notifications_enabled: notificationsEnabled,
-      reminder_offsets: reminderOffsets,
-      tag_ids: selectedTagIds,
-    };
-    if (descriptionDraft.trim()) data.description = descriptionDraft.trim();
-
-    setSubmitting(true);
-    setFormError(null);
-    try {
-      await onSubmit(data);
-    } catch (error) {
-      setFormError(
-        error instanceof Error ? error.message : "タスク作成に失敗しました",
-      );
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <Dialog visible={visible} onDismiss={onDismiss} style={styles.dialog}>
-      <Dialog.Title style={styles.dialogTitle}>タスクを作成</Dialog.Title>
-      <Dialog.ScrollArea style={{ maxHeight: 560 }}>
-        <ScrollView style={{ padding: 4 }} keyboardShouldPersistTaps="handled">
-          <View style={styles.dialogRow}>
-            <Text style={styles.dialogLabel}>プロジェクト</Text>
-            <Menu
-              visible={projectMenuVisible}
-              onDismiss={() => setProjectMenuVisible(false)}
-              anchor={
-                <Chip
-                  onPress={() => setProjectMenuVisible(true)}
-                  style={styles.selectChip}
-                >
-                  {selectedProject?.name || "選択"}
-                </Chip>
-              }
-              contentStyle={styles.menuContent}
-            >
-              {scopedProjects.map((project) => (
-                <Menu.Item
-                  key={project.id}
-                  title={project.name}
-                  leadingIcon={
-                    project.id === projectDraft ? "check" : undefined
-                  }
-                  onPress={() => {
-                    setProjectDraft(project.id);
-                    setSelectedTagIds([]);
-                    setProjectMenuVisible(false);
-                  }}
-                />
-              ))}
-              {scopedProjects.length === 0 ? (
-                <Menu.Item
-                  title="このスペースにプロジェクトがありません"
-                  disabled
-                />
-              ) : null}
-            </Menu>
-          </View>
-
-          <TextInput
-            key={`title-${sessionKey}`}
-            label="タイトル"
-            defaultValue=""
-            onChangeText={setTitleDraft}
-            onKeyPress={handleTitleKeyPress}
-            mode="outlined"
-            style={styles.dialogInput}
-            autoCorrect={false}
-          />
-          <TextInput
-            key={`description-${sessionKey}`}
-            ref={(instance: { focus: () => void } | null) => {
-              descriptionInputRef.current = instance;
-            }}
-            label="説明（Markdown可）"
-            defaultValue=""
-            onChangeText={setDescriptionDraft}
-            mode="outlined"
-            style={styles.dialogInput}
-            autoCorrect={false}
-            multiline
-            numberOfLines={4}
-          />
-
-          <View style={styles.dialogTwoColumn}>
-            <View style={styles.dialogColumn}>
-              <Text style={styles.dialogLabel}>ステータス</Text>
-              <Menu
-                visible={statusMenuVisible}
-                onDismiss={() => setStatusMenuVisible(false)}
-                anchor={
-                  <Chip
-                    onPress={() => setStatusMenuVisible(true)}
-                    style={styles.selectChip}
-                  >
-                    {statusOpt?.label || statusDraft}
-                  </Chip>
-                }
-                contentStyle={styles.menuContent}
-              >
-                {STATUS_OPTIONS.map((opt) => (
-                  <Menu.Item
-                    key={opt.value}
-                    title={opt.label}
-                    onPress={() => {
-                      setStatusDraft(opt.value);
-                      setStatusMenuVisible(false);
-                    }}
-                  />
-                ))}
-              </Menu>
-            </View>
-            <View style={styles.dialogColumn}>
-              <Text style={styles.dialogLabel}>優先度</Text>
-              <Menu
-                visible={priorityMenuVisible}
-                onDismiss={() => setPriorityMenuVisible(false)}
-                anchor={
-                  <Chip
-                    onPress={() => setPriorityMenuVisible(true)}
-                    style={styles.selectChip}
-                  >
-                    {priorityOpt?.label || priorityDraft}
-                  </Chip>
-                }
-                contentStyle={styles.menuContent}
-              >
-                {PRIORITY_OPTIONS.map((opt) => (
-                  <Menu.Item
-                    key={opt.value}
-                    title={opt.label}
-                    onPress={() => {
-                      setPriorityDraft(opt.value);
-                      setPriorityMenuVisible(false);
-                    }}
-                  />
-                ))}
-              </Menu>
-            </View>
-          </View>
-
-          <View style={styles.dialogTwoColumn}>
-            <TextInput
-              key={`start-at-${sessionKey}`}
-              label="開始"
-              defaultValue=""
-              onChangeText={setStartAtDraft}
-              mode="outlined"
-              style={[styles.dialogInput, styles.dialogColumn]}
-              placeholder="yyyy-MM-ddTHH:mm"
-              autoCorrect={false}
-              autoCapitalize="none"
-            />
-            <TextInput
-              key={`end-at-${sessionKey}`}
-              label="期日"
-              defaultValue=""
-              onChangeText={setEndAtDraft}
-              mode="outlined"
-              style={[styles.dialogInput, styles.dialogColumn]}
-              placeholder="yyyy-MM-ddTHH:mm"
-              autoCorrect={false}
-              autoCapitalize="none"
-            />
-          </View>
-          <View style={styles.dialogTwoColumn}>
-            <TextInput
-              key={`estimate-${sessionKey}`}
-              label="見積時間"
-              defaultValue=""
-              onChangeText={setEstimatedHoursDraft}
-              mode="outlined"
-              style={[styles.dialogInput, styles.dialogColumn]}
-              keyboardType="decimal-pad"
-              error={estimateInvalid}
-            />
-            <View style={[styles.dialogColumn, styles.switchRow]}>
-              <Text style={styles.dialogLabel}>終日</Text>
-              <Switch value={allDayDraft} onValueChange={setAllDayDraft} />
-            </View>
-          </View>
-
-          <View style={styles.switchRowFull}>
-            <Text style={styles.dialogLabel}>通知</Text>
-            <Switch
-              value={notificationsEnabled}
-              onValueChange={setNotificationsEnabled}
-            />
-          </View>
-          <Text style={styles.dialogSectionLabel}>リマインダー</Text>
-          <View style={styles.dialogChipRow}>
-            {REMINDER_PRESETS.map((preset) => (
-              <Chip
-                key={preset.value}
-                compact
-                selected={reminderOffsets.includes(preset.value)}
-                disabled={!notificationsEnabled}
-                onPress={() => toggleReminder(preset.value)}
-                style={styles.filterChip}
-                textStyle={styles.filterChipText}
-              >
-                {preset.label}
-              </Chip>
-            ))}
-          </View>
-
-          <Text style={styles.dialogSectionLabel}>タグ</Text>
-          <View style={styles.dialogChipRow}>
-            {availableTags.length === 0 ? (
-              <Text style={styles.hintText}>
-                タグなし / オフラインでは既存タグを取得できません
-              </Text>
-            ) : (
-              availableTags.map((tag) => (
-                <Chip
-                  key={tag.id}
-                  compact
-                  selected={selectedTagIds.includes(tag.id)}
-                  onPress={() => toggleTag(tag.id)}
-                  style={[
-                    styles.filterChip,
-                    tag.color ? { borderColor: tag.color } : null,
-                  ]}
-                  textStyle={styles.filterChipText}
-                >
-                  {tag.name}
-                </Chip>
-              ))
-            )}
-          </View>
-          <View style={styles.newTagRow}>
-            <TextInput
-              value={newTagDraft}
-              onChangeText={setNewTagDraft}
-              mode="outlined"
-              dense
-              placeholder="新規タグ"
-              style={styles.newTagInput}
-              autoCorrect={false}
-            />
-            <Button
-              mode="outlined"
-              onPress={() => void handleCreateTag()}
-              disabled={!projectDraft || !newTagDraft.trim() || tagBusy}
-              loading={tagBusy}
-            >
-              追加
-            </Button>
-          </View>
-          {formError ? (
-            <Text style={styles.commandError}>{formError}</Text>
-          ) : null}
-        </ScrollView>
-      </Dialog.ScrollArea>
-      <Dialog.Actions>
-        <Button onPress={onDismiss} textColor="#a6adc8" disabled={submitting}>
-          キャンセル
-        </Button>
-        <Button
-          onPress={() => {
-            void submit();
-          }}
-          textColor="#7c3aed"
-          loading={submitting}
-          disabled={!canSubmit}
-        >
-          作成
-        </Button>
-      </Dialog.Actions>
-    </Dialog>
-  );
-}
 
 function TaskCommandDialog({
   visible,
@@ -649,7 +125,7 @@ function TaskCommandDialog({
           onSubmitEditing={() => onSubmit(draft)}
         />
         <Text style={styles.commandHint}>
-          利用可能: /status open|in|in_progress|on_hold|review|closed|cancelled
+          利用可能: /status open|in|in_progress|on_hold|review|closed
         </Text>
         {error ? <Text style={styles.commandError}>{error}</Text> : null}
       </Dialog.Content>
@@ -688,9 +164,6 @@ function normalizeTaskCommandStatus(raw: string): string | null {
     completed: "closed",
     close: "closed",
     closed: "closed",
-    cancel: "cancelled",
-    cancelled: "cancelled",
-    canceled: "cancelled",
   };
   return map[normalized] ?? null;
 }
@@ -702,6 +175,349 @@ function parseTaskSlashCommand(input: string): { status: string } | null {
   return status ? { status } : null;
 }
 
+const TASK_LONG_PRESS_DELAY = 350;
+const TASK_TOUCH_SLOP = 8;
+
+type TaskCardProps = {
+  item: Task;
+  selected: boolean;
+  selectedProjectId: string | null;
+  statusOption: ReturnType<typeof getTaskStatusOption>;
+  statusBusy: boolean;
+  statusMenuVisible: boolean;
+  dragging: boolean;
+  onLayout: (taskId: string, event: LayoutChangeEvent) => void;
+  onPress: (task: Task) => void;
+  onLongPress: (taskId: string) => void;
+  onDragStart: (
+    taskId: string,
+    pageY: number,
+    locationY: number,
+  ) => void;
+  onDragMove: (taskId: string, pageY: number) => void;
+  onDragEnd: (taskId: string, pageY: number) => void;
+  onStatusMenuDismiss: () => void;
+  onStatusMenuOpen: () => void;
+  onStatusUpdate: (task: Task, status: string) => void;
+};
+
+function readTouchPosition(event: unknown): {
+  pageY: number;
+  locationY: number;
+} {
+  const nativeEvent = (
+    event as {
+      nativeEvent?: { pageY?: unknown; locationY?: unknown };
+    }
+  )?.nativeEvent;
+  const pageY =
+    typeof nativeEvent?.pageY === "number" ? nativeEvent.pageY : 0;
+  const locationY =
+    typeof nativeEvent?.locationY === "number" ? nativeEvent.locationY : 0;
+  return { pageY, locationY };
+}
+
+/**
+ * Task row touch handling.
+ *
+ * PressableのlongPressだけに頼ると、指を離した後にもう一度drag操作を
+ * 始める必要がある。row自身でタイマーとPanResponderを併用し、長押しが
+ *成立した同じtouch sequenceをそのままD&Dへ引き継ぐ。
+ */
+function TaskCard({
+  item,
+  selected,
+  selectedProjectId,
+  statusOption,
+  statusBusy,
+  statusMenuVisible,
+  dragging,
+  onLayout,
+  onPress,
+  onLongPress,
+  onDragStart,
+  onDragMove,
+  onDragEnd,
+  onStatusMenuDismiss,
+  onStatusMenuOpen,
+  onStatusUpdate,
+}: TaskCardProps) {
+  const touchRef = useRef({
+    active: false,
+    cancelled: false,
+    longPressed: false,
+    dragArmed: false,
+    dragActive: false,
+    suppressNextPress: false,
+    startPageY: 0,
+    timer: null as ReturnType<typeof setTimeout> | null,
+  });
+  const callbacksRef = useRef({
+    onLongPress,
+    onDragStart,
+    onDragMove,
+    onDragEnd,
+  });
+  callbacksRef.current = { onLongPress, onDragStart, onDragMove, onDragEnd };
+
+  const clearLongPressTimer = useCallback(() => {
+    const timer = touchRef.current.timer;
+    if (timer !== null) {
+      clearTimeout(timer);
+      touchRef.current.timer = null;
+    }
+  }, []);
+
+  const startDrag = useCallback(
+    (pageY: number, locationY: number) => {
+      const touch = touchRef.current;
+      if (!touch.active || touch.cancelled || !touch.longPressed) return;
+      if (touch.dragActive) return;
+      touch.dragActive = true;
+      touch.suppressNextPress = true;
+      callbacksRef.current.onDragStart(item.id, pageY, locationY);
+    },
+    [item.id],
+  );
+
+  const finishDrag = useCallback(
+    (pageY: number) => {
+      const touch = touchRef.current;
+      if (!touch.dragActive) return;
+      touch.dragActive = false;
+      touch.dragArmed = false;
+      touch.suppressNextPress = true;
+      callbacksRef.current.onDragEnd(item.id, pageY);
+    },
+    [item.id],
+  );
+
+  const beginLongPress = useCallback(() => {
+    const touch = touchRef.current;
+    if (touch.longPressed || touch.cancelled) return;
+    // テスト環境や一部のnative responderではonPressInが省略されて
+    // onLongPressだけ届くことがある。その場合も同じtouchとしてdragを
+    // 継続できるようactiveを補う。
+    if (!touch.active) {
+      touch.active = true;
+      touch.startPageY = 0;
+    }
+    touch.longPressed = true;
+    touch.dragArmed = true;
+    clearLongPressTimer();
+    callbacksRef.current.onLongPress(item.id);
+  }, [clearLongPressTimer, item.id]);
+
+  const beginTouch = useCallback(
+    (event: unknown) => {
+      const position = readTouchPosition(event);
+      const touch = touchRef.current;
+      clearLongPressTimer();
+      touch.active = true;
+      touch.cancelled = false;
+      touch.longPressed = false;
+      touch.dragArmed = false;
+      touch.dragActive = false;
+      touch.suppressNextPress = false;
+      touch.startPageY = position.pageY;
+      touch.timer = setTimeout(beginLongPress, TASK_LONG_PRESS_DELAY);
+    },
+    [beginLongPress, clearLongPressTimer],
+  );
+
+  const moveTouch = useCallback(
+    (event: unknown) => {
+      const touch = touchRef.current;
+      if (!touch.active) return;
+      const position = readTouchPosition(event);
+      if (!touch.longPressed) {
+        if (
+          Math.abs(position.pageY - touch.startPageY) > TASK_TOUCH_SLOP
+        ) {
+          touch.cancelled = true;
+          clearLongPressTimer();
+        }
+        return;
+      }
+      startDrag(position.pageY, position.locationY);
+      if (touch.dragActive) {
+        callbacksRef.current.onDragMove(item.id, position.pageY);
+      }
+    },
+    [clearLongPressTimer, item.id, startDrag],
+  );
+
+  const endTouch = useCallback(
+    (event: unknown) => {
+      const position = readTouchPosition(event);
+      clearLongPressTimer();
+      finishDrag(position.pageY);
+      touchRef.current.active = false;
+      touchRef.current.dragArmed = false;
+    },
+    [clearLongPressTimer, finishDrag],
+  );
+
+  const handlePress = useCallback(() => {
+    if (touchRef.current.suppressNextPress) {
+      touchRef.current.suppressNextPress = false;
+      return;
+    }
+    onPress(item);
+  }, [item, onPress]);
+
+  const panResponder = useRef(
+    PanResponder.create({
+      onMoveShouldSetPanResponderCapture: () => touchRef.current.dragArmed,
+      onMoveShouldSetPanResponder: () => touchRef.current.dragArmed,
+      onPanResponderGrant: (event: GestureResponderEvent) => {
+        const position = readTouchPosition(event);
+        startDrag(position.pageY, position.locationY);
+      },
+      onPanResponderMove: (_event, gestureState) => {
+        if (!touchRef.current.dragActive) return;
+        callbacksRef.current.onDragMove(item.id, gestureState.moveY);
+      },
+      onPanResponderRelease: (_event, gestureState) => {
+        finishDrag(gestureState.moveY);
+        touchRef.current.active = false;
+        touchRef.current.dragArmed = false;
+        clearLongPressTimer();
+      },
+      onPanResponderTerminate: (_event, gestureState) => {
+        finishDrag(gestureState.moveY);
+        touchRef.current.active = false;
+        touchRef.current.dragArmed = false;
+        clearLongPressTimer();
+      },
+      onPanResponderTerminationRequest: () => false,
+    }),
+  ).current;
+
+  return (
+    <View
+      onLayout={(event) => onLayout(item.id, event)}
+      style={[styles.taskCard, selected && styles.taskCardSelected, dragging && styles.taskCardDragging]}
+    >
+      <Pressable
+        {...panResponder.panHandlers}
+        style={({ pressed }) => [
+          styles.taskCardPressable,
+          pressed && styles.taskCardPressed,
+        ]}
+        onPressIn={beginTouch}
+        onPress={handlePress}
+        onPressOut={endTouch}
+        onTouchMove={moveTouch}
+        onTouchEnd={endTouch}
+        onLongPress={beginLongPress}
+        delayLongPress={TASK_LONG_PRESS_DELAY}
+        hitSlop={4}
+        accessibilityRole="button"
+        accessibilityState={{ selected }}
+        accessibilityLabel={`${item.title}を開く`}
+        accessibilityHint="長押しで選択し、そのままドラッグして並べ替えます"
+      >
+        <View style={styles.taskRow}>
+          <View style={styles.statusButtonSpacer} />
+          <View style={styles.taskContent} pointerEvents="none">
+            <View style={styles.compactMainRow}>
+              <Text
+                style={[
+                  styles.taskTitle,
+                  item.status === "closed" && styles.taskTitleDone,
+                ]}
+                numberOfLines={1}
+              >
+                {item.title}
+              </Text>
+              {item.tags?.slice(0, 2).map((tag) => (
+                <View
+                  key={tag.id}
+                  style={[
+                    styles.compactTag,
+                    { backgroundColor: tag.color || "#45475a" },
+                  ]}
+                >
+                  <Text style={styles.compactTagText} numberOfLines={1}>
+                    {tag.name}
+                  </Text>
+                </View>
+              ))}
+              {(item.tags?.length ?? 0) > 2 ? (
+                <Text style={styles.moreTagsText}>+{item.tags.length - 2}</Text>
+              ) : null}
+              {selected ? (
+                <Chip
+                  compact
+                  style={styles.selectedChip}
+                  textStyle={styles.selectedChipText}
+                >
+                  選択中
+                </Chip>
+              ) : null}
+            </View>
+            {item.start_at ||
+            (!selectedProjectId && item.project_name) ||
+            item.active_time_entry ? (
+              <View style={styles.compactMetaRow}>
+                {item.start_at ? (
+                  <Text style={styles.dueDate} numberOfLines={1}>
+                    {formatTaskDateLabel(item.start_at, {
+                      allDay: item.all_day,
+                      absoluteStyle: "short",
+                    })}
+                  </Text>
+                ) : null}
+                {!selectedProjectId && item.project_name ? (
+                  <Text style={styles.projectText} numberOfLines={1}>
+                    {item.project_name}
+                  </Text>
+                ) : null}
+                {item.active_time_entry ? (
+                  <Text style={styles.compactTimerText}>● 計測中</Text>
+                ) : null}
+              </View>
+            ) : null}
+          </View>
+        </View>
+      </Pressable>
+      <View style={styles.statusAction}>
+        <Menu
+          visible={statusMenuVisible}
+          onDismiss={onStatusMenuDismiss}
+          anchor={
+            <IconButton
+              icon={statusOption?.icon || "circle-outline"}
+              iconColor={statusOption?.color || "#a6adc8"}
+              size={24}
+              mode="contained-tonal"
+              disabled={statusBusy}
+              onPress={() => onStatusMenuOpen()}
+              onLongPress={() => onLongPress(item.id)}
+              style={styles.statusButton}
+              accessibilityLabel={`${item.title}のステータスを選択`}
+              accessibilityRole="button"
+              hitSlop={4}
+            />
+          }
+          contentStyle={styles.menuContent}
+        >
+          {TASK_STATUS_OPTIONS.map((option) => (
+            <Menu.Item
+              key={option.value}
+              title={option.label}
+              leadingIcon={item.status === option.value ? "check" : option.icon}
+              disabled={item.status === option.value || statusBusy}
+              onPress={() => onStatusUpdate(item, option.value)}
+            />
+          ))}
+        </Menu>
+      </View>
+    </View>
+  );
+}
+
 export default function TaskListScreen() {
   const router = useRouter();
   const {
@@ -709,10 +525,6 @@ export default function TaskListScreen() {
     selectedProject,
     selectedSpaceId,
     selectedSpace,
-    spaces,
-    projects,
-    setSelectedSpaceId,
-    setSelectedProjectId,
     refreshProjects,
   } = useProject();
   const { isAuthenticated, isAnonymous, user } = useAuth();
@@ -724,11 +536,11 @@ export default function TaskListScreen() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [filter, setFilter] = useState<string>("all");
   const [showFuture, setShowFuture] = useState(false);
+  const [statusFilterMenuVisible, setStatusFilterMenuVisible] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [search, setSearch] = useState("");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
-  const [scopeMenuVisible, setScopeMenuVisible] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const completionRefreshToken = useTaskCompletionUndoStore(
     (state) => state.refreshToken,
@@ -740,35 +552,43 @@ export default function TaskListScreen() {
   const [statusMenuTaskId, setStatusMenuTaskId] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [draggingTaskId, setDraggingTaskId] = useState<string | null>(null);
-  const [dragOverTaskId, setDragOverTaskId] = useState<string | null>(null);
-  const rowLayoutsRef = useRef(new Map<string, RowLayout>());
-  const listFrameRef = useRef<View | null>(null);
-  const listWindowYRef = useRef(0);
-  const listScrollYRef = useRef(0);
-  const tasksRef = useRef<Task[]>([]);
-  const filteredTasksRef = useRef<Task[]>([]);
-  const dragOriginalTasksRef = useRef<Task[]>([]);
-  const dragOriginalOrderRef = useRef<string[]>([]);
-  const dragCurrentOrderRef = useRef<string[]>([]);
-  const dragActiveRef = useRef(false);
-  const dragSaveBusyRef = useRef(false);
+  const longPressedTaskIdRef = useRef<string | null>(null);
   const loadRequestRef = useRef(0);
+  const tasksRef = useRef<Task[]>([]);
+  const selectedIdsRef = useRef<Set<string>>(new Set());
+  const filteredTasksRef = useRef<Task[]>([]);
+  const taskLayoutsRef = useRef<Map<string, { y: number; height: number }>>(
+    new Map(),
+  );
+  const dragRef = useRef<{
+    taskId: string;
+    selectedTaskIds: Set<string>;
+    canonicalTaskIds: string[];
+    visibleTaskIds: string[];
+    targetVisibleIndex: number;
+    sourcePageY: number;
+    sourceLocationY: number;
+    sourceLayoutY: number | null;
+  } | null>(null);
 
-  const loadTasks = useCallback(async () => {
+  const loadTasks = useCallback(
+    async (options?: { force?: boolean }) => {
     const requestId = ++loadRequestRef.current;
     try {
       const list = selectedProjectId
-        ? await tasksRepo.list(selectedProjectId)
+        ? await tasksRepo.list(selectedProjectId, options)
         : await tasksRepo.listByScope(
             selectedSpaceId ? { space_id: selectedSpaceId } : {},
+            options,
           );
       if (requestId === loadRequestRef.current) {
-        setTasks(list);
+        const canonical = sortTasksCanonical(list);
+        tasksRef.current = canonical;
+        setTasks(canonical);
         setLoadError(null);
       }
     } catch (error) {
       if (requestId === loadRequestRef.current) {
-        setTasks([]);
         setLoadError(
           error instanceof Error ? error.message : "タスク取得に失敗しました",
         );
@@ -778,8 +598,23 @@ export default function TaskListScreen() {
 
   useFocusEffect(
     useCallback(() => {
+      let active = true;
+      // フォーカス時はデルタ同期で鮮度を担保し、フル取得は throttle 側に委ねる。
+      // 同期はSQLiteへ1行ずつ書き込むため、同時に読むと書き込み途中の中間状態を
+      // 拾って毎回違う並びになる。同期完了後にもう一度読み直す。
+      void (async () => {
+        void loadTasks();
+        try {
+          await runSync();
+        } catch {
+          // 同期失敗はローカル表示を妨げない。
+        }
+        if (active) void loadTasks();
+      })();
       void refreshProjects();
-      void loadTasks();
+      return () => {
+        active = false;
+      };
     }, [loadTasks, refreshProjects]),
   );
 
@@ -788,18 +623,24 @@ export default function TaskListScreen() {
   }, [completionRefreshToken, loadTasks]);
 
   useEffect(() => {
+    selectedIdsRef.current = selectedIds;
+  }, [selectedIds]);
+
+  useEffect(() => {
     setSelectedIds((prev) => {
       const next = new Set(
         [...prev].filter((taskId) => tasks.some((task) => task.id === taskId)),
       );
+      selectedIdsRef.current = next;
       return next.size === prev.size ? prev : next;
     });
   }, [tasks]);
 
   const onRefresh = async () => {
     setRefreshing(true);
-    await refreshProjects();
-    await loadTasks();
+    // pull-to-refresh は throttle を無視してフル取得を強制する。
+    await useProjectStore.getState().refreshProjects({ force: true });
+    await loadTasks({ force: true });
     setRefreshing(false);
   };
 
@@ -831,207 +672,21 @@ export default function TaskListScreen() {
       );
     }
 
-    return result;
+    return sortTasksCanonical(result);
   }, [filter, search, showFuture, tasks]);
+
+  useEffect(() => {
+    tasksRef.current = tasks;
+    filteredTasksRef.current = filteredTasks;
+  }, [filteredTasks, tasks]);
 
   const scopeLabel = selectedProject
     ? `プロジェクト: ${selectedProject.name}`
     : selectedSpace
       ? `スペース: ${selectedSpace.name}`
-      : "すべてのスペース";
-  const displayConditionLabel = [
-    selectedProject?.name ?? selectedSpace?.name ?? "全体",
-    filter !== "all" ? FILTER_LABELS[filter] : null,
-    showFuture ? "未来含む" : null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
-
-  useEffect(() => {
-    tasksRef.current = tasks;
-  }, [tasks]);
-
-  useEffect(() => {
-    filteredTasksRef.current = filteredTasks;
-  }, [filteredTasks]);
-
-  const measureListFrame = useCallback(() => {
-    requestAnimationFrame(() => {
-      listFrameRef.current?.measureInWindow((_x, y) => {
-        listWindowYRef.current = y;
-      });
-    });
-  }, []);
-
-  const handleTaskRowLayout = useCallback(
-    (taskId: string, event: LayoutChangeEvent) => {
-      const { y, height } = event.nativeEvent.layout;
-      rowLayoutsRef.current.set(taskId, { y, height });
-    },
-    [],
-  );
-
-  const getReorderableTasks = useCallback(
-    (source: Task[]) => {
-      const spaceProjectIds = selectedSpaceId
-        ? new Set(
-            projects
-              .filter((project) => project.space_id === selectedSpaceId)
-              .map((project) => project.id),
-          )
-        : null;
-      return source.filter((task) => {
-        if (task.parent_task_id) return false;
-        if (selectedProjectId) return task.project_id === selectedProjectId;
-        if (spaceProjectIds) return spaceProjectIds.has(task.project_id);
-        return true;
-      });
-    },
-    [projects, selectedProjectId, selectedSpaceId],
-  );
-
-  const applyOrderToTasks = useCallback(
-    (source: Task[], orderedIds: string[]) => {
-      const order = new Map(orderedIds.map((taskId, index) => [taskId, index]));
-      const reorderableIds = new Set(
-        getReorderableTasks(source).map((task) => task.id),
-      );
-      const reordered = [...source].sort((a, b) => {
-        const aOrder = order.get(a.id);
-        const bOrder = order.get(b.id);
-        if (aOrder != null && bOrder != null) return aOrder - bOrder;
-        if (reorderableIds.has(a.id) && reorderableIds.has(b.id)) {
-          if (aOrder != null) return -1;
-          if (bOrder != null) return 1;
-        }
-        return 0;
-      });
-      return reordered.map((task) => {
-        const nextOrder = order.get(task.id);
-        return nextOrder == null ? task : { ...task, sort_order: nextOrder };
-      });
-    },
-    [getReorderableTasks],
-  );
-
-  const findDragTarget = useCallback((pageY: number) => {
-    const visibleIds = filteredTasksRef.current
-      .filter((task) => !task.parent_task_id)
-      .map((task) => task.id);
-    const contentY = pageY - listWindowYRef.current + listScrollYRef.current;
-    let nearest: {
-      taskId: string;
-      distance: number;
-      insertAfter: boolean;
-    } | null = null;
-
-    for (const taskId of visibleIds) {
-      const layout = rowLayoutsRef.current.get(taskId);
-      if (!layout) continue;
-      const mid = layout.y + layout.height / 2;
-      const distance = Math.abs(contentY - mid);
-      const candidate = {
-        taskId,
-        distance,
-        insertAfter: contentY >= mid,
-      };
-      if (contentY >= layout.y && contentY <= layout.y + layout.height) {
-        return candidate;
-      }
-      if (!nearest || distance < nearest.distance) nearest = candidate;
-    }
-
-    return nearest;
-  }, []);
-
-  const updateDragPosition = useCallback(
-    (pageY: number) => {
-      if (!dragActiveRef.current || !draggingTaskId) return;
-      const target = findDragTarget(pageY);
-      if (!target || target.taskId === draggingTaskId) return;
-      const nextOrder = reorderIds(
-        dragCurrentOrderRef.current,
-        draggingTaskId,
-        target.taskId,
-        target.insertAfter,
-      );
-      if (sameOrder(nextOrder, dragCurrentOrderRef.current)) return;
-      dragCurrentOrderRef.current = nextOrder;
-      setDragOverTaskId(target.taskId);
-      setTasks((current) => applyOrderToTasks(current, nextOrder));
-    },
-    [applyOrderToTasks, draggingTaskId, findDragTarget],
-  );
-
-  const beginTaskDrag = useCallback(
-    (task: Task, pageY: number) => {
-      if (bulkBusy || dragSaveBusyRef.current) return;
-      if (task.parent_task_id) {
-        setActionMessage("サブタスクの並び替えはまだ対応していません");
-        return;
-      }
-      const reorderableTasks = getReorderableTasks(tasksRef.current);
-      const order = reorderableTasks.map((item) => item.id);
-      if (order.length < 2 || !order.includes(task.id)) return;
-
-      dragActiveRef.current = true;
-      dragOriginalTasksRef.current = tasksRef.current;
-      dragOriginalOrderRef.current = order;
-      dragCurrentOrderRef.current = order;
-      setDraggingTaskId(task.id);
-      setDragOverTaskId(task.id);
-      setSelectedIds(new Set());
-      measureListFrame();
-      updateDragPosition(pageY);
-    },
-    [
-      bulkBusy,
-      getReorderableTasks,
-      measureListFrame,
-      selectedProjectId,
-      updateDragPosition,
-    ],
-  );
-
-  const handleTaskTouchMove = useCallback(
-    (event: GestureResponderEvent) => {
-      if (!dragActiveRef.current) return;
-      updateDragPosition(event.nativeEvent.pageY);
-    },
-    [updateDragPosition],
-  );
-
-  const finishTaskDrag = useCallback(async () => {
-    if (!dragActiveRef.current || dragSaveBusyRef.current) return;
-
-    const nextOrder = dragCurrentOrderRef.current;
-    const previousOrder = dragOriginalOrderRef.current;
-    const previousTasks = dragOriginalTasksRef.current;
-    const changed = !sameOrder(previousOrder, nextOrder);
-
-    dragActiveRef.current = false;
-    setDraggingTaskId(null);
-    setDragOverTaskId(null);
-    dragOriginalOrderRef.current = [];
-    dragCurrentOrderRef.current = [];
-
-    if (!changed) return;
-
-    dragSaveBusyRef.current = true;
-    try {
-      await tasksRepo.reorder(selectedProjectId, nextOrder);
-      await loadTasks();
-      setActionMessage("並び替えを保存しました");
-    } catch (error) {
-      setTasks(previousTasks);
-      setActionMessage(
-        error instanceof Error ? error.message : "並び替えの保存に失敗しました",
-      );
-    } finally {
-      dragSaveBusyRef.current = false;
-      dragOriginalTasksRef.current = [];
-    }
-  }, [loadTasks, selectedProjectId]);
+      : "すべてのプロジェクト";
+  const scopeSwitcherLabel =
+    selectedProject?.name ?? selectedSpace?.name ?? "全体";
 
   const selectedTasks = useMemo(
     () => tasks.filter((task) => selectedIds.has(task.id)),
@@ -1042,7 +697,10 @@ export default function TaskListScreen() {
     [selectedTasks],
   );
 
-  const clearSelection = useCallback(() => setSelectedIds(new Set()), []);
+  const clearSelection = useCallback(() => {
+    selectedIdsRef.current = new Set();
+    setSelectedIds(new Set());
+  }, []);
 
   const closeTaskCommandDialog = useCallback(() => {
     setShowCommandDialog(false);
@@ -1059,6 +717,7 @@ export default function TaskListScreen() {
       const next = new Set(prev);
       if (next.has(taskId)) next.delete(taskId);
       else next.add(taskId);
+      selectedIdsRef.current = next;
       return next;
     });
   }, []);
@@ -1252,241 +911,207 @@ export default function TaskListScreen() {
 
   const handleTaskPress = useCallback(
     (task: Task) => {
-      if (dragActiveRef.current || dragSaveBusyRef.current) return;
-      if (selectedIds.size > 0) {
+      const action = resolveTaskPressAction({
+        wasLongPress: longPressedTaskIdRef.current === task.id,
+        selectionMode: selectedIds.size > 0,
+      });
+      longPressedTaskIdRef.current = null;
+      if (action === "toggle-selection") {
         toggleSelection(task.id);
-        return;
+      } else if (action === "navigate") {
+        router.push(`/(tabs)/tasks/${task.id}`);
       }
-      router.push(`/(tabs)/tasks/${task.id}`);
     },
     [router, selectedIds.size, toggleSelection],
   );
 
-  const renderItem = ({ item }: { item: Task }) => {
-    const selected = selectedIds.has(item.id);
+  const handleTaskLongPress = useCallback(
+    (taskId: string) => {
+      longPressedTaskIdRef.current = taskId;
+      // 選択中のtaskを長押しした場合はselection blockを維持し、そのまま
+      // block dragへ入る。未選択taskだけselectionへ追加する。
+      if (!selectedIdsRef.current.has(taskId)) {
+        toggleSelection(taskId);
+      }
+    },
+    [toggleSelection],
+  );
 
+  const handleTaskLayout = useCallback(
+    (taskId: string, event: LayoutChangeEvent) => {
+      const { y, height } = event.nativeEvent.layout;
+      taskLayoutsRef.current.set(taskId, { y, height });
+    },
+    [],
+  );
+
+  const beginTaskDrag = useCallback(
+    (taskId: string, pageY: number, locationY: number) => {
+      if (dragRef.current) return;
+      const canonicalTaskIds = tasksRef.current
+        .filter((task) => !task.parent_task_id)
+        .map((task) => task.id);
+      const visibleTaskIds = filteredTasksRef.current.map((task) => task.id);
+      if (
+        !canonicalTaskIds.includes(taskId) ||
+        !visibleTaskIds.includes(taskId)
+      ) {
+        longPressedTaskIdRef.current = null;
+        return;
+      }
+      const selectedTaskIds = new Set(
+        visibleTaskIds.filter((id) => selectedIdsRef.current.has(id)),
+      );
+      selectedTaskIds.add(taskId);
+      const sourceLayoutY = taskLayoutsRef.current.get(taskId)?.y ?? null;
+      dragRef.current = {
+        taskId,
+        selectedTaskIds,
+        canonicalTaskIds,
+        visibleTaskIds,
+        targetVisibleIndex: visibleTaskIds.indexOf(taskId),
+        sourcePageY: pageY,
+        sourceLocationY: locationY,
+        sourceLayoutY,
+      };
+      setDraggingTaskId(taskId);
+    },
+    [],
+  );
+
+  const updateTaskDrag = useCallback((taskId: string, pageY: number) => {
+    const drag = dragRef.current;
+    if (!drag || drag.taskId !== taskId) return;
+
+    const sourceIndex = drag.visibleTaskIds.indexOf(taskId);
+    const sourceTop =
+      drag.sourcePageY -
+      drag.sourceLocationY -
+      (drag.sourceLayoutY ?? sourceIndex * 56);
+    const fallbackHeight =
+      taskLayoutsRef.current.get(taskId)?.height ??
+      [...taskLayoutsRef.current.values()][0]?.height ??
+      56;
+    let targetVisibleIndex = drag.visibleTaskIds.length;
+    for (const [index, visibleTaskId] of drag.visibleTaskIds.entries()) {
+      const layout = taskLayoutsRef.current.get(visibleTaskId);
+      const top = layout ? sourceTop + layout.y : sourceTop + index * fallbackHeight;
+      const height = layout?.height ?? fallbackHeight;
+      if (pageY < top + height / 2) {
+        targetVisibleIndex = index;
+        break;
+      }
+    }
+    drag.targetVisibleIndex = targetVisibleIndex;
+  }, []);
+
+  const applyTopLevelOrder = useCallback(
+    (baseTasks: readonly Task[], orderedTopLevelIds: readonly string[]) => {
+      const byId = new Map(baseTasks.map((task) => [task.id, task]));
+      let topLevelIndex = 0;
+      return baseTasks.map((task) => {
+        if (task.parent_task_id) return task;
+        const nextIndex = topLevelIndex++;
+        const nextId = orderedTopLevelIds[nextIndex];
+        const nextTask = nextId ? byId.get(nextId) : undefined;
+        return nextTask
+          ? { ...nextTask, sort_order: nextIndex }
+          : task;
+      });
+    },
+    [],
+  );
+
+  const finishTaskDrag = useCallback(
+    async (taskId: string, _pageY: number) => {
+      const drag = dragRef.current;
+      if (!drag || drag.taskId !== taskId) return;
+      dragRef.current = null;
+      setDraggingTaskId(null);
+      longPressedTaskIdRef.current = null;
+
+      const nextCanonicalTaskIds = reorderVisibleTaskIds({
+        canonicalTaskIds: drag.canonicalTaskIds,
+        visibleTaskIds: drag.visibleTaskIds,
+        selectedTaskIds: drag.selectedTaskIds,
+        targetVisibleIndex: drag.targetVisibleIndex,
+      });
+      if (areTaskOrdersEqual(nextCanonicalTaskIds, drag.canonicalTaskIds)) {
+        return;
+      }
+
+      const previousTasks = tasksRef.current;
+      const optimisticTasks = applyTopLevelOrder(
+        previousTasks,
+        nextCanonicalTaskIds,
+      );
+      tasksRef.current = optimisticTasks;
+      setTasks(optimisticTasks);
+      try {
+        await tasksRepo.reorder(
+          selectedProjectId || null,
+          nextCanonicalTaskIds,
+        );
+      } catch (error) {
+        // local-first repositoryが成功した場合は警告を出さず、失敗時だけ
+        // optimistic orderを元へ戻す。offline専用の文言は表示しない。
+        if (tasksRef.current === optimisticTasks) {
+          tasksRef.current = previousTasks;
+          setTasks(previousTasks);
+        }
+        setActionMessage(
+          error instanceof Error
+            ? error.message
+            : "並び替えの保存に失敗しました",
+        );
+      }
+    },
+    [applyTopLevelOrder, selectedProjectId],
+  );
+
+  const renderItem = ({ item }: { item: Task }) => {
     return (
-      <Surface
-        style={[
-          styles.taskCard,
-          selected && styles.taskCardSelected,
-          draggingTaskId === item.id && styles.taskCardDragging,
-          dragOverTaskId === item.id &&
-            draggingTaskId !== item.id &&
-            styles.taskCardDropTarget,
-        ]}
-        elevation={0}
-        onLayout={(event) => handleTaskRowLayout(item.id, event)}
-      >
-        <View style={styles.taskRow}>
-          <Menu
-            visible={statusMenuTaskId === item.id}
-            onDismiss={() => setStatusMenuTaskId(null)}
-            anchor={
-              <IconButton
-                icon={
-                  STATUS_OPTIONS.find((option) => option.value === item.status)
-                    ?.icon || "circle-outline"
-                }
-                iconColor={STATUS_COLORS[item.status] || "#a6adc8"}
-                size={24}
-                mode="contained-tonal"
-                disabled={statusBusyIds.has(item.id)}
-                onPress={() => setStatusMenuTaskId(item.id)}
-                onLongPress={() => toggleSelection(item.id)}
-                style={styles.statusButton}
-                accessibilityLabel={`${item.title}のステータスを選択`}
-              />
-            }
-            contentStyle={styles.menuContent}
-          >
-            {STATUS_OPTIONS.map((option) => (
-              <Menu.Item
-                key={option.value}
-                title={option.label}
-                leadingIcon={
-                  item.status === option.value ? "check" : option.icon
-                }
-                disabled={
-                  item.status === option.value || statusBusyIds.has(item.id)
-                }
-                onPress={() =>
-                  void updateTaskStatusFromMenu(item, option.value)
-                }
-              />
-            ))}
-          </Menu>
-          <Pressable
-            style={({ pressed }) => [
-              styles.taskContent,
-              pressed && styles.taskContentPressed,
-            ]}
-            onPress={() => handleTaskPress(item)}
-            onLongPress={(event) =>
-              beginTaskDrag(item, event.nativeEvent.pageY)
-            }
-            delayLongPress={280}
-          >
-            <View style={styles.compactMainRow}>
-              <Text
-                style={[
-                  styles.taskTitle,
-                  item.status === "closed" && styles.taskTitleDone,
-                ]}
-                numberOfLines={1}
-              >
-                {item.title}
-              </Text>
-              {item.tags?.slice(0, 2).map((tag) => (
-                <View
-                  key={tag.id}
-                  style={[
-                    styles.compactTag,
-                    { backgroundColor: tag.color || "#45475a" },
-                  ]}
-                >
-                  <Text style={styles.compactTagText} numberOfLines={1}>
-                    {tag.name}
-                  </Text>
-                </View>
-              ))}
-              {(item.tags?.length ?? 0) > 2 ? (
-                <Text style={styles.moreTagsText}>+{item.tags.length - 2}</Text>
-              ) : null}
-              {selected ? (
-                <Chip
-                  compact
-                  style={styles.selectedChip}
-                  textStyle={styles.selectedChipText}
-                >
-                  選択中
-                </Chip>
-              ) : null}
-            </View>
-            {item.start_at ||
-            (!selectedProjectId && item.project_name) ||
-            item.active_time_entry ? (
-              <View style={styles.compactMetaRow}>
-                {item.start_at ? (
-                  <Text style={styles.dueDate} numberOfLines={1}>
-                    {formatTaskDateLabel(item.start_at, {
-                      allDay: item.all_day,
-                      absoluteStyle: "short",
-                    })}
-                  </Text>
-                ) : null}
-                {!selectedProjectId && item.project_name ? (
-                  <Text style={styles.projectText} numberOfLines={1}>
-                    {item.project_name}
-                  </Text>
-                ) : null}
-                {item.active_time_entry ? (
-                  <Text style={styles.compactTimerText}>● 計測中</Text>
-                ) : null}
-              </View>
-            ) : null}
-          </Pressable>
-        </View>
-      </Surface>
+      <TaskCard
+        item={item}
+        selected={selectedIds.has(item.id)}
+        selectedProjectId={selectedProjectId}
+        statusOption={getTaskStatusOption(item.status)}
+        statusBusy={statusBusyIds.has(item.id)}
+        statusMenuVisible={statusMenuTaskId === item.id}
+        dragging={draggingTaskId === item.id}
+        onLayout={handleTaskLayout}
+        onPress={handleTaskPress}
+        onLongPress={handleTaskLongPress}
+        onDragStart={beginTaskDrag}
+        onDragMove={updateTaskDrag}
+        onDragEnd={finishTaskDrag}
+        onStatusMenuDismiss={() => setStatusMenuTaskId(null)}
+        onStatusMenuOpen={() => {
+          if (longPressedTaskIdRef.current === item.id) {
+            longPressedTaskIdRef.current = null;
+            return;
+          }
+          longPressedTaskIdRef.current = null;
+          setStatusMenuTaskId(item.id);
+        }}
+        onStatusUpdate={(task, status) => {
+          void updateTaskStatusFromMenu(task, status);
+        }}
+      />
     );
   };
 
   return (
-    <View
-      style={styles.container}
-      onTouchMove={handleTaskTouchMove}
-      onTouchEnd={() => {
-        void finishTaskDrag();
-      }}
-      onTouchCancel={() => {
-        void finishTaskDrag();
-      }}
-    >
+    <View style={styles.container}>
       <ScreenHeader
         title="タスク"
         subtitle={scopeLabel}
         right={
-          <Menu
-            visible={scopeMenuVisible}
-            onDismiss={() => setScopeMenuVisible(false)}
-            anchor={
-              <Chip
-                compact
-                icon="tune-variant"
-                onPress={() => {
-                  setScopeMenuVisible(true);
-                  void refreshProjects();
-                }}
-                style={styles.displayConditionChip}
-                textStyle={styles.projectChipText}
-              >
-                {displayConditionLabel}
-              </Chip>
-            }
-            contentStyle={styles.menuContent}
-          >
-            <Menu.Item title="Project" disabled />
-            <Menu.Item
-              title="全体"
-              leadingIcon={
-                !selectedProjectId && !selectedSpaceId ? "check" : undefined
-              }
-              onPress={() => {
-                setSelectedProjectId(null);
-                setSelectedSpaceId("");
-                setScopeMenuVisible(false);
-              }}
-            />
-            {spaces.map((space) => (
-              <Menu.Item
-                key={`space-${space.id}`}
-                title={`Space: ${space.name}`}
-                leadingIcon={
-                  !selectedProjectId && space.id === selectedSpaceId
-                    ? "check"
-                    : undefined
-                }
-                onPress={() => {
-                  setSelectedProjectId(null);
-                  setSelectedSpaceId(space.id);
-                  setScopeMenuVisible(false);
-                }}
-              />
-            ))}
-            {projects.map((project) => (
-              <Menu.Item
-                key={`project-${project.id}`}
-                title={`Project: ${project.name}`}
-                leadingIcon={
-                  project.id === selectedProjectId ? "check" : undefined
-                }
-                onPress={() => {
-                  setSelectedProjectId(project.id);
-                  setScopeMenuVisible(false);
-                }}
-              />
-            ))}
-            <Menu.Item title="状態" disabled />
-            {FILTERS.map((item) => (
-              <Menu.Item
-                key={`filter-${item}`}
-                title={FILTER_LABELS[item]}
-                leadingIcon={filter === item ? "check" : undefined}
-                onPress={() => {
-                  setFilter(item);
-                  setScopeMenuVisible(false);
-                }}
-              />
-            ))}
-            <Menu.Item
-              title="未来のタスクも表示"
-              leadingIcon={showFuture ? "check" : undefined}
-              onPress={() => {
-                setShowFuture((value) => !value);
-                setScopeMenuVisible(false);
-              }}
-            />
-          </Menu>
+          <ScopeSwitcher
+            label={scopeSwitcherLabel}
+            variant="chip"
+            accessibilityLabel={`表示範囲: ${scopeSwitcherLabel}`}
+          />
         }
       />
       <Surface style={styles.header} elevation={1}>
@@ -1499,6 +1124,48 @@ export default function TaskListScreen() {
           style={styles.searchInput}
           left={<TextInput.Icon icon="magnify" />}
         />
+
+        <View style={styles.filterRow}>
+          <Menu
+            visible={statusFilterMenuVisible}
+            onDismiss={() => setStatusFilterMenuVisible(false)}
+            anchor={
+              <Chip
+                compact
+                icon="filter-variant"
+                onPress={() => setStatusFilterMenuVisible(true)}
+                style={styles.filterChip}
+                textStyle={styles.filterChipText}
+              >
+                状態: {FILTER_LABELS[filter]}
+              </Chip>
+            }
+            contentStyle={styles.menuContent}
+          >
+            {FILTERS.map((item) => (
+              <Menu.Item
+                key={item}
+                title={FILTER_LABELS[item]}
+                leadingIcon={filter === item ? "check" : undefined}
+                onPress={() => {
+                  setFilter(item);
+                  setStatusFilterMenuVisible(false);
+                }}
+              />
+            ))}
+          </Menu>
+
+          <Chip
+            compact
+            selected={showFuture}
+            icon={showFuture ? "calendar-clock" : "calendar-outline"}
+            onPress={() => setShowFuture((value) => !value)}
+            style={styles.filterChip}
+            textStyle={styles.filterChipText}
+          >
+            未来を表示
+          </Chip>
+        </View>
 
         {selectedIds.size > 0 ? (
           <View style={styles.bulkBar}>
@@ -1552,16 +1219,12 @@ export default function TaskListScreen() {
           </View>
         ) : (
           <Text style={styles.hintText}>
-            タップで開く / 長押しで並び替え / ステータス長押しで複数選択
+            タップで開く / 長押しで複数選択
           </Text>
         )}
       </Surface>
 
-      <View
-        ref={listFrameRef}
-        style={styles.listFrame}
-        onLayout={measureListFrame}
-      >
+      <View style={styles.listFrame}>
         <FlatList
           data={filteredTasks}
           keyExtractor={(item) => item.id}
@@ -1574,10 +1237,6 @@ export default function TaskListScreen() {
               tintColor="#7c3aed"
             />
           }
-          onScroll={(event) => {
-            listScrollYRef.current = event.nativeEvent.contentOffset.y;
-          }}
-          scrollEventThrottle={16}
           contentContainerStyle={styles.listContent}
           ListEmptyComponent={
             <View style={styles.empty}>
@@ -1638,16 +1297,14 @@ const styles = StyleSheet.create({
     gap: 7,
   },
   displayConditionChip: { backgroundColor: "#313244", maxWidth: 190 },
+  filterRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  filterChip: { backgroundColor: "#313244", maxWidth: 190 },
+  filterChipText: { color: "#cdd6f4" },
   projectChip: { backgroundColor: "#313244" },
   scopeChip: { backgroundColor: "#181825" },
   scopeActions: { flexDirection: "row", alignItems: "center", gap: 6 },
   projectChipText: { color: "#cdd6f4" },
   searchInput: { backgroundColor: "transparent" },
-  filterRow: { flexDirection: "row", gap: 8, flexWrap: "wrap" },
-  filterChip: { backgroundColor: "#313244" },
-  filterChipActive: { backgroundColor: "#4c1d95" },
-  filterChipText: { color: "#a6adc8", fontSize: 12 },
-  filterChipTextActive: { color: "#cdd6f4", fontSize: 12 },
   bulkBar: { gap: 10 },
   bulkText: { color: "#cdd6f4", fontSize: 13, fontWeight: "600" },
   bulkActions: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
@@ -1660,20 +1317,21 @@ const styles = StyleSheet.create({
     marginHorizontal: 2,
     borderWidth: 1,
     borderColor: "transparent",
+    position: "relative",
   },
   taskCardSelected: {
     borderColor: "#7c3aed",
     backgroundColor: "#221b3b",
   },
   taskCardDragging: {
-    borderColor: "#89b4fa",
-    backgroundColor: "#1b2b45",
+    borderColor: "#cba6f7",
     opacity: 0.82,
   },
-  taskCardDropTarget: {
-    borderColor: "#89b4fa",
-  },
+  taskCardPressable: { borderRadius: 8 },
+  taskCardPressed: { opacity: 0.75 },
   taskRow: { flexDirection: "row", alignItems: "center", padding: 4 },
+  statusAction: { position: "absolute", left: 4, top: 4, zIndex: 1 },
+  statusButtonSpacer: { width: 38, height: 36, flexShrink: 0 },
   statusButton: {
     margin: 0,
     marginRight: 2,
@@ -1682,7 +1340,6 @@ const styles = StyleSheet.create({
     height: 36,
   },
   taskContent: { flex: 1, paddingVertical: 2, paddingRight: 5 },
-  taskContentPressed: { opacity: 0.75 },
   taskTitleRow: {
     flexDirection: "row",
     alignItems: "flex-start",
@@ -1710,13 +1367,13 @@ const styles = StyleSheet.create({
     minHeight: 26,
   },
   compactTag: {
-    maxWidth: 72,
-    paddingHorizontal: 6,
-    paddingVertical: 1,
-    borderRadius: 5,
+    maxWidth: 96,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
   },
-  compactTagText: { color: "#f5f5f7", fontSize: 9 },
-  moreTagsText: { color: "#9399b2", fontSize: 9 },
+  compactTagText: { color: "#f5f5f7", fontSize: 12, fontWeight: "600" },
+  moreTagsText: { color: "#bac2de", fontSize: 11, fontWeight: "600" },
   compactMetaRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -1735,45 +1392,9 @@ const styles = StyleSheet.create({
   dialog: { backgroundColor: "#1e1e2e" },
   dialogTitle: { color: "#cdd6f4" },
   dialogInput: { marginBottom: 12 },
-  dialogRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 12,
-  },
-  dialogTwoColumn: { flexDirection: "row", gap: 10, marginBottom: 10 },
-  dialogColumn: { flex: 1 },
-  dialogLabel: { color: "#a6adc8", fontSize: 14 },
-  dialogSectionLabel: { color: "#a6adc8", fontSize: 13, marginBottom: 8 },
-  dialogChipRow: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 6,
-    marginBottom: 12,
-  },
-  switchRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    minHeight: 54,
-  },
-  switchRowFull: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 12,
-  },
-  newTagRow: {
-    flexDirection: "row",
-    gap: 8,
-    alignItems: "center",
-    marginBottom: 8,
-  },
-  newTagInput: { flex: 1, backgroundColor: "transparent" },
   commandTarget: { color: "#cdd6f4", marginBottom: 12 },
   commandHint: { color: "#9399b2", fontSize: 12 },
   commandError: { color: "#f38ba8", fontSize: 12, marginTop: 8 },
-  selectChip: { backgroundColor: "#313244" },
   menuContent: { backgroundColor: "#1e1e2e" },
   snackbar: { backgroundColor: "#313244" },
 });

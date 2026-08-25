@@ -21,7 +21,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id", default=None, help="MioTTS model id")
     parser.add_argument("--codec-model-id", default=None, help="MioCodec model id")
     parser.add_argument("--presets-dir", default=None, help="Output presets directory")
-    parser.add_argument("--cache-dir", default=None, help="Model cache directory")
     parser.add_argument("--device", default="auto", help="auto, cuda, or cpu")
     return parser.parse_args()
 
@@ -32,7 +31,6 @@ async def main() -> int:
         model_id=args.model_id,
         codec_model_id=args.codec_model_id,
         presets_dir=args.presets_dir,
-        cache_dir=args.cache_dir,
         device=args.device,
     )
     if not await engine.initialize():

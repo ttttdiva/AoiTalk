@@ -1,507 +1,446 @@
-"""シナリオ執筆支援ツール
+"""Story Studio の Story Team Subagent 用ツール。
 
-WritingAgentが使用する4つのツール:
-- get_writing_context: 執筆に必要なコンテキストを自動収集
-- save_scene_draft: 生成テキストをシーンのcontentに保存
-- update_canon_from_content: 確定事実をcanonに追加
-- get_character_voice: キャラクターの口調設定を取得
+本文・設定資料の正本は story_* のみとし、AI の本文変更は提案キューを通さず
+期待 etag を検証した単一トランザクションで直接保存する。旧 scenario / Docs
+書き戻しツールはこのモジュールから除去した。
 """
 
+from __future__ import annotations
+
+import asyncio
 import json
-import logging
-import uuid
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+from collections.abc import Mapping
+from typing import Any
+from uuid import UUID
+
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from .core import tool
+from ..memory.database import get_db_session
+from ..memory.models import ConversationSession
+from ..memory.models.story import (
+    StoryCharacter,
+    StoryEpisode,
+    StoryLink,
+    StoryNote,
+    StoryRulebook,
+    StoryWork,
+    StoryWorkCharacter,
+    StoryWorkRulebook,
+    StoryWritingSession,
+)
+from ..services.story_studio import (
+    StoryConflictError,
+    StoryEpisodeService,
+    StoryRevisionService,
+    StoryModelResolver,
+    build_story_context,
+)
 
-logger = logging.getLogger(__name__)
+
+# §8.8 層① の参照キー。docs_ingest_service.CLIP_INGEST_ROUTE_KEY と同じ流儀で定数化する。
+WRITING_ROUTE_KEY = "model_routing.classes.writing"
 
 
-@tool
-async def get_writing_context(conversation_id: str) -> str:
-    """執筆に必要なコンテキスト（シーン設定、キャラクター、文体定義など）を自動収集して返す。
+def _config_get(config: Any, path: str, default: Any = None) -> Any:
+    """ドット区切りでアプリ設定を辿る。"""
 
-    Args:
-        conversation_id: 現在の会話セッションID
+    current: Any = config
+    for part in path.split("."):
+        if not isinstance(current, Mapping):
+            return default
+        current = current.get(part)
+    return default if current is None else current
 
-    Returns:
-        Markdown形式の執筆コンテキスト
-    """
+
+def _load_app_config() -> dict[str, Any]:
+    """DB 保存のアプリ設定を読む。設定は config.yaml ではなく DB が正本。"""
+
     try:
-        from ..services.scenario_service import (
-            get_writing_session_by_conversation,
-            get_scenario,
-        )
-        from ..memory.database import get_db_session
-        from ..models.ecc_models import (
-            ScenarioScene,
-            ScenarioCharacter,
-            ScenarioEpisode,
-            ScenarioCanonEntry,
-        )
-        from sqlalchemy import select
+        from ..app_config_store import load_app_config_sync
 
-        # 1. writing session取得
-        writing_session = await get_writing_session_by_conversation(conversation_id)
-        if not writing_session:
-            return "エラー: この会話に関連付けられた執筆セッションが見つかりません。"
+        config = load_app_config_sync()
+    except Exception:  # noqa: BLE001
+        return {}
+    return config if isinstance(config, dict) else {}
 
-        target_scene_id = writing_session.get("target_scene_id")
-        scenario_id = writing_session.get("scenario_id")
 
-        if not scenario_id:
-            return "エラー: 執筆セッションにシナリオが設定されていません。"
+async def _resolve_writing_model(work: StoryWork) -> dict[str, str]:
+    """§8.8 の 3 層解決を story_routes と同じ材料で行う。
 
-        # シナリオ全体を取得（キャラクター・シーン含む）
-        scenario_data = await get_scenario(str(scenario_id), include_children=True)
+    層① は DB 設定の ``model_routing.classes.writing`` を読み、``inherit=true``
+    ならメイン LLM 設定（``llm_provider`` / ``llm_model``）を継承する。
+    """
 
-        sections = []
+    config = await asyncio.to_thread(_load_app_config)
+    writing_class = _config_get(config, WRITING_ROUTE_KEY, {}) or {}
+    provider = str(config.get("llm_provider") or "").strip()
+    main_llm: dict[str, Any] = {
+        "provider": provider,
+        "model": str(config.get("llm_model") or "").strip(),
+        "base_url": str(
+            _config_get(config, f"{provider}.base_url", "")
+            or config.get(f"{provider}_base_url", "")
+            or ""
+        ).strip(),
+        "reasoning_effort": str(
+            _config_get(config, f"{provider}.reasoning_effort", "") or ""
+        ).strip(),
+    }
+    return StoryModelResolver.resolve(
+        {},
+        work.model_override or {},
+        writing_class,
+        main_llm,
+    )
 
-        # シナリオ概要
-        scenario_title = scenario_data.get("title", "")
-        scenario_description = scenario_data.get("description", "")
-        overview_parts = []
-        if scenario_title:
-            overview_parts.append(f"タイトル: {scenario_title}")
-        if scenario_description:
-            overview_parts.append(scenario_description)
-        if overview_parts:
-            sections.append("## シナリオ概要\n" + "\n\n".join(overview_parts))
 
-        # 文体設定
-        voice_tone = scenario_data.get("voice_tone", "")
-        voice_tense = scenario_data.get("voice_tense_rules", "")
-        voice_vocab = scenario_data.get("voice_vocabulary_register", "")
-        voice_banned = scenario_data.get("voice_banned_expressions", "")
-        if voice_tone or voice_tense or voice_vocab:
-            voice_parts = []
-            if voice_tone:
-                voice_parts.append(f"トーン: {voice_tone}")
-            if voice_tense:
-                voice_parts.append(f"時制ルール: {voice_tense}")
-            if voice_vocab:
-                voice_parts.append(f"語彙レベル: {voice_vocab}")
-            sections.append("## 文体設定\n" + "\n".join(voice_parts))
-            if voice_banned:
-                sections.append(f"禁止表現: {voice_banned}")
+def _uuid(value: str | UUID | None) -> UUID | None:
+    if value in (None, ""):
+        return None
+    try:
+        return value if isinstance(value, UUID) else UUID(str(value))
+    except (TypeError, ValueError):
+        return None
 
-        # 世界設定
-        setting = scenario_data.get("setting", "")
-        if setting:
-            sections.append(f"## 世界設定\n{setting}")
 
-        gm_instructions = scenario_data.get("gm_instructions", "")
-        if gm_instructions:
-            sections.append(f"## 執筆指示\n{gm_instructions}")
+async def _resolve_scope(
+    session: Any,
+    *,
+    conversation_id: str,
+    work_id: str = "",
+    episode_id: str = "",
+) -> tuple[StoryWork, StoryEpisode | None, UUID | None]:
+    """会話に紐付いた StoryWritingSession と作品・章を解決する。"""
 
-        # エピソード情報（存在する場合）
-        async with await get_db_session() as session:
-            target_scene = None
-            scenes = scenario_data.get("scenes", [])
-            for s in scenes:
-                if s.get("id") == str(target_scene_id):
-                    target_scene = s
-                    break
-
-            # エピソード取得（episode_idがある場合）
-            episode_id = None
-            if target_scene:
-                episode_id = target_scene.get("episode_id")
-
-            if episode_id:
-                try:
-                    episode = await session.get(
-                        ScenarioEpisode, uuid.UUID(str(episode_id))
-                    )
-                    if episode:
-                        ep_dict = episode.to_dict()
-                        ep_parts = [
-                            f"## 現在のエピソード\nタイトル: {ep_dict.get('title', '')}"
-                        ]
-                        synopsis = (
-                            ep_dict.get("synopsis_full")
-                            or ep_dict.get("synopsis_paragraph")
-                            or ep_dict.get("synopsis_sentence", "")
-                        )
-                        if synopsis:
-                            ep_parts.append(f"あらすじ: {synopsis}")
-                        beat_sheet = ep_dict.get("beat_sheet", [])
-                        if beat_sheet:
-                            beats_text = "\n".join(
-                                (
-                                    f"- {b}"
-                                    if isinstance(b, str)
-                                    else f"- {json.dumps(b, ensure_ascii=False)}"
-                                )
-                                for b in beat_sheet
-                            )
-                            ep_parts.append(f"ビートシート:\n{beats_text}")
-                        sections.append("\n".join(ep_parts))
-                except Exception as e:
-                    logger.warning("エピソード取得エラー: %s", e)
-
-            # 現在のシーン
-            if target_scene:
-                scene_parts = [
-                    "## 現在のシーン",
-                    f"タイトル: {target_scene.get('title', '')}",
-                    f"タイプ: {target_scene.get('scene_type', 'normal')}",
-                ]
-                if target_scene.get("description"):
-                    scene_parts.append(f"説明: {target_scene['description']}")
-                if target_scene.get("gm_instructions"):
-                    scene_parts.append(f"GM指示: {target_scene['gm_instructions']}")
-                if target_scene.get("content"):
-                    scene_parts.append(f"現在のコンテンツ:\n{target_scene['content']}")
-                sections.append("\n".join(scene_parts))
-
-            # 前後のシーン取得（対象シーンがある場合のみ）
-            sorted_scenes = sorted(scenes, key=lambda x: x.get("sort_order", 0))
-            target_idx = None
-            if target_scene_id:
-                for i, s in enumerate(sorted_scenes):
-                    if s.get("id") == str(target_scene_id):
-                        target_idx = i
-                        break
-
-            if target_idx is not None:
-                # 前のシーン
-                if target_idx > 0:
-                    prev_scene = sorted_scenes[target_idx - 1]
-                    prev_content = prev_scene.get("content", "")
-                    if prev_content:
-                        # 末尾2000文字のみ
-                        prev_content = prev_content[-2000:]
-                    sections.append(
-                        f"## 前のシーン（末尾）\n"
-                        f"タイトル: {prev_scene.get('title', '')}\n"
-                        f"{prev_content if prev_content else '（コンテンツなし）'}"
-                    )
-                else:
-                    sections.append("## 前のシーン（末尾）\n（なし - 最初のシーン）")
-
-                # 次のシーン
-                if target_idx < len(sorted_scenes) - 1:
-                    next_scene = sorted_scenes[target_idx + 1]
-                    sections.append(
-                        f"## 次のシーン（概要）\n"
-                        f"{next_scene.get('title', '')}: {next_scene.get('description', '')}"
-                    )
-            elif sorted_scenes:
-                episodes = scenario_data.get("episodes", [])
-                if episodes:
-                    episode_lines = ["## エピソード一覧"]
-                    for episode in sorted(
-                        episodes, key=lambda x: x.get("sort_order", 0)
-                    ):
-                        synopsis = (
-                            episode.get("synopsis_sentence")
-                            or episode.get("synopsis_paragraph")
-                            or ""
-                        )
-                        episode_lines.append(
-                            f"- {episode.get('title', '')}: {synopsis}"
-                        )
-                    sections.append("\n".join(episode_lines))
-
-                scene_lines = ["## シーン一覧"]
-                for scene in sorted_scenes:
-                    scene_lines.append(
-                        f"- {scene.get('title', '')}: {scene.get('description', '')}"
-                    )
-                sections.append("\n".join(scene_lines))
-
-            # 登場キャラクター
-            characters = scenario_data.get("characters", [])
-            if characters:
-                char_sections = ["## 登場キャラクター"]
-                for char in characters:
-                    char_parts = [
-                        f"### {char.get('name', '')} ({char.get('role', 'npc')})"
-                    ]
-                    if char.get("description"):
-                        char_parts.append(f"性格: {char['description']}")
-                    if char.get("speech_patterns"):
-                        char_parts.append(f"口調: {char['speech_patterns']}")
-                    if char.get("psychology"):
-                        char_parts.append(f"心理: {char['psychology']}")
-                    if char.get("example_dialogues"):
-                        char_parts.append(f"会話例:\n{char['example_dialogues']}")
-                    # personality_override がある場合
-                    if char.get("personality_override"):
-                        char_parts.append(
-                            f"シナリオ固有の性格: {char['personality_override']}"
-                        )
-                    char_sections.append("\n".join(char_parts))
-                sections.append("\n\n".join(char_sections))
-
-            # Canon（確定事実）取得
-            try:
-                stmt = select(ScenarioCanonEntry).where(
-                    ScenarioCanonEntry.scenario_id == uuid.UUID(str(scenario_id))
-                )
-                canon_result = await session.execute(stmt)
-                canon_entries = canon_result.scalars().all()
-
-                if canon_entries:
-                    canon_by_category: Dict[str, List[str]] = {}
-                    for entry in canon_entries:
-                        cat = getattr(entry, "category", "その他") or "その他"
-                        fact = getattr(entry, "fact", "") or str(entry)
-                        canon_by_category.setdefault(cat, []).append(fact)
-
-                    canon_parts = ["## 確定事実（Canon）"]
-                    for cat, facts in canon_by_category.items():
-                        canon_parts.append(f"### {cat}")
-                        for f in facts:
-                            canon_parts.append(f"- {f}")
-                    sections.append("\n".join(canon_parts))
-            except Exception as e:
-                logger.warning("Canon取得エラー（テーブル未作成の可能性）: %s", e)
-
-        # WorldBookエントリ取得
-        try:
-            from ..services.worldbook_service import get_matching_entries
-
-            # 最新の会話テキストでマッチ（シーンのcontentを使用）
-            recent_text = ""
-            if target_scene and target_scene.get("content"):
-                recent_text = target_scene["content"][-1000:]
-            elif target_scene:
-                recent_text = (
-                    target_scene.get("description", "")
-                    + " "
-                    + target_scene.get("title", "")
-                )
-
-            # シナリオタイトルでもマッチを試みる
-            recent_text += " " + scenario_data.get("title", "")
-
-            # キャラクター名の特定（character_slugとしてシナリオタイトルを使用）
-            character_slug = scenario_data.get("title", "")
-            entries = await get_matching_entries(
-                character_slug,
-                recent_text,
-                scenario_id=str(scenario_id),
+    conversation_uuid = _uuid(conversation_id)
+    writing = None
+    conversation = None
+    if conversation_uuid is not None:
+        writing = await session.scalar(
+            select(StoryWritingSession).where(
+                StoryWritingSession.conversation_session_id == conversation_uuid
             )
-            if entries:
-                wb_parts = ["## 世界情報（WorldBook）"]
-                for e in entries:
-                    name = e.get("name", "")
-                    content = e.get("content", "")
-                    if name:
-                        wb_parts.append(f"### {name}\n{content}")
-                    else:
-                        wb_parts.append(content)
-                sections.append("\n\n".join(wb_parts))
-        except Exception as e:
-            logger.warning("WorldBookエントリ取得エラー: %s", e)
-
-        if not sections:
-            return "コンテキスト情報が見つかりませんでした。シーンとシナリオの設定を確認してください。"
-
-        return "\n\n".join(sections)
-
-    except ImportError as e:
-        logger.error("モジュールインポートエラー（並行実装中の可能性）: %s", e)
-        return f"エラー: 必要なモジュールがまだ利用できません: {e}"
-    except Exception as e:
-        logger.error("執筆コンテキスト取得エラー: %s", e)
-        return f"コンテキスト取得中にエラーが発生しました: {e}"
-
-
-@tool
-async def save_scene_draft(conversation_id: str, content: str) -> str:
-    """生成テキストをシーンのcontentに保存する。
-
-    Args:
-        conversation_id: 現在の会話セッションID
-        content: 保存するシーンの本文テキスト
-
-    Returns:
-        保存結果のメッセージ
-    """
-    try:
-        from ..services.scenario_service import (
-            get_writing_session_by_conversation,
-            save_scene_content,
         )
+        conversation = await session.get(ConversationSession, conversation_uuid)
 
-        # writing session取得
-        writing_session = await get_writing_session_by_conversation(conversation_id)
-        if not writing_session:
-            return "エラー: この会話に関連付けられた執筆セッションが見つかりません。"
-
-        target_scene_id = writing_session.get("target_scene_id")
-        if not target_scene_id:
-            return "エラー: 執筆セッションに対象シーンが設定されていません。"
-
-        # シーンコンテンツを保存（バージョン作成あり）
-        await save_scene_content(
-            scene_id=str(target_scene_id),
-            content=content,
-            create_version=True,
-        )
-
-        # 文字数カウント
-        char_count = len(content)
-        return f"シーンの下書きを保存しました（{char_count}文字）。"
-
-    except ImportError as e:
-        logger.error("モジュールインポートエラー（並行実装中の可能性）: %s", e)
-        return f"エラー: 必要なモジュールがまだ利用できません: {e}"
-    except Exception as e:
-        logger.error("シーン下書き保存エラー: %s", e)
-        return f"シーン下書きの保存中にエラーが発生しました: {e}"
+    resolved_work_id = writing.work_id if writing is not None else _uuid(work_id)
+    resolved_episode_id = writing.episode_id if writing is not None else _uuid(episode_id)
+    if resolved_work_id is None:
+        raise ValueError("StoryWritingSession または work_id が必要です")
+    work = await session.get(StoryWork, resolved_work_id)
+    if work is None or work.archived_at is not None:
+        raise ValueError("作品が見つかりません")
+    if conversation is not None and conversation.user_id and work.user_id != conversation.user_id:
+        raise ValueError("会話から作品へアクセスできません")
+    episode = None
+    if resolved_episode_id is not None:
+        episode = await session.get(StoryEpisode, resolved_episode_id)
+        if episode is None or episode.work_id != work.id or episode.archived_at is not None:
+            raise ValueError("エピソードが作品に存在しません")
+    return work, episode, conversation_uuid
 
 
-@tool
-async def update_canon_from_content(conversation_id: str, new_facts_json: str) -> str:
-    """執筆中に確立された新しい確定事実をCanonに追加する。
+async def _build_context(session: Any, work: StoryWork, episode: StoryEpisode) -> str:
+    episodes = await StoryEpisodeService(session).list(work)
+    links = list(
+        (
+            await session.scalars(
+                select(StoryLink).where(StoryLink.work_id == work.id)
+            )
+        ).all()
+    )
+    route_ids = []
+    from ..services.story_studio import resolve_story_route, story_user_choices
 
-    Args:
-        conversation_id: 現在の会話セッションID
-        new_facts_json: JSON文字列。[{"category": "geography|timeline|character|event|...", "fact": "確定事実テキスト"}]
-
-    Returns:
-        追加結果のメッセージ
-    """
-    try:
-        from ..services.scenario_service import (
-            get_writing_session_by_conversation,
-        )
-        from ..memory.database import get_db_session
-        from ..models.ecc_models import ScenarioCanonEntry
-
-        # writing session取得
-        writing_session = await get_writing_session_by_conversation(conversation_id)
-        if not writing_session:
-            return "エラー: この会話に関連付けられた執筆セッションが見つかりません。"
-
-        scenario_id = writing_session.get("scenario_id")
-        target_scene_id = writing_session.get("target_scene_id")
-
-        if not scenario_id:
-            return "エラー: 執筆セッションにシナリオが設定されていません。"
-
-        # JSONパース
-        try:
-            new_facts = json.loads(new_facts_json)
-        except json.JSONDecodeError as e:
-            return f"エラー: JSONのパースに失敗しました: {e}"
-
-        if not isinstance(new_facts, list):
-            return "エラー: new_facts_jsonはリスト形式である必要があります。"
-
-        # 各factをcanonに追加
-        added_count = 0
-        async with await get_db_session() as session:
-            for fact_data in new_facts:
-                if not isinstance(fact_data, dict):
-                    continue
-                category = fact_data.get("category", "その他")
-                fact = fact_data.get("fact", "")
-                if not fact:
-                    continue
-
-                entry = ScenarioCanonEntry(
-                    id=uuid.uuid4(),
-                    scenario_id=uuid.UUID(str(scenario_id)),
-                    category=category,
-                    fact=fact,
-                    source_scene_id=(
-                        uuid.UUID(str(target_scene_id)) if target_scene_id else None
-                    ),
+    route_ids = resolve_story_route(
+        work.start_episode_id,
+        links,
+        story_user_choices(work.ui_state),
+    )
+    route_map = {str(item.id): item for item in episodes}
+    route = [route_map[item] for item in route_ids if item in route_map]
+    joins = list(
+        (
+            await session.scalars(
+                select(StoryWorkCharacter)
+                .options(selectinload(StoryWorkCharacter.character))
+                .where(StoryWorkCharacter.work_id == work.id)
+            )
+        ).all()
+    )
+    characters = [item.character for item in joins if item.character is not None]
+    book_joins = list(
+        (
+            await session.scalars(
+                select(StoryWorkRulebook).where(StoryWorkRulebook.work_id == work.id)
+            )
+        ).all()
+    )
+    books = list(
+        (
+            await session.scalars(
+                select(StoryRulebook).where(
+                    StoryRulebook.id.in_([item.rulebook_id for item in book_joins])
                 )
-                session.add(entry)
-                added_count += 1
+            )
+        ).all()
+    ) if book_joins else []
+    notes = list(
+        (
+            await session.scalars(
+                select(StoryNote).where(StoryNote.work_id == work.id)
+            )
+        ).all()
+    )
+    model = await _resolve_writing_model(work)
+    return build_story_context(
+        work,
+        episode,
+        route,
+        characters=characters,
+        work_characters=joins,
+        rulebooks=books,
+        work_rulebooks=book_joins,
+        notes=notes,
+        links=links,
+        model=model,
+    ).prompt
 
+
+@tool
+async def get_story_context(
+    conversation_id: str,
+    work_id: str = "",
+    episode_id: str = "",
+) -> str:
+    """作品・現在ルート・対象章の執筆コンテキストを取得する。"""
+
+    try:
+        async with await get_db_session() as session:
+            work, episode, _ = await _resolve_scope(
+                session,
+                conversation_id=conversation_id,
+                work_id=work_id,
+                episode_id=episode_id,
+            )
+            if episode is None:
+                episode = await session.scalar(
+                    select(StoryEpisode)
+                    .where(
+                        StoryEpisode.work_id == work.id,
+                        StoryEpisode.archived_at.is_(None),
+                    )
+                    .order_by(StoryEpisode.sort_hint, StoryEpisode.created_at)
+                )
+            if episode is None:
+                return "作品にエピソードがありません。"
+            return await _build_context(session, work, episode)
+    except Exception as exc:  # noqa: BLE001
+        return f"Storyコンテキスト取得エラー: {exc}"
+
+
+async def _write_body(
+    *,
+    conversation_id: str,
+    episode_id: str,
+    body: str,
+    expected_etag: str,
+    origin: str,
+    message: str,
+) -> str:
+    if not expected_etag:
+        return "エラー: expected_etag は必須です。先に get_story_context で本文を確認してください。"
+    try:
+        async with await get_db_session() as session:
+            work, episode, _ = await _resolve_scope(
+                session,
+                conversation_id=conversation_id,
+                episode_id=episode_id,
+            )
+            if episode is None:
+                return "エラー: 対象エピソードが指定されていません。"
+            revision_service = StoryRevisionService(session)
+            # §6.2: AI 適用直前の保険は origin='pre_ai' 固定で、
+            # 未保存差分がある場合のみ積む。差分判定は create_revision 側の
+            # sha dedup に委ねるため force は付けない。
+            await revision_service.create_revision(
+                episode,
+                origin="pre_ai",
+                message=f"{message}前",
+                created_by="ai",
+            )
+            revision = await revision_service.update_body(
+                episode,
+                body,
+                expected_etag=expected_etag,
+                origin=origin,
+                created_by="ai",
+                message=message,
+            )
+            if revision is None:
+                # §6.2: ai_generate / ai_edit は「常に」積む。AI が既存本文と
+                # 同一の結果を返して dedup された場合も、AI 実行の記録を残す。
+                revision = await revision_service.create_revision(
+                    episode,
+                    origin=origin,
+                    message=message,
+                    created_by="ai",
+                    force=True,
+                    body=body,
+                )
             await session.commit()
-
-        return f"Canon に {added_count} 件の確定事実を追加しました。"
-
-    except ImportError as e:
-        logger.error("モジュールインポートエラー（並行実装中の可能性）: %s", e)
-        return f"エラー: 必要なモジュールがまだ利用できません: {e}"
-    except Exception as e:
-        logger.error("Canon更新エラー: %s", e)
-        return f"Canon更新中にエラーが発生しました: {e}"
+            return json.dumps(
+                {
+                    "episode_id": str(episode.id),
+                    "work_id": str(work.id),
+                    "body_etag": episode.body_etag,
+                    "char_count": episode.char_count,
+                    "current_rev_no": episode.current_rev_no,
+                    "revision": revision.to_dict() if revision else None,
+                },
+                ensure_ascii=False,
+            )
+    except StoryConflictError as exc:
+        return json.dumps(
+            {
+                "error": "conflict",
+                "current_etag": exc.episode.body_etag,
+                "message": str(exc),
+            },
+            ensure_ascii=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"Story本文保存エラー: {exc}"
 
 
 @tool
-async def get_character_voice(conversation_id: str, character_name: str) -> str:
-    """特定キャラクターの口調設定と会話サンプルを返す。
+async def write_episode_body(
+    conversation_id: str,
+    episode_id: str,
+    body: str,
+    expected_etag: str,
+    message: str = "AI本文生成",
+) -> str:
+    """本文を直接保存し、origin='ai_generate' のリビジョンを積む。"""
 
-    Args:
-        conversation_id: 現在の会話セッションID
-        character_name: キャラクター名
+    return await _write_body(
+        conversation_id=conversation_id,
+        episode_id=episode_id,
+        body=body,
+        expected_etag=expected_etag,
+        origin="ai_generate",
+        message=message,
+    )
 
-    Returns:
-        キャラクターの口調設定情報
-    """
+
+@tool
+async def revise_episode_body(
+    conversation_id: str,
+    episode_id: str,
+    replacement: str,
+    expected_etag: str,
+    instruction: str = "AI本文修正",
+) -> str:
+    """本文を直接書き換え、提案・承認キューを介さず origin='ai_edit' を積む。"""
+
+    return await _write_body(
+        conversation_id=conversation_id,
+        episode_id=episode_id,
+        body=replacement,
+        expected_etag=expected_etag,
+        origin="ai_edit",
+        message=instruction,
+    )
+
+
+@tool
+async def add_story_note(
+    conversation_id: str,
+    title: str,
+    content: str,
+    work_id: str = "",
+    ai_mode: str = "keyword",
+    keywords: list[str] | None = None,
+) -> str:
+    """作品へ設定・資料ノートを直接追加する。"""
+
     try:
-        from ..services.scenario_service import (
-            get_writing_session_by_conversation,
-        )
-        from ..services.scenario_service import get_scenario
-
-        # writing session取得
-        writing_session = await get_writing_session_by_conversation(conversation_id)
-        if not writing_session:
-            return "エラー: この会話に関連付けられた執筆セッションが見つかりません。"
-
-        scenario_id = writing_session.get("scenario_id")
-        if not scenario_id:
-            return "エラー: 執筆セッションにシナリオが設定されていません。"
-
-        # シナリオからキャラクター一覧取得
-        scenario_data = await get_scenario(str(scenario_id), include_children=True)
-        characters = scenario_data.get("characters", [])
-
-        # 名前で検索（部分一致対応）
-        target_char = None
-        for char in characters:
-            if char.get("name", "").lower() == character_name.lower():
-                target_char = char
-                break
-
-        # 完全一致がなければ部分一致
-        if not target_char:
-            for char in characters:
-                if character_name.lower() in char.get("name", "").lower():
-                    target_char = char
-                    break
-
-        if not target_char:
-            available = ", ".join(c.get("name", "") for c in characters)
-            return f"キャラクター「{character_name}」が見つかりません。利用可能なキャラクター: {available}"
-
-        # 口調情報を構築
-        parts = [f"## {target_char.get('name', '')} ({target_char.get('role', 'npc')})"]
-
-        if target_char.get("description"):
-            parts.append(f"### 性格・概要\n{target_char['description']}")
-
-        if target_char.get("personality_override"):
-            parts.append(
-                f"### シナリオ固有の性格\n{target_char['personality_override']}"
+        async with await get_db_session() as session:
+            work, _, _ = await _resolve_scope(
+                session,
+                conversation_id=conversation_id,
+                work_id=work_id,
             )
+            note = StoryNote(
+                work_id=work.id,
+                title=title,
+                content=content,
+                ai_mode=ai_mode,
+                keywords=list(keywords or []),
+            )
+            session.add(note)
+            await session.commit()
+            return json.dumps(
+                {"id": str(note.id), "work_id": str(work.id), "title": note.title},
+                ensure_ascii=False,
+            )
+    except Exception as exc:  # noqa: BLE001
+        return f"Storyノート保存エラー: {exc}"
 
-        if target_char.get("speech_patterns"):
-            parts.append(f"### 口調パターン\n{target_char['speech_patterns']}")
 
-        if target_char.get("example_dialogues"):
-            parts.append(f"### 会話例\n{target_char['example_dialogues']}")
+@tool
+async def get_character_voice(
+    conversation_id: str,
+    character_name: str,
+    work_id: str = "",
+) -> str:
+    """作品に所属する人物の説明・役割・口調情報を取得する。"""
 
-        if target_char.get("psychology"):
-            parts.append(f"### 心理\n{target_char['psychology']}")
+    try:
+        async with await get_db_session() as session:
+            work, _, _ = await _resolve_scope(
+                session,
+                conversation_id=conversation_id,
+                work_id=work_id,
+            )
+            rows = list(
+                (
+                    await session.scalars(
+                        select(StoryWorkCharacter)
+                        .options(selectinload(StoryWorkCharacter.character))
+                        .where(StoryWorkCharacter.work_id == work.id)
+                    )
+                ).all()
+            )
+            probe = character_name.casefold()
+            for row in rows:
+                character = row.character
+                if character is None:
+                    continue
+                aliases = character.aliases if isinstance(character.aliases, list) else []
+                if not (
+                    probe in str(character.name or "").casefold()
+                    or any(probe in str(alias).casefold() for alias in aliases)
+                ):
+                    continue
+                details = [
+                    f"## {character.name}",
+                    character.description or character.summary or "説明なし",
+                ]
+                if row.role_note:
+                    details.append(f"役割: {row.role_note}")
+                return "\n".join(details)
+            return f"人物「{character_name}」が作品に見つかりません。"
+    except Exception as exc:  # noqa: BLE001
+        return f"人物情報取得エラー: {exc}"
 
-        return "\n\n".join(parts)
 
-    except ImportError as e:
-        logger.error("モジュールインポートエラー（並行実装中の可能性）: %s", e)
-        return f"エラー: 必要なモジュールがまだ利用できません: {e}"
-    except Exception as e:
-        logger.error("キャラクター口調取得エラー: %s", e)
-        return f"キャラクター口調の取得中にエラーが発生しました: {e}"
+__all__ = [
+    "add_story_note",
+    "get_character_voice",
+    "get_story_context",
+    "revise_episode_body",
+    "write_episode_body",
+]

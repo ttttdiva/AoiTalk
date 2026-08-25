@@ -1,11 +1,38 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { projects, projectMembers } from "@/db/schema";
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { docsLibraries } from "@/lib/server/docs-library-schema";
+import { eq, isNull } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
 import { ensureUserInboxSetup } from "@/lib/server/inbox-project";
 import { canWriteSpace } from "@/lib/server/space-access";
-import { canWriteMembership } from "@/lib/server/task-route-utils";
+import {
+  getDefaultProjectPermissions,
+  hasEffectiveProjectPermission,
+  hasProjectPermission,
+} from "@/lib/server/project-permissions";
+import { isForeignDefaultInboxProject } from "@/lib/server/project-list-visibility";
+import {
+  ensureProjectInformationHierarchyNode,
+  getProjectInformationHierarchyNode,
+  getPersonalDocsLibrary,
+} from "@/lib/server/project-information-hierarchy";
+
+function serializeLibrary(library: typeof docsLibraries.$inferSelect | null | undefined) {
+  if (!library) return null;
+  return {
+    id: library.id,
+    library_id: library.id,
+    docs_library_id: library.id,
+    name: library.name,
+    description: library.description,
+    owner_user_id: library.ownerUserId,
+    library_type: library.libraryType ?? "personal",
+    settings: library.settingsJson ?? {},
+    created_at: library.createdAt instanceof Date ? library.createdAt.toISOString() : library.createdAt,
+    updated_at: library.updatedAt instanceof Date ? library.updatedAt.toISOString() : library.updatedAt,
+  };
+}
 
 function toSlug(name: string): string {
   return name
@@ -90,6 +117,9 @@ function normalizeAliases(value: unknown): string[] {
 function serializeProject(
   row: Record<string, unknown>,
   canWrite?: boolean,
+  isParticipating?: boolean,
+  membership?: { role: string | null; permissions: unknown } | null,
+  canManageSettings?: boolean,
 ): Record<string, unknown> {
   const result = toSnake(row);
   const metadata = parseProjectMetadata(result.metadata);
@@ -99,6 +129,15 @@ function serializeProject(
   result.aliases = aliases;
   result.color = color;
   if (canWrite !== undefined) result.can_write = canWrite;
+  if (isParticipating !== undefined) result.is_participating = isParticipating;
+  if (membership !== undefined) {
+    result.membership = membership
+      ? { role: membership.role, permissions: membership.permissions ?? null }
+      : null;
+  }
+  if (canManageSettings !== undefined) {
+    result.can_manage_settings = canManageSettings;
+  }
   return result;
 }
 
@@ -115,32 +154,71 @@ export async function GET() {
   }
 
   const memberships = await db
-    .select({ projectId: projectMembers.projectId, role: projectMembers.role })
+    .select({
+      projectId: projectMembers.projectId,
+      role: projectMembers.role,
+      permissions: projectMembers.permissions,
+    })
     .from(projectMembers)
     .where(eq(projectMembers.userId, user.id));
 
-  if (memberships.length === 0) {
-    return NextResponse.json({ projects: [], total: 0 });
-  }
-
-  const projectIds = memberships.map((membership) => membership.projectId);
   const membershipByProjectId = new Map(
     memberships.map((membership) => [membership.projectId, membership]),
   );
   const rows = await db
     .select()
     .from(projects)
-    .where(and(inArray(projects.id, projectIds), isNull(projects.deletedAt)));
+    .where(isNull(projects.deletedAt));
 
-  const result = rows.map((row) =>
-    serializeProject(
-      row as unknown as Record<string, unknown>,
-      canWriteMembership(
-        user,
-        membershipByProjectId.get(row.id) ?? null,
-      ),
-    ),
-  );
+  const visibleRows = rows
+    .filter((row) => !isForeignDefaultInboxProject(row, user.id))
+    .filter(
+      (row) =>
+        user.role === "admin" ||
+        row.ownerId === user.id ||
+        hasProjectPermission(
+          membershipByProjectId.get(row.id)?.permissions,
+          "read",
+        ),
+    );
+  const result = (await Promise.all(visibleRows.map(async (row) => {
+      // `projects.knowledge_node_id` is a denormalized reverse pointer.  Do
+      // not expose an ordinary/stale node as a link: only the canonical
+      // project-information child under the owner's Personal hub qualifies.
+      let canonicalNodeId: string | null = null;
+      try {
+        const hierarchy = await getProjectInformationHierarchyNode({ project: row });
+        canonicalNodeId = hierarchy.node?.id ?? null;
+      } catch (error) {
+        // A malformed/stale hierarchy must not make the entire Projects list
+        // fail.  Omit the reverse pointer and let the Project-information
+        // repair boundary handle it with the appropriate write ACL.
+        console.warn("Project Docs canonical pointer validation failed:", error);
+      }
+      const membership = membershipByProjectId.get(row.id) ?? null;
+      const isParticipating =
+        row.ownerId === user.id ||
+        hasProjectPermission(membership?.permissions, "read");
+      const canManageSettings = hasEffectiveProjectPermission({
+        userId: user.id,
+        userRole: user.role,
+        projectOwnerId: row.ownerId,
+        memberPermissions: membership?.permissions,
+        permission: "manage_settings",
+      });
+      return serializeProject(
+        {
+          ...(row as unknown as Record<string, unknown>),
+          knowledgeNodeId: canonicalNodeId,
+        },
+        user.role === "admin" ||
+          row.ownerId === user.id ||
+          hasProjectPermission(membership?.permissions, "write"),
+        isParticipating,
+        membership,
+        canManageSettings,
+      );
+    }))).filter(Boolean);
   return NextResponse.json({ projects: result, total: result.length });
 }
 
@@ -164,6 +242,15 @@ export async function POST(request: NextRequest) {
 
   if (!name) {
     return NextResponse.json({ detail: "nameは必須です" }, { status: 400 });
+  }
+
+  const normalizedRequestedSlug =
+    typeof slug === "string" ? toSlug(slug.trim()) : "";
+  if (normalizedRequestedSlug.startsWith("inbox-project-")) {
+    return NextResponse.json(
+      { detail: "Inbox予約slugは通常のProject作成には使用できません" },
+      { status: 400 },
+    );
   }
 
   const finalSlug = await resolveUniqueProjectSlug(name, slug);
@@ -196,6 +283,8 @@ export async function POST(request: NextRequest) {
       ownerId: user.id,
       estimatedHours: estimated_hours != null ? Number(estimated_hours) : null,
       spaceId: space_id || null,
+      storageQuotaMb: 1000,
+      storageUsedMb: 0,
       projectMetadata: mergedMetadata,
     })
     .returning();
@@ -203,14 +292,33 @@ export async function POST(request: NextRequest) {
   await db.insert(projectMembers).values({
     projectId: project.id,
     userId: user.id,
-    role: "admin",
+    role: "owner",
+    permissions: getDefaultProjectPermissions("owner"),
   });
+
+  // Project information is a real child of the owner's Personal Docs
+  // Library's 案件情報 hub.  Bootstrap it during project creation so
+  // `projects.knowledge_node_id` is authoritative from the first response;
+  // the hierarchy helper is idempotent under concurrent retries.
+  const informationNode = await ensureProjectInformationHierarchyNode({
+    userId: user.id,
+    project,
+  });
+  const library = await getPersonalDocsLibrary(user.id);
 
   return NextResponse.json({
     success: true,
-    project: serializeProject(
-      project as unknown as Record<string, unknown>,
-      true,
-    ),
+    project: {
+      ...serializeProject(
+        { ...(project as unknown as Record<string, unknown>), knowledgeNodeId: informationNode.id },
+        true,
+        true,
+        null,
+        true,
+      ),
+      knowledge_node_id: informationNode.id,
+      docs_library_id: library?.id ?? informationNode.docsLibraryId,
+      library: serializeLibrary(library),
+    },
   });
 }

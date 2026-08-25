@@ -1,73 +1,148 @@
-# AoiTalk リバースプロキシ設定
-# Caddy はインスタンスごとの外部ポート (HTTPS) で受けて内部サービスに振り分ける
 {
-	# 証明書はlegoで管理するため自動HTTPS無効化
-	auto_https off
+	# HTTP入口のredirectは下の明示routeで管理し、TLS証明書の自動管理だけを維持する。
+	auto_https disable_redirects
+
+	# 公開経路はTCPだけで到達できる構成とし、QUIC/HTTP/3へ再誘導しない。
+	servers {
+		protocols h1 h2
+	}
+
+	log {
+		output file "{$AOITALK_CADDY_RUNTIME_LOG:logs/web/caddy-runtime.log}" {
+			roll_size 5MiB
+			roll_keep 5
+			{$AOITALK_CADDY_LOG_ROLL_EXTRA}
+		}
+		format console
+	}
 }
 
-# HTTPS リバースプロキシ (デフォルトポート6002)
-https://nk-h01.f5.si:{$AOITALK_CADDY_PORT:6002} {
-	# 証明書パスは .env の AOITALK_CERT_CRT / AOITALK_CERT_KEY から受け取る。
-	# {$VAR:default} はパース時展開で、未設定でも default にフォールバックする。
-	# 親プロセス (main.py) が python-dotenv で .env を読み込み、subprocess.Popen で
-	# caddy を起動するときに環境変数を継承する前提。
-	tls {$AOITALK_CERT_CRT:D:/Dev/41_AoiTalk/certs/certificates/nk-h01.f5.si.crt} {$AOITALK_CERT_KEY:D:/Dev/41_AoiTalk/certs/certificates/nk-h01.f5.si.key}
+# AoiTalk リバースプロキシ
+#
+# ComposeではAOITALK_CADDY_PORTのHTTPS（Caddyの内部CA／自動証明書）。会社運用では、
+# AOITALK_CADDY_SITE_ADDRESS に会社DNS名を設定し、公開CAまたは会社CAの証明書運用を選ぶ。
+# FastAPI/Next.jsの上流は環境変数で切り替え、Windows固有の絶対パスを持たない。
 
-	# Standard Hydrus Client API-compatible reverse proxy.
+# WSL/Docker Desktopのloopback転送ではIP直指定のTLS SNIが不安定なため、
+# 初回の http://127.0.0.1 は、証明書対象のサイト名へ明示的に寄せる。
+http://127.0.0.1 {
+	handle /healthz {
+		rewrite * /login
+		reverse_proxy {$AOITALK_CADDY_NEXT_UPSTREAM:127.0.0.1:3002}
+	}
+	handle {
+		redir https://{$AOITALK_CADDY_SITE_ADDRESS:localhost}:{$AOITALK_CADDY_PORT:6002}{uri} 308
+	}
+}
+
+{$AOITALK_CADDY_SITE_LABEL:localhost:6002} {
+	# Windows personalではservice_managerがHTTPS catch-allとIPv4 bindを渡す。
+	# Linux nativeでは名前付きsite labelを渡し、従来の自動HTTPSを維持する。
+	{$AOITALK_CADDY_BIND_DIRECTIVE:}
+
+	# Windowsのrun.bat起動ではservice_managerが既存の公開証明書を指定する。
+	# Linux/Composeでは未設定のまま展開され、従来どおりCaddyの自動HTTPSを使う。
+	{$AOITALK_CADDY_TLS_DIRECTIVE:}
+
+	# HTTP/3を広告していた期間に既存クライアントが保持したAlt-Svcを破棄させる。
+	# TCP-onlyの公開経路では、h1/h2へ戻した後も明示的なclearが必要になる。
+	header Alt-Svc "clear"
+
+	log {
+		output file "{$AOITALK_CADDY_ACCESS_LOG:logs/web/caddy-access.log}" {
+			roll_size 10MiB
+			roll_keep 5
+			{$AOITALK_CADDY_LOG_ROLL_EXTRA}
+		}
+		format filter {
+			wrap json
+			fields {
+				request>headers>Authorization delete
+				request>headers>Cookie delete
+				request>headers>Set-Cookie delete
+				request>headers>Proxy-Authorization delete
+			}
+		}
+	}
+
+	encode zstd gzip
+
 	@hydrus_client_api {
 		path /api_version /session_key /get_services /get_files/* /add_tags/* /edit_ratings/* /add_files/*
 	}
 	handle @hydrus_client_api {
-		reverse_proxy 127.0.0.1:{$AOITALK_CADDY_FASTAPI_PORT:3000}
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:127.0.0.1:3000}
 	}
 
-	# ── FastAPI (モバイルアプリ専用の Bearer 認証エンドポイント) ──
-	# モバイル専用パスのみ FastAPI に流す。それ以外の /api/* は Next.js 行き。
-	# 詳細は CLAUDE.md と docs/ のリバースプロキシ関連メモを参照。
-	# NOTE: Windows では `localhost` が IPv6 ([::1]) に解決されることがあり、
-	# Next.js/FastAPI が IPv4 のみ Listen している場合に 502 になる。
-	# 明示的に 127.0.0.1 を指定して回避する。
+	# FastAPI専用エンドポイント（モバイル／OAuth／ファイル／Agent Harness）
 	handle /api/auth/login/mobile {
-		reverse_proxy 127.0.0.1:{$AOITALK_CADDY_FASTAPI_PORT:3000}
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:127.0.0.1:3000}
 	}
 	handle /api/auth/refresh {
-		reverse_proxy 127.0.0.1:{$AOITALK_CADDY_FASTAPI_PORT:3000}
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:127.0.0.1:3000}
+	}
+	# logoutはcookie種別に関係なくFastAPIへ集約する。旧FastAPI cookieと
+	# Next.js cookieが同名のため、cookie matcherで振り分けると主体を
+	# 判別できず、古いセッションの全失効を取りこぼす。
+	handle /api/auth/logout {
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:127.0.0.1:3000}
 	}
 	handle /api/filer/* {
-		reverse_proxy 127.0.0.1:{$AOITALK_CADDY_FASTAPI_PORT:3000}
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:127.0.0.1:3000}
 	}
 	handle /api/google-calendar/oauth/callback {
-		reverse_proxy 127.0.0.1:{$AOITALK_CADDY_FASTAPI_PORT:3000}
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:127.0.0.1:3000}
+	}
+	handle /api/webex/oauth/callback {
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:127.0.0.1:3000}
 	}
 	handle /api/agent-harness/* {
-		reverse_proxy 127.0.0.1:{$AOITALK_CADDY_FASTAPI_PORT:3000}
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:127.0.0.1:3000}
 	}
 
-	# モバイルアプリは Bearer token で FastAPI の同名 /api/* を直接使う。
-	# ブラウザは Cookie 認証で Next.js の /api/* を使うため、Authorization: Bearer
-	# があるリクエストだけ FastAPI に分岐させる。
-	@mobile_bearer_api {
+	# These public Next.js auth/bootstrap routes must remain reachable without
+	# Authorization.  They also stay on the BFF when a client sends an empty
+	# header, instead of falling through to the FastAPI direct boundary.
+	handle /api/auth/login {
+		reverse_proxy {$AOITALK_CADDY_NEXT_UPSTREAM:127.0.0.1:3002}
+	}
+	handle /api/auth/login-form {
+		reverse_proxy {$AOITALK_CADDY_NEXT_UPSTREAM:127.0.0.1:3002}
+	}
+	handle /api/auth/reset-password {
+		reverse_proxy {$AOITALK_CADDY_NEXT_UPSTREAM:127.0.0.1:3002}
+	}
+	handle /api/auth/status {
+		reverse_proxy {$AOITALK_CADDY_NEXT_UPSTREAM:127.0.0.1:3002}
+	}
+
+	# Unified Voice Session HTTP and WebSocket endpoints are authoritative in
+	# FastAPI, including cookie-authenticated browser requests without an
+	# Authorization header.  reverse_proxy preserves WebSocket upgrades.
+	handle /api/voice-sessions* {
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:127.0.0.1:3000}
+	}
+
+	# Only a non-empty Authorization header selects the FastAPI direct
+	# boundary.  Missing/empty Authorization remains on the Next.js BFF, whose
+	# cookie session is the browser authentication path.
+	@fastapi_authorized_api {
 		path /api/*
-		header Authorization "Bearer *"
+		header_regexp Authorization ".+"
 	}
-	handle @mobile_bearer_api {
-		reverse_proxy 127.0.0.1:{$AOITALK_CADDY_FASTAPI_PORT:3000}
+	handle @fastapi_authorized_api {
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:127.0.0.1:3000}
 	}
 
-	# WebSocket（FastAPI）
 	handle /ws* {
-		reverse_proxy 127.0.0.1:{$AOITALK_CADDY_FASTAPI_PORT:3000}
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:127.0.0.1:3000}
 	}
 
-	# ── Next.js (ブラウザ用 Cookie 認証エンドポイント) ──
-	# 上記 FastAPI 専用パスで拾われなかった /api/* は全て Next.js に流す。
-	# Next.js 側で Drizzle 経由の DB アクセスと Cookie セッション処理を行う。
+	# ブラウザ用のNext.js BFF/API
 	handle /api/* {
-		reverse_proxy 127.0.0.1:{$AOITALK_CADDY_NEXT_PORT:3002}
+		reverse_proxy {$AOITALK_CADDY_NEXT_UPSTREAM:127.0.0.1:3002}
 	}
-
-	# Next.js フロントエンド（デフォルト）
 	handle {
-		reverse_proxy 127.0.0.1:{$AOITALK_CADDY_NEXT_PORT:3002}
+		reverse_proxy {$AOITALK_CADDY_NEXT_UPSTREAM:127.0.0.1:3002}
 	}
 }

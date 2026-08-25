@@ -1,0 +1,1839 @@
+{
+  "$schema": "contracts/product-contract.schema.json",
+  "contract_version": "mobile-product-contract/v1",
+  "product": {
+    "name": "AoiTalk",
+    "client": "mobile",
+    "source_of_truth": "contracts/product-contract.json",
+    "version": "p0"
+  },
+  "navigation": {
+    "tabs": [
+      "chat",
+      "tasks",
+      "calendar",
+      "filer",
+      "docs"
+    ],
+    "tab_routes": [
+      "tabs.chat",
+      "tabs.tasks",
+      "tabs.calendar",
+      "tabs.filer",
+      "tabs.docs"
+    ],
+    "routes": [
+      {
+        "id": "root",
+        "path": "index",
+        "kind": "root",
+        "auth_required": false,
+        "tab": false,
+        "entry_points": [
+          "bootstrap"
+        ]
+      },
+      {
+        "id": "auth.login",
+        "path": "(auth)/login",
+        "kind": "auth",
+        "auth_required": false,
+        "tab": false,
+        "entry_points": [
+          "auth"
+        ]
+      },
+      {
+        "id": "tabs.chat",
+        "path": "(tabs)/chat/index",
+        "kind": "tab",
+        "auth_required": true,
+        "tab": true,
+        "entry_points": [
+          "tab.chat"
+        ]
+      },
+      {
+        "id": "tabs.chat.detail",
+        "path": "(tabs)/chat/[sessionId]",
+        "kind": "detail",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.chat"
+        ]
+      },
+      {
+        "id": "tabs.tasks",
+        "path": "(tabs)/tasks/index",
+        "kind": "tab",
+        "auth_required": true,
+        "tab": true,
+        "entry_points": [
+          "tab.tasks"
+        ]
+      },
+      {
+        "id": "tabs.tasks.detail",
+        "path": "(tabs)/tasks/[taskId]",
+        "kind": "detail",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.tasks"
+        ]
+      },
+      {
+        "id": "tabs.tasks.create",
+        "path": "(tabs)/tasks/create",
+        "kind": "detail",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.tasks"
+        ]
+      },
+      {
+        "id": "tabs.calendar",
+        "path": "(tabs)/calendar/index",
+        "kind": "tab",
+        "auth_required": true,
+        "tab": true,
+        "entry_points": [
+          "tab.calendar"
+        ]
+      },
+      {
+        "id": "tabs.filer",
+        "path": "(tabs)/filer/index",
+        "kind": "tab",
+        "auth_required": true,
+        "tab": true,
+        "entry_points": [
+          "tab.filer"
+        ]
+      },
+      {
+        "id": "tabs.filer.text",
+        "path": "(tabs)/filer/text",
+        "kind": "detail",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.filer"
+        ]
+      },
+      {
+        "id": "tabs.docs",
+        "path": "(tabs)/docs/index",
+        "kind": "tab",
+        "auth_required": true,
+        "tab": true,
+        "entry_points": [
+          "tab.docs"
+        ]
+      },
+      {
+        "id": "tabs.docs.detail",
+        "path": "(tabs)/docs/[nodeId]",
+        "kind": "detail",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.docs"
+        ]
+      },
+      {
+        "id": "tabs.apps",
+        "path": "(tabs)/apps/index",
+        "kind": "workspace",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "settings.apps",
+          "sidebar.apps"
+        ]
+      },
+      {
+        "id": "tabs.apps.detail",
+        "path": "(tabs)/apps/[appId]",
+        "kind": "detail",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.apps"
+        ]
+      },
+      {
+        "id": "tabs.settings",
+        "path": "(tabs)/settings/index",
+        "kind": "settings",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "settings"
+        ]
+      },
+      {
+        "id": "tabs.settings.profile",
+        "path": "(tabs)/settings/profile",
+        "kind": "settings",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.settings"
+        ]
+      },
+      {
+        "id": "tabs.settings.connection",
+        "path": "(tabs)/settings/connection",
+        "kind": "settings",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.settings"
+        ]
+      },
+      {
+        "id": "tabs.settings.notifications",
+        "path": "(tabs)/settings/notifications",
+        "kind": "settings",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.settings"
+        ]
+      },
+      {
+        "id": "tabs.settings.character",
+        "path": "(tabs)/settings/character",
+        "kind": "settings",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.settings"
+        ]
+      },
+      {
+        "id": "tabs.settings.memory",
+        "path": "(tabs)/settings/memory",
+        "kind": "settings",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.settings"
+        ]
+      },
+      {
+        "id": "tabs.settings.mcp",
+        "path": "(tabs)/settings/mcp",
+        "kind": "settings",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.settings"
+        ]
+      },
+      {
+        "id": "tabs.settings.remote_servers",
+        "path": "(tabs)/settings/remote-servers",
+        "kind": "settings",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.settings"
+        ]
+      },
+      {
+        "id": "tabs.settings.about",
+        "path": "(tabs)/settings/about",
+        "kind": "settings",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.settings"
+        ]
+      },
+      {
+        "id": "projects",
+        "path": "projects",
+        "kind": "workspace",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "sidebar.projects"
+        ]
+      },
+      {
+        "id": "project.detail",
+        "path": "project/[id]",
+        "kind": "detail",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.projects"
+        ]
+      },
+      {
+        "id": "reports",
+        "path": "reports",
+        "kind": "workspace",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "sidebar.reports"
+        ]
+      },
+      {
+        "id": "report.timeline",
+        "path": "report/timeline",
+        "kind": "detail",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.reports"
+        ]
+      },
+      {
+        "id": "scenario.list",
+        "path": "scenarios",
+        "kind": "workspace",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "sidebar.story"
+        ]
+      },
+      {
+        "id": "scenario.work",
+        "path": "scenario/[workId]",
+        "kind": "detail",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.story"
+        ]
+      },
+      {
+        "id": "scenario.session",
+        "path": "scenario/session",
+        "kind": "detail",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.story"
+        ]
+      },
+      {
+        "id": "trpg.list",
+        "path": "trpg/index",
+        "kind": "workspace",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "sidebar.trpg"
+        ]
+      },
+      {
+        "id": "trpg.room",
+        "path": "trpg/[roomId]",
+        "kind": "detail",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.trpg"
+        ]
+      },
+      {
+        "id": "trpg.host",
+        "path": "trpg/host",
+        "kind": "detail",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.trpg"
+        ]
+      }
+    ],
+    "entry_points": [
+      {
+        "id": "bootstrap",
+        "kind": "bootstrap",
+        "target": "root"
+      },
+      {
+        "id": "auth",
+        "kind": "auth",
+        "target": "auth.login"
+      },
+      {
+        "id": "tab.chat",
+        "kind": "tab",
+        "target": "tabs.chat"
+      },
+      {
+        "id": "tab.tasks",
+        "kind": "tab",
+        "target": "tabs.tasks"
+      },
+      {
+        "id": "tab.calendar",
+        "kind": "tab",
+        "target": "tabs.calendar"
+      },
+      {
+        "id": "tab.filer",
+        "kind": "tab",
+        "target": "tabs.filer"
+      },
+      {
+        "id": "tab.docs",
+        "kind": "tab",
+        "target": "tabs.docs"
+      },
+      {
+        "id": "settings",
+        "kind": "settings",
+        "target": "tabs.settings"
+      },
+      {
+        "id": "settings.apps",
+        "kind": "settings",
+        "target": "tabs.apps",
+        "from": "tabs.settings"
+      },
+      {
+        "id": "sidebar.apps",
+        "kind": "sidebar",
+        "target": "tabs.apps"
+      },
+      {
+        "id": "sidebar.projects",
+        "kind": "sidebar",
+        "target": "projects"
+      },
+      {
+        "id": "sidebar.reports",
+        "kind": "sidebar",
+        "target": "reports"
+      },
+      {
+        "id": "sidebar.story",
+        "kind": "sidebar",
+        "target": "scenario.list"
+      },
+      {
+        "id": "sidebar.trpg",
+        "kind": "sidebar",
+        "target": "trpg.list"
+      },
+      {
+        "id": "parent.chat",
+        "kind": "parent",
+        "target": "tabs.chat",
+        "from": "tab.chat"
+      },
+      {
+        "id": "parent.tasks",
+        "kind": "parent",
+        "target": "tabs.tasks",
+        "from": "tab.tasks"
+      },
+      {
+        "id": "parent.filer",
+        "kind": "parent",
+        "target": "tabs.filer",
+        "from": "tab.filer"
+      },
+      {
+        "id": "parent.docs",
+        "kind": "parent",
+        "target": "tabs.docs",
+        "from": "tab.docs"
+      },
+      {
+        "id": "parent.apps",
+        "kind": "parent",
+        "target": "tabs.apps",
+        "from": "settings.apps"
+      },
+      {
+        "id": "parent.settings",
+        "kind": "parent",
+        "target": "tabs.settings",
+        "from": "settings"
+      },
+      {
+        "id": "parent.projects",
+        "kind": "parent",
+        "target": "projects",
+        "from": "sidebar.projects"
+      },
+      {
+        "id": "parent.reports",
+        "kind": "parent",
+        "target": "reports",
+        "from": "sidebar.reports"
+      },
+      {
+        "id": "parent.story",
+        "kind": "parent",
+        "target": "scenario.list",
+        "from": "sidebar.story"
+      },
+      {
+        "id": "parent.trpg",
+        "kind": "parent",
+        "target": "trpg.list",
+        "from": "sidebar.trpg"
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "id": "auth.login",
+      "domain": "auth",
+      "criticality": "p0",
+      "transport": "fastapi",
+      "operations": [
+        {
+          "operation_id": "login_mobile_api_auth_login_mobile_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        }
+      ],
+      "mobile": {
+        "routes": [
+          "auth.login"
+        ],
+        "entry_points": [
+          "auth"
+        ],
+        "implementation": "mobile/src/contexts/AuthContext.tsx"
+      },
+      "roles": [
+        "anonymous"
+      ],
+      "permissions": [
+        "public"
+      ],
+      "scope": {
+        "kind": "public",
+        "visibility": "public"
+      },
+      "offline": {
+        "read": "forbidden",
+        "mutation": "forbidden",
+        "reconnect": "none"
+      },
+      "persistence": "none",
+      "mutation": "direct_online",
+      "acceptance": [
+        {
+          "id": "auth.login",
+          "given": "the user has valid credentials",
+          "when": "the login form is submitted",
+          "then": "the session is stored and the authenticated shell is reachable"
+        }
+      ]
+    },
+    {
+      "id": "auth.scope",
+      "domain": "auth",
+      "criticality": "p0",
+      "transport": "fastapi",
+      "operations": [
+        {
+          "operation_id": "auth_status_api_auth_status_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        }
+      ],
+      "mobile": {
+        "routes": [
+          "tabs.chat",
+          "tabs.settings"
+        ],
+        "entry_points": [
+          "tab.chat",
+          "settings"
+        ],
+        "implementation": "mobile/src/contexts/AuthContext.tsx"
+      },
+      "roles": [
+        "user",
+        "admin"
+      ],
+      "permissions": [
+        "read"
+      ],
+      "scope": {
+        "kind": "auth_user",
+        "visibility": "auth_user"
+      },
+      "offline": {
+        "read": "cache",
+        "mutation": "forbidden",
+        "reconnect": "refresh"
+      },
+      "persistence": "sqlite_cache",
+      "mutation": "none",
+      "acceptance": [
+        {
+          "id": "auth.scope",
+          "given": "a cached session exists",
+          "when": "the app resumes or switches account",
+          "then": "server auth status is revalidated before scoped data is shown"
+        }
+      ]
+    },
+    {
+      "id": "navigation.shell",
+      "domain": "navigation",
+      "criticality": "p0",
+      "transport": "local",
+      "operations": [],
+      "mobile": {
+        "routes": [
+          "root",
+          "tabs.chat",
+          "tabs.tasks",
+          "tabs.calendar",
+          "tabs.filer",
+          "tabs.docs"
+        ],
+        "entry_points": [
+          "bootstrap",
+          "tab.chat",
+          "tab.tasks",
+          "tab.calendar",
+          "tab.filer",
+          "tab.docs"
+        ],
+        "implementation": "mobile/src/app/(tabs)/_layout.tsx"
+      },
+      "roles": [
+        "user",
+        "admin"
+      ],
+      "permissions": [
+        "read"
+      ],
+      "scope": {
+        "kind": "auth_user",
+        "visibility": "auth_user"
+      },
+      "offline": {
+        "read": "cache",
+        "mutation": "local",
+        "reconnect": "none"
+      },
+      "persistence": "none",
+      "mutation": "local_only",
+      "acceptance": [
+        {
+          "id": "navigation.shell",
+          "given": "the authenticated shell is loaded",
+          "when": "the user opens the app offline",
+          "then": "the canonical five tabs remain stable and Apps is not a bottom tab"
+        }
+      ]
+    },
+    {
+      "id": "navigation.apps_entry",
+      "domain": "navigation",
+      "criticality": "p0",
+      "transport": "local",
+      "operations": [],
+      "mobile": {
+        "routes": [
+          "tabs.apps",
+          "tabs.settings"
+        ],
+        "entry_points": [
+          "settings.apps",
+          "sidebar.apps"
+        ],
+        "implementation": "mobile/src/app/(tabs)/apps/index.tsx"
+      },
+      "roles": [
+        "user",
+        "admin"
+      ],
+      "permissions": [
+        "read"
+      ],
+      "scope": {
+        "kind": "auth_user",
+        "visibility": "auth_user"
+      },
+      "offline": {
+        "read": "cache",
+        "mutation": "local",
+        "reconnect": "none"
+      },
+      "persistence": "sqlite_cache",
+      "mutation": "local_only",
+      "acceptance": [
+        {
+          "id": "navigation.apps",
+          "given": "Apps is hidden from the bottom tab bar",
+          "when": "the user opens Settings or the Apps shortcut",
+          "then": "the Apps index and app detail routes are reachable"
+        }
+      ]
+    },
+    {
+      "id": "chat.search",
+      "domain": "chat",
+      "criticality": "p0",
+      "transport": "fastapi",
+      "operations": [
+        {
+          "operation_id": "search_conversations",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        }
+      ],
+      "mobile": {
+        "routes": [
+          "tabs.chat",
+          "tabs.chat.detail"
+        ],
+        "entry_points": [
+          "tab.chat",
+          "parent.chat"
+        ],
+        "implementation": "mobile/src/lib/chat-api.ts"
+      },
+      "roles": [
+        "user",
+        "member",
+        "owner",
+        "admin"
+      ],
+      "permissions": [
+        "read"
+      ],
+      "scope": {
+        "kind": "conversation",
+        "visibility": "acl_read",
+        "project_parameter": "project_id",
+        "notes": "Search must filter to projects readable by the authenticated user."
+      },
+      "offline": {
+        "read": "cache",
+        "mutation": "forbidden",
+        "reconnect": "refresh"
+      },
+      "persistence": "sqlite_cache",
+      "mutation": "none",
+      "acceptance": [
+        {
+          "id": "chat.search",
+          "given": "the user has readable conversations in multiple projects",
+          "when": "a non-empty query is submitted",
+          "then": "only readable sessions/messages are returned and the search header remains intact"
+        }
+      ]
+    },
+    {
+      "id": "chat.sessions",
+      "domain": "chat",
+      "criticality": "p0",
+      "transport": "fastapi",
+      "operations": [
+        {
+          "operation_id": "list_sessions_api_conversations_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "get_session_api_conversations__session_id__get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "dispatch_conversation_message_api_conversations__session_id__dispatch_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        }
+      ],
+      "mobile": {
+        "routes": [
+          "tabs.chat",
+          "tabs.chat.detail"
+        ],
+        "entry_points": [
+          "tab.chat",
+          "parent.chat"
+        ],
+        "implementation": "mobile/src/lib/chat-api.ts"
+      },
+      "roles": [
+        "user",
+        "member",
+        "owner",
+        "admin"
+      ],
+      "permissions": [
+        "read",
+        "write"
+      ],
+      "scope": {
+        "kind": "conversation",
+        "visibility": "acl_read",
+        "project_parameter": "project_id"
+      },
+      "offline": {
+        "read": "cache",
+        "mutation": "queue",
+        "reconnect": "replay_outbox"
+      },
+      "persistence": "sqlite_and_outbox",
+      "mutation": "outbox_replay",
+      "acceptance": [
+        {
+          "id": "chat.sessions",
+          "given": "a conversation is cached locally",
+          "when": "the user sends a message offline and reconnects",
+          "then": "the message is replayed once and project ACL is rechecked"
+        }
+      ]
+    },
+    {
+      "id": "memory.read_write",
+      "domain": "memory",
+      "criticality": "p0",
+      "transport": "fastapi",
+      "operations": [
+        {
+          "operation_id": "list_memories_api_memories_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "create_memory_api_memories_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "create"
+        },
+        {
+          "operation_id": "update_memory_api_memories__memory_id__patch",
+          "transport": "fastapi",
+          "method": "PATCH",
+          "role": "update"
+        },
+        {
+          "operation_id": "forget_memory_api_memories__memory_id__delete",
+          "transport": "fastapi",
+          "method": "DELETE",
+          "role": "delete"
+        }
+      ],
+      "mobile": {
+        "routes": [
+          "tabs.settings.memory"
+        ],
+        "entry_points": [
+          "parent.settings"
+        ],
+        "implementation": "mobile/src/lib/memory-api.ts"
+      },
+      "roles": [
+        "user",
+        "admin"
+      ],
+      "permissions": [
+        "read",
+        "create",
+        "update",
+        "delete"
+      ],
+      "scope": {
+        "kind": "personal",
+        "visibility": "auth_user"
+      },
+      "offline": {
+        "read": "cache",
+        "mutation": "queue",
+        "reconnect": "replay_outbox"
+      },
+      "persistence": "sqlite_and_outbox",
+      "mutation": "outbox_replay",
+      "acceptance": [
+        {
+          "id": "memory.scope",
+          "given": "the user changes account",
+          "when": "the memory screen loads",
+          "then": "only the current auth scope is read and mutations replay for that scope"
+        }
+      ]
+    },
+    {
+      "id": "tasks.detail",
+      "domain": "tasks",
+      "criticality": "p0",
+      "transport": "fastapi",
+      "operations": [
+        {
+          "operation_id": "list_tasks_api_tasks_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "get_task_api_tasks__task_id__get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "create_task_api_tasks_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "create"
+        },
+        {
+          "operation_id": "update_task_api_tasks__task_id__patch",
+          "transport": "fastapi",
+          "method": "PATCH",
+          "role": "update"
+        },
+        {
+          "operation_id": "delete_task_api_tasks__task_id__delete",
+          "transport": "fastapi",
+          "method": "DELETE",
+          "role": "delete"
+        },
+        {
+          "operation_id": "restore_task_api_tasks__task_id__restore_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        },
+        {
+          "operation_id": "add_comment_api_tasks__task_id__comments_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "create"
+        },
+        {
+          "operation_id": "upload_task_attachment_api_tasks__task_id__attachments_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "create"
+        },
+        {
+          "operation_id": "start_timer_api_time_entries_start_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        },
+        {
+          "operation_id": "stop_timer_api_time_entries_stop_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        },
+        {
+          "operation_id": "get_task_recurrence_api_tasks__task_id__recurrence_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "upsert_task_recurrence_api_tasks__task_id__recurrence_put",
+          "transport": "fastapi",
+          "method": "PUT",
+          "role": "update"
+        },
+        {
+          "operation_id": "delete_task_recurrence_api_tasks__task_id__recurrence_delete",
+          "transport": "fastapi",
+          "method": "DELETE",
+          "role": "delete"
+        },
+        {
+          "operation_id": "list_task_references_api_tasks__task_id__references_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "create_task_reference_api_tasks__task_id__references_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "create"
+        },
+        {
+          "operation_id": "delete_task_reference_api_tasks__task_id__references__reference_id__delete",
+          "transport": "fastapi",
+          "method": "DELETE",
+          "role": "delete"
+        },
+        {
+          "operation_id": "update_occurrence_api_task_occurrences__occurrence_id__patch",
+          "transport": "fastapi",
+          "method": "PATCH",
+          "role": "update"
+        },
+        {
+          "operation_id": "update_time_entry_api_time_entries__entry_id__patch",
+          "transport": "fastapi",
+          "method": "PATCH",
+          "role": "update"
+        },
+        {
+          "operation_id": "delete_time_entry_api_time_entries__entry_id__delete",
+          "transport": "fastapi",
+          "method": "DELETE",
+          "role": "delete"
+        }
+      ],
+      "mobile": {
+        "routes": [
+          "tabs.tasks",
+          "tabs.tasks.detail",
+          "tabs.tasks.create"
+        ],
+        "entry_points": [
+          "tab.tasks",
+          "parent.tasks"
+        ],
+        "implementation": "mobile/src/app/(tabs)/tasks/[taskId].tsx"
+      },
+      "roles": [
+        "user",
+        "member",
+        "owner",
+        "admin"
+      ],
+      "permissions": [
+        "read",
+        "create",
+        "update",
+        "delete",
+        "execute"
+      ],
+      "scope": {
+        "kind": "project",
+        "visibility": "acl_read",
+        "project_parameter": "project_id"
+      },
+      "offline": {
+        "read": "cache",
+        "mutation": "queue",
+        "reconnect": "replay_outbox"
+      },
+      "persistence": "sqlite_and_outbox",
+      "mutation": "local_first",
+      "acceptance": [
+        {
+          "id": "tasks.golden",
+          "given": "a task detail has local data and unsaved edits",
+          "when": "a remote refresh completes",
+          "then": "local edits, serialized autosave, tags, assignee, comments, attachments, subtasks, timer and undo semantics are preserved; task deletion creates a recoverable tombstone and undo/restore remains available for 30 days before irreversible purge"
+        }
+      ]
+    },
+    {
+      "id": "projects.visibility",
+      "domain": "projects",
+      "criticality": "p0",
+      "transport": "fastapi",
+      "operations": [
+        {
+          "operation_id": "list_projects_api_projects_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "get_project_api_projects__project_id__get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "list_members_api_projects__project_id__members_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "create_project_api_projects_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "create"
+        },
+        {
+          "operation_id": "update_project_api_projects__project_id__patch",
+          "transport": "fastapi",
+          "method": "PATCH",
+          "role": "update"
+        },
+        {
+          "operation_id": "add_member_api_projects__project_id__members_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "update"
+        },
+        {
+          "operation_id": "update_member_api_projects__project_id__members__user_id__patch",
+          "transport": "fastapi",
+          "method": "PATCH",
+          "role": "update"
+        },
+        {
+          "operation_id": "remove_member_api_projects__project_id__members__user_id__delete",
+          "transport": "fastapi",
+          "method": "DELETE",
+          "role": "update"
+        },
+        {
+          "operation_id": "list_join_requests_api_projects__project_id__join_requests_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "submit_join_request_api_projects__project_id__join_requests_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "create"
+        },
+        {
+          "operation_id": "approve_join_request_api_projects__project_id__join_requests__request_id__approve_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "update"
+        },
+        {
+          "operation_id": "reject_join_request_api_projects__project_id__join_requests__request_id__reject_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "update"
+        },
+        {
+          "operation_id": "list_tags_api_projects__project_id__tags_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "create_tag_api_projects__project_id__tags_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "create"
+        },
+        {
+          "operation_id": "list_project_files_api_projects__project_id__files_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "upload_project_file_api_projects__project_id__files_upload_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "create"
+        }
+      ],
+      "mobile": {
+        "routes": [
+          "projects",
+          "project.detail",
+          "tabs.tasks",
+          "tabs.chat"
+        ],
+        "entry_points": [
+          "sidebar.projects",
+          "parent.projects",
+          "tab.tasks",
+          "tab.chat"
+        ],
+        "implementation": "mobile/src/lib/project-api.ts"
+      },
+      "roles": [
+        "user",
+        "member",
+        "owner",
+        "admin"
+      ],
+      "permissions": [
+        "read"
+      ],
+      "scope": {
+        "kind": "space_project",
+        "visibility": "acl_read",
+        "project_parameter": "project_id",
+        "space_parameter": "space_id",
+        "notes": "stale or disabled memberships must not remain visible"
+      },
+      "offline": {
+        "read": "cache",
+        "mutation": "forbidden",
+        "reconnect": "refresh"
+      },
+      "persistence": "sqlite_cache",
+      "mutation": "none",
+      "acceptance": [
+        {
+          "id": "projects.acl",
+          "given": "a project is revoked or read=false",
+          "when": "the next list or sync completes",
+          "then": "the project and its dependent task/chat/file selectors disappear from every mobile surface"
+        }
+      ]
+    },
+    {
+      "id": "files.scope",
+      "domain": "files",
+      "criticality": "p0",
+      "transport": "fastapi",
+      "operations": [
+        {
+          "operation_id": "explorer_list_api_explorer_list_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "explorer_get_content_api_explorer_content_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "explorer_save_file_endpoint_api_explorer_save_put",
+          "transport": "fastapi",
+          "method": "PUT",
+          "role": "update"
+        },
+        {
+          "operation_id": "explorer_upload_api_explorer_upload_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "create"
+        }
+      ],
+      "mobile": {
+        "routes": [
+          "tabs.filer",
+          "tabs.filer.text"
+        ],
+        "entry_points": [
+          "tab.filer",
+          "parent.filer"
+        ],
+        "implementation": "mobile/src/lib/files-api.ts"
+      },
+      "roles": [
+        "user",
+        "member",
+        "owner",
+        "admin"
+      ],
+      "permissions": [
+        "read",
+        "create",
+        "update"
+      ],
+      "scope": {
+        "kind": "space_project",
+        "visibility": "acl_read",
+        "project_parameter": "project_id",
+        "space_parameter": "space_id"
+      },
+      "offline": {
+        "read": "cache",
+        "mutation": "queue",
+        "reconnect": "replay_outbox"
+      },
+      "persistence": "sqlite_and_outbox",
+      "mutation": "local_first",
+      "acceptance": [
+        {
+          "id": "files.scope",
+          "given": "the selected project is readable",
+          "when": "a file is opened and edited offline",
+          "then": "the scoped mutation is queued and is not applied to another project"
+        }
+      ]
+    },
+    {
+      "id": "docs.nodes",
+      "domain": "docs",
+      "criticality": "p0",
+      "transport": "fastapi",
+      "operations": [
+        {
+          "operation_id": "get_tree_api_docs_tree_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "get_node_api_docs_nodes__node_id__get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "create_node_api_docs_nodes_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "create"
+        },
+        {
+          "operation_id": "patch_node_api_docs_nodes__node_id__patch",
+          "transport": "fastapi",
+          "method": "PATCH",
+          "role": "update"
+        },
+        {
+          "operation_id": "move_node_api_docs_nodes__node_id__move_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        },
+        {
+          "operation_id": "search_api_docs_search_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "today_api_docs_today_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "add_supertag_api_docs_nodes__node_id__supertags_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "update"
+        },
+        {
+          "operation_id": "remove_supertag_api_docs_nodes__node_id__supertags__supertag_id__delete",
+          "transport": "fastapi",
+          "method": "DELETE",
+          "role": "delete"
+        },
+        {
+          "operation_id": "set_field_api_docs_nodes__node_id__fields__field_id__put",
+          "transport": "fastapi",
+          "method": "PUT",
+          "role": "update"
+        }
+      ],
+      "mobile": {
+        "routes": [
+          "tabs.docs",
+          "tabs.docs.detail"
+        ],
+        "entry_points": [
+          "tab.docs",
+          "parent.docs"
+        ],
+        "implementation": "mobile/src/lib/docs-api.ts"
+      },
+      "roles": [
+        "user",
+        "member",
+        "owner",
+        "admin"
+      ],
+      "permissions": [
+        "read",
+        "create",
+        "update"
+      ],
+      "scope": {
+        "kind": "space_project",
+        "visibility": "acl_read",
+        "project_parameter": "project_id",
+        "space_parameter": "space_id"
+      },
+      "offline": {
+        "read": "cache",
+        "mutation": "queue",
+        "reconnect": "replay_outbox"
+      },
+      "persistence": "sqlite_and_outbox",
+      "mutation": "local_first",
+      "acceptance": [
+        {
+          "id": "docs.nodes",
+          "given": "a scoped document tree is cached",
+          "when": "a node is edited or moved",
+          "then": "outbox, digest, cursor and ACL scope are retained through reconnect"
+        }
+      ]
+    },
+    {
+      "id": "docs.scale_sync",
+      "domain": "docs",
+      "criticality": "p0",
+      "transport": "sync",
+      "operations": [
+        {
+          "operation_id": "pull_api_sync_pull_get",
+          "transport": "sync",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "push_api_sync_push_post",
+          "transport": "sync",
+          "method": "POST",
+          "role": "command"
+        }
+      ],
+      "mobile": {
+        "routes": [
+          "tabs.docs",
+          "tabs.docs.detail"
+        ],
+        "entry_points": [
+          "tab.docs",
+          "parent.docs"
+        ],
+        "implementation": "mobile/src/sync/engine.ts"
+      },
+      "roles": [
+        "user",
+        "member",
+        "owner",
+        "admin"
+      ],
+      "permissions": [
+        "read",
+        "write"
+      ],
+      "scope": {
+        "kind": "space_project",
+        "visibility": "acl_read",
+        "project_parameter": "project_id",
+        "space_parameter": "space_id",
+        "notes": "staging and atomic promotion are required"
+      },
+      "offline": {
+        "read": "cache",
+        "mutation": "queue",
+        "reconnect": "resume"
+      },
+      "persistence": "sqlite_and_outbox",
+      "mutation": "outbox_replay",
+      "acceptance": [
+        {
+          "id": "docs.scale",
+          "given": "a production-shaped tree has many nodes and edges",
+          "when": "sync is interrupted or the app backgrounds",
+          "then": "staging resumes without crash/data loss and promotes atomically after digest/scope checks"
+        }
+      ]
+    },
+    {
+      "id": "story.work",
+      "domain": "story",
+      "criticality": "p0",
+      "transport": "fastapi",
+      "operations": [
+        {
+          "operation_id": "list_works_api_story_works_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "get_work_api_story_works__work_id__get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "create_work_api_story_works_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "create"
+        },
+        {
+          "operation_id": "patch_work_api_story_works__work_id__patch",
+          "transport": "fastapi",
+          "method": "PATCH",
+          "role": "update"
+        },
+        {
+          "operation_id": "list_episodes_api_story_works__work_id__episodes_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "put_episode_body_api_story_episodes__episode_id__body_put",
+          "transport": "fastapi",
+          "method": "PUT",
+          "role": "update"
+        },
+        {
+          "operation_id": "get_graph_api_story_works__work_id__graph_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "search_work_api_story_works__work_id__search_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "export_work_api_story_works__work_id__export_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "export"
+        },
+        {
+          "operation_id": "split_episode_api_story_episodes__episode_id__split_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "update"
+        },
+        {
+          "operation_id": "regenerate_summary_api_story_episodes__episode_id__summary_regenerate_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        },
+        {
+          "operation_id": "context_preview_api_story_episodes__episode_id__context_preview_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "post_structure_api_story_works__work_id__structure_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "update"
+        }
+      ],
+      "mobile": {
+        "routes": [
+          "scenario.list",
+          "scenario.work",
+          "scenario.session"
+        ],
+        "entry_points": [
+          "sidebar.story",
+          "parent.story"
+        ],
+        "implementation": "mobile/src/lib/story-api.ts"
+      },
+      "roles": [
+        "user",
+        "owner",
+        "admin"
+      ],
+      "permissions": [
+        "read",
+        "create",
+        "update"
+      ],
+      "scope": {
+        "kind": "story_work",
+        "visibility": "owner_only"
+      },
+      "offline": {
+        "read": "cache",
+        "mutation": "queue",
+        "reconnect": "resume"
+      },
+      "persistence": "sqlite_and_outbox",
+      "mutation": "local_first",
+      "acceptance": [
+        {
+          "id": "story.workflows",
+          "given": "a work has local draft and revision data",
+          "when": "the writer edits an episode and reloads",
+          "then": "ETag/local draft/conflict and node/graph navigation are preserved"
+        }
+      ]
+    },
+    {
+      "id": "story.jobs",
+      "domain": "story",
+      "criticality": "p0",
+      "transport": "fastapi",
+      "operations": [
+        {
+          "operation_id": "get_job_api_story_jobs__job_id__get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "cancel_job_api_story_jobs__job_id__cancel_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        },
+        {
+          "operation_id": "resume_job_api_story_jobs__job_id__resume_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        }
+      ],
+      "mobile": {
+        "routes": [
+          "scenario.work",
+          "scenario.session"
+        ],
+        "entry_points": [
+          "parent.story"
+        ],
+        "implementation": "mobile/src/lib/story-api.ts"
+      },
+      "roles": [
+        "user",
+        "owner",
+        "admin"
+      ],
+      "permissions": [
+        "read",
+        "execute"
+      ],
+      "scope": {
+        "kind": "story_work",
+        "visibility": "owner_only"
+      },
+      "offline": {
+        "read": "cache",
+        "mutation": "forbidden",
+        "reconnect": "resume"
+      },
+      "persistence": "sqlite_cache",
+      "mutation": "none",
+      "acceptance": [
+        {
+          "id": "story.jobs",
+          "given": "a generation job is running",
+          "when": "the app resumes after interruption",
+          "then": "done/canceled status is mapped consistently and cancel/resume targets the same job"
+        }
+      ]
+    },
+    {
+      "id": "trpg.snapshot",
+      "domain": "trpg",
+      "criticality": "p0",
+      "transport": "fastapi",
+      "operations": [
+        {
+          "operation_id": "get_session_api_trpg_sessions__session_id__get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "patch_snapshot_api_trpg_sessions__session_id__snapshot_patch",
+          "transport": "fastapi",
+          "method": "PATCH",
+          "role": "update"
+        },
+        {
+          "operation_id": "get_private_state_api_trpg_sessions__session_id__private_state_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "end_session_api_trpg_sessions__session_id__end_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        },
+        {
+          "operation_id": "patch_private_state_api_trpg_sessions__session_id__private_state_patch",
+          "transport": "fastapi",
+          "method": "PATCH",
+          "role": "update"
+        },
+        {
+          "operation_id": "list_gm_private_states_api_trpg_sessions__session_id__private_states_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "patch_image_settings_api_trpg_sessions__session_id__image_settings_patch",
+          "transport": "fastapi",
+          "method": "PATCH",
+          "role": "update"
+        },
+        {
+          "operation_id": "generate_session_image_api_trpg_sessions__session_id__images_generate_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        }
+      ],
+      "mobile": {
+        "routes": [
+          "trpg.list",
+          "trpg.room",
+          "trpg.host"
+        ],
+        "entry_points": [
+          "sidebar.trpg",
+          "parent.trpg"
+        ],
+        "implementation": "mobile/src/lib/trpg-api.ts"
+      },
+      "roles": [
+        "user",
+        "gm",
+        "participant",
+        "admin"
+      ],
+      "permissions": [
+        "read",
+        "write"
+      ],
+      "scope": {
+        "kind": "trpg_session",
+        "visibility": "participant"
+      },
+      "offline": {
+        "read": "cache",
+        "mutation": "queue",
+        "reconnect": "resume"
+      },
+      "persistence": "sqlite_and_outbox",
+      "mutation": "outbox_replay",
+      "acceptance": [
+        {
+          "id": "trpg.snapshot",
+          "given": "a session has a current snapshot and private state",
+          "when": "a websocket reconnect or HTTP refresh occurs",
+          "then": "snapshot keys are merged without dropping existing state and private state remains participant-scoped"
+        }
+      ]
+    },
+    {
+      "id": "trpg.play",
+      "domain": "trpg",
+      "criticality": "p0",
+      "transport": "fastapi",
+      "operations": [
+        {
+          "operation_id": "list_sessions_api_trpg_sessions_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "create_session_api_trpg_sessions_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "create"
+        },
+        {
+          "operation_id": "post_action_api_trpg_sessions__session_id__actions_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        },
+        {
+          "operation_id": "roll_dice_api_trpg_sessions__session_id__dice_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        },
+        {
+          "operation_id": "join_session_api_trpg_sessions__session_id__join_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        },
+        {
+          "operation_id": "leave_session_api_trpg_sessions__session_id__leave_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        },
+        {
+          "operation_id": "api_list_rulesets_api_trpg_rulesets_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "api_search_rule_references_api_trpg_rulesets__ruleset_key__references_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "api_rule_reference_stats_api_trpg_rulesets__ruleset_key__reference_stats_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        }
+      ],
+      "mobile": {
+        "routes": [
+          "trpg.list",
+          "trpg.room",
+          "trpg.host"
+        ],
+        "entry_points": [
+          "sidebar.trpg",
+          "parent.trpg"
+        ],
+        "implementation": "mobile/src/lib/trpg-api.ts"
+      },
+      "roles": [
+        "user",
+        "gm",
+        "participant",
+        "admin"
+      ],
+      "permissions": [
+        "read",
+        "create",
+        "write"
+      ],
+      "scope": {
+        "kind": "trpg_session",
+        "visibility": "participant"
+      },
+      "offline": {
+        "read": "cache",
+        "mutation": "queue",
+        "reconnect": "resume"
+      },
+      "persistence": "sqlite_and_outbox",
+      "mutation": "outbox_replay",
+      "acceptance": [
+        {
+          "id": "trpg.play",
+          "given": "the user joins a room",
+          "when": "an action or dice roll is sent offline then reconnects",
+          "then": "the room scope and event order are preserved"
+        }
+      ]
+    }
+  ]
+}

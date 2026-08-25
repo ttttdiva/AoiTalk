@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type MouseEvent as ReactMouseEvent } from "react";
 import {
   CheckSquare,
   ChevronRight,
@@ -29,6 +29,7 @@ import {
   formatFieldSummaryValue,
   tagColorStyle,
 } from "./docs-utils";
+import { hasMeaningfulBlockTitle } from "@/lib/docs-block-model";
 import { nodeText, type DocsTaskBinding } from "./docs-workspace-shared";
 
 export function TaskBindingButton({ task, onOpenTask }: { task: DocsTaskBinding | null; onOpenTask: (taskId: string) => void }) {
@@ -60,6 +61,8 @@ export function PageTitleEditor({
   onRemoveTag = () => {},
   onOpenTag = () => {},
   onNavigateDown = () => {},
+  onContextMenu,
+  readOnly = false,
 }: {
   node: DocsNode;
   tags?: DocsSupertag[];
@@ -70,15 +73,26 @@ export function PageTitleEditor({
   onRemoveTag?: (tag: DocsSupertag) => void;
   onOpenTag?: (tag: DocsSupertag) => void;
   onNavigateDown?: () => void;
+  onContextMenu?: (event: ReactMouseEvent<HTMLInputElement>) => void;
+  readOnly?: boolean;
 }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const committedOnEnterRef = useRef(false);
   const renderedNodeIdRef = useRef(node.id);
+  // Keep the last persisted-looking title separately from the optimistic
+  // `node.title` prop.  The workspace updates that prop on every keystroke;
+  // clearing the input must not turn the canonical page into a blank row.
+  const canonicalTitleRef = useRef(node.title);
 
   useEffect(() => {
     const input = inputRef.current;
     if (!input) return;
     const nodeChanged = renderedNodeIdRef.current !== node.id;
+    if (nodeChanged) {
+      canonicalTitleRef.current = node.title;
+    } else if (hasMeaningfulBlockTitle(node.title)) {
+      canonicalTitleRef.current = node.title;
+    }
     if (nodeChanged || document.activeElement !== input) input.value = node.title;
     renderedNodeIdRef.current = node.id;
     if (requestFocus) {
@@ -87,8 +101,17 @@ export function PageTitleEditor({
     }
   }, [node.id, node.title, requestFocus]);
 
+  const restoreCanonicalTitle = (input: HTMLInputElement) => {
+    const canonical = hasMeaningfulBlockTitle(canonicalTitleRef.current)
+      ? canonicalTitleRef.current
+      : node.title;
+    if (!hasMeaningfulBlockTitle(canonical)) return;
+    input.value = canonical;
+    onChangeTitle(canonical);
+  };
+
   return (
-    <div className="flex min-w-0 items-center gap-1.5" data-docs-page-node-line={node.id}>
+    <div className="flex min-w-0 items-center gap-2" data-docs-page-node-line={node.id}>
       <input
         ref={inputRef}
         data-docs-page-title
@@ -96,12 +119,29 @@ export function PageTitleEditor({
         aria-label="ページタイトル"
         defaultValue={node.title}
         placeholder="Untitled"
-        className="h-9 min-w-[12ch] flex-1 border-0 bg-transparent p-0 text-2xl font-semibold outline-none hover:bg-muted/30 focus:bg-muted/30 focus:ring-1 focus:ring-ring/30"
+        readOnly={readOnly}
+        className="h-12 min-w-[12ch] flex-1 border-0 bg-transparent p-0 text-3xl font-semibold tracking-tight text-foreground outline-none hover:bg-muted/30 focus:bg-muted/30 focus:ring-1 focus:ring-primary/30"
         onFocus={onFocused}
-        onChange={(event) => onChangeTitle(event.target.value)}
+        onContextMenu={(event) => {
+          // The page title is an editor control, so bridge the event explicitly
+          // instead of allowing the browser menu or the workspace row handler
+          // to win.  Selection/editing/keyboard behavior remains unchanged.
+          if (!onContextMenu) return;
+          event.preventDefault();
+          event.stopPropagation();
+          onContextMenu(event);
+        }}
+        onChange={(event) => {
+          if (!readOnly) onChangeTitle(event.target.value);
+        }}
         onBlur={(event) => {
           if (committedOnEnterRef.current) {
             committedOnEnterRef.current = false;
+            return;
+          }
+          if (readOnly) return;
+          if (!hasMeaningfulBlockTitle(event.target.value)) {
+            restoreCanonicalTitle(event.currentTarget);
             return;
           }
           onCommitTitle(event.target.value);
@@ -111,7 +151,13 @@ export function PageTitleEditor({
           if (event.key === "Enter") {
             event.preventDefault();
             committedOnEnterRef.current = true;
-            onCommitTitle(event.currentTarget.value);
+            if (!readOnly) {
+              if (!hasMeaningfulBlockTitle(event.currentTarget.value)) {
+                restoreCanonicalTitle(event.currentTarget);
+              } else {
+                onCommitTitle(event.currentTarget.value);
+              }
+            }
             onNavigateDown();
             return;
           }
@@ -140,7 +186,7 @@ export function PageTitleEditor({
           tag={tag}
           onOpen={() => onOpenTag(tag)}
           onRemove={() => {
-            onRemoveTag(tag);
+            if (!readOnly) onRemoveTag(tag);
             inputRef.current?.focus();
           }}
           onNavigate={(direction) => {
@@ -154,6 +200,7 @@ export function PageTitleEditor({
             if (target) target.focus();
             else onNavigateDown();
           }}
+          disabled={readOnly}
         />
       ))}
     </div>
@@ -171,6 +218,7 @@ export function FieldRows({
   onSuggestionStatus,
   onRunAi,
   onSave,
+  readOnly = false,
 }: {
   node: DocsNode;
   fields: DocsField[];
@@ -182,6 +230,7 @@ export function FieldRows({
   onSuggestionStatus: (suggestionId: string, status: "accepted" | "rejected" | "stale") => Promise<void>;
   onRunAi: () => void;
   onSave: (node: DocsNode, field: DocsField, value: string) => Promise<void>;
+  readOnly?: boolean;
 }) {
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const storageKey = `aoitalk:docs:fields-expanded:${node.id}`;
@@ -228,8 +277,8 @@ export function FieldRows({
       });
     });
   return (
-    <div className="mx-auto mb-4 w-full max-w-3xl space-y-1">
-      <div className="flex min-h-9 flex-wrap items-center gap-2 rounded-md border bg-muted/20 px-2 py-1">
+    <div className="mx-auto mb-5 w-full max-w-4xl space-y-1">
+      <div className="flex min-h-9 flex-wrap items-center gap-2 rounded-md border border-border bg-card px-3 py-1">
         <button
           type="button"
           className="flex min-w-0 flex-1 basis-64 items-center gap-2 text-left text-xs"
@@ -259,7 +308,7 @@ export function FieldRows({
             </span>
           ) : null}
         </button>
-        <Button type="button" variant="ghost" size="sm" className="h-7 gap-1 px-2 text-xs" onClick={onRunAi}>
+        <Button type="button" variant="ghost" size="sm" className="h-7 gap-1 px-2 text-xs" onClick={onRunAi} disabled={readOnly}>
           <Sparkles className="size-3.5" />
           AIで埋める
         </Button>
@@ -285,6 +334,7 @@ export function FieldRows({
                 nodes={nodes}
                 projects={projects}
                 currentNodeId={node.id}
+                disabled={readOnly}
                 onChange={(next) => setDrafts((current) => ({ ...current, [key]: next }))}
                 onCommit={(next) => {
                   setDrafts((current) => {
@@ -308,7 +358,12 @@ export function FieldRows({
                   >
                     {suggestion.value}
                   </button>
-                  <button type="button" className="rounded px-1 hover:bg-accent" onClick={() => void onSuggestionStatus(suggestion.suggestion.id, "rejected")}>
+                  <button
+                    type="button"
+                    aria-label={`${field.name}のAI提案を却下`}
+                    className="rounded px-1 hover:bg-accent"
+                    onClick={() => void onSuggestionStatus(suggestion.suggestion.id, "rejected")}
+                  >
                     <X className="size-3.5" />
                   </button>
                 </div>

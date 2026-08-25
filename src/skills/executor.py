@@ -18,6 +18,13 @@ def invoke_skill(skill_name: str, input_text: str) -> str:
     Returns:
         展開されたスキルプロンプト
     """
+    normalized_name = str(skill_name or "").strip()
+    if normalized_name.casefold() in {"", "?", "？", "none", "null"}:
+        return (
+            "有効なスキル名を指定してください。"
+            "利用可能なスキルはスキル一覧または load_tool_pack の説明を確認してください。"
+        )
+
     from .registry import get_skill_registry
     from .loader import load_project_skills
     from ..services.project_context import get_runtime_project_context
@@ -27,11 +34,14 @@ def invoke_skill(skill_name: str, input_text: str) -> str:
     project_id = str(context.get("id") or "") or None
     if project_id:
         load_project_skills(project_id)
-    skill = registry.get_by_alias(skill_name, project_id) or registry.get(skill_name, project_id)
+    skill = registry.get_by_alias(normalized_name, project_id) or registry.get(
+        normalized_name,
+        project_id,
+    )
 
     if not skill:
         available = ", ".join(registry.get_names(project_id))
-        return f"スキル '{skill_name}' が見つかりません。利用可能なスキル: {available}"
+        return f"スキル '{normalized_name}' が見つかりません。利用可能なスキル: {available}"
 
     rendered = skill.render_prompt(input_text)
     return f"[スキル: {skill.name}]\n{rendered}"

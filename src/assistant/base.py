@@ -11,6 +11,11 @@ from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any
 from pathlib import Path
 from src.tools.keyword.character_manager import get_character_manager
+from src.features import Features
+from src.utils.startup_timing import get_startup_timer
+
+
+_startup_timer = get_startup_timer()
 
 # WSL2環境の自動設定
 if platform.system() == 'Linux':
@@ -43,6 +48,7 @@ class BaseAssistant(ABC):
         self.mode = mode
         self.running = False
         self.web_interface = None
+        self._web_interface_ready_callback = None
         
         # Load character configuration
         self.character_name = self.config.default_character
@@ -98,35 +104,41 @@ class BaseAssistant(ABC):
         Returns:
             bool: True if initialization succeeded
         """
-        print(f"初期化中... (キャラクター: {self.character_name})")
-        print("[BaseAssistant] initializeメソッド開始")
-        
-        # Initialize memory manager in background to avoid blocking startup
-        memory_init_task = None
-        if hasattr(self.llm_client, 'memory_manager') and self.llm_client.memory_manager:
-            if hasattr(self.llm_client.memory_manager, 'initialize'):
-                async def init_memory_background():
-                    try:
-                        print("[BaseAssistant] メモリシステムをバックグラウンドで初期化中...")
-                        await self.llm_client.memory_manager.initialize()
-                        print("[BaseAssistant] メモリシステムの初期化完了")
-                    except Exception as e:
-                        print(f"[BaseAssistant] メモリシステムの初期化エラー: {e}")
-                
-                # Start memory initialization in background
-                memory_init_task = asyncio.create_task(init_memory_background())
-        
-        # Mode-specific initialization (e.g., VOICEVOX) runs in parallel
-        mode_init_result = await self._initialize_mode_specific()
-        
-        # Optionally wait for memory init with a short timeout
-        if memory_init_task:
-            try:
-                await asyncio.wait_for(memory_init_task, timeout=2.0)
-            except asyncio.TimeoutError:
-                # Memory init continues in background
-                print("[BaseAssistant] メモリシステムの初期化は継続中（バックグラウンド）")
-        
+        _initialize_phase = _startup_timer.start_phase("startup.assistant.initialize")
+        try:
+            print(f"初期化中... (キャラクター: {self.character_name})")
+            print("[BaseAssistant] initializeメソッド開始")
+
+            # Initialize memory manager in background to avoid blocking startup
+            memory_init_task = None
+            if hasattr(self.llm_client, 'memory_manager') and self.llm_client.memory_manager:
+                if hasattr(self.llm_client.memory_manager, 'initialize'):
+                    async def init_memory_background():
+                        try:
+                            print("[BaseAssistant] メモリシステムをバックグラウンドで初期化中...")
+                            await self.llm_client.memory_manager.initialize()
+                            print("[BaseAssistant] メモリシステムの初期化完了")
+                        except Exception as e:
+                            print(f"[BaseAssistant] メモリシステムの初期化エラー: {e}")
+
+                    # Start memory initialization in background
+                    memory_init_task = asyncio.create_task(init_memory_background())
+
+            # Mode-specific initialization (e.g., VOICEVOX) runs in parallel
+            mode_init_result = await self._initialize_mode_specific()
+
+            # Optionally wait for memory init with a short timeout
+            if memory_init_task:
+                try:
+                    await asyncio.wait_for(memory_init_task, timeout=2.0)
+                except asyncio.TimeoutError:
+                    # Memory init continues in background
+                    print("[BaseAssistant] メモリシステムの初期化は継続中（バックグラウンド）")
+        except BaseException:
+            _startup_timer.finish_phase(_initialize_phase, status="error")
+            raise
+
+        _startup_timer.finish_phase(_initialize_phase)
         return mode_init_result
 
     def _get_web_interface_settings(self):
@@ -139,12 +151,20 @@ class BaseAssistant(ABC):
 
         host = os.getenv('AOITALK_WEB_HOST', host)
 
-        env_port = os.getenv('AOITALK_WEB_PORT')
+        env_port_name = (
+            'AOITALK_WEB_PORT'
+            if os.getenv('AOITALK_WEB_PORT')
+            else 'AOITALK_FASTAPI_PORT'
+        )
+        env_port = os.getenv(env_port_name)
         if env_port:
             try:
                 port = int(env_port)
             except ValueError:
-                print(f"[WebUI] Invalid AOITALK_WEB_PORT '{env_port}', falling back to {port}")
+                print(
+                    f"[WebUI] Invalid {env_port_name} '{env_port}', "
+                    f"falling back to {port}"
+                )
 
         env_auto = os.getenv('AOITALK_WEB_AUTO_OPEN')
         if env_auto is not None:
@@ -231,20 +251,45 @@ class BaseAssistant(ABC):
             if hasattr(self.llm_client, 'clear_history'):
                 self.web_interface.set_clear_chat_callback(self.llm_client.clear_history)
             
-            server_url = self.web_interface.start_server(
-                host=host, port=port,
-                ssl_keyfile=ssl_keyfile, ssl_certfile=ssl_certfile
-            )
-
-            browser_url = self._get_local_browser_url(host, port, server_url)
-
-            if auto_open_browser:
-                self._open_browser_async(browser_url)
-
-            return server_url
+            with _startup_timer.phase("startup.web.fastapi.start"):
+                server_url = self.web_interface.start_server(
+                    host=host, port=port,
+                    ssl_keyfile=ssl_keyfile, ssl_certfile=ssl_certfile
+                )
         except Exception as e:
             print(f"❌ Webインターフェースの開始に失敗しました: {e}")
+            require_runtime = os.getenv("AOITALK_REQUIRE_DATABASE", "").lower() in {
+                "1", "true", "yes", "on"
+            } or Features.is_enterprise()
+            if require_runtime:
+                raise
             return None
+
+        if not server_url:
+            require_runtime = os.getenv("AOITALK_REQUIRE_DATABASE", "").lower() in {
+                "1", "true", "yes", "on"
+            } or Features.is_enterprise()
+            if require_runtime:
+                raise RuntimeError(
+                    f"Enterprise WebUI did not become ready on {host}:{port}"
+                )
+            return None
+        if self._web_interface_ready_callback:
+            try:
+                with _startup_timer.phase("startup.services.caddy.start"):
+                    self._web_interface_ready_callback(host, port)
+            except Exception:
+                self.web_interface.stop_server()
+                raise
+
+        browser_url = self._get_local_browser_url(host, port, server_url)
+        if auto_open_browser:
+            self._open_browser_async(browser_url)
+        return server_url
+
+    def set_web_interface_ready_callback(self, callback) -> None:
+        """Register orchestration to run after FastAPI reports readiness."""
+        self._web_interface_ready_callback = callback
 
     def _open_browser_async(self, server_url: str):
         """Open browser asynchronously to avoid blocking event loop"""
@@ -324,7 +369,16 @@ class BaseAssistant(ABC):
     async def cleanup(self):
         """Cleanup resources"""
         self.running = False
-        
+
+        # WebUI owns a separate uvicorn thread/event loop. Stop it before
+        # mode-specific and LLM cleanup so supervisor/Docker shutdown cannot
+        # leave a live listener behind.
+        if self.web_interface and hasattr(self.web_interface, "stop_server"):
+            try:
+                self.web_interface.stop_server()
+            except Exception as e:
+                print(f"WebUIクリーンアップエラー: {e}")
+
         # Get goodbye message
         personality = self.character_config.get('personality', {})
         goodbye = personality.get('goodbyeReply', 'さようなら！')

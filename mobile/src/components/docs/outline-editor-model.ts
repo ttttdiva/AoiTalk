@@ -32,7 +32,7 @@ export function buildChildrenMap(nodes: DocsNode[]): Map<string, DocsNode[]> {
 export function flattenVisibleOutline(
   nodes: DocsNode[],
   rootNodeId: string,
-  collapsedIds: ReadonlySet<string>,
+  expandedIds: ReadonlySet<string>,
   showArchived = false,
 ): OutlineRow[] {
   const visibleNodes = showArchived ? nodes : nodes.filter((node) => !node.archived_at);
@@ -47,7 +47,7 @@ export function flattenVisibleOutline(
       visited.add(node.id);
       const hasChildren = (childrenMap.get(node.id)?.length ?? 0) > 0;
       rows.push({ node, depth, siblingIndex, hasChildren });
-      if (hasChildren && !collapsedIds.has(node.id)) visit(node.id, depth + 1);
+      if (hasChildren && expandedIds.has(node.id)) visit(node.id, depth + 1);
     });
   };
 

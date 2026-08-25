@@ -14,7 +14,11 @@ AoiTalk はDB認証だけに依存せず、保存データをアプリ層で暗�
 
 Windows では `scripts/field_crypto_key.ps1` が DPAPI CurrentUser で保護した32 byteデータキーを作成・取得する。既定の保存先は `%APPDATA%\AoiTalk\keys\field-crypto-key.dpapi`。
 
-Linux/macOSでは `AOITALK_FIELD_CRYPTO_KEY_COMMAND` に keyring/KMS から base64 形式の32 byteキーを返すコマンドを設定する。ローカル検証用途だけ、`AOITALK_FIELD_CRYPTO_ALLOW_LOCAL_KEY_FILE=true` でユーザー権限ファイルのフォールバックを使える。
+Linux/macOSでは `AOITALK_FIELD_CRYPTO_KEY_COMMAND` に keyring/KMS から base64 形式の32 byteキーを返すコマンドを設定する。macOSではkey commandが必須で、ローカル鍵ファイルへはフォールバックしない。Linuxのローカル検証用途だけ、`AOITALK_FIELD_CRYPTO_ALLOW_LOCAL_KEY_FILE=true` でユーザー権限ファイルのフォールバックを使える。このフォールバックは `/proc/self/fd` とPOSIXのfd相対操作を必要とし、利用できない環境ではfail closedする。
+
+Linuxのローカル鍵ファイルでは、rootまたは実効ユーザーが所有しgroup/world writableでない全祖先だけを信頼する。sticky bit付きworld-writable祖先を通る場合は、直後のcomponentがrootまたは実効ユーザー所有かつgroup/world writableでないことも検証する。既存鍵は実効ユーザー所有の通常ファイルかつ `0400` または `0600` の場合だけ受理する。`0644` などを自動修復しないため、権限不正時は鍵ファイルをrotationしてから再試行する。
+
+暗号化envelopeは `enc:v1:aes256gcm:local`、12 byte nonce、16 byte GCM tag、paddingなしcanonical base64urlに固定する。key commandやDPAPI helperが失敗した場合、標準出力・標準エラーは例外へ含めず、出力サイズも制限する。
 
 ## 対象
 
@@ -32,6 +36,7 @@ Linux/macOSでは `AOITALK_FIELD_CRYPTO_KEY_COMMAND` に keyring/KMS から base
 - `record_rows.search_text`
 - `task_comments.content`
 - `knowledge_chunks.text`
+- `user_x_cookie_credentials.encrypted_payload`（auth_token/ct0のcanonical最小構造）
 - Qdrant payload `text`
 
 ## 移行

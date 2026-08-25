@@ -3,7 +3,7 @@ Custom AudioSink for discord-ext-voice-recv
 """
 
 import logging
-from discord.ext import voice_recv
+from ..voice_recv_compat import voice_recv
 
 logger = logging.getLogger(__name__)
 

@@ -2,7 +2,10 @@
 Repository for Project management
 """
 
+import asyncio
 import re
+import logging
+import os
 from datetime import datetime
 from typing import List, Optional, Dict, Any, Tuple
 from uuid import UUID, uuid4
@@ -18,12 +21,23 @@ from .models import (
     ProjectNotificationSetting, NotificationDelivery, KnowledgeSourcePermission,
     KnowledgeSource, ProjectContextPack, ContextMemory, RecordAttachment,
     RecordEvent, RecordField, RecordRow, RecordTable, RecordView,
+    AppGrant, AppJob, ProjectApp,
+)
+from ..services.project_permissions import (
+    PROJECT_MEMBER_DEFAULT_PERMISSIONS,
+    get_default_project_permissions,
+    has_effective_project_permission,
+    normalize_project_member_permissions,
+    normalize_project_member_role,
 )
 
 
 INBOX_NAME = "Inbox"
 INBOX_DESCRIPTION = "未整理のタスクを一時的に置く場所"
 INBOX_COLOR = "#6b7280"
+OWNER_MEMBER_PERMISSIONS = PROJECT_MEMBER_DEFAULT_PERMISSIONS["owner"]
+
+logger = logging.getLogger(__name__)
 
 
 def generate_slug(name: str) -> str:
@@ -168,6 +182,13 @@ class ProjectRepository:
         )
         inbox_project = project_result.scalar_one_or_none()
 
+        if inbox_project is not None and inbox_project.owner_id != user_id:
+            # The slug embeds the UUID and is reserved for exactly one user.
+            # Never repair/reassign a colliding project: doing so would leave
+            # the previous owner with a still-valid membership and turn a
+            # harmless slug collision into an ownership takeover.
+            raise RuntimeError("Reserved Inbox project slug is owned by another user")
+
         if inbox_project is None:
             inbox_project = Project(
                 name=INBOX_NAME,
@@ -186,6 +207,7 @@ class ProjectRepository:
         else:
             inbox_project.name = INBOX_NAME
             inbox_project.description = inbox_project.description or INBOX_DESCRIPTION
+            inbox_project.owner_id = user_id
             inbox_project.space_id = inbox_space.id
             inbox_project.deleted_at = None
             metadata = dict(inbox_project.project_metadata or {})
@@ -203,14 +225,22 @@ class ProjectRepository:
                 ProjectMember.user_id == user_id,
             )
         )
-        if member_result.scalar_one_or_none() is None:
+        owner_member = member_result.scalar_one_or_none()
+        if owner_member is None:
             session.add(
                 ProjectMember(
                     project_id=inbox_project.id,
                     user_id=user_id,
-                    role="admin",
+                    role="owner",
+                    permissions=dict(OWNER_MEMBER_PERMISSIONS),
                 )
             )
+        else:
+            # Inbox の所有者は project.owner_id と常に一致させる。過去の
+            # FastAPI/Next 実装が作った admin・権限なし membership も、
+            # ログイン時の冪等なセットアップで安全な所有者権限へ修復する。
+            owner_member.role = "owner"
+            owner_member.permissions = dict(OWNER_MEMBER_PERMISSIONS)
 
         await session.flush()
         return inbox_space, inbox_project
@@ -225,7 +255,13 @@ class ProjectRepository:
         バックエンドは初回ログイン後に存在する前提で参照のみ行う。
         """
         slug = user_inbox_project_slug(user_id)
-        result = await session.execute(select(Project.id).where(Project.slug == slug))
+        result = await session.execute(
+            select(Project.id).where(
+                Project.slug == slug,
+                Project.owner_id == user_id,
+                Project.deleted_at.is_(None),
+            )
+        )
         row = result.scalar_one_or_none()
         return row if row else None
 
@@ -240,6 +276,8 @@ class ProjectRepository:
         project_id: Optional[UUID] = None,
         slug: Optional[str] = None,
         aliases: Optional[list[str]] = None,
+        space_id: Optional[UUID] = None,
+        is_completed: bool = False,
         allow_join_requests: bool = True,
         storage_quota_mb: int = 1000,
         project_metadata: Optional[Dict[str, Any]] = None,
@@ -252,6 +290,8 @@ class ProjectRepository:
             name: Project name
             description: Optional description
             slug: Optional custom slug (auto-generated if not provided)
+            space_id: Optional owning Space UUID
+            is_completed: Whether the project is in the completed section
             allow_join_requests: Whether to accept join requests
             storage_quota_mb: Storage quota in MB
             project_metadata: Optional project metadata payload
@@ -281,6 +321,8 @@ class ProjectRepository:
             slug=final_slug,
             aliases=aliases or [],
             owner_id=owner_id,
+            space_id=space_id,
+            is_completed=bool(is_completed),
             allow_join_requests=allow_join_requests,
             storage_quota_mb=storage_quota_mb,
             project_metadata=project_metadata or {},
@@ -305,17 +347,6 @@ class ProjectRepository:
         await session.commit()
         await session.refresh(project)
         
-        # Initialize git repository for project's workspace directory
-        try:
-            from ..services.git_service import ensure_project_git_repository
-            ensure_project_git_repository(str(project.id))
-        except Exception as e:
-            # Log but don't fail project creation
-            import logging
-            logging.getLogger(__name__).warning(
-                f"Failed to initialize git repository for project {project.id}: {e}"
-            )
-        
         return project
     
     @staticmethod
@@ -339,6 +370,24 @@ class ProjectRepository:
             query = query.options(selectinload(Project.members))
         
         result = await session.execute(query)
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def get_by_id_for_update(
+        session: AsyncSession,
+        project_id: UUID,
+    ) -> Optional[Project]:
+        """Load an active project while holding its row lock.
+
+        File uploads use this lock to serialize the quota check, filesystem
+        write, and tracked usage update across Python and Next.js workers.
+        """
+        result = await session.execute(
+            select(Project)
+            .where(Project.id == project_id, Project.deleted_at.is_(None))
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         return result.scalar_one_or_none()
     
     @staticmethod
@@ -380,11 +429,32 @@ class ProjectRepository:
         Returns:
             List of project dicts with membership info
         """
-        # Get projects where user is a member
+        from ..services.project_permissions import normalize_project_member_permissions
+
+        user = await session.get(User, user_id)
+        if getattr(user, "role", None) == "admin":
+            result = await session.execute(
+                select(Project)
+                .where(Project.deleted_at.is_(None))
+                .order_by(Project.updated_at.desc())
+            )
+            return [project.to_dict() for project in result.scalars().all()]
+
+        # Get projects where user is a member, then apply the same explicit
+        # read policy used by project context and task services.
         query = (
             select(Project, ProjectMember)
-            .join(ProjectMember, Project.id == ProjectMember.project_id)
-            .where(ProjectMember.user_id == user_id, Project.deleted_at.is_(None))
+            .outerjoin(
+                ProjectMember,
+                and_(
+                    Project.id == ProjectMember.project_id,
+                    ProjectMember.user_id == user_id,
+                ),
+            )
+            .where(
+                Project.deleted_at.is_(None),
+                or_(Project.owner_id == user_id, ProjectMember.user_id == user_id),
+            )
             .order_by(Project.updated_at.desc())
         )
         
@@ -392,11 +462,99 @@ class ProjectRepository:
         projects = []
         
         for project, member in result.fetchall():
+            permissions = normalize_project_member_permissions(
+                member.permissions if member else None
+            )
+            if project.owner_id != user_id and permissions.get("read") is not True:
+                continue
             proj_dict = project.to_dict()
-            proj_dict['membership'] = member.to_dict()
+            proj_dict['membership'] = member.to_dict() if member else None
             projects.append(proj_dict)
         
         return projects
+
+    @staticmethod
+    async def get_accessible_project_ids(
+        session: AsyncSession,
+        user_id: UUID,
+    ) -> List[UUID]:
+        """Return project IDs the user may access for management/read paths.
+
+        ``accessible`` intentionally includes global administrators, project
+        owners, and members with an explicit effective ``read`` grant.  A
+        membership row by itself (or its role name) is not a grant; malformed
+        ACL JSON is denied by :func:`normalize_project_member_permissions`.
+        This helper is read-only and never repairs or creates memberships.
+        """
+        user = await session.get(User, user_id)
+        if getattr(user, "role", None) == "admin":
+            result = await session.execute(
+                select(Project.id).where(Project.deleted_at.is_(None))
+            )
+            return list(result.scalars().all())
+
+        owned_result = await session.execute(
+            select(Project.id).where(
+                Project.owner_id == user_id,
+                Project.deleted_at.is_(None),
+            )
+        )
+        accessible = list(owned_result.scalars().all())
+        accessible_set = set(accessible)
+
+        result = await session.execute(
+            select(ProjectMember, Project.owner_id)
+            .join(Project, Project.id == ProjectMember.project_id)
+            .where(
+                ProjectMember.user_id == user_id,
+                Project.deleted_at.is_(None),
+            )
+        )
+        for member, owner_id in result.all():
+            permissions = normalize_project_member_permissions(member.permissions)
+            if owner_id == user_id or permissions.get("read") is True:
+                if member.project_id not in accessible_set:
+                    accessible.append(member.project_id)
+                    accessible_set.add(member.project_id)
+        return accessible
+
+    @staticmethod
+    async def get_participating_project_ids(
+        session: AsyncSession,
+        user_id: UUID,
+    ) -> List[UUID]:
+        """Return operationally participating project IDs for ``user_id``.
+
+        Participation is deliberately narrower than management/read access:
+        project owners participate, as do users with an explicit effective
+        ``ProjectMember.permissions.read`` grant.  A global-admin role alone
+        does *not* make every project participating.  The query is strictly
+        read-only so scope calculation cannot create implicit memberships.
+        """
+        owned_result = await session.execute(
+            select(Project.id).where(
+                Project.owner_id == user_id,
+                Project.deleted_at.is_(None),
+            )
+        )
+        participating = list(owned_result.scalars().all())
+        participating_set = set(participating)
+
+        result = await session.execute(
+            select(ProjectMember, Project.owner_id)
+            .join(Project, Project.id == ProjectMember.project_id)
+            .where(
+                ProjectMember.user_id == user_id,
+                Project.deleted_at.is_(None),
+            )
+        )
+        for member, owner_id in result.all():
+            permissions = normalize_project_member_permissions(member.permissions)
+            if owner_id == user_id or permissions.get("read") is True:
+                if member.project_id not in participating_set:
+                    participating.append(member.project_id)
+                    participating_set.add(member.project_id)
+        return participating
     
     @staticmethod
     async def update_project(
@@ -410,14 +568,15 @@ class ProjectRepository:
             session: Database session
             project_id: Project UUID
             **kwargs: Fields to update (name, description,
-                      allow_join_requests, storage_quota_mb, project_metadata)
+                      space_id, is_completed, allow_join_requests,
+                      storage_quota_mb, project_metadata)
             
         Returns:
             Updated Project or None
         """
         allowed_fields = {
             'name', 'description', 'aliases', 'allow_join_requests',
-            'storage_quota_mb', 'project_metadata'
+            'space_id', 'is_completed', 'storage_quota_mb', 'project_metadata'
         }
         
         update_data = {k: v for k, v in kwargs.items() if k in allowed_fields}
@@ -441,6 +600,30 @@ class ProjectRepository:
         project_id: UUID,
         *,
         delete_workspace: bool = False,
+        workspace_root: str | os.PathLike[str] | None = None,
+    ) -> bool:
+        from ..services.app_operation_lock import project_operation_lock
+        from ..services.app_storage import get_workspaces_root
+
+        # ロック path を決める root と、実際に消す workspace の root がずれると
+        # 排他が静かに壊れる。呼び出し元が None を渡した場合も含めて、実効 root を
+        # ここで 1 度だけ確定し、ロックと削除処理へ同じ値を渡す。
+        effective_root = get_workspaces_root(workspace_root)
+        async with project_operation_lock(project_id, workspace_root=effective_root):
+            return await ProjectRepository._delete_project_unlocked(
+                session,
+                project_id,
+                delete_workspace=delete_workspace,
+                workspace_root=effective_root,
+            )
+
+    @staticmethod
+    async def _delete_project_unlocked(
+        session: AsyncSession,
+        project_id: UUID,
+        *,
+        delete_workspace: bool = False,
+        workspace_root: str | os.PathLike[str] | None = None,
     ) -> bool:
         """Delete a project from the active app surface.
 
@@ -453,7 +636,65 @@ class ProjectRepository:
         if project is None:
             return False
 
+        # Serialize deletion with ProjectApp link/update/unlink operations.
+        # The binding routes acquire this same Project row lock before
+        # mutating the relationship.
+        locked_project_id = await session.scalar(select(Project.id).where(
+            Project.id == project_id,
+            Project.deleted_at.is_(None),
+        ).with_for_update())
+        if locked_project_id is None:
+            return False
+
         now = datetime.utcnow()
+
+        # Project App instances are disposable, but an active App job may
+        # still have that instance as its cwd/log destination.  Cancel active
+        # jobs before deleting the binding; row locks make a queued executor
+        # observe the cancelled state after this transaction commits.
+        project_app_result = await session.execute(
+            select(ProjectApp.app_id).where(ProjectApp.project_id == project_id)
+        )
+        project_app_ids = list(project_app_result.scalars().all())
+        if project_app_ids:
+            await session.execute(
+                select(ProjectApp.app_id)
+                .where(
+                    ProjectApp.project_id == project_id,
+                    ProjectApp.app_id.in_(project_app_ids),
+                )
+                .with_for_update()
+            )
+
+        # AppJob の検索条件は project_id だけで、ProjectApp binding には依存しない。
+        # run 実行中に unlink（ProjectApp 削除）してから Project を削除すると
+        # binding は 0 件になるが、下の ``remove_app_instance`` は
+        # ``_app_instances/project_<id>`` を丸ごと消す。binding の有無でここを
+        # ガードすると、実行中サブプロセスの cwd とログ出力先が生きたまま消える
+        # （Windows は使用中で rmtree 失敗 → 部分削除のまま握り潰し、Linux は
+        # unlink 済みファイルへ書き続ける）。よって走査は常に行う。
+        active_jobs_result = await session.execute(
+            select(AppJob)
+            .where(
+                AppJob.project_id == project_id,
+                AppJob.status.in_(("queued", "running")),
+            )
+            .with_for_update()
+        )
+        active_jobs = list(active_jobs_result.scalars().all())
+        if active_jobs:
+            from ..services.app_job_service import stop_running_job
+
+            for job in active_jobs:
+                if job.status == "running":
+                    # stop_running_job → _kill_process_tree は Windows で
+                    # subprocess.run(["taskkill", ...], timeout=10) を同期実行する。
+                    # event loop 上で直接呼ぶと Job 1 件あたり最大 10 秒、
+                    # サーバー全体が無応答になるため必ず別スレッドへ逃がす。
+                    await asyncio.to_thread(stop_running_job, job.id)
+                job.status = "cancelled"
+                job.result_json = {"error": "Project was deleted"}
+                job.ended_at = now
 
         # タスク配下を tombstone 化
         await session.execute(
@@ -562,11 +803,30 @@ class ProjectRepository:
 
         project.deleted_at = now
         project.updated_at = now
-        if delete_workspace:
-            from ..services.project_workspace_cleanup import remove_project_workspace
-
-            remove_project_workspace(project_id)
+        # Project deletion is a soft delete, so database FK cascades do not run.
+        # App source/artifacts remain first-class resources, while bindings and
+        # Project-scoped grants must be removed explicitly.
+        await session.execute(delete(ProjectApp).where(ProjectApp.project_id == project_id))
+        await session.execute(delete(AppGrant).where(AppGrant.project_id == project_id))
         await session.commit()
+        from ..services.app_storage import remove_app_instance
+
+        # The DB tombstone/binding deletion is the transaction boundary.  Do
+        # not destroy filesystem data before it commits: a DB rollback must
+        # leave the instance available for the still-existing binding.
+        if delete_workspace:
+            try:
+                from ..services.project_workspace_cleanup import remove_project_workspace
+
+                # ロック取得と同じ root を使わないと、別 root の workspace を
+                # 削除してしまう（= ロックが守っていない領域を触る）。
+                remove_project_workspace(project_id, workspace_root=workspace_root)
+            except Exception:
+                logger.exception("Project workspace cleanup failed after Project deletion: %s", project_id)
+        try:
+            remove_app_instance(project_id, workspace_root=workspace_root)
+        except Exception:
+            logger.exception("App instance cleanup failed after Project deletion: %s", project_id)
         return True
 
     @staticmethod
@@ -575,6 +835,7 @@ class ProjectRepository:
         space_id: UUID,
         *,
         delete_workspaces: bool = False,
+        workspace_root: str | os.PathLike[str] | None = None,
     ) -> int:
         """Soft-delete active projects in a space, then detach all project refs.
 
@@ -582,6 +843,8 @@ class ProjectRepository:
         Deleted project rows are detached afterward so the space row can be
         removed without violating the ``projects.space_id`` foreign key.
         """
+        from ..services.app_storage import get_workspaces_root
+
         result = await session.execute(
             select(Project.id).where(
                 Project.space_id == space_id,
@@ -590,12 +853,15 @@ class ProjectRepository:
         )
         project_ids = list(result.scalars().all())
 
+        # Space 配下のすべての Project 削除を同じ実効 root で処理する。
+        effective_root = get_workspaces_root(workspace_root)
         deleted_count = 0
         for project_id in project_ids:
             if await ProjectRepository.delete_project(
                 session,
                 project_id,
                 delete_workspace=delete_workspaces,
+                workspace_root=effective_root,
             ):
                 deleted_count += 1
 
@@ -630,6 +896,19 @@ class ProjectRepository:
         Returns:
             ProjectMember or None if already exists
         """
+        # Membership mutations share the project row lock with storage
+        # writers.  This makes an upload that acquired the lock first finish
+        # under the old ACL, while an upload that waits observes this change.
+        project = await ProjectRepository.get_by_id_for_update(session, project_id)
+        if project is None:
+            return None
+
+        normalized_role = normalize_project_member_role(role)
+        if normalized_role == "owner" and project.owner_id != user_id:
+            raise ValueError("Only the project owner may have owner role")
+        if permissions is not None and not isinstance(permissions, dict):
+            raise ValueError("Project member permissions must be an object")
+
         # Check if already a member
         existing = await session.execute(
             select(ProjectMember).where(
@@ -642,22 +921,22 @@ class ProjectRepository:
         if existing.scalar_one_or_none():
             return None
         
-        # Default permissions by role
-        default_permissions = {
-            'owner': {'read': True, 'write': True, 'delete': True, 'manage_members': True, 'manage_settings': True},
-            'admin': {'read': True, 'write': True, 'delete': True, 'manage_members': True, 'manage_settings': False},
-            'member': {'read': True, 'write': True, 'delete': False, 'manage_members': False, 'manage_settings': False},
-            'viewer': {'read': True, 'write': False, 'delete': False, 'manage_members': False, 'manage_settings': False}
-        }
-        
         member = ProjectMember(
             project_id=project_id,
             user_id=user_id,
-            role=role,
+            role=normalized_role,
             invited_by=invited_by,
-            permissions=permissions or default_permissions.get(role, default_permissions['member'])
+            permissions=(
+                dict(permissions)
+                if permissions is not None
+                else get_default_project_permissions(normalized_role)
+            )
         )
         session.add(member)
+        # ACL changes are part of the project sync revision.  Bumping the
+        # project timestamp lets delta clients refresh the canonical project
+        # set after a grant/revoke without exposing membership rows directly.
+        project.updated_at = datetime.utcnow()
         await session.commit()
         await session.refresh(member)
         
@@ -680,10 +959,13 @@ class ProjectRepository:
             ProjectMember or None
         """
         result = await session.execute(
-            select(ProjectMember).where(
+            select(ProjectMember)
+            .join(Project, Project.id == ProjectMember.project_id)
+            .where(
                 and_(
                     ProjectMember.project_id == project_id,
-                    ProjectMember.user_id == user_id
+                    ProjectMember.user_id == user_id,
+                    Project.deleted_at.is_(None),
                 )
             )
         )
@@ -722,6 +1004,34 @@ class ProjectRepository:
             members.append(member_dict)
         
         return members
+
+    @staticmethod
+    async def get_project_assignee_candidates(
+        session: AsyncSession,
+        project_id: UUID,
+    ) -> List[Dict[str, Any]]:
+        """Return active project members with only task-assignment fields."""
+        result = await session.execute(
+            select(
+                ProjectMember.user_id,
+                User.username,
+                User.display_name,
+            )
+            .join(User, ProjectMember.user_id == User.id)
+            .where(
+                ProjectMember.project_id == project_id,
+                User.is_active.is_(True),
+            )
+            .order_by(ProjectMember.joined_at)
+        )
+        return [
+            {
+                "user_id": str(user_id),
+                "username": username,
+                "display_name": display_name,
+            }
+            for user_id, username, display_name in result.all()
+        ]
     
     @staticmethod
     async def update_member(
@@ -743,11 +1053,27 @@ class ProjectRepository:
         Returns:
             Updated ProjectMember or None
         """
-        update_data = {}
+        project = await ProjectRepository.get_by_id_for_update(session, project_id)
+        if project is None or project.owner_id == user_id:
+            return None
+
+        normalized_role = None
         if role is not None:
-            update_data['role'] = role
+            normalized_role = normalize_project_member_role(role)
+            if normalized_role == "owner":
+                return None
+        if permissions is not None and not isinstance(permissions, dict):
+            raise ValueError("Project member permissions must be an object")
+
+        update_data = {}
+        if normalized_role is not None:
+            update_data['role'] = normalized_role
+            if permissions is None:
+                update_data['permissions'] = get_default_project_permissions(
+                    normalized_role
+                )
         if permissions is not None:
-            update_data['permissions'] = permissions
+            update_data['permissions'] = dict(permissions)
         
         if not update_data:
             return await ProjectRepository.get_member(session, project_id, user_id)
@@ -762,6 +1088,7 @@ class ProjectRepository:
             )
             .values(**update_data)
         )
+        project.updated_at = datetime.utcnow()
         await session.commit()
         
         return await ProjectRepository.get_member(session, project_id, user_id)
@@ -782,7 +1109,12 @@ class ProjectRepository:
         Returns:
             bool: True if removed
         """
-        # Cannot remove owner
+        project = await ProjectRepository.get_by_id_for_update(session, project_id)
+        if project is None or project.owner_id == user_id:
+            return False
+
+        # Keep the persisted role from becoming a second owner, even for
+        # legacy projects whose membership role was manually edited.
         member = await ProjectRepository.get_member(session, project_id, user_id)
         if member and member.role == 'owner':
             return False
@@ -795,6 +1127,8 @@ class ProjectRepository:
                 )
             )
         )
+        if result.rowcount > 0:
+            project.updated_at = datetime.utcnow()
         await session.commit()
         return result.rowcount > 0
     
@@ -823,25 +1157,39 @@ class ProjectRepository:
         if existing_member:
             return None
         
-        # Check for existing pending request
+        # The legacy schema has a full (project_id, user_id) unique constraint,
+        # not a partial pending-only index. Reuse a rejected row so a user can
+        # apply again without turning a normal request into a 500.
         existing_request = await session.execute(
             select(ProjectJoinRequest).where(
                 and_(
                     ProjectJoinRequest.project_id == project_id,
                     ProjectJoinRequest.user_id == user_id,
-                    ProjectJoinRequest.status == 'pending'
                 )
             )
         )
-        if existing_request.scalar_one_or_none():
+        prior_request = existing_request.scalar_one_or_none()
+        if not prior_request:
+            request = ProjectJoinRequest(
+                project_id=project_id,
+                user_id=user_id,
+                message=message,
+            )
+            session.add(request)
+        elif prior_request.status == "pending":
             return None
-        
-        request = ProjectJoinRequest(
-            project_id=project_id,
-            user_id=user_id,
-            message=message
-        )
-        session.add(request)
+        elif prior_request.status == "rejected":
+            prior_request.message = message
+            prior_request.status = "pending"
+            prior_request.processed_by = None
+            prior_request.processed_at = None
+            prior_request.rejection_reason = None
+            prior_request.created_at = datetime.utcnow()
+            request = prior_request
+        else:
+            # An approved request should have a membership. Do not mutate it
+            # implicitly if the database is inconsistent.
+            return None
         await session.commit()
         await session.refresh(request)
         
@@ -889,6 +1237,7 @@ class ProjectRepository:
     async def approve_join_request(
         session: AsyncSession,
         request_id: UUID,
+        project_id: UUID,
         approved_by: UUID,
         role: str = 'member'
     ) -> Optional[ProjectMember]:
@@ -905,7 +1254,12 @@ class ProjectRepository:
         """
         # Get request
         result = await session.execute(
-            select(ProjectJoinRequest).where(ProjectJoinRequest.id == request_id)
+            select(ProjectJoinRequest).where(
+                and_(
+                    ProjectJoinRequest.id == request_id,
+                    ProjectJoinRequest.project_id == project_id,
+                )
+            )
         )
         request = result.scalar_one_or_none()
         
@@ -915,7 +1269,13 @@ class ProjectRepository:
         # Update request status
         await session.execute(
             update(ProjectJoinRequest)
-            .where(ProjectJoinRequest.id == request_id)
+            .where(
+                and_(
+                    ProjectJoinRequest.id == request_id,
+                    ProjectJoinRequest.project_id == project_id,
+                    ProjectJoinRequest.status == "pending",
+                )
+            )
             .values(
                 status='approved',
                 processed_by=approved_by,
@@ -938,6 +1298,7 @@ class ProjectRepository:
     async def reject_join_request(
         session: AsyncSession,
         request_id: UUID,
+        project_id: UUID,
         rejected_by: UUID,
         reason: Optional[str] = None
     ) -> bool:
@@ -957,6 +1318,7 @@ class ProjectRepository:
             .where(
                 and_(
                     ProjectJoinRequest.id == request_id,
+                    ProjectJoinRequest.project_id == project_id,
                     ProjectJoinRequest.status == 'pending'
                 )
             )
@@ -990,12 +1352,36 @@ class ProjectRepository:
         Returns:
             bool: True if has permission
         """
-        member = await ProjectRepository.get_member(session, project_id, user_id)
-        if not member:
+        # Use one fresh query instead of the ORM identity map's potentially
+        # stale Project/User/ProjectMember instances.  Callers that already
+        # hold the project row lock therefore make the ACL decision against
+        # the committed membership visible after that lock was acquired.
+        result = await session.execute(
+            select(Project.owner_id, User.role, ProjectMember.permissions)
+            .select_from(Project)
+            .join(User, User.id == user_id)
+            .outerjoin(
+                ProjectMember,
+                and_(
+                    ProjectMember.project_id == Project.id,
+                    ProjectMember.user_id == user_id,
+                ),
+            )
+            .where(Project.id == project_id, Project.deleted_at.is_(None))
+            .execution_options(populate_existing=True)
+        )
+        row = result.one_or_none()
+        if row is None:
             return False
-        
-        permissions = member.permissions or {}
-        return permissions.get(permission, False)
+
+        owner_id, user_role, member_permissions = row
+        return has_effective_project_permission(
+            user_id=user_id,
+            user_role=user_role,
+            project_owner_id=owner_id,
+            member_permissions=member_permissions,
+            permission=permission,
+        )
     
     @staticmethod
     async def get_storage_path(project_id: UUID) -> str:

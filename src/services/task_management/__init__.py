@@ -10,6 +10,7 @@ from ._shared import (
     DISALLOWED_PLACEHOLDER_TITLES,
     LEGACY_STATUS_MAP,
     VALID_PRIORITIES,
+    VALID_SKIP_MODES,
     VALID_TASK_STATUSES,
     ScheduledOccurrence,
     TaskManagementError,
@@ -17,9 +18,11 @@ from ._shared import (
     build_time_report,
     correct_likely_timer_started_at,
     normalize_priority,
+    normalize_skip_mode,
     normalize_task_status,
 )
 from .service import TaskManagementService
+from .due_completion import _auto_close_now, _task_due_at
 
 __all__ = [
     "DEFAULT_MEMBER_PERMISSIONS",
@@ -27,6 +30,7 @@ __all__ = [
     "DISALLOWED_PLACEHOLDER_TITLES",
     "LEGACY_STATUS_MAP",
     "VALID_PRIORITIES",
+    "VALID_SKIP_MODES",
     "VALID_TASK_STATUSES",
     "ScheduledOccurrence",
     "TaskManagementError",
@@ -35,5 +39,8 @@ __all__ = [
     "build_time_report",
     "correct_likely_timer_started_at",
     "normalize_priority",
+    "normalize_skip_mode",
     "normalize_task_status",
+    "_auto_close_now",
+    "_task_due_at",
 ]

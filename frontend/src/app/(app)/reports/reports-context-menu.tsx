@@ -54,7 +54,7 @@ export function ReportsContextMenu({
       </MenuMnemonicButton>
       <MenuMnemonicButton
         type="button"
-        mnemonic="C"
+        mnemonic="U"
         className="flex w-full items-center gap-2 rounded px-2 py-1 text-left hover:bg-accent hover:text-accent-foreground disabled:opacity-50 disabled:pointer-events-none"
         onClick={handleCtxDuplicate}
         disabled={!ctxMenu.entry.ended_at}

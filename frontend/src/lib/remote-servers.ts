@@ -256,6 +256,19 @@ export function remoteWorkspaceDownloadUrl(
   return `/api/python-proxy/remote-servers/${profileId}/workspace/download${buildQuery({ project_id: projectId, path })}`;
 }
 
+/**
+ * Resolve the POST endpoint used for downloading several files from one
+ * remote project.  The selected paths are carried in the request body; the
+ * project scope remains an explicit query parameter so the remote proxy can
+ * authorize the whole batch against one project.
+ */
+export function remoteWorkspaceDownloadBatchUrl(
+  profileId: string,
+  projectId: string,
+): string {
+  return `/api/python-proxy/remote-servers/${profileId}/workspace/download${buildQuery({ project_id: projectId })}`;
+}
+
 export type RemoteDocsTree = Record<string, unknown> & {
   nodes?: Array<Record<string, unknown>>;
   edges?: Array<Record<string, unknown>>;

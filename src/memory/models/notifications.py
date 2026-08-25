@@ -12,6 +12,7 @@ from sqlalchemy import (
     JSON,
     ForeignKey,
     Boolean,
+    Index,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
@@ -43,10 +44,19 @@ class ProjectNotificationSetting(Base):
     project = relationship("Project", back_populates="notification_settings")
 
     def to_dict(self) -> Dict[str, Any]:
+        webhook_configured = bool(self.discord_webhook_url)
         return {
             "id": str(self.id),
             "project_id": str(self.project_id),
-            "discord_webhook_url": self.discord_webhook_url,
+            # Webhook URLs contain a bearer-equivalent token in their path.
+            # Never serialize the stored value through a read/settings API.
+            "discord_webhook_url": None,
+            "discord_webhook_configured": webhook_configured,
+            "discord_webhook_masked": (
+                "https://discord.com/api/webhooks/••••••••/••••••••"
+                if webhook_configured
+                else None
+            ),
             "default_reminder_offsets": list(self.default_reminder_offsets or []),
             "notify_overdue": self.notify_overdue,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -118,6 +128,51 @@ class NotificationDelivery(Base):
             "read_at": self.read_at.isoformat() if self.read_at else None,
             "status": self.status,
             "payload": self.payload or {},
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class WebPushSubscription(Base):
+    """A browser Push API subscription owned by one authenticated user.
+
+    The endpoint is a capability URL and the ``auth``/``p256dh`` values are
+    public key material.  We still avoid returning the values from unrelated
+    APIs; the worker reads them only when it is delivering a notification.
+    """
+
+    __tablename__ = "web_push_subscriptions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    endpoint = Column(Text, nullable=False, unique=True)
+    p256dh = Column(Text, nullable=False)
+    auth = Column(Text, nullable=False)
+    expiration_time = Column(DateTime, nullable=True)
+    content_encoding = Column(String(32), nullable=False, default="aes128gcm")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    user = relationship("User")
+
+    __table_args__ = (
+        Index("ix_web_push_subscriptions_user_endpoint", "user_id", "endpoint"),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": str(self.id),
+            "user_id": str(self.user_id),
+            "endpoint": self.endpoint,
+            "expiration_time": (
+                self.expiration_time.isoformat() if self.expiration_time else None
+            ),
+            "content_encoding": self.content_encoding,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }

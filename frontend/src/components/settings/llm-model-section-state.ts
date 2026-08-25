@@ -1,17 +1,75 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, type DragEvent } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { useConfirm } from "@/hooks/use-confirm";
 import {
-  buildClassDraft, buildRouteDrafts, defaultModeForOptions, modelOptionSettings,
-  providerSelection, pyFetch, routeSelection, MODEL_PAGE_SIZE, MODEL_ROUTE_DEFINITIONS,
+  filterAvailableProviders,
+  isProviderAvailable,
+  resolveEffectiveProviderId,
+} from "@/lib/llm-provider-visibility";
+import {
+  buildClassDraft, canonicalAgentTeamConfig, defaultModeForOptions, modelOptionSettings,
+  providerSelection, pyFetch, reasoningEffortOptionsForModel, MODEL_PAGE_SIZE,
   CONNECTION_SETTINGS_PROVIDERS, REASONING_EFFORT_PROVIDERS,
-  type AgentTeamModelGroup, type LlmEngineResponse, type LlmModelCatalogResponse,
-  type ModelClassDraft, type ModelRouteDefinition, type ModelRouteDraft, type ModelRouteKey,
+  type LlmEngineResponse, type LlmModelCatalogResponse,
+  type AgentTeamConfig,
+  type LlmProviderCatalog, type ModelClassDraft, type ModelRouteSettings,
   type OllamaDeleteResponse, type OllamaPullTask, type ProviderDraft, type ProviderSettingsDraft,
-  type SettingsPayload, type SpeechRecognitionSettings,
+  type SettingsPayload, type SpeechRecognitionSettings, type MageVLSettings,
+  type ExternalModelPrivacySettings,
+  type LlamaCppSettingsDraft,
+  type LlamaCppRuntimeProfile,
+  llamaCppDraftFromSettings, llamaCppPayloadFromDraft, llamaCppBaseUrlFromPayload,
+  llamaCppRuntimeProfileForModel,
 } from "./llm-model-section-types";
+
+const UNSUPPORTED_CLIP_INGEST_PROVIDERS = new Set(["claude", "grok"]);
+
+export type RoutingSaveScope =
+  | "all"
+  | "vision"
+  | "audio"
+  | "video"
+  | "clip_ingest"
+  | "agent";
+
+function settingsReasoningEffortOptions(
+  provider: LlmProviderCatalog | null | undefined,
+  modelId: string,
+): string[] {
+  // The generic local-model endpoint still uses its fast/thinking response
+  // mode.  Only profile metadata (model or provider settings) opts a local
+  // model into the managed Qwen3.8 effort selector and save payload.
+  if (provider?.id === "openai_compatible_local") {
+    const model = provider.models.find((item) => item.id === modelId);
+    const modelHasProfileContract = Boolean(
+      model?.reasoning_effort_default && model?.reasoning_effort_wire,
+    );
+    if (modelHasProfileContract && model?.reasoning_effort_options?.length) {
+      return model.reasoning_effort_options;
+    }
+    const settings = provider.settings;
+    const settingsHaveProfileContract = Boolean(
+      settings?.reasoning_effort_default && settings?.reasoning_effort_wire,
+    );
+    return settingsHaveProfileContract ? settings?.reasoning_effort_options ?? [] : [];
+  }
+  return reasoningEffortOptionsForModel(provider, modelId);
+}
+
+export function buildClipIngestDraft(
+  route: (ModelRouteSettings & { base_url?: string; api_key?: string }) | undefined,
+  providers: LlmProviderCatalog[] | undefined,
+): ModelClassDraft {
+  if (UNSUPPORTED_CLIP_INGEST_PROVIDERS.has(route?.provider ?? "")) {
+    return { ...buildClassDraft(undefined, providers), inherit: true };
+  }
+  return {
+    ...buildClassDraft(route, providers),
+    inherit: route?.inherit ?? !(route?.provider || route?.model),
+  };
+}
 
 export function useLlmModelSection() {
   const confirm = useConfirm();
@@ -24,6 +82,7 @@ export function useLlmModelSection() {
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [engineChangeError, setEngineChangeError] = useState<string | null>(null);
   const [pulling, setPulling] = useState(false);
   const [pullInput, setPullInput] = useState("gpt-oss:20b");
   const [task, setTask] = useState<OllamaPullTask | null>(null);
@@ -33,46 +92,107 @@ export function useLlmModelSection() {
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [reasoningEffort, setReasoningEffort] = useState("medium");
+  const [llamaCppDraft, setLlamaCppDraft] = useState<LlamaCppSettingsDraft>(() =>
+    llamaCppDraftFromSettings(),
+  );
+  const [llamaCppError, setLlamaCppError] = useState<string | null>(null);
   const [delegationEnabled, setDelegationEnabled] = useState(false);
-  const [routingConfirmPrompt, setRoutingConfirmPrompt] = useState(true);
-  const [routingNotify, setRoutingNotify] = useState(true);
-  const [agentTeamRedactionText, setAgentTeamRedactionText] = useState("");
+  const [orchestrationMode, setOrchestrationMode] = useState<"standard" | "director">("standard");
+  const [chatgptWeb, setChatgptWeb] = useState({
+    profile_dir: "",
+    response_timeout_seconds: 900,
+    max_rounds_per_turn: 20,
+  });
+  const [externalPrivacy, setExternalPrivacy] = useState<ExternalModelPrivacySettings>({
+    mode: "direct", review_policy: "high_risk", notify: true, semantic_redaction_enabled: true,
+    local_provider: "openai_compatible_local", local_model: "", redaction_terms: [],
+    trusted_local_hosts: [], raw_media_policy: "block", cache_enabled: true,
+  });
   const [imageMode, setImageMode] = useState<"auto" | "always" | "off">("auto");
+  const [videoMode, setVideoMode] = useState<"auto" | "off">("auto");
   const [routingDetailsOpen, setRoutingDetailsOpen] = useState(false);
-  const [modelTab, setModelTab] = useState<"language" | "vision" | "audio">("language");
+  const [modelTab, setModelTab] = useState<"language" | "vision" | "audio" | "video" | "clip_ingest">("language");
   const [speechRecognition, setSpeechRecognition] = useState<SpeechRecognitionSettings>({});
-  const [classDrafts, setClassDrafts] = useState<Record<"vision" | "audio", ModelClassDraft>>({
+  const [mageVl, setMageVl] = useState<MageVLSettings>({
+    enabled: true,
+    managed: true,
+    preload_on_start: false,
+    model: "microsoft/Mage-VL",
+    base_url: "http://127.0.0.1:30000/v1",
+    max_video_bytes: 50 * 1024 * 1024,
+    max_video_duration_seconds: 300,
+    video_backend: "frames",
+    codec_engine: "traditional",
+    num_frames: 32,
+    max_pixels: 150000,
+    max_new_tokens: 256,
+  });
+  const [classDrafts, setClassDrafts] = useState<Record<"vision" | "audio" | "video" | "clip_ingest", ModelClassDraft>>({
     vision: { ...buildClassDraft(undefined, undefined), inherit: true },
     audio: { ...buildClassDraft(undefined, undefined), engine: "speech_recognition" },
+    video: { ...buildClassDraft(undefined, undefined), provider: "mage_vl", model: "microsoft/Mage-VL", inherit: false },
+    clip_ingest: { ...buildClassDraft(undefined, undefined), inherit: true },
   });
-  const [routingDrafts, setRoutingDrafts] = useState<Record<ModelRouteKey, ModelRouteDraft>>(() =>
-    buildRouteDrafts(undefined, undefined),
-  );
-  const [modelGroups, setModelGroups] = useState<Record<string, AgentTeamModelGroup>>({
-    heavy: { name: "高負荷", provider: "", model: "", effort_policy: "same", effort: "" },
-    light: { name: "軽量", provider: "", model: "", effort_policy: "lower", effort: "" },
-  });
-  const [memberSettingsInitialized, setMemberSettingsInitialized] = useState(false);
   const [savingRouting, setSavingRouting] = useState(false);
+  const [agentTeamConfig, setAgentTeamConfig] = useState<AgentTeamConfig | null>(null);
 
-  const selectedProvider = useMemo(
-    () => catalog?.providers.find((item) => item.id === provider) ?? null,
-    [catalog, provider],
+  const providerOptions = useMemo(
+    () =>
+      filterAvailableProviders(
+        catalog?.providers,
+        catalog?.deployment,
+        (item) => item.id,
+        (item) => item,
+      ),
+    [catalog],
   );
-
+  const selectedProvider = useMemo(
+    () => providerOptions.find((item) => item.id === provider) ?? null,
+    [providerOptions, provider],
+  );
   const selectedModelId = customModel.trim() || model;
   const selectedModel = useMemo(
     () => selectedProvider?.models.find((item) => item.id === selectedModelId) ?? null,
     [selectedModelId, selectedProvider],
   );
+  const selectedRuntimeProfile: LlamaCppRuntimeProfile | null = useMemo(
+    () => {
+      const providerSettings = selectedProvider?.settings;
+      const runtimeSettings = providerSettings?.llama_cpp
+        ?? providerSettings?.runtime_settings
+        ?? (providerSettings?.runtime_profile
+          ? { runtime_profile: providerSettings.runtime_profile }
+          : undefined);
+      return llamaCppRuntimeProfileForModel(
+        selectedModel,
+        runtimeSettings,
+        selectedModelId,
+      );
+    },
+    [selectedModel, selectedModelId, selectedProvider],
+  );
   const current = catalog?.current;
   const visionProvider = useMemo(
-    () => catalog?.providers.find((item) => item.id === classDrafts.vision.provider),
-    [catalog, classDrafts.vision.provider],
+    () => providerOptions.find((item) => item.id === classDrafts.vision.provider),
+    [providerOptions, classDrafts.vision.provider],
   );
   const audioProvider = useMemo(
-    () => catalog?.providers.find((item) => item.id === classDrafts.audio.provider),
-    [catalog, classDrafts.audio.provider],
+    () => providerOptions.find((item) => item.id === classDrafts.audio.provider),
+    [providerOptions, classDrafts.audio.provider],
+  );
+  const clipIngestProvider = useMemo(
+    () => providerOptions.find((item) => item.id === classDrafts.clip_ingest.provider),
+    [providerOptions, classDrafts.clip_ingest.provider],
+  );
+  // backendの専用client factoryが生成できるproviderだけを候補にする。
+  const clipIngestProviders = useMemo(
+    () =>
+      providerOptions.filter(
+        (item) =>
+          item.selection_kind !== "routing_profile" &&
+          !UNSUPPORTED_CLIP_INGEST_PROVIDERS.has(item.id),
+      ),
+    [providerOptions],
   );
   const speechEngine = speechRecognition.current_engine || "whisper";
   const speechModel = speechRecognition.engines?.[speechEngine]?.model || speechEngine;
@@ -84,10 +204,11 @@ export function useLlmModelSection() {
         ? "inherit"
         : classDrafts.audio.provider;
   const mediaProviders = useCallback(
-    (kind: "image" | "audio") => (catalog?.providers ?? []).filter(
-      (providerItem) => providerItem.models.some((item) => item.media?.[kind]),
-    ),
-    [catalog],
+    (kind: "image" | "audio") =>
+      providerOptions.filter((providerItem) =>
+        providerItem.models.some((item) => item.media?.[kind]),
+      ),
+    [providerOptions],
   );
 
   const providerModels = useMemo(
@@ -134,13 +255,25 @@ export function useLlmModelSection() {
         `/llm/models${query ? `?${query}` : ""}`,
       );
       setCatalog(data);
+      const effectiveProvider = resolveEffectiveProviderId(data.deployment);
+      const preferredProvider =
+        effectiveProvider &&
+        isProviderAvailable(
+          effectiveProvider,
+          data.deployment,
+          data.providers.find((item) => item.id === effectiveProvider),
+        )
+          ? effectiveProvider
+          : data.current.provider;
       setProvider((current) => {
         if (refreshProvider) return current;
         if (catalog) return current;
-        return data.current.provider || current;
+        return preferredProvider || current;
       });
       if (!refreshProvider) {
-        const currentProvider = data.providers.find((item) => item.id === data.current.provider);
+        const currentProvider = data.providers.find(
+          (item) => item.id === preferredProvider,
+        );
         const selection = providerSelection(currentProvider);
         setModel(selection.model);
         setCustomModel(selection.customModel);
@@ -157,6 +290,27 @@ export function useLlmModelSection() {
     if (expanded && !catalog) void loadCatalog(false);
   }, [catalog, expanded, loadCatalog]);
 
+  // A fixed Enterprise deployment may intentionally leave the persisted
+  // provider unavailable. Select the effective provider instead of leaving a
+  // controlled select with a value that is not present in its options.
+  useEffect(() => {
+    if (!catalog || providerOptions.length === 0) return;
+    if (providerOptions.some((item) => item.id === provider)) return;
+
+    const effectiveProvider = resolveEffectiveProviderId(catalog.deployment);
+    const fallback =
+      (effectiveProvider && providerOptions.some((item) => item.id === effectiveProvider)
+        ? effectiveProvider
+        : providerOptions[0]?.id) || "";
+    if (!fallback || fallback === provider) return;
+    const selection = providerSelection(
+      providerOptions.find((item) => item.id === fallback),
+    );
+    setProvider(fallback);
+    setModel(selection.model);
+    setCustomModel(selection.customModel);
+  }, [catalog, provider, providerOptions]);
+
   useEffect(() => {
     setModelPage(1);
   }, [provider, modelSearch]);
@@ -167,10 +321,31 @@ export function useLlmModelSection() {
 
   useEffect(() => {
     const settings = selectedProvider?.settings;
+    const effortOptions = settingsReasoningEffortOptions(selectedProvider, selectedModelId);
+    const selectedOption = selectedProvider?.models.find((item) => item.id === selectedModelId);
+    const configuredEffort = settings?.reasoning_effort
+      ?? selectedOption?.reasoning_effort_default
+      ?? settings?.reasoning_effort_default
+      ?? "medium";
     setBaseUrl(settings?.base_url ?? "");
     setApiKey("");
-    setReasoningEffort(settings?.reasoning_effort ?? "medium");
-  }, [selectedProvider]);
+    setReasoningEffort(
+      effortOptions.length
+        ? defaultModeForOptions(effortOptions, configuredEffort)
+        : configuredEffort,
+    );
+    if (provider === "openai_compatible_local") {
+      const nextDraft = llamaCppDraftFromSettings(
+        settings?.llama_cpp ?? settings?.runtime_settings,
+        selectedModelId,
+        selectedRuntimeProfile,
+      );
+      setLlamaCppDraft(
+        nextDraft,
+      );
+      setLlamaCppError(null);
+    }
+  }, [provider, selectedModelId, selectedProvider, selectedRuntimeProfile]);
 
   useEffect(() => {
     if (provider === "openai_compatible_local" && selectedModel?.base_url) {
@@ -223,6 +398,7 @@ export function useLlmModelSection() {
     const trimmedModel = nextModel.trim();
     if (!nextProvider || !trimmedModel) return;
     setSaving(true);
+    setEngineChangeError(null);
     try {
       const payload: Record<string, unknown> = {
         provider: nextProvider,
@@ -233,6 +409,9 @@ export function useLlmModelSection() {
         if (settings.api_key?.trim()) payload.api_key = settings.api_key.trim();
         if (settings.reasoning_effort !== undefined) {
           payload.reasoning_effort = settings.reasoning_effort;
+        }
+        if (settings.llama_cpp !== undefined) {
+          payload.llama_cpp = settings.llama_cpp;
         }
       }
       const data = await pyFetch<LlmEngineResponse>("/llm/engine", {
@@ -250,6 +429,9 @@ export function useLlmModelSection() {
         ? {
           ...currentCatalog,
           current: { provider: data.provider, model: data.model },
+          ...(Object.prototype.hasOwnProperty.call(data, "deployment")
+            ? { deployment: data.deployment ?? null }
+            : {}),
           providers: currentCatalog.providers.map((item) => item.id === data.provider
             ? {
               ...item,
@@ -261,6 +443,19 @@ export function useLlmModelSection() {
                     : {}),
                   ...(settings.base_url !== undefined
                     ? { base_url: settings.base_url }
+                    : {}),
+                  ...(settings.llama_cpp !== undefined
+                    ? {
+                      llama_cpp: {
+                        ...item.settings?.llama_cpp,
+                        ...settings.llama_cpp,
+                        // The API persists the canonical readiness_timeout
+                        // key while the catalog exposes both spellings.
+                        ...(settings.llama_cpp.readiness_timeout !== undefined
+                          ? { readiness_timeout_seconds: settings.llama_cpp.readiness_timeout }
+                          : {}),
+                      },
+                    }
                     : {}),
                 }
                 : item.settings,
@@ -283,7 +478,9 @@ export function useLlmModelSection() {
         : currentCatalog);
       toast.success(data.message || "言語モデルを保存しました");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "言語モデルを保存できませんでした");
+      const message = error instanceof Error ? error.message : "言語モデルを保存できませんでした";
+      setEngineChangeError(message);
+      toast.error(message);
     } finally {
       setSaving(false);
     }
@@ -292,19 +489,34 @@ export function useLlmModelSection() {
   const handleProviderChange = useCallback(
     (nextProvider: string) => {
       setProvider(nextProvider);
-      const next = catalog?.providers.find((item) => item.id === nextProvider);
+      const next = providerOptions.find((item) => item.id === nextProvider);
       const selection = providerDrafts[nextProvider] ?? providerSelection(next);
       const nextModel = selection.customModel.trim() || selection.model;
       const nextOption = selection.customModel.trim()
         ? null
         : next?.models.find((item) => item.id === selection.model);
-      const nextSettings = modelOptionSettings(nextOption);
+      const nextModelId = selection.customModel.trim() || selection.model;
+      const nextEffortOptions = settingsReasoningEffortOptions(next, nextModelId);
+      const nextEffort = nextEffortOptions.length
+        ? defaultModeForOptions(
+          nextEffortOptions,
+          nextOption?.reasoning_effort_default
+            ?? next?.settings?.reasoning_effort_default
+            ?? next?.settings?.reasoning_effort
+            ?? "medium",
+        )
+        : "";
+      const nextSettings = {
+        ...(modelOptionSettings(nextOption) ?? {}),
+        ...(nextEffort ? { reasoning_effort: nextEffort } : {}),
+      };
       if (nextSettings?.base_url) setBaseUrl(nextSettings.base_url);
+      if (nextEffort) setReasoningEffort(nextEffort);
       setModel(selection.model);
       setCustomModel(selection.customModel);
       void saveModelSelection(nextProvider, nextModel, nextSettings);
     },
-    [catalog, providerDrafts, saveModelSelection],
+    [providerDrafts, providerOptions, saveModelSelection],
   );
 
   const handleModelChange = useCallback(
@@ -316,11 +528,22 @@ export function useLlmModelSection() {
         [provider]: { model: nextModel, customModel: "" },
       }));
       const nextOption = selectedProvider?.models.find((item) => item.id === nextModel);
-      const nextSettings = modelOptionSettings(nextOption);
+      const nextEffortOptions = settingsReasoningEffortOptions(selectedProvider, nextModel);
+      const nextOptionDefault = selectedProvider?.models.find((item) => item.id === nextModel)
+        ?.reasoning_effort_default
+        ?? selectedProvider?.settings?.reasoning_effort_default;
+      const nextEffort = nextEffortOptions.length
+        ? defaultModeForOptions(nextEffortOptions, nextOptionDefault ?? reasoningEffort)
+        : "";
+      const nextSettings = {
+        ...(modelOptionSettings(nextOption) ?? {}),
+        ...(nextEffort ? { reasoning_effort: nextEffort } : {}),
+      };
       if (nextSettings?.base_url) setBaseUrl(nextSettings.base_url);
+      if (nextEffort) setReasoningEffort(nextEffort);
       void saveModelSelection(provider, nextModel, nextSettings);
     },
-    [provider, saveModelSelection, selectedProvider],
+    [provider, reasoningEffort, saveModelSelection, selectedProvider],
   );
 
   const handleCustomModelChange = useCallback(
@@ -355,6 +578,67 @@ export function useLlmModelSection() {
     selectedModelId,
   ]);
 
+  const handleLlamaCppSettingsSave = useCallback(() => {
+    try {
+      const profileAlias = selectedRuntimeProfile?.served_alias?.trim() || "";
+      const aliasLocked = selectedRuntimeProfile?.alias_locked === true && Boolean(profileAlias);
+      const draftForSave = {
+        ...(aliasLocked
+          ? { ...llamaCppDraft, model_alias: profileAlias }
+          : llamaCppDraft),
+        // MTP is profile-owned.  Never send stale MTP controls for an
+        // external/local model or a legacy profile without an MTP contract.
+        ...(selectedRuntimeProfile?.mtp ? {} : { mtp_enabled: undefined }),
+      };
+      const llamaCpp = llamaCppPayloadFromDraft(draftForSave);
+      const selectedModelKey = selectedModelId.trim().toLowerCase();
+      const managedRuntime = Boolean(llamaCpp.model_path)
+        && (llamaCpp.auto_start || llamaCpp.model_alias.trim().toLowerCase() === selectedModelKey);
+      if (
+        managedRuntime
+        && !aliasLocked
+        && llamaCpp.model_alias.trim().toLowerCase() !== selectedModelKey
+      ) {
+        throw new Error("managed llama.cppではmodel aliasを選択中モデルと一致させてください");
+      }
+      const profileRuntime = String(selectedRuntimeProfile?.runtime ?? "")
+        .trim()
+        .toLowerCase()
+        .replace(".", "_") === "llama_cpp";
+      const shouldPersistRuntime = profileRuntime || managedRuntime;
+      setLlamaCppError(null);
+      const settings: ProviderSettingsDraft = {
+        // llama.cpp owns its endpoint: keep the existing connection controls
+        // intact for other providers, but derive this payload's URL from the
+        // same host/port sent to the runtime so the UI/backend round-trip is
+        // immediately consistent (including IPv6 bracket notation).
+        base_url: shouldPersistRuntime
+          ? llamaCppBaseUrlFromPayload(llamaCpp)
+          : baseUrl.trim(),
+        api_key: apiKey,
+        reasoning_effort: reasoningEffort,
+      };
+      // Do not declare a llama.cpp runtime for an external local-model that
+      // has no GGUF path. This keeps its existing custom Base URL and avoids
+      // the backend interpreting default runtime settings as a managed launch.
+      if (shouldPersistRuntime) settings.llama_cpp = llamaCpp;
+      void saveModelSelection(provider, selectedModelId, settings);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "llama.cpp設定を確認してください";
+      setLlamaCppError(message);
+      toast.error(message);
+    }
+  }, [
+    apiKey,
+    baseUrl,
+    llamaCppDraft,
+    provider,
+    reasoningEffort,
+    saveModelSelection,
+    selectedModelId,
+    selectedRuntimeProfile,
+  ]);
+
   const startPull = useCallback(async () => {
     const nextModel = pullInput.trim();
     if (!nextModel) return;
@@ -375,156 +659,73 @@ export function useLlmModelSection() {
   const percent = Math.max(0, Math.min(100, task?.percent ?? 0));
   const hasProviderSettings = Boolean(selectedProvider?.settings && Object.keys(selectedProvider.settings).length > 0);
   const showConnectionSettings = CONNECTION_SETTINGS_PROVIDERS.has(provider);
-  const showReasoningEffort = REASONING_EFFORT_PROVIDERS.has(provider);
-
-  const updateRoutingDraft = useCallback(
-    (key: ModelRouteKey, patch: Partial<ModelRouteDraft>) => {
-      setRoutingDrafts((current) => ({
-        ...current,
-        [key]: { ...current[key], ...patch },
-      }));
-    },
-    [],
+  const selectedReasoningEffortOptions = settingsReasoningEffortOptions(
+    selectedProvider,
+    selectedModelId,
   );
-
-  const handleModelDragStart = useCallback(
-    (event: DragEvent<HTMLElement>, modelId: string) => {
-      event.dataTransfer.setData(
-        "application/json",
-        JSON.stringify({ provider, model: modelId }),
-      );
-      event.dataTransfer.effectAllowed = "copy";
-    },
-    [provider],
-  );
-
-  const routeProviderOptions = useCallback(
-    (definition: ModelRouteDefinition) => {
-      const providers = (catalog?.providers ?? []).filter(
-        (item) => item.selection_kind !== "routing_profile",
-      );
-      if (!definition.allowedProviders) return providers;
-      return providers.filter((item) => definition.allowedProviders?.includes(item.id));
-    },
-    [catalog],
-  );
-
-  const handleMemberDrop = useCallback(
-    (event: DragEvent<HTMLElement>, definition: ModelRouteDefinition) => {
-      event.preventDefault();
-      const raw = event.dataTransfer.getData("application/json");
-      if (!raw) return;
-      let payload: { provider?: string; model?: string };
-      try {
-        payload = JSON.parse(raw) as { provider?: string; model?: string };
-      } catch {
-        return;
-      }
-      const droppedProvider = String(payload.provider || "");
-      const droppedModel = String(payload.model || "");
-      if (!droppedProvider || !droppedModel) return;
-      if (
-        definition.allowedProviders?.length &&
-        !definition.allowedProviders.includes(droppedProvider)
-      ) {
-        toast.error(`${definition.label} にはこの provider を割り当てられません`);
-        return;
-      }
-      const providerCatalog = catalog?.providers.find((item) => item.id === droppedProvider);
-      const droppedOption = providerCatalog?.models.find((item) => item.id === droppedModel);
-      updateRoutingDraft(definition.key, {
-        enabled: true,
-        provider: droppedProvider,
-        model: droppedModel,
-        customModel: "",
-        mode: defaultModeForOptions(
-          droppedOption?.reasoning_effort_options,
-          routingDrafts[definition.key]?.mode ?? "medium",
-        ),
-      });
-    },
-    [catalog, routingDrafts, updateRoutingDraft],
-  );
+  // Managed Qwen3.8 local profiles opt into the catalog-driven effort
+  // selector.  Generic local-model remains on its existing fast/thinking
+  // response-mode control because it has no catalog effort options.
+  const showReasoningEffort = REASONING_EFFORT_PROVIDERS.has(provider)
+    || (provider === "openai_compatible_local" && selectedReasoningEffortOptions.length > 0);
 
   const loadAgentTeamSettings = useCallback(async () => {
     try {
-      const data = await pyFetch<SettingsPayload>("/settings");
-      const team = data.settings?.agent_team;
+      const [data, teamResponse] = await Promise.all([
+        pyFetch<SettingsPayload>("/settings"),
+        pyFetch<{ agent_team?: AgentTeamConfig }>("/agent-team/config"),
+      ]);
+      const team = teamResponse.agent_team ?? (
+        data.settings?.agent_team?.schema_version === 3
+          ? data.settings.agent_team as AgentTeamConfig
+          : undefined
+      );
       const routing = data.settings?.model_routing;
+      setOrchestrationMode(team?.orchestration_mode ?? "standard");
+      setChatgptWeb({
+        profile_dir: data.settings?.chatgpt_web?.profile_dir ?? "",
+        response_timeout_seconds: data.settings?.chatgpt_web?.response_timeout_seconds ?? 900,
+        max_rounds_per_turn: data.settings?.chatgpt_web?.max_rounds_per_turn ?? 20,
+      });
       setDelegationEnabled(team?.delegation_enabled ?? false);
-      setMemberSettingsInitialized(team?.member_settings_initialized ?? false);
-      setRoutingConfirmPrompt(team?.confirm_prompt ?? true);
-      setRoutingNotify(team?.notify ?? true);
-      setAgentTeamRedactionText((team?.redaction_terms ?? []).join(", "));
+      if (team?.schema_version === 3) setAgentTeamConfig(canonicalAgentTeamConfig(team));
+      setExternalPrivacy(data.settings?.external_model_privacy ?? {});
       setImageMode(routing?.media?.image_mode ?? "auto");
+      setVideoMode(routing?.media?.video_mode ?? "auto");
+      const loadedMageVl = data.settings?.mage_vl ?? {};
+      setMageVl((current) => ({ ...current, ...loadedMageVl, api_key: "" }));
       setSpeechRecognition(data.settings?.speech_recognition ?? {});
       setClassDrafts({
         vision: {
-          ...buildClassDraft(routing?.classes?.vision, catalog?.providers),
+          ...buildClassDraft(routing?.classes?.vision, providerOptions),
           inherit: routing?.classes?.vision?.inherit ?? !(
             routing?.classes?.vision?.provider || routing?.classes?.vision?.model
           ),
         },
         audio: {
-          ...buildClassDraft(routing?.classes?.audio, catalog?.providers),
+          ...buildClassDraft(routing?.classes?.audio, providerOptions),
           engine: routing?.classes?.audio?.engine ?? "speech_recognition",
         },
+        video: {
+          ...buildClassDraft(routing?.classes?.video, providerOptions),
+          provider: routing?.classes?.video?.provider || "mage_vl",
+          model: routing?.classes?.video?.model || loadedMageVl.model || "microsoft/Mage-VL",
+          baseUrl: routing?.classes?.video?.base_url || loadedMageVl.base_url || "",
+          inherit: false,
+        },
+        clip_ingest: buildClipIngestDraft(
+          routing?.classes?.clip_ingest,
+          providerOptions,
+        ),
       });
-      setModelGroups({
-        heavy: { name: "高負荷", provider: "", model: "", effort_policy: "same", effort: "" },
-        light: { name: "軽量", provider: "", model: "", effort_policy: "lower", effort: "" },
-        ...(team?.model_groups ?? {}),
-      });
-      setRoutingDrafts(buildRouteDrafts(team?.members, catalog?.providers, team?.roster));
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Agent Team設定を取得できませんでした");
     }
-  }, [catalog]);
-
-  const changeDelegationEnabled = useCallback(async (enabled: boolean) => {
-    const previous = delegationEnabled;
-    setDelegationEnabled(enabled);
-    setSavingRouting(true);
-    try {
-      await pyFetch("/settings", {
-        method: "PATCH",
-        body: JSON.stringify({ key: "agent_team.delegation_enabled", value: enabled }),
-      });
-      await loadAgentTeamSettings();
-    } catch (error) {
-      setDelegationEnabled(previous);
-      toast.error(error instanceof Error ? error.message : "Agent Teamの状態を変更できませんでした");
-    } finally {
-      setSavingRouting(false);
-    }
-  }, [delegationEnabled, loadAgentTeamSettings]);
+  }, [providerOptions]);
 
   useEffect(() => {
     if (expanded) void loadAgentTeamSettings();
   }, [expanded, loadAgentTeamSettings]);
-
-  useEffect(() => {
-    if (!catalog) return;
-    setRoutingDrafts((current) => {
-      let changed = false;
-      const next = { ...current };
-      for (const definition of MODEL_ROUTE_DEFINITIONS) {
-        const draft = current[definition.key];
-        if (!draft || draft.customModel.trim()) continue;
-        const providerCatalog = catalog.providers.find((item) => item.id === draft.provider);
-        if (!providerCatalog) continue;
-        if (providerCatalog.models.some((item) => item.id === draft.model)) continue;
-        const selection = routeSelection(providerCatalog, draft.model || definition.defaultModel);
-        next[definition.key] = {
-          ...draft,
-          model: selection.model,
-          customModel: selection.customModel,
-        };
-        changed = true;
-      }
-      return changed ? next : current;
-    });
-  }, [catalog]);
 
   const deleteOllamaModel = useCallback(async (modelId: string) => {
     if (!modelId || deletingModel) return;
@@ -550,89 +751,47 @@ export function useLlmModelSection() {
     }
   }, [current, deletingModel, loadCatalog, model, confirm]);
 
-  const saveRoutingSettings = useCallback(async () => {
+  const saveExternalPrivacySettings = useCallback(async () => {
     setSavingRouting(true);
     try {
-      await pyFetch("/settings", {
-        method: "PATCH",
-        body: JSON.stringify({ key: "agent_team.delegation_enabled", value: delegationEnabled }),
-      });
+      for (const [field, value] of Object.entries(externalPrivacy)) {
+        await pyFetch("/settings", {
+          method: "PATCH",
+          body: JSON.stringify({
+            key: `external_model_privacy.${field}`,
+            value,
+          }),
+        });
+      }
+      toast.success("外部送信設定を保存しました");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "外部送信設定を保存できませんでした");
+    } finally {
+      setSavingRouting(false);
+    }
+  }, [externalPrivacy]);
 
-      await pyFetch("/settings", {
-        method: "PATCH",
-        body: JSON.stringify({ key: "agent_team.model_groups", value: modelGroups }),
-      });
-
-      const members = Object.fromEntries(MODEL_ROUTE_DEFINITIONS.map((definition) => {
-        const draft = routingDrafts[definition.key];
-        const targetModel = (draft.customModel.trim() || draft.model).trim();
-        const override = {
-          ...(draft.provider && targetModel
-            ? { provider: draft.provider, model: targetModel }
-            : {}),
-          ...(draft.effortPolicy === "inherit"
-            ? {}
-            : {
-                effort_policy: draft.effortPolicy,
-                ...(draft.effortPolicy === "explicit" ? { effort: draft.mode } : {}),
-              }),
-          ...(draft.runner ? { runner: draft.runner } : {}),
-        };
-        return [definition.key, {
-          enabled: draft.enabled,
-          group_id: draft.groupId || "",
-          override,
-          default_instances: draft.defaultInstances,
-          max_instances: draft.maxInstances,
-        }];
-      }));
-      await pyFetch("/settings", {
-        method: "PATCH",
-        body: JSON.stringify({ key: "agent_team.members", value: members }),
-      });
-      await pyFetch("/settings", {
-        method: "PATCH",
-        body: JSON.stringify({ key: "agent_team.confirm_prompt", value: routingConfirmPrompt }),
-      });
-      await pyFetch("/settings", {
-        method: "PATCH",
-        body: JSON.stringify({ key: "agent_team.notify", value: routingNotify }),
-      });
-      await pyFetch("/settings", {
-        method: "PATCH",
-        body: JSON.stringify({
-          key: "agent_team.redaction_terms",
-          value: agentTeamRedactionText
-            .split(",")
-            .map((item) => item.trim())
-            .filter(Boolean),
-        }),
-      });
-      await pyFetch("/settings", {
-        method: "PATCH",
-        body: JSON.stringify({ key: "model_routing.media.image_mode", value: imageMode }),
-      });
-
-      for (const classKey of ["vision", "audio"] as const) {
+  const saveRoutingSettings = useCallback(async (scope: RoutingSaveScope = "all") => {
+    setSavingRouting(true);
+    try {
+      const saveSetting = async (key: string, value: unknown) => {
+        await pyFetch("/settings", {
+          method: "PATCH",
+          body: JSON.stringify({ key, value }),
+        });
+      };
+      const saveClass = async (classKey: "vision" | "audio" | "clip_ingest") => {
         const draft = classDrafts[classKey];
         const targetModel = (draft.customModel.trim() || draft.model).trim();
-        if (classKey === "vision" || classKey === "audio") {
-          await pyFetch("/settings", {
-            method: "PATCH",
-            body: JSON.stringify({
-              key: `model_routing.classes.${classKey}.inherit`,
-              value: draft.inherit ?? false,
-            }),
-          });
-        }
+        await saveSetting(
+          `model_routing.classes.${classKey}.inherit`,
+          draft.inherit ?? false,
+        );
         if (classKey === "audio") {
-          await pyFetch("/settings", {
-            method: "PATCH",
-            body: JSON.stringify({
-              key: "model_routing.classes.audio.engine",
-              value: draft.engine ?? "speech_recognition",
-            }),
-          });
+          await saveSetting(
+            "model_routing.classes.audio.engine",
+            draft.engine ?? "speech_recognition",
+          );
         }
         const effortFields: (readonly [string, string])[] = [
           ["reasoning_effort", draft.mode],
@@ -644,52 +803,103 @@ export function useLlmModelSection() {
           ["base_url", draft.baseUrl.trim()],
           ...effortFields,
         ] as const) {
-          await pyFetch("/settings", {
-            method: "PATCH",
-            body: JSON.stringify({
-              key: `model_routing.classes.${classKey}.${field}`,
-              value,
-            }),
-          });
+          await saveSetting(`model_routing.classes.${classKey}.${field}`, value);
         }
         if (draft.apiKey.trim()) {
-          await pyFetch("/settings", {
-            method: "PATCH",
-            body: JSON.stringify({
-              key: `model_routing.classes.${classKey}.api_key`,
-              value: draft.apiKey.trim(),
-            }),
-          });
+          await saveSetting(
+            `model_routing.classes.${classKey}.api_key`,
+            draft.apiKey.trim(),
+          );
         }
+      };
+
+      if (scope === "all" || scope === "vision") {
+        await saveSetting("model_routing.media.image_mode", imageMode);
+        await saveClass("vision");
+      }
+      if (scope === "all" || scope === "audio") {
+        await saveClass("audio");
+      }
+      if (scope === "all" || scope === "clip_ingest") {
+        await saveClass("clip_ingest");
       }
 
-      toast.success("Agent Team設定を保存しました");
-      setMemberSettingsInitialized(true);
+      if (scope === "all" || scope === "video") {
+        const videoDraft = classDrafts.video;
+        const videoModel = (videoDraft.customModel.trim() || videoDraft.model).trim();
+        for (const [field, value] of [
+          ["inherit", false],
+          ["provider", videoDraft.provider || "mage_vl"],
+          ["model", videoModel || mageVl.model || "microsoft/Mage-VL"],
+          ["base_url", videoDraft.baseUrl.trim() || mageVl.base_url || ""],
+          ["mode", videoDraft.mode],
+        ] as const) {
+          await saveSetting(`model_routing.classes.video.${field}`, value);
+        }
+        if (videoDraft.apiKey.trim()) {
+          await saveSetting(
+            "model_routing.classes.video.api_key",
+            videoDraft.apiKey.trim(),
+          );
+        }
+        const mageFields: Array<[string, unknown]> = [
+          ["enabled", mageVl.enabled !== false],
+          ["managed", mageVl.managed !== false],
+          ["preload_on_start", mageVl.preload_on_start === true],
+          ["model", videoModel || mageVl.model || "microsoft/Mage-VL"],
+          ["base_url", videoDraft.baseUrl.trim() || mageVl.base_url || ""],
+          ["startup_timeout_seconds", mageVl.startup_timeout_seconds ?? 300],
+          ["max_video_bytes", mageVl.max_video_bytes ?? 50 * 1024 * 1024],
+          ["max_video_duration_seconds", mageVl.max_video_duration_seconds ?? 300],
+          ["video_backend", "frames"],
+          ["codec_engine", mageVl.codec_engine ?? "traditional"],
+          ["num_frames", mageVl.num_frames ?? 32],
+          ["max_pixels", mageVl.max_pixels ?? 150000],
+          ["max_new_tokens", mageVl.max_new_tokens ?? 256],
+        ];
+        for (const [field, value] of mageFields) {
+          await saveSetting(`mage_vl.${field}`, value);
+        }
+        await saveSetting("mage_vl.server_command", mageVl.server_command?.trim() ?? "");
+        await saveSetting("model_routing.media.video_mode", videoMode);
+      }
+
+      if (scope === "all" || scope === "agent") {
+        for (const [key, value] of Object.entries(chatgptWeb)) {
+          await saveSetting(`chatgpt_web.${key}`, value);
+        }
+      }
+      toast.success("モデル・メディア設定を保存しました");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Agent Team設定を保存できませんでした");
     } finally {
       setSavingRouting(false);
     }
-  }, [agentTeamRedactionText, classDrafts, delegationEnabled, imageMode, modelGroups, routingConfirmPrompt, routingDrafts, routingNotify]);
+  }, [chatgptWeb, classDrafts, imageMode, mageVl, videoMode]);
 
   return {
     expanded, setExpanded, catalog, setCatalog, provider, setProvider, model, setModel,
     customModel, setCustomModel, providerDrafts, setProviderDrafts, loading, setLoading,
     refreshing, setRefreshing, saving, setSaving, pulling, setPulling, pullInput, setPullInput,
+    engineChangeError,
     task, setTask, deletingModel, setDeletingModel, modelSearch, setModelSearch, modelPage, setModelPage,
     baseUrl, setBaseUrl, apiKey, setApiKey, reasoningEffort, setReasoningEffort,
-    delegationEnabled, setDelegationEnabled, routingConfirmPrompt, setRoutingConfirmPrompt,
-    routingNotify, setRoutingNotify, agentTeamRedactionText, setAgentTeamRedactionText,
-    imageMode, setImageMode, routingDetailsOpen, setRoutingDetailsOpen, modelTab, setModelTab,
-    speechRecognition, setSpeechRecognition, classDrafts, setClassDrafts, routingDrafts, setRoutingDrafts,
-    modelGroups, setModelGroups, memberSettingsInitialized, setMemberSettingsInitialized,
+    llamaCppDraft, setLlamaCppDraft, llamaCppError,
+    delegationEnabled, setDelegationEnabled, orchestrationMode, setOrchestrationMode,
+    chatgptWeb, setChatgptWeb,
+    externalPrivacy, setExternalPrivacy,
+    imageMode, setImageMode, videoMode, setVideoMode, mageVl, setMageVl, routingDetailsOpen, setRoutingDetailsOpen, modelTab, setModelTab,
+    speechRecognition, setSpeechRecognition, classDrafts, setClassDrafts,
+    agentTeamConfig, setAgentTeamConfig,
     savingRouting, setSavingRouting, selectedProvider, selectedModelId, selectedModel, current,
-    visionProvider, audioProvider, speechEngine, speechModel, audioSource, mediaProviders,
+    providerOptions,
+    visionProvider, audioProvider, clipIngestProvider, clipIngestProviders,
+    speechEngine, speechModel, audioSource, mediaProviders,
     providerModels, filteredModels, totalModelPages, currentModelPage, modelPageStart, visibleModels,
     loadCatalog, saveModelSelection, handleProviderChange, handleModelChange, handleCustomModelChange,
-    handleCustomModelConfirm, handleProviderSettingsSave, startPull, percent, hasProviderSettings,
-    showConnectionSettings, showReasoningEffort, updateRoutingDraft, handleModelDragStart,
-    routeProviderOptions, handleMemberDrop, loadAgentTeamSettings, changeDelegationEnabled,
-    deleteOllamaModel, saveRoutingSettings,
+    handleCustomModelConfirm, handleProviderSettingsSave, handleLlamaCppSettingsSave, startPull, percent, hasProviderSettings,
+    showConnectionSettings, showReasoningEffort,
+    loadAgentTeamSettings,
+    deleteOllamaModel, saveRoutingSettings, saveExternalPrivacySettings,
   };
 }

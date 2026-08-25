@@ -10,7 +10,7 @@ import {
 } from "@/lib/server/conversation-route-utils";
 
 export async function POST(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
   const user = await getSession();
@@ -19,8 +19,7 @@ export async function POST(
   }
 
   const { id } = await params;
-
-  const session = await resumeConversationSession(id, user.id);
+  const session = await resumeConversationSession(id, user);
 
   if (!session) {
     return NextResponse.json(
@@ -29,19 +28,23 @@ export async function POST(
     );
   }
 
-  const messages = await db
-    .select()
-    .from(conversationMessages)
-    .where(
-      and(
-        eq(conversationMessages.sessionId, id),
-        or(
-          eq(conversationMessages.isActiveBranch, true),
-          isNull(conversationMessages.isActiveBranch),
-        ),
-      ),
-    )
-    .orderBy(asc(conversationMessages.createdAt));
+  const includeMessages =
+    request.nextUrl.searchParams.get("include_messages") !== "false";
+  const messages = includeMessages
+    ? await db
+        .select()
+        .from(conversationMessages)
+        .where(
+          and(
+            eq(conversationMessages.sessionId, id),
+            or(
+              eq(conversationMessages.isActiveBranch, true),
+              isNull(conversationMessages.isActiveBranch),
+            ),
+          ),
+        )
+        .orderBy(asc(conversationMessages.createdAt))
+    : [];
 
   return NextResponse.json({
     session: sessionToSnake(session as unknown as Record<string, unknown>),

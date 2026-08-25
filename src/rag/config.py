@@ -61,13 +61,17 @@ class EmbeddingConfig:
     model: str = "BAAI/bge-m3"
     batch_size: int = 32
     device: str = "cuda"  # cuda or cpu
+    allow_cpu_fallback: bool = True
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'EmbeddingConfig':
         return cls(
             model=data.get('model', cls.model),
             batch_size=data.get('batch_size', cls.batch_size),
-            device=data.get('device', cls.device)
+            device=data.get('device', cls.device),
+            allow_cpu_fallback=data.get(
+                'allow_cpu_fallback', cls.allow_cpu_fallback
+            )
         )
 
 
@@ -77,13 +81,17 @@ class RerankerConfig:
     model: str = "BAAI/bge-reranker-v2-m3"
     top_n: int = 5
     device: str = "cuda"
+    allow_cpu_fallback: bool = True
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'RerankerConfig':
         return cls(
             model=data.get('model', cls.model),
             top_n=data.get('top_n', cls.top_n),
-            device=data.get('device', cls.device)
+            device=data.get('device', cls.device),
+            allow_cpu_fallback=data.get(
+                'allow_cpu_fallback', cls.allow_cpu_fallback
+            )
         )
 
 

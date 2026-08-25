@@ -1,136 +1,106 @@
 # AoiTalk
 
-[日本語](/README.md) /
-[英語](/docs_i18n/README_en.md)
+[日本語](/README.md) / [English](/docs_i18n/README_en.md)
 
-AoiTalkは、音声認識と複数TTSによる読み上げに対応した、OpenClaw + ClickUp 的なタスク管理・プロジェクト実行ワークスペースです。
-会話だけで終わるAIチャットではなく、相談、タスク化、予定確認、作業時間、資料参照、外部ツール実行を同じ文脈で扱うためのアプリです。
+AoiTalk は、チャット・音声・タスク・プロジェクト・Docs・Files・外部ツール実行を同じワークスペースで扱う AI アシスタントです。音声アシスタントだけを目的とした構成ではなく、現在の主要 UI は `frontend/` の Web アプリです。
 
-## 位置づけ
+## 現在の構成
 
-個人版および公開版のAoiTalkは、声で相談し、AIに作業を分担させ、その結果をタスク管理へ戻すためのワークスペースです。
-中心はタスク・プロジェクト管理です。そこにWebUIチャット、音声入力、読み上げ、Discord、ファイル操作、検索、RAG、カレンダー連携を必要に応じて組み合わせます。
+- **Web / BFF**: `frontend/` — Next.js 16 + React 19。画面と、Drizzle ORM を使う Next.js Route Handler を持ちます。
+- **Python runtime / API**: `main.py`、`src/api/` — FastAPI、WebSocket、AI/Agent、音声、外部連携などを担当します。機能によっては Python 側にも業務 API があるため、「FastAPI は AI 専用」とは扱いません。
+- **Database**: PostgreSQL。DB スキーマの正本は `alembic/versions/` です。`frontend/src/db/schema.ts` は Next.js BFF が利用する Drizzle 定義で、実 DB とのドリフトを CI で検査します。
+- **RAG**: Qdrant を利用する検索経路があります。PostgreSQL の pgvector 拡張は現在の必須要件ではありません。
+- **Mobile**: `mobile/` — Expo + React Native の **first-class Native client**（WebView の代替ではありません）。現行の完成条件は [Mobile Product Contract / Conformance](docs/mobile_product_contract.md)、共有 API 契約と型生成は [OpenAPI 型生成手順](docs/openapi_typegen.md) を参照してください。
+- **Desktop**: `desktop/` — Tauri v2 のローカル WebView shell です。
+- **音声 / Bot**: `src/audio/`、`src/tts/`、`src/bot/`。
 
-## 中核機能
+詳細な文書一覧と「現行仕様 / 設計記録」の区別は [docs/README.md](docs/README.md) を参照してください。
 
-- **音声対応の会話操作**: Whisper、Parakeet、Google Speech、Gemini系の認識器と、VOICEVOX、VOICEROID、A.I.VOICE、CeVIO、AivisSpeech、Nijivoice、Azure TTS、gTTS、Irodori TTS、MioTTS などの読み上げエンジンを構成に応じて利用できます。
-- **タスク・プロジェクト管理**: プロジェクト、スペース、タスク、ステータス、期日、繰り返し、発生日、通知、作業時間、レポートをPostgreSQL上で管理します。
-- **AIツール実行**: 検索、ファイル操作、プロジェクトDB/タスク、スキル呼び出しはメインassistantの直接ツールとして扱い、utility、media、Spotify、writing、import、scenario などだけを高レベル専門委任として使います。
-- **資料と知識の活用**: ファイラー、Office/PDF読取、QdrantベースのRAG、知識ワークスペース、プロジェクト情報整理を使い、案件資料や作業メモを再利用しやすくします。
-- **外部連携**: Google Calendar、MCPサーバー、OpenAI互換LLM、OpenRouter、Gemini、Ollama、SGLangなどを構成に応じて使えます。
+## 主な機能
 
-## アプリ構成
+- Web チャット、会話履歴、プロジェクト文脈、Agent Team / specialist 実行
+- タスク、予定、繰り返し、通知、作業時間、レポート
+- Docs / project information / ClipIngest / Files / Office・PDF 読み取り
+- Qdrant ベースの知識検索と会話検索
+- Whisper / Parakeet / Google Speech / Gemini 系 ASR
+- VOICEVOX、AivisSpeech、VOICEROID、A.I.VOICE、CeVIO、Nijivoice、Azure TTS、gTTS、Irodori-TTS、MioTTS などの TTS
+- Discord Bot / Spotify / Google Calendar / MCP / Web 検索などの外部連携
+- OpenAI、Gemini、OpenRouter、ローカル OpenAI 互換 server、Ollama、SGLang 等の LLM 経路
 
-- **Webアプリ**: `frontend/` にある Next.js UI が現在の主要開発対象です。
-- **Backend API**: FastAPI、SQLAlchemy、Alembic、PostgreSQL、WebSocketで構成されています。
-- **Mobileアプリ**: `mobile/` は Expo + React Native です。現在はメンテナンス中心で、明示的なモバイル作業以外では変更対象にしません。
-- **音声・Botランタイム**: `src/audio/`、`src/tts/`、`src/bot/`、`src/assistant/` が音声入出力、Discord、会話実行を担当します。
+利用可能な provider / model / tool は設定と実装で変わるため、README の列挙ではなく実際の設定画面・catalog・`src/config_defaults.py` 等を正本として確認してください。
 
 ## セットアップ
 
 ### Windows
 
+Windows の正規セットアップ入口は `setup.bat` です。個別の `pip install` や Alembic 手順を README から手作業で再現するより、まずスクリプトを使用してください。
+
 ```powershell
-git clone https://github.com/ttttdiva/AoiTalk.git
-cd AoiTalk
-py -3.12 -m venv venv
-venv\Scripts\activate
-pip install -e ".[audio,test]"
-cd frontend
-npm ci
-npm run build
-cd ..
-alembic upgrade head
+setup.bat
+run.bat
 ```
 
-`run.bat` はPython APIとNext.js WebUIを起動します。起動前にルート `.env` を `frontend/.env` へコピーします。
+現行 `setup.bat` は Python 3.12 以上、Node.js 22 以上、Git、PostgreSQL / `.env`、Python venv、フロントエンド依存、DB schema、production build を確認・準備します。Windows の音声・TTS 用 extra もセットアップ対象です。
 
-### Linux / WSL2
+### Linux / WSL
 
-Debian/Ubuntu系、WSL2を含む環境では以下のスクリプトで一括セットアップできます。
+Debian / Ubuntu 系 Linux と WSL の正規入口は `setup.sh` / `run.sh` です。
 
 ```bash
-git clone https://github.com/ttttdiva/AoiTalk.git
-cd AoiTalk
-cp .env.sample .env
 chmod +x setup.sh run.sh
 ./setup.sh
 ./run.sh
 ```
 
-`setup.sh` は PostgreSQL 16 + pgvector、Node.js、Python 3.12 venv、Alembic migration をまとめて準備します。`sudo` が必要です。
+現行 `setup.sh` は Python 3.12 以上と Node.js 20 以上を要求します。既定では重量級の音声依存を入れません。音声・Irodori 等も同時に入れる場合だけ明示します。
 
-## 重要な環境変数
-
-```env
-NEXTAUTH_SECRET=
-AOITALK_WEB_AUTH_SECRET=
-AOITALK_JWT_SECRET=
-INTERNAL_API_KEY=
-
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_USER=aoitalk
-POSTGRES_PASSWORD=
-POSTGRES_DB=aoitalk_memory
-
-OPENROUTER_API_KEY=
-GEMINI_API_KEY=
-OPENAI_API_KEY=
-XAI_API_KEY=
-NIJIVOICE_API_KEY=
+```bash
+AOITALK_INSTALL_AUDIO_DEPS=true ./setup.sh
 ```
 
-WebUIのログインアカウントはPostgreSQLの `users` テーブルで管理します。`.env` に固定ログイン用のユーザー名やパスワードは置きません。
-詳細は `.env.sample` と `docs/setup_guide.md` を参照してください。
+`setup.sh` は PostgreSQL を準備できますが、pgvector は必須にしません。外部 DB を使う場合は `.env` と `AOITALK_SKIP_DB_SETUP` の扱いを [セットアップガイド](docs/setup_guide.md) で確認してください。
 
-## タスク管理API
+### macOS
 
-????????DB???AoiTalk????????????root runtime ????????????????????????API???????
+Python パッケージ自体は macOS を考慮していますが、`setup.sh` は Debian / Ubuntu 系のパッケージ管理を前提にした箇所があります。macOS では Python 3.12+、Node、PostgreSQL、venv、フロントエンド依存を個別に用意してから `scripts/init_db_schema.py` と production build を実行してください。詳細は [docs/setup_guide.md](docs/setup_guide.md) を参照してください。
 
-- `/api/tasks`
-- `/api/task-occurrences`
-- `/api/time-entries`
-- `/api/reports/time`
-- `/api/notifications`
-- `/api/projects/{id}/notification-settings`
+### リポジトリについて
 
-## Runtime Tools
+この開発リポジトリで作業している場合は現在の checkout をそのまま使用します。公開版の同期先は `ttttdiva/AoiTalk` であり、`scripts/publish_public.ps1` が公開用 tree を生成します。開発元と公開先のリポジトリ名が異なるのは意図された構成です。
 
-Root runtime は検索、ファイル操作、プロジェクトDB/タスク、スキル呼び出しを直接ツールとして公開します。高レベル専門委任は、直接ツールと同じ役割を持たない領域だけに残します。
+## 起動時の既定ポート
 
-- Search: `web_search`, `grok_x_search`, `knowledge_search`, `search_memory`
-- Filesystem: `find_workspace_items`, `read_workspace_file`, `search_files`, `list_directory`, `execute_command`
-- Project: `get_project_context`, `list_project_information`, `organize_project_information_from_folder`, `sync_wbs_tasks`, `create_task`
-- High-level specialists: `utility_assistant`, `media_assistant`, `spotify_assistant`, `writing_assistant`, `import_assistant`, `scenario_assistant`
-## MCP Servers
+起動ラッパーの既定値は次のとおりです。
 
-MCPサーバー設定は `config/config.yaml` の `mcp` セクションで管理します。
+| 用途 | 既定 |
+| --- | --- |
+| FastAPI | `3000` |
+| Next.js | `3002` |
+| Caddy | `6002` |
 
-- `utility`
-- `web_search`
-- `x_search`
-- `workspace`
-- `memory_rag`
-- `os_operations`
-- `media`
+Windows `run.bat` と Linux `run.sh` では公開境界の既定が異なります。Linux / WSL は loopback + Caddy 無効が既定で、外部公開時は `run.sh --public --with-caddy` のように TLS 境界を明示します。単純に `0.0.0.0` へ直接公開しないでください。
 
-## READMEの使い分け
+## 設定・DB
 
-- `README.md`: 開発元リポジトリと公開版Publishで使う日本語READMEです。
-- `docs_i18n/README_en.md`: 公開版向けの英語READMEです。
-- `README.enterprise.md`: 開発リポジトリ側に置くEnterprise出力用の日本語READMEソースです。公開版Publishには含めません。
-- `README.enterprise.en.md`: Enterprise出力用の英語READMEソースです。公開版Publishには含めません。
-- `scripts/publish_enterprise.ps1`: Enterprise出力先の `README.md` / `docs_i18n/README_en.md` / `ENTERPRISE_PUBLISH_README.md` をEnterprise用テンプレートから生成します。
+- `.env` の雛形: `.env.sample`
+- Python 依存: `pyproject.toml`
+- Web 依存: `frontend/package.json`
+- DB migration: `alembic/versions/`
+- DB 初期化入口: `scripts/init_db_schema.py`
+- Python defaults: `src/config_defaults.py`
 
-## Docs
+セットアップスクリプトは認証・内部 API 用 secret と初回管理者 password を生成・確認します。固定 password を README に書かないでください。初回管理者 password は `.env` の `AOITALK_BOOTSTRAP_ADMIN_PASSWORD` を確認します。
 
-- `docs/setup_guide.md`
-- `docs/task_workspace_rebuild.md`
-- `docs/desktop_tauri.md`
-- `docs/public_publish.md`
-- `docs/enterprise_publish.md`
-- `docs/DISCORD_BOT_SETUP.md`
+## 開発・検証
+
+リポジトリ内の作業規約は `AGENTS.md` と `CLAUDE.md` が正本です。通常の変更は変更範囲に応じたターゲット検証を行い、`main` push 後の GitHub Actions を確認します。WebUI のユーザー挙動を変える場合は [AI WebUI QA](docs/ai_webui_qa.md) の独立実ブラウザ確認が追加で必要です。
+
+## 配布
+
+- 公開版同期: [docs/public_publish.md](docs/public_publish.md)
+- Mobile 自動更新 / APK: [docs/mobile-auto-update-standard.md](docs/mobile-auto-update-standard.md)
+- Release 共通手順: [docs/release-checklist.md](docs/release-checklist.md)
+- Enterprise handoff: `README.enterprise.md` が唯一の人間向け手順です。
 
 ## License
 

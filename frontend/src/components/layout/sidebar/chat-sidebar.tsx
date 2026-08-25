@@ -9,11 +9,11 @@ import {
   type FormEvent,
   type MouseEvent,
 } from "react";
-import useSWR from "swr";
 import {
   Plus,
   Menu,
   MessageSquare,
+  Loader2,
   MoreHorizontal,
   Trash2,
   Pencil,
@@ -21,12 +21,13 @@ import {
 import {
   chatApi,
   type ConversationSession,
-  type ScenarioLogResponse,
 } from "@/lib/chat-api";
 import { useProject } from "@/contexts/project-context";
 import { formatRelativeTime } from "@/lib/utils";
 import { toast } from "sonner";
 import { useChatSessions } from "@/contexts/chat-session-context";
+import { useCurrentUserId } from "@/components/providers/swr-global-provider";
+import { createRegularNewChatSession } from "@/lib/create-regular-new-chat-session";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -60,6 +61,8 @@ import {
 } from "@/lib/chat-navigation";
 import {
   groupChatSessionsByProject,
+  isChatSessionUnread,
+  isChatSessionWorking,
   sortChatSessions,
   type ChatHistoryView,
 } from "@/lib/chat-session-view";
@@ -69,6 +72,42 @@ import {
 } from "@/components/chat/session-context-menu";
 
 const CHAT_HISTORY_VIEW_KEY = "aoitalk-chat-history-view";
+const CHAT_LAST_SESSION_KEY = "aoitalk_last_session_id";
+
+function readChatHistoryView(): ChatHistoryView | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const saved = window.localStorage.getItem(CHAT_HISTORY_VIEW_KEY);
+    return saved === "timeline" || saved === "project" ? saved : null;
+  } catch {
+    // localStorageが無効な環境では既定の表示方法を維持する。
+    return null;
+  }
+}
+
+function persistChatHistoryView(historyView: ChatHistoryView) {
+  try {
+    window.localStorage.setItem(CHAT_HISTORY_VIEW_KEY, historyView);
+  } catch {
+    // localStorageが無効でも表示方法の変更はメモリ上で維持する。
+  }
+}
+
+function persistLastSessionId(sessionId: string) {
+  try {
+    window.localStorage.setItem(CHAT_LAST_SESSION_KEY, sessionId);
+  } catch {
+    // localStorageが無効でも会話一覧の更新・遷移は継続する。
+  }
+}
+
+function clearLastSessionId() {
+  try {
+    window.localStorage.removeItem(CHAT_LAST_SESSION_KEY);
+  } catch {
+    // localStorageが無効でも会話一覧の更新・遷移は継続する。
+  }
+}
 
 function handleSidebarAnchorNavigation(
   event: MouseEvent<HTMLAnchorElement | HTMLButtonElement>,
@@ -98,12 +137,13 @@ export function ChatSidebar() {
   const searchParamSessionId = searchParams.get("s") || null;
   const [activeSessionId, setActiveSessionId] = useState(searchParamSessionId);
   const { selectedProjectId, allProjects } = useProject();
+  const userId = useCurrentUserId();
   const {
     sessions,
     sessionsError,
-    fetchSessions,
     addSession,
     removeSession,
+    updateSession,
     updateSessionTitle,
   } = useChatSessions();
   const [isCreatingSession, setIsCreatingSession] = useState(false);
@@ -116,17 +156,13 @@ export function ChatSidebar() {
   const [historyView, setHistoryView] = useState<ChatHistoryView>("timeline");
 
   useEffect(() => {
-    const saved = localStorage.getItem(CHAT_HISTORY_VIEW_KEY);
-    if (saved === "timeline" || saved === "project") setHistoryView(saved);
+    const saved = readChatHistoryView();
+    if (saved) setHistoryView(saved);
   }, []);
 
   useEffect(() => {
-    localStorage.setItem(CHAT_HISTORY_VIEW_KEY, historyView);
+    persistChatHistoryView(historyView);
   }, [historyView]);
-
-  useEffect(() => {
-    fetchSessions();
-  }, [fetchSessions]);
 
   useEffect(() => {
     setActiveSessionId(searchParamSessionId);
@@ -151,53 +187,34 @@ export function ChatSidebar() {
     };
   }, []);
 
-  // シナリオログコンテキストの取得を SWR に委譲（キーは activeSessionId 単位）。
-  // activeSessionId が無ければキー null で未取得、取得中は data undefined のため
-  // scenarioLogContext は null（従来の sessionId 不一致時 null と同義）。失敗時は
-  // fetcher が null を返し従来の catch → null と一致させる。
-  const { data: scenarioLogContext = null } =
-    useSWR<ScenarioLogResponse | null>(
-      activeSessionId
-        ? ["chat-sidebar/scenario-log-context", activeSessionId]
-        : null,
-      ([, sessionId]: [string, string]) =>
-        chatApi
-          .getScenarioLogContextByConversation(sessionId)
-          .catch(() => null),
-      {
-        revalidateOnFocus: false,
-        revalidateOnReconnect: false,
-      },
-    );
-
   const handleCreateSession = useCallback(async () => {
     if (isCreatingSession) return;
 
     setIsCreatingSession(true);
     try {
       const characterName = await chatApi.getCurrentCharacterName();
-
-      const data = await chatApi.createSession(
+      const { session } = await createRegularNewChatSession({
         characterName,
-        selectedProjectId ?? undefined,
-      );
-      addSession(data.session);
-      localStorage.setItem("aoitalk_last_session_id", data.session.id);
+        projectId: selectedProjectId ?? undefined,
+        userId,
+      });
+      addSession(session);
+      persistLastSessionId(session.id);
 
-      const href = `/chat?s=${encodeURIComponent(data.session.id)}`;
+      const href = `/chat?s=${encodeURIComponent(session.id)}`;
       if (!navigateChatSessionInPlace(href)) {
         router.push(href);
       }
     } catch (err) {
       console.error("新規会話作成エラー:", err);
-      localStorage.removeItem("aoitalk_last_session_id");
+      clearLastSessionId();
       if (!navigateChatSessionInPlace("/chat")) {
         router.push("/chat");
       }
     } finally {
       setIsCreatingSession(false);
     }
-  }, [addSession, isCreatingSession, router, selectedProjectId]);
+  }, [addSession, isCreatingSession, router, selectedProjectId, userId]);
 
   const handleDeleteSession = useCallback(
     async (id: string) => {
@@ -205,7 +222,7 @@ export function ChatSidebar() {
         await chatApi.deleteSession(id);
         removeSession(id);
         if (activeSessionId === id) {
-          localStorage.removeItem("aoitalk_last_session_id");
+          clearLastSessionId();
           router.push("/chat");
         }
       } catch (err) {
@@ -291,6 +308,19 @@ export function ChatSidebar() {
     setSessionContextMenu(null);
   }, []);
 
+  const markSessionRead = useCallback(
+    (sessionId: string) => {
+      updateSession(sessionId, (session) => ({
+        ...session,
+        is_unread: false,
+      }));
+      void chatApi.markSessionRead(sessionId).catch(() => {
+        // 読み込み自体は継続し、次回の履歴取得でサーバー状態へ戻す。
+      });
+    },
+    [updateSession],
+  );
+
   const sortedSessions = useMemo(() => sortChatSessions(sessions), [sessions]);
 
   const projectNameById = useMemo(
@@ -319,92 +349,19 @@ export function ChatSidebar() {
     row?.scrollIntoView({ block: "nearest" });
   }, [activeSessionId, historyView, visibleRows.length]);
 
-  const scenarioTitle = scenarioLogContext?.scenario?.title;
-  const scenarioLogs = scenarioLogContext?.logs ?? [];
-
   return (
     <>
-      {scenarioTitle && (
-        <SidebarGroup>
-          <div className="flex items-center justify-between px-2">
-            <div className="min-w-0">
-              <SidebarGroupLabel>ログ</SidebarGroupLabel>
-              <div className="truncate px-2 text-xs text-muted-foreground">
-                {scenarioTitle}
-              </div>
-            </div>
-            <button
-              onClick={handleCreateSession}
-              disabled={isCreatingSession}
-              className="p-1 rounded hover:bg-accent"
-              aria-label="新規通常会話"
-              title="新規通常会話"
-            >
-              <Plus className="size-4" />
-              <span className="sr-only">新規通常会話</span>
-            </button>
-          </div>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {scenarioLogs.length === 0 && (
-                <li className="px-4 py-6 text-center text-xs text-muted-foreground">
-                  ログがありません
-                </li>
-              )}
-              {scenarioLogs.map((log) => {
-                const isActive =
-                  !!activeSessionId &&
-                  log.conversation_session_id === activeSessionId;
-                const href = log.href;
-                return (
-                  <SidebarMenuItem key={`${log.type}:${log.id}`}>
-                    <SidebarMenuButton
-                      isActive={isActive}
-                      render={
-                        href ? (
-                          <button
-                            type="button"
-                            onClick={(event) =>
-                              handleSidebarAnchorNavigation(event, href)
-                            }
-                          />
-                        ) : (
-                          <button type="button" disabled />
-                        )
-                      }
-                      className="group/session-item"
-                    >
-                      <MessageSquare className="size-4 shrink-0" />
-                      <div className="flex min-w-0 flex-1 flex-col">
-                        <span className="truncate text-sm">
-                          {log.target_label || log.title}
-                        </span>
-                        <span className="truncate text-xs text-muted-foreground">
-                          {log.type_label}
-                          {log.updated_at && (
-                            <> &middot; {formatRelativeTime(log.updated_at)}</>
-                          )}
-                          {log.count > 0 && <> &middot; {log.count}件</>}
-                        </span>
-                      </div>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                );
-              })}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-      )}
-
-      <SidebarGroup>
-        <div className="flex items-center justify-between px-2">
-          <SidebarGroupLabel>会話履歴</SidebarGroupLabel>
+      <SidebarGroup className="min-h-0 flex-1 overflow-hidden bg-surface-charcoal p-0 text-on-surface">
+        <div className="flex h-14 shrink-0 items-center justify-between border-b border-border-subtle px-4">
+          <SidebarGroupLabel className="h-auto p-0 text-base font-semibold tracking-normal text-on-surface">
+            History
+          </SidebarGroupLabel>
           <div className="flex items-center gap-1">
             <button
               type="button"
               onClick={handleCreateSession}
               disabled={isCreatingSession}
-              className="rounded p-1 hover:bg-accent disabled:opacity-50"
+              className="flex size-6 items-center justify-center rounded text-text-secondary transition-colors hover:bg-surface-container-high hover:text-primary disabled:opacity-50"
               aria-label="新規会話"
               title="新規会話"
             >
@@ -412,7 +369,7 @@ export function ChatSidebar() {
             </button>
             <DropdownMenu>
               <DropdownMenuTrigger
-                className="rounded p-1 hover:bg-accent"
+                className="flex size-6 items-center justify-center rounded text-text-secondary transition-colors hover:bg-surface-container-high hover:text-primary"
                 aria-label="表示方法"
                 title="表示方法"
               >
@@ -435,8 +392,8 @@ export function ChatSidebar() {
             </DropdownMenu>
           </div>
         </div>
-        <SidebarGroupContent>
-          <SidebarMenu>
+        <SidebarGroupContent className="min-h-0 flex-1 overflow-y-auto px-2 py-3">
+          <SidebarMenu className="gap-1">
             {sessionsError && (
               <li className="px-4 py-6 text-center text-xs text-destructive">
                 {sessionsError}
@@ -451,7 +408,7 @@ export function ChatSidebar() {
               visibleRows.map((row) => {
                 if (row.kind === "group") {
                   return (
-                    <li key={row.key} className="list-none px-3 pb-1 pt-3 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+              <li key={row.key} className="list-none px-2 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-text-secondary first:pt-0">
                       {row.label} <span className="font-normal">({row.count})</span>
                     </li>
                   );
@@ -461,6 +418,8 @@ export function ChatSidebar() {
                 const projectName = s.project_id
                   ? (projectNameById.get(s.project_id) ?? "不明なプロジェクト")
                   : null;
+                const isWorking = isChatSessionWorking(s);
+                const isUnread = isChatSessionUnread(s, activeSessionId);
                 return (
                   <SidebarMenuItem
                     key={s.id}
@@ -474,19 +433,34 @@ export function ChatSidebar() {
                       render={
                         <button
                           type="button"
-                          onClick={(event) =>
-                            handleSidebarAnchorNavigation(event, href)
-                          }
+                          onClick={(event) => {
+                            markSessionRead(s.id);
+                            handleSidebarAnchorNavigation(event, href);
+                          }}
                         />
                       }
-                      className="group/session-item"
+                      className="group/session-item h-auto min-h-10 rounded-md border-l-2 border-transparent px-2 py-1.5 text-on-surface-variant data-active:!border-primary data-active:!bg-surface-slate data-active:!font-medium data-active:!text-on-surface data-active:!shadow-none data-active:hover:!bg-surface-slate hover:bg-surface-container hover:text-on-surface"
                     >
-                      <MessageSquare className="size-4 shrink-0" />
+                      {isWorking ? (
+                        <Loader2
+                          className="size-4 shrink-0 animate-spin text-sky-400 group-data-active/menu-button:!text-primary"
+                          aria-label="エージェントが作業中"
+                        />
+                      ) : (
+                        <MessageSquare className="size-4 shrink-0 group-data-active/menu-button:!text-primary" />
+                      )}
+                      {isUnread && (
+                        <span
+                          aria-label="未読の完了応答"
+                          title="未読の完了応答"
+                          className="size-2 shrink-0 rounded-full bg-primary"
+                        />
+                      )}
                       <div className="flex min-w-0 flex-1 flex-col">
-                        <span className="truncate text-sm">
+                        <span className="truncate text-[13px] leading-[18px]">
                           {s.title || "無題の会話"}
                         </span>
-                        <span className="truncate text-xs text-muted-foreground">
+                        <span className="truncate text-[11px] leading-4 text-text-secondary group-data-active/menu-button:!text-on-surface/70">
                           {projectName && (
                             <>プロジェクト: {projectName} &middot; </>
                           )}
@@ -544,7 +518,7 @@ export function ChatSidebar() {
         open={titleEditSession != null}
         onOpenChange={handleTitleEditOpenChange}
       >
-        <DialogContent className="sm:max-w-md">
+        <DialogContent size="md">
           <DialogHeader>
             <DialogTitle>タイトルを編集</DialogTitle>
           </DialogHeader>

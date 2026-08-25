@@ -1,5 +1,7 @@
 "use client";
 
+import { AppSelect } from "@/components/ui/app-select";
+
 import {
   useState,
 } from "react";
@@ -20,13 +22,13 @@ export function FieldCreator({ tagId, onCreateField }: { tagId: string; onCreate
   return (
     <div className="mt-2 grid grid-cols-[minmax(0,1fr)_96px_auto] gap-1">
       <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="New field" className="h-7 text-xs" />
-      <select value={fieldType} onChange={(event) => setFieldType(event.target.value)} className="h-7 rounded border bg-background px-1 text-xs">
+      <AppSelect value={fieldType} onChange={(event) => setFieldType(event.target.value)} className="h-7 rounded border bg-background px-1 text-xs">
         {["text", "options", "date", "checkbox", "reference", "number"].map((type) => (
           <option key={type} value={type}>
             {type}
           </option>
         ))}
-      </select>
+      </AppSelect>
       <Button
         type="button"
         size="icon-sm"

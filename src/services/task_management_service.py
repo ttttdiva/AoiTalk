@@ -15,6 +15,7 @@ from .task_management import (
     DISALLOWED_PLACEHOLDER_TITLES,
     LEGACY_STATUS_MAP,
     VALID_PRIORITIES,
+    VALID_SKIP_MODES,
     VALID_TASK_STATUSES,
     ScheduledOccurrence,
     TaskManagementError,
@@ -23,7 +24,10 @@ from .task_management import (
     build_time_report,
     correct_likely_timer_started_at,
     normalize_priority,
+    normalize_skip_mode,
     normalize_task_status,
+    _auto_close_now,
+    _task_due_at,
 )
 
 # テストが import する内部ヘルパーも従来どおり公開する。
@@ -44,6 +48,7 @@ __all__ = [
     "DISALLOWED_PLACEHOLDER_TITLES",
     "LEGACY_STATUS_MAP",
     "VALID_PRIORITIES",
+    "VALID_SKIP_MODES",
     "VALID_TASK_STATUSES",
     "ScheduledOccurrence",
     "TaskManagementError",
@@ -52,5 +57,8 @@ __all__ = [
     "build_time_report",
     "correct_likely_timer_started_at",
     "normalize_priority",
+    "normalize_skip_mode",
     "normalize_task_status",
+    "_auto_close_now",
+    "_task_due_at",
 ]

@@ -18,6 +18,18 @@ dist/
 build/
 *.whl
 
+# Frontend build inputs generated locally. Dockerfile rebuilds these in its
+# own stages; copying them into the context can otherwise exceed 20GB.
+frontend/node_modules/
+frontend/.next/
+frontend/test-results/
+frontend/playwright-report/
+mobile/
+desktop/src-tauri/target/
+desktop/node_modules/
+test-results/
+playwright-report/
+
 # Git
 .git/
 .github/
@@ -32,8 +44,9 @@ build/
 
 # Environment & Secrets
 .env
-.env.local
-.env.*.local
+.env*
+**/.env
+**/.env*
 
 # Logs & Cache
 logs/
@@ -46,18 +59,48 @@ temp/
 .ruff_cache/
 
 # User Data (should be mounted as volumes)
-workspaces/
-*.sqlite
-*.db
+# Only the root-level runtime workspace is mounted as a volume.  Do not use
+# an unanchored `workspaces/` pattern here: the sanitized Enterprise source
+# deliberately ships src/tools/workspaces/file_tools.py and Docker would
+# otherwise omit that import closure from the build context.
+/workspaces/
+!src/tools/workspaces/
+!src/tools/workspaces/**
+artifacts/
+sample_livedoor_news/
+frontend/public/uploads/
+data/foam-curation/
+**/*.dump
+**/*.sql.gz
+**/*.sql
+**/*.sqlite
+**/*.sqlite3
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.pem
+**/*.key
+**/*.crt
+**/*.cer
+**/*.pfx
+**/*.p12
+**/*.jks
+*.apk
+*.aab
 
 # SSL Certificates
 certs/
+**/certs/
+caddy/*.exe
+caddy/*.dll
+caddy/*.pdb
 
 # Documentation (not needed at runtime)
 docs/
 memory-bank/
 *.md
 !README.md
+!README.enterprise.md
 
 # Test files
 tests/

@@ -51,8 +51,10 @@ export function useTaskPersistence({
   onNewTaskKept,
   debounceRef,
   draftCreatePromiseRef,
+  draftCreateGenerationRef,
   draftCreatedTaskIdRef,
   draftLifecycleRef,
+  lifecycleGenerationRef,
   taskMetadataRef,
 }: {
   taskId: string | null;
@@ -73,14 +75,21 @@ export function useTaskPersistence({
   setOccurrenceDateOverride: React.Dispatch<
     React.SetStateAction<{ start_at: string | null; end_at: string | null } | null>
   >;
-  onTaskUpdated: () => void;
+  onTaskUpdated: (task?: Task | null) => void;
   onNewTaskKept?: () => void;
   debounceRef: React.MutableRefObject<ReturnType<typeof setTimeout> | null>;
   draftCreatePromiseRef: React.MutableRefObject<Promise<Task | null> | null>;
+  draftCreateGenerationRef: React.MutableRefObject<number | null>;
   draftCreatedTaskIdRef: React.MutableRefObject<string | null>;
   draftLifecycleRef: React.MutableRefObject<number>;
+  lifecycleGenerationRef: React.MutableRefObject<number>;
   taskMetadataRef: React.MutableRefObject<Record<string, unknown>>;
 }) {
+  const isCurrentLifecycle = useCallback(
+    (generation: number) => lifecycleGenerationRef.current === generation,
+    [lifecycleGenerationRef],
+  );
+
   const applyLocalDraftUpdate = useCallback((data: Record<string, unknown>) => {
     setTask((prev) => (prev ? ({ ...prev, ...data } as Task) : prev));
     if (typeof data.title === "string") setEditTitle(data.title);
@@ -121,7 +130,11 @@ export function useTaskPersistence({
 
   const createFromDraft = useCallback(
     async (overrides: Record<string, unknown> = {}) => {
-      if (draftCreatePromiseRef.current) {
+      const lifecycleGeneration = lifecycleGenerationRef.current;
+      if (
+        draftCreatePromiseRef.current &&
+        draftCreateGenerationRef.current === lifecycleGeneration
+      ) {
         return draftCreatePromiseRef.current;
       }
       if (draftCreatedTaskIdRef.current) {
@@ -190,6 +203,11 @@ export function useTaskPersistence({
           overrides.notifications_enabled !== undefined
             ? Boolean(overrides.notifications_enabled)
             : task?.notifications_enabled !== false,
+        auto_close_on_due:
+          overrides.auto_close_on_due !== undefined
+            ? Boolean(overrides.auto_close_on_due)
+            : task?.auto_close_on_due === true ||
+                draftTask?.auto_close_on_due === true,
         tag_ids:
           overrides.tag_ids !== undefined ? overrides.tag_ids : draftTagIds,
         parent_task_id:
@@ -215,37 +233,47 @@ export function useTaskPersistence({
       const createPromise = (async () => {
         const draftLifecycleToken = draftLifecycleRef.current;
         const created = await taskApi.createTask(payload);
-        if (!taskId && draftLifecycleToken !== draftLifecycleRef.current) {
-          return created;
+        if (
+          !isCurrentLifecycle(lifecycleGeneration) ||
+          (!taskId && draftLifecycleToken !== draftLifecycleRef.current)
+        ) {
+          return null;
         }
         draftCreatedTaskIdRef.current = created.id;
         setCreatedTaskId(created.id);
         setTask(created);
         setEditTitle(created.title);
         onNewTaskKept?.();
-        onTaskUpdated();
+        onTaskUpdated(created);
         if (created.project_id) {
           const tagList = await taskApi.listTags(created.project_id);
-          setTags(tagList);
+          if (isCurrentLifecycle(lifecycleGeneration)) setTags(tagList);
         }
         return created;
       })();
       draftCreatePromiseRef.current = createPromise;
+      draftCreateGenerationRef.current = lifecycleGeneration;
       try {
         return await createPromise;
       } finally {
-        draftCreatePromiseRef.current = null;
+        if (draftCreatePromiseRef.current === createPromise) {
+          draftCreatePromiseRef.current = null;
+          draftCreateGenerationRef.current = null;
+        }
       }
     },
     [
       draftTagIds,
       draftTask,
       editTitle,
+      isCurrentLifecycle,
+      lifecycleGenerationRef,
       onNewTaskKept,
       onTaskUpdated,
       saveTaskUpdate,
       task,
       taskId,
+      draftCreateGenerationRef,
       draftCreatePromiseRef,
       draftCreatedTaskIdRef,
       draftLifecycleRef,
@@ -256,10 +284,17 @@ export function useTaskPersistence({
     ],
   );
 
-  const ensureTaskId = useCallback(
-    async () => (await createFromDraft())?.id ?? draftCreatedTaskIdRef.current,
-    [createFromDraft, draftCreatedTaskIdRef],
-  );
+  const ensureTaskId = useCallback(async () => {
+    const lifecycleGeneration = lifecycleGenerationRef.current;
+    const createdTaskId = (await createFromDraft())?.id ?? null;
+    if (!isCurrentLifecycle(lifecycleGeneration)) return null;
+    return createdTaskId ?? draftCreatedTaskIdRef.current;
+  }, [
+    createFromDraft,
+    draftCreatedTaskIdRef,
+    isCurrentLifecycle,
+    lifecycleGenerationRef,
+  ]);
 
   const debouncedUpdate = useCallback(
     (data: Record<string, unknown>) => {
@@ -267,24 +302,33 @@ export function useTaskPersistence({
         applyLocalDraftUpdate(data);
         return;
       }
+      const updateTaskId = effectiveTaskId;
+      const lifecycleGeneration = lifecycleGenerationRef.current;
       if (debounceRef.current) clearTimeout(debounceRef.current);
       debounceRef.current = setTimeout(async () => {
+        debounceRef.current = null;
+        if (!isCurrentLifecycle(lifecycleGeneration)) return;
         try {
           const updated = await saveTaskUpdate(
-            effectiveTaskId,
+            updateTaskId,
             data,
             task?.project_id ?? null,
           );
+          if (!isCurrentLifecycle(lifecycleGeneration)) return;
           setTask(updated);
-          onTaskUpdated();
+          onTaskUpdated(updated);
         } catch (err) {
-          console.error("更新失敗:", err);
+          if (isCurrentLifecycle(lifecycleGeneration)) {
+            console.error("更新失敗:", err);
+          }
         }
       }, 500);
     },
     [
       applyLocalDraftUpdate,
       effectiveTaskId,
+      isCurrentLifecycle,
+      lifecycleGenerationRef,
       onTaskUpdated,
       saveTaskUpdate,
       task?.project_id,
@@ -299,6 +343,8 @@ export function useTaskPersistence({
         applyLocalDraftUpdate(data);
         return null;
       }
+      const updateTaskId = effectiveTaskId;
+      const lifecycleGeneration = lifecycleGenerationRef.current;
       try {
         const previousTask = task;
         if (
@@ -306,7 +352,7 @@ export function useTaskPersistence({
           activeOccurrenceContext?.start_at &&
           typeof data.status === "string"
         ) {
-          const result = await taskApi.updateOccurrenceStatus(effectiveTaskId, {
+          const result = await taskApi.updateOccurrenceStatus(updateTaskId, {
             occurrence_id: activeOccurrenceContext.occurrence_id ?? null,
             occurrence_start_at: activeOccurrenceContext.start_at,
             occurrence_end_at: activeOccurrenceContext.end_at ?? null,
@@ -314,22 +360,31 @@ export function useTaskPersistence({
               activeOccurrenceContext.original_start_at ?? null,
             status: data.status,
           });
+          if (!isCurrentLifecycle(lifecycleGeneration)) return null;
           const nextStatus = String(result.occurrence?.status ?? data.status);
           setOccurrenceStatusOverride(nextStatus);
           setTask((prev) =>
             prev ? { ...prev, status: nextStatus } : prev,
           );
-          onTaskUpdated();
-          return task ? { ...task, status: nextStatus } : null;
+          const updatedTask = task
+            ? {
+                ...task,
+                status: nextStatus,
+                effective_occurrence_status: nextStatus,
+              }
+            : null;
+          onTaskUpdated(updatedTask ?? undefined);
+          return updatedTask;
         }
 
         const updated = await saveTaskUpdate(
-          effectiveTaskId,
+          updateTaskId,
           data,
           task?.project_id ?? null,
         );
+        if (!isCurrentLifecycle(lifecycleGeneration)) return null;
         setTask(updated);
-        onTaskUpdated();
+        onTaskUpdated(updated);
         if (
           previousTask &&
           typeof data.status === "string" &&
@@ -341,7 +396,9 @@ export function useTaskPersistence({
         }
         return updated;
       } catch (err) {
-        console.error("更新失敗:", err);
+        if (isCurrentLifecycle(lifecycleGeneration)) {
+          console.error("更新失敗:", err);
+        }
         return null;
       }
     },
@@ -349,6 +406,8 @@ export function useTaskPersistence({
       applyLocalDraftUpdate,
       activeOccurrenceContext,
       effectiveTaskId,
+      isCurrentLifecycle,
+      lifecycleGenerationRef,
       onTaskUpdated,
       saveTaskUpdate,
       task,
@@ -375,24 +434,31 @@ export function useTaskPersistence({
         applyLocalDraftUpdate({ metadata });
         return;
       }
+      const updateTaskId = effectiveTaskId;
+      const lifecycleGeneration = lifecycleGenerationRef.current;
 
       void (async () => {
         try {
           const updated = await saveTaskUpdate(
-            effectiveTaskId,
+            updateTaskId,
             { metadata },
             task?.project_id ?? null,
           );
+          if (!isCurrentLifecycle(lifecycleGeneration)) return;
           setTask({ ...updated, metadata: taskMetadataRef.current });
-          onTaskUpdated();
+          onTaskUpdated(updated);
         } catch (err) {
-          console.error("URL表示方式の保存に失敗:", err);
+          if (isCurrentLifecycle(lifecycleGeneration)) {
+            console.error("URL表示方式の保存に失敗:", err);
+          }
         }
       })();
     },
     [
       applyLocalDraftUpdate,
       effectiveTaskId,
+      isCurrentLifecycle,
+      lifecycleGenerationRef,
       onTaskUpdated,
       saveTaskUpdate,
       task?.project_id,
@@ -450,6 +516,8 @@ export function useTaskPersistence({
   const moveOccurrenceDateRange = useCallback(
     async (values: { startAt: string | null; endAt: string | null }) => {
       if (!effectiveTaskId || !activeOccurrenceContext?.start_at) return;
+      const updateTaskId = effectiveTaskId;
+      const lifecycleGeneration = lifecycleGenerationRef.current;
       const nextStartAt =
         toTaskDatePayloadValue(values.startAt, { allDay: task?.all_day }) ??
         activeOccurrenceContext.start_at;
@@ -457,7 +525,7 @@ export function useTaskPersistence({
         allDay: task?.all_day,
       });
       try {
-        const result = await taskApi.moveOccurrence(effectiveTaskId, {
+        const result = await taskApi.moveOccurrence(updateTaskId, {
           occurrence_id: activeOccurrenceContext.occurrence_id ?? null,
           occurrence_start_at: activeOccurrenceContext.start_at,
           occurrence_end_at: activeOccurrenceContext.end_at ?? null,
@@ -467,18 +535,33 @@ export function useTaskPersistence({
           status: activeOccurrenceContext.status ?? task?.status ?? null,
           all_day: task?.all_day,
         });
+        if (!isCurrentLifecycle(lifecycleGeneration)) return;
         setOccurrenceDateOverride({
           start_at: result.occurrence?.start_at ?? nextStartAt,
           end_at: result.occurrence?.end_at ?? nextEndAt,
         });
-        onTaskUpdated();
+        onTaskUpdated(
+          task
+            ? {
+                ...task,
+                effective_start_at:
+                  result.occurrence?.start_at ?? nextStartAt,
+                effective_end_at:
+                  result.occurrence?.end_at ?? nextEndAt,
+              }
+            : undefined,
+        );
       } catch (err) {
-        console.error("繰り返し発生日時の更新に失敗:", err);
+        if (isCurrentLifecycle(lifecycleGeneration)) {
+          console.error("繰り返し発生日時の更新に失敗:", err);
+        }
       }
     },
     [
       activeOccurrenceContext,
       effectiveTaskId,
+      isCurrentLifecycle,
+      lifecycleGenerationRef,
       onTaskUpdated,
       task,
       setOccurrenceDateOverride,

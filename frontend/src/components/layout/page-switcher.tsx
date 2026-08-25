@@ -12,6 +12,8 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { FileText, Search, Tags } from "lucide-react";
+import { useDocsCommandContext } from "@/components/docs/hooks/use-docs-command-palette";
+import { compactEntityId, shortEntityId } from "@/lib/entity-id";
 
 type PageHit = {
   id: string;
@@ -28,6 +30,7 @@ export function PageSwitcher() {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [pages, setPages] = useState<PageHit[]>([]);
+  const docsContext = useDocsCommandContext();
 
   // ファイラーページでは Ctrl+P / Ctrl+Shift+P をファイラー固有のショートカット
   // （パスコピー / ファイル名コピー）に譲るため、ページスイッチャーは発火しない。
@@ -62,7 +65,11 @@ export function PageSwitcher() {
       fetch(`/api/docs/pages?q=${encodeURIComponent(query)}&limit=30`, {
         signal: controller.signal,
       })
-        .then((response) => (response.ok ? response.json() as Promise<{ pages: PageHit[] }> : { pages: [] }))
+        .then((response) =>
+          response.ok
+            ? (response.json() as Promise<{ pages: PageHit[] }>)
+            : { pages: [] },
+        )
         .then((data) => setPages(data.pages ?? []))
         .catch(() => {
           if (!controller.signal.aborted) setPages([]);
@@ -74,11 +81,18 @@ export function PageSwitcher() {
     };
   }, [open, query]);
 
-  const title = useMemo(() => query.trim() ? "ページを検索" : "最近のDocsページ", [query]);
+  const title = useMemo(
+    () => (query.trim() ? "ページを検索" : "最近のDocsページ"),
+    [query],
+  );
 
   const openPage = (pageId: string) => {
     setOpen(false);
     setQuery("");
+    if (pathname?.startsWith("/docs") && docsContext?.onOpenNode) {
+      docsContext.onOpenNode(pageId);
+      return;
+    }
     router.push(`/docs/${pageId}`);
   };
 
@@ -87,13 +101,13 @@ export function PageSwitcher() {
       open={open}
       onOpenChange={setOpen}
       title="ページスイッチャー"
-      description="Docsページをタイトルまたはエイリアスで開きます"
+      description="Docsページをタイトル、エイリアス、IDで開きます"
     >
       <Command shouldFilter={false}>
         <CommandInput
           value={query}
           onValueChange={setQuery}
-          placeholder="ページ名またはエイリアス..."
+          placeholder="ページ名、ID（8文字以上）、またはエイリアス..."
         />
         <CommandList>
           <CommandEmpty>該当するページがありません</CommandEmpty>
@@ -101,7 +115,7 @@ export function PageSwitcher() {
             {pages.map((page) => (
               <CommandItem
                 key={page.id}
-                value={`${page.title} ${page.aliases.join(" ")}`}
+                value={`${page.title} ${page.aliases.join(" ")} ${page.id} ${compactEntityId(page.id)} ${shortEntityId(page.id)}`}
                 onSelect={() => openPage(page.id)}
                 className="items-start"
               >
@@ -113,7 +127,12 @@ export function PageSwitcher() {
                 <div className="min-w-0">
                   <div className="truncate font-medium">{page.title}</div>
                   <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
-                    <span className="truncate">{page.breadcrumb.join(" / ") || "Docs"}</span>
+                    <span className="truncate">
+                      {page.breadcrumb.join(" / ") || "Docs"}
+                    </span>
+                    <span className="shrink-0" title={page.id}>
+                      ID: {shortEntityId(page.id)} / {compactEntityId(page.id)}
+                    </span>
                     {page.aliases.length > 0 ? (
                       <span className="inline-flex min-w-0 items-center gap-1 truncate">
                         <Tags className="size-3" />

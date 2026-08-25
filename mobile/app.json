@@ -2,7 +2,7 @@
   "expo": {
     "name": "AoiTalk",
     "slug": "aoitalk",
-    "version": "0.1.89",
+    "version": "0.1.148",
     "orientation": "default",
     "scheme": "aoitalk",
     "icon": "./assets/icon.png",
@@ -29,7 +29,7 @@
         "android.permission.ACCESS_WIFI_STATE",
         "android.permission.POST_NOTIFICATIONS"
       ],
-      "versionCode": 89,
+      "versionCode": 148,
       "package": "com.aoitalk.mobile"
     },
     "web": {

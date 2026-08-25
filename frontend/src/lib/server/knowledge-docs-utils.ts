@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, ilike, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, ilike, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
 import { basename, resolve, sep } from "node:path";
 import { db } from "@/db";
@@ -11,6 +11,7 @@ import {
   knowledgeImportItems,
   knowledgeImportJobs,
   knowledgeNodePlacements,
+  knowledgeNodeShares,
   knowledgeSearchIndex,
   knowledgeSavedViews,
   knowledgeNodeSupertags,
@@ -18,10 +19,11 @@ import {
   knowledgeNodes,
   knowledgeRevisions,
   knowledgeSupertags,
-  knowledgeWorkspaces,
   projectMembers,
   projects,
+  users,
 } from "@/db/schema";
+import { docsLibraries } from "@/lib/server/docs-library-schema";
 import {
   DEFAULT_DOCS_SUPERTAGS,
   normalizeDocsFieldType,
@@ -33,6 +35,8 @@ import {
   getAccessibleProject,
   getWritableProject,
 } from "@/lib/server/project-access";
+import { hasEffectiveProjectPermission } from "@/lib/server/project-permissions";
+import { getReadableProjectIds } from "@/lib/server/task-route-utils";
 import {
   decryptJsonValueIfNeeded,
   decryptTextIfNeeded,
@@ -40,6 +44,11 @@ import {
   encryptText,
 } from "./field-crypto";
 import { listDocsTaskSyntheticFieldValues } from "./docs-task-binding";
+import {
+  appendContentDeletionEvent,
+  createDeletionBatchId,
+} from "./content-deletion-events";
+import { readDeletionRetentionDays } from "./deletion-retention";
 import {
   decryptDocsNodeBodyJson,
   decryptDocsNodeBodyText,
@@ -251,18 +260,24 @@ function normalizeStatus(
 }
 
 export function serializeWorkspace(
-  row: typeof knowledgeWorkspaces.$inferSelect,
+  row: typeof docsLibraries.$inferSelect,
 ) {
   return {
     id: row.id,
+    library_id: row.id,
+    docs_library_id: row.id,
     name: row.name,
     description: row.description,
     owner_user_id: row.ownerUserId,
+    library_type: row.libraryType ?? "personal",
     settings: row.settingsJson ?? {},
     created_at: serializeDate(row.createdAt),
     updated_at: serializeDate(row.updatedAt),
   };
 }
+
+/** Stable API DTO name for the physical workspace row. */
+export const serializeDocsLibrary = serializeWorkspace;
 
 function serializeNodeWithOptions(
   row: typeof knowledgeNodes.$inferSelect,
@@ -271,7 +286,7 @@ function serializeNodeWithOptions(
   const includeBody = options.includeBody;
   return {
     id: row.id,
-    workspace_id: row.workspaceId,
+    docs_library_id: row.docsLibraryId,
     parent_id: row.parentId,
     root_page_id: row.rootPageId,
     project_id: row.projectId,
@@ -302,7 +317,7 @@ export function serializeSupertag(
 ) {
   return {
     id: row.id,
-    workspace_id: row.workspaceId,
+    docs_library_id: row.docsLibraryId,
     parent_supertag_id: row.parentSupertagId,
     name: row.name,
     base_type: row.baseType ?? "note",
@@ -323,7 +338,7 @@ export function serializeSupertag(
 export function serializeField(row: typeof knowledgeFields.$inferSelect) {
   return {
     id: row.id,
-    workspace_id: row.workspaceId,
+    docs_library_id: row.docsLibraryId,
     supertag_id: row.supertagId,
     system_key: row.systemKey,
     name: row.name,
@@ -369,7 +384,7 @@ export function serializeSuggestion(
 ) {
   return {
     id: row.id,
-    workspace_id: row.workspaceId,
+    docs_library_id: row.docsLibraryId,
     node_id: row.nodeId,
     suggestion_type: row.suggestionType,
     payload_json: row.payloadJson ?? {},
@@ -386,7 +401,7 @@ export function serializeImportJob(
 ) {
   return {
     id: row.id,
-    workspace_id: row.workspaceId,
+    docs_library_id: row.docsLibraryId,
     project_id: row.projectId,
     source_type: row.sourceType,
     source_name: row.sourceName,
@@ -419,7 +434,7 @@ export function serializeImportItem(
 export function serializeView(row: typeof knowledgeSavedViews.$inferSelect) {
   return {
     id: row.id,
-    workspace_id: row.workspaceId,
+    docs_library_id: row.docsLibraryId,
     supertag_id: row.supertagId,
     name: row.name,
     layout: row.layout ?? "table",
@@ -489,7 +504,7 @@ export function serializeEdge(row: typeof knowledgeEdges.$inferSelect) {
 
 export async function getKnowledgeNodeDescendantIds(
   client: DocsDb,
-  workspaceId: string,
+  docsLibraryId: string,
   nodeId: string,
 ): Promise<string[]> {
   const rows = await client
@@ -498,7 +513,7 @@ export async function getKnowledgeNodeDescendantIds(
       parentId: knowledgeNodes.parentId,
     })
     .from(knowledgeNodes)
-    .where(eq(knowledgeNodes.workspaceId, workspaceId));
+    .where(eq(knowledgeNodes.docsLibraryId, docsLibraryId));
   const childrenByParent = new Map<string, string[]>();
   for (const row of rows) {
     if (!row.parentId) continue;
@@ -522,7 +537,7 @@ export async function getKnowledgeNodeDescendantIds(
 
 export async function getKnowledgeDisplayDescendantIds(
   client: DocsDb,
-  workspaceId: string,
+  docsLibraryId: string,
   nodeId: string,
 ): Promise<string[]> {
   const [nodes, placements] = await Promise.all([
@@ -532,7 +547,7 @@ export async function getKnowledgeDisplayDescendantIds(
         parentId: knowledgeNodes.parentId,
       })
       .from(knowledgeNodes)
-      .where(eq(knowledgeNodes.workspaceId, workspaceId)),
+      .where(eq(knowledgeNodes.docsLibraryId, docsLibraryId)),
     client
       .select({
         nodeId: knowledgeNodePlacements.nodeId,
@@ -540,14 +555,14 @@ export async function getKnowledgeDisplayDescendantIds(
       })
       .from(knowledgeNodePlacements)
       .innerJoin(knowledgeNodes, eq(knowledgeNodePlacements.nodeId, knowledgeNodes.id))
-      .where(eq(knowledgeNodes.workspaceId, workspaceId)),
+      .where(eq(knowledgeNodes.docsLibraryId, docsLibraryId)),
   ]);
   return collectKnowledgeDisplayDescendantIds(nodes, placements, nodeId);
 }
 
 async function resolveReferenceTargetIds(
   client: DocsDb,
-  workspaceId: string,
+  docsLibraryId: string,
   sourceNodeId: string,
   bodyText: string,
 ): Promise<string[]> {
@@ -560,7 +575,7 @@ async function resolveReferenceTargetIds(
       .from(knowledgeNodes)
       .where(
         and(
-          eq(knowledgeNodes.workspaceId, workspaceId),
+          eq(knowledgeNodes.docsLibraryId, docsLibraryId),
           isNull(knowledgeNodes.archivedAt),
           inArray(knowledgeNodes.id, hints.docsIds),
         ),
@@ -591,7 +606,7 @@ export async function syncKnowledgeNodeReferenceEdges(
   const referenceText = [node.title, bodyText].filter(Boolean).join("\n");
   const targetIds = await resolveReferenceTargetIds(
     client,
-    node.workspaceId,
+    node.docsLibraryId,
     node.id,
     referenceText,
   );
@@ -610,16 +625,16 @@ export async function syncKnowledgeNodeReferenceEdges(
 
 async function seedDefaultDocsWorkspace(
   tx: DocsDb,
-  workspaceId: string,
+  docsLibraryId: string,
   userId: string,
 ) {
   await tx.execute(
-    sql`select pg_advisory_xact_lock(hashtext(${`${workspaceId}:default-docs-seed`}))`,
+    sql`select pg_advisory_xact_lock(hashtext(${`${docsLibraryId}:default-docs-seed`}))`,
   );
   const existingTags = await tx
     .select()
     .from(knowledgeSupertags)
-    .where(eq(knowledgeSupertags.workspaceId, workspaceId));
+    .where(eq(knowledgeSupertags.docsLibraryId, docsLibraryId));
   const tagsByName = new Map(existingTags.map((tag) => [tag.name, tag]));
   const tagsBySystemKey = new Map(
     existingTags
@@ -634,7 +649,7 @@ async function seedDefaultDocsWorkspace(
       const [createdTag] = await tx
         .insert(knowledgeSupertags)
         .values({
-          workspaceId,
+          docsLibraryId,
           parentSupertagId: null,
           systemKey: tag.systemKey ?? null,
           name: tag.name,
@@ -666,7 +681,7 @@ async function seedDefaultDocsWorkspace(
       if (missingFields.length > 0) {
         await tx.insert(knowledgeFields).values(
           missingFields.map((field, fieldIndex) => ({
-            workspaceId,
+            docsLibraryId,
             supertagId: targetTag.id,
             systemKey: field.systemKey ?? null,
             name: field.name,
@@ -760,7 +775,7 @@ async function seedDefaultDocsWorkspace(
         )
         .where(
           and(
-            eq(knowledgeNodes.workspaceId, workspaceId),
+            eq(knowledgeNodes.docsLibraryId, docsLibraryId),
             isNull(knowledgeNodes.archivedAt),
             isNull(projects.deletedAt),
           ),
@@ -799,12 +814,12 @@ async function seedDefaultDocsWorkspace(
   const existingViews = await tx
     .select({ name: knowledgeSavedViews.name })
     .from(knowledgeSavedViews)
-    .where(eq(knowledgeSavedViews.workspaceId, workspaceId));
+    .where(eq(knowledgeSavedViews.docsLibraryId, docsLibraryId));
   const existingViewNames = new Set(existingViews.map((view) => view.name));
   const missingViews: Array<typeof knowledgeSavedViews.$inferInsert> = [];
   if (!existingViewNames.has("全案件 Task board")) {
     missingViews.push({
-      workspaceId,
+      docsLibraryId,
       name: "全案件 Task board",
       layout: "board",
       configJson: {
@@ -817,10 +832,10 @@ async function seedDefaultDocsWorkspace(
     });
   }
   // 「全案件 Risk table」ビューは Risk タグ削除(D11)に伴い dead 定義のため seed から除去した。
-  // 既存DBに残る同名ビュー行は scripts/seed_docs_sample_content.ts が掃除する。
+  // 既存DBに残る同名ビュー行は過去のデータ移行で掃除済み。
   if (!existingViewNames.has("今月の Meeting list")) {
     missingViews.push({
-      workspaceId,
+      docsLibraryId,
       name: "今月の Meeting list",
       layout: "list",
       configJson: { filters: { supertag: "Meeting", date: "this_month" } },
@@ -841,7 +856,7 @@ async function seedDefaultDocsWorkspace(
     .from(knowledgeNodes)
     .where(
       and(
-        eq(knowledgeNodes.workspaceId, workspaceId),
+        eq(knowledgeNodes.docsLibraryId, docsLibraryId),
         eq(knowledgeNodes.systemKey, HOME_SYSTEM_KEY),
       ),
     )
@@ -854,7 +869,7 @@ async function seedDefaultDocsWorkspace(
     .from(knowledgeNodes)
     .where(
       and(
-        eq(knowledgeNodes.workspaceId, workspaceId),
+        eq(knowledgeNodes.docsLibraryId, docsLibraryId),
         eq(knowledgeNodes.title, "Home"),
         isNull(knowledgeNodes.parentId),
         isNull(knowledgeNodes.archivedAt),
@@ -900,7 +915,7 @@ async function seedDefaultDocsWorkspace(
       .from(knowledgeNodes)
       .where(
         and(
-          eq(knowledgeNodes.workspaceId, workspaceId),
+          eq(knowledgeNodes.docsLibraryId, docsLibraryId),
           eq(knowledgeNodes.parentId, existingHome.id),
           eq(knowledgeNodes.nodeType, "search"),
           isNull(knowledgeNodes.archivedAt),
@@ -923,7 +938,7 @@ async function seedDefaultDocsWorkspace(
   const homeId = crypto.randomUUID();
   const home = await insertDocsNode(tx, {
     id: homeId,
-    workspaceId,
+    docsLibraryId,
     parentId: null,
     rootPageId: homeId,
     projectId: null,
@@ -938,11 +953,11 @@ async function seedDefaultDocsWorkspace(
     createdBy: userId,
     updatedBy: userId,
   });
-  await upsertKnowledgeSearchIndex(tx, home, home.title);
+  await upsertKnowledgeSearchIndex(tx, home, effectiveDocsSearchBodyText(home));
   await appendKnowledgeRevision(tx, home, userId, "Homeノードを作成");
   for (const [index, templateNode] of HOME_TEMPLATE.entries()) {
     const child = await insertDocsNode(tx, {
-      workspaceId,
+      docsLibraryId,
       parentId: homeId,
       rootPageId: homeId,
       projectId: null,
@@ -960,7 +975,7 @@ async function seedDefaultDocsWorkspace(
       createdBy: userId,
       updatedBy: userId,
     });
-    await upsertKnowledgeSearchIndex(tx, child, child.title);
+    await upsertKnowledgeSearchIndex(tx, child, effectiveDocsSearchBodyText(child));
     await appendKnowledgeRevision(tx, child, userId, "Home初期テンプレートを作成");
   }
 }
@@ -968,9 +983,14 @@ async function seedDefaultDocsWorkspace(
 export async function ensureDocsWorkspace(user: SessionUser) {
   const [existing] = await db
     .select()
-    .from(knowledgeWorkspaces)
-    .where(eq(knowledgeWorkspaces.ownerUserId, user.id))
-    .orderBy(asc(knowledgeWorkspaces.createdAt))
+    .from(docsLibraries)
+    .where(
+      and(
+        eq(docsLibraries.ownerUserId, user.id),
+        eq(docsLibraries.libraryType, "personal"),
+      ),
+    )
+    .orderBy(asc(docsLibraries.createdAt))
     .limit(1);
   if (existing) {
     const settings = normalizeJsonObject(existing.settingsJson);
@@ -982,13 +1002,13 @@ export async function ensureDocsWorkspace(user: SessionUser) {
     const workspace = needsUpdate
       ? (
           await db
-            .update(knowledgeWorkspaces)
+            .update(docsLibraries)
             .set({
               name: DOCS_WORKSPACE_NAME,
               description: existing.description || DOCS_WORKSPACE_DESCRIPTION,
               settingsJson: mergedSettings,
             })
-            .where(eq(knowledgeWorkspaces.id, existing.id))
+            .where(eq(docsLibraries.id, existing.id))
             .returning()
         )[0] ?? existing
       : existing;
@@ -1000,25 +1020,90 @@ export async function ensureDocsWorkspace(user: SessionUser) {
 
   return await db.transaction(async (tx) => {
     const [workspace] = await tx
-      .insert(knowledgeWorkspaces)
+      .insert(docsLibraries)
       .values({
         name: DOCS_WORKSPACE_NAME,
         description: DOCS_WORKSPACE_DESCRIPTION,
         ownerUserId: user.id,
         settingsJson: DOCS_WORKSPACE_SETTINGS,
       })
-      .onConflictDoUpdate({
-        target: knowledgeWorkspaces.ownerUserId,
-        set: {
-          name: DOCS_WORKSPACE_NAME,
-          description: DOCS_WORKSPACE_DESCRIPTION,
-          settingsJson: DOCS_WORKSPACE_SETTINGS,
-        },
-      })
+      // The canonical schema uses a partial unique index (personal owners
+      // only), so `ON CONFLICT (owner_user_id)` cannot be inferred on every
+      // supported PostgreSQL version. Conflict-do-nothing followed by a
+      // deterministic select is safe under the unique index and also works
+      // during the workspace→DocsLibrary rename migration.
+      .onConflictDoNothing()
       .returning();
-    await seedDefaultDocsWorkspace(tx, workspace.id, user.id);
-    return workspace;
+    const canonical =
+      workspace ??
+      (
+        await tx
+          .select()
+          .from(docsLibraries)
+          .where(
+            and(
+              eq(docsLibraries.ownerUserId, user.id),
+              eq(docsLibraries.libraryType, "personal"),
+            ),
+          )
+          .orderBy(asc(docsLibraries.createdAt), asc(docsLibraries.id))
+          .limit(1)
+      )[0];
+    if (!canonical) throw new Error("Personal Docs Library could not be created");
+    await seedDefaultDocsWorkspace(tx, canonical.id, user.id);
+    return canonical;
   });
+}
+
+/**
+ * Return the canonical membership-scoped Docs Library for a project.
+ *
+ * Project information is owned by the project's owner and is stored under
+ * that user's Personal Docs Library.  The old project-scoped workspace rows
+ * remain readable for migration compatibility, but this resolver deliberately
+ * never creates or returns one.  The public function name is retained while
+ * clients migrate from `workspace`/`workspace_id` to `library`/`docs_library_id`.
+ */
+export async function ensureProjectDocsWorkspace(
+  projectId: string,
+  user: SessionUser,
+) {
+  const access = await ensureProjectReadable(projectId, user);
+  if (!access) return null;
+  const ownerId = access.project.ownerId;
+  const writable = await ensureProjectWritable(projectId, user);
+
+  const existing = await db
+    .select()
+    .from(docsLibraries)
+    .where(
+      and(
+        eq(docsLibraries.libraryType, "personal"),
+        eq(docsLibraries.ownerUserId, ownerId),
+      ),
+    )
+    .limit(1);
+  if (existing[0]) {
+    // The Personal Library's default metadata (Home, system supertags,
+    // fields, views, etc.) is owner-private.  A Project writer/member may
+    // use an already initialized library and canonical project child, but
+    // must never reseed or repair the owner's global metadata as a side
+    // effect of a task Docs-node/meeting-note request.
+    if (writable && user.id === ownerId) {
+      await db.transaction(async (tx) => {
+        await seedDefaultDocsWorkspace(tx, existing[0].id, user.id);
+      });
+    }
+    return existing[0];
+  }
+
+  // A read-only caller, or a Project member whose owner library has not been
+  // initialized yet, gets a deterministic empty/missing result.  Only the
+  // Personal Library owner may bootstrap the missing owner-owned library.
+  if (!writable || user.id !== ownerId) return null;
+
+  // Use the same idempotent personal bootstrap path as `/docs`.
+  return ensureDocsWorkspace({ id: ownerId, role: ownerId === user.id ? user.role : null });
 }
 
 export async function ensureProjectReadable(
@@ -1037,40 +1122,743 @@ export async function ensureProjectWritable(
   return await getWritableProject(projectId, user);
 }
 
+export type DocsNodeAccess = {
+  permission: "owner" | "read" | "write";
+  node: typeof knowledgeNodes.$inferSelect;
+  workspace: typeof docsLibraries.$inferSelect;
+};
+
+export type DocsNodeAccessMap = Map<string, DocsNodeAccess>;
+
+const DOCS_ACL_MAX_ANCESTOR_DEPTH = 512;
+const DOCS_ACL_BIND_CHUNK_SIZE = 5000;
+
+function chunkDocsAclIds<T>(items: readonly T[]): T[][] {
+  const chunks: T[][] = [];
+  for (let offset = 0; offset < items.length; offset += DOCS_ACL_BIND_CHUNK_SIZE) {
+    chunks.push(items.slice(offset, offset + DOCS_ACL_BIND_CHUNK_SIZE));
+  }
+  return chunks;
+}
+
+type ProjectPermissionSets = {
+  readable: Set<string>;
+  writable: Set<string>;
+};
+
+/**
+ * Resolve project ACLs for a whole candidate set in two bounded queries.
+ *
+ * Calling getAccessibleProject/getWritableProject for every candidate node
+ * used to multiply the project/member lookup by the number of roots.  The
+ * ACL decision itself is unchanged; only the lookup is materialized once.
+ */
+async function getProjectPermissionSets(
+  projectIds: string[],
+  user: SessionUser,
+): Promise<ProjectPermissionSets> {
+  const readable = new Set<string>();
+  const writable = new Set<string>();
+  const uniqueProjectIds = Array.from(new Set(projectIds.filter(Boolean)));
+  if (uniqueProjectIds.length === 0) return { readable, writable };
+
+  try {
+    const [[principal], projectRows] = await Promise.all([
+      db
+        .select({ role: users.role })
+        .from(users)
+        .where(eq(users.id, user.id))
+        .limit(1),
+      Promise.all(
+        chunkDocsAclIds(uniqueProjectIds).map((projectIdChunk) =>
+          db
+            .select({
+              id: projects.id,
+              ownerId: projects.ownerId,
+              memberPermissions: projectMembers.permissions,
+            })
+            .from(projects)
+            .leftJoin(
+              projectMembers,
+              and(
+                eq(projectMembers.projectId, projects.id),
+                eq(projectMembers.userId, user.id),
+              ),
+            )
+            .where(
+              and(
+                isNull(projects.deletedAt),
+                inArray(projects.id, projectIdChunk),
+              ),
+            ),
+        ),
+      ),
+    ]);
+
+    for (const row of projectRows.flat()) {
+      const input = {
+        userId: user.id,
+        userRole: principal?.role ?? user.role,
+        projectOwnerId: row.ownerId,
+        memberPermissions: row.memberPermissions,
+      };
+      try {
+        if (hasEffectiveProjectPermission({ ...input, permission: "read" })) {
+          readable.add(row.id);
+        }
+        if (hasEffectiveProjectPermission({ ...input, permission: "write" })) {
+          writable.add(row.id);
+        }
+      } catch {
+        // Malformed persisted permissions fail closed for this project.
+      }
+    }
+  } catch {
+    // A rolling deploy or malformed project row must not turn a Docs read
+    // into a 500.  Empty sets intentionally deny every project-gated node.
+  }
+
+  return { readable, writable };
+}
+
+/**
+ * Resolve ACLs for a set of nodes with request-local/batch lookups.
+ *
+ * The returned map contains only nodes visible to the actor.  Callers must
+ * treat a missing key as deny; this is important for race-safe serialization
+ * when a share is revoked between the candidate query and response assembly.
+ */
+export async function getDocsNodeAccessMap(
+  nodeIds: readonly string[],
+  user: SessionUser,
+  options: { includeArchived?: boolean } = {},
+): Promise<DocsNodeAccessMap> {
+  const ids = Array.from(new Set(nodeIds.filter(Boolean)));
+  const accessByNodeId: DocsNodeAccessMap = new Map();
+  if (ids.length === 0) return accessByNodeId;
+
+  let rows: Array<{
+    node: typeof knowledgeNodes.$inferSelect;
+    workspace: typeof docsLibraries.$inferSelect;
+  }>;
+  try {
+    const rowChunks = await Promise.all(
+      chunkDocsAclIds(ids).map((idChunk) =>
+        db
+          .select({ node: knowledgeNodes, workspace: docsLibraries })
+          .from(knowledgeNodes)
+          .innerJoin(
+            docsLibraries,
+            eq(knowledgeNodes.docsLibraryId, docsLibraries.id),
+          )
+          .where(inArray(knowledgeNodes.id, idChunk)),
+      ),
+    );
+    rows = rowChunks.flat();
+  } catch {
+    return accessByNodeId;
+  }
+  if (rows.length === 0) return accessByNodeId;
+
+  // Normalize the joined rows once at the ACL boundary so every decision
+  // below is made from docsLibraryId/libraryType and cannot accidentally grant
+  // across a library.
+  rows = (
+    rows as Array<{
+      node?: Record<string, unknown> | null;
+      workspace?: Record<string, unknown> | null;
+    }>
+  ).flatMap((row) => {
+    const rawNode = row.node;
+    const rawWorkspace = row.workspace;
+    const docsLibraryId = rawNode?.docsLibraryId;
+    if (
+      !rawNode ||
+      !rawWorkspace ||
+      typeof rawNode.id !== "string" ||
+      typeof docsLibraryId !== "string" ||
+      typeof rawWorkspace.id !== "string" ||
+      docsLibraryId !== rawWorkspace.id
+    ) {
+      return [];
+    }
+    return [{
+      node: {
+        ...rawNode,
+        docsLibraryId,
+      } as typeof knowledgeNodes.$inferSelect,
+      workspace: {
+        ...rawWorkspace,
+        libraryType: rawWorkspace.libraryType,
+      } as typeof docsLibraries.$inferSelect,
+    }];
+  });
+
+  const candidateRows = options.includeArchived === false
+    ? rows.filter((row) => !row.node.archivedAt)
+    : rows;
+  if (candidateRows.length === 0) return accessByNodeId;
+
+  // Resolve owner-controlled rows before touching any ancestor/child query.
+  // A Personal Library owner does not need a share graph for ordinary nodes;
+  // project-linked rows still require the project membership gate, so those
+  // project ids are evaluated below without reading the entire library.
+  const ownerProjectRows: typeof candidateRows = [];
+  const candidateRowsForAcl: typeof candidateRows = [];
+  for (const row of candidateRows) {
+    if (row.workspace.ownerUserId !== user.id) {
+      candidateRowsForAcl.push(row);
+      continue;
+    }
+    if (row.node.systemKey === "project_information_root" || !row.node.projectId) {
+      accessByNodeId.set(row.node.id, {
+        node: row.node,
+        workspace: row.workspace,
+        permission: "owner",
+      });
+      continue;
+    }
+    ownerProjectRows.push(row);
+  }
+
+  const hubRows = candidateRowsForAcl.filter(
+    (row) => row.node.systemKey === "project_information_root",
+  );
+  let hubChildRows: Array<{
+    id: string;
+    parentId: string | null;
+    docsLibraryId: string;
+    projectId: string | null;
+    archivedAt: Date | null;
+  }> = [];
+  if (hubRows.length > 0) {
+    try {
+      const childChunks = await Promise.all(
+        chunkDocsAclIds(hubRows.map((row) => row.node.id)).map((hubIdChunk) =>
+          db
+            .select({
+              id: knowledgeNodes.id,
+              parentId: knowledgeNodes.parentId,
+              docsLibraryId: knowledgeNodes.docsLibraryId,
+              projectId: knowledgeNodes.projectId,
+              archivedAt: knowledgeNodes.archivedAt,
+            })
+            .from(knowledgeNodes)
+            .where(inArray(knowledgeNodes.parentId, hubIdChunk)),
+        ),
+      );
+      hubChildRows = childChunks.flat().filter((row) =>
+        typeof row.id === "string" &&
+        typeof row.docsLibraryId === "string" &&
+        typeof row.parentId === "string",
+      ) as typeof hubChildRows;
+    } catch {
+      // A malformed/rolling adapter simply denies member hub access below.
+      hubChildRows = [];
+    }
+  }
+
+  const projectIds = [
+    ...ownerProjectRows.map((row) => row.node.projectId),
+    ...candidateRowsForAcl.map((row) => row.node.projectId),
+    ...hubChildRows.map((row) => row.projectId),
+  ].filter((value): value is string => Boolean(value));
+  const projectPermissions = await getProjectPermissionSets(projectIds, user);
+
+  for (const row of ownerProjectRows) {
+    if (!row.node.projectId || !projectPermissions.readable.has(row.node.projectId)) continue;
+    accessByNodeId.set(row.node.id, {
+      node: row.node,
+      workspace: row.workspace,
+      permission: "owner",
+    });
+  }
+
+  const readableProjectChildByHub = new Set<string>();
+  const workspaceByHubId = new Map(hubRows.map((row) => [row.node.id, row.workspace.id]));
+  for (const child of hubChildRows) {
+    const parentId = child.parentId;
+    if (
+      !child.archivedAt &&
+      parentId &&
+      child.projectId &&
+      workspaceByHubId.get(parentId) === child.docsLibraryId &&
+      projectPermissions.readable.has(child.projectId)
+    ) {
+      readableProjectChildByHub.add(parentId);
+    }
+  }
+
+  const shareCandidates = candidateRowsForAcl.filter(
+    (row) => row.node.systemKey !== "project_information_root" && !row.node.projectId,
+  );
+  const ancestorIdsByNodeId = await getDocsAncestorPaths(
+    shareCandidates.map((row) => ({
+      id: row.node.id,
+      parentId: row.node.parentId,
+      docsLibraryId: row.node.docsLibraryId,
+    })),
+  );
+  const allAncestorIds = new Set<string>();
+  for (const ancestorIds of ancestorIdsByNodeId.values()) {
+    for (const ancestorId of ancestorIds) allAncestorIds.add(ancestorId);
+  }
+
+  const sharePermissionByNodeId = new Map<string, "read" | "write">();
+  if (allAncestorIds.size > 0) {
+    try {
+      const shares = (
+        await Promise.all(
+          chunkDocsAclIds(Array.from(allAncestorIds)).map((ancestorChunk) =>
+            db
+              .select({
+                nodeId: knowledgeNodeShares.nodeId,
+                permission: knowledgeNodeShares.permission,
+              })
+              .from(knowledgeNodeShares)
+              .where(
+                and(
+                  eq(knowledgeNodeShares.userId, user.id),
+                  inArray(knowledgeNodeShares.nodeId, ancestorChunk),
+                ),
+              ),
+          ),
+        )
+      ).flat();
+      for (const share of shares) {
+        if (share.permission === "read" || share.permission === "write") {
+          sharePermissionByNodeId.set(share.nodeId, share.permission);
+        }
+      }
+    } catch {
+      // Unknown/malformed share storage fails closed.  Owner/project grants
+      // below remain available without trusting an unreadable share table.
+    }
+  }
+
+  for (const row of candidateRowsForAcl) {
+    // Evaluate the Personal project-information hub before generic
+    // `project_id` handling.  A malformed/stale hub carrying a project id
+    // must never grant a member write access; only the library owner may
+    // repair such metadata.
+    if (row.node.systemKey === "project_information_root") {
+      if (
+        !row.node.projectId &&
+        !row.node.parentId &&
+        row.node.rootPageId === row.node.id &&
+        readableProjectChildByHub.has(row.node.id)
+      ) {
+        accessByNodeId.set(row.node.id, {
+          node: row.node,
+          workspace: row.workspace,
+          permission: "read",
+        });
+      }
+      continue;
+    }
+
+    // Project identity is carried by the node.  Project libraries were
+    // removed by the canonical Docs-library migration, so a missing
+    // node.project_id is always a non-project personal node.
+    const effectiveProjectId = row.node.projectId;
+    const projectReadable = effectiveProjectId
+      ? projectPermissions.readable.has(effectiveProjectId)
+      : false;
+    const projectWritable = effectiveProjectId
+      ? projectPermissions.writable.has(effectiveProjectId)
+      : false;
+
+    // Project membership is an ACL gate for every node carrying a
+    // `project_id`, including the unified personal-library hierarchy.  The
+    // project owner receives owner/write access; members receive their
+    // project permission directly (write or read) without a separate node
+    // share; non-members are denied above. This keeps all personal project
+    // roots on the same ACL contract.
+    if (effectiveProjectId) {
+      if (!projectReadable) continue;
+      accessByNodeId.set(row.node.id, {
+        node: row.node,
+        workspace: row.workspace,
+        permission: projectWritable ? "write" : "read",
+      });
+      continue;
+    }
+
+    const ancestorIds = ancestorIdsByNodeId.get(row.node.id) ?? [];
+    const explicitPermission = ancestorIds
+      .map((ancestorId) => sharePermissionByNodeId.get(ancestorId))
+      .find(
+        (candidate): candidate is "read" | "write" =>
+          candidate === "read" || candidate === "write",
+      );
+    if (!explicitPermission) continue;
+    accessByNodeId.set(row.node.id, {
+      node: row.node,
+      workspace: row.workspace,
+      permission: explicitPermission === "write" ? "write" : "read",
+    });
+  }
+
+  return accessByNodeId;
+}
+
+type DocsAclAncestorCandidate = {
+  id: string;
+  parentId: string | null;
+  docsLibraryId: string;
+};
+
+/**
+ * Resolve candidate ancestor paths without loading an entire Docs Library.
+ * The normal path uses one recursive CTE; adapters without raw execution fall
+ * back to level-by-level parent lookups deduplicated across candidates.  Each
+ * returned row is checked against the child library before it is added to a
+ * path, so a malformed cross-library edge cannot widen a share.
+ */
+async function getDocsAncestorPaths(
+  candidates: readonly DocsAclAncestorCandidate[],
+): Promise<Map<string, string[]>> {
+  const paths = new Map<string, string[]>();
+  const seenByCandidate = new Map<string, Set<string>>();
+  const candidateById = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+
+  for (const candidate of candidates) {
+    paths.set(candidate.id, [candidate.id]);
+    seenByCandidate.set(candidate.id, new Set([candidate.id]));
+  }
+  if (candidates.length === 0) return paths;
+
+  // Prefer one recursive query for all candidate paths.  The seed list is
+  // bounded by the caller's candidate set, and each path is capped at 512
+  // parent hops, so this never falls back to a library-wide scan.
+  try {
+    const seedIds = sql.join(
+      candidates.map((candidate) => sql`${candidate.id}`),
+      sql`, `,
+    );
+    const result = await db.execute(sql`
+      WITH RECURSIVE ancestors AS (
+        SELECT
+          n.id,
+          n.parent_id,
+          n.docs_library_id,
+          n.id AS candidate_id,
+          ARRAY[n.id]::uuid[] AS visited_path,
+          0 AS depth
+        FROM knowledge_nodes AS n
+        WHERE n.id IN (${seedIds})
+        UNION ALL
+        SELECT
+          parent.id,
+          parent.parent_id,
+          parent.docs_library_id,
+          child.candidate_id,
+          child.visited_path || ARRAY[parent.id]::uuid[],
+          child.depth + 1
+        FROM knowledge_nodes AS parent
+        INNER JOIN ancestors AS child ON child.parent_id = parent.id
+        WHERE parent.docs_library_id = child.docs_library_id
+          AND child.depth < ${DOCS_ACL_MAX_ANCESTOR_DEPTH}
+          AND NOT parent.id = ANY(child.visited_path)
+      )
+      SELECT candidate_id, id, docs_library_id
+      FROM ancestors
+      ORDER BY candidate_id, depth ASC
+    `);
+    if (Array.isArray(result)) {
+      const seedCandidates = new Set<string>();
+      for (const item of result as Array<Record<string, unknown>>) {
+        const candidateId = item.candidate_id ?? item.candidateId;
+        const id = item.id;
+        const docsLibraryId = item.docs_library_id ?? item.docsLibraryId;
+        if (
+          typeof candidateId !== "string" ||
+          typeof id !== "string" ||
+          typeof docsLibraryId !== "string"
+        ) {
+          continue;
+        }
+        const candidate = candidateById.get(candidateId);
+        if (!candidate || candidate.docsLibraryId !== docsLibraryId) continue;
+        if (id === candidateId) seedCandidates.add(candidateId);
+        const seen = seenByCandidate.get(candidateId);
+        if (!seen || seen.has(id)) continue;
+        const path = paths.get(candidateId);
+        if (!path || path.length >= DOCS_ACL_MAX_ANCESTOR_DEPTH + 1) continue;
+        seen.add(id);
+        path.push(id);
+      }
+      // A valid recursive result includes the seed row for every candidate.
+      // If an adapter returned an unrecognizable shape, use the compatible
+      // bounded fallback rather than silently dropping share access.
+      if (seedCandidates.size >= candidates.length) return paths;
+    }
+  } catch {
+    // Fall through to the bounded adapter-compatible lookup below.
+  }
+
+  let frontier = new Map<
+    string,
+    Array<{ candidateId: string; docsLibraryId: string }>
+  >();
+  for (const candidate of candidates) {
+    if (!candidate.parentId) continue;
+    const entries = frontier.get(candidate.parentId) ?? [];
+    entries.push({ candidateId: candidate.id, docsLibraryId: candidate.docsLibraryId });
+    frontier.set(candidate.parentId, entries);
+  }
+
+  for (
+    let depth = 1;
+    depth <= DOCS_ACL_MAX_ANCESTOR_DEPTH && frontier.size > 0;
+    depth += 1
+  ) {
+    const parentIds = Array.from(frontier.keys());
+    let rows: Array<{
+      id: string;
+      parentId: string | null;
+      docsLibraryId: string;
+    }>;
+    try {
+      const chunks = await Promise.all(
+        chunkDocsAclIds(parentIds).map((idChunk) =>
+          db
+            .select({
+              id: knowledgeNodes.id,
+              parentId: knowledgeNodes.parentId,
+              docsLibraryId: knowledgeNodes.docsLibraryId,
+            })
+            .from(knowledgeNodes)
+            .where(inArray(knowledgeNodes.id, idChunk)),
+        ),
+      );
+      rows = chunks.flat();
+    } catch {
+      break;
+    }
+
+    const nextFrontier = new Map<
+      string,
+      Array<{ candidateId: string; docsLibraryId: string }>
+    >();
+    for (const row of rows) {
+      const matches = frontier.get(row.id) ?? [];
+      for (const match of matches) {
+        if (row.docsLibraryId !== match.docsLibraryId) continue;
+        const seen = seenByCandidate.get(match.candidateId);
+        if (!seen) continue;
+        if (!seen.has(row.id)) {
+          seen.add(row.id);
+          paths.get(match.candidateId)?.push(row.id);
+        }
+        if (!row.parentId || depth >= DOCS_ACL_MAX_ANCESTOR_DEPTH) continue;
+        if (seen.has(row.parentId)) continue;
+        const entries = nextFrontier.get(row.parentId) ?? [];
+        entries.push(match);
+        nextFrontier.set(row.parentId, entries);
+      }
+    }
+    frontier = nextFrontier;
+  }
+
+  return paths;
+}
+
+/**
+ * Resolve personal subtree shares and project membership in one place.
+ * Global admins do not implicitly gain access to another user's personal Docs.
+ */
+export async function getDocsNodeAccess(
+  nodeId: string,
+  user: SessionUser,
+  accessMap?: DocsNodeAccessMap,
+): Promise<DocsNodeAccess | null> {
+  if (accessMap) return accessMap.get(nodeId) ?? null;
+
+  // Keep the single-node path independent from the batch resolver.  Both paths
+  // now use bounded ACL lookups, but this one can return owner/project grants
+  // before constructing a batch closure for callers that need one node only.
+  let row: {
+    node: typeof knowledgeNodes.$inferSelect;
+    workspace: typeof docsLibraries.$inferSelect;
+  } | undefined;
+  try {
+    const rows = await db
+      .select({ node: knowledgeNodes, workspace: docsLibraries })
+      .from(knowledgeNodes)
+      .innerJoin(
+        docsLibraries,
+        eq(knowledgeNodes.docsLibraryId, docsLibraries.id),
+      )
+      .where(eq(knowledgeNodes.id, nodeId))
+      .limit(1);
+    row = rows[0];
+  } catch {
+    return null;
+  }
+  if (!row) return null;
+
+  // Do not trust an adapter row whose node/library ids disagree.  Besides
+  // failing closed, this prevents a malformed cross-library parent from
+  // widening a share below.
+  const rawNode = row.node as unknown as Record<string, unknown> | null | undefined;
+  const rawWorkspace = row.workspace as unknown as Record<string, unknown> | null | undefined;
+  if (
+    !rawNode ||
+    !rawWorkspace ||
+    typeof rawNode.id !== "string" ||
+    typeof rawNode.docsLibraryId !== "string" ||
+    typeof rawWorkspace.id !== "string" ||
+    rawNode.docsLibraryId !== rawWorkspace.id
+  ) {
+    return null;
+  }
+  const node = {
+    ...rawNode,
+    docsLibraryId: rawNode.docsLibraryId,
+  } as typeof knowledgeNodes.$inferSelect;
+  const workspace = {
+    ...rawWorkspace,
+    libraryType: rawWorkspace.libraryType,
+  } as typeof docsLibraries.$inferSelect;
+
+  const directAccess = (permission: DocsNodeAccess["permission"]): DocsNodeAccess => ({
+    node,
+    workspace,
+    permission,
+  });
+
+  // A project-information hub is owner-private metadata.  The owner may
+  // always access it (including a stale project_id); members can read only a
+  // canonical shell that has a readable active direct project child.
+  if (node.systemKey === "project_information_root") {
+    if (workspace.ownerUserId === user.id) return directAccess("owner");
+    if (
+      node.projectId ||
+      node.parentId ||
+      node.rootPageId !== node.id
+    ) {
+      return null;
+    }
+
+    let childRows: Array<{ projectId: string | null; archivedAt: Date | null }>;
+    try {
+      childRows = await db
+        .select({
+          projectId: knowledgeNodes.projectId,
+          archivedAt: knowledgeNodes.archivedAt,
+        })
+        .from(knowledgeNodes)
+        .where(
+          and(
+            eq(knowledgeNodes.docsLibraryId, workspace.id),
+            eq(knowledgeNodes.parentId, node.id),
+          ),
+        );
+    } catch {
+      return null;
+    }
+    const projectIds = childRows
+      .filter((child) => !child.archivedAt && Boolean(child.projectId))
+      .map((child) => child.projectId as string);
+    const projectPermissions = await getProjectPermissionSets(projectIds, user);
+    return projectIds.some((projectId) => projectPermissions.readable.has(projectId))
+      ? directAccess("read")
+      : null;
+  }
+
+  const effectiveProjectId = node.projectId;
+  if (effectiveProjectId) {
+    // Project membership is an ACL gate for every node carrying project_id,
+    // including nodes in a Personal Library.  This is the same decision as
+    // getDocsNodeAccessMap, but scoped to this one project instead of all
+    // project references in the library.
+    const projectPermissions = await getProjectPermissionSets([effectiveProjectId], user);
+    if (!projectPermissions.readable.has(effectiveProjectId)) return null;
+    if (workspace.ownerUserId === user.id) return directAccess("owner");
+    return directAccess(
+      projectPermissions.writable.has(effectiveProjectId) ? "write" : "read",
+    );
+  }
+
+  if (workspace.ownerUserId === user.id) return directAccess("owner");
+
+  const ancestorIds =
+    (await getDocsAncestorPaths([
+      {
+        id: node.id,
+        parentId: node.parentId,
+        docsLibraryId: workspace.id,
+      },
+    ])).get(node.id) ?? [];
+  if (ancestorIds.length === 0) return null;
+
+  let shares: Array<{
+    nodeId: string;
+    permission: string | null;
+  }>;
+  try {
+    shares = await db
+      .select({
+        nodeId: knowledgeNodeShares.nodeId,
+        permission: knowledgeNodeShares.permission,
+      })
+      .from(knowledgeNodeShares)
+      .where(
+        and(
+          eq(knowledgeNodeShares.userId, user.id),
+          inArray(knowledgeNodeShares.nodeId, ancestorIds),
+        ),
+      );
+  } catch {
+    return null;
+  }
+  const permissionByNodeId = new Map(
+    shares
+      .filter(
+        (share): share is { nodeId: string; permission: "read" | "write" } =>
+          (share.permission === "read" || share.permission === "write") &&
+          typeof share.nodeId === "string",
+      )
+      .map((share) => [share.nodeId, share.permission]),
+  );
+  const permission = ancestorIds
+    .map((ancestorId) => permissionByNodeId.get(ancestorId))
+    .find(
+      (candidate): candidate is "read" | "write" =>
+        candidate === "read" || candidate === "write",
+    );
+  return permission ? directAccess(permission) : null;
+}
+
+/** Only the personal Docs Library owner may create, update, or revoke shares. */
+export async function getDocsNodeShareManager(
+  nodeId: string,
+  user: SessionUser,
+) {
+  const access = await getDocsNodeAccess(nodeId, user);
+  if (
+    !access ||
+    access.workspace.libraryType !== "personal"
+  ) return null;
+  if (access.workspace.ownerUserId !== user.id) return null;
+  return access;
+}
+
 export async function requireDocsNode(
   nodeId: string,
   user: SessionUser,
   mode: "read" | "write" = "read",
 ) {
-  const [row] = await db
-    .select({
-      node: knowledgeNodes,
-      workspace: knowledgeWorkspaces,
-    })
-    .from(knowledgeNodes)
-    .innerJoin(
-      knowledgeWorkspaces,
-      eq(knowledgeNodes.workspaceId, knowledgeWorkspaces.id),
-    )
-    .where(eq(knowledgeNodes.id, nodeId))
-    .limit(1);
-
-  if (!row || row.workspace.ownerUserId !== user.id) return null;
-
-  if (row.node.projectId) {
-    const access =
-      mode === "write"
-        ? await ensureProjectWritable(row.node.projectId, user)
-        : await ensureProjectReadable(row.node.projectId, user);
-    if (!access) return null;
-  }
-
-  return row;
+  const access = await getDocsNodeAccess(nodeId, user);
+  if (!access) return null;
+  if (mode === "write" && access.permission === "read") return null;
+  return { node: access.node, workspace: access.workspace };
 }
 
 export async function requireDocsSupertag(
   supertagId: string,
-  workspaceId: string,
+  docsLibraryId: string,
 ) {
   const [tag] = await db
     .select()
@@ -1078,21 +1866,21 @@ export async function requireDocsSupertag(
     .where(
       and(
         eq(knowledgeSupertags.id, supertagId),
-        eq(knowledgeSupertags.workspaceId, workspaceId),
+        eq(knowledgeSupertags.docsLibraryId, docsLibraryId),
       ),
     )
     .limit(1);
   return tag ?? null;
 }
 
-export async function requireDocsField(fieldId: string, workspaceId: string) {
+export async function requireDocsField(fieldId: string, docsLibraryId: string) {
   const [field] = await db
     .select()
     .from(knowledgeFields)
     .where(
       and(
         eq(knowledgeFields.id, fieldId),
-        eq(knowledgeFields.workspaceId, workspaceId),
+        eq(knowledgeFields.docsLibraryId, docsLibraryId),
       ),
     )
     .limit(1);
@@ -1100,47 +1888,164 @@ export async function requireDocsField(fieldId: string, workspaceId: string) {
 }
 
 export async function getKnowledgeNodeChildMetadata(
-  workspaceId: string,
+  docsLibraryId: string,
   nodeIds: string[],
-  accessibleProjectIds: string[],
+  accessibleProjectIds: string[] | null,
   includeArchived = false,
+  user?: SessionUser,
+  accessMap?: DocsNodeAccessMap,
 ) {
   if (nodeIds.length === 0) {
     return { hasChildrenIds: [], loadedChildrenParentIds: [] };
   }
-  const accessibleNodeCondition = accessibleProjectIds.length > 0
-    ? or(isNull(knowledgeNodes.projectId), inArray(knowledgeNodes.projectId, accessibleProjectIds))
-    : isNull(knowledgeNodes.projectId);
+  // When an actor is available, defer project/share decisions to the same
+  // per-node ACL resolver used by the node routes.  A broad candidate query is
+  // required for an explicitly shared personal subtree that carries a stale
+  // or otherwise inaccessible project_id.
+  const accessibleNodeCondition = user
+    ? undefined
+    : accessibleProjectIds === null
+    ? undefined
+    : accessibleProjectIds.length > 0
+      ? or(isNull(knowledgeNodes.projectId), inArray(knowledgeNodes.projectId, accessibleProjectIds))
+      : isNull(knowledgeNodes.projectId);
+  const nodeVisibleOrBridge = sql<boolean>`(
+    regexp_replace(trim(${knowledgeNodes.title}), '[[:space:]]+', '', 'g') <> ''
+    OR EXISTS (
+      WITH RECURSIVE blank_descendants AS (
+        SELECT
+          id,
+          parent_id,
+          title,
+          archived_at,
+          docs_library_id,
+          ARRAY[id]::uuid[] AS visited_path,
+          0 AS depth
+        FROM knowledge_nodes
+        WHERE parent_id = ${knowledgeNodes.id}
+          AND docs_library_id = ${docsLibraryId}
+        UNION ALL
+        SELECT
+          child.id,
+          child.parent_id,
+          child.title,
+          child.archived_at,
+          child.docs_library_id,
+          ancestor.visited_path || ARRAY[child.id]::uuid[],
+          ancestor.depth + 1
+        FROM knowledge_nodes AS child
+        INNER JOIN blank_descendants AS ancestor ON child.parent_id = ancestor.id
+        WHERE child.docs_library_id = ${docsLibraryId}
+          AND ancestor.depth < 512
+          AND NOT child.id = ANY(ancestor.visited_path)
+      )
+      SELECT 1 FROM blank_descendants
+      WHERE archived_at IS NULL
+        AND regexp_replace(trim(title), '[[:space:]]+', '', 'g') <> ''
+    )
+  )`;
+  const notLegacyEmailBlank = sql<boolean>`NOT (
+    ${knowledgeNodes.title} = '（空行）'
+    AND EXISTS (
+      WITH RECURSIVE email_ancestors AS (
+        SELECT
+          id,
+          parent_id,
+          system_key,
+          docs_library_id,
+          ARRAY[id]::uuid[] AS visited_path,
+          0 AS depth
+        FROM knowledge_nodes
+        WHERE id = ${knowledgeNodes.id}
+          AND docs_library_id = ${docsLibraryId}
+        UNION ALL
+        SELECT
+          parent.id,
+          parent.parent_id,
+          parent.system_key,
+          parent.docs_library_id,
+          child.visited_path || ARRAY[parent.id]::uuid[],
+          child.depth + 1
+        FROM knowledge_nodes AS parent
+        INNER JOIN email_ancestors AS child ON parent.id = child.parent_id
+        WHERE parent.docs_library_id = ${docsLibraryId}
+          AND child.depth < 512
+          AND NOT parent.id = ANY(child.visited_path)
+      )
+      SELECT 1 FROM email_ancestors WHERE system_key LIKE 'project_mail:%'
+    )
+  )`;
   const [childRows, placementRows] = await Promise.all([
     db
-      .select({ parentId: knowledgeNodes.parentId })
+      .select({ id: knowledgeNodes.id, parentId: knowledgeNodes.parentId })
       .from(knowledgeNodes)
       .where(
         and(
-          eq(knowledgeNodes.workspaceId, workspaceId),
+          eq(knowledgeNodes.docsLibraryId, docsLibraryId),
           inArray(knowledgeNodes.parentId, nodeIds),
+          nodeVisibleOrBridge,
+          notLegacyEmailBlank,
           includeArchived ? undefined : isNull(knowledgeNodes.archivedAt),
           accessibleNodeCondition,
         ),
       ),
     db
-      .select({ parentId: knowledgeNodePlacements.parentNodeId })
+      .select({ nodeId: knowledgeNodePlacements.nodeId, parentId: knowledgeNodePlacements.parentNodeId })
       .from(knowledgeNodePlacements)
       .innerJoin(knowledgeNodes, eq(knowledgeNodePlacements.nodeId, knowledgeNodes.id))
       .where(
         and(
           inArray(knowledgeNodePlacements.parentNodeId, nodeIds),
-          eq(knowledgeNodes.workspaceId, workspaceId),
+          eq(knowledgeNodes.docsLibraryId, docsLibraryId),
+          nodeVisibleOrBridge,
+          notLegacyEmailBlank,
           includeArchived ? undefined : isNull(knowledgeNodes.archivedAt),
           accessibleNodeCondition,
         ),
       ),
   ]);
+  let visibleChildIds: Set<string> | null = null;
+  if (user) {
+    const candidateChildIds = Array.from(
+      new Set([
+        ...childRows.map((row) => row.id),
+        ...placementRows.map((row) => row.nodeId),
+      ]),
+    );
+    const candidateAccessMap = accessMap ?? new Map<string, DocsNodeAccess>();
+    const missingIds = candidateChildIds.filter((id) => !candidateAccessMap.has(id));
+    // Resolve all missing children in one bounded batch.  The batch resolver
+    // no longer scans an entire Personal Library; it evaluates owner/project
+    // candidates locally and fetches only hub children/ancestor closure rows.
+    const fetchedAccessMap = missingIds.length
+      ? await getDocsNodeAccessMap(missingIds, user)
+      : new Map<string, DocsNodeAccess>();
+    visibleChildIds = new Set(
+      candidateChildIds.filter(
+        (id) => candidateAccessMap.has(id) || fetchedAccessMap.has(id),
+      ),
+    );
+  }
+  const childCountByParent: Record<string, number> = {};
+  for (const row of childRows) {
+    if (!row.parentId || (visibleChildIds && !visibleChildIds.has(row.id))) continue;
+    childCountByParent[row.parentId] = (childCountByParent[row.parentId] ?? 0) + 1;
+  }
+  for (const row of placementRows) {
+    if (!row.parentId || (visibleChildIds && !visibleChildIds.has(row.nodeId))) continue;
+    childCountByParent[row.parentId] = (childCountByParent[row.parentId] ?? 0) + 1;
+  }
   return {
     hasChildrenIds: Array.from(new Set([
-      ...childRows.map((row) => row.parentId).filter((id): id is string => Boolean(id)),
-      ...placementRows.map((row) => row.parentId),
+      ...childRows
+        .filter((row) => !visibleChildIds || visibleChildIds.has(row.id))
+        .map((row) => row.parentId)
+        .filter((id): id is string => Boolean(id)),
+      ...placementRows
+        .filter((row) => !visibleChildIds || visibleChildIds.has(row.nodeId))
+        .map((row) => row.parentId),
     ])),
+    childCountByParent,
     loadedChildrenParentIds: [],
   };
 }
@@ -1153,7 +2058,6 @@ export function serializeNodeWithoutBody(row: typeof knowledgeNodes.$inferSelect
   return serializeNodeWithOptions(row, { includeBody: false });
 }
 
-const DOCS_ARCHIVE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const docsArchiveLastPurgedAt = new Map<string, number>();
 const docsArchivePurgeInFlight = new Map<string, Promise<number>>();
 
@@ -1161,41 +2065,163 @@ const docsArchivePurgeInFlight = new Map<string, Promise<number>>();
  * Docsを開いた時に最大1日1回、30日を過ぎたアーカイブだけを物理削除する。
  * activeまたは保存期間内の子孫を持つ親はcascade対象にせず、データ欠損を防ぐ。
  */
-export async function purgeExpiredDocsArchive(workspaceId: string, now = new Date()) {
-  const lastRun = docsArchiveLastPurgedAt.get(workspaceId) ?? 0;
+export async function purgeExpiredDocsArchive(docsLibraryId: string, now = new Date()) {
+  const lastRun = docsArchiveLastPurgedAt.get(docsLibraryId) ?? 0;
   if (now.getTime() - lastRun < 24 * 60 * 60 * 1000) return 0;
-  const existingRun = docsArchivePurgeInFlight.get(workspaceId);
+  const existingRun = docsArchivePurgeInFlight.get(docsLibraryId);
   if (existingRun) return existingRun;
   const run = (async () => {
-    const cutoff = new Date(now.getTime() - DOCS_ARCHIVE_RETENTION_MS);
+    const retentionDays = readDeletionRetentionDays();
+    const cutoff = new Date(
+      now.getTime() - retentionDays * 24 * 60 * 60 * 1000,
+    );
     const cutoffIso = cutoff.toISOString();
     const rows = await db.execute(sql`
     with recursive purgeable as (
       select n.id
       from knowledge_nodes n
-      where n.workspace_id = ${workspaceId}
+      where n.docs_library_id = ${docsLibraryId}
         and n.archived_at < ${cutoffIso}
         and not exists (
           with recursive descendants as (
-            select child.id, child.archived_at
+            select
+              child.id,
+              child.archived_at,
+              child.docs_library_id,
+              array[child.id]::uuid[] as visited_path,
+              0 as depth
+            from knowledge_nodes child
+            where child.parent_id = n.id
+              and child.docs_library_id = ${docsLibraryId}
+            union all
+            select
+              child.id,
+              child.archived_at,
+              child.docs_library_id,
+              parent.visited_path || array[child.id]::uuid[],
+              parent.depth + 1
+            from knowledge_nodes child
+            join descendants parent on child.parent_id = parent.id
+            where child.docs_library_id = ${docsLibraryId}
+              and parent.depth < 512
+              and not child.id = any(parent.visited_path)
+          )
+         select 1 from descendants
+         where archived_at is null or archived_at >= ${cutoffIso}
+       )
+        -- Never let a same-library purge cascade into a foreign child.
+        -- Traverse every descendant library with a visited path; a malformed
+        -- cross-library edge blocks the candidate root entirely.
+        and not exists (
+          with recursive all_descendants as (
+            select
+              child.id,
+              child.docs_library_id,
+              array[child.id]::uuid[] as visited_path,
+              0 as depth
             from knowledge_nodes child
             where child.parent_id = n.id
             union all
-            select child.id, child.archived_at
+            select
+              child.id,
+              child.docs_library_id,
+              parent.visited_path || array[child.id]::uuid[],
+              parent.depth + 1
             from knowledge_nodes child
-            join descendants parent on child.parent_id = parent.id
+            join all_descendants parent on child.parent_id = parent.id
+            where parent.depth < 512
+              and not child.id = any(parent.visited_path)
           )
-          select 1 from descendants
-          where archived_at is null or archived_at >= ${cutoffIso}
+          select 1 from all_descendants
+          where docs_library_id <> ${docsLibraryId}
+             or depth >= 512
         )
-    ), deleted as (
-      delete from knowledge_nodes n
-      using purgeable p
-      where n.id = p.id
-      returning n.id
-    )
-    select count(*)::int as count from deleted
-    `) as Array<{ count: number }>;
+   )
+    select id::text as id
+    from purgeable
+    `) as Array<{ id?: string | null }>;
+    const deletedIds = rows
+      .map((row) => row.id)
+      .filter((value): value is string => typeof value === "string");
+    let purgedIds: string[] = [];
+    if (deletedIds.length > 0) {
+      await db.transaction(async (tx) => {
+        // Recheck and lock the candidate rows inside the same transaction as
+        // the audit insert/delete. A concurrent restore therefore removes the
+        // row from this set instead of being audited and then deleted.
+        const lockedRows = await tx
+          .select({ id: knowledgeNodes.id, parentId: knowledgeNodes.parentId })
+          .from(knowledgeNodes)
+          .where(
+            and(
+              inArray(knowledgeNodes.id, deletedIds),
+              lt(knowledgeNodes.archivedAt, cutoff),
+            ),
+          )
+          .for("update");
+        const candidateIds = new Set(lockedRows.map((row) => row.id));
+        const parentById = new Map<string, string | null>(
+          lockedRows.map((row) => [row.id, row.parentId]),
+        );
+        const blocked = new Set<string>();
+        let frontier = lockedRows.map((row) => row.id);
+        // Lock and inspect the full descendant closure. A restored or
+        // foreign-library child must block its candidate ancestor; otherwise
+        // deleting the parent would cascade into the child after the child
+        // transaction appeared to restore successfully.
+        for (let depth = 0; depth < 512 && frontier.length > 0; depth += 1) {
+          const descendants = await tx
+            .select({
+              id: knowledgeNodes.id,
+              parentId: knowledgeNodes.parentId,
+              archivedAt: knowledgeNodes.archivedAt,
+              docsLibraryId: knowledgeNodes.docsLibraryId,
+            })
+            .from(knowledgeNodes)
+            .where(inArray(knowledgeNodes.parentId, frontier))
+            .for("update");
+          if (descendants.length === 0) break;
+          const next: string[] = [];
+          for (const child of descendants) {
+            parentById.set(child.id, child.parentId);
+            const unsafe =
+              child.docsLibraryId !== docsLibraryId ||
+              child.archivedAt === null ||
+              child.archivedAt >= cutoff;
+            if (unsafe) {
+              let ancestor = child.parentId;
+              while (ancestor && candidateIds.has(ancestor)) {
+                blocked.add(ancestor);
+                ancestor = parentById.get(ancestor) ?? null;
+              }
+            }
+            next.push(child.id);
+          }
+          frontier = next;
+        }
+        purgedIds = lockedRows
+          .map((row) => row.id)
+          .filter((id) => !blocked.has(id));
+        if (purgedIds.length === 0) return;
+
+        if (typeof tx.insert === "function") {
+          const batchId = createDeletionBatchId();
+          for (const nodeId of purgedIds) {
+            await appendContentDeletionEvent(tx, {
+              batchId,
+              entityType: "docs_node",
+              entityId: nodeId,
+              rootEntityId: nodeId,
+              action: "purged",
+              source: "web.docs.archive_cleanup",
+              eventAt: now,
+              metadata: { retention_days: retentionDays },
+            });
+          }
+        }
+        await tx.delete(knowledgeNodes).where(inArray(knowledgeNodes.id, purgedIds));
+      });
+    }
     const cwd = resolve(process.cwd());
     const repoRoot = basename(cwd).toLowerCase() === "frontend" ? resolve(cwd, "..") : cwd;
     const runRoot = resolve(repoRoot, "artifacts", "foam_curation", "phase3_source_v1", "semantic_overlay_runs");
@@ -1212,14 +2238,14 @@ export async function purgeExpiredDocsArchive(workspaceId: string, now = new Dat
         }
       }
     }
-    docsArchiveLastPurgedAt.set(workspaceId, now.getTime());
-    return Number(rows[0]?.count ?? 0);
+    docsArchiveLastPurgedAt.set(docsLibraryId, now.getTime());
+    return purgedIds.length;
   })();
-  docsArchivePurgeInFlight.set(workspaceId, run);
+  docsArchivePurgeInFlight.set(docsLibraryId, run);
   try {
     return await run;
   } finally {
-    if (docsArchivePurgeInFlight.get(workspaceId) === run) docsArchivePurgeInFlight.delete(workspaceId);
+    if (docsArchivePurgeInFlight.get(docsLibraryId) === run) docsArchivePurgeInFlight.delete(docsLibraryId);
   }
 }
 
@@ -1227,20 +2253,69 @@ export async function listDocsState(
   user: SessionUser,
   filters: {
     search?: string | null;
-    projectId?: string | null;
     supertagId?: string | null;
     includeArchived?: boolean;
   } = {},
 ) {
+  // Generic Docs bootstrap always starts from the actor's Personal Docs
+  // Library. Project information is a real child under its 案件情報 hub;
+  // project selection belongs to the project-information route, not a hidden
+  // library selected by this generic state loader.
   const workspace = await ensureDocsWorkspace(user);
+  if (!workspace) return null;
   await purgeExpiredDocsArchive(workspace.id);
   const projectsForUser = await getUserProjects(user.id);
   const accessibleProjectIds = projectsForUser.map((project) => project.id);
+  // Include the actor's personal library, explicit personal shares, and all
+  // owner-personal/legacy project libraries for projects readable by the
+  // actor. Final node ACL checks below decide which candidates are visible.
+  const personalWorkspace = workspace;
+  const sharedWorkspaceRows = await db
+    .select({ docsLibraryId: knowledgeNodes.docsLibraryId })
+    .from(knowledgeNodeShares)
+    .innerJoin(knowledgeNodes, eq(knowledgeNodeShares.nodeId, knowledgeNodes.id))
+    .innerJoin(docsLibraries, eq(knowledgeNodes.docsLibraryId, docsLibraries.id))
+    .where(
+      and(
+        eq(knowledgeNodeShares.userId, user.id),
+        eq(docsLibraries.libraryType, "personal"),
+      ),
+    );
+  const workspaceIds = await getDocsLibraryIdsForReadableProjects(user.id, [
+    workspace.id,
+    personalWorkspace?.id,
+    ...sharedWorkspaceRows.map((row) => row.docsLibraryId),
+  ].filter((value): value is string => Boolean(value)));
 
-  if (filters.projectId) {
-    const access = await ensureProjectReadable(filters.projectId, user);
-    if (!access) return null;
-  }
+  const emptyState = async () => {
+    // The requested canonical workspace is itself ACL-checked above.  It is
+    // the only safe fallback when a filter yields no visible node; shared
+    // personal workspaces are never included unless a visible node originates
+    // there.
+    const definitions = await getDocsWorkspaceDefinitions(
+      workspace.ownerUserId === user.id ? [workspace.id] : [],
+    );
+    return {
+      workspace,
+      nodes: [],
+      hasChildrenIds: [],
+      childCountByParent: {},
+      loadedChildrenParentIds: [],
+      supertags: definitions.supertags,
+      nodeSupertags: [],
+      supertagFields: definitions.supertagFields,
+      placements: [],
+      fields: definitions.fields,
+      fieldValues: [],
+      views: definitions.views,
+      suggestions: [],
+      importJobs: [],
+      importItems: [],
+      attachments: [],
+      edges: [],
+      projects: projectsForUser,
+    };
+  };
 
   const tagNodeIds =
     filters.supertagId && filters.supertagId !== "all"
@@ -1254,7 +2329,7 @@ export async function listDocsState(
             )
             .where(
               and(
-                eq(knowledgeSupertags.workspaceId, workspace.id),
+                inArray(knowledgeSupertags.docsLibraryId, workspaceIds),
                 eq(knowledgeNodeSupertags.supertagId, filters.supertagId),
               ),
             )
@@ -1262,38 +2337,86 @@ export async function listDocsState(
       : null;
 
   if (tagNodeIds && tagNodeIds.length === 0) {
-    return {
-      workspace,
-      nodes: [],
-      hasChildrenIds: [],
-      loadedChildrenParentIds: [],
-      supertags: await getWorkspaceSupertags(workspace.id),
-      nodeSupertags: [],
-      supertagFields: await getWorkspaceSupertagFields(workspace.id),
-      placements: [],
-      fields: await getWorkspaceFields(workspace.id),
-      fieldValues: [],
-      views: await getWorkspaceViews(workspace.id),
-      suggestions: [],
-      importJobs: [],
-      importItems: [],
-      attachments: [],
-      edges: [],
-      projects: projectsForUser,
-    };
+    return emptyState();
   }
 
   const search = filters.search?.trim();
+  // Bootstrap must retain a legacy blank root only when it bridges to a
+  // meaningful descendant; the client then hoists that descendant.
+  const nodeVisibleOrBridge = sql<boolean>`(
+    regexp_replace(trim(${knowledgeNodes.title}), '[[:space:]]+', '', 'g') <> ''
+    OR EXISTS (
+      WITH RECURSIVE blank_descendants AS (
+        SELECT
+          id,
+          parent_id,
+          title,
+          archived_at,
+          docs_library_id,
+          ARRAY[id]::uuid[] AS visited_path,
+          0 AS depth
+        FROM knowledge_nodes
+        WHERE parent_id = ${knowledgeNodes.id}
+          AND docs_library_id = ${workspace.id}
+        UNION ALL
+        SELECT
+          child.id,
+          child.parent_id,
+          child.title,
+          child.archived_at,
+          child.docs_library_id,
+          ancestor.visited_path || ARRAY[child.id]::uuid[],
+          ancestor.depth + 1
+        FROM knowledge_nodes AS child
+        INNER JOIN blank_descendants AS ancestor ON child.parent_id = ancestor.id
+        WHERE child.docs_library_id = ${workspace.id}
+          AND ancestor.depth < 512
+          AND NOT child.id = ANY(ancestor.visited_path)
+      )
+      SELECT 1 FROM blank_descendants
+      WHERE archived_at IS NULL
+        AND regexp_replace(trim(title), '[[:space:]]+', '', 'g') <> ''
+    )
+  )`;
   const nodeConditions = [
-    eq(knowledgeNodes.workspaceId, workspace.id),
-    // bootstrapはルートだけを返す。ページ配下は近傍APIで遅延ロードする。
+    inArray(knowledgeNodes.docsLibraryId, workspaceIds),
+    nodeVisibleOrBridge,
+    sql<boolean>`NOT (
+      ${knowledgeNodes.title} = '（空行）'
+      AND EXISTS (
+        WITH RECURSIVE email_ancestors AS (
+          SELECT
+            id,
+            parent_id,
+            system_key,
+            docs_library_id,
+            ARRAY[id]::uuid[] AS visited_path,
+            0 AS depth
+          FROM knowledge_nodes
+          WHERE id = ${knowledgeNodes.id}
+            AND docs_library_id = ${knowledgeNodes.docsLibraryId}
+          UNION ALL
+          SELECT
+            parent.id,
+            parent.parent_id,
+            parent.system_key,
+            parent.docs_library_id,
+            child.visited_path || ARRAY[parent.id]::uuid[],
+            child.depth + 1
+          FROM knowledge_nodes AS parent
+          INNER JOIN email_ancestors AS child ON parent.id = child.parent_id
+          WHERE parent.docs_library_id = ${knowledgeNodes.docsLibraryId}
+            AND child.depth < 512
+            AND NOT parent.id = ANY(child.visited_path)
+        )
+        SELECT 1 FROM email_ancestors WHERE system_key LIKE 'project_mail:%'
+      )
+    )`,
+    // Bootstrap returns only top-level roots. Project information roots are
+    // real children under the Personal 案件情報 hub and load through the
+    // children route.
     isNull(knowledgeNodes.parentId),
     filters.includeArchived ? undefined : isNull(knowledgeNodes.archivedAt),
-    filters.projectId
-      ? eq(knowledgeNodes.projectId, filters.projectId)
-      : accessibleProjectIds.length > 0
-        ? or(isNull(knowledgeNodes.projectId), inArray(knowledgeNodes.projectId, accessibleProjectIds))
-        : isNull(knowledgeNodes.projectId),
     tagNodeIds ? inArray(knowledgeNodes.id, tagNodeIds) : undefined,
   ].filter(Boolean);
 
@@ -1304,7 +2427,7 @@ export async function listDocsState(
       .from(knowledgeSearchIndex)
       .where(
         and(
-          eq(knowledgeSearchIndex.workspaceId, workspace.id),
+          inArray(knowledgeSearchIndex.docsLibraryId, workspaceIds),
           or(
             ilike(knowledgeSearchIndex.titleText, `%${search}%`),
             ilike(knowledgeSearchIndex.bodyTextPlain, `%${search}%`),
@@ -1314,62 +2437,78 @@ export async function listDocsState(
       .limit(300);
     searchNodeIds = rows.map((row) => row.nodeId);
     if (searchNodeIds.length === 0) {
-      return {
-        workspace,
-        nodes: [],
-        hasChildrenIds: [],
-        loadedChildrenParentIds: [],
-        supertags: await getWorkspaceSupertags(workspace.id),
-        nodeSupertags: [],
-        supertagFields: await getWorkspaceSupertagFields(workspace.id),
-        placements: [],
-        fields: await getWorkspaceFields(workspace.id),
-        fieldValues: [],
-        views: await getWorkspaceViews(workspace.id),
-        suggestions: [],
-        importJobs: [],
-        importItems: [],
-        attachments: [],
-        edges: [],
-        projects: projectsForUser,
-      };
+      return emptyState();
     }
   }
   if (searchNodeIds) nodeConditions.push(inArray(knowledgeNodes.id, searchNodeIds));
 
-  const nodes = await db
+  const candidateNodes = await db
     .select()
     .from(knowledgeNodes)
     .where(and(...nodeConditions))
     .orderBy(asc(knowledgeNodes.sortOrder), desc(knowledgeNodes.updatedAt))
     .limit(1000);
+  const nodeAccessMap = await getDocsNodeAccessMap(
+    candidateNodes.map((node) => node.id),
+    user,
+    { includeArchived: filters.includeArchived === true },
+  );
+  const nodes = candidateNodes.filter((node) => nodeAccessMap.has(node.id));
   const nodeIds = nodes.map((node) => node.id);
-  const childMetadata = await getKnowledgeNodeChildMetadata(
-    workspace.id,
-    nodeIds,
-    accessibleProjectIds,
-    filters.includeArchived,
+  if (nodes.length === 0 && workspace.ownerUserId !== user.id) {
+    return emptyState();
+  }
+  const originWorkspaceIds = nodes.length > 0
+    ? Array.from(new Set(nodes.map((node) => node.docsLibraryId)))
+    : [workspace.id];
+  const childMetadataByWorkspace = await Promise.all(
+    workspaceIds.map((docsLibraryId) => {
+      const workspaceNodeIds = nodes
+        .filter((node) => node.docsLibraryId === docsLibraryId)
+        .map((node) => node.id);
+      return getKnowledgeNodeChildMetadata(
+        docsLibraryId,
+        workspaceNodeIds,
+        null,
+        filters.includeArchived,
+        user,
+        nodeAccessMap,
+      );
+    }),
+  );
+  const childMetadata = childMetadataByWorkspace.reduce(
+    (result, current) => {
+      for (const id of current.hasChildrenIds) {
+        if (!result.hasChildrenIds.includes(id)) result.hasChildrenIds.push(id);
+      }
+      Object.assign(result.childCountByParent, current.childCountByParent);
+      return result;
+    },
+    {
+      hasChildrenIds: [] as string[],
+      childCountByParent: {} as Record<string, number>,
+      loadedChildrenParentIds: [] as string[],
+    },
   );
 
-  const [
-    supertags,
-    supertagFields,
-    fields,
-    views,
-    suggestions,
-    importJobs,
-    edges,
-  ] = await Promise.all([
-    getWorkspaceSupertags(workspace.id),
-    getWorkspaceSupertagFields(workspace.id),
-    getWorkspaceFields(workspace.id),
-    getWorkspaceViews(workspace.id),
+  const definitions = await getDocsWorkspaceDefinitions(originWorkspaceIds);
+  const definitionLibraries = await db
+    .select({ id: docsLibraries.id, ownerUserId: docsLibraries.ownerUserId })
+    .from(docsLibraries)
+    .where(inArray(docsLibraries.id, originWorkspaceIds));
+  const ownerByLibraryId = new Map(
+    definitionLibraries.map((library) => [library.id, library.ownerUserId]),
+  );
+  const ownerLibraryIds = new Set(
+    originWorkspaceIds.filter((docsLibraryId) => ownerByLibraryId.get(docsLibraryId) === user.id),
+  );
+  const [suggestions, importJobs, edges] = await Promise.all([
     db
       .select()
       .from(knowledgeAiSuggestions)
       .where(
         and(
-          eq(knowledgeAiSuggestions.workspaceId, workspace.id),
+          inArray(knowledgeAiSuggestions.docsLibraryId, originWorkspaceIds),
           nodeIds.length > 0
             ? or(isNull(knowledgeAiSuggestions.nodeId), inArray(knowledgeAiSuggestions.nodeId, nodeIds))
             : isNull(knowledgeAiSuggestions.nodeId),
@@ -1382,10 +2521,17 @@ export async function listDocsState(
       .from(knowledgeImportJobs)
       .where(
         and(
-          eq(knowledgeImportJobs.workspaceId, workspace.id),
-          accessibleProjectIds.length > 0
-            ? or(isNull(knowledgeImportJobs.projectId), inArray(knowledgeImportJobs.projectId, accessibleProjectIds))
-            : isNull(knowledgeImportJobs.projectId),
+          inArray(knowledgeImportJobs.docsLibraryId, originWorkspaceIds),
+          ownerLibraryIds.size > 0
+            ? accessibleProjectIds.length > 0
+              ? or(isNull(knowledgeImportJobs.projectId), inArray(knowledgeImportJobs.projectId, accessibleProjectIds))
+              : isNull(knowledgeImportJobs.projectId)
+            : accessibleProjectIds.length > 0
+              ? and(
+                  sql<boolean>`${knowledgeImportJobs.projectId} is not null`,
+                  inArray(knowledgeImportJobs.projectId, accessibleProjectIds),
+                )
+              : sql<boolean>`false`,
         ),
       )
       .orderBy(desc(knowledgeImportJobs.createdAt))
@@ -1403,7 +2549,6 @@ export async function listDocsState(
           .limit(200)
       : Promise.resolve([]),
   ]);
-
   const [nodeSupertags, storedFieldValues, attachments] = nodeIds.length
     ? await Promise.all([
         db
@@ -1420,10 +2565,65 @@ export async function listDocsState(
           .where(inArray(knowledgeAttachments.nodeId, nodeIds)),
       ])
     : [[], [], []];
+  const nodeWorkspaceById = new Map(nodes.map((node) => [node.id, node.docsLibraryId]));
+  const attachedSupertagIds = new Set(nodeSupertags.map((relation) => relation.supertagId));
+  const attachedFieldIds = new Set(storedFieldValues.map((value) => value.fieldId));
+  // Non-owner/shared libraries may contribute only definitions that are
+  // actually attached to a visible node (plus the canonical project/task
+  // supertags needed to render an authorized project shell).  Owners retain
+  // the complete definition catalog for their own library.
+  const supertags = definitions.supertags.filter(
+    (tag) =>
+      ownerLibraryIds.has(tag.docsLibraryId) ||
+      attachedSupertagIds.has(tag.id) ||
+      (tag.systemKey === "project_info" && nodes.some((node) => node.docsLibraryId === tag.docsLibraryId && node.projectId)),
+  );
+  const supertagWorkspaceById = new Map(supertags.map((tag) => [tag.id, tag.docsLibraryId]));
+  const fieldIdsFromAttachedTags = new Set(
+    definitions.supertagFields
+      .filter((relation) => supertagWorkspaceById.has(relation.supertagId))
+      .map((relation) => relation.fieldId),
+  );
+  const fields = definitions.fields.filter(
+    (field) =>
+      ownerLibraryIds.has(field.docsLibraryId) ||
+      attachedFieldIds.has(field.id) ||
+      fieldIdsFromAttachedTags.has(field.id),
+  );
+  const fieldById = new Map(fields.map((field) => [field.id, field]));
+  const supertagFields = definitions.supertagFields.filter(
+    (relation) =>
+      supertagWorkspaceById.has(relation.supertagId) &&
+      fieldById.has(relation.fieldId),
+  );
+  const views = definitions.views.filter(
+    (view) =>
+      ownerLibraryIds.has(view.docsLibraryId) ||
+      (view.supertagId !== null && supertagWorkspaceById.has(view.supertagId)),
+  );
+  const validNodeSupertags = nodeSupertags.filter(
+    (relation) =>
+      nodeWorkspaceById.get(relation.nodeId) !== undefined &&
+      supertagWorkspaceById.get(relation.supertagId) === nodeWorkspaceById.get(relation.nodeId),
+  );
+  const validStoredFieldValues = storedFieldValues.filter((value) => {
+    const nodeWorkspaceId = nodeWorkspaceById.get(value.nodeId);
+    const field = fieldById.get(value.fieldId);
+    if (!nodeWorkspaceId || !field || field.docsLibraryId !== nodeWorkspaceId) return false;
+    if (!value.targetNodeId) return true;
+    return nodeWorkspaceById.get(value.targetNodeId) === nodeWorkspaceId;
+  });
   const taskFieldValues = nodeIds.length
-    ? await listDocsTaskSyntheticFieldValues({ nodeIds, fields })
+    ? await listDocsTaskSyntheticFieldValues({ nodeIds, fields, user })
     : [];
-  const fieldValues = [...storedFieldValues, ...taskFieldValues];
+  const validTaskFieldValues = taskFieldValues.filter((value) => {
+    const nodeWorkspaceId = nodeWorkspaceById.get(value.nodeId);
+    const field = fieldById.get(value.fieldId);
+    if (!nodeWorkspaceId || !field || field.docsLibraryId !== nodeWorkspaceId) return false;
+    if (!value.targetNodeId) return true;
+    return nodeWorkspaceById.get(value.targetNodeId) === nodeWorkspaceId;
+  });
+  const fieldValues = [...validStoredFieldValues, ...validTaskFieldValues];
 
   const placements = nodeIds.length
     ? await db
@@ -1436,9 +2636,35 @@ export async function listDocsState(
           ),
         )
     : [];
+  const validPlacements = placements.filter(
+    (placement) =>
+      nodeWorkspaceById.get(placement.nodeId) !== undefined &&
+      nodeWorkspaceById.get(placement.parentNodeId) === nodeWorkspaceById.get(placement.nodeId),
+  );
+
+  const validEdges = edges.filter(
+    (edge) =>
+      nodeWorkspaceById.get(edge.sourceNodeId) !== undefined &&
+      nodeWorkspaceById.get(edge.targetNodeId) === nodeWorkspaceById.get(edge.sourceNodeId),
+  );
+
+  const visibleSuggestionRows = suggestions.filter(
+    (suggestion) =>
+      suggestion.nodeId !== null
+        ? nodeIds.includes(suggestion.nodeId) &&
+          nodeWorkspaceById.get(suggestion.nodeId) === suggestion.docsLibraryId
+        : ownerLibraryIds.has(suggestion.docsLibraryId),
+  );
+  const visibleImportJobs = importJobs.filter((job) => {
+    if (ownerLibraryIds.has(job.docsLibraryId)) return true;
+    if (!job.projectId || !accessibleProjectIds.includes(job.projectId)) return false;
+    return nodes.some(
+      (node) => node.docsLibraryId === job.docsLibraryId && node.projectId === job.projectId,
+    );
+  });
 
   const importItems =
-    importJobs.length > 0
+    visibleImportJobs.length > 0
       ? await db
           .select()
           .from(knowledgeImportItems)
@@ -1446,7 +2672,7 @@ export async function listDocsState(
             and(
               inArray(
                 knowledgeImportItems.jobId,
-                importJobs.map((job) => job.id),
+                visibleImportJobs.map((job) => job.id),
               ),
               nodeIds.length > 0
                 ? or(isNull(knowledgeImportItems.nodeId), inArray(knowledgeImportItems.nodeId, nodeIds))
@@ -1454,70 +2680,275 @@ export async function listDocsState(
             ),
           )
       : [];
+  const visibleImportItems = importItems.filter((item) => {
+    const job = visibleImportJobs.find((candidate) => candidate.id === item.jobId);
+    if (!job) return false;
+    if (!item.nodeId) return ownerLibraryIds.has(job.docsLibraryId);
+    return nodeIds.includes(item.nodeId) && nodeWorkspaceById.get(item.nodeId) === job.docsLibraryId;
+  });
 
   return {
     workspace,
     nodes,
     ...childMetadata,
     supertags,
-    nodeSupertags,
+    nodeSupertags: validNodeSupertags,
     supertagFields,
-    placements,
+    placements: validPlacements,
     fields,
     fieldValues,
     views,
-    suggestions,
-    importJobs,
-    importItems,
+    suggestions: visibleSuggestionRows,
+    importJobs: visibleImportJobs,
+    importItems: visibleImportItems,
     attachments,
-    edges,
+    edges: validEdges,
     projects: projectsForUser,
   };
 }
 
-async function getWorkspaceSupertags(workspaceId: string) {
-  return await db
-    .select()
-    .from(knowledgeSupertags)
-    .where(eq(knowledgeSupertags.workspaceId, workspaceId))
-    .orderBy(asc(knowledgeSupertags.name));
+type DocsListState = NonNullable<Awaited<ReturnType<typeof listDocsState>>>;
+
+/**
+ * Remove every node-derived payload row that is no longer covered by the
+ * request's surviving ACL map.  This is intentionally applied at the route
+ * boundary as well as in listDocsState: a share can be revoked between the
+ * candidate query and serialization.
+ */
+export function filterDocsStateToVisibleNodes(
+  state: DocsListState,
+  visibleNodeIds: ReadonlySet<string>,
+  visibleWorkspaceIds: ReadonlySet<string>,
+): DocsListState {
+  const nodes = state.nodes.filter((node) => visibleNodeIds.has(node.id));
+  const visibleSupertags = state.supertags.filter((tag) => visibleWorkspaceIds.has(tag.docsLibraryId));
+  const supertagIds = new Set(visibleSupertags.map((tag) => tag.id));
+  const visibleFields = state.fields.filter((field) => visibleWorkspaceIds.has(field.docsLibraryId));
+  const fieldIds = new Set(visibleFields.map((field) => field.id));
+  const nodeWorkspaceById = new Map(nodes.map((node) => [node.id, node.docsLibraryId]));
+  const supertagWorkspaceById = new Map(
+    visibleSupertags.map((tag) => [tag.id, tag.docsLibraryId]),
+  );
+  const fieldWorkspaceById = new Map(
+    visibleFields.map((field) => [field.id, field.docsLibraryId]),
+  );
+  const visibleViews = state.views.filter(
+    (view) =>
+      visibleWorkspaceIds.has(view.docsLibraryId) &&
+      (!view.supertagId || supertagWorkspaceById.get(view.supertagId) === view.docsLibraryId),
+  );
+  const visibleProjectIds = new Set(
+    nodes
+      .map((node) => node.projectId)
+      .filter((projectId): projectId is string => Boolean(projectId)),
+  );
+  const visibleJobIds = new Set(
+    state.importJobs
+      .filter(
+        (job) =>
+          visibleWorkspaceIds.has(job.docsLibraryId) &&
+          (!job.projectId || visibleProjectIds.has(job.projectId)),
+      )
+      .map((job) => job.id),
+  );
+  const nodeSupertags = state.nodeSupertags.filter(
+    (relation) => {
+      const nodeWorkspaceId = nodeWorkspaceById.get(relation.nodeId);
+      return (
+        nodeWorkspaceId !== undefined &&
+        supertagIds.has(relation.supertagId) &&
+        supertagWorkspaceById.get(relation.supertagId) === nodeWorkspaceId
+      );
+    },
+  );
+  const supertagFields = state.supertagFields.filter(
+    (relation) => {
+      const supertagWorkspaceId = supertagWorkspaceById.get(relation.supertagId);
+      return (
+        supertagWorkspaceId !== undefined &&
+        supertagIds.has(relation.supertagId) &&
+        fieldIds.has(relation.fieldId) &&
+        fieldWorkspaceById.get(relation.fieldId) === supertagWorkspaceId
+      );
+    },
+  );
+  const fieldValues = state.fieldValues.filter(
+    (value) => {
+      const nodeWorkspaceId = nodeWorkspaceById.get(value.nodeId);
+      if (
+        nodeWorkspaceId === undefined ||
+        !fieldIds.has(value.fieldId) ||
+        fieldWorkspaceById.get(value.fieldId) !== nodeWorkspaceId
+      ) {
+        return false;
+      }
+      return (
+        !value.targetNodeId ||
+        nodeWorkspaceById.get(value.targetNodeId) === nodeWorkspaceId
+      );
+    },
+  );
+  const placements = state.placements.filter(
+    (placement) => {
+      const nodeWorkspaceId = nodeWorkspaceById.get(placement.nodeId);
+      return (
+        nodeWorkspaceId !== undefined &&
+        nodeWorkspaceById.get(placement.parentNodeId) === nodeWorkspaceId
+      );
+    },
+  );
+  const attachments = state.attachments.filter((attachment) => visibleNodeIds.has(attachment.nodeId));
+  const edges = state.edges.filter(
+    (edge) => {
+      const sourceWorkspaceId = nodeWorkspaceById.get(edge.sourceNodeId);
+      return (
+        sourceWorkspaceId !== undefined &&
+        nodeWorkspaceById.get(edge.targetNodeId) === sourceWorkspaceId
+      );
+    },
+  );
+  const suggestions = state.suggestions.filter(
+    (suggestion) => {
+      if (!visibleWorkspaceIds.has(suggestion.docsLibraryId)) return false;
+      if (!suggestion.nodeId) return true;
+      return nodeWorkspaceById.get(suggestion.nodeId) === suggestion.docsLibraryId;
+    },
+  );
+  const importJobs = state.importJobs.filter((job) => visibleJobIds.has(job.id));
+  const importJobWorkspaceById = new Map(importJobs.map((job) => [job.id, job.docsLibraryId]));
+  const importItems = state.importItems.filter(
+    (item) => {
+      const jobWorkspaceId = importJobWorkspaceById.get(item.jobId);
+      if (!jobWorkspaceId) return false;
+      if (!item.nodeId) return true;
+      return nodeWorkspaceById.get(item.nodeId) === jobWorkspaceId;
+    },
+  );
+
+  return {
+    ...state,
+    nodes,
+    hasChildrenIds: state.hasChildrenIds.filter((id) => visibleNodeIds.has(id)),
+    loadedChildrenParentIds: state.loadedChildrenParentIds.filter((id) => visibleNodeIds.has(id)),
+    supertags: visibleSupertags,
+    nodeSupertags,
+    supertagFields,
+    fields: visibleFields,
+    fieldValues,
+    views: visibleViews,
+    suggestions,
+    importJobs,
+    importItems,
+    placements,
+    attachments,
+    edges,
+  };
 }
 
-async function getWorkspaceFields(workspaceId: string) {
-  return await db
-    .select()
-    .from(knowledgeFields)
-    .where(eq(knowledgeFields.workspaceId, workspaceId))
-    .orderBy(asc(knowledgeFields.sortOrder), asc(knowledgeFields.name));
-}
+type DocsWorkspaceDefinitions = {
+  supertags: Array<typeof knowledgeSupertags.$inferSelect>;
+  fields: Array<typeof knowledgeFields.$inferSelect>;
+  supertagFields: Array<typeof knowledgeSupertagFields.$inferSelect>;
+  views: Array<typeof knowledgeSavedViews.$inferSelect>;
+};
 
-async function getWorkspaceSupertagFields(workspaceId: string) {
-  const rows = await db
-    .select({ relation: knowledgeSupertagFields })
-    .from(knowledgeSupertagFields)
-    .innerJoin(
-      knowledgeSupertags,
-      eq(knowledgeSupertagFields.supertagId, knowledgeSupertags.id),
+/**
+ * Load definitions for exactly the workspaces that contributed visible
+ * nodes.  A shared personal node must bring along its origin definitions, but
+ * no unrelated/revoked workspace metadata may be returned.
+ */
+export async function getDocsWorkspaceDefinitions(
+  workspaceIds: string[],
+): Promise<DocsWorkspaceDefinitions> {
+  const ids = Array.from(new Set(workspaceIds.filter(Boolean)));
+  if (ids.length === 0) {
+    return { supertags: [], fields: [], supertagFields: [], views: [] };
+  }
+
+  const [rawSupertags, rawFields, rawSupertagFields, rawViews] = await Promise.all([
+    db
+      .select()
+      .from(knowledgeSupertags)
+      .where(inArray(knowledgeSupertags.docsLibraryId, ids))
+      .orderBy(asc(knowledgeSupertags.name)),
+    db
+      .select()
+      .from(knowledgeFields)
+      .where(inArray(knowledgeFields.docsLibraryId, ids))
+      .orderBy(asc(knowledgeFields.sortOrder), asc(knowledgeFields.name)),
+    db
+      .select({ relation: knowledgeSupertagFields, supertagWorkspaceId: knowledgeSupertags.docsLibraryId })
+      .from(knowledgeSupertagFields)
+      .innerJoin(
+        knowledgeSupertags,
+        eq(knowledgeSupertagFields.supertagId, knowledgeSupertags.id),
+      )
+      .where(inArray(knowledgeSupertags.docsLibraryId, ids))
+      .orderBy(asc(knowledgeSupertagFields.sortOrder)),
+    db
+      .select()
+      .from(knowledgeSavedViews)
+      .where(inArray(knowledgeSavedViews.docsLibraryId, ids))
+      .orderBy(asc(knowledgeSavedViews.sortOrder), asc(knowledgeSavedViews.createdAt)),
+  ]);
+
+  const workspaceIdSet = new Set(ids);
+  const rawSupertagById = new Map(rawSupertags.map((tag) => [tag.id, tag]));
+  // Keep the definition itself, but sever a corrupt parent relation that
+  // points into another workspace rather than exposing that foreign ID.
+  const supertags = rawSupertags
+    .filter((tag) => workspaceIdSet.has(tag.docsLibraryId))
+    .map((tag) => {
+      if (!tag.parentSupertagId) return tag;
+      const parent = rawSupertagById.get(tag.parentSupertagId);
+      return parent && parent.docsLibraryId === tag.docsLibraryId
+        ? tag
+        : { ...tag, parentSupertagId: null };
+    });
+  const supertagById = new Map(supertags.map((tag) => [tag.id, tag]));
+
+  const fields = rawFields.filter(
+    (field) =>
+      workspaceIdSet.has(field.docsLibraryId) &&
+      supertagById.get(field.supertagId)?.docsLibraryId === field.docsLibraryId,
+  );
+  const fieldById = new Map(fields.map((field) => [field.id, field]));
+  const supertagFields = rawSupertagFields
+    .filter(
+      ({ relation, supertagWorkspaceId }) =>
+        supertagById.get(relation.supertagId)?.docsLibraryId === supertagWorkspaceId &&
+        fieldById.get(relation.fieldId)?.docsLibraryId === supertagWorkspaceId,
     )
-    .where(eq(knowledgeSupertags.workspaceId, workspaceId))
-    .orderBy(asc(knowledgeSupertagFields.sortOrder));
-  return rows.map((row) => row.relation);
+    .map(({ relation }) => relation);
+  const views = rawViews.filter(
+    (view) =>
+      workspaceIdSet.has(view.docsLibraryId) &&
+      (!view.supertagId || supertagById.get(view.supertagId)?.docsLibraryId === view.docsLibraryId),
+  );
+
+  return { supertags, fields, supertagFields, views };
 }
 
-export async function getWorkspaceViews(workspaceId: string) {
+export async function getWorkspaceViews(docsLibraryId: string) {
   return await db
     .select()
     .from(knowledgeSavedViews)
-    .where(eq(knowledgeSavedViews.workspaceId, workspaceId))
+    .where(eq(knowledgeSavedViews.docsLibraryId, docsLibraryId))
     .orderBy(asc(knowledgeSavedViews.sortOrder), asc(knowledgeSavedViews.createdAt));
 }
 
 export async function getUserProjects(userId: string) {
+  const readableProjectIds = await getReadableProjectIds(userId);
+  if (readableProjectIds.length === 0) return [];
   const rows = await db
     .select({ project: projects })
-    .from(projectMembers)
-    .innerJoin(projects, eq(projectMembers.projectId, projects.id))
-    .where(and(eq(projectMembers.userId, userId), isNull(projects.deletedAt)));
+    .from(projects)
+    .where(
+      and(
+        isNull(projects.deletedAt),
+        inArray(projects.id, readableProjectIds),
+      ),
+    );
   return rows.map(({ project }) => ({
     id: project.id,
     name: project.name,
@@ -1530,6 +2961,35 @@ export async function getUserProjects(userId: string) {
         ? ((project.projectMetadata as Record<string, unknown>).color as string)
         : null,
   }));
+}
+
+/**
+ * Return Docs Library IDs that may contain nodes for projects readable by an
+ * actor. Unified project information nodes live in the project owner's
+ * Personal Library. Callers must run the resulting node candidates through
+ * getDocsNodeAccess(Map) before serializing them.
+ */
+export async function getDocsLibraryIdsForReadableProjects(
+  userId: string,
+  seedIds: readonly string[] = [],
+) {
+  const ids = new Set(seedIds.filter(Boolean));
+  const readableProjectIds = await getReadableProjectIds(userId);
+  if (readableProjectIds.length === 0) return Array.from(ids);
+
+  const personalRows = await db
+    .select({ id: docsLibraries.id })
+    .from(docsLibraries)
+    .innerJoin(projects, eq(docsLibraries.ownerUserId, projects.ownerId))
+    .where(
+      and(
+        eq(docsLibraries.libraryType, "personal"),
+        isNull(projects.deletedAt),
+        inArray(projects.id, readableProjectIds),
+      ),
+    );
+  for (const row of personalRows) ids.add(row.id);
+  return Array.from(ids);
 }
 
 export async function appendKnowledgeRevision(
@@ -1556,31 +3016,62 @@ export async function appendKnowledgeRevision(
   });
 }
 
+type DocsSearchIndexNode = Pick<
+  typeof knowledgeNodes.$inferSelect,
+  "id" | "docsLibraryId" | "projectId" | "title"
+> &
+  Partial<Pick<typeof knowledgeNodes.$inferSelect, "bodyJson" | "bodyText">>;
+
+const EDITABLE_DOC_BLOCK_TYPES = new Set(["markdown", "code"]);
+
+/**
+ * Return the user-visible body used by the lexical Docs search index.
+ *
+ * Ordinary nodes continue to use their body_text/title mirror.  Typed
+ * markdown/code blocks are the exception: their independent, editable
+ * content is the searchable body while title remains the node label.
+ */
+export function effectiveDocsSearchBodyText(
+  node: Pick<DocsSearchIndexNode, "title" | "bodyJson" | "bodyText">,
+  fallbackBodyText = "",
+): string {
+  const body = decryptNodeBodyJson(node.bodyJson ?? {});
+  if (
+    body.format === "doc_block" &&
+    typeof body.block_type === "string" &&
+    EDITABLE_DOC_BLOCK_TYPES.has(body.block_type) &&
+    typeof body.content === "string"
+  ) {
+    return body.content;
+  }
+
+  const bodyText = decryptNodeBodyText(node.bodyText ?? "");
+  return bodyText || fallbackBodyText || node.title || "";
+}
+
 export async function upsertKnowledgeSearchIndex(
   client: DocsDb,
-  node: Pick<
-    typeof knowledgeNodes.$inferSelect,
-    "id" | "workspaceId" | "projectId" | "title"
-  >,
-  bodyTextPlain: string,
+  node: DocsSearchIndexNode,
+  bodyTextPlain = "",
 ) {
+  const effectiveBodyText = effectiveDocsSearchBodyText(node, bodyTextPlain);
   await client
     .insert(knowledgeSearchIndex)
     .values({
       nodeId: node.id,
-      workspaceId: node.workspaceId,
+      docsLibraryId: node.docsLibraryId,
       projectId: node.projectId,
       titleText: node.title ?? "",
-      bodyTextPlain,
+      bodyTextPlain: effectiveBodyText,
       updatedAt: new Date(),
     })
     .onConflictDoUpdate({
       target: knowledgeSearchIndex.nodeId,
       set: {
-        workspaceId: node.workspaceId,
+        docsLibraryId: node.docsLibraryId,
         projectId: node.projectId,
         titleText: node.title ?? "",
-        bodyTextPlain,
+        bodyTextPlain: effectiveBodyText,
         updatedAt: new Date(),
       },
     });

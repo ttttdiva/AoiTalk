@@ -1,5 +1,7 @@
 "use client";
 
+import { AppSelect } from "@/components/ui/app-select";
+
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Database,
@@ -10,6 +12,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
@@ -377,7 +380,7 @@ export function ProjectRecordsPanel({ projectId }: { projectId: string }) {
               </div>
               <div className="w-36 space-y-1">
                 <Label className="text-xs">型</Label>
-                <select
+                <AppSelect
                   value={newFieldType}
                   onChange={(event) => setNewFieldType(event.target.value)}
                   className="h-9 w-full rounded-md border bg-background px-2 text-sm"
@@ -387,7 +390,7 @@ export function ProjectRecordsPanel({ projectId }: { projectId: string }) {
                       {type.label}
                     </option>
                   ))}
-                </select>
+                </AppSelect>
               </div>
               <Button size="sm" onClick={addField} disabled={saving}>
                 {saving ? <Loader2 className="mr-1 size-3 animate-spin" /> : <Plus className="mr-1 size-3" />}
@@ -433,11 +436,10 @@ export function ProjectRecordsPanel({ projectId }: { projectId: string }) {
                         {fields.map((field) => (
                           <td key={field.id} className="border-b border-r p-1">
                             {field.fieldType === "checkbox" ? (
-                              <input
-                                type="checkbox"
+                              <Checkbox
                                 checked={values[field.key] === true}
-                                onChange={(event) =>
-                                  void updateCell(row, field, event.target.checked)
+                                onCheckedChange={(checked) =>
+                                  void updateCell(row, field, checked === true)
                                 }
                                 className="ml-2 size-4"
                               />

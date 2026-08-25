@@ -1,11 +1,14 @@
 "use client";
 
+import { AppSelect } from "@/components/ui/app-select";
+
 import {
   Fragment,
   createContext,
   useCallback,
   useContext,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -17,22 +20,25 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal, flushSync } from "react-dom";
-import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
-import { Compartment, EditorSelection, EditorState, Prec, RangeSetBuilder } from "@codemirror/state";
+import { defaultKeymap, history, historyKeymap, redo, redoDepth, undo, undoDepth } from "@codemirror/commands";
+import { Compartment, EditorSelection, EditorState, Prec, RangeSetBuilder, Transaction } from "@codemirror/state";
 import { Decoration, drawSelection, dropCursor, EditorView, keymap, ViewPlugin, WidgetType, type DecorationSet, type ViewUpdate } from "@codemirror/view";
-import { Check, CheckSquare, ChevronDown, ChevronRight, Copy, ExternalLink, FileText, GripVertical, ListFilter, LoaderCircle, MoreVertical, MoveRight, Plus, Tag, Trash2 } from "lucide-react";
+import { Check, CheckSquare, ChevronDown, ChevronRight, FileText, GripVertical, ListFilter, LoaderCircle, MoreVertical } from "lucide-react";
 import Image from "next/image";
 import { toast } from "sonner";
-import type { LucideIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { observeElementRect as observeVirtualElementRect, useVirtualizer } from "@tanstack/react-virtual";
-import {
-  MenuMnemonicButton,
-  MenuMnemonicSurface,
-} from "@/components/ui/menu-mnemonic";
+import { DocsNodeContextMenu } from "@/components/docs/docs-node-context-menu";
 import {
   blockJsonForKind,
   docsBlockKind,
+  docsTypedContentBodyJson,
+  docsTypedContentBlock,
+  docsTypedContentDisplayContent,
+  blankParagraphBodyJson,
+  clearBlankParagraphMarker,
+  hasMeaningfulBlockTitle,
+  isExplicitBlankParagraph,
   markdownShortcutPatchForTitle,
   markdownShortcutPrefixForTitle,
   parseIndentedMarkdownBlocks,
@@ -42,12 +48,14 @@ import {
   type MarkdownBlock,
 } from "@/lib/docs-block-model";
 import { renderDocsInlineHtml, docsRowBlockClass } from "@/lib/docs-block-render";
+import { createEditorImageInsertExtension } from "@/components/editor/image-insert-extension";
 import { selectNextOccurrenceKeymap } from "@/components/editor/code-mirror-shared";
 import { cn } from "@/lib/utils";
 import type { DocsAiSuggestion, DocsAttachment, DocsField, DocsFieldValue, DocsNode, DocsProject, DocsSupertag } from "@/components/docs/types";
 import { FieldControl } from "@/components/docs/field-control";
 import { DocsSupertagChip } from "@/components/docs/docs-supertag-chip";
 import { fieldValueToDraft } from "@/components/docs/docs-utils";
+import { MarkdownContent } from "@/components/ui/markdown-content";
 import type { Task } from "@/lib/task-api";
 
 export type OutlineEditorRow = {
@@ -75,6 +83,14 @@ export type BlockCreateInput = {
   title: string;
   kind?: DocsBlockKind;
   checked?: boolean;
+  /** Persist an intentional empty paragraph. Empty titles without this flag remain invalid. */
+  blank?: boolean;
+  /** Insert before the first sibling when afterNodeId is null. */
+  insertAtStart?: boolean;
+  focusOnCreate?: boolean;
+  // Optimistic creates report a later POST failure so editor-only rows can
+  // restore their text without delaying focus on the next row.
+  onPersistenceError?: (nodeId: string, error: unknown) => void;
 };
 
 export type BlockMoveInput = {
@@ -160,7 +176,7 @@ export function outlineDropMove(
 
 type FieldCommandState = {
   nodeId: string;
-  fieldName: string;
+  field: Promise<DocsField | null>;
   prefix: string;
 };
 
@@ -180,6 +196,19 @@ type MoveDialogState = {
   error: string | null;
 };
 
+type PendingBlankRow = {
+  parentId: string | null;
+  afterNodeId: string | null;
+  kind: DocsBlockKind;
+  depth: number;
+};
+
+type PendingFieldSuggestion = {
+  candidates: DocsField[];
+  activeIndex: number;
+  query: string;
+};
+
 type OutlineRowMemoEntry = {
   inputs: readonly unknown[];
   element: ReactNode;
@@ -192,14 +221,31 @@ type OutlineRowMemoEntry = {
 // optional 指定は移設前の props と同一に保つ。一部の実装は `if (onXxx)` で存在チェックし
 // メニュー項目の出し分けをしているため、未指定＝undefined を維持し挙動不変を守る。
 export type DocsEditorContextValue = {
+  /** Workspace-level read-only mode (for example remote Enterprise Docs). */
+  readOnly?: boolean;
   onSelectNode: (nodeId: string) => void;
   onOpenNode: (nodeId: string) => void;
   onOpenTask?: (taskId: string) => void;
   onFocused: (nodeId: string | null) => void;
   onCommitPending?: (operation: Promise<boolean> | null) => void;
-  onCommitTitle: (node: DocsNode, title: string, patch?: Partial<Pick<DocsNode, "body_json" | "node_type" | "display_props" | "description">>) => Promise<void> | void;
+  onCommitTitle: (node: DocsNode, title: string, patch?: Partial<Pick<DocsNode, "body_json" | "body_text" | "node_type" | "display_props" | "description">>) => Promise<void> | void;
   onDraftChange?: (node: DocsNode, title: string) => void;
   onCommitSuccess?: (nodeId: string, committedDraft: string) => void;
+  // Workspace Undo/Redo can update a node while its CodeMirror view remains
+  // mounted. The revision lets the editor reconcile that view before blur.
+  historySync?: {
+    revision: number;
+    nodeIds: readonly string[];
+    // During an async history PATCH the rows still contain the pre-Undo
+    // value.  Supplying the intended title lets the mounted CM view reconcile
+    // immediately, before a blur can enqueue that stale value again.
+    titles?: Readonly<Record<string, string>>;
+  };
+  // CodeMirror line history owns the first undo/redo step.  These callbacks
+  // are used only when that local history is exhausted, so a single keypress
+  // never applies both histories.
+  onUndo?: () => Promise<void> | void;
+  onRedo?: () => Promise<void> | void;
   onCreateNode: (input: BlockCreateInput) => DocsNode | Promise<DocsNode>;
   onArchiveNode: (node: DocsNode) => Promise<void> | void;
   onMoveNode: (input: BlockMoveInput) => Promise<void> | void;
@@ -211,16 +257,22 @@ export type DocsEditorContextValue = {
   onOpenTag?: (tag: DocsSupertag) => void;
   onSaveField: (node: DocsNode, field: DocsField, value: string) => Promise<void> | void;
   onDeleteAttachment?: (attachment: DocsAttachment) => Promise<void> | void;
+  /** Paste/drop image files into the active node without mutating its title. */
+  onInsertImages?: (
+    node: DocsNode,
+    files: readonly File[],
+    source: "paste" | "drop",
+  ) => Promise<void> | void;
   onMoveToPage?: (node: DocsNode, page: MovePageCandidate) => Promise<void> | void;
   onReplaceTitles: (updates: Array<{ node: DocsNode; title: string }>) => Promise<void> | void;
-  // タイトルが `フィールド名:: 値` 記法にマッチした時に呼ぶ。true を返すと通常のタイトルコミットをスキップする。
-  onFieldShorthand?: (row: OutlineEditorRow, fieldName: string, rawValue: string) => Promise<boolean> | boolean;
+  // `/field` で選択したField値を確定する時に呼ぶ。true を返すと通常のタイトルコミットをスキップする。
+  onFieldShorthand?: (row: OutlineEditorRow, field: DocsField, rawValue: string) => Promise<boolean> | boolean;
   // スラッシュコマンド「エイリアス」で呼ぶ。行ノードのエイリアス編集を親側で開く。
   onOpenAliasEditor?: (row: OutlineEditorRow) => void;
   // スラッシュコマンド「Search node」で呼ぶ。行ノードを起点に検索ノードを親側で作成する。
   onCreateSearchNode?: (row: OutlineEditorRow) => void;
   onSuggestFields?: (row: OutlineEditorRow) => void;
-  onCreateFieldCandidate?: (row: OutlineEditorRow, name: string) => Promise<boolean> | boolean;
+  onCreateFieldCandidate?: (row: OutlineEditorRow, name: string) => Promise<DocsField | null> | DocsField | null;
   onSuggestionStatus?: (suggestionId: string, status: "accepted" | "rejected" | "stale") => Promise<void> | void;
 };
 
@@ -244,6 +296,7 @@ export function createDocsEditorContextValue(
   overrides: Partial<DocsEditorContextValue> = {},
 ): DocsEditorContextValue {
   return {
+    readOnly: false,
     onSelectNode: () => {},
     onOpenNode: () => {},
     onFocused: () => {},
@@ -258,6 +311,7 @@ export function createDocsEditorContextValue(
     onDuplicateNode: () => {},
     onApplyTag: () => {},
     onSaveField: () => {},
+    onInsertImages: () => {},
     onReplaceTitles: () => {},
     ...overrides,
   };
@@ -278,12 +332,18 @@ type OutlineBlockEditorProps = {
   hasMoreRows?: boolean;
   onLoadMoreRows?: () => Promise<unknown> | void;
   onNavigateToDocumentTitle?: () => void;
+  /** Document/topic metadata supplied by the owning Docs workspace. */
+  renderDocumentMetadata?: ReactNode;
   isCollapsed: (nodeId: string) => boolean;
   // 折りたたみ中で子が rows に無いノードのシェブロン表示判定に使う（未指定時は collapsed 判定のみ）
   nodeHasChildren?: (nodeId: string) => boolean;
   isNodeLoading?: (nodeId: string) => boolean;
   // 各行の直下に任意の内容を描画する拡張点（未指定なら従来通り）
-  renderBelowRow?: (row: OutlineEditorRow, index: number) => ReactNode;
+  renderBelowRow?: (
+    row: OutlineEditorRow,
+    index: number,
+    state: { searchExpanded: boolean },
+  ) => ReactNode;
   fieldCandidatesForRow?: (row: OutlineEditorRow) => DocsField[];
 };
 
@@ -343,6 +403,63 @@ function nextVisibleNode(rows: OutlineEditorRow[], nodeId: string) {
   return index >= 0 ? rows[index + 1] ?? null : null;
 }
 
+/**
+ * Return only a sibling at the same outline depth and under the same parent.
+ * The flattened visible projection contains descendants between siblings, so
+ * previousVisibleNode/nextVisibleNode are not safe structural merge targets.
+ */
+export function previousSiblingRow(rows: OutlineEditorRow[], index: number): OutlineEditorRow | null {
+  const current = rows[index];
+  if (!current) return null;
+  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+    const candidate = rows[cursor];
+    if (!candidate) continue;
+    if (candidate.depth < current.depth) return null;
+    if (candidate.depth === current.depth) {
+      return candidate.node.parent_id === current.node.parent_id ? candidate : null;
+    }
+  }
+  return null;
+}
+
+export function nextSiblingRow(rows: OutlineEditorRow[], index: number): OutlineEditorRow | null {
+  const current = rows[index];
+  if (!current) return null;
+  for (let cursor = index + 1; cursor < rows.length; cursor += 1) {
+    const candidate = rows[cursor];
+    if (!candidate) continue;
+    if (candidate.depth < current.depth) return null;
+    if (candidate.depth === current.depth) {
+      return candidate.node.parent_id === current.node.parent_id ? candidate : null;
+    }
+  }
+  return null;
+}
+
+function previousSiblingForParent(
+  rows: OutlineEditorRow[],
+  index: number,
+  depth: number,
+  parentId: string | null,
+): string | null {
+  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+    const candidate = rows[cursor];
+    if (!candidate) continue;
+    if (candidate.depth < depth) return null;
+    if (candidate.depth === depth) return candidate.node.parent_id === parentId ? candidate.node.id : null;
+  }
+  return null;
+}
+
+/** True when the browser owns a non-collapsed text range inside the Docs editor. */
+export function hasNativeDocsTextSelection(rootElement: Element | null): boolean {
+  if (!rootElement || typeof window === "undefined") return false;
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return false;
+  const range = selection.getRangeAt(0);
+  return rootElement.contains(range.startContainer) && rootElement.contains(range.endContainer);
+}
+
 function escapeHtml(value: string) {
   return value
     .replace(/&/g, "&amp;")
@@ -392,20 +509,12 @@ function parentForDepth(rows: OutlineEditorRow[], index: number, depth: number) 
   return null;
 }
 
-function previousSiblingForDepth(rows: OutlineEditorRow[], index: number, depth: number) {
-  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
-    const candidate = rows[cursor];
-    if (!candidate) continue;
-    if (candidate.depth < depth) return null;
-    if (candidate.depth === depth) return candidate.node.id;
-  }
-  return null;
-}
-
 function docsLineEditorTheme(lineHeight: number, fontSize: number, fontWeight: number) {
   return EditorView.theme({
     "&": {
       minHeight: `${lineHeight}px`,
+      // 折り返しの基準になる幅。これが無いと inline-block が行を横へ伸ばして見切れる。
+      maxWidth: "100%",
       border: "0",
       borderRadius: "0",
       background: "transparent",
@@ -689,46 +798,212 @@ function getCaretColumnFromPoint(event: ReactMouseEvent<HTMLElement>, fallbackLe
   return fallbackLength;
 }
 
-function VerbatimContentBlock({ content }: { content: string }) {
-  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+// 行内をドラッグして範囲選択した場合、mouseup が本文（.cm-editor / [data-docs-title-display]）の外側
+// ―― 左のガターや行の余白 ―― で起きると click の target が行 div になり、closest(".cm-editor") の
+// ガードをすり抜けて focusNode(…, title.length) が走って選択が潰れ、キャレットが末尾へ飛ぶ。
+// ドラッグ由来の click では行のフォーカス処理そのものを行わず、選択範囲をそのまま残す。
+const DRAG_SELECT_THRESHOLD_PX = 4;
 
-  const copyContent = async () => {
-    if (typeof navigator === "undefined" || !navigator.clipboard) {
-      setCopyState("failed");
-      return;
-    }
+function isDragSelectClick(
+  event: ReactMouseEvent<HTMLElement>,
+  origin: { x: number; y: number } | null,
+) {
+  if (origin) {
+    const movedX = Math.abs(event.clientX - origin.x);
+    const movedY = Math.abs(event.clientY - origin.y);
+    if (movedX > DRAG_SELECT_THRESHOLD_PX || movedY > DRAG_SELECT_THRESHOLD_PX) return true;
+  }
+  const selection = event.currentTarget.ownerDocument.getSelection();
+  if (!selection || selection.isCollapsed || selection.toString().length === 0) return false;
+  // 他行に残った選択でクリックを握り潰さないよう、この行の中の選択だけを対象にする。
+  return Boolean(selection.anchorNode && event.currentTarget.contains(selection.anchorNode));
+}
+
+/**
+ * Render a typed multiline body and switch the same block into a raw
+ * CodeMirror editor for writers.  This deliberately does not understand
+ * legacy `verbatim_*` keys; those are migration input and never a visible
+ * content source in the Web client.
+ */
+function EditableTypedContentBlock({
+  node,
+  onCommitTitle,
+}: {
+  node: DocsNode;
+  onCommitTitle: DocsEditorContextValue["onCommitTitle"];
+}) {
+  const { readOnly = false } = useDocsEditorContext();
+  const block = docsTypedContentBlock(node.body_json, node.title);
+  const [editing, setEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const viewRef = useRef<EditorView | null>(null);
+  const content = block?.content ?? "";
+  const canEdit = !readOnly && node.permission !== "read";
+
+  useEffect(() => {
+    if (!editing || !block || !hostRef.current || viewRef.current) return;
+    const view = new EditorView({
+      state: EditorState.create({
+        doc: content,
+        extensions: [
+          history(),
+          keymap.of([...defaultKeymap, ...historyKeymap]),
+          EditorView.lineWrapping,
+          EditorView.theme({
+            "&": { maxHeight: "min(60vh, 32rem)", border: "0", background: "transparent" },
+            ".cm-scroller": { overflow: "auto", fontFamily: "var(--font-mono, ui-monospace, monospace)" },
+            ".cm-content": { minHeight: "8rem", padding: "0.75rem", caretColor: "var(--primary)" },
+            ".cm-focused": { outline: "none" },
+          }),
+        ],
+      }),
+      parent: hostRef.current,
+    });
+    viewRef.current = view;
+    view.focus();
+    return () => {
+      view.destroy();
+      viewRef.current = null;
+    };
+  }, [block, content, editing]);
+
+  useEffect(() => {
+    if (editing || !block) return;
+    setError(null);
+  }, [block, editing]);
+
+  if (!block) return null;
+
+  const displayContent = docsTypedContentDisplayContent(block);
+
+  const startEditing = () => {
+    if (!canEdit) return;
+    setError(null);
+    setEditing(true);
+  };
+
+  const save = async () => {
+    const view = viewRef.current;
+    const nextContent = view?.state.doc.toString() ?? content;
+    const nextBody = docsTypedContentBodyJson(
+      block.block_type,
+      nextContent,
+      block.label,
+      node.body_json,
+    );
+    setSaving(true);
+    setError(null);
     try {
-      await navigator.clipboard.writeText(content);
-      setCopyState("copied");
-    } catch {
-      setCopyState("failed");
+      // The title argument keeps the label/body_text mirror contract. The
+      // workspace commit path persists the typed body in the same PATCH.
+      await onCommitTitle(node, block.label, {
+        body_json: nextBody,
+        body_text: block.label,
+      });
+      setEditing(false);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "本文を保存できませんでした");
+    } finally {
+      setSaving(false);
     }
   };
 
   return (
     <div
-      className="mt-2 max-w-full rounded-md border bg-muted/20"
-      data-testid="docs-verbatim-content"
+      className="mt-2 max-w-full"
+      data-testid="docs-typed-content-block"
+      data-block-type={block.block_type}
       onClick={(event) => event.stopPropagation()}
       onDoubleClick={(event) => event.stopPropagation()}
     >
-      <div className="flex justify-end border-b px-2 py-1">
-        <Button
-          type="button"
-          size="sm"
-          variant="ghost"
-          className="h-7 gap-1.5 px-2 text-xs"
-          aria-label="逐語本文をコピー"
-          onClick={(event) => {
+      {editing ? (
+        <div className="rounded-md border bg-muted/20">
+          <div
+            ref={hostRef}
+            data-testid="docs-typed-content-editor"
+            className="max-w-full"
+            onKeyDown={(event) => event.stopPropagation()}
+          />
+          <div className="flex items-center justify-end gap-2 border-t px-2 py-1.5">
+            {error ? <span role="alert" className="mr-auto text-xs text-destructive">{error}</span> : null}
+            <Button type="button" size="sm" variant="ghost" disabled={saving} onClick={() => setEditing(false)}>キャンセル</Button>
+            <Button type="button" size="sm" disabled={saving} data-testid="docs-typed-content-save" onClick={() => void save()}>
+              {saving ? "保存中…" : "保存"}
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <div
+          className={cn(
+            "cursor-text text-sm leading-relaxed",
+            block.block_type === "code"
+              ? "max-w-full overflow-x-auto rounded-md bg-muted/20 p-3"
+              : "max-w-full",
+          )}
+          data-testid="docs-typed-content-display"
+          role={canEdit ? "button" : undefined}
+          tabIndex={canEdit ? 0 : undefined}
+          aria-label={canEdit ? `${block.label}を編集` : block.label}
+          onClick={startEditing}
+          onKeyDown={(event) => {
+            if (canEdit && (event.key === "Enter" || event.key === " ")) {
+              event.preventDefault();
+              startEditing();
+            }
             event.stopPropagation();
-            void copyContent();
           }}
         >
-          {copyState === "copied" ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
-          {copyState === "copied" ? "コピー済み" : copyState === "failed" ? "コピー失敗" : "全文をコピー"}
-        </Button>
-      </div>
-      <pre className="max-w-full overflow-x-auto whitespace-pre p-3 text-xs leading-relaxed">{content}</pre>
+          {block.block_type === "markdown" ? (
+            <MarkdownContent content={displayContent} />
+          ) : (
+            <pre className="max-w-full overflow-x-auto whitespace-pre font-mono text-xs leading-relaxed">{displayContent}</pre>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Attachments owned by the page node itself are rendered in the document
+ * header/details area.  They must not depend on the outline row's collapsed
+ * state: opening a page directly can leave that row out of the visible child
+ * list entirely, which previously hid clip-ingest images until a parent was
+ * expanded.
+ */
+function DocumentAttachmentPreview({ attachments }: { attachments: DocsAttachment[] }) {
+  if (attachments.length === 0) return null;
+  return (
+    <div className="grid gap-2 border-l border-border/60 py-1 pl-4" data-testid="docs-document-attachments">
+      {attachments.map((attachment) => (
+        <a
+          key={attachment.id}
+          href={`/api/docs/attachments/${attachment.id}`}
+          target="_blank"
+          rel="noreferrer"
+          className="block w-fit max-w-full rounded outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          aria-label={`${attachment.file_name}を開く`}
+          onClick={(event) => event.stopPropagation()}
+        >
+          {attachment.mime_type?.startsWith("image/") ? (
+            <Image
+              src={`/api/docs/attachments/${attachment.id}`}
+              alt={attachment.file_name}
+              width={640}
+              height={480}
+              unoptimized
+              className="max-h-80 w-auto max-w-full rounded border object-contain"
+            />
+          ) : (
+            <span className="inline-flex h-7 items-center gap-1 text-xs text-primary underline underline-offset-2">
+              <FileText className="size-3.5" />
+              {attachment.file_name}
+            </span>
+          )}
+        </a>
+      ))}
     </div>
   );
 }
@@ -748,13 +1023,16 @@ export function OutlineBlockEditor({
   hasMoreRows = false,
   onLoadMoreRows,
   onNavigateToDocumentTitle,
+  renderDocumentMetadata,
   isCollapsed,
   nodeHasChildren,
   isNodeLoading,
   renderBelowRow,
   fieldCandidatesForRow,
 }: OutlineBlockEditorProps) {
+  const fieldControlIdPrefix = useId();
   const {
+    readOnly: editorReadOnly = false,
     onSelectNode,
     onOpenNode,
     onOpenTask,
@@ -763,6 +1041,9 @@ export function OutlineBlockEditor({
     onCommitTitle,
     onDraftChange,
     onCommitSuccess,
+    historySync,
+    onUndo,
+    onRedo,
     onCreateNode,
     onArchiveNode,
     onMoveNode,
@@ -774,6 +1055,7 @@ export function OutlineBlockEditor({
     onOpenTag,
     onSaveField,
     onDeleteAttachment,
+    onInsertImages,
     onMoveToPage,
     onReplaceTitles,
     onFieldShorthand,
@@ -783,10 +1065,87 @@ export function OutlineBlockEditor({
     onCreateFieldCandidate,
     onSuggestionStatus,
   } = useDocsEditorContext();
+  const onUndoRef = useRef(onUndo);
+  onUndoRef.current = onUndo;
+  const onRedoRef = useRef(onRedo);
+  onRedoRef.current = onRedo;
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
+  const [expandedSearchNodeIds, setExpandedSearchNodeIds] = useState<Set<string>>(() => new Set());
   const editingNodeIdRef = useRef<string | null>(null);
   editingNodeIdRef.current = editingNodeId;
   const [emptyDraft, setEmptyDraft] = useState("");
+  // A pending row intentionally remains a lightweight input rather than a
+  // persisted node. Keep a small local value history so Ctrl/Cmd-Z and redo
+  // behave like the CodeMirror row editor without stealing the first undo
+  // step for Workspace history.
+  const pendingDraftHistoryRef = useRef<{ values: string[]; index: number; lastAt: number }>({ values: [""], index: 0, lastAt: 0 });
+  // The input can be remounted when an optimistic create changes the flat
+  // outline insertion point. Keep the value history outside that DOM node so
+  // a late render cannot make the first local undo fall through to Workspace.
+  const resetPendingDraft = useCallback((value: string) => {
+    pendingDraftHistoryRef.current = { values: [value], index: 0, lastAt: 0 };
+    setEmptyDraft(value);
+  }, []);
+  const recordPendingDraft = useCallback((value: string) => {
+    const current = pendingDraftHistoryRef.current;
+    const now = Date.now();
+    if (current.values[current.index] === value) {
+      setEmptyDraft(value);
+      return;
+    }
+    // Native text inputs coalesce a contiguous typing burst into one undo
+    // step. Mirror that boundary so keyboard.type("abc") behaves like the
+    // browser's own history rather than requiring three Ctrl/Cmd-Z presses.
+    if (current.index === current.values.length - 1 && current.lastAt > 0 && now - current.lastAt < 500) {
+      const values = [...current.values];
+      values[current.index] = value;
+      pendingDraftHistoryRef.current = { values, index: current.index, lastAt: now };
+      setEmptyDraft(value);
+      return;
+    }
+    const values = [...current.values.slice(0, current.index + 1), value].slice(-100);
+    pendingDraftHistoryRef.current = { values, index: values.length - 1, lastAt: now };
+    setEmptyDraft(value);
+  }, []);
+  const stepPendingDraftHistory = useCallback((direction: -1 | 1) => {
+    const current = pendingDraftHistoryRef.current;
+    const nextIndex = current.index + direction;
+    if (nextIndex < 0 || nextIndex >= current.values.length) return false;
+    pendingDraftHistoryRef.current = { ...current, index: nextIndex, lastAt: 0 };
+    setEmptyDraft(current.values[nextIndex] ?? "");
+    return true;
+  }, []);
+  // Enter で行末へ挿入した blank row は、本文が入力されるまで DB node に
+  // しない。通常の空ページ用 input と、既存行の直後へ表示する一時行を
+  // 同じ state で扱い、空行だけで search index/revision を増やさない。
+  const [pendingBlankRow, setPendingBlankRow] = useState<PendingBlankRow | null>(null);
+  const pendingBlankRowRef = useRef<PendingBlankRow | null>(null);
+  pendingBlankRowRef.current = pendingBlankRow;
+  // Persisted block kind is carried independently of the transient row
+  // object's position. This prevents a stale anchor effect from reverting a
+  // Markdown heading row to the paragraph default after create success.
+  const pendingKindRef = useRef<DocsBlockKind>("paragraph");
+  // Keep the last real anchor id even while an Undo/archive temporarily
+  // removes that row from the visible projection.  Once Redo or lazy loading
+  // brings it back, the pending editor can reconnect to the same position.
+  const pendingAnchorMemoryRef = useRef<string | null>(null);
+  const [pendingBlankCommit, setPendingBlankCommit] = useState(false);
+  const pendingBlankCommitRef = useRef(false);
+  pendingBlankCommitRef.current = pendingBlankCommit;
+  const [pendingBlankAutoFocus, setPendingBlankAutoFocus] = useState(true);
+  const pendingCreateIdRef = useRef<string | null>(null);
+  const pendingCreateGenerationRef = useRef(0);
+  const pendingCreateFocusRef = useRef(false);
+  // When an optimistic pending create fails, React removes/reinserts the
+  // editor-only row. Remember the user's external target so that rollback
+  // rendering cannot steal focus, while still allowing a target that was
+  // already focused to remain untouched.
+  const pendingExternalFocusRef = useRef<HTMLElement | null>(null);
+  const pendingRollbackFocusRef = useRef<HTMLElement | null>(null);
+  const [pendingRollbackFocusRevision, setPendingRollbackFocusRevision] = useState(0);
+  const [pendingFieldSuggestion, setPendingFieldSuggestion] = useState<PendingFieldSuggestion | null>(null);
+  const [pendingField, setPendingField] = useState<DocsField | null>(null);
+  const pendingFieldCreateRef = useRef<{ name: string; promise: Promise<DocsField | null> } | null>(null);
   const [draft, setDraft] = useState("");
   const [caretColumn, setCaretColumn] = useState(0);
   const [urlChoice, setUrlChoice] = useState<UrlChoice | null>(null);
@@ -808,17 +1167,57 @@ export function OutlineBlockEditor({
   const [slashIndex, setSlashIndex] = useState(0);
   const editorHostRef = useRef<HTMLDivElement | null>(null);
   const editorViewRef = useRef<EditorView | null>(null);
+  const editorSessionRef = useRef<{
+    nodeId: string;
+    row: OutlineEditorRow;
+    view: EditorView;
+    // History reconciliation belongs to this concrete CM session. A shared
+    // short-lived flag is racy: the view may blur after the flag is cleared
+    // and commit the pre-Undo title captured by its effect closure.
+    historyRevision: number;
+    historyCanonicalTitle: string | null;
+  } | null>(null);
   const pendingTagFocusRef = useRef<{ nodeId: string; tagId: string } | null>(null);
   const editorThemeCompartmentRef = useRef<Compartment | null>(null);
-  const menuSurfaceRef = useRef<HTMLDivElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const moveInputRef = useRef<HTMLInputElement | null>(null);
+  const rowPointerDownRef = useRef<{ x: number; y: number } | null>(null);
   const composingRef = useRef(false);
+  const editorUserEditedRef = useRef(false);
   const applyingShortcutRef = useRef(false);
+  const explicitCommandCommitRef = useRef<string | null>(null);
   const commitPromisesRef = useRef(new Map<string, Promise<boolean>>());
+  // Structural edits (Enter/Tab/Backspace/Delete) must observe one another's
+  // latest rows projection. Keep one queue per editor and swallow an operation
+  // failure only after surfacing it, so a rejected save cannot poison the next
+  // keyboard operation.
+  const structuralMutationQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const structuralMutationRowsVersionRef = useRef(0);
+  const structuralMutationBlockedAtRowsVersionRef = useRef<number | null>(null);
+  const enqueueStructuralMutation = useCallback((operation: () => Promise<void> | void) => {
+    const next = structuralMutationQueueRef.current
+      .then(() => {
+        // A failed create/save/move can leave an optimistic projection in an
+        // unknown state. Do not run queued follow-up edits until React has
+        // published a new rows projection.
+        const blockedAt = structuralMutationBlockedAtRowsVersionRef.current;
+        if (blockedAt !== null && blockedAt === structuralMutationRowsVersionRef.current) return;
+        structuralMutationBlockedAtRowsVersionRef.current = null;
+        return operation();
+      })
+      .catch((error: unknown) => {
+        structuralMutationBlockedAtRowsVersionRef.current = structuralMutationRowsVersionRef.current;
+        toast.error(error instanceof Error ? error.message : "Docsの構造編集を保存できませんでした");
+      });
+    structuralMutationQueueRef.current = next;
+    return next;
+  }, []);
   const caretColumnRef = useRef(caretColumn);
   const rowsRef = useRef(rows);
+  // depth 0 の行の親＝表示中のページノード。Shift-Tab の outdent 先に使う。
+  const pageParentIdRef = useRef<string | null>(null);
   const draftRef = useRef(draft);
+  const draftNodeIdRef = useRef<string | null>(null);
   const slashCommandRef = useRef<SlashCommandState | null>(null);
   const slashMenuRef = useRef<HTMLDivElement | null>(null);
   const slashIndexRef = useRef(0);
@@ -826,9 +1225,17 @@ export function OutlineBlockEditor({
   const inlineIndexRef = useRef(0);
   const taskCandidatesRef = useRef<Task[]>([]);
   const fieldCommandRef = useRef<FieldCommandState | null>(null);
+  const onCreateNodeRef = useRef(onCreateNode);
+  onCreateNodeRef.current = onCreateNode;
+  const onCreateFieldCandidateRef = useRef(onCreateFieldCandidate);
+  onCreateFieldCandidateRef.current = onCreateFieldCandidate;
   const rowRenderCacheRef = useRef(new Map<string, OutlineRowMemoEntry>());
   const outlineScrollRef = useRef<HTMLDivElement | null>(null);
   const editorRootRef = useRef<HTMLDivElement | null>(null);
+  const editorSessionFor = useCallback((nodeId: string) => {
+    const session = editorSessionRef.current;
+    return session?.nodeId === nodeId ? session : null;
+  }, []);
   // 少数行は通常描画し、大量行は可視範囲だけを描画する。
   const outlineVirtualized = rows.length > 50;
   const rowVirtualizer = useVirtualizer({
@@ -848,7 +1255,120 @@ export function OutlineBlockEditor({
 
   useLayoutEffect(() => {
     rowsRef.current = rows;
+    structuralMutationRowsVersionRef.current += 1;
   }, [rows]);
+  useLayoutEffect(() => {
+    if (!historySync?.revision) return;
+    const session = editorSessionRef.current;
+    if (!session || !historySync.nodeIds.includes(session.nodeId)) return;
+    const row = rows.find((item) => item.node.id === session.nodeId);
+    const canonicalTitle = historySync.titles?.[session.nodeId] ?? row?.node.title;
+    if (typeof canonicalTitle !== "string") return;
+    session.historyRevision = historySync.revision;
+    session.historyCanonicalTitle = canonicalTitle;
+    if (session.view.state.doc.toString() === canonicalTitle) return;
+    session.view.dispatch({
+      changes: { from: 0, to: session.view.state.doc.length, insert: canonicalTitle },
+      selection: EditorSelection.cursor(canonicalTitle.length),
+      // Canonical Workspace history reconciliation is not a user edit and
+      // must not become a new CM undo step that resurrects the pre-Undo title.
+      annotations: Transaction.addToHistory.of(false),
+    });
+    draftRef.current = canonicalTitle;
+    draftNodeIdRef.current = session.nodeId;
+    setDraft(canonicalTitle);
+    setCaretColumn(canonicalTitle.length);
+  }, [historySync, rows]);
+  useLayoutEffect(() => {
+    const pending = pendingBlankRowRef.current;
+    if (!pending) return;
+    if (!pending.afterNodeId) {
+      // A Tab/Shift-Tab row can have no after-anchor. If the parent itself
+      // disappears during Undo/archive, move it to the current page instead
+      // of leaving a stale parent id for the eventual create.
+      const parentExists = !pending.parentId
+        || nodes.some((node) => node.id === pending.parentId && !node.archived_at);
+      if (parentExists) {
+        if (pending.kind === pendingKindRef.current) return;
+        setPendingBlankRow({ ...pending, kind: pendingKindRef.current });
+        return;
+      }
+      const parentId = emptyParentId ?? documentRow?.node.id ?? null;
+      const depth = 0;
+      const lastSibling = rows
+        .filter((row) => row.node.parent_id === parentId && row.depth === depth)
+        .at(-1);
+      setPendingBlankRow({ ...pending, parentId, afterNodeId: lastSibling?.node.id ?? null, depth, kind: pendingKindRef.current });
+      return;
+    }
+    const rememberedAnchor = pendingAnchorMemoryRef.current
+      && pendingAnchorMemoryRef.current !== pending.afterNodeId
+      ? rows.find((row) => row.node.id === pendingAnchorMemoryRef.current) ?? null
+      : null;
+    if (rememberedAnchor) {
+      setPendingBlankRow({
+        ...pending,
+        parentId: rememberedAnchor.node.parent_id,
+        afterNodeId: rememberedAnchor.node.id,
+        depth: rememberedAnchor.depth,
+        kind: pendingKindRef.current,
+      });
+      return;
+    }
+    const anchor = rows.find((row) => row.node.id === pending.afterNodeId) ?? null;
+    if (anchor) {
+      pendingAnchorMemoryRef.current = anchor.node.id;
+      const nextParentId = anchor.node.parent_id;
+      const nextDepth = anchor.depth;
+      if (
+        pending.parentId === nextParentId
+        && pending.depth === nextDepth
+        && pending.kind === pendingKindRef.current
+      ) return;
+      setPendingBlankRow({ ...pending, parentId: nextParentId, depth: nextDepth, kind: pendingKindRef.current });
+      return;
+    }
+    const parentExists = !pending.parentId
+      || nodes.some((node) => node.id === pending.parentId && !node.archived_at);
+    const parentId = parentExists ? pending.parentId : (emptyParentId ?? documentRow?.node.id ?? null);
+    const depth = parentExists ? pending.depth : 0;
+    const lastSibling = rows
+      .filter((row) => row.node.parent_id === parentId && row.depth === depth)
+      .at(-1);
+    const afterNodeId = lastSibling?.node.id ?? null;
+    if (
+      pending.parentId === parentId
+      && pending.afterNodeId === afterNodeId
+      && pending.depth === depth
+      && pending.kind === pendingKindRef.current
+    ) return;
+    setPendingBlankRow({ ...pending, parentId, afterNodeId, depth, kind: pendingKindRef.current });
+  }, [documentRow?.node.id, emptyParentId, nodes, pendingBlankRow, rows]);
+  useEffect(() => {
+    if (!pendingBlankCommit) return;
+    const rememberExternalFocus = (event: FocusEvent) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      if (target.closest("[data-docs-blank-row]")) return;
+      pendingExternalFocusRef.current = target;
+    };
+    document.addEventListener("focusin", rememberExternalFocus, true);
+    return () => document.removeEventListener("focusin", rememberExternalFocus, true);
+  }, [pendingBlankCommit]);
+  useLayoutEffect(() => {
+    if (!pendingRollbackFocusRevision) return;
+    const target = pendingRollbackFocusRef.current;
+    pendingRollbackFocusRef.current = null;
+    if (!target?.isConnected) return;
+    const active = document.activeElement;
+    // If the user has already selected another external control, never move
+    // focus back. Only repair the browser's body/blank-row fallback caused by
+    // the rollback render itself.
+    if (!active || active === document.body || active.closest("[data-docs-blank-row]")) target.focus();
+  }, [pendingRollbackFocusRevision]);
+  useLayoutEffect(() => {
+    pageParentIdRef.current = documentRow?.node.id ?? emptyParentId ?? rows[0]?.node.parent_id ?? null;
+  }, [documentRow, emptyParentId, rows]);
   useLayoutEffect(() => {
     const pending = pendingTagFocusRef.current;
     if (!pending) return;
@@ -859,9 +1379,6 @@ export function OutlineBlockEditor({
     chip.focus();
     pendingTagFocusRef.current = null;
   });
-  useEffect(() => {
-    draftRef.current = draft;
-  }, [draft]);
   useEffect(() => {
     caretColumnRef.current = caretColumn;
   }, [caretColumn]);
@@ -918,6 +1435,12 @@ export function OutlineBlockEditor({
   }, [inlineSuggestion?.kind, inlineSuggestion?.query]);
 
   const editingRow = useMemo(() => rows.find((row) => row.node.id === editingNodeId) ?? null, [editingNodeId, rows]);
+  const editingRowRef = useRef(editingRow);
+  editingRowRef.current = editingRow;
+  const editorReadOnlyRef = useRef(editorReadOnly);
+  editorReadOnlyRef.current = editorReadOnly;
+  const onInsertImagesRef = useRef(onInsertImages);
+  onInsertImagesRef.current = onInsertImages;
   const editingKind = editingRow ? docsBlockKind(editingRow.node) : null;
   const pageRootId = rows[0]?.node.root_page_id ?? rows[0]?.node.id ?? null;
   const searchTargets = useMemo(
@@ -1026,19 +1549,6 @@ export function OutlineBlockEditor({
     return () => window.removeEventListener("keydown", handleKeyDown, { capture: true });
   }, []);
 
-  // 三点メニューはメニュー外の mousedown で閉じる（トリガー再クリック以外での閉じ手段）
-  useEffect(() => {
-    if (!menuNodeId) return;
-    const handlePointerDown = (event: MouseEvent) => {
-      const surface = menuSurfaceRef.current;
-      if (surface && event.target instanceof Node && surface.contains(event.target)) return;
-      setMenuNodeId(null);
-      setContextMenuPosition(null);
-    };
-    document.addEventListener("mousedown", handlePointerDown);
-    return () => document.removeEventListener("mousedown", handlePointerDown);
-  }, [menuNodeId]);
-
   useEffect(() => {
     if (!urlChoice && !inlineSuggestion && !slashCommand) return;
     const handlePointerDown = (event: MouseEvent) => {
@@ -1057,11 +1567,42 @@ export function OutlineBlockEditor({
     if (!pendingFocusDraft) return;
     if (!rows.some((row) => row.node.id === pendingFocusDraft.nodeId)) return;
     draftRef.current = pendingFocusDraft.title;
+    draftNodeIdRef.current = pendingFocusDraft.nodeId;
+    editingNodeIdRef.current = pendingFocusDraft.nodeId;
     setEditingNodeId(pendingFocusDraft.nodeId);
     setDraft(pendingFocusDraft.title);
     setCaretColumn(0);
     setPendingFocusDraft(null);
   }, [pendingFocusDraft, rows]);
+
+  // Structural merges commit the active row before archiving its sibling.
+  // Keep the mounted CodeMirror session in lockstep with that canonical title
+  // so a subsequent blur cannot enqueue the pre-merge draft again.
+  const syncCommittedEditorDraft = useCallback((
+    nodeId: string,
+    title: string,
+    row: OutlineEditorRow,
+  ) => {
+    const session = editorSessionRef.current;
+    if (!session || session.nodeId !== nodeId) return;
+    if (session.view.state.doc.toString() !== title) {
+      session.view.dispatch({
+        changes: { from: 0, to: session.view.state.doc.length, insert: title },
+        selection: EditorSelection.cursor(title.length),
+        // The structural merge is already represented by Workspace history;
+        // do not add a second CodeMirror-local undo step for the reconciliation.
+        annotations: Transaction.addToHistory.of(false),
+      });
+    }
+    session.row = {
+      ...row,
+      node: { ...row.node, title, body_text: title },
+    };
+    draftRef.current = title;
+    draftNodeIdRef.current = nodeId;
+    setDraft(title);
+    setCaretColumn(title.length);
+  }, []);
 
   useLayoutEffect(() => {
     const view = editorViewRef.current;
@@ -1079,15 +1620,33 @@ export function OutlineBlockEditor({
   }, [editingKind, editingRow?.node.id]);
 
   // 戻り値: フィールド記法として処理された場合 true（Enter 後の新規ノード作成をスキップさせる）。
-  const commitCurrent = useCallback((): Promise<boolean> => {
-    const row = editingNodeId ? rowsRef.current.find((item) => item.node.id === editingNodeId) : null;
+  const commitNodeDraft = useCallback((
+    nodeId: string,
+    draftAtCommit: string,
+    rowSnapshot?: OutlineEditorRow,
+  ): Promise<boolean> => {
+    const row = rowSnapshot?.node.id === nodeId
+      ? rowSnapshot
+      : rowsRef.current.find((item) => item.node.id === nodeId);
     if (!row || composingRef.current) return Promise.resolve(false);
-    const draftAtCommit = draftRef.current;
     const commitKey = `${row.node.id}\u0000${draftAtCommit}`;
     const existing = commitPromisesRef.current.get(commitKey);
     if (existing) return existing;
     const operation = (async () => {
       try {
+        // An explicitly cleared ordinary outline paragraph is a real draft,
+        // not a transient placeholder. Persist the canonical blank marker and
+        // keep the editor value empty even when the save is asynchronous.
+        if (!hasMeaningfulBlockTitle(draftAtCommit)) {
+          await onCommitTitle(row.node, "", {
+            body_json: blankParagraphBodyJson(row.node.body_json),
+            body_text: "",
+            node_type: "node",
+            display_props: { ...row.node.display_props, show_checkbox: false },
+          });
+          onCommitSuccess?.(row.node.id, "");
+          return false;
+        }
         // Field は `/field` から開始した入力だけを処理する。通常の `>` はMarkdown引用として予約する。
         const fieldCommand = fieldCommandRef.current?.nodeId === row.node.id ? fieldCommandRef.current : null;
         if (onFieldShorthand && fieldCommand) {
@@ -1095,8 +1654,9 @@ export function OutlineBlockEditor({
             ? draftAtCommit.slice(fieldCommand.prefix.length)
             : draftAtCommit;
           fieldCommandRef.current = null;
-          if (fieldCommand.fieldName) {
-            const handled = await onFieldShorthand(row, fieldCommand.fieldName, rawValue);
+          const field = await fieldCommand.field;
+          if (field) {
+            const handled = await onFieldShorthand(row, field, rawValue);
             if (handled) {
               onCommitSuccess?.(row.node.id, draftAtCommit);
               return true;
@@ -1118,10 +1678,22 @@ export function OutlineBlockEditor({
                   ...(shortcut.kind === "checkbox" ? { show_checkbox: true, checked: shortcut.checked === true } : {}),
                 },
               }
-            : undefined;
+            : isExplicitBlankParagraph(row.node.title, row.node.body_json, row.node.node_type)
+              ? {
+                  body_json: clearBlankParagraphMarker(row.node.body_json),
+                  body_text: draftAtCommit,
+                  node_type: row.node.node_type,
+                }
+              : undefined;
         await onCommitTitle(row.node, shortcut?.title ?? draftAtCommit, patch);
         onCommitSuccess?.(row.node.id, draftAtCommit);
         return false;
+      } catch (error) {
+        // Do not reconcile a failed draft to the server value. The mounted
+        // CodeMirror view remains authoritative and the caller can decide
+        // whether a dependent archive/move should be skipped.
+        toast.error(error instanceof Error ? error.message : "Docsの保存に失敗しました");
+        throw error;
       } finally {
         commitPromisesRef.current.delete(commitKey);
         onCommitPending?.(Array.from(commitPromisesRef.current.values()).at(-1) ?? null);
@@ -1130,7 +1702,7 @@ export function OutlineBlockEditor({
     commitPromisesRef.current.set(commitKey, operation);
     onCommitPending?.(operation);
     return operation;
-  }, [editingNodeId, onCommitPending, onCommitSuccess, onCommitTitle, onFieldShorthand]);
+  }, [onCommitPending, onCommitSuccess, onCommitTitle, onFieldShorthand]);
 
   const executeSlashCommand = useCallback((commandId: SlashCommandId) => {
     const state = slashCommandRef.current;
@@ -1140,8 +1712,13 @@ export function OutlineBlockEditor({
       setSlashCommand(null);
       return;
     }
-    const view = editorViewRef.current;
-    const fullText = view ? view.state.doc.toString() : draftRef.current;
+    const session = editorSessionFor(row.node.id);
+    const view = session?.view ?? null;
+    const fullText = view
+      ? view.state.doc.toString()
+      : draftNodeIdRef.current === row.node.id
+        ? draftRef.current
+        : row.node.title;
     // 行末の `/入力文字列` を除去したタイトル。
     const nextTitle = (fullText.slice(0, state.from) + fullText.slice(state.to)).replace(/\s+$/, "");
     setSlashCommand(null);
@@ -1154,6 +1731,7 @@ export function OutlineBlockEditor({
       });
       setDraft(fieldPrefix);
       draftRef.current = fieldPrefix;
+      draftNodeIdRef.current = row.node.id;
       const coords = view?.coordsAtPos(fieldPrefix.length);
       const fallback = view?.dom.getBoundingClientRect();
       updateInlineSuggestion({
@@ -1168,46 +1746,93 @@ export function OutlineBlockEditor({
       setInlineIndex(0);
       return;
     }
+    explicitCommandCommitRef.current = row.node.id;
     setDraft(nextTitle);
     draftRef.current = nextTitle;
+    draftNodeIdRef.current = row.node.id;
+    view?.dispatch({
+      changes: { from: 0, to: view.state.doc.length, insert: nextTitle },
+      selection: EditorSelection.cursor(nextTitle.length),
+    });
     const closeEditing = () => {
+      editingNodeIdRef.current = null;
       setEditingNodeId(null);
       onFocused(null);
     };
     const blockKind = SLASH_BLOCK_KIND[commandId];
     if (blockKind) {
       void (async () => {
-        await onCommitTitle(row.node, nextTitle, {
-          body_json: { ...row.node.body_json, ...blockJsonForKind(blockKind) },
-          node_type: row.node.node_type === "search" ? "node" : row.node.node_type,
-          display_props:
-            blockKind === "checkbox"
-              ? { ...row.node.display_props, show_checkbox: true, checked: false }
-              : { ...row.node.display_props, show_checkbox: false },
-        });
-        closeEditing();
+        try {
+          await onCommitTitle(row.node, nextTitle, {
+            body_json: { ...row.node.body_json, ...blockJsonForKind(blockKind) },
+            node_type: row.node.node_type === "search" ? "node" : row.node.node_type,
+            display_props:
+              blockKind === "checkbox"
+                ? { ...row.node.display_props, show_checkbox: true, checked: false }
+                : { ...row.node.display_props, show_checkbox: false },
+          });
+          closeEditing();
+        } catch (error) {
+          if (explicitCommandCommitRef.current === row.node.id) explicitCommandCommitRef.current = null;
+          throw error;
+        }
       })();
       return;
     }
     void (async () => {
-      await onCommitTitle(row.node, nextTitle);
-      if (commandId === "field_ai") {
-        onSuggestFields?.(row);
-      } else if (commandId === "alias") {
-        onOpenAliasEditor?.(row);
-      } else if (commandId === "search_node") {
-        onCreateSearchNode?.(row);
-      } else if (commandId === "move") {
-        openMoveDialog(row);
+      try {
+        await onCommitTitle(row.node, nextTitle);
+        if (commandId === "field_ai") {
+          onSuggestFields?.(row);
+        } else if (commandId === "alias") {
+          onOpenAliasEditor?.(row);
+        } else if (commandId === "search_node") {
+          onCreateSearchNode?.(row);
+        } else if (commandId === "move") {
+          openMoveDialog(row);
+        }
+        closeEditing();
+      } catch (error) {
+        if (explicitCommandCommitRef.current === row.node.id) explicitCommandCommitRef.current = null;
+        throw error;
       }
-      closeEditing();
     })();
-  }, [onCommitTitle, onFocused, onOpenAliasEditor, onCreateSearchNode, onSuggestFields, openMoveDialog, updateInlineSuggestion]);
+  }, [editorSessionFor, onCommitTitle, onFocused, onOpenAliasEditor, onCreateSearchNode, onSuggestFields, openMoveDialog, updateInlineSuggestion]);
 
   const executeSlashCommandRef = useRef(executeSlashCommand);
   useEffect(() => {
     executeSlashCommandRef.current = executeSlashCommand;
   }, [executeSlashCommand]);
+
+  const beginFieldCreation = useCallback((
+    row: OutlineEditorRow,
+    suggestion: InlineSuggestion,
+    view: EditorView,
+  ) => {
+    const createFieldCandidate = onCreateFieldCandidateRef.current;
+    const fieldName = suggestion.query.trim();
+    if (!createFieldCandidate || !fieldName) return;
+    const value = `${fieldName}: `;
+    const fieldPromise = Promise.resolve()
+      .then(() => createFieldCandidate(row, fieldName))
+      .catch((error: unknown) => {
+        toast.error(error instanceof Error ? error.message : "Fieldを作成できませんでした");
+        return null;
+      });
+    fieldCommandRef.current = {
+      nodeId: suggestion.nodeId,
+      field: fieldPromise,
+      prefix: view.state.sliceDoc(0, suggestion.from) + value,
+    };
+    const nextCaret = suggestion.from + value.length;
+    caretColumnRef.current = nextCaret;
+    flushSync(() => updateInlineSuggestion(null));
+    view.dispatch({
+      changes: { from: suggestion.from, to: suggestion.to, insert: value },
+      selection: EditorSelection.cursor(nextCaret),
+    });
+    view.focus();
+  }, [updateInlineSuggestion]);
 
   const focusNode = useCallback((nodeId: string, column = caretColumnRef.current, fallbackTitle = "") => {
     const targetIndex = rowsRef.current.findIndex((item) => item.node.id === nodeId);
@@ -1221,8 +1846,15 @@ export function OutlineBlockEditor({
       onFocused(nodeId);
       return;
     }
+    const previousSession = editorSessionRef.current;
+    if (previousSession && previousSession.nodeId !== nodeId) {
+      const previousText = previousSession.view.state.doc.toString();
+      void commitNodeDraft(previousSession.nodeId, previousText, previousSession.row).catch(() => undefined);
+    }
     if (!row) {
       draftRef.current = fallbackTitle;
+      draftNodeIdRef.current = nodeId;
+      editingNodeIdRef.current = nodeId;
       setPendingFocusDraft({ nodeId, title: fallbackTitle });
       setEditingNodeId(nodeId);
       setDraft(fallbackTitle);
@@ -1232,12 +1864,42 @@ export function OutlineBlockEditor({
       return;
     }
     draftRef.current = row.node.title;
+    draftNodeIdRef.current = nodeId;
+    editingNodeIdRef.current = nodeId;
     setEditingNodeId(nodeId);
     setDraft(row.node.title);
     setCaretColumn(Math.max(0, column));
     onSelectNode(nodeId);
     onFocused(nodeId);
-  }, [onFocused, onSelectNode, outlineVirtualized, rowVirtualizer]);
+  }, [commitNodeDraft, onFocused, onSelectNode, outlineVirtualized, rowVirtualizer]);
+
+  const openPendingBlankRow = useCallback((
+    row: OutlineEditorRow,
+    afterNodeId: string | null,
+  ) => {
+    pendingCreateGenerationRef.current += 1;
+    resetPendingDraft("");
+    setPendingBlankCommit(false);
+    setPendingBlankAutoFocus(true);
+    pendingCreateIdRef.current = null;
+    pendingCreateFocusRef.current = false;
+    pendingAnchorMemoryRef.current = afterNodeId;
+    setPendingFieldSuggestion(null);
+    setPendingField(null);
+    pendingFieldCreateRef.current = null;
+    pendingKindRef.current = docsBlockKind(row.node);
+    setPendingBlankRow({
+      parentId: row.node.parent_id,
+      afterNodeId,
+      kind: docsBlockKind(row.node),
+      depth: row.depth,
+    });
+    // The previous CodeMirror session must be closed before the temporary row
+    // receives focus. Its draft is committed by the caller when it has content.
+    editingNodeIdRef.current = null;
+    setEditingNodeId(null);
+    onFocused(null);
+  }, [onFocused, resetPendingDraft]);
 
   const fieldControlsForNode = useCallback((nodeId: string) => (
     Array.from(
@@ -1328,6 +1990,17 @@ export function OutlineBlockEditor({
     await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
   }, []);
 
+  const copyNodeId = useCallback(async (node: DocsNode) => {
+    setMenuNodeId(null);
+    setContextMenuPosition(null);
+    try {
+      await navigator.clipboard.writeText(node.id);
+      toast.success("ノードIDをコピーしました");
+    } catch {
+      toast.error("ノードIDのコピーに失敗しました");
+    }
+  }, []);
+
   const focusFirstTag = useCallback((nodeId: string) => {
     const chip = editorRootRef.current?.querySelector<HTMLButtonElement>(
       `[data-docs-block-id="${nodeId}"] [data-docs-supertag-chip]`,
@@ -1337,14 +2010,24 @@ export function OutlineBlockEditor({
     return true;
   }, []);
 
+  const requestFocusNodeVisible = Boolean(
+    requestFocusNodeId && rows.some((row) => row.node.id === requestFocusNodeId),
+  );
   useEffect(() => {
-    if (requestFocusNodeId) focusNode(requestFocusNodeId);
-  }, [focusNode, requestFocusNodeId]);
+    if (requestFocusNodeId && requestFocusNodeVisible) {
+      focusNode(requestFocusNodeId);
+    }
+  }, [focusNode, requestFocusNodeId, requestFocusNodeVisible]);
 
   useLayoutEffect(() => {
     if (!editorHostRef.current || !editingRow) return;
-    editorViewRef.current?.destroy();
-    const editorDraft = draftRef.current;
+    const editorNodeId = editingRow.node.id;
+    const editorDraft =
+      draftNodeIdRef.current === editorNodeId
+        ? draftRef.current
+        : editingRow.node.title;
+    draftNodeIdRef.current = editorNodeId;
+    draftRef.current = editorDraft;
     const kind = docsBlockKind(editingRow.node);
     const lineHeight = lineHeightForKind(kind);
     const fontSize = fontSizeForKind(kind);
@@ -1357,17 +2040,6 @@ export function OutlineBlockEditor({
       if (text.includes("\n")) return false;
       const prefix = markdownShortcutPrefixForTitle(text);
       if (!prefix) return false;
-      const patch = {
-        body_json: {
-          ...editingRow.node.body_json,
-          ...blockJsonForKind(prefix.kind, prefix.checked),
-        },
-        node_type: editingRow.node.node_type,
-        display_props: {
-          ...editingRow.node.display_props,
-          ...(prefix.kind === "checkbox" ? { show_checkbox: true, checked: prefix.checked === true } : {}),
-        },
-      };
       applyingShortcutRef.current = true;
       try {
         view.dispatch({
@@ -1379,8 +2051,10 @@ export function OutlineBlockEditor({
       }
       setDraft("");
       draftRef.current = "";
+      draftNodeIdRef.current = editorNodeId;
       setCaretColumn(0);
-      void onCommitTitle(editingRow.node, "", patch);
+      // Prefix-only input leaves no meaningful title; defer persistence until
+      // the user enters text instead of issuing an empty-title PATCH.
       return true;
     };
     const view = new EditorView({
@@ -1392,14 +2066,70 @@ export function OutlineBlockEditor({
           head: Math.min(caretColumnRef.current, editorDraft.length),
         },
         extensions: [
+          // 表示側と同じく、編集中の長い行も折り返して全文を見せる。
+          EditorView.lineWrapping,
           drawSelection(),
           dropCursor(),
           history(),
           EditorState.allowMultipleSelections.of(true),
           selectNextOccurrenceKeymap,
           inlinePreviewPlugin,
+          // Paste and native file drops share one image pipeline. Returning
+          // null from the handler deliberately leaves the node title/body
+          // untouched; the workspace publishes the new attachment state.
+          createEditorImageInsertExtension({
+            readOnly: () =>
+              editorReadOnlyRef.current ||
+              editingRowRef.current?.node.permission === "read",
+            handler: async (files, source) => {
+              const currentRow = editingRowRef.current;
+              const callback = onInsertImagesRef.current;
+              if (!currentRow || !callback) return null;
+              await callback(currentRow.node, files, source);
+              return null;
+            },
+          }),
           themeCompartment.of(docsLineEditorTheme(lineHeight, fontSize, fontWeight)),
           Prec.highest(keymap.of([
+            {
+              key: "Mod-z",
+              preventDefault: true,
+              run: (currentView) => {
+                const initialPersistedBlank = isExplicitBlankParagraph(
+                  editingRow.node.title,
+                  editingRow.node.body_json,
+                  editingRow.node.node_type,
+                ) && currentView.state.doc.toString() === "" && !editorUserEditedRef.current;
+                if (!initialPersistedBlank && undoDepth(currentView.state) > 0) return undo(currentView);
+                const fallback = onUndoRef.current;
+                if (!fallback) return false;
+                void Promise.resolve(fallback());
+                return true;
+              },
+            },
+            {
+              key: "Mod-y",
+              mac: "Mod-Shift-z",
+              preventDefault: true,
+              run: (currentView) => {
+                if (redoDepth(currentView.state) > 0) return redo(currentView);
+                const fallback = onRedoRef.current;
+                if (!fallback) return false;
+                void Promise.resolve(fallback());
+                return true;
+              },
+            },
+            {
+              key: "Ctrl-Shift-z",
+              preventDefault: true,
+              run: (currentView) => {
+                if (redoDepth(currentView.state) > 0) return redo(currentView);
+                const fallback = onRedoRef.current;
+                if (!fallback) return false;
+                void Promise.resolve(fallback());
+                return true;
+              },
+            },
             {
               key: "Mod-b",
               run: (view) => formatSelection(view, "**"),
@@ -1415,31 +2145,32 @@ export function OutlineBlockEditor({
             {
               key: "Alt-ArrowUp",
               run: () => {
-                const index = rowsRef.current.findIndex((row) => row.node.id === editingRow.node.id);
-                const current = rowsRef.current[index];
-                if (!current) return true;
-                const previous = previousSiblingForDepth(rowsRef.current, index, current.depth);
-                if (!previous) return true;
-                const previousIndex = rowsRef.current.findIndex((row) => row.node.id === previous);
-                const beforePrevious = previousSiblingForDepth(rowsRef.current, previousIndex, current.depth);
-                void onMoveNode({ nodeId: editingRow.node.id, parentId: current.node.parent_id, afterNodeId: beforePrevious });
+                if (composingRef.current) return true;
+                void enqueueStructuralMutation(async () => {
+                  const index = rowsRef.current.findIndex((row) => row.node.id === editingRow.node.id);
+                  const current = rowsRef.current[index];
+                  if (!current) return;
+                  const previous = previousSiblingRow(rowsRef.current, index);
+                  if (!previous) return;
+                  const previousIndex = rowsRef.current.findIndex((row) => row.node.id === previous.node.id);
+                  const beforePrevious = previousSiblingRow(rowsRef.current, previousIndex);
+                  await onMoveNode({ nodeId: current.node.id, parentId: current.node.parent_id, afterNodeId: beforePrevious?.node.id ?? null });
+                });
                 return true;
               },
             },
             {
               key: "Alt-ArrowDown",
               run: () => {
-                const index = rowsRef.current.findIndex((row) => row.node.id === editingRow.node.id);
-                const current = rowsRef.current[index];
-                if (!current) return true;
-                for (let cursor = index + 1; cursor < rowsRef.current.length; cursor += 1) {
-                  const candidate = rowsRef.current[cursor];
-                  if (!candidate || candidate.depth < current.depth) break;
-                  if (candidate.depth === current.depth) {
-                    void onMoveNode({ nodeId: editingRow.node.id, parentId: current.node.parent_id, afterNodeId: candidate.node.id });
-                    return true;
-                  }
-                }
+                if (composingRef.current) return true;
+                void enqueueStructuralMutation(async () => {
+                  const index = rowsRef.current.findIndex((row) => row.node.id === editingRow.node.id);
+                  const current = rowsRef.current[index];
+                  if (!current) return;
+                  const next = nextSiblingRow(rowsRef.current, index);
+                  if (!next) return;
+                  await onMoveNode({ nodeId: current.node.id, parentId: current.node.parent_id, afterNodeId: next.node.id });
+                });
                 return true;
               },
             },
@@ -1489,7 +2220,7 @@ export function OutlineBlockEditor({
                     const nextCaret = fieldSuggestion.from + value.length;
                     fieldCommandRef.current = {
                       nodeId: fieldSuggestion.nodeId,
-                      fieldName: selected.name,
+                      field: Promise.resolve(selected),
                       prefix: view.state.sliceDoc(0, fieldSuggestion.from) + value,
                     };
                     caretColumnRef.current = nextCaret;
@@ -1500,23 +2231,7 @@ export function OutlineBlockEditor({
                     });
                     view.focus();
                   } else if (row && fieldSuggestion.query.trim() && onCreateFieldCandidate) {
-                    void Promise.resolve(onCreateFieldCandidate(row, fieldSuggestion.query.trim())).then((created) => {
-                      if (!created) return;
-                      const fieldName = fieldSuggestion.query.trim();
-                      const value = `${fieldName}: `;
-                      fieldCommandRef.current = {
-                        nodeId: fieldSuggestion.nodeId,
-                        fieldName,
-                        prefix: view.state.sliceDoc(0, fieldSuggestion.from) + value,
-                      };
-                      caretColumnRef.current = fieldSuggestion.from + value.length;
-                      flushSync(() => updateInlineSuggestion(null));
-                      view.dispatch({
-                        changes: { from: fieldSuggestion.from, to: fieldSuggestion.to, insert: value },
-                        selection: EditorSelection.cursor(fieldSuggestion.from + value.length),
-                      });
-                      view.focus();
-                    });
+                    beginFieldCreation(row, fieldSuggestion, view);
                   }
                   return true;
                 }
@@ -1536,57 +2251,173 @@ export function OutlineBlockEditor({
                     setSlashCommand(null);
                   }
                   return true;
-                }
-                  const cursor = view.state.selection.main.head;
-                  const parts = splitBlockTitle(view.state.doc.toString(), cursor);
-                  void (async () => {
-                    setDraft(parts.before);
-                    draftRef.current = parts.before;
-                    // `/field` 入力だけはField保存結果を確認してから兄弟ノード作成を判断する。
-                    const isFieldCommand = fieldCommandRef.current?.nodeId === editingRow.node.id;
-                    if (isFieldCommand) {
-                      const handledAsField = await commitCurrent();
-                      if (handledAsField) return;
-                    } else {
-                      void commitCurrent();
-                    }
-                    const createdOrPromise = onCreateNode({
-                    parentId: editingRow.node.parent_id,
-                    afterNodeId: editingRow.node.id,
-                    title: parts.after,
-                    kind: docsBlockKind(editingRow.node),
-                  });
-                  if (createdOrPromise instanceof Promise) {
-                    const created = await createdOrPromise;
-                    focusNode(created.id, 0, parts.after);
-                  } else {
-                    focusNode(createdOrPromise.id, 0, parts.after);
                   }
-                })();
+                  // Enter is a structural operation. Resolve the row and its
+                  // parent/depth only when this queued operation executes.
+                  void enqueueStructuralMutation(async () => {
+                    const latestIndex = rowsRef.current.findIndex((row) => row.node.id === editingRow.node.id);
+                    const currentRow = latestIndex >= 0 ? rowsRef.current[latestIndex] : null;
+                    if (!currentRow) return;
+                    const currentView = editorSessionRef.current?.nodeId === currentRow.node.id
+                      ? editorSessionRef.current.view
+                      : view;
+                    const currentText = currentView.state.doc.toString();
+                    const currentCursor = currentView.state.selection.main.head;
+                    const currentParts = splitBlockTitle(currentText, currentCursor);
+                    const currentKind = docsBlockKind(currentRow.node);
+                    const currentTitleIsBlank = !hasMeaningfulBlockTitle(currentText);
+                    const index = rowsRef.current.findIndex((row) => row.node.id === currentRow.node.id);
+                    if (index < 0) return;
+                    const parentId = currentRow.node.parent_id;
+                    const afterCurrentId = currentRow.node.id;
+
+                    const createNode = async (input: {
+                      parentId: string | null;
+                      afterNodeId: string | null;
+                      title: string;
+                      blank?: boolean;
+                      insertAtStart?: boolean;
+                      kind?: DocsBlockKind;
+                      onPersistenceError?: (error: unknown) => void;
+                    }) => {
+                      let persistenceReported = false;
+                      try {
+                        const createdOrPromise = onCreateNodeRef.current({
+                          ...input,
+                          focusOnCreate: false,
+                          onPersistenceError: (_nodeId, error) => {
+                            persistenceReported = true;
+                            structuralMutationBlockedAtRowsVersionRef.current = structuralMutationRowsVersionRef.current;
+                            toast.error(error instanceof Error ? error.message : "Enter後の保存に失敗しました");
+                            input.onPersistenceError?.(error);
+                          },
+                        });
+                        const created = createdOrPromise instanceof Promise
+                          ? await createdOrPromise
+                          : createdOrPromise;
+                        if (!created || typeof created.id !== "string" || !created.id) {
+                          throw new Error("Enter後のノード作成に失敗しました");
+                        }
+                        return created;
+                      } catch (error) {
+                        if (!persistenceReported) input.onPersistenceError?.(error);
+                        throw error;
+                      }
+                    };
+
+                    // At the start of a non-empty row, keep the current node
+                    // intact and insert a persisted blank sibling before it.
+                    if (currentCursor === 0 && hasMeaningfulBlockTitle(currentText)) {
+                      await commitNodeDraft(currentRow.node.id, currentText, currentRow);
+                      const savedIndex = rowsRef.current.findIndex((row) => row.node.id === currentRow.node.id);
+                      const savedRow = rowsRef.current[savedIndex] ?? currentRow;
+                      const savedPrevious = previousSiblingRow(rowsRef.current, savedIndex);
+                      const created = await createNode({
+                        parentId: savedRow.node.parent_id,
+                        afterNodeId: savedPrevious?.node.id ?? null,
+                        title: "",
+                        blank: true,
+                        insertAtStart: !savedPrevious,
+                        kind: "paragraph",
+                        onPersistenceError: () => openPendingBlankRow(savedRow, savedPrevious?.node.id ?? null),
+                      });
+                      focusNode(created.id, 0);
+                      return;
+                    }
+
+                    // Empty rows (including an explicit persisted blank) and
+                    // line-end Enter create another blank sibling.
+                    if (currentTitleIsBlank || currentCursor >= currentText.length) {
+                      if (hasMeaningfulBlockTitle(currentText)) {
+                        await commitNodeDraft(currentRow.node.id, currentText, currentRow);
+                      }
+                      const savedIndex = rowsRef.current.findIndex((row) => row.node.id === currentRow.node.id);
+                      const savedRow = rowsRef.current[savedIndex] ?? currentRow;
+                      const created = await createNode({
+                        parentId: savedRow.node.parent_id,
+                        afterNodeId: savedRow.node.id,
+                        title: "",
+                        blank: true,
+                        kind: "paragraph",
+                        onPersistenceError: () => openPendingBlankRow(savedRow, savedRow.node.id),
+                      });
+                      focusNode(created.id, 0);
+                      return;
+                    }
+
+                    // Middle split: save the prefix before changing the mounted
+                    // view, then create the suffix as a same-parent sibling.
+                    await commitNodeDraft(currentRow.node.id, currentParts.before, currentRow);
+                    currentView.dispatch({
+                      changes: { from: 0, to: currentView.state.doc.length, insert: currentParts.before },
+                      selection: EditorSelection.cursor(currentParts.before.length),
+                    });
+                    draftRef.current = currentParts.before;
+                    draftNodeIdRef.current = currentRow.node.id;
+                    setDraft(currentParts.before);
+                    const created = await createNode({
+                      parentId,
+                      afterNodeId: afterCurrentId,
+                      title: currentParts.after,
+                      kind: currentKind,
+                      onPersistenceError: () => {
+                        openPendingBlankRow(currentRow, currentRow.node.id);
+                        resetPendingDraft(currentParts.after);
+                      },
+                    });
+                    focusNode(created.id, 0, currentParts.after);
+                  });
                 return true;
               },
             },
             {
               key: "Tab",
               run: () => {
-                const index = rowsRef.current.findIndex((row) => row.node.id === editingRow.node.id);
-                const current = rowsRef.current[index];
-                if (!current) return true;
-                const previousSiblingId = previousSiblingForDepth(rowsRef.current, index, current.depth);
-                if (!previousSiblingId) return true;
-                void onMoveNode({ nodeId: editingRow.node.id, parentId: previousSiblingId, afterNodeId: null });
+                if (composingRef.current) return true;
+                void enqueueStructuralMutation(async () => {
+                  const index = rowsRef.current.findIndex((row) => row.node.id === editingRow.node.id);
+                  const current = rowsRef.current[index];
+                  if (!current) return;
+                  // Tab semantics intentionally use the immediate previous
+                  // same-depth sibling, never a visible descendant.
+                  const session = editorSessionFor(current.node.id);
+                  if (session) await commitNodeDraft(current.node.id, session.view.state.doc.toString(), current);
+                  const latestIndex = rowsRef.current.findIndex((row) => row.node.id === current.node.id);
+                  const latestCurrent = rowsRef.current[latestIndex];
+                  if (!latestCurrent) return;
+                  const previous = previousSiblingRow(rowsRef.current, latestIndex);
+                  if (!previous) return;
+                  await onMoveNode({ nodeId: latestCurrent.node.id, parentId: previous.node.id, afterNodeId: null });
+                });
                 return true;
               },
             },
             {
               key: "Shift-Tab",
               run: () => {
-                const index = rowsRef.current.findIndex((row) => row.node.id === editingRow.node.id);
-                const current = rowsRef.current[index];
-                if (!current || current.depth <= 0) return true;
-                const parentId = parentForDepth(rowsRef.current, index, current.depth - 1);
-                const afterNodeId = previousSiblingForDepth(rowsRef.current, index, current.depth - 1);
-                void onMoveNode({ nodeId: editingRow.node.id, parentId, afterNodeId });
+                if (composingRef.current) return true;
+                void enqueueStructuralMutation(async () => {
+                  const index = rowsRef.current.findIndex((row) => row.node.id === editingRow.node.id);
+                  const current = rowsRef.current[index];
+                  if (!current || current.depth <= 0) return;
+                  const session = editorSessionFor(current.node.id);
+                  if (session) await commitNodeDraft(current.node.id, session.view.state.doc.toString(), current);
+                  const latestIndex = rowsRef.current.findIndex((row) => row.node.id === current.node.id);
+                  const latestCurrent = rowsRef.current[latestIndex];
+                  if (!latestCurrent || latestCurrent.depth <= 0) return;
+                  const targetDepth = latestCurrent.depth - 1;
+                  // depth 0 まで戻る場合の親は表示中のページ。parentForDepth は null を返すため、
+                  // そのまま渡すとノードがワークスペース直下へ飛び出してページから消える。
+                  const parentId = targetDepth === 0
+                    ? pageParentIdRef.current
+                    : parentForDepth(rowsRef.current, latestIndex, targetDepth);
+                  if (targetDepth === 0 && !parentId) return;
+                  const previous = previousSiblingRow(rowsRef.current, latestIndex);
+                  const afterNodeId = previous && previous.depth === targetDepth && previous.node.parent_id === parentId
+                    ? previous.node.id
+                    : previousSiblingForParent(rowsRef.current, latestIndex, targetDepth, parentId);
+                  await onMoveNode({ nodeId: latestCurrent.node.id, parentId, afterNodeId });
+                });
                 return true;
               },
             },
@@ -1627,7 +2458,7 @@ export function OutlineBlockEditor({
                   return true;
                 }
                 const column = view.state.selection.main.head;
-                void commitCurrent();
+                void commitNodeDraft(editingRow.node.id, view.state.doc.toString(), editingRow).catch(() => undefined);
                 const previous = previousVisibleNode(rowsRef.current, editingRow.node.id);
                 if (!previous) {
                   onNavigateToDocumentTitle?.();
@@ -1667,7 +2498,7 @@ export function OutlineBlockEditor({
                   return true;
                 }
                 const column = view.state.selection.main.head;
-                void commitCurrent();
+                void commitNodeDraft(editingRow.node.id, view.state.doc.toString(), editingRow).catch(() => undefined);
                 if (focusFirstDetail(editingRow.node.id)) return true;
                 const target = nextVisibleNode(rowsRef.current, editingRow.node.id);
                 if (!target) return false;
@@ -1678,40 +2509,116 @@ export function OutlineBlockEditor({
             {
               key: "Backspace",
               run: (view) => {
-                if (view.state.selection.main.head !== 0) return false;
-                const currentKind = docsBlockKind(editingRow.node);
-                if (currentKind === "heading_1" || currentKind === "heading_2" || currentKind === "heading_3") {
-                  void onCommitTitle(editingRow.node, view.state.doc.toString(), {
-                    body_json: { ...editingRow.node.body_json, ...blockJsonForKind("paragraph") },
-                    display_props: { ...editingRow.node.display_props, show_checkbox: false },
-                  });
+                if (selectedNodeIds.size > 1) {
+                  if (!view.state.selection.main.empty) return false;
                   return true;
                 }
-                const previous = previousVisibleNode(rowsRef.current, editingRow.node.id);
-                if (!previous) return false;
-                const merged = `${previous.node.title}${view.state.doc.toString()}`;
-                void (async () => {
-                  await onCommitTitle(previous.node, merged);
-                  await onArchiveNode(editingRow.node);
+                // A normal text selection belongs to CodeMirror. Never turn
+                // a collapsed structural operation into a merge/archive.
+                if (!view.state.selection.main.empty) return false;
+                if (view.state.selection.main.head !== 0) return false;
+                if (composingRef.current) return true;
+                void enqueueStructuralMutation(async () => {
+                  const currentIndex = rowsRef.current.findIndex((row) => row.node.id === editingRow.node.id);
+                  const current = rowsRef.current[currentIndex];
+                  if (!current) return;
+                  const currentSession = editorSessionFor(current.node.id);
+                  const currentText = currentSession?.view.state.doc.toString() ?? view.state.doc.toString();
+                  const currentKind = docsBlockKind(current.node);
+                  if (currentKind === "heading_1" || currentKind === "heading_2" || currentKind === "heading_3") {
+                    await onCommitTitle(current.node, currentText, {
+                      body_json: hasMeaningfulBlockTitle(currentText)
+                        ? { ...current.node.body_json, ...blockJsonForKind("paragraph") }
+                        : blankParagraphBodyJson(current.node.body_json),
+                      body_text: currentText,
+                      node_type: "node",
+                      display_props: { ...current.node.display_props, show_checkbox: false },
+                    });
+                    return;
+                  }
+                  const hasChildRows = hasChildren(current, rowsRef.current, currentIndex) || Boolean(nodeHasChildren?.(current.node.id));
+                  if (current.depth > 0) {
+                    // Backspace on an indented row is an outdent, not a merge.
+                    await commitNodeDraft(current.node.id, currentText, current);
+                    const latestIndex = rowsRef.current.findIndex((row) => row.node.id === current.node.id);
+                    const latest = rowsRef.current[latestIndex];
+                    if (!latest || latest.depth <= 0) return;
+                    const targetDepth = latest.depth - 1;
+                    const parentId = targetDepth === 0
+                      ? pageParentIdRef.current
+                      : parentForDepth(rowsRef.current, latestIndex, targetDepth);
+                    if (targetDepth === 0 && !parentId) return;
+                    const previous = previousSiblingForParent(rowsRef.current, latestIndex, targetDepth, parentId);
+                    await onMoveNode({ nodeId: latest.node.id, parentId, afterNodeId: previous });
+                    return;
+                  }
+                  if (hasChildRows) return;
+                  const previous = previousSiblingRow(rowsRef.current, currentIndex);
+                  if (isExplicitBlankParagraph(current.node.title, current.node.body_json, current.node.node_type)) {
+                    if (!previous) {
+                      await onArchiveNode(current.node);
+                      onNavigateToDocumentTitle?.();
+                    } else {
+                      await onArchiveNode(current.node);
+                      focusNode(previous.node.id, previous.node.title.length);
+                    }
+                    return;
+                  }
+                  if (!previous) return;
+                  const merged = `${previous.node.title}${currentText}`;
+                  // Archive only after the target save succeeds. A rejected
+                  // commit leaves both nodes and the user's draft intact.
+                  await onCommitTitle(
+                    previous.node,
+                    merged,
+                    isExplicitBlankParagraph(previous.node.title, previous.node.body_json, previous.node.node_type)
+                      ? { body_json: clearBlankParagraphMarker(previous.node.body_json), body_text: merged, node_type: "node" }
+                      : undefined,
+                  );
+                  await onArchiveNode(current.node);
                   focusNode(previous.node.id, previous.node.title.length);
-                })();
+                });
                 return true;
               },
             },
             {
               key: "Delete",
               run: (view) => {
+                if (selectedNodeIds.size > 1) {
+                  if (!view.state.selection.main.empty) return false;
+                  return true;
+                }
+                if (!view.state.selection.main.empty) return false;
                 if (view.state.selection.main.head !== view.state.doc.length) return false;
-                const next = nextVisibleNode(rowsRef.current, editingRow.node.id);
-                if (!next) return false;
-                const merged = `${view.state.doc.toString()}${next.node.title}`;
-                void (async () => {
-                  setDraft(merged);
-                  draftRef.current = merged;
-                  await onCommitTitle(editingRow.node, merged);
+                if (composingRef.current) return true;
+                void enqueueStructuralMutation(async () => {
+                  const currentIndex = rowsRef.current.findIndex((row) => row.node.id === editingRow.node.id);
+                  const current = rowsRef.current[currentIndex];
+                  if (!current) return;
+                  const currentSession = editorSessionFor(current.node.id);
+                  const currentText = currentSession?.view.state.doc.toString() ?? view.state.doc.toString();
+                  const next = nextSiblingRow(rowsRef.current, currentIndex);
+                  if (!next) return;
+                  const nextIndex = rowsRef.current.findIndex((row) => row.node.id === next.node.id);
+                  const nextHasChildren = hasChildren(next, rowsRef.current, nextIndex) || Boolean(nodeHasChildren?.(next.node.id));
+                  if (nextHasChildren) return;
+                  const merged = `${currentText}${next.node.title}`;
+                  const mergedPatch = isExplicitBlankParagraph(current.node.title, current.node.body_json, current.node.node_type)
+                    ? { body_json: clearBlankParagraphMarker(current.node.body_json), body_text: merged, node_type: "node" as const }
+                    : undefined;
+                  syncCommittedEditorDraft(current.node.id, merged, {
+                    ...current,
+                    node: { ...current.node, ...(mergedPatch ?? {}), title: merged, body_text: merged },
+                  });
+                  await onCommitTitle(
+                    current.node,
+                    merged,
+                    mergedPatch,
+                  );
+                  onCommitSuccess?.(current.node.id, merged);
                   await onArchiveNode(next.node);
-                  focusNode(editingRow.node.id, view.state.doc.length);
-                })();
+                  focusNode(current.node.id, view.state.doc.length);
+                });
                 return true;
               },
             },
@@ -1727,11 +2634,16 @@ export function OutlineBlockEditor({
                   return true;
                 }
                 if (composingRef.current) return false;
-                void commitCurrent().then(() => {
+                void commitNodeDraft(editingRow.node.id, view.state.doc.toString(), editingRow).then(() => {
+                  if (editorSessionRef.current?.nodeId === editingRow.node.id) {
+                    editorSessionRef.current = null;
+                    editorViewRef.current = null;
+                  }
+                  editingNodeIdRef.current = null;
                   setEditingNodeId(null);
                   onFocused(null);
                   requestAnimationFrame(() => editorRootRef.current?.focus());
-                });
+                }).catch(() => undefined);
                 return true;
               },
             },
@@ -1739,27 +2651,39 @@ export function OutlineBlockEditor({
             ...defaultKeymap,
           ])),
           EditorView.domEventHandlers({
+            keydown(event) {
+              // CodeMirror keymaps do not expose the native KeyboardEvent to
+              // each command. Stop all structural commands while an IME has an
+              // active composition, including synthetic isComposing events.
+              if (event.isComposing || composingRef.current) return true;
+              return false;
+            },
             compositionstart() {
               composingRef.current = true;
               return false;
             },
             compositionend() {
               composingRef.current = false;
-              const currentView = editorViewRef.current;
-              if (currentView) applyInputMarkdownShortcut(currentView);
+              const currentSession = editorSessionRef.current;
+              if (currentSession?.nodeId === editorNodeId) applyInputMarkdownShortcut(currentSession.view);
               return false;
             },
             blur(_event, view) {
+              const activeSession = editorSessionRef.current;
+              if (activeSession?.nodeId !== editorNodeId || activeSession.view !== view) return false;
               setCaretColumn(view.state.selection.main.head);
               setUrlChoice(null);
               updateInlineSuggestion(null);
               setSlashCommand(null);
-              // 初回focus直後や展開・格納による再描画では、draft同期の
-              // passive effectより先にblurする場合がある。常に現在表示中の
-              // CodeMirror文書を正本にしてから保存し、空の古いrefで既存
-              // タイトルを上書きしない。
-              draftRef.current = view.state.doc.toString();
-              void commitCurrent();
+              const currentText = view.state.doc.toString();
+              draftRef.current = currentText;
+              draftNodeIdRef.current = editorNodeId;
+              const historyReconciled = activeSession.historyCanonicalTitle !== null
+                && activeSession.historyRevision > 0
+                && currentText === activeSession.historyCanonicalTitle;
+              if (explicitCommandCommitRef.current !== editorNodeId && !historyReconciled) {
+                void commitNodeDraft(editorNodeId, currentText, activeSession.row).catch(() => undefined);
+              }
               return false;
             },
             click(event) {
@@ -1812,25 +2736,46 @@ export function OutlineBlockEditor({
           }),
           EditorView.updateListener.of((update: ViewUpdate) => {
             if (!update.docChanged && !update.selectionSet) return;
+            const activeSession = editorSessionRef.current;
+            if (activeSession?.nodeId !== editorNodeId || activeSession.view !== update.view) return;
             const nextText = update.state.doc.toString();
             const head = update.state.selection.main.head;
             setDraft(nextText);
             draftRef.current = nextText;
+            draftNodeIdRef.current = editorNodeId;
             setCaretColumn(head);
-            if (update.docChanged) onDraftChange?.(editingRow.node, nextText);
+            if (update.docChanged) {
+              editorUserEditedRef.current = true;
+              onDraftChange?.(editingRow.node, nextText);
+            }
             if (update.docChanged && !composingRef.current && applyInputMarkdownShortcut(update.view)) return;
             const before = nextText.slice(0, head);
             const after = nextText.slice(head);
             const coords = update.view.coordsAtPos(head);
             // 行頭または空白直後の `/文字列` を汎用スラッシュコマンドのトリガーにする（URL の // は非対象）。
             const slashMatch = before.match(/(^|\s)\/((?:field\s+ai)|[^\s/]*)$/i);
+            const activeFieldSuggestion =
+              inlineSuggestionRef.current?.kind === "field" &&
+              inlineSuggestionRef.current.nodeId === editingRow.node.id
+                ? inlineSuggestionRef.current
+                : null;
             // 新規入力中の [[ だけ補完対象にする。既存参照/ファイルリンク([[node:.. / [[file:.. )は
             // : / | を含むため発火させない（＝サジェストが消えない/全パスが並ぶ不具合の防止）。
             const refMatch = (slashMatch || after.startsWith("]]")) ? null : before.match(/\[\[([^\]\n:/|]*)$/);
             const tagMatch = slashMatch || refMatch ? null : before.match(/(^|\s)#([\p{L}\p{N}_-]*)$/u);
             const taskMatch = slashMatch || refMatch || tagMatch ? null : before.match(/(^|\s)@task(?:\s+([^\n]*))?$/iu);
             const userMatch = slashMatch || refMatch || tagMatch || taskMatch ? null : before.match(/(^|\s)@([\p{L}\p{N}_@._-]*)$/u);
-            if (slashMatch && coords) {
+            if (activeFieldSuggestion && head >= activeFieldSuggestion.from && coords) {
+              setSlashCommand(null);
+              updateInlineSuggestion({
+                ...activeFieldSuggestion,
+                query: nextText.slice(activeFieldSuggestion.from, head),
+                to: head,
+                x: coords.left,
+                y: coords.bottom + 8,
+              });
+              setInlineIndex(0);
+            } else if (slashMatch && coords) {
               const query = slashMatch[2] ?? "";
               setSlashCommand({ nodeId: editingRow.node.id, query, from: head - query.length - 1, to: head, x: coords.left, y: coords.bottom + 8 });
               setSlashIndex(0);
@@ -1869,11 +2814,32 @@ export function OutlineBlockEditor({
       }),
     });
     editorViewRef.current = view;
+    editorUserEditedRef.current = false;
+    const editorSession = {
+      nodeId: editorNodeId,
+      row: editingRow,
+      view,
+      historyRevision: 0,
+      historyCanonicalTitle: null as string | null,
+    };
+    editorSessionRef.current = editorSession;
     view.focus();
-    return () => {
+      return () => {
+        const currentText = view.state.doc.toString();
+        if (draftNodeIdRef.current === editorNodeId) draftRef.current = currentText;
+        const explicitlyCommitted = explicitCommandCommitRef.current === editorNodeId;
+        const canonicalTitle = rowsRef.current.find((row) => row.node.id === editorNodeId)?.node.title ?? editingRow.node.title;
+        const historyAlreadyApplied = editorSession.historyRevision > 0
+          && editorSession.historyCanonicalTitle !== null
+          && currentText === editorSession.historyCanonicalTitle;
+        if (!explicitlyCommitted && !historyAlreadyApplied && currentText !== canonicalTitle) {
+          void commitNodeDraft(editorNodeId, currentText, editorSession.row).catch(() => undefined);
+        }
+        if (explicitlyCommitted) explicitCommandCommitRef.current = null;
+      if (editorSessionRef.current?.view === view) editorSessionRef.current = null;
+      if (editorViewRef.current === view) editorViewRef.current = null;
       view.destroy();
       if (editorThemeCompartmentRef.current === themeCompartment) editorThemeCompartmentRef.current = null;
-      if (editorViewRef.current === view) editorViewRef.current = null;
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editingRow?.node.id, outlineVirtualized]);
@@ -1882,12 +2848,14 @@ export function OutlineBlockEditor({
     let afterNodeId: string | null = anchorRow.node.id;
     const stack: Array<{ depth: number; node: DocsNode }> = [{ depth: anchorRow.depth, node: anchorRow.node }];
     for (const block of blocks) {
+      if (!hasMeaningfulBlockTitle(block.title) && !block.blank) continue;
       while (stack.length > 0 && (stack.at(-1)?.depth ?? 0) >= anchorRow.depth + 1 + block.depth) stack.pop();
       const parent = stack.at(-1)?.node ?? anchorRow.node;
       const created = await onCreateNode({
         parentId: parent.id,
         afterNodeId,
         title: block.title,
+        blank: block.blank === true,
         kind: block.kind,
         checked: block.checked,
       });
@@ -1911,7 +2879,8 @@ export function OutlineBlockEditor({
     const row = rowsRef.current.find((item) => item.node.id === urlChoice.nodeId);
     if (!row) return;
     const fallbackLabel = hostLabelForUrl(urlChoice.url);
-    const sourceTitle = editingNodeId === row.node.id ? draftRef.current : row.node.title;
+    const session = editorSessionFor(row.node.id);
+    const sourceTitle = session ? session.view.state.doc.toString() : row.node.title;
     const replaceUrl = (value: string, label: string) =>
       `${value.slice(0, urlChoice.from)}[${label}](${urlChoice.url})${value.slice(urlChoice.to)}`;
     const synchronousLink = replaceUrl(sourceTitle, fallbackLabel);
@@ -1921,12 +2890,13 @@ export function OutlineBlockEditor({
         : mode === "bookmark"
           ? `${sourceTitle.slice(0, urlChoice.from)}${fallbackLabel} ${urlChoice.url}${sourceTitle.slice(urlChoice.to)}`
           : sourceTitle;
-    if (editingNodeId === row.node.id && editorViewRef.current) {
-      editorViewRef.current.dispatch({
-        changes: { from: 0, to: editorViewRef.current.state.doc.length, insert: next },
+    if (session) {
+      session.view.dispatch({
+        changes: { from: 0, to: session.view.state.doc.length, insert: next },
         selection: EditorSelection.cursor(Math.min(next.length, urlChoice.from + next.length - sourceTitle.length)),
       });
       draftRef.current = next;
+      draftNodeIdRef.current = row.node.id;
       setDraft(next);
     }
     await onCommitTitle(row.node, next);
@@ -1940,12 +2910,14 @@ export function OutlineBlockEditor({
     const label = preview?.title || fallbackLabel;
     const titled = mode === "link" ? replaceUrl(sourceTitle, label) : next;
     if (label !== fallbackLabel || mode === "bookmark") {
-      if (editingNodeId === row.node.id && editorViewRef.current && mode === "link") {
-        editorViewRef.current.dispatch({
-          changes: { from: 0, to: editorViewRef.current.state.doc.length, insert: titled },
+      const currentSession = editorSessionFor(row.node.id);
+      if (currentSession && mode === "link") {
+        currentSession.view.dispatch({
+          changes: { from: 0, to: currentSession.view.state.doc.length, insert: titled },
           selection: EditorSelection.cursor(Math.min(titled.length, urlChoice.from + titled.length - sourceTitle.length)),
         });
         draftRef.current = titled;
+        draftNodeIdRef.current = row.node.id;
         setDraft(titled);
       }
       await onCommitTitle(row.node, titled, mode === "bookmark" ? { body_json: { ...row.node.body_json, bookmark: { url: urlChoice.url, title: label, description: preview?.description ?? "", domain: preview?.domain ?? fallbackLabel, favicon: preview?.favicon ?? "" } } } : undefined);
@@ -1953,8 +2925,8 @@ export function OutlineBlockEditor({
   };
 
   const applyInlineSuggestion = async (suggestion: InlineSuggestion, value: string, tag?: DocsSupertag) => {
-    const view = editorViewRef.current;
-    if (!view || editingNodeId !== suggestion.nodeId) return;
+    const view = editorSessionFor(suggestion.nodeId)?.view;
+    if (!view) return;
     caretColumnRef.current = suggestion.from + value.length;
     view.dispatch({
       changes: { from: suggestion.from, to: suggestion.to, insert: value },
@@ -1971,6 +2943,10 @@ export function OutlineBlockEditor({
   };
 
   const handleCopy = (event: ReactClipboardEvent<HTMLDivElement>) => {
+    // Let the browser copy an actual native text range verbatim. In
+    // particular, a multi-node selection can coexist with selectedNodeIds;
+    // never replace the range with outline serialization in that case.
+    if (hasNativeDocsTextSelection(event.currentTarget)) return;
     const selected = rows.filter((row) => selectedNodeIds.has(row.node.id));
     if (selected.length <= 1) return;
     event.preventDefault();
@@ -2031,10 +3007,433 @@ export function OutlineBlockEditor({
     }
   }, [moveDialog, onMoveToPage]);
 
+  const blankRow = pendingBlankRow ?? (
+    rows.length === 0 && emptyParentId
+      ? { parentId: emptyParentId, afterNodeId: null, kind: "paragraph" as const, depth: 0 }
+      : null
+  );
+  const pendingBlankInsertionIndex = pendingBlankRow
+    ? (() => {
+        if (pendingBlankRow.afterNodeId) {
+          const anchorIndex = rows.findIndex((row) => row.node.id === pendingBlankRow.afterNodeId);
+          if (anchorIndex < 0) return rows.length;
+          let index = anchorIndex + 1;
+          while (index < rows.length && rows[index].depth > rows[anchorIndex].depth) index += 1;
+          return index;
+        }
+        const firstSibling = rows.findIndex((row) =>
+          row.node.parent_id === pendingBlankRow.parentId && row.depth === pendingBlankRow.depth,
+        );
+        return firstSibling >= 0 ? firstSibling : rows.length;
+      })()
+    : -1;
+  const pendingFieldAnchorRow = pendingBlankRow?.afterNodeId
+    ? rows.find((item) => item.node.id === pendingBlankRow.afterNodeId) ?? null
+    : null;
+  const pendingFieldOwnerRow = pendingFieldAnchorRow
+    ?? (pendingBlankRow?.parentId
+      ? (() => {
+          const parent = nodes.find((item) => item.id === pendingBlankRow.parentId);
+          if (!parent) return null;
+          // fieldCandidatesForRow resolves the fields from row.node.parent_id.
+          // A pending child has no persisted row yet, so provide the same
+          // relationship on a lightweight row projection instead of creating
+          // an empty database node merely to open `/field` suggestions.
+          return {
+            node: { ...parent, parent_id: pendingBlankRow.parentId },
+            depth: pendingBlankRow.depth,
+            checked: false,
+            tags: [],
+          } as OutlineEditorRow;
+        })()
+      : null);
+  const pendingFieldCandidates = pendingFieldAnchorRow
+    ? (fieldCandidatesForRow?.(pendingFieldAnchorRow) ?? pendingFieldAnchorRow.fields ?? [])
+    : pendingFieldOwnerRow
+      ? (fieldCandidatesForRow?.(pendingFieldOwnerRow) ?? pendingFieldOwnerRow.fields ?? [])
+      : [];
+  const renderBlankRowInput = (row: PendingBlankRow, key?: string) => (
+    <div
+      key={key}
+      data-docs-blank-row
+      className={cn(
+        "group relative rounded-md px-1 py-0 transition-colors hover:bg-muted/30",
+        row.kind === "heading_1" ? "mt-8" : row.kind === "heading_2" ? "mt-6" : row.kind === "heading_3" ? "mt-4" : null,
+      )}
+      style={{ marginLeft: row.depth * 24 }}
+      tabIndex={-1}
+    >
+      <div className="grid min-w-0 grid-cols-[44px_1fr_28px] items-start gap-1">
+        <div className={cn("flex items-center", row.kind === "heading_1" ? "mt-3" : row.kind === "heading_2" ? "mt-1.5" : "mt-1")}>
+          <span
+            aria-hidden="true"
+            className="grid size-5 place-items-center rounded text-muted-foreground opacity-0 transition-opacity group-hover:opacity-70"
+          >
+            <GripVertical className="size-3.5" />
+          </span>
+          <span className="grid size-5 place-items-center rounded text-muted-foreground" aria-hidden="true">
+            <span className="size-1.5 rounded-full bg-current" />
+          </span>
+        </div>
+        <div className={cn("min-h-7 min-w-0 cursor-text", docsRowBlockClass(row.kind))}>
+          <input
+            autoFocus={pendingBlankAutoFocus && !pendingBlankCommit}
+            disabled={pendingBlankCommit}
+            aria-busy={pendingBlankCommit || undefined}
+            aria-label={rows.length === 0 && !pendingBlankRow ? "最初のノード" : "空行（入力するとノードとして保存）"}
+            data-docs-blank-row-input
+            className="h-7 w-full border-0 bg-transparent px-0 text-[15px] leading-7 outline-none placeholder:text-muted-foreground"
+            value={emptyDraft}
+            placeholder="入力を開始…"
+            onChange={(event) => {
+              const nextValue = event.target.value;
+              recordPendingDraft(nextValue);
+              if (!pendingFieldSuggestion) return;
+              const slashMatch = nextValue.trim().match(/^\/field(?:\s*(.*))?$/i);
+              if (!slashMatch) {
+                setPendingFieldSuggestion(null);
+                return;
+              }
+              const query = (slashMatch[1] ?? "").trim();
+              const candidates = pendingFieldCandidates.filter((field) =>
+                !query || field.name.toLowerCase().includes(query.toLowerCase()),
+              );
+              setPendingFieldSuggestion((current) => current
+                ? { ...current, candidates, activeIndex: 0, query }
+                : current);
+            }}
+            onBlur={(event) => {
+              // A failed optimistic POST may arrive after the user has moved
+              // to another row. Invalidate only that stale create generation;
+              // moving between successive pending rows keeps the generation.
+              const related = event.relatedTarget;
+              const remainsInPendingRow = related instanceof Element
+                && Boolean(related.closest("[data-docs-blank-row]"));
+              if (!remainsInPendingRow && (pendingCreateIdRef.current || pendingBlankCommitRef.current)) {
+                pendingCreateFocusRef.current = false;
+                if (related instanceof HTMLElement) {
+                  pendingExternalFocusRef.current = related;
+                }
+                setPendingBlankAutoFocus(false);
+              }
+            }}
+            onKeyDown={(event) => {
+              if (event.nativeEvent.isComposing) return;
+              const keyName = event.key.toLowerCase();
+              if ((event.ctrlKey || event.metaKey) && !event.altKey && (keyName === "z" || keyName === "y")) {
+                event.preventDefault();
+                const redoRequested = keyName === "y" || event.shiftKey;
+                // The pending input owns its local text history first. Only
+                // once exhausted does this key reach Workspace history.
+                const handledLocally = stepPendingDraftHistory(redoRequested ? 1 : -1);
+                if (handledLocally) {
+                  setPendingFieldSuggestion(null);
+                  setPendingField(null);
+                  pendingFieldCreateRef.current = null;
+                  return;
+                }
+                const fallback = redoRequested ? onRedoRef.current : onUndoRef.current;
+                if (fallback) void Promise.resolve(fallback());
+                return;
+              }
+              if (!pendingFieldSuggestion && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+                const insertionIndex = pendingBlankRow ? pendingBlankInsertionIndex : rows.length;
+                const targetIndex = insertionIndex + (event.key === "ArrowUp" ? -1 : 0);
+                const target = rowsRef.current[targetIndex];
+                if (target) {
+                  event.preventDefault();
+                  focusNode(target.node.id, event.key === "ArrowUp" ? target.node.title.length : 0);
+                }
+                return;
+              }
+              if (pendingFieldSuggestion) {
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  setPendingFieldSuggestion(null);
+                  return;
+                }
+                if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+                  event.preventDefault();
+                  setPendingFieldSuggestion((current) => {
+                    if (!current || current.candidates.length === 0) return current;
+                    const delta = event.key === "ArrowDown" ? 1 : -1;
+                    return {
+                      ...current,
+                      activeIndex: (current.activeIndex + delta + current.candidates.length) % current.candidates.length,
+                    };
+                  });
+                  return;
+                }
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  const field = pendingFieldSuggestion.candidates[pendingFieldSuggestion.activeIndex];
+                  if (field) {
+                    setPendingField(field);
+                    setPendingFieldSuggestion(null);
+                    pendingFieldCreateRef.current = null;
+                    resetPendingDraft(`${field.name}: `);
+                    requestAnimationFrame(() => {
+                      editorRootRef.current?.querySelector<HTMLInputElement>("[data-docs-blank-row-input]")?.focus();
+                    });
+                  } else if (pendingFieldSuggestion.query && pendingFieldOwnerRow && onCreateFieldCandidateRef.current) {
+                    const name = pendingFieldSuggestion.query;
+                    const promise = Promise.resolve()
+                      .then(() => onCreateFieldCandidateRef.current?.(pendingFieldOwnerRow, name) ?? null);
+                    pendingFieldCreateRef.current = { name, promise };
+                    setPendingFieldSuggestion(null);
+                    resetPendingDraft(`${name}: `);
+                    void promise.then((createdField) => {
+                      if (pendingFieldCreateRef.current?.promise !== promise) return;
+                      if (createdField) {
+                        setPendingField(createdField);
+                      } else {
+                        pendingFieldCreateRef.current = null;
+                        resetPendingDraft("");
+                      }
+                    }).catch((error: unknown) => {
+                      if (pendingFieldCreateRef.current?.promise !== promise) return;
+                      pendingFieldCreateRef.current = null;
+                      resetPendingDraft("");
+                      toast.error(error instanceof Error ? error.message : "Fieldの作成に失敗しました");
+                    });
+                  }
+                  return;
+                }
+              }
+              if ((pendingField || pendingFieldCreateRef.current) && event.key === "Enter" && hasMeaningfulBlockTitle(emptyDraft)) {
+                event.preventDefault();
+                const parent = pendingBlankRowRef.current?.parentId
+                  ? nodes.find((item) => item.id === pendingBlankRowRef.current?.parentId) ?? null
+                  : null;
+                if (!parent) return;
+                const selectedField = pendingField;
+                const pendingCreation = pendingFieldCreateRef.current;
+                const prefix = selectedField
+                  ? `${selectedField.name}: `
+                  : pendingCreation
+                    ? `${pendingCreation.name}: `
+                    : "";
+                const rawValue = prefix && emptyDraft.startsWith(prefix) ? emptyDraft.slice(prefix.length) : emptyDraft;
+                pendingBlankCommitRef.current = true;
+                setPendingBlankCommit(true);
+                void Promise.resolve()
+                  .then(() => pendingCreation?.promise ?? selectedField)
+                  .then((resolvedField) => {
+                    if (!resolvedField) throw new Error("Fieldの作成に失敗しました");
+                    return onSaveField(parent, resolvedField, rawValue);
+                  })
+                  .then(() => {
+                    pendingFieldCreateRef.current = null;
+                    setPendingField(null);
+                    resetPendingDraft("");
+                  })
+                  .catch((error: unknown) => {
+                    toast.error(error instanceof Error ? error.message : "フィールドの保存に失敗しました");
+                  })
+                  .finally(() => {
+                    pendingBlankCommitRef.current = false;
+                    setPendingBlankCommit(false);
+                    requestAnimationFrame(() => {
+                      editorRootRef.current?.querySelector<HTMLInputElement>("[data-docs-blank-row-input]")?.focus();
+                    });
+                  });
+                return;
+              }
+              if (event.key === "Tab") {
+                event.preventDefault();
+                const current = pendingBlankRowRef.current ?? row;
+                const anchor = current.afterNodeId
+                  ? rowsRef.current.find((item) => item.node.id === current.afterNodeId) ?? null
+                  : null;
+                if (event.shiftKey) {
+                  const parent = current.parentId
+                    ? nodes.find((item) => item.id === current.parentId) ?? null
+                    : null;
+                  pendingAnchorMemoryRef.current = parent?.id ?? null;
+                  setPendingBlankRow({
+                    ...current,
+                    parentId: parent?.parent_id ?? null,
+                    afterNodeId: parent?.id ?? null,
+                    depth: Math.max(0, current.depth - 1),
+                  });
+                } else if (anchor) {
+                  const childDepth = anchor.depth + 1;
+                  const lastChild = rowsRef.current
+                    .filter((item) => item.node.parent_id === anchor.node.id && item.depth === childDepth)
+                    .at(-1);
+                  pendingAnchorMemoryRef.current = lastChild?.node.id ?? null;
+                  setPendingBlankRow({
+                    ...current,
+                    parentId: anchor.node.id,
+                    // createNode treats a null after-node as append. Anchor
+                    // the pending row after the current last child so the
+                    // visual insertion and persisted sort order agree.
+                    afterNodeId: lastChild?.node.id ?? null,
+                    depth: childDepth,
+                  });
+                }
+                return;
+              }
+              if (event.key === "Escape") {
+                event.preventDefault();
+                if (!pendingBlankCommitRef.current) {
+                  pendingCreateGenerationRef.current += 1;
+                  pendingCreateIdRef.current = null;
+                  setPendingBlankAutoFocus(false);
+                  pendingFieldCreateRef.current = null;
+                  setPendingFieldSuggestion(null);
+                  setPendingField(null);
+                  resetPendingDraft("");
+                  if (pendingBlankRow) setPendingBlankRow(null);
+                }
+                return;
+              }
+              if (event.key !== "Enter" || !hasMeaningfulBlockTitle(emptyDraft) || pendingBlankCommitRef.current) return;
+              event.preventDefault();
+              const title = emptyDraft;
+              const slashFieldMatch = title.trim().match(/^\/field(?:\s*.*)?$/i);
+              if (slashFieldMatch) {
+                const query = title.trim().slice("/field".length).trim().toLowerCase();
+                const candidates = pendingFieldCandidates.filter((field) => !query || field.name.toLowerCase().includes(query));
+                setPendingFieldSuggestion({ candidates, activeIndex: 0, query });
+                return;
+              }
+              const currentInsertion = pendingBlankRowRef.current ?? row;
+              // Resolve the anchor against the latest projection.  A Tab,
+              // Shift+Tab, or D&D can move it while this editor-only row is
+              // open, and creating against the original parent would place a
+              // node in the wrong hierarchy.
+              const anchor = currentInsertion.afterNodeId
+                ? rowsRef.current.find((item) => item.node.id === currentInsertion.afterNodeId)
+                : null;
+              const insertion: PendingBlankRow = anchor
+                ? {
+                    parentId: anchor.node.parent_id,
+                    afterNodeId: anchor.node.id,
+                    kind: currentInsertion.kind,
+                    depth: anchor.depth,
+                  }
+                : currentInsertion;
+              const markdownShortcut = markdownShortcutPatchForTitle(title, insertion.kind);
+              const persistedTitle = markdownShortcut?.title ?? title;
+              const persistedKind = markdownShortcut?.kind ?? insertion.kind;
+              const createGeneration = pendingCreateGenerationRef.current + 1;
+              pendingCreateGenerationRef.current = createGeneration;
+              pendingCreateFocusRef.current = true;
+              pendingBlankCommitRef.current = true;
+              pendingCreateIdRef.current = null;
+              setPendingBlankCommit(true);
+              void Promise.resolve()
+                .then(() => onCreateNode({
+                  parentId: insertion.parentId,
+                  afterNodeId: insertion.afterNodeId,
+                  title: persistedTitle,
+                  kind: persistedKind,
+                  checked: markdownShortcut?.checked,
+                  focusOnCreate: false,
+                  onPersistenceError: (nodeId) => {
+                    // The callback is delivered by the workspace after the
+                    // optimistic node's id is known.  Ignore failures from an
+                    // older row once the user has already moved on.
+                    if (pendingCreateGenerationRef.current !== createGeneration) return;
+                    if (pendingCreateIdRef.current && pendingCreateIdRef.current !== nodeId) return;
+                    pendingCreateGenerationRef.current += 1;
+                    pendingCreateIdRef.current = null;
+                    pendingCreateFocusRef.current = false;
+                    pendingBlankCommitRef.current = false;
+                    setPendingBlankCommit(false);
+                    pendingKindRef.current = insertion.kind;
+                    setPendingBlankRow(insertion);
+                    resetPendingDraft(title);
+                    const activeElement = document.activeElement;
+                    const externalTarget = pendingExternalFocusRef.current;
+                    if (externalTarget && !externalTarget.isConnected) pendingExternalFocusRef.current = null;
+                    const shouldFocus = !activeElement
+                      || activeElement === document.body
+                      || Boolean(activeElement.closest("[data-docs-blank-row]"));
+                    // Keep an external selection (for example the page title)
+                    // authoritative. If rollback rendering drops it to body,
+                    // restore that exact element after the pending row is
+                    // rendered instead of allowing autoFocus to win.
+                    if (!shouldFocus && activeElement instanceof HTMLElement) {
+                      pendingExternalFocusRef.current = activeElement;
+                    }
+                    pendingRollbackFocusRef.current = externalTarget
+                      ?? (activeElement instanceof HTMLElement && !shouldFocus ? activeElement : null);
+                    setPendingRollbackFocusRevision((current) => current + 1);
+                    const hasLiveExternalTarget = Boolean(pendingExternalFocusRef.current?.isConnected);
+                    setPendingBlankAutoFocus(shouldFocus && !hasLiveExternalTarget);
+                    pendingAnchorMemoryRef.current = insertion.afterNodeId;
+                    if (shouldFocus && !hasLiveExternalTarget) {
+                      requestAnimationFrame(() => {
+                        editorRootRef.current?.querySelector<HTMLInputElement>("[data-docs-blank-row-input]")?.focus();
+                      });
+                    }
+                  },
+                }))
+                .then((created) => {
+                  if (pendingCreateGenerationRef.current !== createGeneration) return;
+                  // Keep the editor-only row model: successful entry commits
+                  // exactly once, then immediately exposes the next sibling
+                  // row rather than leaving focus on the saved node.
+                  const nextRow: PendingBlankRow = {
+                    parentId: created.parent_id,
+                    afterNodeId: created.id,
+                    kind: persistedKind,
+                    depth: insertion.depth,
+                  };
+                  pendingCreateIdRef.current = created.id;
+                  pendingAnchorMemoryRef.current = created.id;
+                  pendingKindRef.current = persistedKind;
+                  setPendingBlankAutoFocus(pendingCreateFocusRef.current);
+                  resetPendingDraft("");
+                  setPendingBlankRow(nextRow);
+                  if (pendingCreateFocusRef.current) {
+                    requestAnimationFrame(() => {
+                      editorRootRef.current?.querySelector<HTMLInputElement>("[data-docs-blank-row-input]")?.focus();
+                    });
+                  }
+                })
+                .catch(() => {
+                  if (pendingCreateGenerationRef.current !== createGeneration) return;
+                  // Keep the text in the editor-only row when persistence
+                  // fails; no blank/partial node is left behind.
+                  pendingCreateIdRef.current = null;
+                  pendingKindRef.current = insertion.kind;
+                  setPendingBlankRow(insertion);
+                  resetPendingDraft(title);
+                  const activeElement = document.activeElement;
+                  pendingRollbackFocusRef.current = pendingExternalFocusRef.current
+                    ?? (activeElement instanceof HTMLElement && activeElement !== document.body ? activeElement : null);
+                  setPendingRollbackFocusRevision((current) => current + 1);
+                  setPendingBlankAutoFocus(false);
+                })
+                .finally(() => {
+                  pendingBlankCommitRef.current = false;
+                  setPendingBlankCommit(false);
+                  if (pendingCreateGenerationRef.current !== createGeneration) return;
+                  const activeElement = document.activeElement;
+                  const shouldFocus = pendingCreateFocusRef.current
+                    && (!activeElement || activeElement.closest("[data-docs-blank-row]"));
+                  pendingCreateFocusRef.current = false;
+                  if (shouldFocus) {
+                    requestAnimationFrame(() => {
+                      editorRootRef.current?.querySelector<HTMLInputElement>("[data-docs-blank-row-input]")?.focus();
+                    });
+                  }
+                });
+            }}
+          />
+        </div>
+        <div />
+      </div>
+    </div>
+  );
+
   return (
     <div
       ref={editorRootRef}
-      className={cn("docs-outline-block-editor min-w-0", className)}
+      className={cn("docs-outline-block-editor min-w-0 text-[15px] leading-7 text-foreground", className)}
       data-testid="docs-block-editor"
       data-docs-editor-node-id={documentRow?.node.id}
       tabIndex={0}
@@ -2092,14 +3491,14 @@ export function OutlineBlockEditor({
           {searchMode === "replace" ? (
             <label className="grid gap-1">
               <span className="text-muted-foreground">範囲</span>
-              <select
+              <AppSelect
                 className="h-8 rounded border bg-background px-2"
                 value={searchState.scope}
                 onChange={(event) => setSearchState((current) => ({ ...current, scope: event.target.value as SearchReplaceState["scope"] }))}
               >
                 <option value="page">現在ページ</option>
                 <option value="workspace">ワークスペース全体</option>
-              </select>
+              </AppSelect>
             </label>
           ) : null}
           <div className="h-8 rounded border bg-muted px-2 leading-8 text-muted-foreground">
@@ -2128,10 +3527,10 @@ export function OutlineBlockEditor({
             <span className="text-muted-foreground">置換</span>
             <input className="h-8 rounded border bg-background px-2" value={searchState.replace} onChange={(event) => setSearchState((current) => ({ ...current, replace: event.target.value }))} />
           </label>
-          <select className="mt-5 h-8 rounded border bg-background px-2" value={searchState.scope} onChange={(event) => setSearchState((current) => ({ ...current, scope: event.target.value as SearchReplaceState["scope"] }))}>
+          <AppSelect className="mt-5 h-8 rounded border bg-background px-2" value={searchState.scope} onChange={(event) => setSearchState((current) => ({ ...current, scope: event.target.value as SearchReplaceState["scope"] }))}>
             <option value="page">現在ページ</option>
             <option value="workspace">ワークスペース全体</option>
-          </select>
+          </AppSelect>
           <div className="mt-5 flex gap-1">
             <Button type="button" size="sm" onClick={() => void replaceAll()}>一括置換</Button>
             <Button type="button" size="sm" variant="ghost" onClick={() => setSearchOpen(false)}>閉じる</Button>
@@ -2144,23 +3543,28 @@ export function OutlineBlockEditor({
           .filter((field) => !field.system_key?.startsWith("task_"))
           .map((field) => ({ field, value: fieldValueToDraft(valuesByFieldId.get(field.id)) }))
           .filter(({ value }) => value !== "");
-        const verbatimContent = typeof documentRow.node.body_json?.verbatim_content === "string"
-          ? documentRow.node.body_json.verbatim_content
-          : null;
         const bookmark = documentRow.node.body_json?.bookmark;
         return (
-          <div data-testid="docs-document-details" className="mb-2 space-y-1 pl-7">
+          <div data-testid="docs-document-details" className="mb-4 space-y-1 border-l border-border/60 pl-7 text-sm">
             {visibleFields.length > 0 ? (
               <div className="space-y-1" data-testid="docs-document-fields">
                 {visibleFields.map(({ field, value }, fieldIndex) => (
-                  <div key={field.id} className="grid grid-cols-[minmax(8rem,0.35fr)_minmax(12rem,1fr)] items-start gap-2 text-xs">
-                    <span className="truncate px-1 py-2 text-muted-foreground">&gt;{field.name}</span>
+                  <div key={field.id} className="grid max-w-2xl grid-cols-[minmax(8rem,11rem)_minmax(12rem,32rem)] items-start gap-2 text-xs">
+                    <label
+                      htmlFor={`${fieldControlIdPrefix}-docs-document-field-${documentRow.node.id}-${field.id}`}
+                      className="cursor-text truncate px-1 py-2 text-muted-foreground"
+                    >
+                      &gt;{field.name}
+                    </label>
                     <FieldControl
                       field={field}
                       value={value}
                       nodes={nodes}
                       projects={projects}
                       currentNodeId={documentRow.node.id}
+                      disabled={documentRow.node.permission === "read"}
+                      controlId={`${fieldControlIdPrefix}-docs-document-field-${documentRow.node.id}-${field.id}`}
+                      longTextLayout="document"
                       onChange={() => {}}
                       onCommit={(next) => void onSaveField(documentRow.node, field, next)}
                       onNavigatePrevious={() => {
@@ -2179,45 +3583,19 @@ export function OutlineBlockEditor({
                 ))}
               </div>
             ) : null}
-            {verbatimContent !== null ? <VerbatimContentBlock content={verbatimContent} /> : null}
+            {renderDocumentMetadata}
+            <EditableTypedContentBlock node={documentRow.node} onCommitTitle={onCommitTitle} />
             {bookmark && typeof bookmark === "object" ? (
               <div className="max-w-xl rounded-md border bg-muted/20 p-3 text-xs">
                 <div className="font-medium">{String((bookmark as Record<string, unknown>).title ?? "Bookmark")}</div>
                 <div className="mt-1 text-muted-foreground">{String((bookmark as Record<string, unknown>).domain ?? "")}</div>
               </div>
             ) : null}
+            <DocumentAttachmentPreview attachments={documentRow.attachments ?? []} />
           </div>
         );
       })() : null}
-      {rows.length === 0 && emptyParentId ? (
-        <input
-          autoFocus
-          aria-label="最初のノード"
-          className="ml-7 h-8 w-[calc(100%-1.75rem)] border-0 bg-transparent px-1 text-sm outline-none placeholder:text-muted-foreground"
-          value={emptyDraft}
-          placeholder="入力を開始…"
-          onChange={(event) => setEmptyDraft(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.nativeEvent.isComposing) return;
-            if (event.key === "Escape") {
-              event.preventDefault();
-              setEmptyDraft("");
-              return;
-            }
-            if (event.key !== "Enter" || !emptyDraft.trim()) return;
-            event.preventDefault();
-            void Promise.resolve(onCreateNode({
-              parentId: emptyParentId,
-              afterNodeId: null,
-              title: emptyDraft,
-              kind: "paragraph",
-            })).then((created) => {
-              setEmptyDraft("");
-              focusNode(created.id, created.title.length, created.title);
-            });
-          }}
-        />
-      ) : null}
+      {blankRow && !pendingBlankRow ? renderBlankRowInput(blankRow, "initial-blank-row") : null}
       <div ref={outlineScrollRef} className="space-y-0.5">
         <div
           className={outlineVirtualized ? "relative w-full" : "contents"}
@@ -2241,6 +3619,19 @@ export function OutlineBlockEditor({
               {content}
             </div>
           ) : content;
+          const withPendingBlankAnchor = (content: ReactNode) => {
+            if (!pendingBlankRow) return content;
+            const insertBefore = !pendingBlankRow.afterNodeId && index === pendingBlankInsertionIndex;
+            const insertAfter = pendingBlankRow.afterNodeId !== null && index + 1 === pendingBlankInsertionIndex;
+            if (!insertBefore && !insertAfter) return content;
+            return (
+              <Fragment key={`pending-blank-anchor-${row.node.id}`}>
+                {insertBefore ? renderBlankRowInput(pendingBlankRow, "pending-blank-before") : null}
+                {content}
+                {insertAfter ? renderBlankRowInput(pendingBlankRow, "pending-blank-after") : null}
+              </Fragment>
+            );
+          };
           const kind = docsBlockKind(row.node);
           const selected = selectedNodeIds.has(row.node.id);
           const collapsed = isCollapsed(row.node.id);
@@ -2252,6 +3643,7 @@ export function OutlineBlockEditor({
           const nodeLoading = isNodeLoading?.(row.node.id) ?? false;
           const taskBinding = row.taskBinding ?? null;
           const fieldsExpanded = !collapsed;
+          const searchExpanded = expandedSearchNodeIds.has(row.node.id);
           const activeSearchOccurrence = currentSearchHit?.nodeId === row.node.id ? currentSearchHit.occurrence : null;
           const memoInputs = [
             row,
@@ -2263,6 +3655,7 @@ export function OutlineBlockEditor({
             taskBinding,
             fieldsExpanded,
             activeSearchOccurrence,
+            searchExpanded,
             currentSearchHit,
             dragNodeId,
             dropTarget,
@@ -2297,7 +3690,7 @@ export function OutlineBlockEditor({
           ] as const;
           const cached = rowRenderCacheRef.current.get(row.node.id);
           if (cached && cached.inputs.length === memoInputs.length && cached.inputs.every((value, inputIndex) => value === memoInputs[inputIndex])) {
-            return wrapVirtualRow(cached.element);
+            return withPendingBlankAnchor(wrapVirtualRow(cached.element));
           }
           const fieldValuesById = new Map((row.fieldValues ?? []).map((value) => [value.field_id, value]));
           // タスク状態は専用のタスクチップで表示するため、同じ値をフィールド要約へ重ねて表示しない。
@@ -2322,46 +3715,42 @@ export function OutlineBlockEditor({
               return Boolean(currentValue) || aiFieldSuggestions.some((item) => item.field.id === field.id);
             });
           const visibleTags = taskBinding ? row.tags.filter((tag) => tag.system_key !== "task") : row.tags;
-          const belowRowContent = renderBelowRow ? renderBelowRow(row, index) : null;
+          const belowRowContent = renderBelowRow
+            ? renderBelowRow(row, index, { searchExpanded })
+            : null;
           const menuAtPointer = contextMenuPosition?.nodeId === row.node.id ? contextMenuPosition : null;
           const rowMenu = menuNodeId === row.node.id ? (
-            <MenuMnemonicSurface
-              ref={menuSurfaceRef}
-              data-docs-row-menu
-              className={cn(
-                "z-50 min-w-44 rounded-md border bg-popover p-1 text-xs shadow-lg",
-                menuAtPointer ? "fixed" : "absolute right-0 top-7",
-              )}
-              style={menuAtPointer ? { left: menuAtPointer.x, top: menuAtPointer.y } : undefined}
-              onKeyDown={(event) => {
-                if (event.key === "Escape") {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  setMenuNodeId(null);
-                  setContextMenuPosition(null);
-                }
-              }}
-            >
-              <MenuButton icon={Plus} label="複製" mnemonic="C" onClick={() => { setMenuNodeId(null); setContextMenuPosition(null); void onDuplicateNode(row.node); }} />
-              <MenuButton icon={Trash2} label="削除" mnemonic="D" onClick={() => { setMenuNodeId(null); setContextMenuPosition(null); void onArchiveNode(row.node); }} />
-              <MenuButton icon={MoveRight} label="別ページへ移動" mnemonic="M" onClick={() => openMoveDialog(row)} />
-              <MenuButton icon={CheckSquare} label="タスク化" mnemonic="T" onClick={() => { setMenuNodeId(null); setContextMenuPosition(null); void onCommitTitle(row.node, row.node.title, { body_json: { ...row.node.body_json, ...blockJsonForKind("checkbox") }, display_props: { ...row.node.display_props, show_checkbox: true } }); }} />
-              <MenuButton icon={Tag} label="先頭タグを付与" mnemonic="G" onClick={() => {
+            <DocsNodeContextMenu
+              node={row.node}
+              tags={row.tags}
+              position={menuAtPointer ? { x: menuAtPointer.x, y: menuAtPointer.y } : null}
+              onClose={() => {
                 setMenuNodeId(null);
                 setContextMenuPosition(null);
-                if (row.tags[0]) void onApplyTag(row.node, row.tags[0]);
-              }} />
-              <MenuButton icon={ExternalLink} label="右パネルで開く" mnemonic="O" onClick={() => { setMenuNodeId(null); setContextMenuPosition(null); onOpenNode(row.node.id); }} />
-            </MenuMnemonicSurface>
+              }}
+              onCopyNodeId={copyNodeId}
+              onDuplicateNode={(node) => onDuplicateNode(node)}
+              onArchiveNode={(node) => onArchiveNode(node)}
+              onMoveNode={() => openMoveDialog(row)}
+              onTaskifyNode={(node) => onCommitTitle(node, node.title, {
+                body_json: { ...node.body_json, ...blockJsonForKind("checkbox") },
+                display_props: { ...node.display_props, show_checkbox: true },
+              })}
+              onApplyTag={(node, tag) => onApplyTag(node, tag)}
+              onOpenNode={(node) => onOpenNode(node.id)}
+            />
           ) : null;
+          // key は node.id だけにする。親や sort_order を混ぜると Tab / Shift-Tab / D&D の移動で
+          // キーが変わって行が作り直され、編集中の CodeMirror が古いDOMごと切り離されて
+          // 行が空白になり、キャレットも失われる。
           const element = (
-             <Fragment key={`${row.node.id}:${row.node.parent_id ?? "root"}:${row.node.sort_order}`}>
+             <Fragment key={row.node.id}>
             <div
               data-docs-node-id={row.node.id}
               data-docs-block-id={row.node.id}
               data-block-kind={kind}
-              className={cn(
-                "group relative rounded px-1 py-0",
+                className={cn(
+                 "group relative rounded-md px-1 py-0 transition-colors hover:bg-muted/30",
                 selected && "bg-primary/10",
                 currentSearchHit?.nodeId === row.node.id && "ring-1 ring-primary/40",
                 dragNodeId === row.node.id && "opacity-50",
@@ -2372,7 +3761,12 @@ export function OutlineBlockEditor({
               style={{ marginLeft: row.depth * 24 }}
               tabIndex={0}
               onKeyDown={(event) => handleStaticKeyDown(event, row)}
+              onMouseDown={(event) => {
+                rowPointerDownRef.current = { x: event.clientX, y: event.clientY };
+              }}
               onClick={(event) => {
+                const pointerDown = rowPointerDownRef.current;
+                rowPointerDownRef.current = null;
                 const taskId = (event.target as HTMLElement).closest<HTMLElement>("[data-docs-task-id]")?.dataset.docsTaskId;
                 if (taskId) {
                   event.preventDefault();
@@ -2381,13 +3775,17 @@ export function OutlineBlockEditor({
                   return;
                 }
                 if ((event.target as HTMLElement).closest(".cm-editor, [data-docs-field-control], [data-docs-supertag-chip], [data-docs-attachment-control], button, a")) return;
+                if (hasNativeDocsTextSelection(editorRootRef.current)) return;
+                if (isDragSelectClick(event, pointerDown)) return;
                 onSelectNode(row.node.id);
                 focusNode(row.node.id, getCaretColumnFromPoint(event, row.node.title.length));
               }}
               onContextMenu={(event) => {
                 event.preventDefault();
                 event.stopPropagation();
-                onSelectNode(row.node.id);
+                if (!selectedNodeIds.has(row.node.id)) {
+                  onSelectNode(row.node.id);
+                }
                 setContextMenuPosition({ nodeId: row.node.id, x: event.clientX, y: event.clientY });
                 setMenuNodeId(row.node.id);
               }}
@@ -2465,8 +3863,9 @@ export function OutlineBlockEditor({
                   </button>
                 </div>
                 <div className="min-w-0">
-                  <div className={cn("min-h-7 cursor-text overflow-hidden whitespace-nowrap", docsRowBlockClass(kind))}>
-                    <span className="inline-flex max-w-full min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap align-middle">
+                  {/* 長い1行も省略せず折り返して全文を見せる。行を横に伸ばして隠さない。 */}
+                  <div className={cn("min-h-7 cursor-text", docsRowBlockClass(kind))}>
+                    <span className="inline-flex max-w-full min-w-0 flex-wrap items-center gap-2 align-middle">
                       {kind === "checkbox" || row.node.display_props?.show_checkbox === true ? (
                         <button
                           type="button"
@@ -2480,10 +3879,28 @@ export function OutlineBlockEditor({
                         </button>
                       ) : null}
                       {row.node.node_type === "search" ? (
-                        <span className="inline-flex shrink-0 items-center gap-1 rounded border border-emerald-500/40 px-1.5 py-0.5 text-[11px] font-medium leading-4 text-emerald-600 dark:text-emerald-300">
+                        <button
+                          type="button"
+                          data-testid="docs-search-node-toggle"
+                          aria-expanded={searchExpanded}
+                          aria-label={`${row.node.title}のLive Queryを${searchExpanded ? "折りたたむ" : "展開"}`}
+                           className="inline-flex shrink-0 items-center gap-1 rounded border border-primary/40 bg-primary/5 px-1.5 py-0.5 text-xs font-medium leading-4 text-primary hover:bg-primary/10"
+                          onMouseDown={(event) => event.preventDefault()}
+                          onKeyDown={(event) => event.stopPropagation()}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setExpandedSearchNodeIds((current) => {
+                              const next = new Set(current);
+                              if (next.has(row.node.id)) next.delete(row.node.id);
+                              else next.add(row.node.id);
+                              return next;
+                            });
+                          }}
+                        >
                           <ListFilter className="size-3" />
                           Live query
-                        </span>
+                          {searchExpanded ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
+                        </button>
                       ) : null}
                       {editingNodeId === row.node.id ? (
                         <span className="inline-block min-w-[1ch] max-w-full align-baseline">
@@ -2492,7 +3909,7 @@ export function OutlineBlockEditor({
                       ) : (
                         <span
                           data-docs-title-display
-                          className="min-w-0 truncate"
+                          className="min-w-0 break-words [overflow-wrap:anywhere]"
                           dangerouslySetInnerHTML={{ __html: renderSearchHighlightedTitle(row.node.title, searchMode ? searchState.find : "", activeSearchOccurrence) }}
                         />
                       )}
@@ -2553,9 +3970,7 @@ export function OutlineBlockEditor({
                       </div>
                     ) : null}
                   </div>
-                  {typeof row.node.body_json?.verbatim_content === "string" ? (
-                    <VerbatimContentBlock content={row.node.body_json.verbatim_content} />
-                  ) : null}
+                  <EditableTypedContentBlock node={row.node} onCommitTitle={onCommitTitle} />
                   {fieldsExpanded && visibleFields.length > 0 ? (
                     <div
                       className="grid gap-0 border-l border-border/60 pl-4"
@@ -2576,7 +3991,8 @@ export function OutlineBlockEditor({
                               value={currentValue}
                               nodes={nodes}
                               projects={projects}
-                              currentNodeId={row.node.id}
+                               currentNodeId={row.node.id}
+                               disabled={row.node.permission === "read"}
                                onChange={() => {}}
                                onCommit={(value) => void onSaveField(row.node, field, value)}
                                onNavigatePrevious={() => {
@@ -2728,8 +4144,17 @@ export function OutlineBlockEditor({
             </Fragment>
           );
           rowRenderCacheRef.current.set(row.node.id, { inputs: memoInputs, element });
-          return wrapVirtualRow(element);
+          return withPendingBlankAnchor(wrapVirtualRow(element));
         })}
+        {pendingBlankRow
+          && pendingBlankInsertionIndex >= rows.length
+          // A missing after-anchor is inserted after the last visible row by
+          // withPendingBlankAnchor.  Keep this fallback only for an empty
+          // projection (or an explicit append with no anchor), otherwise the
+          // editor-only row would render twice after Undo removes its anchor.
+          && (!pendingBlankRow.afterNodeId || rows.length === 0)
+          ? renderBlankRowInput(pendingBlankRow, "pending-blank-end")
+          : null}
         </div>
       </div>
       {hasMoreRows && onLoadMoreRows ? (
@@ -2818,6 +4243,76 @@ export function OutlineBlockEditor({
           <Button type="button" size="sm" variant="ghost" onClick={() => void applyUrlChoice("link")}>タイトル付きリンク</Button>
           <Button type="button" size="sm" variant="ghost" onClick={() => void applyUrlChoice("bookmark")}>ブックマークカード</Button>
           <Button type="button" size="sm" variant="ghost" onClick={() => void applyUrlChoice("plain")}>プレーン</Button>
+        </div>
+      ) : null}
+      {pendingFieldSuggestion ? (
+        <div
+          data-docs-inline-popup
+          className="fixed left-1/2 top-16 z-50 grid max-h-60 min-w-56 -translate-x-1/2 gap-1 overflow-auto rounded-md border bg-popover p-1 text-xs shadow-lg"
+          role="listbox"
+          aria-label="インライン候補"
+          onMouseDown={(event) => event.preventDefault()}
+        >
+          {pendingFieldSuggestion.candidates.map((field, index) => (
+            <button
+              type="button"
+              key={field.id}
+              role="option"
+              aria-selected={index === pendingFieldSuggestion.activeIndex}
+              className={cn("rounded px-2 py-1.5 text-left hover:bg-accent", index === pendingFieldSuggestion.activeIndex && "bg-accent")}
+              onMouseEnter={() => setPendingFieldSuggestion((current) => current ? { ...current, activeIndex: index } : current)}
+              onMouseDown={(event) => {
+                event.preventDefault();
+                setPendingField(field);
+                setPendingFieldSuggestion(null);
+                setEmptyDraft(`${field.name}: `);
+                requestAnimationFrame(() => {
+                  editorRootRef.current?.querySelector<HTMLInputElement>("[data-docs-blank-row-input]")?.focus();
+                });
+              }}
+            >
+              {field.name}
+            </button>
+          ))}
+          {pendingFieldSuggestion.candidates.length === 0 && pendingFieldSuggestion.query && onCreateFieldCandidate ? (
+            <button
+              type="button"
+              role="option"
+              aria-selected
+              className="rounded px-2 py-1.5 text-left hover:bg-accent"
+              onMouseDown={(event) => {
+                event.preventDefault();
+                const owner = pendingFieldOwnerRow;
+                if (!owner) return;
+                const name = pendingFieldSuggestion.query;
+                const promise = Promise.resolve()
+                  .then(() => onCreateFieldCandidateRef.current?.(owner, name) ?? null);
+                pendingFieldCreateRef.current = { name, promise };
+                setPendingFieldSuggestion(null);
+                setEmptyDraft(`${name}: `);
+                void promise.then((createdField) => {
+                  if (pendingFieldCreateRef.current?.promise !== promise) return;
+                  if (createdField) setPendingField(createdField);
+                  else {
+                    pendingFieldCreateRef.current = null;
+                    setEmptyDraft("");
+                  }
+                }).catch((error: unknown) => {
+                  if (pendingFieldCreateRef.current?.promise !== promise) return;
+                  pendingFieldCreateRef.current = null;
+                  setEmptyDraft("");
+                  toast.error(error instanceof Error ? error.message : "Fieldの作成に失敗しました");
+                });
+              }}
+            >
+              Field「{pendingFieldSuggestion.query}」を作成
+            </button>
+          ) : null}
+          {pendingFieldSuggestion.candidates.length === 0 && !pendingFieldSuggestion.query ? (
+            <div className="px-2 py-1.5 text-muted-foreground">
+              候補がありません。新規Field名を入力してください（親ノードにSupertagが必要）
+            </div>
+          ) : null}
         </div>
       ) : null}
       {inlineSuggestion ? (
@@ -2921,7 +4416,7 @@ export function OutlineBlockEditor({
                       const view = editorViewRef.current;
                       fieldCommandRef.current = {
                         nodeId: inlineSuggestion.nodeId,
-                        fieldName: field.name,
+                        field: Promise.resolve(field),
                         prefix: (view?.state.sliceDoc(0, inlineSuggestion.from) ?? "") + value,
                       };
                       void applyInlineSuggestion(inlineSuggestion, value);
@@ -2936,22 +4431,17 @@ export function OutlineBlockEditor({
                     className="rounded px-2 py-1.5 text-left hover:bg-accent"
                     onMouseDown={(event) => {
                       event.preventDefault();
-                      void Promise.resolve(onCreateFieldCandidate(row, inlineSuggestion.query.trim())).then((created) => {
-                        if (!created) return;
-                        const fieldName = inlineSuggestion.query.trim();
-                        const value = `${fieldName}: `;
-                        const view = editorViewRef.current;
-                        fieldCommandRef.current = {
-                          nodeId: inlineSuggestion.nodeId,
-                          fieldName,
-                          prefix: (view?.state.sliceDoc(0, inlineSuggestion.from) ?? "") + value,
-                        };
-                        void applyInlineSuggestion(inlineSuggestion, value);
-                      });
+                      const view = editorSessionFor(inlineSuggestion.nodeId)?.view;
+                      if (view) beginFieldCreation(row, inlineSuggestion, view);
                     }}
                   >
                     Field「{inlineSuggestion.query.trim()}」を作成
                   </button>
+                ) : null}
+                {candidates.length === 0 && !inlineSuggestion.query.trim() ? (
+                  <div className="px-2 py-1.5 text-muted-foreground">
+                    候補がありません。新規Field名を入力してください（親ノードにSupertagが必要）
+                  </div>
                 ) : null}
               </>
             );
@@ -3022,14 +4512,5 @@ export function OutlineBlockEditor({
       </Button>
       */}
     </div>
-  );
-}
-
-function MenuButton({ icon: Icon, label, mnemonic, onClick }: { icon: LucideIcon; label: string; mnemonic: string; onClick: () => void }) {
-  return (
-    <MenuMnemonicButton type="button" mnemonic={mnemonic} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-accent" onClick={onClick}>
-      <Icon className="size-3.5" />
-      {label}
-    </MenuMnemonicButton>
   );
 }

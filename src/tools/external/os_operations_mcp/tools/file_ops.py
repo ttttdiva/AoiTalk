@@ -16,13 +16,46 @@ from ..config_loader import resolve_path_for_user, check_path_protection
 logger = logging.getLogger(__name__)
 
 
+def _resolve_scoped_path(
+    path: str,
+    *,
+    access: str,
+    operation: str,
+) -> tuple[str | None, dict | None]:
+    """Resolve one MCP path through the active run contract when present.
+
+    The standalone MCP server still serves ordinary user/app requests without
+    a run scope, so those retain ``resolve_path_for_user`` compatibility.  A
+    bound worker run never falls back to that process-global workspace base.
+    """
+
+    try:
+        from src.security.agent_run_scope import RunScopeViolation, get_current_run_scope
+    except ImportError:  # pragma: no cover - defensive for stripped builds
+        return resolve_path_for_user(path), None
+
+    scope = get_current_run_scope()
+    if scope is None:
+        return resolve_path_for_user(path), None
+    try:
+        if access == "read":
+            resolved = scope.assert_read_allowed(path)
+        elif access == "delete":
+            resolved = scope.assert_delete_allowed(path)
+        else:
+            resolved = scope.assert_mutation_allowed(path, operation)
+        return str(resolved), None
+    except RunScopeViolation as exc:
+        return None, {"success": False, "error": str(exc)}
+
+
 def register(mcp: FastMCP):
     """ファイル操作ツールを MCP サーバーに登録する。"""
 
     from src.tools.os_operations.file_editor import get_file_editor, FileEditorError
 
     @mcp.tool()
-    async def view_file(path: str, start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
+    async def read_file(path: str, start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
         """ファイルの内容を表示する（行番号付き）
 
         Args:
@@ -30,7 +63,9 @@ def register(mcp: FastMCP):
             start_line: 開始行（1から始まる。省略時は最初から）
             end_line: 終了行（省略時は最後まで。-1も最後まで）
         """
-        path = resolve_path_for_user(path)
+        path, scope_error = _resolve_scoped_path(path, access="read", operation="read")
+        if scope_error:
+            return json.dumps(scope_error, ensure_ascii=False)
         try:
             if start_line is not None:
                 start_line = int(start_line)
@@ -55,7 +90,9 @@ def register(mcp: FastMCP):
             path: 作成するファイルのパス
             content: ファイルの内容
         """
-        path = resolve_path_for_user(path)
+        path, scope_error = _resolve_scoped_path(path, access="mutation", operation="create")
+        if scope_error:
+            return json.dumps(scope_error, ensure_ascii=False)
         protection_error = check_path_protection(path, "作成")
         if protection_error:
             return json.dumps(protection_error, ensure_ascii=False)
@@ -76,7 +113,9 @@ def register(mcp: FastMCP):
         Args:
             path: 削除するファイルまたはディレクトリのパス
         """
-        path = resolve_path_for_user(path)
+        path, scope_error = _resolve_scoped_path(path, access="delete", operation="delete")
+        if scope_error:
+            return json.dumps(scope_error, ensure_ascii=False)
         protection_error = check_path_protection(path, "削除")
         if protection_error:
             return json.dumps(protection_error, ensure_ascii=False)
@@ -103,7 +142,9 @@ def register(mcp: FastMCP):
             path: 追記するファイルのパス
             content: 追記する内容
         """
-        path = resolve_path_for_user(path)
+        path, scope_error = _resolve_scoped_path(path, access="mutation", operation="append")
+        if scope_error:
+            return json.dumps(scope_error, ensure_ascii=False)
         protection_error = check_path_protection(path, "編集")
         if protection_error:
             return json.dumps(protection_error, ensure_ascii=False)
@@ -128,7 +169,9 @@ def register(mcp: FastMCP):
             old_str: 置換する元の文字列（ファイル内で一意である必要あり）
             new_str: 置換後の文字列
         """
-        path = resolve_path_for_user(path)
+        path, scope_error = _resolve_scoped_path(path, access="mutation", operation="edit")
+        if scope_error:
+            return json.dumps(scope_error, ensure_ascii=False)
         protection_error = check_path_protection(path, "編集")
         if protection_error:
             return json.dumps(protection_error, ensure_ascii=False)
@@ -151,7 +194,9 @@ def register(mcp: FastMCP):
             line_number: 挿入する行番号（0=ファイルの先頭、n=n行目の後）
             content: 挿入する内容
         """
-        path = resolve_path_for_user(path)
+        path, scope_error = _resolve_scoped_path(path, access="mutation", operation="insert")
+        if scope_error:
+            return json.dumps(scope_error, ensure_ascii=False)
         protection_error = check_path_protection(path, "編集")
         if protection_error:
             return json.dumps(protection_error, ensure_ascii=False)
@@ -172,7 +217,9 @@ def register(mcp: FastMCP):
         Args:
             path: 取り消し対象のファイルパス
         """
-        path = resolve_path_for_user(path)
+        path, scope_error = _resolve_scoped_path(path, access="mutation", operation="undo")
+        if scope_error:
+            return json.dumps(scope_error, ensure_ascii=False)
         try:
             editor = get_file_editor()
             result = editor.undo(path)

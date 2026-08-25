@@ -73,6 +73,9 @@ def register_api_token_routes(app: FastAPI, server: "WebChatServer") -> None:
         """長期トークンを発行する。平文トークンはこのレスポンスでのみ返す。"""
         _ensure_available()
         user_id = await _require_user_id(request)
+        user_info = await server._get_user_info_from_request(request)
+        if not user_info:
+            raise HTTPException(status_code=401, detail="Unauthorized")
         expires_at = None
         if payload.expires_in_days is not None:
             expires_at = datetime.utcnow() + timedelta(days=payload.expires_in_days)
@@ -83,6 +86,7 @@ def register_api_token_routes(app: FastAPI, server: "WebChatServer") -> None:
                 user_id=user_id,
                 name=payload.name.strip(),
                 expires_at=expires_at,
+                session_version=int(user_info.get("session_version") or 1),
             )
             data = record.to_dict()
             data["token"] = plaintext  # 発行時のみ返却

@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useRouter } from "next/navigation";
 import FullCalendar from "@fullcalendar/react";
 import dayGridPlugin from "@fullcalendar/daygrid";
 import timeGridPlugin from "@fullcalendar/timegrid";
@@ -15,7 +16,10 @@ import type {
   DateClickArg,
   EventResizeDoneArg,
 } from "@fullcalendar/interaction";
-import { Plus } from "lucide-react";
+import {
+  AlertCircle,
+  FileText,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -53,6 +57,10 @@ import {
   RemoteTaskDialog,
   type RemoteTaskDialogTarget,
 } from "@/components/tasks/remote-task-dialog";
+import { CalendarWorkspaceNavigation } from "@/components/tasks/calendar-workspace-navigation";
+import {
+  useWorkspaceShellRegistration,
+} from "@/components/layout/shell-context";
 
 type ScopeMode = "project" | "space" | "all";
 type CalendarViewName = "dayGridMonth" | "timeGridWeek" | "listWeek";
@@ -105,6 +113,7 @@ interface CalendarEvent {
     occurrenceOriginalStartAt?: string | null;
     occurrenceSourceKind?: string | null;
     isRemote?: boolean;
+    isReadOnly?: boolean;
     remoteServerId?: string | null;
     remoteServerName?: string | null;
     remoteBaseUrl?: string | null;
@@ -122,21 +131,20 @@ const FC_PLUGINS = [
 ];
 
 const FC_HEADER_TOOLBAR = {
-  left: "prev,next today",
+  left: "today prev,next",
   center: "title",
   right: "dayGridMonth,timeGridWeek,listWeek",
 };
 
 const FC_BUTTON_TEXT = {
-  today: "今日",
-  month: "月",
-  week: "週",
-  list: "リスト",
+  today: "Today",
+  month: "Month",
+  week: "Week",
+  list: "List",
 };
 
 function shouldShowEventTime(start: Date | null, allDay: boolean): boolean {
-  if (!start || allDay) return false;
-  return start.getHours() !== 0 || start.getMinutes() !== 0;
+  return Boolean(start && !allDay);
 }
 
 function parseTaskCalendarDate(value: string | null | undefined): Date | null {
@@ -180,32 +188,68 @@ function formatLocalDateKey(date: Date): string {
   return `${year}-${month}-${day}`;
 }
 
+function shiftCalendarMonth(
+  value: string | null | undefined,
+  offset: number,
+): string {
+  const anchor = parseTaskCalendarDate(value) ?? new Date();
+  const day = anchor.getDate();
+  const target = new Date(anchor);
+  target.setDate(1);
+  target.setMonth(target.getMonth() + offset);
+  const lastDay = new Date(
+    target.getFullYear(),
+    target.getMonth() + 1,
+    0,
+  ).getDate();
+  target.setDate(Math.min(day, lastDay));
+  return formatLocalDateKey(target);
+}
+
 function getEventStartDateKey(event: CalendarEvent): string | null {
   const date = new Date(event.start);
   if (Number.isNaN(date.getTime())) return null;
   return formatLocalDateKey(date);
 }
 
+// タスク本体イベントとオカレンスイベントの突き合わせキー。
+// 文字列表現の揺れ（秒やタイムゾーン表記）で取りこぼさないよう時刻値で比較する。
+function eventOccurrenceKey(event: CalendarEvent): string {
+  const taskId = (event.extendedProps.taskId as string | undefined) ?? "";
+  const time = new Date(event.start).getTime();
+  return `${taskId}:${Number.isNaN(time) ? event.start : time}`;
+}
+
 export default function CalendarView() {
-  const { selectedProjectId, selectedSpaceId, selectedProject, selectedSpace } =
-    useProject();
+  const {
+    selectedProjectId,
+    selectedSpaceId,
+    selectedProject,
+    selectedSpace,
+    allProjects,
+  } = useProject();
   const { resolvedTheme } = useTheme();
   const calendarRef = useRef<FullCalendar>(null);
   const calendarContainerRef = useRef<HTMLDivElement>(null);
   const [calendarMirrorParent, setCalendarMirrorParent] =
     useState<HTMLElement | null>(null);
+  const router = useRouter();
   const [scope, setScope] = useState<ScopeMode>("project");
   const [tasks, setTasks] = useState<Task[]>([]);
   const [occurrences, setOccurrences] = useState<TaskOccurrence[]>([]);
-  const [docsCalendarItems, setDocsCalendarItems] = useState<DocsCalendarItem[]>([]);
-  const [showDocsLayer, setShowDocsLayer] = useState(true);
+  const [docsCalendarItems, setDocsCalendarItems] = useState<
+    DocsCalendarItem[]
+  >([]);
+  const [showDocsLayer, setShowDocsLayer] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [calendarError, setCalendarError] = useState<string | null>(null);
   const dateRangeRef = useRef<{ start: string; end: string } | null>(null);
   const fetchGenerationRef = useRef(0);
   const settingsSaveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
   const [selectedOccurrenceContext, setSelectedOccurrenceContext] =
     useState<RecurringOccurrenceContext | null>(null);
   const [draftTask, setDraftTask] = useState<Partial<Task> | null>(null);
@@ -222,6 +266,89 @@ export default function CalendarView() {
   const lastKeyboardNavigationRef = useRef(0);
   const [remoteDialogTarget, setRemoteDialogTarget] =
     useState<RemoteTaskDialogTarget | null>(null);
+  const closeTaskContextMenu = contextMenu.close;
+
+  const projectsById = useMemo(
+    () => new Map(allProjects.map((project) => [project.id, project] as const)),
+    [allProjects],
+  );
+  const isProjectReadOnly = useCallback(
+    (projectId: string | null | undefined) => {
+      if (!projectId) return false;
+      const project = projectsById.get(projectId);
+      return project?.source === "remote" || project?.can_write === false;
+    },
+    [projectsById],
+  );
+
+  const calendarRemoteContext =
+    selectedProject?.source === "remote"
+      ? selectedProject
+      : selectedSpace?.source === "remote"
+        ? selectedSpace
+        : null;
+  const calendarReadOnly = Boolean(
+    calendarRemoteContext || selectedProject?.can_write === false,
+  );
+
+  const detailTask = useMemo(
+    () =>
+      (detailTaskId ? tasks.find((task) => task.id === detailTaskId) : null) ??
+      null,
+    [detailTaskId, tasks],
+  );
+  const detailReadOnly = Boolean(
+    calendarReadOnly ||
+      detailTask?.source === "remote" ||
+      isProjectReadOnly(detailTask?.project_id),
+  );
+
+  const calendarScopeLabel =
+    scope === "all"
+      ? "All projects"
+      : scope === "space"
+        ? selectedSpace
+          ? `Space: ${selectedSpace.name}`
+          : "No space selected"
+        : selectedProject
+          ? `Project: ${selectedProject.name}`
+          : "No project selected";
+
+  const navigateMiniMonth = useCallback(
+    (offset: number) => {
+      const api = calendarRef.current?.getApi();
+      const baseDate = api ? formatLocalDateKey(api.getDate()) : currentDate;
+      const nextDate = shiftCalendarMonth(baseDate, offset);
+      api?.gotoDate(nextDate);
+    },
+    [currentDate],
+  );
+
+  useWorkspaceShellRegistration({
+    id: "calendar-workspace",
+    workspaceNavigation: (
+      <CalendarWorkspaceNavigation
+        scope={scope}
+        scopeLabel={calendarScopeLabel}
+        readOnly={calendarReadOnly}
+        showDocsLayer={showDocsLayer}
+        hideRecurring={hideRecurring}
+        showClosed={showClosed}
+        onScopeChange={setScope}
+        onShowDocsLayerChange={setShowDocsLayer}
+        onHideRecurringChange={setHideRecurring}
+        onShowClosedChange={setShowClosed}
+        currentDate={currentDate}
+        onDateChange={(date) => calendarRef.current?.getApi().gotoDate(date)}
+        onPreviousMonth={() => navigateMiniMonth(-1)}
+        onNextMonth={() => navigateMiniMonth(1)}
+      />
+    ),
+  });
+
+  useEffect(() => {
+    if (calendarReadOnly) closeTaskContextMenu();
+  }, [calendarReadOnly, closeTaskContextMenu]);
 
   useEffect(() => {
     setCalendarMirrorParent(document.body);
@@ -268,6 +395,9 @@ export default function CalendarView() {
           view.current_view === "listWeek"
         ) {
           setCurrentView(view.current_view);
+        }
+        if (typeof view.current_date === "string" && view.current_date) {
+          setCurrentDate(view.current_date.slice(0, 10));
         }
       })
       .catch((err) => {
@@ -382,6 +512,7 @@ export default function CalendarView() {
       const generation = fetchGenerationRef.current + 1;
       fetchGenerationRef.current = generation;
       setLoading(true);
+      setCalendarError(null);
       try {
         const remoteContext =
           selectedProject?.source === "remote"
@@ -421,33 +552,50 @@ export default function CalendarView() {
               start_from: dr.start,
               end_to: dr.end,
             }).then((items) =>
-              items.map((item) => decorateRemoteOccurrence(remoteProfileId, item)),
+              items.map((item) =>
+                decorateRemoteOccurrence(remoteProfileId, item),
+              ),
             )
           : Promise.resolve([] as TaskOccurrence[]);
         const localDocsPromise = remoteProfileId
           ? Promise.resolve([] as DocsCalendarItem[])
-          : fetch(`/api/docs/calendar-items?${new URLSearchParams({
-              start: dr.start,
-              end: dr.end,
-              ...(scopeArg.project_id ? { project_id: scopeArg.project_id } : {}),
-              ...(scopeArg.space_id ? { space_id: scopeArg.space_id } : {}),
-            }).toString()}`, {
-              credentials: "include",
-            })
+          : fetch(
+              `/api/docs/calendar-items?${new URLSearchParams({
+                start: dr.start,
+                end: dr.end,
+                ...(scopeArg.project_id
+                  ? { project_id: scopeArg.project_id }
+                  : {}),
+                ...(scopeArg.space_id ? { space_id: scopeArg.space_id } : {}),
+              }).toString()}`,
+              {
+                credentials: "include",
+              },
+            )
               .then((res) => (res.ok ? res.json() : { items: [] }))
-              .then((data) => Array.isArray(data.items) ? data.items as DocsCalendarItem[] : [])
+              .then((data) =>
+                Array.isArray(data.items)
+                  ? (data.items as DocsCalendarItem[])
+                  : [],
+              )
               .catch((err) => {
                 console.error("Docsカレンダー取得失敗:", err);
                 return [] as DocsCalendarItem[];
               });
         const [taskList, occList, docsItems] = remoteProfileId
-          ? await Promise.all([remoteTasksPromise, remoteOccurrencesPromise, localDocsPromise])
+          ? await Promise.all([
+              remoteTasksPromise,
+              remoteOccurrencesPromise,
+              localDocsPromise,
+            ])
           : await Promise.all([
               taskApi.listTasks(scopeArg),
-              taskApi.listOccurrences(scopeArg, dr.start, dr.end).catch((err) => {
-                console.error("カレンダー繰り返し予定取得失敗:", err);
-                return [] as TaskOccurrence[];
-              }),
+              taskApi
+                .listOccurrences(scopeArg, dr.start, dr.end)
+                .catch((err) => {
+                  console.error("カレンダー繰り返し予定取得失敗:", err);
+                  return [] as TaskOccurrence[];
+                }),
               localDocsPromise,
             ]);
         if (fetchGenerationRef.current !== generation) {
@@ -456,11 +604,18 @@ export default function CalendarView() {
         setTasks(taskList);
         setOccurrences(occList);
         setDocsCalendarItems(docsItems);
+        setCalendarError(null);
       } catch (err) {
         if (fetchGenerationRef.current !== generation) {
           return;
         }
         console.error("カレンダーデータ取得失敗:", err);
+        setTasks([]);
+        setOccurrences([]);
+        setDocsCalendarItems([]);
+        setCalendarError(
+          "Calendar data could not be loaded. Try again.",
+        );
       } finally {
         if (fetchGenerationRef.current === generation) {
           setLoading(false);
@@ -487,13 +642,14 @@ export default function CalendarView() {
       setTasks([]);
       setOccurrences([]);
       setDocsCalendarItems([]);
+      setCalendarError(null);
     }
   }, [fetchData, scopeArg]);
 
   const handleDatesSet = useCallback(
     (arg: DatesSetArg) => {
       const nextView = arg.view.type as CalendarViewName;
-      const nextDate = formatLocalDateKey(arg.view.currentStart);
+      const nextDate = formatLocalDateKey(arg.view.calendar.getDate());
       setCurrentView((prev) => (prev === nextView ? prev : nextView));
       setCurrentDate((prev) => (prev === nextDate ? prev : nextDate));
       const prev = dateRangeRef.current;
@@ -512,15 +668,18 @@ export default function CalendarView() {
   const handleCreateTask = useCallback(
     (startAt?: string, allDay?: boolean, endAt?: string) => {
       if (!selectedProjectId) {
-        alert("タスク作成にはプロジェクトを選択してください。");
+        alert("Select a project before creating a task.");
         return;
       }
-      if (selectedProject?.source === "remote") {
-        alert("Enterprise参照は読み取り専用です。");
+      if (calendarReadOnly) {
+        alert("Enterprise reference is read-only.");
         return;
       }
       setSelectedTaskId(null);
+      setDetailTaskId(null);
       setSelectedOccurrenceContext(null);
+      setRemoteDialogTarget(null);
+      closeTaskContextMenu();
       setDraftTask({
         project_id: selectedProjectId,
         title: "",
@@ -530,7 +689,12 @@ export default function CalendarView() {
         ...(allDay !== undefined && { all_day: allDay }),
       });
     },
-    [selectedProject, selectedProjectId, taskNotificationsDefaultEnabled],
+    [
+      selectedProjectId,
+      calendarReadOnly,
+      closeTaskContextMenu,
+      taskNotificationsDefaultEnabled,
+    ],
   );
 
   const handleDateClick = useCallback(
@@ -577,11 +741,15 @@ export default function CalendarView() {
           start: task.start_at || task.end_at || "",
           end: getCalendarEventEnd(task.end_at, task.all_day),
           allDay: task.all_day,
-          backgroundColor: colorTokens?.surface,
-          borderColor: colorTokens?.border,
+          backgroundColor: "transparent",
+          borderColor: "transparent",
           textColor: colorTokens?.text ?? "var(--foreground)",
-          classNames: [`event-${task.status}`, ...(task.source === "remote" ? ["event-remote"] : [])],
-          editable: task.source !== "remote",
+          classNames: [
+            `event-${task.status}`,
+            ...(task.source === "remote" ? ["event-remote"] : []),
+          ],
+          editable:
+            task.source !== "remote" && !isProjectReadOnly(task.project_id),
           extendedProps: {
             taskId: task.id,
             projectId: task.project_id,
@@ -596,6 +764,8 @@ export default function CalendarView() {
             occurrenceOriginalStartAt: null,
             occurrenceSourceKind: null,
             isRemote: task.source === "remote",
+            isReadOnly:
+              task.source === "remote" || isProjectReadOnly(task.project_id),
             remoteServerId: task.remote_server_id,
             remoteServerName: task.remote_server_name,
             remoteBaseUrl: task.remote_server_base_url,
@@ -620,11 +790,16 @@ export default function CalendarView() {
           start: occurrence.start_at || "",
           end: getCalendarEventEnd(occurrence.end_at, occurrence.all_day),
           allDay: occurrence.all_day,
-          backgroundColor: colorTokens?.surface,
-          borderColor: colorTokens?.border,
+          backgroundColor: "transparent",
+          borderColor: "transparent",
           textColor: colorTokens?.text ?? "var(--foreground)",
-          classNames: [`event-${occurrence.status}`, ...(occurrence.source === "remote" ? ["event-remote"] : [])],
-          editable: occurrence.source !== "remote",
+          classNames: [
+            `event-${occurrence.status}`,
+            ...(occurrence.source === "remote" ? ["event-remote"] : []),
+          ],
+          editable:
+            occurrence.source !== "remote" &&
+            !isProjectReadOnly(occurrence.project_id),
           extendedProps: {
             taskId: occurrence.task_id,
             projectId: occurrence.project_id ?? null,
@@ -644,6 +819,9 @@ export default function CalendarView() {
               occurrence.original_start_at ?? occurrence.start_at ?? null,
             occurrenceSourceKind: occurrence.source_kind,
             isRemote: occurrence.source === "remote",
+            isReadOnly:
+              occurrence.source === "remote" ||
+              isProjectReadOnly(occurrence.project_id),
             remoteServerId: occurrence.remote_server_id,
             remoteTaskId: occurrence.task_id.replace(/^remote:[^:]+:/, ""),
           },
@@ -653,7 +831,10 @@ export default function CalendarView() {
     const docsEvents: CalendarEvent[] = showDocsLayer
       ? docsCalendarItems.map((item) => ({
           id: `docs-${item.id}`,
-          title: item.node.title || item.field.name,
+          // 1ノードが複数のdateフィールドを持つ場合に見分けが付くよう、フィールド名を併記する
+          title: item.node.title
+            ? `${item.node.title}（${item.field.name}）`
+            : item.field.name,
           start: item.start,
           end: item.end ?? item.start,
           allDay: item.all_day,
@@ -676,7 +857,15 @@ export default function CalendarView() {
         }))
       : [];
 
-    return [...taskEvents, ...occurrenceEvents, ...docsEvents];
+    // 同じタスクの同じ開始時刻がタスク本体とオカレンスの両方から来たらオカレンスを正とし、
+    // タスク本体側を落とす。通常は API 側で除外済みだが、remote サーバー由来の
+    // オカレンス（listRemoteTaskOccurrences）は相手側の実装に依存するため保険を残す。
+    const occurrenceKeys = new Set(occurrenceEvents.map(eventOccurrenceKey));
+    const dedupedTaskEvents = taskEvents.filter(
+      (event) => !occurrenceKeys.has(eventOccurrenceKey(event)),
+    );
+
+    return [...dedupedTaskEvents, ...occurrenceEvents, ...docsEvents];
   }, [
     tasks,
     occurrences,
@@ -685,6 +874,7 @@ export default function CalendarView() {
     showClosed,
     hideRecurring,
     resolvedTheme,
+    isProjectReadOnly,
   ]);
 
   const calendarEvents = useMemo(() => {
@@ -724,62 +914,81 @@ export default function CalendarView() {
     return hiddenCounts;
   }, [events, currentView]);
 
-  const handleEventClick = useCallback((info: EventClickArg) => {
-    const props = info.event.extendedProps;
-    if (props.isDocs && props.docsNodeId) {
-      window.location.href = `/docs/${encodeURIComponent(props.docsNodeId as string)}`;
-      return;
-    }
-    if (props.isRemote && props.remoteServerId) {
-      setRemoteDialogTarget({
-        profileId: props.remoteServerId as string,
-        profileName: (props.remoteServerName as string) ?? "remote",
-        profileColor: (props.projectColor as string | null) ?? null,
-        baseUrl: (props.remoteBaseUrl as string | null) ?? "",
-        taskId: (props.remoteTaskId as string) ?? (props.taskId as string),
-        title: info.event.title.replace(/^\[[^\]]*\]\s*/, ""),
-        status: (props.status as string) ?? "open",
-        priority: (props.priority as string) ?? "none",
-        startAt: info.event.start
-          ? formatDateTimeLocal(info.event.start)
-          : null,
-        endAt: info.event.end ? formatDateTimeLocal(info.event.end) : null,
-      });
-      return;
-    }
-    const taskId = info.event.extendedProps.taskId;
-    if (taskId) {
-      setDraftTask(null);
-      const occurrenceStartAt = info.event.extendedProps.occurrenceStartAt as
-        | string
-        | null
-        | undefined;
-      setSelectedOccurrenceContext(
-        occurrenceStartAt
-          ? {
-              occurrence_id:
-                (info.event.extendedProps.occurrenceId as string | null) ??
-                null,
-              start_at: occurrenceStartAt,
-              end_at:
-                (info.event.extendedProps.occurrenceEndAt as string | null) ??
-                null,
-              original_start_at:
-                (info.event.extendedProps.occurrenceOriginalStartAt as
-                  | string
-                  | null) ?? null,
-              source_kind:
-                (info.event.extendedProps.occurrenceSourceKind as
-                  | string
-                  | null) ?? "task_schedule",
-              status:
-                (info.event.extendedProps.status as string | null) ?? null,
-            }
-          : null,
-      );
-      setSelectedTaskId(taskId);
-    }
-  }, []);
+  const handleEventClick = useCallback(
+    (info: EventClickArg) => {
+      const props = info.event.extendedProps;
+      if (props.isDocs && props.docsNodeId) {
+        closeTaskContextMenu();
+        setSelectedTaskId(null);
+        setDetailTaskId(null);
+        setSelectedOccurrenceContext(null);
+        setDraftTask(null);
+        setRemoteDialogTarget(null);
+        router.push(`/docs/${encodeURIComponent(props.docsNodeId as string)}`);
+        return;
+      }
+      if (props.isRemote && props.remoteServerId) {
+        closeTaskContextMenu();
+        setSelectedTaskId(null);
+        setDetailTaskId(null);
+        setSelectedOccurrenceContext(null);
+        setDraftTask(null);
+        setRemoteDialogTarget(null);
+        setRemoteDialogTarget({
+          profileId: props.remoteServerId as string,
+          profileName: (props.remoteServerName as string) ?? "remote",
+          profileColor: (props.projectColor as string | null) ?? null,
+          baseUrl: (props.remoteBaseUrl as string | null) ?? "",
+          taskId: (props.remoteTaskId as string) ?? (props.taskId as string),
+          title: info.event.title.replace(/^\[[^\]]*\]\s*/, ""),
+          status: (props.status as string) ?? "open",
+          priority: (props.priority as string) ?? "none",
+          startAt: info.event.start
+            ? formatDateTimeLocal(info.event.start)
+            : null,
+          endAt: info.event.end ? formatDateTimeLocal(info.event.end) : null,
+        });
+        return;
+      }
+      const taskId = info.event.extendedProps.taskId;
+      if (taskId) {
+        closeTaskContextMenu();
+        setDraftTask(null);
+        setDetailTaskId(null);
+        setRemoteDialogTarget(null);
+        const occurrenceStartAt = info.event.extendedProps.occurrenceStartAt as
+          | string
+          | null
+          | undefined;
+        setSelectedOccurrenceContext(
+          occurrenceStartAt
+            ? {
+                occurrence_id:
+                  (info.event.extendedProps.occurrenceId as string | null) ??
+                  null,
+                start_at: occurrenceStartAt,
+                end_at:
+                  (info.event.extendedProps.occurrenceEndAt as string | null) ??
+                  null,
+                original_start_at:
+                  (info.event.extendedProps.occurrenceOriginalStartAt as
+                    | string
+                    | null) ?? null,
+                source_kind:
+                  (info.event.extendedProps.occurrenceSourceKind as
+                    | string
+                    | null) ?? "task_schedule",
+                status:
+                  (info.event.extendedProps.status as string | null) ?? null,
+              }
+            : null,
+        );
+        setSelectedTaskId(taskId);
+        setDetailTaskId(taskId);
+      }
+    },
+    [closeTaskContextMenu, router],
+  );
 
   const handleEventContextMenu = useCallback(
     (
@@ -792,6 +1001,7 @@ export default function CalendarView() {
       eventAllDay: boolean,
       occurrenceContext?: RecurringOccurrenceContext | null,
     ) => {
+      if (calendarReadOnly) return;
       const task = tasks.find((t) => t.id === taskId);
       const menuTask: Task =
         task ??
@@ -822,12 +1032,15 @@ export default function CalendarView() {
         occurrenceContext,
       );
     },
-    [tasks, contextMenu],
+    [calendarReadOnly, contextMenu, tasks],
   );
 
   const handleEventDrop = useCallback(
     async (info: EventDropArg) => {
-      if (info.event.extendedProps.isRemote) {
+      if (
+        info.event.extendedProps.isRemote ||
+        info.event.extendedProps.isReadOnly
+      ) {
         info.revert();
         return;
       }
@@ -899,7 +1112,10 @@ export default function CalendarView() {
 
   const handleEventResize = useCallback(
     async (info: EventResizeDoneArg) => {
-      if (info.event.extendedProps.isRemote) {
+      if (
+        info.event.extendedProps.isRemote ||
+        info.event.extendedProps.isReadOnly
+      ) {
         info.revert();
         return;
       }
@@ -987,7 +1203,7 @@ export default function CalendarView() {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "ao-calendar-toggle";
-      button.textContent = isExpanded ? "しまう" : `+${hiddenCount}件`;
+      button.textContent = isExpanded ? "Collapse" : `+${hiddenCount} more`;
       button.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -1002,32 +1218,36 @@ export default function CalendarView() {
   }, [hiddenEventCountsByDate, expandedWeekKey, getWeekKey]);
 
   return (
-    <div className="flex h-full flex-col gap-2 p-3">
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-border bg-card px-3 py-2">
+    <div
+      className="ao-calendar-canvas flex h-full min-h-0 flex-col bg-background"
+      data-shell-workspace="calendar"
+      data-shell-region="calendar-canvas"
+    >
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-border bg-card px-3 py-2 md:hidden">
         <Tabs value={scope} onValueChange={(v) => setScope(v as ScopeMode)}>
           <TabsList className="h-8">
             <TabsTrigger value="project" className="text-xs">
-              プロジェクト単位
+              Project
             </TabsTrigger>
             <TabsTrigger value="space" className="text-xs">
-              スペース単位
+              Space
             </TabsTrigger>
             <TabsTrigger value="all" className="text-xs">
-              全表示
+              All
             </TabsTrigger>
           </TabsList>
         </Tabs>
 
         <div className="text-xs text-muted-foreground">
           {scope === "all"
-            ? "全プロジェクト横断"
+            ? "All projects"
             : scope === "space"
               ? selectedSpace
-                ? `スペース: ${selectedSpace.name}`
-                : "スペース未選択"
+                ? `Space: ${selectedSpace.name}`
+                : "No space selected"
               : selectedProject
-                ? `プロジェクト: ${selectedProject.name}`
-                : "プロジェクト未選択"}
+                ? `Project: ${selectedProject.name}`
+                : "No project selected"}
         </div>
 
         <div className="ml-auto flex items-center gap-3">
@@ -1036,36 +1256,53 @@ export default function CalendarView() {
               checked={showDocsLayer}
               onCheckedChange={(checked) => setShowDocsLayer(!!checked)}
             />
-            Docsを表示
+            Docs Items
           </label>
           <label className="flex cursor-pointer select-none items-center gap-1.5 text-xs text-muted-foreground">
             <Checkbox
               checked={hideRecurring}
               onCheckedChange={(checked) => setHideRecurring(!!checked)}
             />
-            繰り返しを非表示
+            Hide Recurring
           </label>
           <label className="flex cursor-pointer select-none items-center gap-1.5 text-xs text-muted-foreground">
             <Checkbox
               checked={showClosed}
               onCheckedChange={(checked) => setShowClosed(!!checked)}
             />
-            完了済みを表示
+            Show Completed
           </label>
         </div>
       </div>
 
       <div
         ref={calendarContainerRef}
-        className="relative min-h-0 flex-1"
+        className="ao-calendar-frame relative min-h-0 flex-1 overflow-hidden border border-border bg-card"
         style={{ minHeight: "500px" }}
       >
-        {canRenderCalendar ? (
+        {canRenderCalendar && calendarError ? (
+          <div
+            role="alert"
+            className="flex h-full flex-col items-center justify-center gap-3 rounded-lg border border-destructive/35 bg-destructive/5 px-6 text-center"
+          >
+            <AlertCircle className="size-6 text-destructive" aria-hidden="true" />
+            <p className="text-sm text-foreground">{calendarError}</p>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => void fetchData()}
+            >
+              Retry
+            </Button>
+          </div>
+        ) : canRenderCalendar ? (
           <FullCalendar
             ref={calendarRef}
             plugins={FC_PLUGINS}
             initialView={currentView}
-            locale="ja"
+            initialDate={currentDate ?? undefined}
+            locale="en"
             headerToolbar={FC_HEADER_TOOLBAR}
             buttonText={FC_BUTTON_TEXT}
             events={calendarEvents}
@@ -1085,6 +1322,33 @@ export default function CalendarView() {
               const projectAccent =
                 (info.event.extendedProps.projectColor as string | null) ??
                 undefined;
+              const isDocs = Boolean(info.event.extendedProps.isDocs);
+              const tagTokens = tags.length === 1
+                ? resolveProjectColorTokens(tags[0].color, resolvedTheme)
+                : null;
+              const tagSurface = tagTokens?.surface;
+              const tagAccent = tagTokens?.accent;
+              const singleTagTint =
+                resolvedTheme === "light" && tagSurface && tagAccent
+                  ? `color-mix(in srgb, ${tagSurface} 72%, ${tagAccent} 28%)`
+                  : tagSurface;
+              const eventTint = isDocs
+                ? "color-mix(in srgb, #0ea5e9 16%, var(--surface-slate))"
+                : tags.length === 1
+                  ? singleTagTint ?? "var(--surface-slate)"
+                  : "var(--surface-slate)";
+              const eventBorder = tags.length === 1 ? tagTokens?.border : undefined;
+              const eventCardClasses = [
+                "ao-cal-event",
+                isDocs ? "ao-cal-event-docs" : "",
+                tags.length === 1
+                  ? "ao-cal-event-tag-single"
+                  : tags.length > 1
+                    ? "ao-cal-event-tag-multi"
+                    : "ao-cal-event-tag-none",
+              ]
+                .filter(Boolean)
+                .join(" ");
               const timeText = shouldShowEventTime(
                 info.event.start,
                 info.event.allDay,
@@ -1104,76 +1368,124 @@ export default function CalendarView() {
                   .filter(Boolean)
                   .join(" / ");
                 return (
-                  <div className="ao-cal-event" title={tooltip}>
+                  <div
+                    className={`${eventCardClasses} rounded-r px-1.5 py-1 transition-colors hover:bg-foreground/[0.09]`}
+                    style={{
+                      backgroundColor: eventTint,
+                      borderColor: eventBorder,
+                    }}
+                    title={tooltip}
+                  >
                     <span
                       className="ao-cal-event-bar"
-                      style={{ backgroundColor: projectAccent }}
+                      style={{ backgroundColor: projectAccent ?? "var(--border)" }}
                     />
-                    <span className="ao-cal-event-title">
-                      {info.event.title}
-                    </span>
-                    {timeText && (
-                      <span className="ao-cal-event-time">{timeText}</span>
+                    {isDocs && (
+                      <FileText className="ao-cal-event-doc-icon" aria-hidden="true" />
                     )}
-                  </div>
-                );
-              }
-
-              // 週表示・リスト表示: プロジェクト名・タグを表示
-              const visibleTags = tags.slice(0, 2);
-              const hiddenTagCount = Math.max(
-                0,
-                tags.length - visibleTags.length,
-              );
-              return (
-                <div className="min-w-0 overflow-hidden">
-                  <div className="flex min-w-0 items-baseline gap-1">
-                    <div className="truncate font-medium">
-                      {info.event.title}
-                    </div>
-                    {timeText && (
-                      <span className="shrink-0 text-[10px] font-medium text-muted-foreground">
-                        {timeText}
+                    <span className="ao-cal-event-content">
+                      <span className="ao-cal-event-title">
+                        {isDocs && <span className="ao-cal-event-doc-label">Docs</span>}
+                        {info.event.title}
                       </span>
-                    )}
-                  </div>
-                  {projectName && (
-                    <div className="truncate text-[10px] text-muted-foreground">
-                      {projectName}
-                    </div>
-                  )}
-                  {visibleTags.length > 0 && (
-                    <div className="mt-0.5 flex gap-1 overflow-hidden">
-                      {visibleTags.map((tag) =>
-                        (() => {
-                          const tagTokens = resolveProjectColorTokens(
+                      {timeText && (
+                        <span className="ao-cal-event-time">{timeText}</span>
+                      )}
+                    </span>
+                    {tags.length > 1 && (
+                      <span className="ao-cal-event-tags" aria-label={`${tags.length} tags`}>
+                        {tags.slice(0, 3).map((tag) => {
+                          const tokens = resolveProjectColorTokens(
                             tag.color,
                             resolvedTheme,
                           );
                           return (
                             <span
                               key={tag.id}
-                              className="truncate rounded border px-1 py-0 text-[9px] font-medium"
-                              style={{
-                                backgroundColor:
-                                  tagTokens?.surface ?? "var(--muted)",
-                                borderColor:
-                                  tagTokens?.border ?? "var(--border)",
-                                color: tagTokens?.text ?? "var(--foreground)",
-                              }}
-                            >
-                              {tag.name}
-                            </span>
+                              className="ao-cal-event-tag-dot"
+                              style={{ backgroundColor: tokens?.accent ?? "var(--primary)" }}
+                            />
                           );
-                        })(),
-                      )}
-                      {hiddenTagCount > 0 && (
-                        <span className="shrink-0 rounded bg-muted px-1 py-0 text-[9px] font-medium text-muted-foreground">
-                          +{hiddenTagCount}
+                        })}
+                        {tags.length > 3 && (
+                          <span className="ao-cal-event-tag-count">+{tags.length - 3}</span>
+                        )}
+                      </span>
+                    )}
+                  </div>
+                );
+              }
+
+              // 週表示・リスト表示: プロジェクト名・タグを表示
+              const visibleTags = tags.length > 1 ? tags.slice(0, 2) : [];
+              const hiddenTagCount = tags.length > 2 ? tags.length - visibleTags.length : 0;
+              return (
+                <div
+                  className={`${eventCardClasses.replace("ao-cal-event", "ao-cal-event-list")} min-w-0 overflow-hidden rounded px-1.5 py-1 transition-colors hover:bg-foreground/[0.09]`}
+                  style={{
+                    backgroundColor: eventTint,
+                    borderColor: eventBorder,
+                    borderLeftColor: projectAccent ?? "var(--border)",
+                  }}
+                >
+                  {isDocs && (
+                    <FileText className="ao-cal-event-doc-icon" aria-hidden="true" />
+                  )}
+                  <div className="ao-cal-event-list-body">
+                    <div className="flex min-w-0 items-baseline gap-1">
+                      <div className="truncate font-medium">
+                        {isDocs && <span className="ao-cal-event-doc-label">Docs</span>}
+                        {info.event.title}
+                      </div>
+                      {timeText && (
+                        <span className="shrink-0 text-[10px] font-medium text-muted-foreground">
+                          {timeText}
                         </span>
                       )}
                     </div>
-                  )}
+                    {projectName && (
+                      <div className="truncate text-[10px] text-muted-foreground">
+                        {projectName}
+                      </div>
+                    )}
+                    {visibleTags.length > 0 && (
+                      <div className="mt-0.5 flex gap-1 overflow-hidden">
+                        {visibleTags.map((tag) =>
+                          (() => {
+                            const tagTokens = resolveProjectColorTokens(
+                              tag.color,
+                              resolvedTheme,
+                            );
+                            const chipSurface =
+                              resolvedTheme === "light" &&
+                              tagTokens?.surface &&
+                              tagTokens.accent
+                                ? `color-mix(in srgb, ${tagTokens.surface} 72%, ${tagTokens.accent} 28%)`
+                                : tagTokens?.surface ?? "var(--muted)";
+                            return (
+                              <span
+                                key={tag.id}
+                                className="truncate rounded border px-1 py-0 text-[9px] font-medium"
+                                style={{
+                                  backgroundColor: chipSurface,
+                                  borderColor:
+                                    tagTokens?.border ?? "var(--border)",
+                                  color: tagTokens?.text ?? "var(--foreground)",
+                                }}
+                              >
+                                {tag.name}
+                              </span>
+                            );
+                          })(),
+                        )}
+                        {hiddenTagCount > 0 && (
+                          <span className="shrink-0 rounded bg-muted px-1 py-0 text-[9px] font-medium text-muted-foreground">
+                            +{hiddenTagCount}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </div>
               );
             }}
@@ -1181,7 +1493,12 @@ export default function CalendarView() {
               const taskId = info.event.extendedProps.taskId as
                 | string
                 | undefined;
-              if (!taskId) return;
+              if (
+                !taskId ||
+                info.event.extendedProps.isRemote ||
+                info.event.extendedProps.isReadOnly
+              )
+                return;
               const occurrenceStartAt = info.event.extendedProps
                 .occurrenceStartAt as string | null | undefined;
               info.el.addEventListener("contextmenu", (e) => {
@@ -1236,13 +1553,17 @@ export default function CalendarView() {
             nowIndicator
           />
         ) : (
-          <div className="flex h-full items-center justify-center rounded-xl border border-dashed text-sm text-muted-foreground">
-            カレンダーを準備中...
+          <div className="flex h-full items-center justify-center rounded-lg border border-dashed border-border text-sm text-muted-foreground">
+            {prefsLoaded && scopeArg === null
+              ? scope === "space"
+                ? "Select a space to view this calendar"
+                : "Select a project to view this calendar"
+              : "Preparing calendar..."}
           </div>
         )}
         {loading && prefsLoaded && (
           <div className="pointer-events-none absolute right-3 top-3 rounded-md border border-border bg-card/90 px-2 py-1 text-xs text-muted-foreground shadow-sm">
-            読み込み中...
+            Loading...
           </div>
         )}
         {!prefsLoaded && (
@@ -1252,28 +1573,15 @@ export default function CalendarView() {
         )}
       </div>
 
-      {selectedProjectId && selectedProject?.source !== "remote" && (
-        <Button
-          size="icon"
-          className="fixed bottom-6 right-6 z-50 size-14 rounded-full shadow-sm"
-          onClick={() => {
-            const now = new Date();
-            now.setHours(now.getHours(), 0, 0, 0);
-            handleCreateTask(formatDateTimeLocal(now), false);
-          }}
-          title="今日の日時でタスク作成"
-        >
-          <Plus className="size-6" />
-        </Button>
-      )}
-
       <TaskDetailModal
-        taskId={selectedTaskId}
+        taskId={detailTaskId}
         draftTask={draftTask}
-        open={!!selectedTaskId || !!draftTask}
+        readOnly={detailReadOnly}
+        open={!!detailTaskId || !!draftTask}
         onOpenChange={(open) => {
           if (open) return;
           setSelectedTaskId(null);
+          setDetailTaskId(null);
           setSelectedOccurrenceContext(null);
           setDraftTask(null);
         }}

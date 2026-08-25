@@ -39,6 +39,8 @@ _TOOL_ORDER = (
     "delete_record_rows",
     "delete_record_table",
     "list_tasks",
+    "search_task_candidates",
+    "get_task",
     "create_task",
     "update_task",
     "delete_task",
@@ -97,7 +99,12 @@ Behavior rules:
 - A header-selected project is the runtime project context. Do not say that the project is unknown when runtime context is present.
 - When the user asks to add/create/register a task and provides the task content, call create_task. Do not ask for project, category, classification, or priority first.
 - Before calling create_task, derive a concise, human-readable title from the concrete action/event in the provided content.
+- Before creating any task, call search_task_candidates for the selected/current project (optionally with search) and inspect the returned parent_task_id hierarchy. Use get_task only when one candidate needs full detail. Do not repeatedly create new top-level tasks without checking existing work.
+- If an existing task clearly represents the same outcome or a container that owns the requested work, add the new actionable work beneath it with parent_task_id. Preserve existing parent/child structure and avoid duplicate container tasks.
+- If one new user goal requires multiple actions and no suitable existing root exists, create one outcome-oriented top-level task and create the actionable steps as its subtasks. Create separate top-level tasks only for independently deliverable outcomes; a single simple action does not need an extra container.
+- Do not merge or reparent tasks merely because their titles are similar. When containment is ambiguous, keep them separate rather than guessing. Cross-cutting relationships or dependencies are not parent/child containment.
 - If the user gives a planned date, due date, 予定日, deadline, appointment day, or any date/day for the task, pass it to create_task as due_date when there is no specific time, or start_at/end_at when time is known. Do not mention a schedule in your response unless the tool result contains start_at or end_at.
+- Set auto_close_on_due only when the user explicitly asks for automatic due-date completion; it is opt-in and defaults to false. For date-only tasks, completion is evaluated at 23:59:59 Asia/Tokyo.
 - For reservation/booking emails, title should use only the venue/service and purpose, e.g. "予約先 来店（サービス名）" or "予約先 サービス予約". Do not include appointment dates or times in the title. Never append parenthesized dates/times such as "（YYYY年MM月DD日 HH:mm）". Do not use generic titles such as "予約確認タスク", "タスク追加", or a reservation number as the main title.
 - Put appointment dates/times in start_at/end_at and description. Put reservation numbers, prices, coupon/point details, phone numbers, cancellation notes, and full extracted email facts in description, not in title.
 - For task creation without explicit priority, use priority="medium". For task creation without explicit project, use the runtime project; if no runtime project is available, create it in Inbox.

@@ -5,6 +5,12 @@ import io
 import numpy as np
 from typing import Optional, Generator, Tuple, Dict, Any
 
+from src.services.outbound_privacy_service import (
+    OutboundPrivacyGateway,
+    get_privacy_policy_context,
+)
+from src.services.turn_context import get_turn_context
+
 try:
     from google.cloud import speech
     GOOGLE_SPEECH_AVAILABLE = True
@@ -45,6 +51,50 @@ class GoogleSpeechRecognizer(SpeechRecognizerInterface):
         # Streaming configuration
         self.streaming_config = None
         self.stream_requests = []
+
+    def _privacy_gateway(self) -> OutboundPrivacyGateway:
+        """Build a request-scoped gateway for direct Google STT transport."""
+
+        try:
+            turn = get_turn_context()
+        except Exception:
+            turn = None
+        inherited = get_privacy_policy_context()
+        session_context = self.config.get("session_context")
+        project_metadata = self.config.get("project_metadata")
+        if not isinstance(session_context, dict):
+            session_context = inherited.session_context
+        if not isinstance(project_metadata, dict):
+            project_metadata = inherited.project_metadata
+        return OutboundPrivacyGateway(
+            self.config,
+            user_id=str(
+                self.config.get("user_id")
+                or getattr(turn, "user_id", None)
+                or ""
+            ),
+            session_id=str(
+                self.config.get("session_id")
+                or getattr(turn, "session_id", None)
+                or ""
+            ),
+            session_context=session_context if isinstance(session_context, dict) else None,
+            project_metadata=project_metadata if isinstance(project_metadata, dict) else None,
+        )
+
+    def _gate_audio(self, audio_data: bytes, *, source_kind: str) -> bytes:
+        """Apply privacy policy immediately before Google sends raw audio."""
+
+        protected = self._privacy_gateway().protect_sync(
+            {"audio": bytes(audio_data or b"")},
+            provider="google_speech",
+            base_url="https://speech.googleapis.com",
+            source_kind=source_kind,
+        )
+        payload = protected.payload
+        if isinstance(payload, dict) and isinstance(payload.get("audio"), (bytes, bytearray)):
+            return bytes(payload["audio"])
+        return bytes(audio_data or b"")
         
     def configure(self, config: Dict[str, Any]) -> None:
         """Configure the recognition engine
@@ -124,9 +174,21 @@ class GoogleSpeechRecognizer(SpeechRecognizerInterface):
         # Process accumulated requests
         if len(self.stream_requests) >= 5:  # Process every 5 chunks
             try:
-                # Create request iterator
-                requests = iter([speech.StreamingRecognizeRequest(streaming_config=self.streaming_config)] + 
-                              self.stream_requests)
+                # Gate the complete batch immediately before opening the
+                # Google streaming transport.  Protected/local_only policy
+                # therefore fails closed before ``streaming_recognize``.
+                batch_audio = b"".join(
+                    bytes(getattr(item, "audio_content", b"") or b"")
+                    for item in self.stream_requests
+                )
+                gated_audio = self._gate_audio(
+                    batch_audio,
+                    source_kind="google_speech_streaming",
+                )
+                requests = iter(
+                    [speech.StreamingRecognizeRequest(streaming_config=self.streaming_config)]
+                    + [speech.StreamingRecognizeRequest(audio_content=gated_audio)]
+                )
                 
                 # Get responses
                 responses = self.client.streaming_recognize(requests)
@@ -156,9 +218,19 @@ class GoogleSpeechRecognizer(SpeechRecognizerInterface):
             return None
             
         try:
-            # Process remaining requests
-            requests = iter([speech.StreamingRecognizeRequest(streaming_config=self.streaming_config)] + 
-                          self.stream_requests)
+            # Process remaining requests only after the raw-media gate.
+            batch_audio = b"".join(
+                bytes(getattr(item, "audio_content", b"") or b"")
+                for item in self.stream_requests
+            )
+            gated_audio = self._gate_audio(
+                batch_audio,
+                source_kind="google_speech_streaming_final",
+            )
+            requests = iter(
+                [speech.StreamingRecognizeRequest(streaming_config=self.streaming_config)]
+                + [speech.StreamingRecognizeRequest(audio_content=gated_audio)]
+            )
             
             responses = self.client.streaming_recognize(requests)
             
@@ -212,7 +284,12 @@ class GoogleSpeechRecognizer(SpeechRecognizerInterface):
                 model=self.model,
             )
             
-            # Perform recognition
+            # Perform recognition only after the raw-media gate.
+            gated_audio = self._gate_audio(
+                audio_data,
+                source_kind="google_speech_recognize",
+            )
+            audio = speech.RecognitionAudio(content=gated_audio)
             response = self.client.recognize(config=config, audio=audio)
             
             # Extract result

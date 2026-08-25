@@ -1,4 +1,8 @@
-import type { DocsBlockSnapshot } from "@/lib/docs-block-model";
+import {
+  hasMeaningfulBlockTitle,
+  isExplicitBlankParagraph,
+  type DocsBlockSnapshot,
+} from "@/lib/docs-block-model";
 import { plainDocsTitle } from "@/lib/docs-title";
 import type {
   DocsField,
@@ -79,6 +83,12 @@ export type LoadOptions = {
   nodeId?: string;
 };
 
+export const DOCS_WORKSPACE_UNMOUNTED_MESSAGE = "Docs Workspaceは既に閉じられています";
+
+export function isDocsWorkspaceUnmountedError(error: unknown): boolean {
+  return error instanceof Error && error.message === DOCS_WORKSPACE_UNMOUNTED_MESSAGE;
+}
+
 // 固定コマンドに加え、Supertag config_json.tools で宣言される任意のツールコマンドも受け付ける。
 export type DocsAiCommand =
   | "continue"
@@ -119,7 +129,14 @@ export type DocsCommandMode =
 export const SUPERTAGS_OVERVIEW_ID = "__supertags_overview__";
 
 export const COLLAPSED_KEY = "aoitalk.docs.outline.collapsed";
+/** @deprecated Sidebar expansion is session-only; removed on Docs mount. Kept for legacy cleanup. */
 export const SIDEBAR_COLLAPSED_KEY = "aoitalk.docs.sidebar.collapsed";
+// 子は遅延読込のため「collapsed に無い」だけでは展開を復元できない（未読込＝折りたたみ表示）。
+// ユーザーが実際に開いたノードをここに記録し、再訪時に子を先読みして展開状態へ戻す。
+export const EXPANDED_KEY = "aoitalk.docs.outline.expanded";
+// 復元で先読みする親ノードの上限。Docs は「基本は格納」で上位ノードを軽く保つ設計なので、
+// 起動時に走る自動先読みは小さく抑える。まとめて開きたい時は Ctrl+→ の2回押しを使う。
+export const EXPANDED_RESTORE_LIMIT = 15;
 export const DOCS_SIDEBAR_SLOT_ID = "docs-sidebar-slot";
 
 export function getDocsSidebarSlotSnapshot() {
@@ -150,7 +167,52 @@ export function writeCollapsed(value: Set<string>, key = COLLAPSED_KEY) {
 }
 
 export function nodeText(node: DocsNode) {
+  if (isExplicitBlankParagraph(node.title, node.body_json, node.node_type)) return "";
   return plainDocsTitle(node.title || node.body_text) || "Untitled";
+}
+
+/**
+ * Explicit blank paragraphs are persisted outline entries and remain visible
+ * as empty rows. Existing legacy rows can still be present in old workspaces,
+ * so every outline/list projection applies the same contract instead of
+ * rendering arbitrary blank nodes as "Untitled".
+ */
+export function isDocsNodeTitleVisible(
+  node: Pick<DocsNode, "title"> & Partial<Pick<DocsNode, "body_json" | "node_type">>,
+) {
+  // The serialized Docs contract always carries a string title. Treat an
+  // absent field from older/partial client snapshots as visible for
+  // backwards compatibility; only an explicit blank title is a legacy row.
+  if (typeof node.title !== "string") return true;
+  if (hasMeaningfulBlockTitle(node.title)) return true;
+  return isExplicitBlankParagraph(node.title, node.body_json, node.node_type);
+}
+
+/**
+ * Legacy mail importers used a literal ``（空行）`` label for an empty line.
+ * It is data, not a general-purpose blank marker: hide it only when the node
+ * is reachable from an email-origin document.  Ordinary user nodes with the
+ * same title remain visible.
+ */
+export function isLegacyEmailEmptyLineNode(
+  node: Pick<DocsNode, "id" | "title" | "parent_id" | "system_key" | "body_json">,
+  nodesById: Map<string, Pick<DocsNode, "id" | "parent_id" | "system_key" | "body_json">>,
+) {
+  if (node.title !== "（空行）") return false;
+  const isEmailDocument = (candidate: Pick<DocsNode, "system_key" | "body_json">) =>
+    candidate.body_json?.format === "email"
+    || candidate.system_key?.startsWith("project_mail:") === true;
+  if (isEmailDocument(node)) return true;
+  const seen = new Set<string>();
+  let parentId = node.parent_id;
+  while (parentId && !seen.has(parentId)) {
+    seen.add(parentId);
+    const parent = nodesById.get(parentId);
+    if (!parent) break;
+    if (isEmailDocument(parent)) return true;
+    parentId = parent.parent_id;
+  }
+  return false;
 }
 
 export function renderNodeTitleTemplate(
@@ -194,20 +256,129 @@ export function fieldsForNode(
   return Array.from(byId.values()).sort((a, b) => a.sort_order - b.sort_order);
 }
 
+const LEGACY_EMAIL_FIELD_KEYS = new Map([
+  ["件名", "email_subject"],
+  ["メール日時", "email_date"],
+  ["From", "email_from"],
+  ["To", "email_to"],
+  ["CC", "email_cc"],
+  ["BCC", "email_bcc"],
+  ["Message-ID", "email_message_id"],
+  ["In-Reply-To", "email_in_reply_to"],
+  ["References", "email_references"],
+  ["元ファイル名", "email_source_filename"],
+  ["元ファイルのプロジェクト内パス", "email_source_path"],
+  ["本文", "email_body"],
+]);
+
+function legacyEmailOutlineChunks(value: string, maxChunks: number) {
+  const chunks: string[] = [];
+  let truncated = false;
+  for (const line of value.replaceAll("\r\n", "\n").replaceAll("\r", "\n").split("\n")) {
+    const characters = Array.from(line);
+    const lineChunks = characters.length === 0
+      ? ["（空行）"]
+      : Array.from(
+        { length: Math.ceil(characters.length / 450) },
+        (_, index) => characters.slice(index * 450, (index + 1) * 450).join(""),
+      );
+    for (const chunk of lineChunks) {
+      if (chunks.length >= maxChunks) {
+        truncated = true;
+        break;
+      }
+      chunks.push(chunk);
+    }
+    if (truncated) break;
+  }
+  if (truncated) chunks[chunks.length - 1] = "（続きはノードのフィールドに全文保存されています）";
+  return chunks.length > 0 ? chunks : ["（空）"];
+}
+
+export function isLegacyEmailOutlineCandidate(
+  documentNode: DocsNode,
+  documentTags: DocsSupertag[],
+  candidate: DocsNode,
+) {
+  return documentNode.body_json?.format === "email"
+    && documentNode.system_key?.startsWith("project_mail:") === true
+    && documentTags.some((tag) => tag.system_key === "email")
+    && candidate.parent_id === documentNode.id
+    && LEGACY_EMAIL_FIELD_KEYS.has(candidate.title)
+    && !candidate.system_key
+    && candidate.display_props?.placement_reference !== true;
+}
+
+export function suppressLegacyEmailOutlineRows(
+  rows: Array<{ node: DocsNode; depth: number }>,
+  documentNode: DocsNode,
+  documentTags: DocsSupertag[],
+  documentFields: DocsField[],
+  documentFieldValues: DocsFieldValue[],
+  childrenByParent: Map<string | null, DocsNode[]>,
+  nodeHasChildren: (nodeId: string) => boolean,
+) {
+  if (!documentTags.some((tag) => tag.system_key === "email")) return rows;
+
+  let hiddenRootDepth: number | null = null;
+  return rows.filter((row) => {
+    if (hiddenRootDepth !== null) {
+      if (row.depth > hiddenRootDepth) return false;
+      hiddenRootDepth = null;
+    }
+    const fieldSystemKey = LEGACY_EMAIL_FIELD_KEYS.get(row.node.title);
+    const field = fieldSystemKey
+      ? documentFields.find((candidate) => candidate.system_key === fieldSystemKey)
+      : undefined;
+    const fieldValue = field
+      ? documentFieldValues.find((candidate) => candidate.field_id === field.id)
+      : undefined;
+    const expectedChunks = field
+      ? legacyEmailOutlineChunks(fieldValueToDraft(fieldValue), fieldSystemKey === "email_body" ? 32 : 4)
+      : [];
+    const actualChildren = (childrenByParent.get(row.node.id) ?? [])
+      .filter((child) => !child.archived_at);
+    const childrenExactlyMatch =
+      expectedChunks.length === actualChildren.length
+      && actualChildren.every((child, index) =>
+        !child.system_key
+        && child.display_props?.placement_reference !== true
+        && !nodeHasChildren(child.id)
+        && child.title === expectedChunks[index]);
+    const isLegacyMirror =
+      row.depth === 0
+      && isLegacyEmailOutlineCandidate(documentNode, documentTags, row.node)
+      && field !== undefined
+      && actualChildren.length > 0
+      && childrenExactlyMatch;
+    if (!isLegacyMirror) return true;
+    hiddenRootDepth = row.depth;
+    return false;
+  });
+}
+
 export function outlineRows(
   parentId: string,
   childrenByParent: Map<string | null, DocsNode[]>,
   collapsed: Set<string>,
   depth = 0,
   path = new Set<string>(),
+  isVisible: (node: DocsNode) => boolean = isDocsNodeTitleVisible,
 ) {
   const rows: Array<{ node: DocsNode; depth: number }> = [];
   for (const child of childrenByParent.get(parentId) ?? []) {
     if (child.archived_at) continue;
     if (path.has(child.id)) continue;
+    if (!isVisible(child)) {
+      // A legacy blank node must not hide meaningful descendants. Keep the
+      // hierarchy readable by walking through the invisible row at the same
+      // depth without exposing it as a KnowledgeNode row.
+      rows.push(...outlineRows(child.id, childrenByParent, collapsed, depth, new Set([...path, child.id]), isVisible));
+      continue;
+    }
     rows.push({ node: child, depth });
     if (!collapsed.has(child.id)) {
-      rows.push(...outlineRows(child.id, childrenByParent, collapsed, depth + 1, new Set([...path, child.id])));
+      rows.push(...outlineRows(child.id, childrenByParent, collapsed, depth + 1, new Set([...path, child.id]), isVisible));
     }
   }
   return rows;
@@ -243,7 +414,7 @@ export function searchTagIds(node: DocsNode) {
 }
 
 export function searchQueryClauses(query: unknown) {
-  const record = readConfigRecord(query);
+  const record = normalizeSearchQuery(query);
   return Array.isArray(record.and)
     ? record.and.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object" && !Array.isArray(item)))
     : [];
@@ -254,7 +425,7 @@ export function replaceSearchClause(
   predicate: (clause: Record<string, unknown>) => boolean,
   nextClause: Record<string, unknown> | null,
 ) {
-  const record = { ...readConfigRecord(query) };
+  const record = normalizeSearchQuery(query);
   const clauses = searchQueryClauses(record).filter((clause) => !predicate(clause));
   if (nextClause) clauses.push(nextClause);
   if (clauses.length > 0) {
@@ -291,13 +462,8 @@ export function searchFieldFilter(node: DocsNode): SearchFieldFilterDraft {
   };
 }
 
-export function searchProjectScope(node: DocsNode) {
-  const projectId = node.query_json?.project_id;
-  return typeof projectId === "string" ? projectId : "";
-}
-
 export function searchGroupBy(node: DocsNode) {
-  const groupBy = node.query_json?.group_by;
+  const groupBy = normalizeSearchQuery(node.query_json).group_by;
   if (typeof groupBy === "string") return groupBy;
   if (groupBy && typeof groupBy === "object" && !Array.isArray(groupBy)) {
     const fieldId = (groupBy as Record<string, unknown>).field_id ?? (groupBy as Record<string, unknown>).field;
@@ -327,18 +493,8 @@ export function withSearchFieldFilter(query: unknown, filter: SearchFieldFilterD
       : null,
   );
 }
-export function withSearchProjectScope(query: unknown, projectId: string) {
-  const record = { ...readConfigRecord(query) };
-  if (projectId) {
-    record.project_id = projectId;
-  } else {
-    delete record.project_id;
-  }
-  return record;
-}
-
 export function withSearchGroupBy(query: unknown, fieldId: string) {
-  const record = { ...readConfigRecord(query) };
+  const record = normalizeSearchQuery(query);
   const trimmed = fieldId.trim();
   if (trimmed) {
     record.group_by = trimmed;
@@ -447,4 +603,43 @@ export function searchSort(node: DocsNode): SearchSort {
 
 export function readConfigRecord(value: unknown) {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+/** Return a sidebar/outline list while hoisting legacy invisible blank rows. */
+export function hoistedVisibleChildren(
+  childrenByParent: Map<string | null, DocsNode[]>,
+  parentId: string | null,
+  isVisible: (node: DocsNode) => boolean,
+  path = new Set<string>(),
+) {
+  const result: DocsNode[] = [];
+  for (const child of childrenByParent.get(parentId) ?? []) {
+    if (path.has(child.id) || child.archived_at) continue;
+    if (isVisible(child)) {
+      result.push(child);
+      continue;
+    }
+    // Only title-invisible rows are hoisted.  A meaningful row hidden by an
+    // explicit sidebar policy must continue to hide its subtree as before.
+    if (!isDocsNodeTitleVisible(child)) {
+      result.push(...hoistedVisibleChildren(
+        childrenByParent,
+        child.id,
+        isVisible,
+        new Set([...path, child.id]),
+      ));
+    }
+  }
+  return result;
+}
+
+/**
+ * Search nodes are library-wide.  Older saved views may still carry the
+ * retired `project_id` query key; remove it at every search boundary so that
+ * those views cannot silently reintroduce a project-only scope.
+ */
+export function normalizeSearchQuery(value: unknown) {
+  const record = { ...readConfigRecord(value) };
+  delete record.project_id;
+  return record;
 }

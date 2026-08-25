@@ -7,7 +7,12 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
+from ..conversation_context import (
+    compact_model_transcript_for_history,
+    merge_model_transcript_snapshot,
+)
 from ..native_runtime import AgentDefinition as Agent
+from ...services.agent_run_service import redact_sensitive_model_transcript
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +27,9 @@ class MemoryIntegrationMixin:
             if self._loaded_history_session_id is not None:
                 self.history_manager.clear()
                 self._loaded_history_session_id = None
+            self._history_authoritative_model_transcript = []
+            self._history_active_model_transcript = []
+            self._privacy_session_context = {}
             return
 
         if session_id == self._loaded_history_session_id:
@@ -35,6 +43,9 @@ class MemoryIntegrationMixin:
 
         if not self.memory_manager or not self._memory_enabled:
             self._loaded_history_session_id = session_id
+            self._history_authoritative_model_transcript = []
+            self._history_active_model_transcript = []
+            self._privacy_session_context = {}
             return
 
         if not self.memory_manager.is_initialized():
@@ -53,6 +64,8 @@ class MemoryIntegrationMixin:
             )
         except Exception as e:
             self._loaded_history_session_id = None
+            self._history_authoritative_model_transcript = []
+            self._history_active_model_transcript = []
             print(f"[AgentLLMClient] Failed to load session history: {e}")
             return
 
@@ -73,6 +86,9 @@ class MemoryIntegrationMixin:
                     getattr(session, "current_summary", "") or ""
                 )
             session_context = getattr(session, "context", None) or {}
+            self._privacy_session_context = (
+                dict(session_context) if isinstance(session_context, dict) else {}
+            )
             provider_state = (
                 session_context.get("llm_provider_state")
                 if isinstance(session_context, dict)
@@ -83,34 +99,55 @@ class MemoryIntegrationMixin:
                     "previous_response_id": provider_state.get("previous_response_id"),
                     "fingerprint": provider_state.get("fingerprint"),
                 }
+        else:
+            self._privacy_session_context = {}
 
         max_messages = getattr(self.history_manager, "hard_limit", 100)
         model_messages: list[dict[str, Any]] = []
+        previous_transcript: list[dict[str, Any]] = []
+        fallback_start = 0
         for msg in messages[-max_messages:]:
             if msg.role not in {"user", "assistant", "system"}:
                 continue
             self.history_manager.add_message(msg.role, msg.content)
             metadata = getattr(msg, "message_metadata", None) or {}
             transcript = metadata.get("model_transcript") if isinstance(metadata, dict) else None
-            if isinstance(transcript, list) and transcript:
-                first = transcript[0] if isinstance(transcript[0], dict) else {}
-                if (
-                    model_messages
-                    and first.get("role") == "user"
-                    and model_messages[-1].get("role") == "user"
-                ):
-                    model_messages.pop()
-                model_messages.extend(
-                    dict(item)
-                    for item in transcript
-                    if isinstance(item, dict)
-                    and item.get("role") in {"user", "assistant", "tool"}
+            if msg.role == "assistant" and isinstance(transcript, list) and transcript:
+                model_messages, previous_transcript, fallback_start = (
+                    merge_model_transcript_snapshot(
+                    model_messages,
+                    previous_transcript,
+                    fallback_start,
+                    transcript,
+                    allowed_roles={"user", "assistant", "tool"},
+                )
                 )
             else:
                 model_messages.append({"role": msg.role, "content": msg.content})
 
+        compacted_model_messages = compact_model_transcript_for_history(
+            model_messages,
+            getattr(self, "config", None),
+        )
+        # Keep the complete model-role transcript separately from the compact
+        # provider input.  Native results are based on the latter, while
+        # durable assistant metadata must retain the former for replay and
+        # cumulative checkpoint merging.
+        self._history_authoritative_model_transcript = [
+            dict(item)
+            for item in model_messages
+            if isinstance(item, dict)
+            and item.get("role") in {"user", "assistant", "tool"}
+        ]
+        self._history_active_model_transcript = [
+            dict(item)
+            for item in compacted_model_messages
+            if isinstance(item, dict)
+            and item.get("role") in {"user", "assistant", "tool"}
+        ]
+        self._last_model_transcript = [dict(item) for item in previous_transcript]
         if hasattr(self.history_manager, "set_model_messages"):
-            self.history_manager.set_model_messages(model_messages)
+            self.history_manager.set_model_messages(compacted_model_messages)
 
         self._loaded_history_session_id = session_id
         print(
@@ -134,41 +171,27 @@ class MemoryIntegrationMixin:
         metadata = self.session_metadata.copy() if self.session_metadata else {}
         transcript = getattr(self, "_last_model_transcript", None) or []
         if transcript:
-            metadata["model_transcript"] = [
-                dict(message)
-                for message in transcript
-                if isinstance(message, dict)
-            ]
+            metadata["model_transcript"] = redact_sensitive_model_transcript(
+                [
+                    dict(message)
+                    for message in transcript
+                    if isinstance(message, dict)
+                ]
+            )
         return metadata
 
     async def _build_past_conversation_recall(self, user_input: str) -> str:
-        """ユーザー入力で過去会話をベクトル検索し、関連する抜粋だけを整形して返す。
+        """Return no implicit cross-session recall for ordinary turns.
 
-        キーワードゲートは使わず、意味的関連度(内部で min_relevance_score=0.3)で
-        フィルタ済みの結果だけを注入する。関連が無ければ空文字列を返し、
-        いかなる例外でもターンを壊さず "" を返す。
+        Past-chat retrieval is a read-only LLM tool decision (or an explicit
+        command capability), not a natural-language trigger.  In particular,
+        a retained Selected Project ID must never become a hidden project
+        memory scope while Project Context is OFF.  Keeping this hook empty
+        also prevents provider-specific direct-client fallbacks from bypassing
+        the turn-local visibility flag.
         """
-        if not self.memory_manager or not self._memory_enabled:
-            return ""
-        if not getattr(self.memory_manager.config, "enable_search", True):
-            return ""
 
-        try:
-            from ...memory.cross_session_memory import get_cross_session_memory
-
-            csm = get_cross_session_memory()
-            results = await csm.search_relevant_conversations(
-                user_id=self._get_session_user_id(),
-                query=user_input,
-                current_session_id=self.current_session_id,
-                limit=3,
-            )
-            if not results:
-                return ""
-            return csm.format_memory_context(results, max_chars=1200)
-        except Exception as e:
-            logger.debug(f"過去会話の自動注入に失敗(注入をスキップ): {e}")
-            return ""
+        return ""
 
     def check_and_summarize_history(self, history_manager=None) -> None:
         """Check if history needs summarization and start background task.
@@ -186,7 +209,12 @@ class MemoryIntegrationMixin:
             # Create background task
             try:
                 loop = asyncio.get_running_loop()
-                task = loop.create_task(self._summarize_history_task(history_manager))
+                task = loop.create_task(
+                    self._summarize_history_task(
+                        history_manager,
+                        session_id=self.current_session_id,
+                    )
+                )
                 self._active_summarization_tasks.add(task)
                 task.add_done_callback(self._active_summarization_tasks.discard)
 
@@ -197,7 +225,7 @@ class MemoryIntegrationMixin:
                 # No running loop (shouldn't happen in async context usually)
                 pass
 
-    async def _summarize_history_task(self, history_manager):
+    async def _summarize_history_task(self, history_manager, *, session_id=None):
         """Background task to summarize old history.
 
         Args:
@@ -223,6 +251,23 @@ class MemoryIntegrationMixin:
             new_summary = await self._generate_summary(
                 messages_to_summarize, current_summary
             )
+            from ...memory.summary_validation import validate_generated_summary
+
+            source_text = "\n".join(
+                f"{message.get('role', 'message')}: {message.get('content', '')}"
+                for message in messages_to_summarize
+            )
+            validation = validate_generated_summary(
+                new_summary,
+                source_text=source_text,
+                previous_summary=current_summary,
+            )
+            if not validation.accepted:
+                logger.warning(
+                    "履歴要約候補を棄却しました: %s",
+                    validation.reason,
+                )
+                return
 
             # Commit the checkpoint only when the prefix is still unchanged.
             # New messages may have arrived while the summary was generated.
@@ -230,18 +275,24 @@ class MemoryIntegrationMixin:
             if current_prefix != messages_to_summarize:
                 logger.info("履歴要約を保留: 要約中に履歴の先頭が変更されました")
                 return
-            history_manager.update_summary(new_summary)
+            if (
+                session_id
+                and getattr(self, "_loaded_history_session_id", session_id)
+                != session_id
+            ):
+                logger.info(
+                    "履歴要約を保留: 要約中に別セッションへ切り替わりました"
+                )
+                return
+            # This is provider-local prompt compaction only. The canonical DB
+            # summary is owned by ConversationMemoryManager, whose checkpoint
+            # archives and deletes the summarized message prefix atomically.
+            # Persisting here without deleting DB messages would reload the
+            # same content as both current_summary and active messages.
+            history_manager.update_summary(validation.normalized)
             history_manager.history = history_manager.history[len(messages_to_summarize) :]
             if hasattr(history_manager, "set_model_messages"):
                 history_manager.set_model_messages(history_manager.get_all())
-            if self.current_session_id and self.memory_manager:
-                try:
-                    await self.memory_manager.repository.update_session_summary(
-                        self.current_session_id,
-                        history_manager.summary,
-                    )
-                except Exception:
-                    logger.warning("要約checkpointの永続化に失敗しました", exc_info=True)
             print(
                 f"[AgentLLMClient] Summary updated. New history length: {len(history_manager.history)}"
             )
@@ -284,7 +335,13 @@ Updated summary:
                 tools=[],
                 model_settings=self.agent.model_settings,
             )
-            result = await self._turn_runner.run(summary_agent, prompt)
+            # History summarization runs in a background task while a native
+            # turn may still be using the shared runner object.  Reuse the
+            # client-wide native runner scope so mutable runner settings and
+            # provider state cannot overlap; the scope itself does not cover
+            # any database/usage persistence performed by the caller.
+            async with self._native_runner_lock_scope():
+                result = await self._turn_runner.run(summary_agent, prompt)
             return result.final_output
 
         except Exception as e:

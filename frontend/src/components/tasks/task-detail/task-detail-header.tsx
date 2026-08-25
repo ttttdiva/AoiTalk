@@ -3,7 +3,7 @@
 import type { RefObject } from "react";
 
 import {
-  Send,
+  MessageSquarePlus,
   Trash2,
   Plus,
   MoreHorizontal,
@@ -42,10 +42,25 @@ import {
   formatDuration,
   formatTimeRange,
 } from "@/components/tasks/task-detail/task-detail-utils";
+import { toast } from "sonner";
 
 type SlashCandidate = ReturnType<
   typeof import("@/components/tasks/task-form-utils").buildTaskCommandCandidates
 >;
+
+type ProjectOption = {
+  id: string;
+  name: string;
+  space_id?: string | null;
+  source?: string;
+  can_write?: boolean;
+};
+
+function isWritableProject(project: ProjectOption | undefined): boolean {
+  return Boolean(
+    project && project.source !== "remote" && project.can_write !== false,
+  );
+}
 
 export function TaskDetailHeader({
   task,
@@ -58,7 +73,7 @@ export function TaskDetailHeader({
   entryFocus,
   allProjects,
   spaces,
-  launchingAgent,
+  openingChat,
   triagingAgent,
   onTitleChange,
   onTitleBlur,
@@ -66,11 +81,12 @@ export function TaskDetailHeader({
   onParseSlashCommands,
   focusDescriptionEditor,
   immediateUpdate,
-  handleRunWithAgent,
+  handleOpenInChat,
   handleRunAgentTriage,
   handleDuplicate,
   handleDelete,
   handleDialogOpenChange,
+  readOnly = false,
 }: {
   task: Task;
   effectiveTaskId: string | null;
@@ -80,9 +96,9 @@ export function TaskDetailHeader({
   titleInputRef: RefObject<HTMLInputElement | null>;
   slashCandidates: SlashCandidate;
   entryFocus?: TimeEntry | null;
-  allProjects: { id: string; name: string; space_id?: string | null }[];
+  allProjects: ProjectOption[];
   spaces: { id: string; name: string }[];
-  launchingAgent: boolean;
+  openingChat: boolean;
   triagingAgent: boolean;
   onTitleChange: (val: string) => void;
   onTitleBlur: () => void;
@@ -95,15 +111,16 @@ export function TaskDetailHeader({
   immediateUpdate: (
     data: Record<string, unknown>,
   ) => Promise<Task | null> | void;
-  handleRunWithAgent: () => void;
+  handleOpenInChat: () => void;
   handleRunAgentTriage: () => void;
   handleDuplicate: () => void;
   handleDelete: () => void;
   handleDialogOpenChange: (open: boolean) => void;
+  readOnly?: boolean;
 }) {
   return (
-    <div className="pt-2">
-      {editingTitle ? (
+    <div className="border-b border-border pb-4 pt-1">
+      {editingTitle && !readOnly ? (
         <SlashCommandInput
           inputRef={titleInputRef}
           value={editTitle}
@@ -115,14 +132,18 @@ export function TaskDetailHeader({
           onSubmitIntent={onTitleSubmitIntent}
           submitOnEnter={!effectiveTaskId}
           onParseSlashCommands={onParseSlashCommands}
-          className="text-2xl md:text-2xl font-bold h-auto border-none shadow-none px-0 py-0 focus-visible:ring-0"
+          className="h-auto border-none px-0 py-0 text-2xl font-semibold tracking-tight shadow-none focus-visible:ring-0 md:text-2xl"
           autoFocus
           onNavigateDown={focusDescriptionEditor}
         />
       ) : (
         <h1
-          className="text-2xl md:text-2xl font-bold cursor-pointer hover:text-primary/80 transition-colors"
-          onClick={() => setEditingTitle(true)}
+          className={
+            readOnly
+              ? "text-2xl font-semibold tracking-tight"
+              : "cursor-pointer text-2xl font-semibold tracking-tight transition-colors hover:text-primary/80"
+          }
+          onClick={readOnly ? undefined : () => setEditingTitle(true)}
         >
           {editTitle || task.title}
         </h1>
@@ -159,7 +180,18 @@ export function TaskDetailHeader({
             <span className="text-xs text-muted-foreground">📁</span>
             <Select
               value={task.project_id}
-              onValueChange={(v) => v && immediateUpdate({ project_id: v })}
+              disabled={readOnly}
+              onValueChange={(v) => {
+                if (!v || v === task.project_id || readOnly) return;
+                const targetProject = allProjects.find(
+                  (project) => project.id === v,
+                );
+                if (!isWritableProject(targetProject)) {
+                  toast.error("読み取り専用プロジェクトへは移動できません");
+                  return;
+                }
+                void immediateUpdate({ project_id: v });
+              }}
             >
               <SelectTrigger className="h-6 w-auto max-w-full border-none px-1 text-xs text-muted-foreground shadow-none hover:text-foreground">
                 <span className="truncate">
@@ -175,7 +207,11 @@ export function TaskDetailHeader({
                     <SelectGroup key={s.id}>
                       <SelectLabel>{s.name}</SelectLabel>
                       {group.map((p) => (
-                        <SelectItem key={p.id} value={p.id}>
+                        <SelectItem
+                          key={p.id}
+                          value={p.id}
+                          disabled={!isWritableProject(p)}
+                        >
                           {p.name}
                         </SelectItem>
                       ))}
@@ -188,7 +224,11 @@ export function TaskDetailHeader({
                     {allProjects
                       .filter((p) => !p.space_id)
                       .map((p) => (
-                        <SelectItem key={p.id} value={p.id}>
+                        <SelectItem
+                          key={p.id}
+                          value={p.id}
+                          disabled={!isWritableProject(p)}
+                        >
                           {p.name}
                         </SelectItem>
                       ))}
@@ -200,36 +240,42 @@ export function TaskDetailHeader({
         )}
 
         <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="h-8 gap-2"
-            onClick={() => void handleRunWithAgent()}
-            disabled={
-              launchingAgent || !normalizeTaskTitle(editTitle || task.title)
-            }
-          >
-            <Send className="size-3.5" />
-            {launchingAgent ? "Starting..." : "Run with agent"}
-          </Button>
+          {!readOnly && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-8 gap-2 rounded"
+              onClick={() => void handleOpenInChat()}
+              disabled={
+                openingChat || !normalizeTaskTitle(editTitle || task.title)
+              }
+            >
+              <MessageSquarePlus className="size-3.5" />
+              {openingChat ? "Opening..." : "Open in Chat"}
+            </Button>
+          )}
           <DropdownMenu>
-            <DropdownMenuTrigger className="inline-flex size-8 items-center justify-center rounded-md border bg-background text-muted-foreground shadow-xs transition-colors hover:bg-accent hover:text-accent-foreground">
+            <DropdownMenuTrigger className="inline-flex size-8 items-center justify-center rounded border border-border bg-transparent text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground">
               <MoreHorizontal className="size-4" />
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-56 min-w-56">
               <DropdownMenuLabel>Task</DropdownMenuLabel>
               {effectiveTaskId ? (
                 <>
-                  <DropdownMenuItem
-                    mnemonic="A"
-                    disabled={triagingAgent}
-                    onClick={() => void handleRunAgentTriage()}
-                  >
-                    <CircleDot className="size-4" />
-                    {triagingAgent ? "Preparing..." : "Prepare for Agent"}
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
+                  {!readOnly && (
+                    <>
+                      <DropdownMenuItem
+                        mnemonic="A"
+                        disabled={triagingAgent}
+                        onClick={() => void handleRunAgentTriage()}
+                      >
+                        <CircleDot className="size-4" />
+                        {triagingAgent ? "Preparing..." : "Prepare for Agent"}
+                      </DropdownMenuItem>
+                      <DropdownMenuSeparator />
+                    </>
+                  )}
                   <div className="px-2 py-1.5 text-xs text-muted-foreground">
                     作成: {formatDateTime(task.created_at)}
                   </div>
@@ -241,28 +287,33 @@ export function TaskDetailHeader({
                       完了: {formatDateTime(task.completed_at)}
                     </div>
                   )}
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem
-                    mnemonic="C"
-                    onClick={() => void handleDuplicate()}
-                  >
-                    <Plus className="size-4" />
-                    複製
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    mnemonic="D"
-                    variant="destructive"
-                    onClick={() => void handleDelete()}
-                  >
-                    <Trash2 className="size-4" />
-                    削除
-                  </DropdownMenuItem>
+                  {!readOnly && (
+                    <>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem
+                        mnemonic="C"
+                        onClick={() => void handleDuplicate()}
+                      >
+                        <Plus className="size-4" />
+                        複製
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        mnemonic="D"
+                        variant="destructive"
+                        onClick={() => void handleDelete()}
+                      >
+                        <Trash2 className="size-4" />
+                        削除
+                      </DropdownMenuItem>
+                    </>
+                  )}
                 </>
               ) : (
                 <DropdownMenuItem
                   mnemonic="D"
                   variant="destructive"
                   onClick={() => handleDialogOpenChange(false)}
+                  disabled={readOnly}
                 >
                   <Trash2 className="size-4" />
                   下書きを破棄

@@ -18,7 +18,9 @@ import {
   ChevronDown,
 } from "lucide-react";
 
+import type { RecurrenceSkipMode } from "@/lib/recurrence-preview";
 import { Input } from "@/components/ui/input";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -32,15 +34,13 @@ import {
   DropdownMenuContent,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import type {
-  RecurrenceRule,
-  Tag,
-  Task,
-} from "@/lib/task-api";
+import type { RecurrenceRule, Tag, Task } from "@/lib/task-api";
 import { toLocalDateTimeInputValue } from "@/lib/date-time";
 import { cn } from "@/lib/utils";
 import { formatTimerClock } from "@/lib/task-time";
 import { TaskDatePicker } from "@/components/tasks/task-date-picker";
+import { formatTaskDateLabel } from "@/lib/task-date-label";
+import { AssigneeSelector } from "@/components/tasks/task-detail/assignee-selector";
 
 import { PropertyRow } from "@/components/tasks/task-detail/property-row";
 import { TagSelector } from "@/components/tasks/task-detail/tag-selector";
@@ -59,6 +59,7 @@ type DateUpdatePartial = {
 export function TaskDetailPropertyGrid({
   task,
   effectiveTaskId,
+  assigneeSelectorKey,
   tags,
   spaces,
   currentSpaceId,
@@ -99,6 +100,7 @@ export function TaskDetailPropertyGrid({
   recEndDate,
   recSkipWeekend,
   recSkipHoliday,
+  recSkipMode,
   recurrenceSaving,
   handleFreqChange,
   setRecInterval,
@@ -111,11 +113,14 @@ export function TaskDetailPropertyGrid({
   setRecEndDate,
   setRecSkipWeekend,
   setRecSkipHoliday,
+  setRecSkipMode,
   handleSaveRecurrence,
   handleDeleteRecurrence,
+  readOnly = false,
 }: {
   task: Task;
   effectiveTaskId: string | null;
+  assigneeSelectorKey: string;
   tags: Tag[];
   spaces: { id: string; name: string; slug: string }[];
   currentSpaceId: string | null;
@@ -164,6 +169,7 @@ export function TaskDetailPropertyGrid({
   recEndDate: string | null;
   recSkipWeekend: boolean;
   recSkipHoliday: boolean;
+  recSkipMode: RecurrenceSkipMode;
   recurrenceSaving: boolean;
   handleFreqChange: (newFreq: string) => void;
   setRecInterval: (value: number) => void;
@@ -176,19 +182,24 @@ export function TaskDetailPropertyGrid({
   setRecEndDate: (value: string | null) => void;
   setRecSkipWeekend: (value: boolean) => void;
   setRecSkipHoliday: (value: boolean) => void;
+  setRecSkipMode: (value: RecurrenceSkipMode) => void;
   handleSaveRecurrence: () => void;
   handleDeleteRecurrence: () => void;
+  readOnly?: boolean;
 }) {
   return (
-    <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,26.25rem)] gap-x-6 border-y divide-y [&>*:nth-child(odd)]:border-r [&>*:nth-child(odd)]:pr-6 [&>*:nth-child(even)]:pl-6">
+    <div
+      className="grid grid-cols-1 divide-y border-y md:grid-cols-2 md:gap-x-6 md:divide-y-0 md:[&>div:nth-child(even)]:border-l md:[&>div:nth-child(even)]:pl-6 md:[&>div:nth-child(n+3)]:border-t [&>div]:min-h-10 [&>div]:py-2"
+      data-task-detail-property-grid="true"
+    >
       {/* Status */}
-      <PropertyRow
-        icon={<CircleDot className="size-3.5" />}
-        label="ステータス"
-      >
+      <PropertyRow icon={<CircleDot className="size-3.5" />} label="ステータス">
         <div className="flex items-center gap-1">
           <DropdownMenu onOpenChange={setStatusSelectOpen}>
-            <DropdownMenuTrigger className="inline-flex h-7 w-auto items-center gap-1 rounded-md px-1.5 text-xs font-medium outline-none transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:ring-1 focus-visible:ring-ring data-[state=open]:bg-accent">
+            <DropdownMenuTrigger
+              disabled={readOnly}
+              className="inline-flex h-7 w-auto items-center gap-1 rounded-md px-1.5 text-xs font-medium outline-none transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:ring-1 focus-visible:ring-ring data-[state=open]:bg-accent disabled:pointer-events-none"
+            >
               <span className="flex items-center gap-1.5">
                 <span
                   className={cn(
@@ -216,6 +227,7 @@ export function TaskDetailPropertyGrid({
           </DropdownMenu>
           <button
             type="button"
+            disabled={readOnly}
             title={task.status === "closed" ? "未着手に戻す" : "完了にする"}
             className={cn(
               "flex items-center justify-center size-6 rounded transition-colors",
@@ -241,16 +253,30 @@ export function TaskDetailPropertyGrid({
 
       {/* Assignees */}
       <PropertyRow icon={<Users2 className="size-3.5" />} label="担当者">
-        {task.assignees && task.assignees.length > 0 ? (
-          <div className="flex flex-wrap gap-1">
-            {task.assignees.map((a) => (
-              <span key={a.id} className="text-xs">
-                {a.display_name || a.username || a.user_id}
-              </span>
-            ))}
-          </div>
+        {readOnly ? (
+          task.assignees && task.assignees.length > 0 ? (
+            <div className="flex flex-wrap gap-1">
+              {task.assignees.map((assignee) => (
+                <span key={assignee.id} className="text-xs">
+                  {assignee.display_name ||
+                    assignee.username ||
+                    assignee.user_id}
+                </span>
+              ))}
+            </div>
+          ) : (
+            <span className="text-xs text-muted-foreground">Empty</span>
+          )
         ) : (
-          <span className="text-xs text-muted-foreground">Empty</span>
+          <AssigneeSelector
+            key={assigneeSelectorKey}
+            projectId={task.project_id}
+            assignees={task.assignees || []}
+            disabled={!effectiveTaskId}
+            onChange={(assigneeIds) =>
+              immediateUpdate({ assignee_ids: assigneeIds })
+            }
+          />
         )}
       </PropertyRow>
 
@@ -263,69 +289,122 @@ export function TaskDetailPropertyGrid({
               aria-label="繰り返しタスク"
             />
           )}
-          <TaskDatePicker
-            startAt={toLocalDateTimeInputValue(displayStartAt, {
-              allDay: task.all_day,
-            })}
-            endAt={toLocalDateTimeInputValue(displayEndAt, {
-              allDay: task.all_day,
-            })}
-            allDay={task.all_day}
-            deferCommitUntilClose={!!activeOccurrenceContext?.start_at}
-            onRangeChange={
-              activeOccurrenceContext?.start_at
-                ? moveOccurrenceDateRange
-                : ({ startAt, endAt }) =>
-                    immediateUpdate(
-                      buildDateTaskUpdate({
-                        start_at: startAt,
-                        end_at: endAt,
-                      }),
-                    )
-            }
-            onStartAtChange={(v) =>
-              immediateUpdate(
-                buildDateTaskUpdate({
-                  start_at: v,
-                }),
-              )
-            }
-            onEndAtChange={(v) =>
-              immediateUpdate(
-                buildDateTaskUpdate({
-                  end_at: v,
-                }),
-              )
-            }
-            recurrence={{
-              recurrenceRule,
-              freq: recFreq,
-              interval: recInterval,
-              byDay: recByDay,
-              triggerStatus: recTriggerStatus,
-              createNew: recCreateNew,
-              recurForever: recRecurForever,
-              resetStatusTo: recResetStatusTo,
-              endCount: recEndCount,
-              endDate: recEndDate,
-              skipWeekend: recSkipWeekend,
-              skipHoliday: recSkipHoliday,
-              saving: recurrenceSaving,
-              onFreqChange: handleFreqChange,
-              onIntervalChange: setRecInterval,
-              onToggleWeekday: toggleWeekday,
-              onTriggerStatusChange: setRecTriggerStatus,
-              onCreateNewChange: setRecCreateNew,
-              onRecurForeverChange: setRecRecurForever,
-              onResetStatusToChange: setRecResetStatusTo,
-              onEndCountChange: setRecEndCount,
-              onEndDateChange: setRecEndDate,
-              onSkipWeekendChange: setRecSkipWeekend,
-              onSkipHolidayChange: setRecSkipHoliday,
-              onSave: handleSaveRecurrence,
-              onDelete: handleDeleteRecurrence,
+          {readOnly ? (
+            <span className="text-xs text-muted-foreground">
+              {formatTaskDateLabel(displayStartAt ?? null, {
+                allDay: task.all_day,
+                absoluteStyle: "long",
+              })}
+              {displayEndAt
+                ? ` → ${formatTaskDateLabel(displayEndAt, {
+                    allDay: task.all_day,
+                    absoluteStyle: "long",
+                  })}`
+                : ""}
+            </span>
+          ) : (
+            <TaskDatePicker
+              startAt={toLocalDateTimeInputValue(displayStartAt, {
+                allDay: task.all_day,
+              })}
+              endAt={toLocalDateTimeInputValue(displayEndAt, {
+                allDay: task.all_day,
+              })}
+              allDay={task.all_day}
+              deferCommitUntilClose={!!activeOccurrenceContext?.start_at}
+              onRangeChange={
+                activeOccurrenceContext?.start_at
+                  ? moveOccurrenceDateRange
+                  : ({ startAt, endAt }) =>
+                      immediateUpdate(
+                        buildDateTaskUpdate({
+                          start_at: startAt,
+                          end_at: endAt,
+                        }),
+                      )
+              }
+              onStartAtChange={(v) =>
+                immediateUpdate(
+                  buildDateTaskUpdate({
+                    start_at: v,
+                  }),
+                )
+              }
+              onEndAtChange={(v) =>
+                immediateUpdate(
+                  buildDateTaskUpdate({
+                    end_at: v,
+                  }),
+                )
+              }
+              recurrence={{
+                recurrenceRule,
+                freq: recFreq,
+                interval: recInterval,
+                byDay: recByDay,
+                triggerStatus: recTriggerStatus,
+                createNew: recCreateNew,
+                recurForever: recRecurForever,
+                resetStatusTo: recResetStatusTo,
+                endCount: recEndCount,
+                endDate: recEndDate,
+                skipWeekend: recSkipWeekend,
+                skipHoliday: recSkipHoliday,
+                skipMode: recSkipMode,
+                saving: recurrenceSaving,
+                onFreqChange: handleFreqChange,
+                onIntervalChange: setRecInterval,
+                onToggleWeekday: toggleWeekday,
+                onTriggerStatusChange: setRecTriggerStatus,
+                onCreateNewChange: setRecCreateNew,
+                onRecurForeverChange: setRecRecurForever,
+                onResetStatusToChange: setRecResetStatusTo,
+                onEndCountChange: setRecEndCount,
+                onEndDateChange: setRecEndDate,
+                onSkipWeekendChange: setRecSkipWeekend,
+                onSkipHolidayChange: setRecSkipHoliday,
+                onSkipModeChange: setRecSkipMode,
+                onSave: handleSaveRecurrence,
+                onDelete: handleDeleteRecurrence,
+              }}
+            />
+          )}
+        </div>
+      </PropertyRow>
+
+      {/* Auto-close on due */}
+      <PropertyRow
+        icon={<CheckCircle className="size-3.5" />}
+        label="期日で自動完了"
+      >
+        <div className="flex items-start gap-2">
+          <Checkbox
+            id="task-detail-auto-close-on-due"
+            checked={task.auto_close_on_due === true}
+            disabled={readOnly}
+            onCheckedChange={(checked) => {
+              const next = !!checked;
+              if (effectiveTaskId) {
+                void immediateUpdate({ auto_close_on_due: next });
+              } else {
+                applyLocalDraftUpdate({ auto_close_on_due: next });
+              }
             }}
           />
+          <div className="grid gap-0.5">
+            <label
+              htmlFor="task-detail-auto-close-on-due"
+              className={cn(
+                "text-xs cursor-pointer",
+                readOnly && "cursor-default",
+              )}
+            >
+              期日で自動完了
+            </label>
+            <p className="text-[10px] text-muted-foreground">
+              期日になると自動的に完了にします。終日は23:59までです。
+            </p>
+          </div>
         </div>
       </PropertyRow>
 
@@ -333,6 +412,7 @@ export function TaskDetailPropertyGrid({
       <PropertyRow icon={<Flag className="size-3.5" />} label="優先度">
         <Select
           value={task.priority}
+          disabled={readOnly}
           onValueChange={(v) => v && immediateUpdate({ priority: v })}
         >
           <SelectTrigger className="h-7 w-auto border-none shadow-none px-1.5 text-xs">
@@ -368,7 +448,7 @@ export function TaskDetailPropertyGrid({
             className="h-6 w-16 text-xs border-none shadow-none px-1"
             min="0"
             step="0.5"
-            disabled={estHoursSaving}
+            disabled={estHoursSaving || readOnly}
           />
           {editEstHours && (
             <span className="text-[10px] text-muted-foreground">h</span>
@@ -384,7 +464,7 @@ export function TaskDetailPropertyGrid({
             variant={task.active_time_entry ? "destructive" : "outline"}
             className="h-6 text-xs px-2 gap-1"
             onClick={handleTimer}
-            disabled={timerLoading}
+            disabled={timerLoading || readOnly}
           >
             {task.active_time_entry ? (
               <>
@@ -425,48 +505,62 @@ export function TaskDetailPropertyGrid({
 
       {/* Tags — ClickUp風: エリアクリックでタグ選択ドロップダウン */}
       <PropertyRow icon={<TagIcon className="size-3.5" />} label="タグ">
-        <TagSelector
-          taskTags={displayTaskTags}
-          allTags={tags}
-          spaces={spaces}
-          currentSpaceId={currentSpaceId}
-          onToggle={(tagId) => {
-            const current = effectiveTaskId
-              ? (task.tags || []).map((t) => t.id)
-              : draftTagIds;
-            const newTagIds = current.includes(tagId)
-              ? current.filter((id) => id !== tagId)
-              : [...current, tagId];
-            if (effectiveTaskId) {
-              void immediateUpdate({ tag_ids: newTagIds });
-              return;
-            }
-            applyLocalDraftUpdate({ tag_ids: newTagIds });
-          }}
-          onClear={() => {
-            if (effectiveTaskId) {
-              void immediateUpdate({ tag_ids: [] });
-              return;
-            }
-            applyLocalDraftUpdate({ tag_ids: [] });
-          }}
-          onCreate={async (name) => {
-            const updates = await resolveTagUpdates([name]);
-            if (effectiveTaskId) {
-              await immediateUpdate(updates);
-              return;
-            }
-            applyLocalDraftUpdate(updates);
-          }}
-          onRenameTag={handleRenameTag}
-          onChangeTagColor={handleChangeTagColor}
-          onDeleteTag={handleDeleteTag}
-          onCopyTagToSpace={handleCopyTagToSpace}
-        />
+        {readOnly ? (
+          <div className="flex flex-wrap gap-1">
+            {displayTaskTags.length > 0 ? (
+              displayTaskTags.map((tag) => (
+                <Badge key={tag.id} variant="secondary">
+                  {tag.name}
+                </Badge>
+              ))
+            ) : (
+              <span className="text-xs text-muted-foreground">Empty</span>
+            )}
+          </div>
+        ) : (
+          <TagSelector
+            taskTags={displayTaskTags}
+            allTags={tags}
+            spaces={spaces}
+            currentSpaceId={currentSpaceId}
+            onToggle={(tagId) => {
+              const current = effectiveTaskId
+                ? (task.tags || []).map((t) => t.id)
+                : draftTagIds;
+              const newTagIds = current.includes(tagId)
+                ? current.filter((id) => id !== tagId)
+                : [...current, tagId];
+              if (effectiveTaskId) {
+                void immediateUpdate({ tag_ids: newTagIds });
+                return;
+              }
+              applyLocalDraftUpdate({ tag_ids: newTagIds });
+            }}
+            onClear={() => {
+              if (effectiveTaskId) {
+                void immediateUpdate({ tag_ids: [] });
+                return;
+              }
+              applyLocalDraftUpdate({ tag_ids: [] });
+            }}
+            onCreate={async (name) => {
+              const updates = await resolveTagUpdates([name]);
+              if (effectiveTaskId) {
+                await immediateUpdate(updates);
+                return;
+              }
+              applyLocalDraftUpdate(updates);
+            }}
+            onRenameTag={handleRenameTag}
+            onChangeTagColor={handleChangeTagColor}
+            onDeleteTag={handleDeleteTag}
+            onCopyTagToSpace={handleCopyTagToSpace}
+          />
+        )}
       </PropertyRow>
 
       <PropertyRow icon={<BookOpen className="size-3.5" />} label="Docs">
-        {effectiveTaskId ? (
+        {effectiveTaskId && (!readOnly || task.knowledge_node_id) ? (
           <div className="flex flex-wrap gap-1">
             <Button
               type="button"
@@ -483,17 +577,19 @@ export function TaskDetailPropertyGrid({
               )}
               {task.knowledge_node_id ? "Docsで開く" : "Docsノート化"}
             </Button>
-            <Button
-              type="button"
-              variant="secondary"
-              size="sm"
-              className="h-6 gap-1 px-2 text-xs"
-              onClick={() => void handleOpenMeetingNote()}
-              disabled={docsNodeLoading}
-            >
-              <BookOpen className="size-3" />
-              議事メモを開く
-            </Button>
+            {!readOnly && (
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                className="h-6 gap-1 px-2 text-xs"
+                onClick={() => void handleOpenMeetingNote()}
+                disabled={docsNodeLoading}
+              >
+                <BookOpen className="size-3" />
+                議事メモを開く
+              </Button>
+            )}
           </div>
         ) : (
           <span className="text-xs text-muted-foreground">
@@ -516,15 +612,14 @@ export function TaskDetailPropertyGrid({
                   notifications_enabled: !task.notifications_enabled,
                 })
               }
+              disabled={readOnly}
             >
               {task.notifications_enabled
                 ? "このタスクは通知しない"
                 : "通知を再開"}
             </Button>
             <span className="text-[10px] text-muted-foreground">
-              {task.notifications_enabled
-                ? "通知中"
-                : "このタスクの通知は無効"}
+              {task.notifications_enabled ? "通知中" : "このタスクの通知は無効"}
             </span>
           </div>
           <div
@@ -549,10 +644,11 @@ export function TaskDetailPropertyGrid({
                   className={cn(
                     "text-[10px] px-1.5 h-5",
                     task.notifications_enabled &&
+                      !readOnly &&
                       "cursor-pointer hover:opacity-80",
                   )}
                   onClick={() => {
-                    if (!task.notifications_enabled) return;
+                    if (!task.notifications_enabled || readOnly) return;
                     const newOffsets = isActive
                       ? offsets.filter((o) => o !== preset.value)
                       : [...offsets, preset.value].sort((a, b) => a - b);

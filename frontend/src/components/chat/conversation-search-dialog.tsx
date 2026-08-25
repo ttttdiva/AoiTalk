@@ -109,7 +109,7 @@ export function ConversationSearchDialog({
       onOpenChange={handleOpenChange}
       title="会話履歴検索"
       description="会話履歴を検索します"
-      className="sm:max-w-2xl"
+      size="2xl"
     >
       <Command shouldFilter={false}>
         <CommandInput

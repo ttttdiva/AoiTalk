@@ -12,7 +12,7 @@ import {
 import { getSession } from "@/lib/auth";
 import {
   appendKnowledgeRevision,
-  ensureDocsWorkspace,
+  ensureProjectDocsWorkspace,
   serializeNode,
   upsertKnowledgeSearchIndex,
 } from "@/lib/server/knowledge-docs-utils";
@@ -80,14 +80,17 @@ export async function POST(
       { status: 409 },
     );
   }
-  const workspace = await ensureDocsWorkspace(user);
+  const workspace = await ensureProjectDocsWorkspace(project.id, user);
+  if (!workspace) {
+    return NextResponse.json({ detail: "Project Docs workspaceへの書き込み権限がありません" }, { status: 403 });
+  }
   const projectNode = await ensureProjectInformationHierarchyNode({
-    workspaceId: workspace.id,
+    docsLibraryId: workspace.id,
     userId: user.id,
     project,
   });
   const meetingSection = await ensureProjectMeetingSection({
-    workspaceId: workspace.id,
+    docsLibraryId: workspace.id,
     userId: user.id,
     projectId: project.id,
     projectNode,
@@ -122,10 +125,10 @@ export async function POST(
   const [meetingTag] = await db
     .select()
     .from(knowledgeSupertags)
-    .where(and(eq(knowledgeSupertags.workspaceId, workspace.id), eq(knowledgeSupertags.systemKey, "meeting_note")))
+    .where(and(eq(knowledgeSupertags.docsLibraryId, workspace.id), eq(knowledgeSupertags.systemKey, "meeting_note")))
     .limit(1);
   const tag = meetingTag ?? (await db.insert(knowledgeSupertags).values({
-    workspaceId: workspace.id,
+    docsLibraryId: workspace.id,
     systemKey: "meeting_note",
     name: "議事メモ",
     baseType: "meeting",
@@ -141,7 +144,7 @@ export async function POST(
 
   const result = await db.transaction(async (tx) => {
     const note = await insertDocsNode(tx, {
-      workspaceId: workspace.id,
+      docsLibraryId: workspace.id,
       parentId,
       rootPageId,
       projectId: project.id,
@@ -161,7 +164,7 @@ export async function POST(
     const lines = templateLines(tag.templateJson);
     for (const [index, line] of lines.entries()) {
       const child = await insertDocsNode(tx, {
-        workspaceId: workspace.id,
+        docsLibraryId: workspace.id,
         parentId: note.id,
         rootPageId: rootPageId,
         projectId: project.id,
@@ -179,7 +182,7 @@ export async function POST(
     const fields = await tx
       .select()
       .from(knowledgeFields)
-      .where(eq(knowledgeFields.workspaceId, workspace.id));
+      .where(eq(knowledgeFields.docsLibraryId, workspace.id));
     const projectField = fields.find((field) => field.systemKey === "meeting_project");
     const taskField = fields.find((field) => field.systemKey === "meeting_related_task");
     const fieldValues: Array<typeof knowledgeFieldValues.$inferInsert> = [];

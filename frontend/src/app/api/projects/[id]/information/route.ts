@@ -1,25 +1,29 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createHash } from "crypto";
-import { and, asc, desc, eq, inArray, isNull, or } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { db } from "@/db";
 import {
   knowledgeNodes,
   knowledgeFields,
   knowledgeFieldValues,
   knowledgeNodeSupertags,
+  knowledgeSupertagFields,
   knowledgeSupertags,
   projectQaEntries,
   projects,
   recordTables,
 } from "@/db/schema";
+import { docsLibraries } from "@/lib/server/docs-library-schema";
 import { getSession } from "@/lib/auth";
 import { decryptTextIfNeeded, encryptText } from "@/lib/server/field-crypto";
 import {
   appendKnowledgeRevision,
-  ensureDocsWorkspace,
+  getKnowledgeNodeDescendantIds,
   normalizeFieldValueInput,
   serializeNode,
   serializeNodeSupertag,
+  serializeField,
+  serializeSupertagField,
   serializeSupertag,
   upsertKnowledgeSearchIndex,
 } from "@/lib/server/knowledge-docs-utils";
@@ -30,11 +34,19 @@ import {
 import { normalizeProjectManagementConfig } from "@/lib/server/project-workspace-management";
 import { insertDocsNode, updateDocsNode, type DocsNodeWriterUpdate } from "@/lib/server/docs-node-writer";
 import {
+  getProjectInformationHierarchyNode,
   ensureProjectInformationHierarchyNode,
   isDefaultInboxProject,
 } from "@/lib/server/project-information-hierarchy";
+import { proxyRequestToPythonApi } from "@/lib/server/python-api-proxy";
 
-const QA_STATUSES = new Set(["unanswered", "answered", "stale", "archived"]);
+const QA_STATUSES = new Set([
+  "unanswered",
+  "answered",
+  "stale",
+  "cancelled",
+  "archived",
+]);
 const QA_REVIEW_STATES = new Set(["candidate", "accepted", "rejected"]);
 const PROJECT_INFORMATION_SUPERTAG = "Project information";
 const PROJECT_INFORMATION_SYSTEM_KEY = "project_info";
@@ -92,16 +104,78 @@ function projectInformationBodyJson() {
   };
 }
 
-async function ensureProjectInformationFieldValues(
+/**
+ * Invalidate the derived Project Context Pack only after the surrounding
+ * Project Information mutation has completed successfully.  The canonical
+ * Docs write remains the source of truth; this bridge merely marks the
+ * projection stale and deliberately does not make a failed invalidation turn
+ * an otherwise committed mutation into an error.
+ */
+async function invalidateProjectContextPack(
+  request: NextRequest,
+  projectId: string,
+  user: { id: string; username?: string | null; role?: string | null },
+) {
+  try {
+    // The mutation request itself may be POST, PATCH, or DELETE.  Build a
+    // separate POST bridge request so the FastAPI invalidation endpoint never
+    // accidentally receives the original mutation method/body.
+    const bridgeRequest = new NextRequest(
+      new URL(
+        `/api/projects/${encodeURIComponent(projectId)}/context-pack/invalidate`,
+        request.url,
+      ),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ reason: "project_information_changed" }),
+      },
+    );
+    const response = await proxyRequestToPythonApi(bridgeRequest, {
+      path: ["projects", projectId, "context-pack", "invalidate"],
+      user,
+    });
+    if (!response.ok) {
+      console.warn(
+        "Project Context Pack invalidation failed after Project Information mutation:",
+        response.status,
+      );
+    }
+  } catch (error) {
+    console.warn(
+      "Project Context Pack invalidation bridge failed after Project Information mutation:",
+      error,
+    );
+  }
+}
+
+export async function ensureProjectInformationFieldValues(
   node: typeof knowledgeNodes.$inferSelect,
   supertag: typeof knowledgeSupertags.$inferSelect,
   project: typeof projects.$inferSelect,
   userId: string,
 ) {
-  const fields = await db
+  const fields = (await db
     .select()
     .from(knowledgeFields)
-    .where(eq(knowledgeFields.supertagId, supertag.id));
+    .where(
+      and(
+        eq(knowledgeFields.supertagId, supertag.id),
+        // A malformed field can point at the canonical supertag while still
+        // belonging to another Docs Library.  Definitions used for the
+        // canonical Project node must stay inside the tag/library boundary.
+        eq(knowledgeFields.docsLibraryId, supertag.docsLibraryId),
+        eq(knowledgeFields.docsLibraryId, node.docsLibraryId),
+      ),
+    ))
+    // Keep a defensive in-memory boundary as well.  It protects repair code
+    // if a malformed row is returned by a compatibility/migration query or
+    // a future query refactor accidentally drops one of the SQL predicates.
+    .filter(
+      (field) =>
+        field.docsLibraryId === node.docsLibraryId &&
+        field.docsLibraryId === supertag.docsLibraryId,
+    );
   const projectField = fields.find((field) => field.name === "Project" || field.systemKey === "project");
   if (projectField) {
     const fieldValue = {
@@ -140,6 +214,22 @@ async function ensureProjectInformationFieldValues(
       })
       .onConflictDoNothing();
   }
+}
+
+function serializeLibrary(library: typeof docsLibraries.$inferSelect | null | undefined) {
+  if (!library) return null;
+  return {
+    id: library.id,
+    library_id: library.id,
+    docs_library_id: library.id,
+    name: library.name,
+    description: library.description,
+    owner_user_id: library.ownerUserId,
+    library_type: library.libraryType ?? "personal",
+    settings: library.settingsJson ?? {},
+    created_at: library.createdAt instanceof Date ? library.createdAt.toISOString() : library.createdAt,
+    updated_at: library.updatedAt instanceof Date ? library.updatedAt.toISOString() : library.updatedAt,
+  };
 }
 
 async function findProjectInformationSection(parentId: string, title: string) {
@@ -181,13 +271,22 @@ async function ensureProjectInformationDocument(
   user: { id: string; role?: string | null },
   project: typeof projects.$inferSelect,
 ) {
-  const workspace = await ensureDocsWorkspace(user);
-  const [supertag] = await db
+  const hierarchyNode = await ensureProjectInformationHierarchyNode({
+    userId: user.id,
+    project,
+  });
+  const [library] = await db
+    .select()
+    .from(docsLibraries)
+    .where(eq(docsLibraries.id, hierarchyNode.docsLibraryId))
+    .limit(1);
+  if (!library) throw new Error("Project owner Personal Docs Library is missing");
+  const candidateSupertags = await db
     .select()
     .from(knowledgeSupertags)
     .where(
       and(
-        eq(knowledgeSupertags.workspaceId, workspace.id),
+        eq(knowledgeSupertags.docsLibraryId, library.id),
         or(
           eq(knowledgeSupertags.systemKey, PROJECT_INFORMATION_SYSTEM_KEY),
           eq(knowledgeSupertags.name, PROJECT_INFORMATION_SUPERTAG),
@@ -195,16 +294,13 @@ async function ensureProjectInformationDocument(
         ),
       ),
     )
-    .limit(1);
+  const supertag = candidateSupertags.find((tag) => tag.systemKey === PROJECT_INFORMATION_SYSTEM_KEY)
+    ?? candidateSupertags.find((tag) => tag.name === PROJECT_INFORMATION_SUPERTAG || tag.name === "案件情報")
+    ?? null;
 
   if (!supertag) {
     throw new Error("案件情報スーパータグが見つかりません");
   }
-  const hierarchyNode = await ensureProjectInformationHierarchyNode({
-    workspaceId: workspace.id,
-    userId: user.id,
-    project,
-  });
   const node = await updateDocsNode(db, hierarchyNode.id, {
     bodyJson: projectInformationBodyJson(),
     updatedBy: user.id,
@@ -212,7 +308,38 @@ async function ensureProjectInformationDocument(
   });
   await ensureProjectInformationFieldValues(node, supertag, project, user.id);
   await upsertKnowledgeSearchIndex(db, node, node.title);
-  return { node, supertag };
+  return { node, supertag, library };
+}
+
+/**
+ * Read phase used by GET.  It does not mutate the hierarchy itself; the GET
+ * handler may follow up with the idempotent repair helper for active projects
+ * whose canonical node/pointer is missing or stale.
+ */
+async function readProjectInformationDocument(
+  _user: { id: string; role?: string | null },
+  project: typeof projects.$inferSelect,
+) {
+  const hierarchy = await getProjectInformationHierarchyNode({ project });
+  const library = hierarchy.library;
+  if (!library) return { ...hierarchy, supertag: null };
+  const candidateSupertags = await db
+    .select()
+    .from(knowledgeSupertags)
+    .where(
+      and(
+        eq(knowledgeSupertags.docsLibraryId, library.id),
+        or(
+          eq(knowledgeSupertags.systemKey, PROJECT_INFORMATION_SYSTEM_KEY),
+          eq(knowledgeSupertags.name, PROJECT_INFORMATION_SUPERTAG),
+          eq(knowledgeSupertags.name, "案件情報"),
+        ),
+      ),
+    )
+  const supertag = candidateSupertags.find((tag) => tag.systemKey === PROJECT_INFORMATION_SYSTEM_KEY)
+    ?? candidateSupertags.find((tag) => tag.name === PROJECT_INFORMATION_SUPERTAG || tag.name === "案件情報")
+    ?? null;
+  return { ...hierarchy, supertag };
 }
 
 export async function GET(
@@ -226,11 +353,14 @@ export async function GET(
 
   const { id: projectId } = await params;
   const access = await getAccessibleProject(projectId, user.id);
-  if (!access) {
+  if (access === undefined) {
     return NextResponse.json(
-      { detail: "プロジェクトが見つからないか権限がありません" },
+      { detail: "プロジェクトが見つかりません" },
       { status: 404 },
     );
+  }
+  if (access === null) {
+    return NextResponse.json({ detail: "権限がありません" }, { status: 403 });
   }
   if (isDefaultInboxProject(access.project)) {
     return NextResponse.json(
@@ -239,11 +369,82 @@ export async function GET(
     );
   }
 
-  const { node, supertag } = await ensureProjectInformationDocument(
-    user,
-    access.project,
-  );
-  const [qaEntries, tables, treeNodes, projectSupertags] = await Promise.all([
+  let document: Awaited<ReturnType<typeof readProjectInformationDocument>>;
+  try {
+    document = await readProjectInformationDocument(user, access.project);
+  } catch (error) {
+    console.warn("Project information Docs GET read failed:", error);
+    return NextResponse.json(
+      {
+        detail: "案件情報Docsを読み込めませんでした",
+        code: "project_information_unavailable",
+      },
+      { status: 500 },
+    );
+  }
+  // The Projects tab is a repair boundary for active, non-Inbox projects
+  // created before the canonical Personal Docs hierarchy was introduced.
+  // A missing/stale reverse pointer must be repaired before returning the
+  // DTO; if the caller cannot repair it, return an explicit conflict rather
+  // than serializing a null/stale node that would crash the UI.
+  if (!access.project.isCompleted && !isDefaultInboxProject(access.project)) {
+    const pointerNeedsRepair =
+      !document.node || document.node.id !== access.project.knowledgeNodeId;
+    if (pointerNeedsRepair) {
+      // A read-only member may navigate an existing hierarchy, but GET must
+      // not create/repair the owner's Personal hub. Restrict this idempotent
+      // repair path to a Project writer (owner or write member).
+      let writable: Awaited<ReturnType<typeof getWritableProject>> = null;
+      try {
+        writable = await getWritableProject(projectId, user);
+      } catch (error) {
+        console.warn("Project information Docs write access check failed:", error);
+      }
+      if (!writable) {
+        return NextResponse.json(
+          {
+            detail: "案件情報Docsの初期化にはProject書き込み権限が必要です",
+            code: "project_information_unavailable",
+          },
+          { status: 409 },
+        );
+      }
+      try {
+        const repaired = await ensureProjectInformationDocument(user, access.project);
+        document = {
+          ...document,
+          node: repaired.node,
+          supertag: repaired.supertag,
+          library: repaired.library,
+        } as typeof document;
+      } catch (error) {
+        console.warn("Project information Docs GET self-repair failed:", error);
+        return NextResponse.json(
+          {
+            detail: "案件情報Docsの初期化に失敗しました",
+            code: "project_information_unavailable",
+          },
+          { status: 409 },
+        );
+      }
+    }
+  }
+  if (!document.node) {
+    return NextResponse.json(
+      {
+        detail: "案件情報Docsが未初期化です",
+        code: "project_information_unavailable",
+      },
+      { status: 409 },
+    );
+  }
+  const node = document.node;
+  const supertag = document.supertag;
+  const library = document.library;
+  const hierarchyNodeIds = node
+    ? [node.id, ...(await getKnowledgeNodeDescendantIds(db, node.docsLibraryId, node.id))]
+    : [];
+  const [qaEntries, tables, treeNodes] = await Promise.all([
     db
       .select()
       .from(projectQaEntries)
@@ -264,15 +465,18 @@ export async function GET(
       .from(recordTables)
       .where(and(eq(recordTables.projectId, projectId), isNull(recordTables.deletedAt)))
       .orderBy(recordTables.sortOrder, recordTables.createdAt),
-    db
-      .select()
-      .from(knowledgeNodes)
-      .where(and(eq(knowledgeNodes.projectId, projectId), eq(knowledgeNodes.workspaceId, node.workspaceId), isNull(knowledgeNodes.archivedAt)))
-      .orderBy(asc(knowledgeNodes.sortOrder), asc(knowledgeNodes.createdAt)),
-    db
-      .select()
-      .from(knowledgeSupertags)
-      .where(eq(knowledgeSupertags.workspaceId, node.workspaceId)),
+    node
+      ? db
+          .select()
+          .from(knowledgeNodes)
+          .where(and(
+            eq(knowledgeNodes.projectId, projectId),
+            eq(knowledgeNodes.docsLibraryId, node.docsLibraryId),
+            hierarchyNodeIds.length > 0 ? inArray(knowledgeNodes.id, hierarchyNodeIds) : undefined,
+            isNull(knowledgeNodes.archivedAt),
+          ))
+          .orderBy(asc(knowledgeNodes.sortOrder), asc(knowledgeNodes.createdAt))
+      : Promise.resolve([]),
   ]);
   const treeNodeIds = treeNodes.map((entry) => entry.id);
   const treeNodeSupertags = treeNodeIds.length > 0
@@ -281,19 +485,73 @@ export async function GET(
         .from(knowledgeNodeSupertags)
         .where(inArray(knowledgeNodeSupertags.nodeId, treeNodeIds))
     : [];
+  // Project-information metadata is scoped to definitions actually attached
+  // to this project's visible subtree.  Returning every definition in the
+  // owner's Personal Library would expose unrelated/private tags and fields
+  // to a Project member.
+  const attachedSupertagIds = Array.from(new Set(treeNodeSupertags.map((row) => row.supertagId)));
+  const projectSupertags = library && attachedSupertagIds.length > 0
+    ? await db
+        .select()
+        .from(knowledgeSupertags)
+        .where(
+          and(
+            eq(knowledgeSupertags.docsLibraryId, library.id),
+            inArray(knowledgeSupertags.id, attachedSupertagIds),
+          ),
+        )
+    : [];
+  const validProjectSupertagIds = new Set(projectSupertags.map((tag) => tag.id));
+  const validTreeNodeSupertags = treeNodeSupertags.filter((row) => validProjectSupertagIds.has(row.supertagId));
+  const projectFields = library && attachedSupertagIds.length > 0
+    ? await db
+        .select()
+        .from(knowledgeFields)
+        .where(
+          and(
+            eq(knowledgeFields.docsLibraryId, library.id),
+            inArray(knowledgeFields.supertagId, attachedSupertagIds),
+          ),
+        )
+    : [];
+  const projectSupertagFields = library && attachedSupertagIds.length > 0 && projectFields.length > 0
+    ? await db
+        .select({ relation: knowledgeSupertagFields })
+        .from(knowledgeSupertagFields)
+        .innerJoin(knowledgeSupertags, eq(knowledgeSupertagFields.supertagId, knowledgeSupertags.id))
+        .where(
+          and(
+            eq(knowledgeSupertags.docsLibraryId, library.id),
+            inArray(knowledgeSupertagFields.supertagId, attachedSupertagIds),
+            inArray(knowledgeSupertagFields.fieldId, projectFields.map((field) => field.id)),
+          ),
+        )
+        .then((rows) => rows.map((row) => row.relation))
+    : [];
 
   return NextResponse.json({
     project: {
       id: access.project.id,
       name: access.project.name,
       description: access.project.description,
-      knowledge_node_id: node.id,
+      // The resolved canonical node is the only value safe to expose as the
+      // authoritative reverse pointer. A stale legacy pointer must not make a
+      // missing document look initialized.
+      knowledge_node_id: node?.id ?? null,
+      docs_library_id: library?.id ?? null,
+      library: serializeLibrary(library),
     },
-    node: serializeNode(node),
+    library: serializeLibrary(library),
+    docs_library_id: library?.id ?? null,
+    node: node ? serializeNode(node) : null,
     tree_nodes: treeNodes.map(serializeNode),
-    node_supertags: treeNodeSupertags.map(serializeNodeSupertag),
+    node_supertags: validTreeNodeSupertags.map(serializeNodeSupertag),
+    fields: projectFields.map(serializeField),
+    supertag_fields: projectSupertagFields.map(serializeSupertagField),
     supertags: projectSupertags.map(serializeSupertag),
-    supertag: serializeSupertag(supertag),
+    supertag: supertag && validProjectSupertagIds.has(supertag.id)
+      ? serializeSupertag(supertag)
+      : null,
     qa_entries: qaEntries.map(decryptQaEntry),
     management_documents: managementDocuments(access.project),
     record_tables: tables,
@@ -311,11 +569,14 @@ export async function POST(
 
   const { id: projectId } = await params;
   const access = await getWritableProject(projectId, user);
-  if (!access) {
+  if (access === undefined) {
     return NextResponse.json(
-      { detail: "プロジェクトが見つからないか権限がありません" },
+      { detail: "プロジェクトが見つかりません" },
       { status: 404 },
     );
+  }
+  if (access === null) {
+    return NextResponse.json({ detail: "権限がありません" }, { status: 403 });
   }
   if (isDefaultInboxProject(access.project)) {
     return NextResponse.json(
@@ -334,35 +595,74 @@ export async function POST(
       return NextResponse.json({ detail: "question is required" }, { status: 400 });
     }
     const answer = cleanNullableString(body.answer);
-    const [created] = await db
-      .insert(projectQaEntries)
-      .values({
-        projectId,
-        knowledgeNodeId: node.id,
-        question: encryptText(question, "project_qa_entries.question"),
-        answer: answer ? encryptText(answer, "project_qa_entries.answer") : null,
-        normalizedQuestionHash: normalizedQuestionHash(question),
-        status: oneOf(body.status, QA_STATUSES, answer ? "answered" : "unanswered"),
-        reviewState: oneOf(body.review_state, QA_REVIEW_STATES, "accepted"),
-        confidence: numberValue(body.confidence, 1),
-        askedCount: Math.max(1, Math.round(numberValue(body.asked_count, 1))),
-        sourceMessageIds: Array.isArray(body.source_message_ids)
-          ? body.source_message_ids
-          : [],
-        sourceAgentRunIds: Array.isArray(body.source_agent_run_ids)
-          ? body.source_agent_run_ids
-          : [],
-        sourceToolCallIds: Array.isArray(body.source_tool_call_ids)
-          ? body.source_tool_call_ids
-          : [],
-        answerSourceRefs: Array.isArray(body.answer_source_refs)
-          ? body.answer_source_refs
-          : [],
-        createdBy: user.id,
-        updatedBy: user.id,
-        createdByAgent: Boolean(body.created_by_agent),
-      })
-      .returning();
+    const questionHash = normalizedQuestionHash(question);
+    const result = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtext(${`project-qa:${access.project.id}`}))`,
+      );
+      const candidates = await tx
+        .select()
+        .from(projectQaEntries)
+        .where(
+          and(
+            eq(projectQaEntries.projectId, projectId),
+            or(
+              eq(projectQaEntries.normalizedQuestionHash, questionHash),
+              isNull(projectQaEntries.normalizedQuestionHash),
+            ),
+          ),
+        );
+      const existing = candidates.find((entry) => {
+        if (entry.normalizedQuestionHash === questionHash) return true;
+        if (entry.normalizedQuestionHash !== null) return false;
+        const plainQuestion =
+          decryptTextIfNeeded(entry.question, "project_qa_entries.question") || "";
+        return normalizedQuestionHash(plainQuestion) === questionHash;
+      });
+      if (existing) return { existing, created: null };
+
+      const [created] = await tx
+        .insert(projectQaEntries)
+        .values({
+          projectId,
+          knowledgeNodeId: node.id,
+          question: encryptText(question, "project_qa_entries.question"),
+          answer: answer ? encryptText(answer, "project_qa_entries.answer") : null,
+          normalizedQuestionHash: questionHash,
+          status: oneOf(body.status, QA_STATUSES, answer ? "answered" : "unanswered"),
+          reviewState: oneOf(body.review_state, QA_REVIEW_STATES, "accepted"),
+          confidence: numberValue(body.confidence, 1),
+          askedCount: Math.max(1, Math.round(numberValue(body.asked_count, 1))),
+          sourceMessageIds: Array.isArray(body.source_message_ids)
+            ? body.source_message_ids
+            : [],
+          sourceAgentRunIds: Array.isArray(body.source_agent_run_ids)
+            ? body.source_agent_run_ids
+            : [],
+          sourceToolCallIds: Array.isArray(body.source_tool_call_ids)
+            ? body.source_tool_call_ids
+            : [],
+          answerSourceRefs: Array.isArray(body.answer_source_refs)
+            ? body.answer_source_refs
+            : [],
+          createdBy: user.id,
+          updatedBy: user.id,
+          createdByAgent: Boolean(body.created_by_agent),
+        })
+        .returning();
+      return { existing: null, created };
+    });
+    if (result.existing) {
+      return NextResponse.json(
+        {
+          detail: "The same project question already exists.",
+          qa_entry: decryptQaEntry(result.existing),
+        },
+        { status: 409 },
+      );
+    }
+    const created = result.created!;
+    await invalidateProjectContextPack(request, projectId, user);
     return NextResponse.json({ qa_entry: decryptQaEntry(created) }, { status: 201 });
   }
 
@@ -381,7 +681,7 @@ export async function POST(
     const description = cleanNullableString(body.description);
     const section = await findProjectInformationSection(node.id, "参照");
     const created = await insertDocsNode(db, {
-        workspaceId: node.workspaceId,
+        docsLibraryId: node.docsLibraryId,
         projectId,
         parentId: section?.id ?? node.id,
         rootPageId: node.rootPageId ?? node.id,
@@ -408,7 +708,7 @@ export async function POST(
     ].filter((item): item is string => !!item);
     for (const [index, childTitle] of referenceChildren.entries()) {
       const child = await insertDocsNode(db, {
-        workspaceId: node.workspaceId,
+        docsLibraryId: node.docsLibraryId,
         projectId,
         parentId: created.id,
         rootPageId: node.rootPageId ?? node.id,
@@ -422,6 +722,7 @@ export async function POST(
       await upsertKnowledgeSearchIndex(db, child, child.title);
     }
     await appendKnowledgeRevision(db, created, user.id, "Project information reference added");
+    await invalidateProjectContextPack(request, projectId, user);
     return NextResponse.json({ node: serializeNode(created) }, { status: 201 });
   }
 
@@ -439,11 +740,14 @@ export async function PATCH(
 
   const { id: projectId } = await params;
   const access = await getWritableProject(projectId, user);
-  if (!access) {
+  if (access === undefined) {
     return NextResponse.json(
-      { detail: "プロジェクトが見つからないか権限がありません" },
+      { detail: "プロジェクトが見つかりません" },
       { status: 404 },
     );
+  }
+  if (access === null) {
+    return NextResponse.json({ detail: "権限がありません" }, { status: 403 });
   }
   if (isDefaultInboxProject(access.project)) {
     return NextResponse.json(
@@ -458,18 +762,46 @@ export async function PATCH(
   if (kind === "document_node") {
     const nodeId = cleanString(body.node_id);
     if (!nodeId) return NextResponse.json({ detail: "node_id is required" }, { status: 400 });
-    const [node] = await db
+    const hierarchy = await getProjectInformationHierarchyNode({ project: access.project });
+    const canonicalNode = hierarchy.node;
+    if (!canonicalNode) {
+      return NextResponse.json(
+        { detail: "案件情報Docsのcanonical nodeが未初期化または不正です" },
+        { status: 409 },
+      );
+    }
+    // `ensureProjectInformationDocument` returns the strict canonical node:
+    // owner Personal Library + active hub parent/root + exact project/system
+    // key + attached project_info tag.  A generic (or foreign-library) node
+    // must never be accepted merely because its project_id matches.
+    if (nodeId !== canonicalNode.id) {
+      return NextResponse.json(
+        { detail: "案件情報Docsのcanonical nodeのみ更新できます" },
+        { status: 409 },
+      );
+    }
+    if (!canonicalNode.parentId || !canonicalNode.rootPageId) {
+      return NextResponse.json(
+        { detail: "案件情報Docsのcanonical hierarchyが不正です" },
+        { status: 409 },
+      );
+    }
+    const [candidateNode] = await db
       .select()
       .from(knowledgeNodes)
       .where(
         and(
           eq(knowledgeNodes.id, nodeId),
+          eq(knowledgeNodes.docsLibraryId, canonicalNode.docsLibraryId),
           eq(knowledgeNodes.projectId, projectId),
+          eq(knowledgeNodes.parentId, canonicalNode.parentId),
+          eq(knowledgeNodes.rootPageId, canonicalNode.rootPageId),
+          eq(knowledgeNodes.systemKey, `project_information:${projectId}`),
           isNull(knowledgeNodes.archivedAt),
         ),
       )
       .limit(1);
-    if (!node) {
+    if (!candidateNode) {
       return NextResponse.json({ detail: "node not found" }, { status: 404 });
     }
 
@@ -478,16 +810,16 @@ export async function PATCH(
       updatedAt: new Date(),
     };
     if (body.title !== undefined) {
-      updates.title = cleanString(body.title, node.title, 500);
+      updates.title = cleanString(body.title, canonicalNode.title, 500);
     }
     if (body.body_text !== undefined) {
-      updates.title = cleanString(body.body_text, updates.title ?? node.title, 500);
+      updates.title = cleanString(body.body_text, updates.title ?? canonicalNode.title, 500);
     }
     if (body.body_json !== undefined) {
       updates.bodyJson = jsonObject(body.body_json);
     }
 
-    const updated = await updateDocsNode(db, node.id, updates);
+    const updated = await updateDocsNode(db, canonicalNode.id, updates);
     await upsertKnowledgeSearchIndex(db, updated, updated.title);
     await appendKnowledgeRevision(
       db,
@@ -495,6 +827,7 @@ export async function PATCH(
       user.id,
       cleanString(body.update_reason, "案件情報Docs正本を更新", 200),
     );
+    await invalidateProjectContextPack(request, projectId, user);
     return NextResponse.json({ node: serializeNode(updated) });
   }
 
@@ -533,14 +866,58 @@ export async function PATCH(
         ? body.answer_source_refs
         : [];
     }
-    const [updated] = await db
-      .update(projectQaEntries)
-      .set(updates)
-      .where(and(eq(projectQaEntries.id, id), eq(projectQaEntries.projectId, projectId)))
-      .returning();
-    return updated
-      ? NextResponse.json({ qa_entry: decryptQaEntry(updated) })
-      : NextResponse.json({ detail: "not found" }, { status: 404 });
+    const result = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtext(${`project-qa:${access.project.id}`}))`,
+      );
+      if (updates.normalizedQuestionHash) {
+        const candidates = await tx
+          .select()
+          .from(projectQaEntries)
+          .where(
+            and(
+              eq(projectQaEntries.projectId, projectId),
+              or(
+                eq(
+                  projectQaEntries.normalizedQuestionHash,
+                  updates.normalizedQuestionHash,
+                ),
+                isNull(projectQaEntries.normalizedQuestionHash),
+              ),
+            ),
+          );
+        const collision = candidates.find((entry) => {
+          if (entry.id === id) return false;
+          if (entry.normalizedQuestionHash === updates.normalizedQuestionHash) return true;
+          if (entry.normalizedQuestionHash !== null) return false;
+          const plainQuestion =
+            decryptTextIfNeeded(entry.question, "project_qa_entries.question") || "";
+          return normalizedQuestionHash(plainQuestion) === updates.normalizedQuestionHash;
+        });
+        if (collision) return { collision, updated: null };
+      }
+      const [updated] = await tx
+        .update(projectQaEntries)
+        .set(updates)
+        .where(and(eq(projectQaEntries.id, id), eq(projectQaEntries.projectId, projectId)))
+        .returning();
+      return { collision: null, updated };
+    });
+    if (result.collision) {
+      return NextResponse.json(
+        {
+          detail: "The same project question already exists.",
+          qa_entry: decryptQaEntry(result.collision),
+        },
+        { status: 409 },
+      );
+    }
+    const updated = result.updated;
+    if (!updated) {
+      return NextResponse.json({ detail: "not found" }, { status: 404 });
+    }
+    await invalidateProjectContextPack(request, projectId, user);
+    return NextResponse.json({ qa_entry: decryptQaEntry(updated) });
   }
 
   return NextResponse.json({ detail: "Invalid kind" }, { status: 400 });
@@ -556,11 +933,14 @@ export async function DELETE(
   }
   const { id: projectId } = await params;
   const access = await getWritableProject(projectId, user);
-  if (!access) {
+  if (access === undefined) {
     return NextResponse.json(
-      { detail: "プロジェクトが見つからないか権限がありません" },
+      { detail: "プロジェクトが見つかりません" },
       { status: 404 },
     );
+  }
+  if (access === null) {
+    return NextResponse.json({ detail: "権限がありません" }, { status: 403 });
   }
   const { searchParams } = new URL(request.url);
   const kind = searchParams.get("kind");
@@ -575,7 +955,9 @@ export async function DELETE(
     .set({ status: "archived", deletedAt: now, updatedAt: now, updatedBy: user.id })
     .where(and(eq(projectQaEntries.id, id), eq(projectQaEntries.projectId, projectId)))
     .returning();
-  return updated
-    ? NextResponse.json({ ok: true })
-    : NextResponse.json({ detail: "not found" }, { status: 404 });
+  if (!updated) {
+    return NextResponse.json({ detail: "not found" }, { status: 404 });
+  }
+  await invalidateProjectContextPack(request, projectId, user);
+  return NextResponse.json({ ok: true });
 }

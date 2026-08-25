@@ -7,7 +7,6 @@ import { useState, useEffect, useCallback, useRef, Suspense } from "react";
 import {
   MessageSquare,
   CheckSquare,
-  FolderOpen,
   FileText,
   Home,
 } from "lucide-react";
@@ -18,7 +17,6 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import {
-  Sidebar,
   SidebarContent,
   SidebarGroup,
   SidebarGroupContent,
@@ -32,13 +30,36 @@ import { navigateChatSessionInPlace } from "@/lib/chat-navigation";
 import { DOCS_ROUTE } from "@/lib/docs-model";
 import { ChatSidebar } from "./sidebar/chat-sidebar";
 import { TaskSidebar } from "./sidebar/task-sidebar";
-import { FilerSidebar } from "./sidebar/filer-sidebar";
-import { NotificationPanel } from "./sidebar/notification-panel";
 import { MobileContextSwitcher } from "./sidebar/mobile-context-switcher";
 
-type SidebarTab = "chat" | "tasks" | "filer" | "docs";
-const SIDEBAR_TABS: SidebarTab[] = ["chat", "tasks", "filer", "docs"];
+type SidebarTab = "chat" | "tasks" | "docs";
+const SIDEBAR_TABS: SidebarTab[] = ["chat", "tasks", "docs"];
 const DOCS_SIDEBAR_SLOT_ID = "docs-sidebar-slot";
+const SIDEBAR_TAB_STORAGE_KEY = "aoitalk-sidebar-tab";
+
+function readSidebarTab(storageKey = SIDEBAR_TAB_STORAGE_KEY): SidebarTab {
+  if (typeof window === "undefined") return "chat";
+  try {
+    const saved = window.localStorage.getItem(storageKey);
+    return SIDEBAR_TABS.includes(saved as SidebarTab)
+      ? (saved as SidebarTab)
+      : "chat";
+  } catch {
+    // localStorageが無効な環境ではサイドバーを既定タブで表示する。
+    return "chat";
+  }
+}
+
+function persistSidebarTab(
+  tab: SidebarTab,
+  storageKey = SIDEBAR_TAB_STORAGE_KEY,
+) {
+  try {
+    window.localStorage.setItem(storageKey, tab);
+  } catch {
+    // localStorageが無効でもタブ切り替え自体は維持する。
+  }
+}
 
 function isDocsPath(pathname: string | null) {
   return pathname === DOCS_ROUTE || pathname?.startsWith(`${DOCS_ROUTE}/`);
@@ -50,15 +71,8 @@ function AppSidebarInner() {
   const pathname = usePathname();
   const { state: sidebarState, isMobile, openMobile } = useSidebar();
   // サイドバーのタブ状態をlocalStorageで永続化（メイン画面のルートとは独立）
-  const [sidebarTab, setSidebarTab] = useState<SidebarTab>(
-    () => {
-      if (typeof window !== "undefined") {
-        const saved = localStorage.getItem("aoitalk-sidebar-tab");
-        if (SIDEBAR_TABS.includes(saved as SidebarTab))
-          return saved as SidebarTab;
-      }
-      return "chat";
-    },
+  const [sidebarTab, setSidebarTab] = useState<SidebarTab>(() =>
+    readSidebarTab(),
   );
 
   const tabBeforeDocsRef = useRef<Exclude<SidebarTab, "docs"> | null>(null);
@@ -89,13 +103,17 @@ function AppSidebarInner() {
       return;
     }
     setSidebarTab(tab);
-    localStorage.setItem("aoitalk-sidebar-tab", tab);
+    persistSidebarTab(tab);
   }, [router, sidebarTab]);
 
   const handleBrandClick = useCallback(() => {
     setSidebarTab("chat");
-    localStorage.setItem("aoitalk-sidebar-tab", "chat");
-    localStorage.removeItem("aoitalk_last_session_id");
+    persistSidebarTab("chat");
+    try {
+      window.localStorage.removeItem("aoitalk_last_session_id");
+    } catch {
+      // localStorageが無効でも新規チャットへの遷移は継続する。
+    }
     if (!navigateChatSessionInPlace("/chat")) {
       window.location.href = "/chat";
     }
@@ -109,8 +127,19 @@ function AppSidebarInner() {
     sidebarTab === "docs" &&
     (isMobile ? openMobile : sidebarState === "expanded");
 
+  // Apps now uses the Shared Global Rail. Its workspace content is rendered
+  // by AppsWorkspaceShell in the main canvas, so do not mount a second rail.
+  if (pathname === "/apps" || pathname?.startsWith("/apps/")) return null;
+
+  const panelVisible = isMobile ? openMobile : sidebarState === "expanded";
+  if (!panelVisible) return null;
+
   return (
-    <Sidebar>
+    <aside
+      className="ao-workspace-nav-panel"
+      data-shell-region="workspace-navigation"
+      data-sidebar-state={sidebarState}
+    >
       <SidebarHeader className="ao-sidebar-hero justify-center">
         <div className="flex min-w-0 items-center gap-1.5">
           <button
@@ -156,9 +185,6 @@ function AppSidebarInner() {
         <MobileContextSwitcher />
       </SidebarHeader>
       <SidebarContent>
-        {/* 通知パネル */}
-        <NotificationPanel />
-
         {/* サイドバー内タブ切り替え（メイン画面は遷移しない） */}
         <SidebarGroup>
           <SidebarGroupContent>
@@ -183,15 +209,6 @@ function AppSidebarInner() {
               </SidebarMenuItem>
               <SidebarMenuItem>
                 <SidebarMenuButton
-                  isActive={sidebarTab === "filer"}
-                  onClick={() => handleSetSidebarTab("filer")}
-                >
-                  <FolderOpen className="size-4" />
-                  <span>ファイラー</span>
-                </SidebarMenuButton>
-              </SidebarMenuItem>
-              <SidebarMenuItem>
-                <SidebarMenuButton
                   isActive={sidebarTab === "docs"}
                   onClick={() => handleSetSidebarTab("docs")}
                 >
@@ -206,12 +223,11 @@ function AppSidebarInner() {
         {/* タブに応じたサイドバーコンテンツ */}
         {sidebarTab === "chat" && <ChatSidebar />}
         {sidebarTab === "tasks" && <TaskSidebar />}
-        {sidebarTab === "filer" && <FilerSidebar />}
         {shouldRenderDocsSlot && (
           <div id={DOCS_SIDEBAR_SLOT_ID} className="min-h-0 flex-1 flex flex-col" />
         )}
       </SidebarContent>
-    </Sidebar>
+    </aside>
   );
 }
 

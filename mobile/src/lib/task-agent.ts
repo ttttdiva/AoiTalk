@@ -93,3 +93,13 @@ export function buildTaskAgentSessionTitle(title: string): string {
       : normalized;
   return `Task: ${clipped}`;
 }
+
+export function buildTaskAgentDispatchPayload(task: Task) {
+  return {
+    message: buildTaskAgentPrompt(task),
+    project_id: task.project_id || undefined,
+    generation_profile: "assisted_work",
+    include_project_context: true,
+    tools_required: true,
+  } as const;
+}

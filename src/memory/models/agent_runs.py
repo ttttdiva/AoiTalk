@@ -8,9 +8,11 @@ from typing import Any, Dict
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     JSON,
@@ -64,7 +66,20 @@ class AgentRun(Base):
         nullable=True,
         index=True,
     )
+    app_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("apps.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # Target は (app_id, app_target_id) の複合 FK で App に閉じ込める。
+    app_target_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    base_revision = Column(String(80), nullable=True, index=True)
+    result_revision = Column(String(80), nullable=True, index=True)
     user_id = Column(String(200), nullable=True, index=True)
+    client_message_id = Column(String(512), nullable=True)
+    client_message_key = Column(String(64), nullable=True)
+    request_fingerprint = Column(String(64), nullable=True)
     run_type = Column(String(64), nullable=False, default="chat_turn", index=True)
     status = Column(String(32), nullable=False, default="queued", index=True)
     title = Column(String(255), nullable=False, default="")
@@ -119,6 +134,24 @@ class AgentRun(Base):
             "status",
             "created_at",
         ),
+        UniqueConstraint(
+            "session_id",
+            "user_id",
+            "client_message_key",
+            name="uq_agent_runs_session_user_client_message_key",
+        ),
+        # 実 DB は ON DELETE SET NULL (app_target_id)。app_id は巻き込まない。
+        ForeignKeyConstraint(
+            ["app_id", "app_target_id"],
+            ["app_targets.app_id", "app_targets.id"],
+            name="fk_agent_runs_app_target_app",
+            ondelete="SET NULL",
+        ),
+        # 複合 FK は MATCH SIMPLE のため app_id が NULL だと検査されない。
+        CheckConstraint(
+            "app_target_id IS NULL OR app_id IS NOT NULL",
+            name="ck_agent_runs_app_target_requires_app",
+        ),
     )
 
     def to_dict(
@@ -128,6 +161,9 @@ class AgentRun(Base):
         include_tool_calls: bool = False,
         include_edges: bool = False,
     ) -> Dict[str, Any]:
+        metadata = self.run_metadata if isinstance(self.run_metadata, dict) else {}
+        result = self.result if isinstance(self.result, dict) else {}
+        usage = metadata.get("usage") or result.get("usage")
         payload: Dict[str, Any] = {
             "id": str(self.id),
             "root_run_id": str(self.root_run_id) if self.root_run_id else None,
@@ -137,7 +173,14 @@ class AgentRun(Base):
                 str(self.trigger_message_id) if self.trigger_message_id else None
             ),
             "project_id": str(self.project_id) if self.project_id else None,
+            "app_id": str(self.app_id) if self.app_id else None,
+            "app_target_id": str(self.app_target_id) if self.app_target_id else None,
+            "base_revision": self.base_revision,
+            "result_revision": self.result_revision,
             "user_id": self.user_id,
+            "client_message_id": self.client_message_id,
+            "client_message_key": self.client_message_key,
+            "request_fingerprint": self.request_fingerprint,
             "run_type": self.run_type,
             "status": self.status,
             "title": self.title,
@@ -149,6 +192,7 @@ class AgentRun(Base):
             "result": self.result or {},
             "validation": self.validation or {},
             "metadata": self.run_metadata or {},
+            "usage": usage if isinstance(usage, dict) else None,
             "created_at": _dt(self.created_at),
             "updated_at": _dt(self.updated_at),
             "started_at": _dt(self.started_at),
@@ -169,6 +213,51 @@ class AgentRun(Base):
                 edge.to_dict() for edge in getattr(self, "parent_edges", []) or []
             ]
         return payload
+
+
+class ConversationDispatchOutbox(Base):
+    """Durable hand-off from an idempotent REST dispatch to the in-process worker."""
+
+    __tablename__ = "conversation_dispatch_outbox"
+
+    run_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_runs.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    session_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("conversation_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id = Column(String(200), nullable=False)
+    client_message_id = Column(String(512), nullable=False)
+    client_message_key = Column(String(64), nullable=False)
+    request_fingerprint = Column(String(64), nullable=False)
+    payload = Column(JSON, nullable=False, default=dict)
+    status = Column(String(32), nullable=False, default="pending", index=True)
+    lease_owner = Column(String(64), nullable=True)
+    lease_token = Column(String(64), nullable=True)
+    lease_expires_at = Column(DateTime, nullable=True, index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    delivered_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id",
+            "user_id",
+            "client_message_key",
+            name="uq_conversation_dispatch_outbox_session_user_client_key",
+        ),
+    )
 
 
 class AgentRunEvent(Base):
@@ -245,6 +334,11 @@ class AgentRunToolCall(Base):
 
     __table_args__ = (
         Index("ix_agent_run_tool_calls_run_tool", "run_id", "tool_name"),
+        UniqueConstraint(
+            "run_id",
+            "tool_call_id",
+            name="uq_agent_run_tool_calls_run_tool_call_id",
+        ),
     )
 
     def to_dict(self) -> Dict[str, Any]:

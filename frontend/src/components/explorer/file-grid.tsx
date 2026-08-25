@@ -2,10 +2,17 @@
 
 /* eslint-disable @next/next/no-img-element */
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import {
+  useState,
+  useEffect,
+  useCallback,
+  useMemo,
+  useRef,
+  type ReactNode,
+} from "react";
 import { useExplorer } from "@/contexts/explorer-context";
 import type { ExplorerDirectory, ExplorerFile } from "@/lib/explorer-api";
-import { explorerMove } from "@/lib/explorer-api";
+import { useFilerOperations } from "@/hooks/use-filer-operations";
 import {
   getFileServeUrl,
   getImageThumbnailUrl,
@@ -18,6 +25,10 @@ import {
   sortExplorerDirectories,
   sortExplorerFiles,
 } from "@/lib/explorer-sort";
+import {
+  Pagination,
+  paginateCombinedItems,
+} from "@/components/explorer/pagination";
 
 // ファイルタイプ判定
 const IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "svg", "bmp"];
@@ -156,7 +167,7 @@ function FolderThumbnail({
             width: Math.min(size * 0.5, 48),
             height: Math.min(size * 0.5, 48),
           }}
-          className="text-blue-500"
+          className="text-tertiary"
         />
       </div>
     );
@@ -242,12 +253,21 @@ interface FileGridProps {
     e: React.MouseEvent,
     item: ExplorerDirectory | ExplorerFile,
   ) => void;
+  directories?: ExplorerDirectory[];
+  files?: ExplorerFile[];
+  headerAddon?: ReactNode;
 }
 
 // D&D用MIMEタイプ
 const DND_MIME = "application/x-explorer-paths";
 
-export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
+export function FileGrid({
+  onFileClick,
+  onContextMenu,
+  directories,
+  files,
+  headerAddon,
+}: FileGridProps) {
   const {
     browseData,
     navigate,
@@ -260,10 +280,28 @@ export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
     refresh,
     sortKey,
     sortDir,
+    isHfMode,
     isHydrusMode,
+    capabilities,
+    userId,
   } = useExplorer();
+  const { transfer } = useFilerOperations({ capabilities, refresh });
   const containerRef = useRef<HTMLDivElement>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const [hfPage, setHfPage] = useState(1);
+  // Keep a render-time principal identity so an A user's grid cannot survive
+  // the first render after logout/login to B while effects are still running.
+  const [gridUserId, setGridUserId] = useState<string | null>(userId);
+  const principalReady = gridUserId === userId;
+  const HF_PAGE_SIZE = 60;
+  const displayedPathSet = useMemo(
+    () =>
+      new Set([
+        ...(directories ?? browseData?.directories ?? []).map((item) => item.path),
+        ...(files ?? browseData?.files ?? []).map((item) => item.path),
+      ]),
+    [browseData?.directories, browseData?.files, directories, files],
+  );
 
   // サムネイルサイズ（localStorage保存）
   const [thumbIndex, setThumbIndex] = useState(() => {
@@ -274,6 +312,27 @@ export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
   });
 
   const thumbSize = THUMB_SIZES[thumbIndex];
+
+  const hfPageKey = useMemo(
+    () =>
+      JSON.stringify({
+        dirs: (directories ?? browseData?.directories ?? []).map((item) => item.path),
+        files: (files ?? browseData?.files ?? []).map((item) => item.path),
+        sortKey,
+        sortDir,
+      }),
+    [browseData?.directories, browseData?.files, directories, files, sortDir, sortKey],
+  );
+
+  useEffect(() => {
+    setGridUserId(userId);
+  }, [userId]);
+
+  useEffect(() => {
+    // The page is derived from the current listing identity; reset it when
+    // navigation/search/sort changes so stale HF pages cannot remain visible.
+    if (isHfMode) setHfPage(1);
+  }, [hfPageKey, isHfMode]);
 
   const changeThumbSize = useCallback((delta: number) => {
     setThumbIndex((prev) => {
@@ -327,12 +386,15 @@ export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
   const handleDragStart = useCallback(
     (e: React.DragEvent, item: ExplorerDirectory | ExplorerFile) => {
       const paths = selectedItems.has(item.path)
-        ? Array.from(selectedItems)
+        ? Array.from(selectedItems).filter((path) => displayedPathSet.has(path))
         : [item.path];
       e.dataTransfer.setData(DND_MIME, JSON.stringify(paths));
-      e.dataTransfer.effectAllowed = "move";
+      // Folder targets still request `move`; the bookmark/launcher rail
+      // requests `copy` and never mutates the source.  Advertise both so the
+      // browser can render the target-selected operation correctly.
+      e.dataTransfer.effectAllowed = "copyMove";
     },
-    [selectedItems],
+    [displayedPathSet, selectedItems],
   );
 
   const handleDragOverFolder = useCallback(
@@ -362,17 +424,10 @@ export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
       // 自分自身へのドロップは無視
       if (paths.includes(destPath)) return;
 
-      for (const src of paths) {
-        try {
-          await explorerMove(src, destPath);
-        } catch {
-          // エラー時は中断
-          break;
-        }
-      }
-      refresh();
+      // 実行・Undo登録は filer-operations 側へ集約
+      await transfer({ paths, destDir: destPath, operation: "move" });
     },
-    [refresh],
+    [transfer],
   );
 
   // セルの幅 = サムネイルサイズ + パディング。
@@ -381,46 +436,62 @@ export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
   const minColumns = 3;
   const gridTemplate = `repeat(auto-fill, minmax(min(${cellWidth}px, calc((100% - ${(minColumns - 1) * 4}px) / ${minColumns})), 1fr))`;
 
-  if (!browseData) return null;
-
   // Hydrus は検索時に Hydrus 側で全件ソート済みのため、1ページ分だけを
   // フロント側で並べ替えると全体の順序が壊れる。API 応答順のまま描画する。
+  const sourceDirectories = directories ?? browseData?.directories ?? [];
+  const sourceFiles = files ?? browseData?.files ?? [];
   const sortedDirs = isHydrusMode
-    ? browseData.directories
-    : sortExplorerDirectories(browseData.directories, sortKey, sortDir);
+    ? sourceDirectories
+    : sortExplorerDirectories(sourceDirectories, sortKey, sortDir);
   const sortedFiles = isHydrusMode
-    ? browseData.files
-    : sortExplorerFiles(browseData.files, sortKey, sortDir);
+    ? sourceFiles
+    : sortExplorerFiles(sourceFiles, sortKey, sortDir);
+  const paged = paginateCombinedItems(
+    sortedDirs,
+    sortedFiles,
+    isHfMode ? hfPage : 1,
+    HF_PAGE_SIZE,
+  );
+  const totalGridPages = paged.totalPages;
+  const effectiveHfPage = isHfMode ? paged.page : 1;
+  useEffect(() => {
+    // Clamp after a delete/refresh reduces the total number of pages.
+    if (isHfMode && hfPage > totalGridPages) setHfPage(totalGridPages);
+  }, [hfPage, isHfMode, totalGridPages]);
+  if (!browseData || !principalReady) return null;
+  const visibleDirs = isHfMode ? paged.directories : sortedDirs;
+  const visibleFiles = isHfMode ? paged.files : sortedFiles;
   const orderedPaths = [
-    ...sortedDirs.map((dir) => dir.path),
-    ...sortedFiles.map((file) => file.path),
+    ...visibleDirs.map((dir) => dir.path),
+    ...visibleFiles.map((file) => file.path),
   ];
 
   return (
-    <div ref={containerRef}>
+    <div ref={containerRef} className="min-w-0">
       {/* サイズインジケーター */}
-      <div className="flex items-center justify-end gap-2 px-2 pb-1 text-[10px] text-muted-foreground">
+      <div className="flex items-center justify-end gap-2 px-1 pb-2 text-[10px] text-muted-foreground/70">
         <span>Ctrl+ホイールでサイズ変更</span>
         <span>{thumbSize}px</span>
       </div>
+      {headerAddon && <div className="px-2 pb-1">{headerAddon}</div>}
 
       <div
         data-explorer-grid="true"
-        className="grid gap-1 p-2"
+        className="grid gap-3 p-1 sm:grid-cols-[repeat(auto-fill,minmax(132px,1fr))] sm:gap-4"
         style={{
           gridTemplateColumns: gridTemplate,
         }}
       >
         {/* フォルダ */}
-        {sortedDirs.map((dir) => (
+        {visibleDirs.map((dir) => (
           <div
             key={dir.path}
             data-explorer-item-path={dir.path}
             draggable
             className={cn(
-              "flex cursor-pointer flex-col items-center gap-1 rounded-lg p-2 text-center transition-opacity hover:bg-muted",
-              selectedItems.has(dir.path) && "bg-accent",
-              focusedItemPath === dir.path && "ring-2 ring-primary/45",
+              "group flex min-h-32 cursor-pointer flex-col items-center justify-center gap-1 rounded-md border border-border bg-card/35 p-3 text-center transition-colors hover:border-muted-foreground/40 hover:bg-muted/50",
+              selectedItems.has(dir.path) && "border-primary bg-primary/5 ring-1 ring-primary/40",
+              focusedItemPath === dir.path && "outline outline-1 outline-primary/45 outline-offset-1",
               clipboard?.operation === "cut" &&
                 clipboard.paths.includes(dir.path) &&
                 "opacity-50",
@@ -457,11 +528,11 @@ export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
                     width: Math.min(thumbSize * 0.5, 48),
                     height: Math.min(thumbSize * 0.5, 48),
                   }}
-                  className="text-blue-500"
+                  className="text-tertiary"
                 />
               </div>
             )}
-            <span className="w-full truncate text-xs">{dir.name}</span>
+            <span className="w-full truncate text-[13px] leading-5">{dir.name}</span>
             {dir.item_count != null && (
               <span className="text-[10px] text-muted-foreground">
                 {dir.item_count}件
@@ -471,15 +542,15 @@ export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
         ))}
 
         {/* ファイル */}
-        {sortedFiles.map((file) => (
+        {visibleFiles.map((file) => (
           <div
             key={file.path}
             data-explorer-item-path={file.path}
             draggable={!isRecordTableFile(file)}
             className={cn(
-              "flex cursor-pointer flex-col items-center gap-1 rounded-lg p-2 text-center transition-opacity hover:bg-muted",
-              selectedItems.has(file.path) && "bg-accent",
-              focusedItemPath === file.path && "ring-2 ring-primary/45",
+              "group flex min-h-32 cursor-pointer flex-col items-center justify-center gap-1 rounded-md border border-border bg-card/35 p-3 text-center transition-colors hover:border-muted-foreground/40 hover:bg-muted/50",
+              selectedItems.has(file.path) && "border-primary bg-primary/5 ring-1 ring-primary/40",
+              focusedItemPath === file.path && "outline outline-1 outline-primary/45 outline-offset-1",
               clipboard?.operation === "cut" &&
                 clipboard.paths.includes(file.path) &&
                 "opacity-50",
@@ -522,12 +593,21 @@ export function FileGrid({ onFileClick, onContextMenu }: FileGridProps) {
                 {fileTypeIcon(file, thumbSize)}
               </div>
             )}
-            <span className="w-full truncate text-xs" title={file.name}>
+            <span className="w-full truncate text-[13px] leading-5" title={file.name}>
               {file.name}
             </span>
           </div>
         ))}
       </div>
+      {isHfMode && totalGridPages > 1 && (
+        <Pagination
+          page={effectiveHfPage}
+          totalPages={totalGridPages}
+          onPageChange={setHfPage}
+          className="justify-center px-2 pb-2"
+          label="HFページ"
+        />
+      )}
     </div>
   );
 }

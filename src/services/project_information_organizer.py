@@ -9,16 +9,127 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..memory.models import Project, ProjectContextPack
+from ..memory.models import Project, ProjectContextPack, ProjectQaEntry
+from .project_context_pack_service import (
+    _TERMINAL_QUESTION_STATES,
+    create_pack_revision,
+    invalidate_project_context_pack,
+    pack_snapshot,
+    validate_generated_pack_replacement,
+)
 from .project_information_docs import update_project_information_doc
+from .project_qa_candidate_service import (
+    _normalized_question_hash,
+    find_existing_project_qa_entry,
+)
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class LLMUsageContext:
+    """Immutable identity scope for one project-information LLM job.
+
+    The organizer creates a fresh provider client for each job.  Keeping this
+    scope as a value object (rather than mutating a shared/global client) lets
+    direct ``generate_response`` usage be attributed to the authenticated
+    user/project while concurrent requests remain isolated.
+    """
+
+    user_id: str | None = None
+    project_id: str | None = None
+    session_id: str | None = None
+
+
+def _coerce_llm_usage_context(value: Any) -> LLMUsageContext | None:
+    """Normalize a caller-provided or task-local usage scope."""
+
+    if value is None:
+        try:
+            from .turn_context import get_turn_context
+
+            turn = get_turn_context()
+            if not any(
+                getattr(turn, name, None)
+                for name in ("user_id", "project_id", "session_id")
+            ):
+                return None
+            value = turn
+        except Exception:  # pragma: no cover - import/runtime compatibility
+            return None
+
+    if isinstance(value, LLMUsageContext):
+        return value
+
+    def _read(name: str) -> str | None:
+        if isinstance(value, Mapping):
+            raw = value.get(name)
+        else:
+            raw = getattr(value, name, None)
+        if raw is None:
+            return None
+        normalized = str(raw).strip()
+        return normalized or None
+
+    return LLMUsageContext(
+        user_id=_read("user_id"),
+        project_id=_read("project_id"),
+        session_id=_read("session_id"),
+    )
+
+
+def _apply_llm_usage_context(client: Any, usage_context: Any = None) -> None:
+    """Apply one immutable scope to a newly-created provider client.
+
+    ``set_session_context`` is the public user identity seam.  Project and
+    conversation IDs are also explicit client attributes because the shared
+    ``persist_usage_sync`` path reads those fields when writing ``TokenUsage``.
+    This function is intentionally best-effort: telemetry context must not
+    turn a successful organizer response into a failed request.
+    """
+
+    context = _coerce_llm_usage_context(usage_context)
+    if client is None or context is None:
+        return
+
+    setter = getattr(client, "set_session_context", None)
+    if callable(setter) and context.user_id:
+        metadata = {
+            key: value
+            for key, value in (
+                ("project_id", context.project_id),
+                ("session_id", context.session_id),
+            )
+            if value
+        }
+        try:
+            setter(user_id=context.user_id, metadata=metadata or None)
+        except TypeError:
+            # Lightweight test/fallback clients may expose the older
+            # ``set_session_context(user_id)`` shape.
+            try:
+                setter(user_id=context.user_id)
+            except Exception:
+                logger.debug("LLM usage user context setup failed", exc_info=True)
+        except Exception:
+            logger.debug("LLM usage user context setup failed", exc_info=True)
+
+    for attribute, value in (
+        ("current_session_id", context.session_id),
+        ("current_project_id", context.project_id),
+    ):
+        if value is None:
+            continue
+        try:
+            setattr(client, attribute, value)
+        except Exception:
+            logger.debug("LLM usage %s context setup failed", attribute, exc_info=True)
 
 SUPPORTED_EXTENSIONS = {
     ".txt",
@@ -208,8 +319,11 @@ def _extract_file_text(file_path: Path, max_chars: int) -> tuple[str, str | None
         if ext in {".docx", ".xlsx", ".pptx", ".pdf"}:
             from ..tools.file_explorer.file_explorer_service import _convert_office_to_text
 
-            converted = _convert_office_to_text(file_path) or ""
-            return _clip(converted, max_chars), None if converted else "本文を抽出できませんでした"
+            result = _convert_office_to_text(file_path)
+            converted = str(result.get("content") or "") if result.get("success") else ""
+            if not converted:
+                return "", str(result.get("error") or "本文を抽出できませんでした")
+            return _clip(converted, max_chars), None
     except Exception as exc:  # pragma: no cover - parser failures vary by environment
         return "", str(exc)
 
@@ -636,6 +750,8 @@ async def organize_with_llm(
     source_folder: str,
     files: list[ScannedProjectFile],
     fallback: OrganizationDraft,
+    *,
+    usage_context: LLMUsageContext | Mapping[str, Any] | Any = None,
 ) -> OrganizationDraft:
     payload = [
         {
@@ -718,6 +834,7 @@ are valid when supported by the documents.
         from ..llm.manager import create_llm_client
 
         client = create_llm_client(config)
+        _apply_llm_usage_context(client, usage_context)
         return client.generate_response(prompt, stream=False)
 
     try:
@@ -806,19 +923,143 @@ async def apply_organization_draft(
         append_text=_draft_to_markdown(draft, scanned_files),
         change_summary="フォルダ整理結果を案件情報Docs正本へ反映",
     )
+    # Keep source mutation and projection invalidation in this transaction.
+    # The pack is rebuilt below when the organizer succeeds, so the final
+    # status is reset to fresh before the same commit.
+    await invalidate_project_context_pack(
+        session=session,
+        project_id=project_id,
+        reason="project_information_docs_updated",
+    )
 
     pack_result = await session.execute(
-        select(ProjectContextPack).where(ProjectContextPack.project_id == project_id)
+        select(ProjectContextPack)
+        .where(ProjectContextPack.project_id == project_id)
+        .with_for_update()
     )
     pack = pack_result.scalar_one_or_none()
+    existing_pack = pack is not None
     if pack is None:
         pack = ProjectContextPack(id=uuid4(), project_id=project_id)
         session.add(pack)
+    old_pack_payload = pack_snapshot(pack)
+    questions_to_migrate: list[tuple[Any, str, str, bool]] = []
+    for legacy_item in old_pack_payload.get("open_questions") or []:
+        if isinstance(legacy_item, dict):
+            question = legacy_item.get("text") or legacy_item.get("question")
+            legacy_status = str(
+                legacy_item.get("status") or "open"
+            ).strip().casefold()
+            source_deleted = bool(legacy_item.get("deleted_at"))
+        else:
+            question = legacy_item
+            legacy_status = "open"
+            source_deleted = False
+        if source_deleted:
+            qa_status = "archived"
+            review_state = "accepted"
+        elif legacy_status in _TERMINAL_QUESTION_STATES:
+            if legacy_status in {"answered", "resolved"}:
+                qa_status = "answered"
+            elif legacy_status in {"cancelled", "canceled"}:
+                qa_status = "cancelled"
+            elif legacy_status == "stale":
+                qa_status = "stale"
+            else:
+                qa_status = "archived"
+            review_state = (
+                "rejected" if legacy_status == "rejected" else "accepted"
+            )
+        else:
+            qa_status = "unanswered"
+            review_state = "candidate"
+        questions_to_migrate.append(
+            (question, qa_status, review_state, source_deleted)
+        )
+    questions_to_migrate.extend(
+        (question, "unanswered", "candidate", False)
+        for question in draft.open_questions
+    )
+    migrated_hashes: set[str] = set()
+    for question, qa_status, review_state, source_deleted in questions_to_migrate:
+        if not str(question or "").strip():
+            continue
+        question_hash = _normalized_question_hash(question)
+        if question_hash in migrated_hashes:
+            continue
+        migrated_hashes.add(question_hash)
+        existing_question = await find_existing_project_qa_entry(
+            session,
+            project_id=project_id,
+            question=str(question),
+            question_hash=question_hash,
+        )
+        incoming_terminal = (
+            qa_status != "unanswered" or review_state == "rejected"
+        )
+        if existing_question is not None and incoming_terminal:
+            existing_terminal = (
+                existing_question.status != "unanswered"
+                or existing_question.review_state == "rejected"
+            )
+            if not existing_terminal:
+                existing_question.status = qa_status
+                existing_question.review_state = review_state
+                existing_question.updated_by = user_id
+        if (
+            existing_question is not None
+            and source_deleted
+            and existing_question.deleted_at is None
+        ):
+            existing_question.deleted_at = datetime.utcnow()
+        if existing_question is None:
+            session.add(
+                ProjectQaEntry(
+                    project_id=project_id,
+                    knowledge_node_id=node.id,
+                    question=str(question).strip(),
+                    normalized_question_hash=question_hash,
+                    status=qa_status,
+                    review_state=review_state,
+                    confidence=0.65,
+                    asked_count=1,
+                    created_by=user_id,
+                    updated_by=user_id,
+                    created_by_agent=True,
+                    deleted_at=(datetime.utcnow() if source_deleted else None),
+                )
+            )
+    new_pack_payload = {
+        **old_pack_payload,
+        "summary_md": draft.summary_md,
+        "goals": draft.goals,
+        "constraints": draft.constraints,
+        "decisions": draft.decisions,
+        # ProjectQaEntry is the single status-bearing canonical store.
+        "open_questions": [],
+    }
+    validate_generated_pack_replacement(
+        old_pack_payload,
+        new_pack_payload,
+        fields=(
+            "summary_md",
+            "goals",
+            "constraints",
+            "decisions",
+        ),
+    )
+    if existing_pack:
+        await create_pack_revision(
+            session,
+            pack,
+            change_reason="project_information_organizer",
+            snapshot=old_pack_payload,
+        )
     pack.summary_md = draft.summary_md
     pack.goals = draft.goals
     pack.constraints = draft.constraints
     pack.decisions = draft.decisions
-    pack.open_questions = draft.open_questions
+    pack.open_questions = []
     pack.generated_from = {
         "source": "project_information_organizer",
         "folder": draft.source_folder,
@@ -826,6 +1067,8 @@ async def apply_organization_draft(
         "file_count": len(scanned_files),
         "updated_at": datetime.utcnow().isoformat(),
     }
+    pack.status = "fresh"
+    pack.generated_at = datetime.utcnow()
     pack.updated_at = datetime.utcnow()
 
     await session.commit()
@@ -849,6 +1092,7 @@ async def organize_project_folder(
     config: Any = None,
     max_files: int = 80,
     draft_override: dict[str, Any] | None = None,
+    usage_context: LLMUsageContext | Mapping[str, Any] | Any = None,
 ) -> dict[str, Any]:
     files, relative_folder = scan_project_folder(
         storage_root,
@@ -865,7 +1109,14 @@ async def organize_project_folder(
             draft.generated_by,
         )
     elif use_llm and config and files:
-        draft = await organize_with_llm(config, project_name, relative_folder, files, fallback)
+        draft = await organize_with_llm(
+            config,
+            project_name,
+            relative_folder,
+            files,
+            fallback,
+            usage_context=usage_context,
+        )
 
     applied = {"documents": 0, "facts": 0}
     if apply:

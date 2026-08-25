@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from datetime import datetime, timedelta
@@ -25,6 +26,7 @@ from ...memory.models import (
     TaskAssignee,
     TaskAttachment,
     TaskReference,
+    TaskRelation,
     TaskComment,
     TaskDependency,
     TaskOccurrence,
@@ -59,12 +61,37 @@ from ._shared import (
     _get_user_task_notifications_default_enabled,
     _is_date_only_occurrence,
     _is_midnight,
-    _normalize_member_permissions,
     _normalize_task_title,
     _strip_google_calendar_metadata,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Normal task deletion is reversible for the shared content-deletion retention
+# period.  Keep a thirty-day fallback for rolling deployments where the
+# optional policy helper has not landed yet.
+try:
+    from ..content_deletion_service import get_deletion_retention_days
+except ImportError:  # pragma: no cover - only mixed-version deployments
+    def get_deletion_retention_days(value: Any = None) -> int:
+        return 30
+
+
+def _task_deletion_retention_days(value: Any = None) -> int:
+    return int(get_deletion_retention_days(value))
+
+
+def _assert_generation_mutation_allowed() -> None:
+    """Reject a late generation write immediately before committing cleanup."""
+
+    try:
+        from ...llm.generation_cancellation import (
+            raise_if_generation_mutation_blocked,
+        )
+    except ImportError:
+        return
+    raise_if_generation_mutation_blocked()
 
 
 class HelperMixin:
@@ -81,12 +108,19 @@ class HelperMixin:
     async def _get_accessible_project_ids(
         self, session: AsyncSession, user_id: UUID
     ) -> list[UUID]:
-        result = await session.execute(
-            select(ProjectMember.project_id)
-            .join(Project, Project.id == ProjectMember.project_id)
-            .where(ProjectMember.user_id == user_id, Project.deleted_at.is_(None))
-        )
-        return list(result.scalars().all())
+        return await ProjectRepository.get_accessible_project_ids(session, user_id)
+
+    async def _get_participating_project_ids(
+        self, session: AsyncSession, user_id: UUID
+    ) -> list[UUID]:
+        """Resolve operational project scope without global-admin expansion.
+
+        Management/direct URL/Docs callers continue to use
+        :meth:`_get_accessible_project_ids`.  Aggregates (tasks, calendar,
+        time entries and reports) should call this narrower helper so a global
+        admin does not silently receive every project's operational data.
+        """
+        return await ProjectRepository.get_participating_project_ids(session, user_id)
 
     async def _filter_project_ids_by_space(
         self,
@@ -152,26 +186,15 @@ class HelperMixin:
         user_id: UUID,
         permission: str,
     ) -> None:
-        member = await ProjectRepository.get_member(session, project_id, user_id)
         project = await ProjectRepository.get_by_id(session, project_id)
         if project is None:
             raise TaskManagementError("Project not found", status_code=404)
-        if member is None:
-            raise TaskManagementError("Project access denied", status_code=403)
 
-        if member.role in {"owner", "admin"}:
-            return
-
-        permissions = _normalize_member_permissions(member.role, member.permissions)
-        if permission == "read" and permissions.get("read", False):
-            return
-        if permission == "write" and permissions.get("write", False):
-            return
-        if permission == "delete" and permissions.get("delete", False):
-            return
-        if permission == "manage_settings" and (
-            permissions.get("manage_settings", False)
-            or permissions.get("manage_notifications", False)
+        if await ProjectRepository.has_permission(
+            session,
+            project_id=project_id,
+            user_id=user_id,
+            permission=permission,
         ):
             return
         raise TaskManagementError("Project permission denied", status_code=403)
@@ -197,16 +220,27 @@ class HelperMixin:
         return task
 
     async def _collect_task_tree_ids(
-        self, session: AsyncSession, root_task_id: UUID
+        self,
+        session: AsyncSession,
+        root_task_id: UUID,
+        *,
+        lock_rows: bool = False,
     ) -> list[UUID]:
         task_ids = [root_task_id]
         seen = {root_task_id}
         queue = [root_task_id]
 
         while queue:
-            result = await session.execute(
-                select(Task.id).where(Task.parent_task_id.in_(queue))
-            )
+            statement = select(Task.id).where(
+                    Task.parent_task_id.in_(queue),
+                    Task.deleted_at.is_(None),
+                )
+            if lock_rows:
+                # Lock each discovered level before the bulk tombstone update
+                # so a concurrent child DELETE cannot create a second batch
+                # between tree discovery and root deletion.
+                statement = statement.with_for_update()
+            result = await session.execute(statement)
             child_ids = [
                 child_id
                 for child_id in result.scalars().all()
@@ -220,6 +254,202 @@ class HelperMixin:
 
         return task_ids
 
+    async def _append_task_deletion_audit(
+        self,
+        session: AsyncSession,
+        *,
+        task_ids: Iterable[UUID],
+        deletion_batch_id: UUID,
+        deleted_at: datetime,
+        action: str,
+        actor_user_id: Optional[UUID] = None,
+        root_task_id: Optional[UUID] = None,
+        event_at: Optional[datetime] = None,
+        project_id: Optional[UUID] = None,
+    ) -> None:
+        """Best-effort bridge to the shared content-deletion audit service.
+
+        The audit service is introduced independently of the task rollout. A
+        lazy import keeps this service import-safe while workers are on mixed
+        revisions; once present, support its keyword-oriented API without
+        coupling task code to a concrete implementation signature.
+        """
+
+        from ..content_deletion_service import append_content_deletion_event
+
+        normalized_action = {
+            "delete": "deleted",
+            "restore": "restored",
+            "purge": "purged",
+        }.get(action, action)
+        ids = list(task_ids)
+        if not ids:
+            return
+        root_id = str(root_task_id or ids[0])
+        for task_id in ids:
+            result = append_content_deletion_event(
+                session,
+                "task",
+                str(task_id),
+                action=normalized_action,
+                root_entity_id=root_id,
+                batch_id=deletion_batch_id,
+                project_id=project_id,
+                actor_user_id=actor_user_id,
+                source="task_management",
+                event_at=event_at or deleted_at,
+                metadata={
+                    "retention_days": _task_deletion_retention_days(),
+                    "deleted_at": deleted_at.isoformat(),
+                },
+            )
+            if inspect.isawaitable(result):
+                await result
+
+    async def purge_expired_task_deletions(
+        self,
+        session: AsyncSession,
+        *,
+        now: Optional[datetime] = None,
+        retention_days: Optional[int] = None,
+        limit: Optional[int] = None,
+        commit: bool = True,
+    ) -> dict[str, Any]:
+        """Physically remove task batches whose restore window has expired.
+
+        Normal DELETE never removes rows.  This helper is intentionally
+        separate so a scheduled retention worker (or an explicitly approved
+        maintenance command) can perform the irreversible step after the
+        thirty-day window.  Rows are deleted in dependency order and the
+        parent self-reference is detached before task rows are removed.
+        """
+
+        retention_days = (
+            _task_deletion_retention_days()
+            if retention_days is None
+            else int(retention_days)
+        )
+        if retention_days < 0:
+            raise TaskManagementError("retention_days must be non-negative", status_code=400)
+        cutoff = (now or datetime.utcnow()) - timedelta(days=retention_days)
+        batch_stmt = (
+            select(Task.deletion_batch_id, func.min(Task.deleted_at))
+            .where(
+                Task.deleted_at.is_not(None),
+                Task.deleted_at < cutoff,
+                Task.deletion_batch_id.is_not(None),
+            )
+            .group_by(Task.deletion_batch_id)
+            .order_by(func.min(Task.deleted_at).asc())
+        )
+        if limit is not None:
+            batch_stmt = batch_stmt.limit(max(0, int(limit)))
+        batch_result = await session.execute(batch_stmt)
+        batch_rows = list(batch_result.all())
+        if not batch_rows:
+            return {
+                "purged_batches": 0,
+                "purged_tasks": 0,
+                "cutoff": cutoff.isoformat(),
+            }
+
+        purged_batches = 0
+        purged_tasks = 0
+        for batch_id, batch_deleted_at in batch_rows:
+            if batch_id is None:
+                continue
+            task_result = await session.execute(
+                select(Task.id, Task.project_id).where(
+                    Task.deletion_batch_id == batch_id
+                )
+            )
+            task_rows = list(task_result.all())
+            task_ids = [row[0] for row in task_rows]
+            batch_project_id = task_rows[0][1] if task_rows else None
+            if not task_ids:
+                continue
+
+            await self._append_task_deletion_audit(
+                session,
+                task_ids=task_ids,
+                deletion_batch_id=batch_id,
+                deleted_at=batch_deleted_at or cutoff,
+                action="purge",
+                event_at=now or datetime.utcnow(),
+                project_id=batch_project_id,
+            )
+            await self._remove_task_supertags_for_deleted_tasks(session, task_ids)
+
+            # Keep the explicit order even though most installations also
+            # declare ON DELETE CASCADE.  This works against older rolling
+            # schemas and preserves task/time-entry audit rows until purge.
+            await session.execute(
+                delete(NotificationDelivery).where(
+                    NotificationDelivery.task_id.in_(task_ids)
+                )
+            )
+            await session.execute(delete(TimeEntry).where(TimeEntry.task_id.in_(task_ids)))
+            await session.execute(
+                delete(TaskOccurrence).where(TaskOccurrence.task_id.in_(task_ids))
+            )
+            await session.execute(
+                delete(TaskDependency).where(
+                    or_(
+                        TaskDependency.task_id.in_(task_ids),
+                        TaskDependency.depends_on_task_id.in_(task_ids),
+                    )
+                )
+            )
+            await session.execute(
+                delete(TaskActivity).where(TaskActivity.task_id.in_(task_ids))
+            )
+            await session.execute(
+                delete(TaskRecurrenceRule).where(TaskRecurrenceRule.task_id.in_(task_ids))
+            )
+            await session.execute(delete(TaskComment).where(TaskComment.task_id.in_(task_ids)))
+            await session.execute(
+                delete(TaskAttachment).where(TaskAttachment.task_id.in_(task_ids))
+            )
+            await session.execute(
+                delete(TaskReference).where(TaskReference.task_id.in_(task_ids))
+            )
+            await session.execute(
+                delete(TaskRelation).where(
+                    or_(
+                        TaskRelation.task_a_id.in_(task_ids),
+                        TaskRelation.task_b_id.in_(task_ids),
+                    )
+                )
+            )
+            await session.execute(delete(TaskTag).where(TaskTag.task_id.in_(task_ids)))
+            await session.execute(
+                delete(TaskAssignee).where(TaskAssignee.task_id.in_(task_ids))
+            )
+            # Detach the self-referential parent links before deleting the
+            # batch; otherwise a non-deferrable FK can reject parent removal.
+            await session.execute(
+                update(Task)
+                .where(Task.id.in_(task_ids))
+                .values(parent_task_id=None)
+            )
+            await session.execute(delete(Task).where(Task.id.in_(task_ids)))
+            purged_batches += 1
+            purged_tasks += len(task_ids)
+
+        if commit and (purged_batches or purged_tasks):
+            _assert_generation_mutation_allowed()
+            await session.commit()
+        return {
+            "purged_batches": purged_batches,
+            "purged_tasks": purged_tasks,
+            "cutoff": cutoff.isoformat(),
+        }
+
+    # Keep a discoverable spelling for retention workers written against the
+    # initial task-lifecycle design.
+    async def purge_deleted_task_batches(self, session: AsyncSession, **kwargs: Any) -> dict[str, Any]:
+        return await self.purge_expired_task_deletions(session, **kwargs)
+
     async def _replace_assignees(
         self,
         session: AsyncSession,
@@ -227,6 +457,7 @@ class HelperMixin:
         task: Task,
         assignee_ids: list[UUID],
         assigned_by: UUID,
+        assign_requester_when_empty: bool = False,
     ) -> None:
         await session.execute(
             delete(TaskAssignee).where(TaskAssignee.task_id == task.id)
@@ -239,7 +470,7 @@ class HelperMixin:
             seen.add(assignee_id)
             unique_ids.append(assignee_id)
 
-        if not unique_ids:
+        if not unique_ids and assign_requester_when_empty:
             unique_ids = [assigned_by]
 
         for index, assignee_id in enumerate(unique_ids):

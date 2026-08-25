@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from ..memory.database import get_db_session
 from ..memory.models import ConversationMessage, ConversationSession, Project, ProjectQaEntry
@@ -53,6 +53,68 @@ def _coerce_uuid(value: Any) -> uuid.UUID | None:
 def _normalized_question_hash(value: str) -> str:
     normalized = " ".join(str(value or "").strip().lower().split())
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+_CLOSED_QA_STATUSES = frozenset({"answered", "resolved", "stale", "cancelled", "archived"})
+
+
+def is_project_qa_entry_closed(entry: ProjectQaEntry) -> bool:
+    """Return whether an automatic intake must leave this canonical row untouched."""
+    return (
+        entry.deleted_at is not None
+        or str(entry.status or "").strip().lower() in _CLOSED_QA_STATUSES
+        or str(entry.review_state or "").strip().lower() == "rejected"
+    )
+
+
+async def find_existing_project_qa_entry(
+    session: Any,
+    *,
+    project_id: uuid.UUID,
+    question: str,
+    question_hash: str | None = None,
+) -> ProjectQaEntry | None:
+    """Find active or terminal Q&A without reopening legacy tombstones."""
+    normalized_hash = question_hash or _normalized_question_hash(question)
+    bind = session.get_bind() if hasattr(session, "get_bind") else None
+    dialect_name = getattr(getattr(bind, "dialect", None), "name", "")
+    if dialect_name == "postgresql":
+        # Serialize all Q&A writers per project. Hash-level locks can deadlock when
+        # two drafts contain the same questions in opposite order.
+        lock_key = f"project-qa:{project_id}"
+        await session.execute(
+            select(func.pg_advisory_xact_lock(func.hashtext(lock_key)))
+        )
+
+    result = await session.execute(
+        select(ProjectQaEntry)
+        .where(
+            ProjectQaEntry.project_id == project_id,
+            ProjectQaEntry.normalized_question_hash == normalized_hash,
+        )
+        .limit(1)
+    )
+    entry = result.scalar_one_or_none()
+    if entry is not None:
+        return entry
+
+    legacy_result = await session.execute(
+        select(ProjectQaEntry).where(
+            ProjectQaEntry.project_id == project_id,
+            ProjectQaEntry.normalized_question_hash.is_(None),
+        )
+    )
+    entry = next(
+        (
+            candidate
+            for candidate in legacy_result.scalars().all()
+            if _normalized_question_hash(candidate.question) == normalized_hash
+        ),
+        None,
+    )
+    if entry is not None:
+        entry.normalized_question_hash = normalized_hash
+    return entry
 
 
 def extract_project_qa_candidate_questions(content: str, *, limit: int = 5) -> list[str]:
@@ -135,13 +197,14 @@ async def process_project_qa_candidates_for_message(message_id: uuid.UUID) -> di
             await session.flush()
 
             if not questions:
-                metadata["project_qa_candidate_job"] = {
+                completed_metadata = dict(metadata)
+                completed_metadata["project_qa_candidate_job"] = {
                     "status": "done",
                     "started_at": now.isoformat(),
                     "finished_at": datetime.utcnow().isoformat(),
                     "question_count": 0,
                 }
-                message.message_metadata = metadata
+                message.message_metadata = completed_metadata
                 await session.commit()
                 return {"success": True, "created": 0, "updated": 0}
 
@@ -156,16 +219,12 @@ async def process_project_qa_candidates_for_message(message_id: uuid.UUID) -> di
             updated = 0
             for question in questions:
                 question_hash = _normalized_question_hash(question)
-                existing_result = await session.execute(
-                    select(ProjectQaEntry)
-                    .where(
-                        ProjectQaEntry.project_id == project.id,
-                        ProjectQaEntry.deleted_at.is_(None),
-                        ProjectQaEntry.normalized_question_hash == question_hash,
-                    )
-                    .limit(1)
+                entry = await find_existing_project_qa_entry(
+                    session,
+                    project_id=project.id,
+                    question=question,
+                    question_hash=question_hash,
                 )
-                entry = existing_result.scalar_one_or_none()
                 if entry is None:
                     entry = ProjectQaEntry(
                         project_id=project.id,
@@ -185,6 +244,8 @@ async def process_project_qa_candidates_for_message(message_id: uuid.UUID) -> di
                     )
                     session.add(entry)
                     created += 1
+                elif is_project_qa_entry_closed(entry):
+                    continue
                 else:
                     entry.asked_count = int(entry.asked_count or 0) + 1
                     entry.last_asked_at = now
@@ -196,7 +257,8 @@ async def process_project_qa_candidates_for_message(message_id: uuid.UUID) -> di
                     entry.source_message_ids = sources
                     updated += 1
 
-            metadata["project_qa_candidate_job"] = {
+            completed_metadata = dict(metadata)
+            completed_metadata["project_qa_candidate_job"] = {
                 "status": "done",
                 "started_at": now.isoformat(),
                 "finished_at": datetime.utcnow().isoformat(),
@@ -204,7 +266,7 @@ async def process_project_qa_candidates_for_message(message_id: uuid.UUID) -> di
                 "created": created,
                 "updated": updated,
             }
-            message.message_metadata = metadata
+            message.message_metadata = completed_metadata
             await session.commit()
             return {"success": True, "created": created, "updated": updated}
         except Exception:

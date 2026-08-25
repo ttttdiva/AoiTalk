@@ -1,15 +1,16 @@
 import React, { useEffect, useState } from "react";
-import { ScrollView, StyleSheet, View } from "react-native";
+import { StyleSheet, View } from "react-native";
 import { useRouter } from "expo-router";
 import { goBackOrReplace } from "../../../lib/navigation";
 import {
   Button,
-  IconButton,
   Surface,
   Switch,
   Text,
   TextInput,
 } from "react-native-paper";
+import { ScreenHeader } from "../../../components/screen-header";
+import { ScreenShell } from "../../../components/screen-primitives";
 import { DEFAULT_API_URL, EXTERNAL_API_URL } from "../../../constants/config";
 import { clearApiUrlCache } from "../../../lib/api-client";
 import { getApiUrl, saveApiUrl } from "../../../lib/auth";
@@ -60,22 +61,18 @@ export default function SettingsConnectionScreen() {
   };
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      <Surface style={styles.header} elevation={1}>
-        <View style={styles.headerRow}>
-          <IconButton
-            icon="arrow-left"
-            iconColor="#cdd6f4"
-            onPress={() => goBackOrReplace(router, '/(tabs)/settings')}
-          />
-          <View style={{ flex: 1 }}>
-            <Text variant="titleLarge" style={styles.headerTitle}>
-              Server / Network
-            </Text>
-            <Text style={styles.headerSubtext}>Current: {currentNetwork}</Text>
-          </View>
-        </View>
-      </Surface>
+    <ScreenShell
+      scroll
+      style={styles.container}
+      contentContainerStyle={styles.content}
+      header={
+        <ScreenHeader
+          title="Server / Network"
+          subtitle={`Current: ${currentNetwork}`}
+          onBack={() => goBackOrReplace(router, "/(tabs)/settings")}
+        />
+      }
+    >
 
       <Surface style={styles.card} elevation={0}>
         <View style={styles.switchRow}>
@@ -131,22 +128,13 @@ export default function SettingsConnectionScreen() {
           </Button>
         </View>
       </Surface>
-    </ScrollView>
+    </ScreenShell>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b" },
   content: { paddingBottom: 32 },
-  header: {
-    paddingTop: 52,
-    paddingHorizontal: 8,
-    paddingBottom: 16,
-    backgroundColor: "#1e1e2e",
-  },
-  headerRow: { flexDirection: "row", alignItems: "center" },
-  headerTitle: { color: "#cdd6f4", fontWeight: "bold" },
-  headerSubtext: { color: "#a6adc8", marginTop: 2 },
   card: {
     backgroundColor: "#1e1e2e",
     borderRadius: 12,

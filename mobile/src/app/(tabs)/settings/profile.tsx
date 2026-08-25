@@ -1,8 +1,8 @@
-import React from "react";
 import { StyleSheet, View } from "react-native";
 import { useRouter } from "expo-router";
 import { goBackOrReplace } from "../../../lib/navigation";
-import { Button, IconButton, Surface, Text } from "react-native-paper";
+import { Button, Surface, Text } from "react-native-paper";
+import { ScreenHeader } from "../../../components/screen-header";
 import { useAuth } from "../../../contexts/AuthContext";
 
 export default function SettingsProfileScreen() {
@@ -11,18 +11,10 @@ export default function SettingsProfileScreen() {
 
   return (
     <View style={styles.container}>
-      <Surface style={styles.header} elevation={1}>
-        <View style={styles.headerRow}>
-          <IconButton
-            icon="arrow-left"
-            iconColor="#cdd6f4"
-            onPress={() => goBackOrReplace(router, '/(tabs)/settings')}
-          />
-          <Text variant="titleLarge" style={styles.headerTitle}>
-            Account details
-          </Text>
-        </View>
-      </Surface>
+      <ScreenHeader
+        title="Account details"
+        onBack={() => goBackOrReplace(router, "/(tabs)/settings")}
+      />
 
       <Surface style={styles.card} elevation={0}>
         <Text style={styles.cardTitle}>
@@ -54,7 +46,7 @@ export default function SettingsProfileScreen() {
       <Surface style={styles.card} elevation={0}>
         <Text style={styles.cardTitle}>Session</Text>
         <Text style={styles.cardDescription}>
-          ログアウトしても端末内のローカルデータは削除しません。サーバー連携だけを切断します。
+          ログアウトすると未同期のローカル同期キャッシュは破棄されます。サーバー上のデータは削除されません。
         </Text>
         {isAuthenticated ? (
           <Button
@@ -79,20 +71,13 @@ export default function SettingsProfileScreen() {
           </Button>
         )}
       </Surface>
+
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b", paddingBottom: 24 },
-  header: {
-    paddingTop: 52,
-    paddingHorizontal: 8,
-    paddingBottom: 16,
-    backgroundColor: "#1e1e2e",
-  },
-  headerRow: { flexDirection: "row", alignItems: "center" },
-  headerTitle: { color: "#cdd6f4", fontWeight: "bold" },
   card: {
     backgroundColor: "#1e1e2e",
     borderColor: "#313244",

@@ -7,31 +7,35 @@ import { toast } from "sonner";
 
 import { taskApi, type Task } from "@/lib/task-api";
 import { isTaskCompletionTransition } from "@/lib/task-completion-undo";
+import {
+  hasEffectiveTaskOccurrence,
+  updateEffectiveTaskOccurrenceStatus,
+} from "@/lib/task-occurrence-status";
+import { getTaskDisplayStatus } from "@/lib/tasks-page-utils";
 import { cn } from "@/lib/utils";
 import { useContextMenuPosition } from "@/hooks/use-context-menu-position";
-import type { FetchDataOptions } from "@/components/tasks/hooks/use-tasks-data";
 import type { UndoEntry } from "@/components/tasks/hooks/use-task-undo";
 
 /**
  * タスク一覧の右クリックコンテキストメニュー状態と各操作をまとめたフック。
  */
 export function useTaskContextMenu({
-  fetchData,
   pushUndo,
   queueTaskCompletionUndo,
   applyTaskPatchLocally,
   upsertTaskLocally,
   removeTaskLocally,
   setSelectedIds,
+  refreshTasks,
   requestRecurringDelete,
 }: {
-  fetchData: (options?: FetchDataOptions) => Promise<void>;
   pushUndo: (entry: UndoEntry) => void;
   queueTaskCompletionUndo: (entries: Task[]) => void;
   applyTaskPatchLocally: (taskId: string, patch: Partial<Task>) => void;
   upsertTaskLocally: (task: Task) => void;
   removeTaskLocally: (taskId: string) => void;
   setSelectedIds: React.Dispatch<React.SetStateAction<Set<string>>>;
+  refreshTasks?: () => Promise<void>;
   requestRecurringDelete?: (task: Task) => boolean;
 }) {
   const [contextMenu, setContextMenu] = useState<{
@@ -93,7 +97,23 @@ export function useTaskContextMenu({
       if (!contextMenu) return;
       const task = contextMenu.task;
       closeContextMenu();
-      const willComplete = isTaskCompletionTransition(task.status, status);
+      const currentStatus = getTaskDisplayStatus(task);
+      if (status === currentStatus) return;
+      if (hasEffectiveTaskOccurrence(task)) {
+        try {
+          await updateEffectiveTaskOccurrenceStatus({
+            task,
+            status,
+            applyTaskPatchLocally,
+            refreshTasks,
+          });
+        } catch (err) {
+          console.error("繰り返し発生回のステータス更新失敗:", err);
+        }
+        return;
+      }
+
+      const willComplete = isTaskCompletionTransition(currentStatus, status);
       try {
         if (!willComplete) {
           pushUndo({
@@ -108,11 +128,14 @@ export function useTaskContextMenu({
         applyTaskPatchLocally(task.id, { status });
         const updated = await taskApi.updateTask(task.id, { status });
         upsertTaskLocally(updated);
-        await fetchData();
         if (willComplete) {
           queueTaskCompletionUndo([task]);
         }
       } catch (err) {
+        applyTaskPatchLocally(task.id, {
+          status: task.status,
+          completed_at: task.completed_at ?? null,
+        });
         console.error("ステータス更新失敗:", err);
       }
     },
@@ -120,9 +143,9 @@ export function useTaskContextMenu({
       contextMenu,
       applyTaskPatchLocally,
       closeContextMenu,
-      fetchData,
       pushUndo,
       queueTaskCompletionUndo,
+      refreshTasks,
       upsertTaskLocally,
     ],
   );
@@ -141,7 +164,6 @@ export function useTaskContextMenu({
         applyTaskPatchLocally(task.id, { priority });
         const updated = await taskApi.updateTask(task.id, { priority });
         upsertTaskLocally(updated);
-        await fetchData();
       } catch (err) {
         console.error("優先度更新失敗:", err);
       }
@@ -150,7 +172,6 @@ export function useTaskContextMenu({
       contextMenu,
       applyTaskPatchLocally,
       closeContextMenu,
-      fetchData,
       pushUndo,
       upsertTaskLocally,
     ],
@@ -163,24 +184,28 @@ export function useTaskContextMenu({
     try {
       if (task.active_time_entry) {
         await taskApi.stopTimer(task.active_time_entry.id);
+        applyTaskPatchLocally(task.id, { active_time_entry: null });
         window.dispatchEvent(
           new CustomEvent("timer-changed", {
-            detail: { activeEntry: null },
+            detail: { activeEntry: null, taskId: task.id },
           }),
         );
       } else {
-        const started = await taskApi.startTimer(task.id);
+        const started = await taskApi.startTimer(
+          task.id,
+          task.effective_occurrence_id ?? undefined,
+        );
+        applyTaskPatchLocally(task.id, { active_time_entry: started });
         window.dispatchEvent(
           new CustomEvent("timer-changed", {
-            detail: { activeEntry: started },
+            detail: { activeEntry: started, taskId: task.id },
           }),
         );
       }
-      await fetchData();
     } catch (err) {
       console.error("タイマー操作失敗:", err);
     }
-  }, [contextMenu, closeContextMenu, fetchData]);
+  }, [applyTaskPatchLocally, contextMenu, closeContextMenu]);
 
   const handleDuplicate = useCallback(async () => {
     if (!contextMenu) return;
@@ -193,15 +218,20 @@ export function useTaskContextMenu({
         description: task.description || "",
         status: task.status,
         priority: task.priority,
+        start_at: task.start_at ?? null,
+        end_at: task.end_at ?? null,
+        all_day: task.all_day,
+        ...(task.auto_close_on_due ? { auto_close_on_due: true } : {}),
         notifications_enabled: task.notifications_enabled,
+        reminder_offsets: task.reminder_offsets || [],
+        parent_task_id: task.parent_task_id ?? null,
         tag_ids: (task.tags || []).map((t) => t.id),
       });
       upsertTaskLocally(created);
-      await fetchData();
     } catch (err) {
       console.error("タスク複製失敗:", err);
     }
-  }, [contextMenu, closeContextMenu, fetchData, upsertTaskLocally]);
+  }, [contextMenu, closeContextMenu, upsertTaskLocally]);
 
   const handleCopyTaskId = useCallback(async () => {
     if (!contextMenu) return;
@@ -233,14 +263,12 @@ export function useTaskContextMenu({
         next.delete(task.id);
         return next;
       });
-      await fetchData();
     } catch (err) {
       console.error("タスク削除失敗:", err);
     }
   }, [
     contextMenu,
     closeContextMenu,
-    fetchData,
     pushUndo,
     removeTaskLocally,
     requestRecurringDelete,

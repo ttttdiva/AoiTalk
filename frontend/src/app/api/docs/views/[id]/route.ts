@@ -47,7 +47,7 @@ export async function PATCH(
     .where(
       and(
         eq(knowledgeSavedViews.id, id),
-        eq(knowledgeSavedViews.workspaceId, workspace.id),
+        eq(knowledgeSavedViews.docsLibraryId, workspace.id),
       ),
     )
     .returning();
@@ -74,7 +74,7 @@ export async function DELETE(
     .where(
       and(
         eq(knowledgeSavedViews.id, id),
-        eq(knowledgeSavedViews.workspaceId, workspace.id),
+        eq(knowledgeSavedViews.docsLibraryId, workspace.id),
       ),
     )
     .returning();

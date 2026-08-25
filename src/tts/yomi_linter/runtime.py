@@ -72,7 +72,6 @@ class YomiLinterRuntime:
             str(settings["model_id"]),
             str(settings.get("device", "cpu")),
             str(settings.get("quantization", "int8")),
-            settings.get("cache_dir"),
         )
         if self._pipeline is not None and self._signature == signature:
             return
@@ -115,9 +114,8 @@ class YomiLinterRuntime:
             self.state = "ready"
         except Exception as exc:
             self.state = "error"
-            cache_dir = settings.get("cache_dir") or "Hugging Face cache"
             self.last_error = (
-                f"repo={settings['model_id']} cache={cache_dir} "
+                f"repo={settings['model_id']} "
                 f"cause={type(exc).__name__}: {exc}"
             )
             raise RuntimeError(self.last_error) from exc
@@ -137,9 +135,7 @@ class YomiLinterRuntime:
             ) from exc
 
         model_id = str(settings["model_id"])
-        cache_dir = settings.get("cache_dir") or None
         common = {
-            "cache_dir": cache_dir,
             "revision": settings.get("revision") or "main",
             "local_files_only": bool(settings.get("local_files_only", False)),
         }

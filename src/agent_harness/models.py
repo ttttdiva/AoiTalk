@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -55,10 +55,33 @@ class RunResult:
 
     success: bool
     message: str = ""
-    session_id: str | None = None
+    # Provider-native continuation/thread identifier.  This is deliberately
+    # distinct from AoiTalk's durable conversation/session identifiers.
+    provider_session_id: str | None = None
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    # Deprecated constructor/attribute alias for external runners migrating
+    # from the pre-namespace contract.  It is an InitVar, so it does not
+    # become a serialized/public model field; ``provider_session_id`` remains
+    # the sole canonical value.
+    session_id: InitVar[str | None] = None
+
+    def __post_init__(self, session_id: str | None) -> None:
+        if self.provider_session_id is None and isinstance(session_id, str):
+            self.provider_session_id = session_id.strip() or None
+
+    @property
+    def session_id(self) -> str | None:
+        """Deprecated alias for ``provider_session_id``."""
+
+        return self.provider_session_id
+
+    @session_id.setter
+    def session_id(self, value: str | None) -> None:
+        self.provider_session_id = (
+            value.strip() if isinstance(value, str) and value.strip() else None
+        )
 
 
 @dataclass
@@ -73,11 +96,33 @@ class RunningEntry:
     last_event: str | None = None
     last_message: Any = None
     last_event_at: datetime | None = None
-    session_id: str | None = None
+    # Provider-native continuation/thread identifier observed while the run
+    # is active.  Do not rename this back to ``session_id``: callers that need
+    # an AoiTalk conversation session use their own domain models.
+    provider_session_id: str | None = None
     codex_input_tokens: int = 0
     codex_output_tokens: int = 0
     codex_total_tokens: int = 0
     turn_count: int = 0
+    # See RunResult.session_id.  Kept at the end so legacy positional
+    # arguments for the pre-rename fields retain their ordering.
+    session_id: InitVar[str | None] = None
+
+    def __post_init__(self, session_id: str | None) -> None:
+        if self.provider_session_id is None and isinstance(session_id, str):
+            self.provider_session_id = session_id.strip() or None
+
+    @property
+    def session_id(self) -> str | None:
+        """Deprecated alias for ``provider_session_id``."""
+
+        return self.provider_session_id
+
+    @session_id.setter
+    def session_id(self, value: str | None) -> None:
+        self.provider_session_id = (
+            value.strip() if isinstance(value, str) and value.strip() else None
+        )
 
 
 @dataclass

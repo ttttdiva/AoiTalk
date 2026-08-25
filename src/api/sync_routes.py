@@ -6,7 +6,10 @@ pull-only local caches on mobile.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import secrets
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID
@@ -20,8 +23,9 @@ from sqlalchemy.orm import selectinload
 from ..memory.models import (
     ConversationMessage,
     ConversationSession,
+    ContentDeletionEvent,
+    KnowledgeNodeShare,
     Project,
-    ProjectMember,
     RecordField,
     RecordRow,
     RecordTable,
@@ -31,25 +35,37 @@ from ..memory.models import (
     TaskRecurrenceRule,
     TaskTag,
     TimeEntry,
-)
-from ..models.ecc_models import (
-    Scenario,
-    ScenarioCharacter,
-    ScenarioEpisode,
-    ScenarioScene,
+    KnowledgeNode,
+    DocsLibrary,
+    public_session_context,
 )
 from ..memory.project_repository import ProjectRepository
 from ..services.docs_graph_service import DocsGraphService
+from ..services.docs_acl import (
+    accessible_project_ids as docs_accessible_project_ids,
+    docs_readable_node_predicate,
+    can_read_node,
+    library_can_read,
+    library_can_write,
+)
 from ..services.task_management_service import TaskManagementError, TaskManagementService
+from ..services.docs_library_compat import read_docs_library_id
+from ..services.docs_library_compat import with_legacy_docs_library_aliases
+from ..services.docs_workspace import get_project_docs_library
 from .docs_sync import (
     DOCS_PULL_LIMITS,
     DOCS_SYNC_TABLES,
     DocsOperationError,
     apply_docs_operation,
+    docs_scope_digest as calculate_docs_scope_digest,
+    docs_scope_revision as calculate_docs_scope_revision,
     load_current_docs_entity,
+    normalize_docs_body_json,
+    pull_cursor_envelope,
     pull_docs_table,
 )
 from .uuid_http import parse_uuid_or_400
+from .story_legacy_compat import LEGACY_STORY_PULL_LIMITS, LEGACY_STORY_TABLES, pull_story_table
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +79,7 @@ SYNC_TABLES = {
     "record_tables",
     "record_fields",
     "record_rows",
-    "scenarios",
-    "scenario_characters",
-    "scenario_scenes",
-    "scenario_episodes",
+    *LEGACY_STORY_TABLES,
     *DOCS_SYNC_TABLES,
 }
 
@@ -87,10 +100,7 @@ SYNC_PULL_LIMITS = {
     "record_tables": 1000,
     "record_fields": 5000,
     "record_rows": 5000,
-    "scenarios": 1000,
-    "scenario_characters": 5000,
-    "scenario_scenes": 5000,
-    "scenario_episodes": 5000,
+    **LEGACY_STORY_PULL_LIMITS,
     **DOCS_PULL_LIMITS,
 }
 
@@ -106,6 +116,156 @@ class SyncOperation(BaseModel):
 
 class SyncPushPayload(BaseModel):
     operations: list[SyncOperation] = Field(default_factory=list)
+
+
+class SyncPullPayload(BaseModel):
+    """pull 要求の任意ボディ。
+
+    ``docs_digests`` は「テーブル名 → 前回サーバが返したダイジェスト文字列」のエコー。
+    Docs の削除伝播テーブルで、サーバの現在ダイジェストと一致すれば権威セット全量
+    の返却を省く（定常時の応答をほぼ空にする）。未指定・未知テーブルは無視する。
+    """
+
+    docs_digests: dict[str, str] = Field(default_factory=dict)
+    docs_cursors: dict[str, str] = Field(default_factory=dict)
+    # Optional Docs composite discriminator.  ``project_id`` is meaningful
+    # together with ``docs_scope_id`` on the route; non-Docs pull tables keep
+    # their historical all-accessible-project behavior.
+    project_id: Optional[str] = None
+    docs_scope_id: Optional[str] = None
+    # Additive Docs pagination metadata.  These are optional so non-Docs sync
+    # and legacy v2 mobile clients retain their existing request contract.
+    docs_snapshot_token: Optional[str] = None
+    docs_scope_revision: Optional[str] = None
+
+
+async def _read_pull_docs_digests(request: Request) -> dict[str, str]:
+    """GET /pull の docs_digests を取り出す（無ければ空 dict）。
+
+    モバイルの fetch は GET にボディを付けられないため、クエリパラメータ
+    ``docs_digests``（URLエンコードした JSON object）を優先して読む。
+    後方の任意ボディ読み取りはテスト・ツール向けのフォールバック。
+    """
+    from_query = request.query_params.get("docs_digests")
+    if from_query:
+        try:
+            return SyncPullPayload.model_validate({"docs_digests": json.loads(from_query)}).docs_digests
+        except Exception:  # noqa: BLE001
+            return {}
+    try:
+        raw = await request.body()
+    except Exception:  # noqa: BLE001
+        return {}
+    if not raw:
+        return {}
+    try:
+        return SyncPullPayload.model_validate_json(raw).docs_digests
+    except Exception:  # noqa: BLE001
+        # 不正なボディでも pull 全体は落とさず、従来どおり全量 pull にフォールバックする。
+        return {}
+
+
+async def _read_pull_docs_cursors(request: Request) -> dict[str, str]:
+    """Docsテーブルごとの不透明な次ページcursorを取り出す。"""
+    from_query = request.query_params.get("docs_cursors")
+    if from_query:
+        try:
+            return SyncPullPayload.model_validate(
+                {"docs_cursors": json.loads(from_query)}
+            ).docs_cursors
+        except Exception:  # noqa: BLE001
+            return {}
+    return {}
+
+
+async def _read_pull_docs_snapshot_token(request: Request) -> Optional[str]:
+    """Read the opaque Docs snapshot token from query or optional GET body."""
+
+    from_query = request.query_params.get("docs_snapshot_token")
+    if from_query:
+        return from_query
+    try:
+        raw = await request.body()
+    except Exception:  # noqa: BLE001
+        return None
+    if not raw:
+        return None
+    try:
+        return SyncPullPayload.model_validate_json(raw).docs_snapshot_token
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _read_pull_docs_scope_revision(request: Request) -> Optional[str]:
+    """Read the opaque ACL revision from query or optional GET body."""
+
+    from_query = request.query_params.get("docs_scope_revision")
+    if from_query:
+        return from_query
+    try:
+        raw = await request.body()
+    except Exception:  # noqa: BLE001
+        return None
+    if not raw:
+        return None
+    try:
+        return SyncPullPayload.model_validate_json(raw).docs_scope_revision
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _read_pull_project_id(request: Request) -> Optional[str]:
+    """Read an optional Docs project discriminator from query or GET body."""
+
+    from_query = request.query_params.get("project_id")
+    if from_query:
+        return from_query
+    try:
+        raw = await request.body()
+    except Exception:  # noqa: BLE001
+        return None
+    if not raw:
+        return None
+    try:
+        return SyncPullPayload.model_validate_json(raw).project_id
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _read_pull_docs_scope_id(request: Request) -> Optional[str]:
+    """Read the Docs library scope from query or optional GET body."""
+
+    from_query = request.query_params.get("docs_scope_id")
+    if from_query:
+        return from_query
+    try:
+        raw = await request.body()
+    except Exception:  # noqa: BLE001
+        return None
+    if not raw:
+        return None
+    try:
+        return SyncPullPayload.model_validate_json(raw).docs_scope_id
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _validate_docs_opaque_token(value: Optional[str], field_name: str) -> Optional[str]:
+    """Validate token shape without interpreting its opaque contents."""
+
+    if value in (None, ""):
+        return None
+    # Cursor envelopes are untrusted JSON.  Do not coerce numbers/arrays into
+    # strings: the Director contract requires a non-empty opaque *string* and
+    # a coerced value could accidentally make malformed metadata look valid.
+    if not isinstance(value, str):
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name}")
+    token = value.strip()
+    # URL-safe random tokens are intentionally opaque.  Length limits prevent
+    # an accidental unbounded query value while accepting future token formats.
+    if not token or len(token) > 512 or any(ord(char) < 0x20 for char in token):
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name}")
+    return token
 
 
 def _parse_datetime(value: Optional[str], field_name: str) -> Optional[datetime]:
@@ -155,15 +315,131 @@ def _ensure_not_stale(
 
 
 async def _accessible_project_ids(session: AsyncSession, user_id: UUID) -> list[UUID]:
-    result = await session.execute(
-        select(ProjectMember.project_id)
-        .join(Project, Project.id == ProjectMember.project_id)
+    # Use the shared Project ACL policy rather than raw membership rows.  This
+    # includes project owners and global admins (who need not have a
+    # ProjectMember row), while excluding disabled/read=false memberships.
+    return await docs_accessible_project_ids(session, user_id)
+
+
+async def _docs_sync_scopes(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    project_ids: list[UUID],
+    personal_library: DocsLibrary | None = None,
+    personal_workspace: DocsLibrary | None = None,
+) -> list[dict[str, Any]]:
+    """Return the Docs workspaces visible to mobile sync.
+
+    The legacy endpoint only pulled the actor's personal library.  Docs ACL
+    now permits explicit Personal subtree shares and canonical Project
+    workspaces, so advertise every currently readable scope and let the client
+    pull each scope independently (with a scope-specific cursor/digest).
+    """
+
+    # ``personal_workspace`` is accepted only as an in-process compatibility
+    # alias; the canonical service/API name is ``personal_library``.
+    personal_library = personal_library or personal_workspace
+    if personal_library is None:
+        raise ValueError("personal_library is required")
+    libraries: dict[UUID, DocsLibrary] = {
+        personal_library.id: personal_library,
+    }
+    project_scopes: list[tuple[UUID, DocsLibrary, str]] = []
+    if project_ids:
+        # Project Docs now live in the owner's Personal Library.  A Project
+        # member must still receive a project-scoped entry even though
+        # ``library_can_read`` is (correctly) owner-only for Personal
+        # libraries.  Resolve through the SELECT-only pointer validator so a
+        # stale/malformed project pointer is never advertised.
+        for project_id in sorted(set(project_ids), key=str):
+            try:
+                library = await get_project_docs_library(
+                    session,
+                    project_id=project_id,
+                    actor_user_id=user_id,
+                )
+            except (PermissionError, ValueError):
+                library = None
+            if library is None:
+                continue
+            can_write = await ProjectRepository.has_permission(
+                session,
+                project_id=project_id,
+                user_id=user_id,
+                permission="write",
+            )
+            libraries[library.id] = library
+            project_scopes.append(
+                (project_id, library, "write" if can_write else "read")
+            )
+
+    shared_rows = await session.execute(
+        select(DocsLibrary, KnowledgeNodeShare.permission)
+        .join(KnowledgeNode, KnowledgeNode.docs_library_id == DocsLibrary.id)
+        .join(KnowledgeNodeShare, KnowledgeNodeShare.node_id == KnowledgeNode.id)
         .where(
-            ProjectMember.user_id == user_id,
-            Project.deleted_at.is_(None),
+            KnowledgeNodeShare.user_id == user_id,
+            DocsLibrary.library_type == "personal",
+            DocsLibrary.id != personal_library.id,
+            KnowledgeNode.archived_at.is_(None),
         )
     )
-    return list(result.scalars().all())
+    shared_permissions: dict[UUID, str] = {}
+    for library, permission in shared_rows.all():
+        libraries[library.id] = library
+        value = str(permission or "read").lower()
+        if shared_permissions.get(library.id) != "write":
+            shared_permissions[library.id] = "write" if value == "write" else "read"
+
+    scopes: list[dict[str, Any]] = []
+    scopes.append(
+        with_legacy_docs_library_aliases(
+            {
+                "docs_library_id": str(personal_library.id),
+                "source": "personal",
+                "access": "owner",
+                "read_only": False,
+            },
+            personal_library.id,
+        )
+    )
+    # Keep one explicit scope per readable Project.  Multiple projects may
+    # share the same owner's Personal Library; the project_id discriminator
+    # prevents clients from treating the whole Personal Library as shared.
+    for project_id, library, access in sorted(project_scopes, key=lambda item: str(item[0])):
+        scopes.append(
+            with_legacy_docs_library_aliases(
+                {
+                    "docs_library_id": str(library.id),
+                    "project_id": str(project_id),
+                    "source": "project",
+                    "access": access,
+                    "read_only": access == "read",
+                },
+                library.id,
+            )
+        )
+
+    project_library_ids = {library.id for _, library, _ in project_scopes}
+    for library in sorted(libraries.values(), key=lambda item: str(item.id)):
+        if library.id == personal_library.id or library.id in project_library_ids:
+            continue
+        # Personal subtree shares are advertised only as a shared scope.  The
+        # pull endpoint still applies node-level ACL filtering, so metadata
+        # from unrelated private nodes cannot leak through this announcement.
+        scopes.append(
+            with_legacy_docs_library_aliases(
+                {
+                    "docs_library_id": str(library.id),
+                    "source": "shared",
+                    "access": shared_permissions.get(library.id, "read"),
+                    "read_only": shared_permissions.get(library.id, "read") == "read",
+                },
+                library.id,
+            )
+        )
+    return scopes
 
 
 def _split_changes(rows: list[Any]) -> dict[str, Any]:
@@ -175,15 +451,30 @@ def _split_changes(rows: list[Any]) -> dict[str, Any]:
         if deleted_at is None:
             changes.append(payload)
         else:
-            tombstones.append({"id": str(row.id), "deleted_at": _iso(deleted_at)})
+            tombstone = {"id": str(row.id), "deleted_at": _iso(deleted_at)}
+            deletion_batch_id = getattr(row, "deletion_batch_id", None)
+            if deletion_batch_id:
+                tombstone["deletion_batch_id"] = str(deletion_batch_id)
+            tombstones.append(tombstone)
     return {"changes": changes, "tombstones": tombstones, "cursor": None}
 
 
 def _conversation_session_payload(row: ConversationSession) -> dict[str, Any]:
     payload = row.to_dict()
-    payload["updated_at"] = _iso(row.last_activity or row.session_start)
+    payload["is_unread"] = bool(
+        row.app_id is not None
+        and row.development_status == "waiting_for_user"
+        and row.last_activity is not None
+        and (row.last_read_at is None or row.last_activity > row.last_read_at)
+    )
+    timestamps = [
+        value
+        for value in (row.last_activity, row.last_read_at, row.session_start)
+        if value is not None
+    ]
+    payload["updated_at"] = _iso(max(timestamps) if timestamps else None)
     payload["created_at"] = _iso(row.session_start)
-    payload["session_metadata"] = row.context or {}
+    payload["session_metadata"] = public_session_context(row.context) or {}
     return payload
 
 
@@ -304,7 +595,47 @@ async def _pull_tasks(
         stmt = stmt.where(or_(Task.updated_at > since, Task.deleted_at > since))
     stmt = stmt.order_by(Task.updated_at.desc()).limit(SYNC_PULL_LIMITS["tasks"])
     result = await session.execute(stmt)
-    return _split_changes(list(result.scalars().unique().all()))
+    payload = _split_changes(list(result.scalars().unique().all()))
+
+    # A purged task no longer has a row for the ordinary table query.  Keep
+    # the append-only deletion ledger as the durable sync source so a client
+    # that was offline across the physical purge still receives a tombstone
+    # instead of recreating the stale task on its next push.
+    ledger_stmt = select(ContentDeletionEvent).where(
+        ContentDeletionEvent.entity_type == "task",
+        ContentDeletionEvent.project_id.in_(project_ids),
+        ContentDeletionEvent.action.in_(("deleted", "purged", "permanent_deleted")),
+    )
+    if since:
+        ledger_stmt = ledger_stmt.where(ContentDeletionEvent.event_at > since)
+    ledger_stmt = ledger_stmt.order_by(
+        ContentDeletionEvent.event_at.desc()
+    ).limit(SYNC_PULL_LIMITS["tasks"])
+    ledger_result = await session.execute(ledger_stmt)
+    latest_by_id: dict[str, ContentDeletionEvent] = {}
+    for event in ledger_result.scalars().all():
+        entity_id = str(event.entity_id)
+        if entity_id not in latest_by_id:
+            latest_by_id[entity_id] = event
+
+    known_ids = {
+        str(item.get("id"))
+        for item in (*payload.get("changes", []), *payload.get("tombstones", []))
+        if item.get("id") is not None
+    }
+    for entity_id, event in latest_by_id.items():
+        if entity_id in known_ids:
+            continue
+        payload.setdefault("tombstones", []).append(
+            {
+                "id": entity_id,
+                "deleted_at": _iso(event.event_at),
+                "deletion_batch_id": (
+                    str(event.batch_id) if event.batch_id is not None else None
+                ),
+            }
+        )
+    return payload
 
 
 async def _pull_occurrences(
@@ -369,6 +700,7 @@ async def _pull_conversation_sessions(
         stmt = stmt.where(
             or_(
                 ConversationSession.last_activity > since,
+                ConversationSession.last_read_at > since,
                 ConversationSession.deleted_at > since,
             )
         )
@@ -404,7 +736,10 @@ async def _pull_conversation_messages(
 ) -> dict[str, Any]:
     stmt = (
         select(ConversationMessage)
-        .join(ConversationSession)
+        .join(
+            ConversationSession,
+            ConversationMessage.session_id == ConversationSession.id,
+        )
         .where(ConversationSession.user_id.in_(_conversation_user_ids(user_id)))
     )
     if since:
@@ -472,90 +807,6 @@ async def _pull_record_rows(
     return _split_record_changes(list(result.scalars().all()), _record_row_payload)
 
 
-async def _pull_scenarios(
-    session: AsyncSession, since: Optional[datetime]
-) -> dict[str, Any]:
-    stmt = select(Scenario)
-    if since:
-        stmt = stmt.where(Scenario.updated_at > since)
-    stmt = stmt.order_by(Scenario.updated_at.desc()).limit(SYNC_PULL_LIMITS["scenarios"])
-    result = await session.execute(stmt)
-    rows = list(result.scalars().all())
-    active_ids_result = await session.execute(select(Scenario.id))
-    return {
-        "changes": [row.to_dict() for row in rows],
-        "tombstones": [],
-        "cursor": None,
-        "authoritative_ids": [str(item) for item in active_ids_result.scalars().all()],
-    }
-
-
-async def _pull_scenario_characters(
-    session: AsyncSession, since: Optional[datetime]
-) -> dict[str, Any]:
-    # ScenarioCharacter has no updated_at/deleted_at columns, so pull the
-    # current authoritative set every time to catch edits and hard deletes.
-    stmt = (
-        select(ScenarioCharacter)
-        .join(Scenario)
-        .order_by(ScenarioCharacter.sort_order.asc(), ScenarioCharacter.name.asc())
-        .limit(SYNC_PULL_LIMITS["scenario_characters"])
-    )
-    result = await session.execute(stmt)
-    rows = list(result.scalars().all())
-    active_ids_result = await session.execute(
-        select(ScenarioCharacter.id).join(Scenario)
-    )
-    return {
-        "changes": [row.to_dict() for row in rows],
-        "tombstones": [],
-        "cursor": None,
-        "authoritative_ids": [str(item) for item in active_ids_result.scalars().all()],
-    }
-
-
-async def _pull_scenario_scenes(
-    session: AsyncSession, since: Optional[datetime]
-) -> dict[str, Any]:
-    # ScenarioScene has no updated_at/deleted_at columns, so pull the current
-    # authoritative set every time to catch content edits and hard deletes.
-    stmt = (
-        select(ScenarioScene)
-        .join(Scenario)
-        .order_by(ScenarioScene.sort_order.asc(), ScenarioScene.title.asc())
-        .limit(SYNC_PULL_LIMITS["scenario_scenes"])
-    )
-    result = await session.execute(stmt)
-    rows = list(result.scalars().all())
-    active_ids_result = await session.execute(select(ScenarioScene.id).join(Scenario))
-    return {
-        "changes": [row.to_dict() for row in rows],
-        "tombstones": [],
-        "cursor": None,
-        "authoritative_ids": [str(item) for item in active_ids_result.scalars().all()],
-    }
-
-
-async def _pull_scenario_episodes(
-    session: AsyncSession, since: Optional[datetime]
-) -> dict[str, Any]:
-    stmt = select(ScenarioEpisode).join(Scenario)
-    if since:
-        stmt = stmt.where(ScenarioEpisode.updated_at > since)
-    stmt = stmt.order_by(ScenarioEpisode.updated_at.desc()).limit(
-        SYNC_PULL_LIMITS["scenario_episodes"]
-    )
-    result = await session.execute(stmt)
-    rows = list(result.scalars().all())
-    active_ids_result = await session.execute(select(ScenarioEpisode.id).join(Scenario))
-    return {
-        "changes": [row.to_dict() for row in rows],
-        "tombstones": [],
-        "cursor": None,
-        "authoritative_ids": [str(item) for item in active_ids_result.scalars().all()],
-    }
-
-
 async def _pull_table(
     table: str,
     session: AsyncSession,
@@ -563,17 +814,39 @@ async def _pull_table(
     user_id: UUID,
     project_ids: list[UUID],
     since: Optional[datetime],
-    docs_workspace_id: Optional[UUID] = None,
+    docs_docs_library_id: Optional[UUID] = None,
+    docs_digests: Optional[dict[str, str]] = None,
+    docs_cursors: Optional[dict[str, str]] = None,
+    docs_pagination: bool = False,
+    force_docs_full: bool = False,
+    docs_reconcile: bool = True,
+    docs_snapshot_token: Optional[str] = None,
+    docs_scope_revision: Optional[str] = None,
+    docs_project_id: Optional[UUID] = None,
+    docs_accessible_project_ids: Optional[list[UUID]] = None,
 ) -> dict[str, Any]:
     if table in DOCS_SYNC_TABLES:
-        if docs_workspace_id is None:
+        if docs_docs_library_id is None:
             return {"changes": [], "tombstones": [], "cursor": None}
         return await pull_docs_table(
             table,
             session,
-            workspace_id=docs_workspace_id,
-            accessible_project_ids=project_ids,
+            docs_library_id=docs_docs_library_id,
+            accessible_project_ids=(
+                docs_accessible_project_ids
+                if docs_accessible_project_ids is not None
+                else project_ids
+            ),
+            scope_project_id=docs_project_id,
             since=since,
+            client_digest=(docs_digests or {}).get(table),
+            cursor=(docs_cursors or {}).get(table),
+            paginate=docs_pagination,
+            force_full=force_docs_full,
+            include_authoritative_ids=docs_reconcile,
+            user_id=user_id,
+            snapshot_token=docs_snapshot_token,
+            scope_revision=docs_scope_revision,
         )
     if table == "projects":
         return await _pull_projects(session, project_ids, since)
@@ -593,37 +866,49 @@ async def _pull_table(
         return await _pull_record_fields(session, project_ids, since)
     if table == "record_rows":
         return await _pull_record_rows(session, project_ids, since)
-    if table == "scenarios":
-        return await _pull_scenarios(session, since)
-    if table == "scenario_characters":
-        return await _pull_scenario_characters(session, since)
-    if table == "scenario_scenes":
-        return await _pull_scenario_scenes(session, since)
-    if table == "scenario_episodes":
-        return await _pull_scenario_episodes(session, since)
+    if table in LEGACY_STORY_TABLES:
+        return await pull_story_table(
+            table,
+            session,
+            user_id=user_id,
+            since=since,
+            limit=SYNC_PULL_LIMITS[table],
+        )
     return {"changes": [], "tombstones": [], "cursor": None}
 
 
 def _task_updates_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    updates = {
-        "project_id": parse_uuid_or_400(payload.get("project_id"), "project_id")
-        if "project_id" in payload
-        else None,
-        "title": payload.get("title"),
-        "description": payload.get("description"),
-        "status": payload.get("status"),
-        "priority": payload.get("priority"),
-        "start_at": _parse_wall_clock_datetime(payload.get("start_at"), "start_at")
-        if "start_at" in payload
-        else None,
-        "end_at": _parse_wall_clock_datetime(payload.get("end_at"), "end_at")
-        if "end_at" in payload
-        else None,
-        "all_day": payload.get("all_day"),
-        "reminder_offsets": payload.get("reminder_offsets"),
-        "notifications_enabled": payload.get("notifications_enabled"),
-        "task_metadata": _task_metadata_from_payload(payload),
-    }
+    updates: dict[str, Any] = {}
+    if "project_id" in payload:
+        updates["project_id"] = parse_uuid_or_400(
+            payload.get("project_id"), "project_id"
+        )
+    if "title" in payload:
+        updates["title"] = payload.get("title")
+    if "description" in payload:
+        updates["description"] = payload.get("description")
+    if "status" in payload:
+        updates["status"] = payload.get("status")
+    if "priority" in payload:
+        updates["priority"] = payload.get("priority")
+    if "start_at" in payload:
+        updates["start_at"] = _parse_wall_clock_datetime(
+            payload.get("start_at"), "start_at"
+        )
+    if "end_at" in payload:
+        updates["end_at"] = _parse_wall_clock_datetime(
+            payload.get("end_at"), "end_at"
+        )
+    if "all_day" in payload:
+        updates["all_day"] = payload.get("all_day")
+    if "auto_close_on_due" in payload:
+        updates["auto_close_on_due"] = payload.get("auto_close_on_due")
+    if "reminder_offsets" in payload:
+        updates["reminder_offsets"] = payload.get("reminder_offsets")
+    if "notifications_enabled" in payload:
+        updates["notifications_enabled"] = payload.get("notifications_enabled")
+    if "metadata" in payload or "task_metadata" in payload:
+        updates["task_metadata"] = _task_metadata_from_payload(payload)
     if "estimated_hours" in payload:
         updates["estimated_hours"] = payload.get("estimated_hours")
     if "parent_task_id" in payload:
@@ -674,7 +959,7 @@ def _time_entry_values_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _project_values_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    return {
+    values = {
         "name": str(payload.get("name") or "").strip(),
         "description": payload.get("description"),
         "aliases": payload.get("aliases") if isinstance(payload.get("aliases"), list) else None,
@@ -682,6 +967,15 @@ def _project_values_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "storage_quota_mb": payload.get("storage_quota_mb"),
         "project_metadata": payload.get("metadata") or payload.get("project_metadata"),
     }
+    if "space_id" in payload:
+        values["space_id"] = (
+            parse_uuid_or_400(payload.get("space_id"), "space_id")
+            if payload.get("space_id")
+            else None
+        )
+    if "is_completed" in payload:
+        values["is_completed"] = bool(payload.get("is_completed"))
+    return values
 
 
 async def _load_current_task_payload(
@@ -699,7 +993,29 @@ async def _load_current_task_payload(
             "id": str(task.id),
             "updated_at": _iso(task.updated_at),
             "deleted_at": _iso(task.deleted_at),
+            "deletion_batch_id": (
+                str(task.deletion_batch_id)
+                if getattr(task, "deletion_batch_id", None)
+                else None
+            ),
         }
+
+
+def _task_tombstone_payload(task: Task) -> dict[str, Any]:
+    """Return the canonical sync tombstone for an already-deleted task."""
+
+    return {
+        "id": str(task.id),
+        "task_id": str(task.id),
+        "updated_at": _iso(task.updated_at),
+        "deleted_at": _iso(task.deleted_at),
+        "deletion_batch_id": (
+            str(task.deletion_batch_id)
+            if getattr(task, "deletion_batch_id", None)
+            else None
+        ),
+        "idempotent": True,
+    }
 
 
 async def _load_current_time_entry_payload(
@@ -716,6 +1032,11 @@ async def _load_current_time_entry_payload(
             "id": str(entry.id),
             "updated_at": _iso(entry.updated_at),
             "deleted_at": _iso(entry.deleted_at),
+            "deletion_batch_id": (
+                str(entry.deletion_batch_id)
+                if getattr(entry, "deletion_batch_id", None)
+                else None
+            ),
         }
     return await service._serialize_time_entry(session, entry.id)
 
@@ -735,16 +1056,74 @@ async def _apply_task_operation(
     existing = existing_result.scalar_one_or_none()
 
     if operation.action == "delete":
-        if existing is not None:
-            _ensure_not_stale(existing.updated_at, operation.base_updated_at)
-        await service.delete_task(session, user_id=user_id, task_id=task_id)
-        return {"id": str(task_id), "deleted_at": datetime.utcnow().isoformat()}
+        if existing is None:
+            # A client may retry a delete after the retention worker has
+            # already purged the row.  Keep the operation idempotent while
+            # accurately reporting that no server tombstone remains.
+            return {
+                "id": str(task_id),
+                "task_id": str(task_id),
+                "updated_at": None,
+                "deleted_at": None,
+                "deletion_batch_id": None,
+                "idempotent": True,
+                "purged": True,
+            }
+        if existing.deleted_at is not None:
+            # Do not re-run stale checking for a tombstone.  A repeated offline
+            # delete must converge on the server's original batch/timestamp.
+            return _task_tombstone_payload(existing)
+        _ensure_not_stale(existing.updated_at, operation.base_updated_at)
+        return await service.delete_task(
+            session, user_id=user_id, task_id=task_id
+        )
+
+    if operation.action == "restore":
+        raw_batch_id = operation.payload.get("deletion_batch_id")
+        batch_id = (
+            parse_uuid_or_400(raw_batch_id, "deletion_batch_id")
+            if raw_batch_id
+            else None
+        )
+        return await service.restore_task(
+            session,
+            user_id=user_id,
+            task_id=task_id,
+            deletion_batch_id=batch_id,
+        )
 
     if operation.action == "create":
         payload = operation.payload
         title = str(payload.get("title") or "").strip()
         if not title:
             raise TaskManagementError("title is required", status_code=400)
+        if existing is not None and existing.deleted_at is not None:
+            # A normal create is never an implicit restore.  The explicit
+            # restore operation carries the batch guard and ACL checks.
+            raise TaskManagementError(
+                "Task is deleted; use restore before creating it again",
+                status_code=409,
+                detail={"code": "task_tombstoned"},
+            )
+        if existing is None:
+            ledger_result = await session.execute(
+                select(ContentDeletionEvent)
+                .where(
+                    ContentDeletionEvent.entity_type == "task",
+                    ContentDeletionEvent.entity_id == str(task_id),
+                    ContentDeletionEvent.action.in_(
+                        ("deleted", "purged", "permanent_deleted")
+                    ),
+                )
+                .order_by(ContentDeletionEvent.event_at.desc())
+                .limit(1)
+            )
+            if ledger_result.scalar_one_or_none() is not None:
+                raise TaskManagementError(
+                    "Task was permanently removed; stale create is rejected",
+                    status_code=409,
+                    detail={"code": "task_purged_tombstone"},
+                )
         if existing is not None and existing.deleted_at is None:
             _ensure_not_stale(existing.updated_at, operation.base_updated_at)
             return await service.update_task(
@@ -765,6 +1144,7 @@ async def _apply_task_operation(
             start_at=_parse_wall_clock_datetime(payload.get("start_at"), "start_at"),
             end_at=_parse_wall_clock_datetime(payload.get("end_at"), "end_at"),
             all_day=bool(payload.get("all_day") or False),
+            auto_close_on_due=bool(payload.get("auto_close_on_due") or False),
             reminder_offsets=payload.get("reminder_offsets"),
             notifications_enabled=payload.get("notifications_enabled"),
             estimated_hours=payload.get("estimated_hours"),
@@ -816,10 +1196,42 @@ async def _apply_time_entry_operation(
 
     if operation.action == "delete":
         if existing is None:
-            return {"id": str(entry_id), "deleted_at": datetime.utcnow().isoformat()}
+            return {
+                "id": str(entry_id),
+                "updated_at": None,
+                "deleted_at": None,
+                "deletion_batch_id": None,
+                "idempotent": True,
+                "purged": True,
+            }
+        if existing.deleted_at is not None:
+            return {
+                "id": str(existing.id),
+                "updated_at": _iso(existing.updated_at),
+                "deleted_at": _iso(existing.deleted_at),
+                "deletion_batch_id": (
+                    str(existing.deletion_batch_id)
+                    if getattr(existing, "deletion_batch_id", None)
+                    else None
+                ),
+                "idempotent": True,
+            }
         _ensure_not_stale(existing.updated_at, operation.base_updated_at)
         await service.delete_time_entry(session, user_id=user_id, entry_id=entry_id)
-        return {"id": str(entry_id), "deleted_at": datetime.utcnow().isoformat()}
+        # The deleted row is intentionally hidden by the live serializer, so
+        # return the exact in-memory tombstone rather than reloading it with a
+        # ``deleted_at IS NULL`` predicate.
+        return {
+            "id": str(existing.id),
+            "updated_at": _iso(existing.updated_at),
+            "deleted_at": _iso(existing.deleted_at),
+            "deletion_batch_id": (
+                str(existing.deletion_batch_id)
+                if getattr(existing, "deletion_batch_id", None)
+                else None
+            ),
+            "idempotent": False,
+        }
 
     if operation.action == "create":
         task_id = values["task_id"]
@@ -888,7 +1300,9 @@ async def _apply_project_operation(
     session: AsyncSession,
     *,
     user_id: UUID,
+    user_info: Optional[dict[str, Any]] = None,
     operation: SyncOperation,
+    workspace_root: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     project_id = parse_uuid_or_400(operation.entity_id, "entity_id")
     if project_id is None:
@@ -907,7 +1321,8 @@ async def _apply_project_operation(
         await ProjectRepository.delete_project(
             session,
             project_id,
-            delete_workspace=True,
+            delete_library=True,
+            workspace_root=workspace_root,
         )
         return {"id": str(project_id), "deleted_at": datetime.utcnow().isoformat()}
 
@@ -920,12 +1335,43 @@ async def _apply_project_operation(
                 session, project_id=project_id, user_id=user_id, permission="write"
             )
             _ensure_not_stale(existing.updated_at, operation.base_updated_at)
+            if "space_id" in values and values["space_id"] is not None:
+                from ..services.space_access import can_write_space
+
+                can_write, space = await can_write_space(
+                    session,
+                    space_id=values["space_id"],
+                    user_id=user_id,
+                    user_info=user_info or {"id": str(user_id)},
+                )
+                if space is None:
+                    raise TaskManagementError("Space not found", status_code=404)
+                if not can_write:
+                    raise TaskManagementError("Space access denied", status_code=403)
             updated = await ProjectRepository.update_project(
                 session,
                 project_id,
-                **{key: value for key, value in values.items() if value is not None},
+                **{
+                    key: value
+                    for key, value in values.items()
+                    if value is not None or key == "space_id"
+                },
             )
             return updated.to_dict() if updated else {"id": str(project_id)}
+        space_id = values.get("space_id")
+        if space_id is not None:
+            from ..services.space_access import can_write_space
+
+            can_write, space = await can_write_space(
+                session,
+                space_id=space_id,
+                user_id=user_id,
+                user_info=user_info or {"id": str(user_id)},
+            )
+            if space is None:
+                raise TaskManagementError("Space not found", status_code=404)
+            if not can_write:
+                raise TaskManagementError("Space access denied", status_code=403)
         created = await ProjectRepository.create_project(
             session,
             owner_id=user_id,
@@ -933,6 +1379,8 @@ async def _apply_project_operation(
             name=name,
             description=values["description"],
             aliases=values["aliases"],
+            space_id=space_id,
+            is_completed=bool(values.get("is_completed") or False),
             allow_join_requests=bool(
                 values["allow_join_requests"]
                 if values["allow_join_requests"] is not None
@@ -941,6 +1389,21 @@ async def _apply_project_operation(
             storage_quota_mb=int(values["storage_quota_mb"] or 1000),
             project_metadata=values["project_metadata"] or {},
         )
+        # Sync create is another Project creation path. Seed the canonical
+        # information node after the repository's internal commit; failures
+        # remain retryable by the Project tab's idempotent ensure endpoint.
+        from ..services.project_information_docs import (
+            ensure_project_information_doc,
+            is_default_inbox_project,
+        )
+        if not is_default_inbox_project(created):
+            await ensure_project_information_doc(
+                session,
+                project=created,
+                user_id=user_id,
+            )
+            await session.commit()
+            await session.refresh(created)
         return created.to_dict()
 
     if operation.action == "update":
@@ -951,6 +1414,23 @@ async def _apply_project_operation(
         )
         _ensure_not_stale(existing.updated_at, operation.base_updated_at)
         update_values = {key: value for key, value in values.items() if value is not None}
+        if "space_id" in values:
+            # Explicit null moves a project back to the unclassified bucket;
+            # a non-null target still has to pass the canonical Space policy.
+            update_values["space_id"] = values["space_id"]
+            if values["space_id"] is not None:
+                from ..services.space_access import can_write_space
+
+                can_write, space = await can_write_space(
+                    session,
+                    space_id=values["space_id"],
+                    user_id=user_id,
+                    user_info=user_info or {"id": str(user_id)},
+                )
+                if space is None:
+                    raise TaskManagementError("Space not found", status_code=404)
+                if not can_write:
+                    raise TaskManagementError("Space access denied", status_code=403)
         if "name" in update_values and not update_values["name"]:
             update_values.pop("name")
         updated = await ProjectRepository.update_project(session, project_id, **update_values)
@@ -964,15 +1444,99 @@ async def _apply_docs_push_operation(
     *,
     user_id: UUID,
     operation: SyncOperation,
+    workspace_root: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     """Docs push をRESTと同一の処理へ委譲し、サーバー版を検証する。"""
-    service = DocsGraphService(session)
-    workspace = await service.ensure_workspace(user_id)
+    if operation.table == "knowledge_nodes" and "body_json" in operation.payload and operation.payload.get("body_json") is not None:
+        try:
+            operation.payload["body_json"] = normalize_docs_body_json(operation.payload["body_json"])
+        except ValueError as exc:
+            raise DocsOperationError(str(exc), status_code=400) from exc
+    # app_readme の書き戻しはロックと実ファイル操作で同じ root を使う必要がある。
+    # DocsGraphService に実効 root を持たせて docs_sync 側へ透過する。
+    service = DocsGraphService(session, workspace_root=workspace_root)
+    project_ref = operation.payload.get("project_id")
+    # New clients send docs_library_id/docsLibraryId; old mobile sends
+    # workspace_id/workspaceId.  Read all four explicitly at the wire boundary.
+    workspace_ref = read_docs_library_id(operation.payload)
+    library = None
+    target_ref = (
+        operation.payload.get("node_id")
+        or operation.payload.get("parent_id")
+        or str(operation.entity_id).split(":", 1)[0]
+    )
+    try:
+        target_id = UUID(str(target_ref)) if target_ref else None
+    except (TypeError, ValueError):
+        target_id = None
+    target = await session.get(KnowledgeNode, target_id) if target_id is not None else None
+    if target is not None:
+        # Existing node library is authoritative.  A stale project_id in an
+        # update must not redirect the operation into a canonical library.
+        library = await session.get(DocsLibrary, target.docs_library_id)
+        target_readable = False
+        if library is not None:
+            target_readable = await library_can_read(session, library, user_id)
+            if not target_readable:
+                # Personal workspaces are shared at subtree roots, not at the
+                # library row.  Check the target node ACL before returning a
+                # generic not-found response for a legitimate shared edit.
+                target_readable = await can_read_node(
+                    session,
+                    target,
+                    user_id,
+                    library=library,
+                    include_archived=True,
+                )
+        if library is not None and not target_readable:
+            raise DocsOperationError("Docs node not found", status_code=404)
+    elif workspace_ref not in (None, ""):
+        try:
+            docs_library_id = UUID(str(workspace_ref))
+        except (TypeError, ValueError) as exc:
+            raise DocsOperationError("Invalid docs_library_id", status_code=400) from exc
+        library = await session.get(DocsLibrary, docs_library_id)
+        scope_readable = library is not None and await library_can_read(
+            session, library, user_id
+        )
+        if not scope_readable and project_ref not in (None, ""):
+            # A Project member's sync scope points at the owner's Personal
+            # Library.  Library ownership is intentionally owner-only, so
+            # validate the Project ACL/pointer as the authority instead of
+            # rejecting a legitimate project create/update.
+            try:
+                scoped_project_id = UUID(str(project_ref))
+                project_library = await service.get_project_information_library(
+                    scoped_project_id,
+                    user_id,
+                )
+            except (PermissionError, ValueError, TypeError):
+                project_library = None
+            scope_readable = bool(
+                project_library is not None
+                and library is not None
+                and project_library.id == library.id
+            )
+        if library is None or not scope_readable:
+            raise DocsOperationError("Docs library not found", status_code=404)
+    elif project_ref not in (None, ""):
+        try:
+            project_id = UUID(str(project_ref))
+        except (TypeError, ValueError) as exc:
+            raise DocsOperationError("Invalid project_id", status_code=400) from exc
+        try:
+            library = await service.ensure_project_information_library(project_id, user_id)
+        except PermissionError as exc:
+            raise DocsOperationError(str(exc), status_code=403) from exc
+        except ValueError as exc:
+            raise DocsOperationError(str(exc), status_code=404) from exc
+    if library is None:
+        library = await service.ensure_library(user_id)
     return await apply_docs_operation(
         session,
         service,
         user_id=user_id,
-        workspace_id=workspace.id,
+        docs_library_id=library.id,
         table=operation.table,
         action=operation.action,
         entity_id=operation.entity_id,
@@ -986,7 +1550,14 @@ def create_sync_router(
     get_db_manager,
     get_user_from_request,
     require_auth_dependency,
+    workspace_root: str | os.PathLike[str] | None = None,
 ) -> APIRouter:
+    """Mobile sync router。
+
+    ``workspace_root`` は Project 削除のロック取得先と library 削除先、および
+    Docs 経由の App README 書き戻し先を一致させるために透過する。``None`` なら
+    ``AOITALK_WORKSPACES_DIR`` 由来の既定 root を使う。
+    """
     router = APIRouter(prefix="/api/sync", tags=["sync"])
     service = TaskManagementService()
 
@@ -1001,9 +1572,38 @@ def create_sync_router(
         request: Request,
         since: Optional[str] = None,
         tables: Optional[str] = None,
+        project_id: Optional[str] = None,
+        docs_scope_id: Optional[str] = None,
+        docs_pagination: bool = False,
+        docs_scope_digest: Optional[str] = None,
+        docs_snapshot_token: Optional[str] = None,
+        docs_scope_revision: Optional[str] = None,
+        docs_reconcile: bool = True,
         _auth=Depends(require_auth_dependency),
     ):
         user_id, _ = await _get_current_user(request)
+        docs_digests = await _read_pull_docs_digests(request)
+        docs_cursors = await _read_pull_docs_cursors(request)
+        body_snapshot_token = await _read_pull_docs_snapshot_token(request)
+        body_scope_revision = await _read_pull_docs_scope_revision(request)
+        body_project_id = await _read_pull_project_id(request)
+        body_docs_scope_id = await _read_pull_docs_scope_id(request)
+        # Query parameters win, matching the existing digest/cursor readers;
+        # GET bodies remain a test/tooling fallback for composite Docs scopes.
+        project_id = project_id or body_project_id
+        docs_scope_id = docs_scope_id or body_docs_scope_id
+        # Query parameters win, matching the existing digest/cursor readers;
+        # GET bodies remain a test/tooling fallback.
+        docs_snapshot_token = _validate_docs_opaque_token(
+            docs_snapshot_token or body_snapshot_token,
+            "docs_snapshot_token",
+        )
+        requested_snapshot_token = docs_snapshot_token
+        cursor_snapshot_token: Optional[str] = None
+        docs_scope_revision = _validate_docs_opaque_token(
+            docs_scope_revision or body_scope_revision,
+            "docs_scope_revision",
+        )
         requested = [
             table.strip()
             for table in (tables.split(",") if tables else sorted(SYNC_TABLES))
@@ -1020,28 +1620,361 @@ def create_sync_router(
             await ProjectRepository.ensure_user_inbox_setup(session, user_id)
             await session.commit()
             project_ids = await _accessible_project_ids(session, user_id)
-            # Docs テーブルが要求された場合のみ workspace を解決する。
-            docs_workspace_id: Optional[UUID] = None
+            # Docs テーブルが要求された場合のみ library を解決する。
+            docs_docs_library_id: Optional[UUID] = None
+            docs_project_id: Optional[UUID] = None
+            docs_scopes: list[dict[str, Any]] = []
+            docs_revision_scopes: list[dict[str, Any]] = []
+            docs_acl_entries: list[tuple[Any, Any]] = []
             if any(table in DOCS_SYNC_TABLES for table in requested):
-                workspace = await DocsGraphService(session).ensure_workspace(user_id)
-                await session.commit()
-                docs_workspace_id = workspace.id
-            pulled = {}
-            for table in requested:
-                pulled[table] = await _pull_table(
-                    table,
+                docs_service = DocsGraphService(session)
+                if docs_scope_id:
+                    try:
+                        library = await session.get(
+                            DocsLibrary, UUID(str(docs_scope_id))
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise HTTPException(status_code=400, detail="Invalid Docs scope") from exc
+                    if library is None:
+                        raise HTTPException(status_code=404, detail="Docs scope not found")
+                    if project_id:
+                        # A composite scope identifies one Project inside the
+                        # supplied library. Resolve through the SELECT-only
+                        # canonical pointer validator so a stale/malformed
+                        # Project.knowledge_node_id cannot expose a sibling
+                        # Project sharing the same Personal library.
+                        try:
+                            docs_project_id = UUID(str(project_id))
+                        except (TypeError, ValueError) as exc:
+                            raise HTTPException(status_code=400, detail="Invalid project_id") from exc
+                        project_row = await session.get(Project, docs_project_id)
+                        if project_row is None or project_row.deleted_at is not None:
+                            raise HTTPException(status_code=404, detail="Project not found")
+                        try:
+                            project_library = await docs_service.get_project_information_library(
+                                docs_project_id,
+                                user_id,
+                            )
+                        except PermissionError as exc:
+                            if docs_snapshot_token or docs_cursors or docs_scope_revision:
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail="Docs sync scope revoked; restart pull",
+                                ) from exc
+                            raise HTTPException(status_code=403, detail=str(exc)) from exc
+                        except (TypeError, ValueError) as exc:
+                            raise HTTPException(status_code=404, detail="Project not found") from exc
+                        if project_library is None:
+                            if docs_snapshot_token or docs_cursors or docs_scope_revision:
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail="Docs sync scope revoked; restart pull",
+                                )
+                            raise HTTPException(
+                                status_code=400,
+                                detail="Project Docs pointer is invalid",
+                            )
+                        if project_library.id != library.id:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="Project Docs pointer does not match docs_scope_id",
+                            )
+                    else:
+                        scope_readable = await library_can_read(
+                            session, library, user_id
+                        )
+                        if not scope_readable:
+                            # Personal libraries are shared by subtree ACL;
+                            # there is intentionally no library-level share.
+                            scope_readable = (
+                                await session.scalar(
+                                    select(KnowledgeNode.id)
+                                    .where(
+                                        docs_readable_node_predicate(
+                                            KnowledgeNode,
+                                            docs_library_id=library.id,
+                                            user_id=user_id,
+                                            library_owner_id=getattr(library, "owner_user_id", None),
+                                        )
+                                    )
+                                    .limit(1)
+                                )
+                            ) is not None
+                        if not scope_readable:
+                            # A scoped continuation which lost access is a
+                            # resumable authorization change, not a generic 403:
+                            # the mobile promotion must quarantine the revoked
+                            # scope and restart from its authoritative scope set.
+                            if docs_snapshot_token or docs_cursors or docs_scope_revision:
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail="Docs sync scope revoked; restart pull",
+                                )
+                            raise HTTPException(status_code=403, detail="Docs scope access denied")
+                elif project_id:
+                    try:
+                        docs_project_id = UUID(str(project_id))
+                    except (TypeError, ValueError) as exc:
+                        raise HTTPException(status_code=400, detail="Invalid project_id") from exc
+                    project_row = await session.get(Project, docs_project_id)
+                    if project_row is None or project_row.deleted_at is not None:
+                        raise HTTPException(status_code=404, detail="Project not found")
+                    try:
+                        library = await docs_service.get_project_information_library(
+                            docs_project_id, user_id
+                        )
+                    except PermissionError as exc:
+                        if docs_snapshot_token or docs_cursors or docs_scope_revision:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="Docs sync scope revoked; restart pull",
+                            ) from exc
+                        raise HTTPException(status_code=403, detail=str(exc)) from exc
+                    except (TypeError, ValueError) as exc:
+                        raise HTTPException(status_code=404, detail="Project not found") from exc
+                    if library is None:
+                        if docs_snapshot_token or docs_cursors or docs_scope_revision:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="Docs sync scope revoked; restart pull",
+                            )
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Project Docs pointer is invalid",
+                        )
+                else:
+                    library = await docs_service.ensure_library(user_id)
+                docs_docs_library_id = library.id
+                personal_library = (
+                    library
+                    if library.owner_user_id == user_id
+                    else await docs_service.ensure_library(user_id)
+                )
+                docs_scopes = await _docs_sync_scopes(
                     session,
                     user_id=user_id,
                     project_ids=project_ids,
-                    since=since_dt,
-                    docs_workspace_id=docs_workspace_id,
+                    personal_library=personal_library,
                 )
-                pulled[table]["cursor"] = server_time.isoformat()
-            return {
+                # The authoritative response advertises the complete active
+                # set, but each cursor/revision must hash only the selected
+                # composite scope.  Otherwise Project A ACL changes would
+                # invalidate an independent Project B run in the same library.
+                library_scope_id = str(docs_docs_library_id)
+                if docs_project_id is not None:
+                    docs_revision_scopes = [
+                        scope
+                        for scope in docs_scopes
+                        if str(
+                            scope.get("docs_library_id") or scope.get("workspace_id")
+                        )
+                        == library_scope_id
+                        and str(scope.get("project_id")) == str(docs_project_id)
+                    ]
+                else:
+                    # The root data slice is personal-only, but its
+                    # authoritative scope revision still binds the complete
+                    # active discovery set. A Project revoke must invalidate
+                    # an in-flight root run so promotion can quarantine it.
+                    docs_revision_scopes = docs_scopes
+                if docs_pagination:
+                    # Include the actor's canonical node-share rows in the
+                    # scope revision. Aggregate docs_scopes alone cannot
+                    # distinguish a child-level downgrade/revocation inside
+                    # an otherwise still-active shared library. Restrict the
+                    # projection to this composite scope so Project A ACL
+                    # changes do not invalidate an independent Project B run.
+                    try:
+                        acl_stmt = (
+                            select(
+                                KnowledgeNodeShare.node_id,
+                                KnowledgeNodeShare.permission,
+                            )
+                            .join(
+                                KnowledgeNode,
+                                KnowledgeNode.id == KnowledgeNodeShare.node_id,
+                            )
+                            .where(
+                                KnowledgeNodeShare.user_id == user_id,
+                                KnowledgeNode.docs_library_id == docs_docs_library_id,
+                            )
+                        )
+                        if docs_project_id is not None:
+                            acl_stmt = acl_stmt.where(
+                                KnowledgeNode.project_id == docs_project_id
+                            )
+                        acl_rows = await session.execute(acl_stmt)
+                        docs_acl_entries = list(acl_rows.all())
+                    except Exception:  # noqa: BLE001
+                        # A rolling deployment may not have the optional
+                        # share table yet. The SQL-native pull ACL remains
+                        # fail-closed; omit only the additive revision input.
+                        docs_acl_entries = []
+                # Materialize all library metadata before commit; the async
+                # session may expire ORM attributes on commit.
+                await session.commit()
+            docs_scope_project_ids = (
+                [docs_project_id] if docs_project_id is not None else []
+            )
+            current_docs_scope_digest = (
+                calculate_docs_scope_digest(
+                    docs_docs_library_id,
+                    docs_scope_project_ids,
+                    scope_project_id=docs_project_id,
+                )
+                if docs_pagination and docs_docs_library_id is not None
+                else None
+            )
+            current_docs_scope_revision = (
+                calculate_docs_scope_revision(
+                    docs_docs_library_id,
+                    docs_scope_project_ids,
+                    docs_revision_scopes,
+                    docs_acl_entries,
+                    scope_project_id=docs_project_id,
+                )
+                if docs_pagination and docs_docs_library_id is not None
+                else None
+            )
+            if docs_pagination and docs_docs_library_id is not None:
+                # One opaque token identifies the root pull snapshot.  It is
+                # echoed by every table page and is carried inside cursors;
+                # no server-side mutable run state is required.
+                has_docs_cursor = any(bool(value) for value in docs_cursors.values())
+                cursor_tokens: set[str] = set()
+                cursor_revisions: set[str] = set()
+                if has_docs_cursor:
+                    # Every resumable cursor issued by the additive protocol
+                    # must carry its opaque token and ACL revision.  A
+                    # malformed envelope or a pre-metadata cursor cannot be
+                    # safely associated with this root snapshot, so fail
+                    # closed instead of silently starting a new run.
+                    for value in docs_cursors.values():
+                        if not value:
+                            continue
+                        envelope = pull_cursor_envelope(value)
+                        token = envelope.get("snapshot_token") if envelope else None
+                        revision = envelope.get("scope_revision") if envelope else None
+                        token = _validate_docs_opaque_token(token, "docs_snapshot_token")
+                        revision = _validate_docs_opaque_token(
+                            revision, "docs_scope_revision"
+                        )
+                        if token is None or revision is None:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="Invalid Docs sync cursor; restart pull",
+                            )
+                        cursor_tokens.add(token)
+                        cursor_revisions.add(revision)
+                if len(cursor_tokens) > 1:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Docs sync snapshot changed; restart pull",
+                    )
+                if len(cursor_revisions) > 1:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Docs sync scope changed; restart pull",
+                    )
+                cursor_token = next(iter(cursor_tokens), None)
+                if (
+                    requested_snapshot_token
+                    and cursor_token
+                    and requested_snapshot_token != cursor_token
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Docs sync snapshot changed; restart pull",
+                    )
+                # Preserve the token from a cursor when a legacy client does
+                # not echo the new query field.  Cursors issued before the
+                # additive token contract are rejected above rather than
+                # silently restarting under a different snapshot.
+                docs_snapshot_token = (
+                    requested_snapshot_token
+                    or cursor_token
+                    or secrets.token_urlsafe(24)
+                )
+                cursor_snapshot_token = requested_snapshot_token or cursor_token
+                if not has_docs_cursor:
+                    cursor_snapshot_token = docs_snapshot_token
+                if (
+                    docs_scope_revision
+                    and current_docs_scope_revision is not None
+                    and docs_scope_revision != current_docs_scope_revision
+                    and (has_docs_cursor or docs_snapshot_token)
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Docs sync scope changed; restart pull",
+                    )
+                if (
+                    docs_scope_digest
+                    and current_docs_scope_digest is not None
+                    and docs_scope_digest != current_docs_scope_digest
+                    and has_docs_cursor
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Docs sync scope changed; restart pull",
+                    )
+            else:
+                current_docs_scope_revision = None
+            # A v2 client may have a legacy last-pulled timestamp but no
+            # additive ACL revision (and sometimes no per-table digest at all).
+            # Since cannot safely describe ACL-visible historical rows, so the
+            # first revision-less paginated pull must rebuild the visible set.
+            # Once the server returns a revision, new clients echo it on
+            # continuation and retain the normal since optimization.
+            legacy_docs_without_revision = bool(
+                docs_pagination and not docs_scope_revision
+            )
+            force_docs_full = bool(
+                docs_pagination
+                and current_docs_scope_digest is not None
+                and docs_scope_digest is not None
+                and docs_scope_digest != current_docs_scope_digest
+            ) or legacy_docs_without_revision
+            pulled = {}
+            for table in requested:
+                try:
+                    pulled[table] = await _pull_table(
+                        table,
+                        session,
+                        user_id=user_id,
+                        project_ids=project_ids,
+                        since=since_dt,
+                        docs_docs_library_id=docs_docs_library_id,
+                        docs_digests=docs_digests,
+                        docs_cursors=docs_cursors,
+                        docs_pagination=docs_pagination,
+                        force_docs_full=force_docs_full,
+                        docs_reconcile=docs_reconcile,
+                        docs_snapshot_token=cursor_snapshot_token,
+                        docs_scope_revision=current_docs_scope_revision,
+                        docs_project_id=docs_project_id,
+                        docs_accessible_project_ids=docs_scope_project_ids,
+                    )
+                except (ValueError, TypeError) as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                if table not in DOCS_SYNC_TABLES:
+                    pulled[table]["cursor"] = server_time.isoformat()
+            response = {
                 "tables": pulled,
                 "server_time": server_time.isoformat(),
-                "has_more": False,
+                "has_more": docs_pagination and any(
+                    table in DOCS_SYNC_TABLES and payload.get("cursor")
+                    for table, payload in pulled.items()
+                ),
             }
+            if docs_pagination:
+                response["docs_pagination_version"] = 2
+                response["docs_scope_digest"] = current_docs_scope_digest
+                response["docs_snapshot_token"] = docs_snapshot_token
+                response["docs_scope_revision"] = current_docs_scope_revision
+            if docs_scopes:
+                response["docs_scopes"] = docs_scopes
+            return response
         finally:
             await session.close()
 
@@ -1051,7 +1984,7 @@ def create_sync_router(
         request: Request,
         _auth=Depends(require_auth_dependency),
     ):
-        user_id, _ = await _get_current_user(request)
+        user_id, user_info = await _get_current_user(request)
         session = await get_db_manager().get_session()
         results = []
         try:
@@ -1059,7 +1992,12 @@ def create_sync_router(
                 try:
                     if operation.table == "projects":
                         entity = await _apply_project_operation(
-                            service, session, user_id=user_id, operation=operation
+                            service,
+                            session,
+                            user_id=user_id,
+                            user_info=user_info,
+                            operation=operation,
+                            workspace_root=workspace_root,
                         )
                     elif operation.table == "tasks":
                         entity = await _apply_task_operation(
@@ -1071,7 +2009,10 @@ def create_sync_router(
                         )
                     elif operation.table in DOCS_PUSH_TABLES:
                         entity = await _apply_docs_push_operation(
-                            session, user_id=user_id, operation=operation
+                            session,
+                            user_id=user_id,
+                            operation=operation,
+                            workspace_root=workspace_root,
                         )
                     else:
                         raise TaskManagementError(
@@ -1101,12 +2042,33 @@ def create_sync_router(
                         entity_id = None
                     if status == "conflict" and operation.table in DOCS_PUSH_TABLES:
                         docs_service = DocsGraphService(session)
-                        docs_workspace = await docs_service.ensure_workspace(user_id)
+                        conflict_project = operation.payload.get("project_id")
+                        if conflict_project:
+                            try:
+                                docs_workspace = await docs_service.ensure_project_information_library(
+                                    UUID(str(conflict_project)), user_id
+                                )
+                            except Exception:
+                                docs_workspace = await docs_service.ensure_library(user_id)
+                        else:
+                            conflict_ref = operation.payload.get("node_id") or str(
+                                operation.entity_id
+                            ).split(":", 1)[0]
+                            try:
+                                conflict_node = await session.get(KnowledgeNode, UUID(str(conflict_ref)))
+                            except (TypeError, ValueError):
+                                conflict_node = None
+                            docs_workspace = (
+                                await session.get(DocsLibrary, conflict_node.docs_library_id)
+                                if conflict_node is not None
+                                else await docs_service.ensure_library(user_id)
+                            )
                         conflict_entity = await load_current_docs_entity(
                             session,
-                            workspace_id=docs_workspace.id,
+                            docs_library_id=docs_workspace.id,
                             table=operation.table,
                             entity_id=operation.entity_id,
+                            user_id=user_id,
                         )
                     elif status == "conflict" and entity_id is not None:
                         if operation.table == "tasks":

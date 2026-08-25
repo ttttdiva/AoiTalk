@@ -1,5 +1,7 @@
 "use client";
 
+import { AppSelect } from "@/components/ui/app-select";
+
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Check,
@@ -37,6 +39,8 @@ const TAG_COLORS = [
 interface SpaceInfo {
   id: string;
   name: string;
+  source?: string;
+  can_write?: boolean;
 }
 
 interface TagInfo {
@@ -51,6 +55,8 @@ interface TagInfo {
 interface SpaceTagManagementPanelProps {
   space: SpaceInfo;
   spaces: SpaceInfo[];
+  /** Remote/read-only Spaces keep the tag list visible but cannot mutate it. */
+  readOnly?: boolean;
 }
 
 async function apiFetch<T = unknown>(
@@ -72,7 +78,10 @@ async function apiFetch<T = unknown>(
 export function SpaceTagManagementPanel({
   space,
   spaces,
+  readOnly: readOnlyProp = false,
 }: SpaceTagManagementPanelProps) {
+  const readOnly =
+    readOnlyProp || space.source === "remote" || space.can_write === false;
   const confirm = useConfirm();
   const [tags, setTags] = useState<TagInfo[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -89,13 +98,28 @@ export function SpaceTagManagementPanel({
   const [copySpaceId, setCopySpaceId] = useState("");
 
   const otherSpaces = useMemo(
-    () => spaces.filter((item) => item.id !== space.id),
+    () =>
+      spaces.filter(
+        (item) =>
+          item.id !== space.id &&
+          item.source !== "remote" &&
+          item.can_write !== false,
+      ),
     [space.id, spaces],
   );
 
   const fetchTags = useCallback(async () => {
     setLoading(true);
     setError("");
+    // Remote resource IDs are not local Space IDs.  There is no remote tag
+    // endpoint in the current contract, so do not accidentally query the
+    // local `/api/spaces/{id}/tags` route for a remote Space.
+    if (space.source === "remote") {
+      setTags([]);
+      setSelectedIds(new Set());
+      setLoading(false);
+      return;
+    }
     try {
       const rows = await apiFetch<TagInfo[]>(`/api/spaces/${space.id}/tags`);
       setTags(rows);
@@ -109,7 +133,7 @@ export function SpaceTagManagementPanel({
     } finally {
       setLoading(false);
     }
-  }, [space.id]);
+  }, [space.id, space.source]);
 
   useEffect(() => {
     setSelectedIds(new Set());
@@ -119,28 +143,40 @@ export function SpaceTagManagementPanel({
     void fetchTags();
   }, [fetchTags]);
 
-  const toggleSelected = useCallback((tagId: string) => {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(tagId)) {
-        next.delete(tagId);
-      } else {
-        next.add(tagId);
-      }
-      return next;
-    });
-  }, []);
+  useEffect(() => {
+    if (!readOnly) return;
+    setSelectedIds(new Set());
+    setEditingTagId(null);
+    setCopySpaceId("");
+  }, [readOnly]);
+
+  const toggleSelected = useCallback(
+    (tagId: string) => {
+      if (readOnly) return;
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        if (next.has(tagId)) {
+          next.delete(tagId);
+        } else {
+          next.add(tagId);
+        }
+        return next;
+      });
+    },
+    [readOnly],
+  );
 
   const toggleAll = useCallback(() => {
+    if (readOnly) return;
     setSelectedIds((prev) =>
       prev.size === tags.length
         ? new Set()
         : new Set(tags.map((tag) => tag.id)),
     );
-  }, [tags]);
+  }, [readOnly, tags]);
 
   const handleCreate = useCallback(async () => {
-    if (!newName.trim()) return;
+    if (readOnly || !newName.trim()) return;
     setSaving(true);
     setError("");
     setMessage("");
@@ -156,13 +192,17 @@ export function SpaceTagManagementPanel({
     } finally {
       setSaving(false);
     }
-  }, [fetchTags, newColor, newName, space.id]);
+  }, [fetchTags, newColor, newName, readOnly, space.id]);
 
-  const startEditing = useCallback((tag: TagInfo) => {
-    setEditingTagId(tag.id);
-    setEditName(tag.name);
-    setEditColor(tag.color || TAG_COLORS[5]);
-  }, []);
+  const startEditing = useCallback(
+    (tag: TagInfo) => {
+      if (readOnly) return;
+      setEditingTagId(tag.id);
+      setEditName(tag.name);
+      setEditColor(tag.color || TAG_COLORS[5]);
+    },
+    [readOnly],
+  );
 
   const cancelEditing = useCallback(() => {
     setEditingTagId(null);
@@ -171,7 +211,7 @@ export function SpaceTagManagementPanel({
   }, []);
 
   const handleSaveEdit = useCallback(async () => {
-    if (!editingTagId || !editName.trim()) return;
+    if (readOnly || !editingTagId || !editName.trim()) return;
     setSaving(true);
     setError("");
     setMessage("");
@@ -187,10 +227,11 @@ export function SpaceTagManagementPanel({
     } finally {
       setSaving(false);
     }
-  }, [cancelEditing, editColor, editName, editingTagId, fetchTags]);
+  }, [cancelEditing, editColor, editName, editingTagId, fetchTags, readOnly]);
 
   const handleDelete = useCallback(
     async (tag: TagInfo) => {
+      if (readOnly) return;
       if (
         !(await confirm({
           description: `"${tag.name}" を削除します。関連タスクからも外れます。`,
@@ -213,11 +254,11 @@ export function SpaceTagManagementPanel({
         setSaving(false);
       }
     },
-    [fetchTags, confirm],
+    [fetchTags, confirm, readOnly],
   );
 
   const handleCopySelected = useCallback(async () => {
-    if (!copySpaceId || selectedIds.size === 0) return;
+    if (readOnly || !copySpaceId || selectedIds.size === 0) return;
     const selectedTags = tags.filter((tag) => selectedIds.has(tag.id));
     const targetSpace = spaces.find((item) => item.id === copySpaceId);
     setCopying(true);
@@ -244,17 +285,25 @@ export function SpaceTagManagementPanel({
     } finally {
       setCopying(false);
     }
-  }, [copySpaceId, selectedIds, spaces, tags]);
+  }, [copySpaceId, readOnly, selectedIds, spaces, tags]);
 
   return (
-    <Card className="flex-1">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-sm">
-          <Tags className="size-4" />
-          タグ管理: {space.name}
+    <Card className="flex-1 border-border bg-card shadow-none">
+      <CardHeader className="border-b border-border">
+        <CardTitle className="flex items-center justify-between gap-2 text-base font-semibold">
+          <span className="flex min-w-0 items-center gap-2">
+            <Tags className="size-4" />
+            <span className="truncate">Space tags: {space.name}</span>
+          </span>
+          {readOnly ? (
+            <Badge variant="outline" className="shrink-0 text-xs font-normal">
+              Read-only
+            </Badge>
+          ) : null}
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
+        {!readOnly ? (
         <div className="grid gap-3 md:grid-cols-[1fr_auto]">
           <div className="space-y-2">
             <Label className="text-xs">新しいタグ</Label>
@@ -289,8 +338,15 @@ export function SpaceTagManagementPanel({
             <ColorPicker value={newColor} onChange={setNewColor} />
           </div>
         </div>
+        ) : (
+          <p className="rounded-md border border-dashed border-border p-3 text-sm text-muted-foreground">
+            {space.source === "remote"
+              ? "Remote Spaces are read-only in this workspace. Tag mutations are unavailable."
+              : "This Space is read-only. Tag mutations are unavailable."}
+          </p>
+        )}
 
-        <Separator />
+        {!readOnly ? <Separator /> : null}
 
         <div className="flex flex-wrap items-center gap-2">
           <Button
@@ -304,41 +360,45 @@ export function SpaceTagManagementPanel({
             />
             再読込
           </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={toggleAll}
-            disabled={tags.length === 0}
-          >
-            {selectedIds.size === tags.length && tags.length > 0
-              ? "選択解除"
-              : "全選択"}
-          </Button>
-          <select
-            value={copySpaceId}
-            onChange={(event) => setCopySpaceId(event.target.value)}
-            className="h-8 min-w-48 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-1 focus-visible:ring-ring/50 dark:bg-input/30"
-            disabled={otherSpaces.length === 0}
-          >
-            <option value="">コピー先スペース</option>
-            {otherSpaces.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.name}
-              </option>
-            ))}
-          </select>
-          <Button
-            size="sm"
-            disabled={!copySpaceId || selectedIds.size === 0 || copying}
-            onClick={() => void handleCopySelected()}
-          >
-            {copying ? (
-              <Loader2 className="mr-1 size-3.5 animate-spin" />
-            ) : (
-              <Copy className="mr-1 size-3.5" />
-            )}
-            {selectedIds.size > 0 ? `${selectedIds.size}件をコピー` : "コピー"}
-          </Button>
+          {!readOnly ? (
+            <>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={toggleAll}
+                disabled={tags.length === 0}
+              >
+                {selectedIds.size === tags.length && tags.length > 0
+                  ? "選択解除"
+                  : "全選択"}
+              </Button>
+              <AppSelect
+                value={copySpaceId}
+                onChange={(event) => setCopySpaceId(event.target.value)}
+                className="h-8 min-w-48 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-1 focus-visible:ring-ring/50 dark:bg-input/30"
+                disabled={otherSpaces.length === 0}
+              >
+                <option value="">コピー先スペース</option>
+                {otherSpaces.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.name}
+                  </option>
+                ))}
+              </AppSelect>
+              <Button
+                size="sm"
+                disabled={!copySpaceId || selectedIds.size === 0 || copying}
+                onClick={() => void handleCopySelected()}
+              >
+                {copying ? (
+                  <Loader2 className="mr-1 size-3.5 animate-spin" />
+                ) : (
+                  <Copy className="mr-1 size-3.5" />
+                )}
+                {selectedIds.size > 0 ? `${selectedIds.size}件をコピー` : "コピー"}
+              </Button>
+            </>
+          ) : null}
         </div>
 
         {error && <p className="text-xs text-destructive">{error}</p>}
@@ -347,7 +407,7 @@ export function SpaceTagManagementPanel({
         {loading ? (
           <div className="space-y-2">
             {Array.from({ length: 4 }).map((_, index) => (
-              <Skeleton key={index} className="h-12 w-full rounded-lg" />
+              <Skeleton key={index} className="h-12 w-full rounded-md" />
             ))}
           </div>
         ) : tags.length > 0 ? (
@@ -355,13 +415,15 @@ export function SpaceTagManagementPanel({
             {tags.map((tag) => (
               <div
                 key={tag.id}
-                className="flex flex-wrap items-center gap-3 rounded-lg border p-2.5"
+                className="flex flex-wrap items-center gap-3 rounded-md border border-border p-2.5"
               >
-                <Checkbox
-                  checked={selectedIds.has(tag.id)}
-                  onCheckedChange={() => toggleSelected(tag.id)}
-                />
-                {editingTagId === tag.id ? (
+                {!readOnly ? (
+                  <Checkbox
+                    checked={selectedIds.has(tag.id)}
+                    onCheckedChange={() => toggleSelected(tag.id)}
+                  />
+                ) : null}
+                {editingTagId === tag.id && !readOnly ? (
                   <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
                     <Input
                       value={editName}
@@ -416,23 +478,27 @@ export function SpaceTagManagementPanel({
                       {tag.color || "色なし"}
                     </span>
                     <div className="ml-auto flex items-center gap-1">
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="h-8 px-2"
-                        onClick={() => startEditing(tag)}
-                      >
-                        <Pencil className="size-3.5" />
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="h-8 px-2 text-destructive hover:text-destructive"
-                        disabled={saving}
-                        onClick={() => void handleDelete(tag)}
-                      >
-                        <Trash2 className="size-3.5" />
-                      </Button>
+                      {!readOnly ? (
+                        <>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-8 px-2"
+                            onClick={() => startEditing(tag)}
+                          >
+                            <Pencil className="size-3.5" />
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-8 px-2 text-destructive hover:text-destructive"
+                            disabled={saving}
+                            onClick={() => void handleDelete(tag)}
+                          >
+                            <Trash2 className="size-3.5" />
+                          </Button>
+                        </>
+                      ) : null}
                     </div>
                   </>
                 )}

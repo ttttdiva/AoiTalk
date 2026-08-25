@@ -1,0 +1,6 @@
+services:
+  caddy:
+    environment:
+      AOITALK_TRANSPORT: http-redirect
+    ports:
+      - "${AOITALK_PUBLIC_BIND_ADDRESS:-0.0.0.0}:${AOITALK_HTTP_PORT:-6001}:80"

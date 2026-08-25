@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
-  KeyboardAvoidingView,
-  Platform,
+  AppState,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -11,6 +10,7 @@ import {
   ActivityIndicator,
   Button,
   Dialog,
+  IconButton,
   List,
   Portal,
   Surface,
@@ -27,16 +27,23 @@ import {
 import { TagPicker } from "../../../components/docs/tag-picker";
 import { FieldEditor } from "../../../components/docs/field-editor";
 import { MovePicker } from "../../../components/docs/move-picker";
+import { ClipIngestDialog } from "../../../components/docs/clip-ingest-dialog";
+import { DocsTaskBinding } from "../../../components/docs/task-binding";
+import { DocBlockEditor } from "../../../components/docs/verbatim-blocks";
 import { docsRepo } from "../../../repositories/docs";
+import { useNetworkStore } from "../../../stores/network";
+import { runSync } from "../../../sync/engine";
 import type { DocsNode, DocsSupertag } from "../../../types/api";
 
 export default function DocsNodeScreen() {
   const router = useRouter();
   const params = useLocalSearchParams<{ nodeId: string; created?: string }>();
   const nodeId = params.nodeId;
+  const online = useNetworkStore((state) => state.online);
   const [node, setNode] = useState<DocsNode | null>(null);
   const [tags, setTags] = useState<DocsSupertag[]>([]);
   const [backlinks, setBacklinks] = useState<DocsNode[]>([]);
+  const [outgoingReferences, setOutgoingReferences] = useState<DocsNode[]>([]);
   const [loading, setLoading] = useState(true);
   const [titleDraft, setTitleDraft] = useState("");
   const [titleEditing, setTitleEditing] = useState(false);
@@ -45,17 +52,42 @@ export default function DocsNodeScreen() {
   const [showArchived, setShowArchived] = useState(false);
   const [reloadToken, setReloadToken] = useState(0);
   const [moveTargetId, setMoveTargetId] = useState<string | null>(null);
+  const [clipIngestVisible, setClipIngestVisible] = useState(false);
   const draftsInitialized = useRef(false);
   const initialFocusApplied = useRef(false);
   const titleInputRef = useRef<{ focus: () => void } | null>(null);
   const outlineRef = useRef<OutlineEditorHandle>(null);
+  const activeNodeIdRef = useRef(nodeId);
+  activeNodeIdRef.current = nodeId;
   const loadGeneration = useRef(0);
+  const nodeLoadRequestRef = useRef(0);
+  const focusedRef = useRef(false);
+  const titleEditingRef = useRef(false);
+  const propertiesVisibleRef = useRef(false);
+  const titleDraftRef = useRef("");
+  const descDraftRef = useRef("");
+  const titleDirtyRef = useRef(false);
+  const descDirtyRef = useRef(false);
+  const titleSaveCountRef = useRef(0);
+  const descSaveCountRef = useRef(0);
+  const titleDraftRevisionRef = useRef(0);
+  const descDraftRevisionRef = useRef(0);
+  const revalidateFlightRef = useRef<Promise<void> | null>(null);
 
   const bump = useCallback(() => setReloadToken((value) => value + 1), []);
-  const loadNode = useCallback(async (generation: number) => {
-    const isCurrent = () => loadGeneration.current === generation;
+  const loadNode = useCallback(async (
+    generation: number,
+    refreshDrafts = false,
+  ): Promise<DocsNode | null> => {
+    const requestId = ++nodeLoadRequestRef.current;
+    const isCurrent = () =>
+      loadGeneration.current === generation &&
+      nodeLoadRequestRef.current === requestId;
+    const titleDraftRevision = titleDraftRevisionRef.current;
+    const descDraftRevision = descDraftRevisionRef.current;
     const tagsRequest = docsRepo.getNodeTags(nodeId);
     const backlinksRequest = docsRepo.getBacklinks(nodeId);
+    const outgoingReferencesRequest = docsRepo.getOutgoingReferences(nodeId);
 
     void tagsRequest
       .then((loadedTags) => {
@@ -71,42 +103,146 @@ export default function DocsNodeScreen() {
       .catch(() => {
         if (isCurrent()) setBacklinks([]);
       });
+    void outgoingReferencesRequest
+      .then((links) => {
+        if (isCurrent()) setOutgoingReferences(links);
+      })
+      .catch(() => {
+        if (isCurrent()) setOutgoingReferences([]);
+      });
 
     try {
       const loaded = await docsRepo.getNode(nodeId);
-      if (!isCurrent()) return;
+      if (!isCurrent()) return null;
       setNode(loaded);
-      if (loaded && !draftsInitialized.current) {
-        setTitleDraft(loaded.title ?? "");
-        setDescDraft(loaded.description ?? "");
+      if (loaded) {
+        if (
+          !draftsInitialized.current ||
+          (
+            refreshDrafts &&
+            !titleEditingRef.current &&
+            !titleDirtyRef.current &&
+            titleSaveCountRef.current === 0 &&
+            titleDraftRevisionRef.current === titleDraftRevision
+          )
+        ) {
+          const nextTitle = loaded.title ?? "";
+          titleDraftRef.current = nextTitle;
+          titleDirtyRef.current = false;
+          setTitleDraft(nextTitle);
+        }
+        if (
+          !draftsInitialized.current ||
+          (
+            refreshDrafts &&
+            !propertiesVisibleRef.current &&
+            !descDirtyRef.current &&
+            descSaveCountRef.current === 0 &&
+            descDraftRevisionRef.current === descDraftRevision
+          )
+        ) {
+          const nextDescription = loaded.description ?? "";
+          descDraftRef.current = nextDescription;
+          descDirtyRef.current = false;
+          setDescDraft(nextDescription);
+        }
         draftsInitialized.current = true;
       }
+      return loaded;
     } catch {
       if (isCurrent()) setNode(null);
+      return null;
     } finally {
       if (isCurrent()) setLoading(false);
     }
   }, [nodeId]);
+
+  const revalidateNode = useCallback(
+    (generation: number): Promise<void> => {
+      if (!online) return Promise.resolve();
+      let syncFlight = revalidateFlightRef.current;
+      if (!syncFlight) {
+        const flight = runSync()
+          .catch(() => {
+            // ローカル表示は維持し、次のfocus/foregroundで再試行する。
+          })
+          .finally(() => {
+            if (revalidateFlightRef.current === flight) {
+              revalidateFlightRef.current = null;
+            }
+          });
+        revalidateFlightRef.current = flight;
+        syncFlight = flight;
+      }
+
+      return syncFlight.then(async () => {
+        if (
+          !focusedRef.current ||
+          loadGeneration.current !== generation
+        ) {
+          return;
+        }
+        await loadNode(generation, true);
+        if (
+          focusedRef.current &&
+          loadGeneration.current === generation
+        ) {
+          try {
+            await outlineRef.current?.reloadFromRepository();
+          } catch {
+            // 保存できなかったdraftはOutlineEditor内に残し、次回の同期で再試行する。
+          }
+        }
+      });
+    },
+    [loadNode, online],
+  );
 
   useEffect(() => {
     loadGeneration.current += 1;
     setNode(null);
     setTags([]);
     setBacklinks([]);
+    setOutgoingReferences([]);
     setLoading(true);
     draftsInitialized.current = false;
     initialFocusApplied.current = false;
+    titleDraftRef.current = "";
+    descDraftRef.current = "";
+    titleDirtyRef.current = false;
+    descDirtyRef.current = false;
+    titleDraftRevisionRef.current += 1;
+    descDraftRevisionRef.current += 1;
+    setTitleDraft("");
+    setDescDraft("");
     setTitleEditing(false);
   }, [nodeId]);
+  useEffect(() => {
+    titleEditingRef.current = titleEditing;
+  }, [titleEditing]);
+  useEffect(() => {
+    propertiesVisibleRef.current = propertiesVisible;
+  }, [propertiesVisible]);
   useFocusEffect(
     useCallback(() => {
+      focusedRef.current = true;
       const generation = ++loadGeneration.current;
       void loadNode(generation);
+      void revalidateNode(generation);
       return () => {
+        focusedRef.current = false;
         if (loadGeneration.current === generation) loadGeneration.current += 1;
       };
-    }, [loadNode, reloadToken]),
+    }, [loadNode, reloadToken, revalidateNode]),
   );
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (state) => {
+      if (state === "active" && focusedRef.current) {
+        void revalidateNode(loadGeneration.current);
+      }
+    });
+    return () => subscription.remove();
+  }, [revalidateNode]);
   useEffect(() => {
     if (!node || params.created !== "1" || initialFocusApplied.current) return;
     initialFocusApplied.current = true;
@@ -116,12 +252,30 @@ export default function DocsNodeScreen() {
 
   const saveTitle = useCallback(async () => {
     if (!node) return;
-    const next = titleDraft.replace(/[\r\n]+/g, " ").slice(0, 500);
-    if (next !== titleDraft) setTitleDraft(next);
-    if (next === (node.title ?? "")) return;
-    const updated = await docsRepo.updateNode(nodeId, { title: next });
-    setNode(updated);
-  }, [node, nodeId, titleDraft]);
+    const next = titleDraftRef.current.replace(/[\r\n]+/g, " ").slice(0, 500);
+    if (next !== titleDraftRef.current) {
+      titleDraftRef.current = next;
+      setTitleDraft(next);
+    }
+    if (next === (node.title ?? "")) {
+      titleDirtyRef.current = false;
+      titleDraftRevisionRef.current += 1;
+      return;
+    }
+    titleSaveCountRef.current += 1;
+    try {
+      const updated = await docsRepo.updateNode(nodeId, { title: next });
+      if (activeNodeIdRef.current === nodeId) {
+        setNode(updated);
+        if (titleDraftRef.current === next) {
+          titleDirtyRef.current = false;
+          titleDraftRevisionRef.current += 1;
+        }
+      }
+    } finally {
+      titleSaveCountRef.current -= 1;
+    }
+  }, [node, nodeId]);
 
   const submitTitle = useCallback(async () => {
     await saveTitle();
@@ -130,10 +284,27 @@ export default function DocsNodeScreen() {
   }, [saveTitle]);
 
   const saveDescription = useCallback(async () => {
-    if (!node || descDraft === (node.description ?? "")) return;
-    const updated = await docsRepo.updateNode(nodeId, { description: descDraft });
-    setNode(updated);
-  }, [descDraft, node, nodeId]);
+    if (!node) return;
+    const next = descDraftRef.current;
+    if (next === (node.description ?? "")) {
+      descDirtyRef.current = false;
+      descDraftRevisionRef.current += 1;
+      return;
+    }
+    descSaveCountRef.current += 1;
+    try {
+      const updated = await docsRepo.updateNode(nodeId, { description: next });
+      if (activeNodeIdRef.current === nodeId) {
+        setNode(updated);
+        if (descDraftRef.current === next) {
+          descDirtyRef.current = false;
+          descDraftRevisionRef.current += 1;
+        }
+      }
+    } finally {
+      descSaveCountRef.current -= 1;
+    }
+  }, [node, nodeId]);
 
   const archiveSelf = useCallback(async () => {
     await docsRepo.archiveNode(nodeId);
@@ -161,25 +332,30 @@ export default function DocsNodeScreen() {
   }
 
   return (
-    <KeyboardAvoidingView
-      style={styles.container}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
-      keyboardVerticalOffset={Platform.OS === "ios" ? 88 : 0}
-    >
+    <View style={styles.container}>
       <ScreenHeader
         title="Docs"
         subtitle={node?.archived_at ? "アーカイブ済み" : undefined}
         onBack={() => goBackOrReplace(router, "/(tabs)/docs")}
         right={
-          <Button
-            compact
-            icon="tune-variant"
-            textColor="#cdd6f4"
-            disabled={!node}
-            onPress={() => setPropertiesVisible(true)}
-          >
-            プロパティ
-          </Button>
+          <>
+            <IconButton
+              icon="tray-arrow-down"
+              size={22}
+              iconColor="#a6adc8"
+              accessibilityLabel="クリップ取り込み"
+              onPress={() => setClipIngestVisible(true)}
+            />
+            <Button
+              compact
+              icon="tune-variant"
+              textColor="#cdd6f4"
+              disabled={!node}
+              onPress={() => setPropertiesVisible(true)}
+            >
+              プロパティ
+            </Button>
+          </>
         }
       />
       <OutlineEditor
@@ -203,9 +379,13 @@ export default function DocsNodeScreen() {
                     titleInputRef.current = input;
                   }}
                   value={titleDraft}
-                  onChangeText={(value) =>
-                    setTitleDraft(value.replace(/[\r\n]+/g, " ").slice(0, 500))
-                  }
+                  onChangeText={(value) => {
+                    const next = value.replace(/[\r\n]+/g, " ").slice(0, 500);
+                    titleDraftRef.current = next;
+                    titleDirtyRef.current = true;
+                    titleDraftRevisionRef.current += 1;
+                    setTitleDraft(next);
+                  }}
                   onBlur={() => {
                     void saveTitle();
                     setTitleEditing(false);
@@ -247,6 +427,13 @@ export default function DocsNodeScreen() {
                 {tags.map((tag) => `#${tag.name}`).join("  ")}
               </Text>
             ) : null}
+            {node ? (
+              <DocBlockEditor
+                node={node}
+                testIdPrefix="docs-page-block"
+                onSaved={setNode}
+              />
+            ) : null}
           </Surface>
         }
       />
@@ -263,13 +450,23 @@ export default function DocsNodeScreen() {
               <Text style={styles.sectionLabel}>概要</Text>
               <TextInput
                 value={descDraft}
-                onChangeText={setDescDraft}
+                onChangeText={(value) => {
+                  descDraftRef.current = value;
+                  descDirtyRef.current = true;
+                  descDraftRevisionRef.current += 1;
+                  setDescDraft(value);
+                }}
                 onBlur={() => void saveDescription()}
                 mode="outlined"
                 multiline
                 numberOfLines={4}
                 placeholder="概要（任意）"
                 style={styles.descInput}
+              />
+              <DocsTaskBinding
+                nodeId={nodeId}
+                projectId={node?.project_id}
+                readOnly={Boolean(node?.read_only || node?.access === "read")}
               />
               {backlinks.length > 0 ? (
                 <>
@@ -280,6 +477,23 @@ export default function DocsNodeScreen() {
                       title={link.title || "無題"}
                       titleStyle={styles.backlinkTitle}
                       left={(props) => <List.Icon {...props} icon="link-variant" color="#89b4fa" />}
+                      onPress={() => {
+                        setPropertiesVisible(false);
+                        router.push(`/(tabs)/docs/${link.id}`);
+                      }}
+                    />
+                  ))}
+                </>
+              ) : null}
+              {outgoingReferences.length > 0 ? (
+                <>
+                  <Text style={styles.sectionLabel}>参照先</Text>
+                  {outgoingReferences.map((link) => (
+                    <List.Item
+                      key={link.id}
+                      title={link.title || "無題"}
+                      titleStyle={styles.backlinkTitle}
+                      left={(props) => <List.Icon {...props} icon="link-variant-plus" color="#a6e3a1" />}
                       onPress={() => {
                         setPropertiesVisible(false);
                         router.push(`/(tabs)/docs/${link.id}`);
@@ -322,7 +536,15 @@ export default function DocsNodeScreen() {
         onDismiss={() => setMoveTargetId(null)}
         onConfirm={(targetId, leaveReference) => void handleMoveConfirm(targetId, leaveReference)}
       />
-    </KeyboardAvoidingView>
+      <ClipIngestDialog
+        visible={clipIngestVisible}
+        onDismiss={() => setClipIngestVisible(false)}
+        onOpenNode={(openNodeId) => {
+          setClipIngestVisible(false);
+          router.push(`/(tabs)/docs/${openNodeId}`);
+        }}
+      />
+    </View>
   );
 }
 

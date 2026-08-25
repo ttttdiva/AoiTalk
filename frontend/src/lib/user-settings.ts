@@ -3,8 +3,87 @@ import {
   normalizeAudioPlayerSettings,
   type AudioPlayerSettings,
 } from "./audio-player-settings";
+import type { AppNavigationVisibility } from "./app-navigation";
 
 export type UserSettings = Record<string, unknown>;
+export type UserSettingsRequestOptions = {
+  signal?: AbortSignal;
+};
+
+/** Error emitted by the settings client while retaining enough information
+ * for callers to distinguish a retryable transport failure from a rejected
+ * request. */
+export class UserSettingsRequestError extends Error {
+  readonly status?: number;
+  readonly retryable: boolean;
+  readonly offline: boolean;
+
+  constructor(
+    message: string,
+    options: {
+      status?: number;
+      retryable: boolean;
+      offline?: boolean;
+      cause?: unknown;
+    },
+  ) {
+    super(message);
+    this.name = "UserSettingsRequestError";
+    this.status = options.status;
+    this.retryable = options.retryable;
+    this.offline = options.offline === true;
+    if (options.cause !== undefined) {
+      (this as Error & { cause?: unknown }).cause = options.cause;
+    }
+  }
+}
+
+function browserIsOffline(): boolean {
+  return typeof navigator !== "undefined" && navigator.onLine === false;
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function settingsRequestError(
+  message: string,
+  options: {
+    status?: number;
+    cause?: unknown;
+  } = {},
+): UserSettingsRequestError {
+  const offline = browserIsOffline();
+  return new UserSettingsRequestError(message, {
+    status: options.status,
+    retryable:
+      offline ||
+      options.status === undefined ||
+      isRetryableStatus(options.status),
+    offline,
+    cause: options.cause,
+  });
+}
+
+export function isUserSettingsRequestRetryable(error: unknown): boolean {
+  if (error instanceof UserSettingsRequestError) return error.retryable;
+  // Test doubles and callers that wrap fetch failures in a plain Error should
+  // still receive the bounded retry behaviour. Explicit 4xx errors should be
+  // represented by UserSettingsRequestError and are not retried.
+  if (error && typeof error === "object" && "status" in error) {
+    const status = (error as { status?: unknown }).status;
+    return typeof status !== "number" || isRetryableStatus(status);
+  }
+  return true;
+}
+
+export function isUserSettingsRequestOffline(error: unknown): boolean {
+  return (
+    (error instanceof UserSettingsRequestError && error.offline) ||
+    browserIsOffline()
+  );
+}
+
 export type EditorLinkDefaultDisplayMode = "embed" | "link";
 export const DEFAULT_EDITOR_LINK_DISPLAY_MODE: EditorLinkDefaultDisplayMode =
   "embed";
@@ -12,11 +91,7 @@ export const DEFAULT_TASK_NOTIFICATIONS_ENABLED = true;
 export const DEFAULT_REMOTE_SERVER_CONNECTION_ENABLED = false;
 export const DEFAULT_SCENARIO_TAB_VISIBLE = false; // public-publish-default: false
 export const DEFAULT_TRPG_TAB_VISIBLE = false; // public-publish-default: false
-
-export type AppNavigationVisibility = {
-  scenarios: boolean;
-  trpg: boolean;
-};
+export type { AppNavigationVisibility };
 
 export function normalizeEditorLinkDefaultDisplayMode(
   value: unknown,
@@ -92,35 +167,74 @@ export function getAudioPlayerSettings(
 export { DEFAULT_AUDIO_PLAYER_SETTINGS };
 export type { AudioPlayerSettings };
 
-export async function getUserSettings(): Promise<UserSettings> {
-  const res = await fetch("/api/users/me/settings", {
-    credentials: "include",
-    signal: AbortSignal.timeout(5000),
-  });
+function timeoutSignal(): AbortSignal | undefined {
+  return typeof AbortSignal !== "undefined" && "timeout" in AbortSignal
+    ? AbortSignal.timeout(5000)
+    : undefined;
+}
 
-  if (!res.ok) {
-    throw new Error("ユーザー設定の取得に失敗しました");
+export async function getUserSettings(
+  options: UserSettingsRequestOptions = {},
+): Promise<UserSettings> {
+  let res: Response;
+  try {
+    res = await fetch("/api/users/me/settings", {
+      credentials: "include",
+      signal: options.signal ?? timeoutSignal(),
+    });
+  } catch (error) {
+    throw settingsRequestError("ユーザー設定の取得に失敗しました", {
+      cause: error,
+    });
   }
 
-  const data = (await res.json()) as { settings?: UserSettings };
-  return data.settings ?? {};
+  if (!res.ok) {
+    throw settingsRequestError("ユーザー設定の取得に失敗しました", {
+      status: res.status,
+    });
+  }
+
+  try {
+    const data = (await res.json()) as { settings?: UserSettings };
+    return data.settings ?? {};
+  } catch (error) {
+    throw settingsRequestError("ユーザー設定の取得に失敗しました", {
+      cause: error,
+    });
+  }
 }
 
 export async function patchUserSettings(
   patch: UserSettings,
+  options: UserSettingsRequestOptions = {},
 ): Promise<UserSettings> {
-  const res = await fetch("/api/users/me/settings", {
-    method: "PATCH",
-    credentials: "include",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(patch),
-    signal: AbortSignal.timeout(5000),
-  });
-
-  if (!res.ok) {
-    throw new Error("ユーザー設定の保存に失敗しました");
+  let res: Response;
+  try {
+    res = await fetch("/api/users/me/settings", {
+      method: "PATCH",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+      signal: options.signal ?? timeoutSignal(),
+    });
+  } catch (error) {
+    throw settingsRequestError("ユーザー設定の保存に失敗しました", {
+      cause: error,
+    });
   }
 
-  const data = (await res.json()) as { settings?: UserSettings };
-  return data.settings ?? {};
+  if (!res.ok) {
+    throw settingsRequestError("ユーザー設定の保存に失敗しました", {
+      status: res.status,
+    });
+  }
+
+  try {
+    const data = (await res.json()) as { settings?: UserSettings };
+    return data.settings ?? {};
+  } catch (error) {
+    throw settingsRequestError("ユーザー設定の保存に失敗しました", {
+      cause: error,
+    });
+  }
 }

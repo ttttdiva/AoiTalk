@@ -5,6 +5,7 @@ from .time_tools import get_current_time
 from .weather_tools import get_weather_info
 from .calculation_tools import calculate
 from .web_search import web_search
+from .x_search import x_search
 from .grok_x_search import grok_x_search
 
 __all__ = [
@@ -12,5 +13,6 @@ __all__ = [
     'get_weather_info', 
     'calculate',
     'web_search',
+    'x_search',
     'grok_x_search'
 ]

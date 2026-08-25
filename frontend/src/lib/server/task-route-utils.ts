@@ -1,14 +1,19 @@
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "@/db";
-import { projectMembers, projects, tags } from "@/db/schema";
+import { projectMembers, projects, tags, users } from "@/db/schema";
 import {
   parseDisplayDateAsDbTimestamp,
   serializeDbTimestamp,
 } from "@/lib/server/db-time";
 import { normalizeTaskStatus } from "@/lib/task-status";
+import { hasProjectPermission } from "./project-permissions";
+import { getParticipatingProjectIds as getParticipatingProjectIdsForScope } from "./project-access";
 
 export type SessionUser = { id: string; role?: string | null };
-export type ProjectMembership = { role: string | null };
+export type ProjectMembership = {
+  role: string | null;
+  permissions?: unknown;
+};
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -37,6 +42,7 @@ export function taskToSnake(
     updatedAt: "updated_at",
     deletedAt: "deleted_at",
     taskMetadata: "metadata",
+    autoCloseOnDue: "auto_close_on_due",
     estimatedHours: "estimated_hours",
     sortOrder: "sort_order",
     parentTaskId: "parent_task_id",
@@ -118,12 +124,9 @@ export function canWriteMembership(
   user: SessionUser,
   membership: ProjectMembership | null,
 ): boolean {
+  if (user.role === "admin") return true;
   if (!membership) return false;
-  return (
-    user.role === "admin" ||
-    membership.role === "admin" ||
-    membership.role === "owner"
-  );
+  return hasProjectPermission(membership.permissions, "write");
 }
 
 export async function getProjectMembership(
@@ -131,26 +134,59 @@ export async function getProjectMembership(
   projectId: string,
 ): Promise<ProjectMembership | null> {
   const [membership] = await db
-    .select({ role: projectMembers.role })
+    .select({ role: projectMembers.role, permissions: projectMembers.permissions })
     .from(projectMembers)
+    .innerJoin(projects, eq(projects.id, projectMembers.projectId))
     .where(
       and(
         eq(projectMembers.userId, userId),
         eq(projectMembers.projectId, projectId),
+        isNull(projects.deletedAt),
       ),
     )
     .limit(1);
   return membership ?? null;
 }
 
+export async function getProjectAccess(
+  user: SessionUser,
+  projectId: string,
+): Promise<{
+  project: typeof projects.$inferSelect;
+  membership: ProjectMembership | null;
+  canRead: boolean;
+  canWrite: boolean;
+} | null> {
+  const [project] = await db
+    .select()
+    .from(projects)
+    .where(and(eq(projects.id, projectId), isNull(projects.deletedAt)))
+    .limit(1);
+  if (!project) return null;
+
+  const membership = await getProjectMembership(user.id, projectId);
+  const elevated = user.role === "admin" || project.ownerId === user.id;
+  return {
+    project,
+    membership,
+    canRead: elevated || hasProjectPermission(membership?.permissions, "read"),
+    canWrite:
+      elevated || hasProjectPermission(membership?.permissions, "write"),
+  };
+}
+
+export async function canReadProjectId(
+  user: SessionUser,
+  projectId: string,
+): Promise<boolean> {
+  return Boolean((await getProjectAccess(user, projectId))?.canRead);
+}
+
 export async function canWriteProjectId(
   user: SessionUser,
   projectId: string,
 ): Promise<boolean> {
-  return canWriteMembership(
-    user,
-    await getProjectMembership(user.id, projectId),
-  );
+  return Boolean((await getProjectAccess(user, projectId))?.canWrite);
 }
 
 export async function getProjectSpaceId(
@@ -204,36 +240,48 @@ export async function getReadableProjectIds(
   userId: string,
   scope: { projectId?: string | null; spaceId?: string | null } = {},
 ): Promise<string[]> {
-  if (scope.projectId) {
-    const rows = await db
-      .select({ projectId: projectMembers.projectId })
-      .from(projectMembers)
-      .where(
-        and(
-          eq(projectMembers.userId, userId),
-          eq(projectMembers.projectId, scope.projectId),
-        ),
-      );
-    return rows.map((membership) => membership.projectId);
-  }
+  const [principal] = await db
+    .select({ role: users.role })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+  const isGlobalAdmin = principal?.role === "admin";
+  const conditions = [isNull(projects.deletedAt)];
+  if (scope.projectId) conditions.push(eq(projects.id, scope.projectId));
+  if (scope.spaceId) conditions.push(eq(projects.spaceId, scope.spaceId));
 
-  if (scope.spaceId) {
-    const rows = await db
-      .select({ projectId: projectMembers.projectId })
-      .from(projectMembers)
-      .innerJoin(projects, eq(projectMembers.projectId, projects.id))
-      .where(
-        and(
-          eq(projectMembers.userId, userId),
-          eq(projects.spaceId, scope.spaceId),
-        ),
-      );
-    return rows.map((membership) => membership.projectId);
-  }
+  const projectRows = await db
+    .select({ projectId: projects.id, ownerId: projects.ownerId })
+    .from(projects)
+    .where(and(...conditions));
+  if (projectRows.length === 0) return [];
 
-  const rows = await db
-    .select({ projectId: projectMembers.projectId })
+  const membershipRows = await db
+    .select({ projectId: projectMembers.projectId, permissions: projectMembers.permissions })
     .from(projectMembers)
-    .where(eq(projectMembers.userId, userId));
-  return rows.map((membership) => membership.projectId);
+    .where(
+      and(
+        eq(projectMembers.userId, userId),
+        inArray(projectMembers.projectId, projectRows.map((row) => row.projectId)),
+      ),
+    );
+  const permissionsByProject = new Map(
+    membershipRows.map((row) => [row.projectId, row.permissions]),
+  );
+  return projectRows
+    .filter(
+      (row) =>
+        isGlobalAdmin ||
+        row.ownerId === userId ||
+        hasProjectPermission(permissionsByProject.get(row.projectId), "read"),
+    )
+    .map((row) => row.projectId);
+}
+
+/** Operational (participating) project scope; excludes global-admin-only access. */
+export async function getParticipatingProjectIds(
+  userId: string,
+  scope: { projectId?: string | null; spaceId?: string | null } = {},
+): Promise<string[]> {
+  return getParticipatingProjectIdsForScope(userId, scope);
 }

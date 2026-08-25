@@ -22,19 +22,29 @@ export const STORAGE_KEYS = {
   API_URL: "aoitalk_api_url",
   SELECTED_PROJECT_ID: "aoitalk_selected_project_id",
   SELECTED_SPACE_ID: "aoitalk_selected_space_id",
-  DEFAULT_CHARACTER_NAME: "aoitalk_default_character_name",
+  CURRENT_CHARACTER_SLUG: "aoitalk_default_character_name",
   // メインスロットのプロバイダー選択（"server" | direct各種）。
   CHAT_LLM_PROVIDER: "aoitalk_chat_llm_provider",
   // メインスロットのモデルID（スロット単位）。
   CHAT_LLM_MAIN_MODEL: "aoitalk_chat_llm_main_model",
+  // メインの Direct スロットで使う reasoning effort。
+  CHAT_LLM_MAIN_EFFORT: "aoitalk_chat_llm_main_effort",
   // フォールバック設定（独立オブジェクト）。
   CHAT_LLM_FALLBACK_ENABLED: "aoitalk_chat_llm_fallback_enabled",
   CHAT_LLM_FALLBACK_PROVIDER: "aoitalk_chat_llm_fallback_provider",
   CHAT_LLM_FALLBACK_MODEL: "aoitalk_chat_llm_fallback_model",
+  CHAT_LLM_FALLBACK_EFFORT: "aoitalk_chat_llm_fallback_effort",
+  // クリップ取り込み専用スロット（個別指定が無効ならメインを使う）。
+  CHAT_LLM_CLIP_INGEST_ENABLED: "aoitalk_chat_llm_clip_ingest_enabled",
+  CHAT_LLM_CLIP_INGEST_PROVIDER: "aoitalk_chat_llm_clip_ingest_provider",
+  CHAT_LLM_CLIP_INGEST_MODEL: "aoitalk_chat_llm_clip_ingest_model",
+  CHAT_LLM_CLIP_INGEST_EFFORT: "aoitalk_chat_llm_clip_ingest_effort",
   // 新設定へ移行済みかどうかのフラグ。
   CHAT_LLM_SLOT_MIGRATED: "aoitalk_chat_llm_slot_migrated",
   // プロバイダー別のモデル一覧キャッシュ（AsyncStorage・モデルIDのみ。APIキーは保持しない）。
   CHAT_LLM_MODEL_CATALOG_CACHE: "aoitalk_chat_llm_model_catalog_cache",
+  // chat composerの候補・選択・未同期mode。server URL + account scope別のsuffixを付ける。
+  CHAT_LLM_UI_PREFERENCES_PREFIX: "aoitalk_chat_llm_ui_preferences_v1",
   // プロバイダー単位の共有プロファイル（APIキー / Base URL）。
   // モデルはスロット単位へ移行したため、ここではモデルを保持しない。
   CHAT_LLM_OPENAI_API_KEY: "aoitalk_chat_llm_openai_api_key",
@@ -43,6 +53,10 @@ export const STORAGE_KEYS = {
   CHAT_LLM_GEMINI_BASE_URL: "aoitalk_chat_llm_gemini_base_url",
   CHAT_LLM_KIMI_API_KEY: "aoitalk_chat_llm_kimi_api_key",
   CHAT_LLM_KIMI_BASE_URL: "aoitalk_chat_llm_kimi_base_url",
+  CHAT_LLM_DEEPSEEK_API_KEY: "aoitalk_chat_llm_deepseek_api_key",
+  CHAT_LLM_DEEPSEEK_BASE_URL: "aoitalk_chat_llm_deepseek_base_url",
+  CHAT_LLM_DEEPINFRA_API_KEY: "aoitalk_chat_llm_deepinfra_api_key",
+  CHAT_LLM_DEEPINFRA_BASE_URL: "aoitalk_chat_llm_deepinfra_base_url",
   CHAT_LLM_OPENROUTER_API_KEY: "aoitalk_chat_llm_openrouter_api_key",
   CHAT_LLM_OPENROUTER_BASE_URL: "aoitalk_chat_llm_openrouter_base_url",
   CHAT_LLM_ANTHROPIC_API_KEY: "aoitalk_chat_llm_anthropic_api_key",

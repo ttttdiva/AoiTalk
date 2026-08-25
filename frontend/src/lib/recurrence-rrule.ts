@@ -1,4 +1,7 @@
-import type { RecurrencePreviewConfig } from "@/lib/recurrence-preview";
+import type {
+  RecurrencePreviewConfig,
+  RecurrenceSkipMode,
+} from "@/lib/recurrence-preview";
 
 export const RECURRENCE_FREQ_OPTIONS = [
   { value: "DAILY", label: "毎日" },
@@ -16,6 +19,18 @@ export const RECURRENCE_WEEKDAYS = [
   { key: "SA", label: "土" },
   { key: "SU", label: "日" },
 ] as const;
+
+/**
+ * 土日・祝日スキップに当たった回の扱い。
+ * 「次の平日にずらす」と「その回は実施しない」をユーザーが選べるようにする。
+ */
+export const RECURRENCE_SKIP_MODE_OPTIONS: readonly {
+  value: RecurrenceSkipMode;
+  label: string;
+}[] = [
+  { value: "shift_forward", label: "後ろにずらす（翌営業日）" },
+  { value: "omit", label: "実施しない（その回を飛ばす）" },
+];
 
 export type ParsedRrule = {
   freq: string;
@@ -49,6 +64,15 @@ export function recurrenceLabel(
   const unit =
     { DAILY: "日", WEEKLY: "週", MONTHLY: "月", YEARLY: "年" }[freq] ?? "";
   return `${interval}${unit}ごと`;
+}
+
+/**
+ * 「週末をスキップ」を設定できる繰り返し頻度かどうか。
+ * WEEKLY で曜日を明示指定している場合はその曜日指定が優先されるため対象外にする。
+ * それ以外（毎日・毎月・毎年・曜日未指定の毎週）はすべて設定できる。
+ */
+export function supportsSkipWeekend(freq: string, byDay: string[]): boolean {
+  return !(freq === "WEEKLY" && byDay.length > 0);
 }
 
 export function buildRrule(

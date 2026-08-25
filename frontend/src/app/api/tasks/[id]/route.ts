@@ -11,6 +11,7 @@ import {
   users,
   timeEntries,
   projects,
+  taskSchedulePlacements,
 } from "@/db/schema";
 import { eq, desc, inArray, sql, isNull, and, max } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
@@ -19,7 +20,6 @@ import { computeNextRecurringScheduleAfter } from "@/lib/recurrence-schedule";
 import { normalizeTaskStatus } from "@/lib/task-status";
 import { parseRrule } from "@/lib/recurrence-rrule";
 import {
-  deleteAutoGoogleCalendarForTask,
   enqueueAutoSyncGoogleCalendarForTask,
 } from "@/lib/server/google-calendar-auto-sync";
 import {
@@ -27,10 +27,11 @@ import {
   dbTimestampToLocalDate,
   serializeDbTimestamp,
   toDbLocalTimestamp,
+  type DbTimestampValue,
 } from "@/lib/server/db-time";
 import {
-  canWriteMembership,
-  getProjectMembership,
+  canWriteProjectId,
+  canReadProjectId,
   isDateOnlyTaskInput,
   normalizeOptionalUuid,
   parseTaskWallClockDate,
@@ -40,22 +41,60 @@ import {
   taskToSnake,
   type SessionUser,
 } from "@/lib/server/task-route-utils";
-import {
-  collectTaskTreeIds,
-  deleteTaskTreeRows,
-} from "@/lib/server/task-delete";
+import { fetchPythonApi } from "@/lib/server/python-api-proxy";
 import {
   appendKnowledgeRevision,
   upsertKnowledgeSearchIndex,
 } from "@/lib/server/knowledge-docs-utils";
 import { updateDocsNode } from "@/lib/server/docs-node-writer";
+import {
+  lockTaskParentUpdate,
+  lockTaskProjectMoveAndAssertNoDependencies,
+  TaskProjectMoveInvariantError,
+} from "@/lib/server/project-move-dependency-invariant";
+
+function serializeAutoCloseOnDue(
+  row: typeof tasks.$inferSelect,
+  result: Record<string, unknown>,
+): Record<string, unknown> {
+  result.auto_close_on_due = row.autoCloseOnDue === true;
+  return result;
+}
+
+type IncompleteSubtaskSummary = {
+  id: string;
+  title: string;
+  status: string;
+};
+
+class IncompleteSubtasksConfirmationRequired extends Error {
+  constructor(readonly subtasks: IncompleteSubtaskSummary[]) {
+    super("未完了のサブタスクがあります");
+    this.name = "IncompleteSubtasksConfirmationRequired";
+  }
+}
+
+class IncompleteSubtaskPermissionDenied extends Error {
+  constructor() {
+    super("サブタスクを更新する権限がありません");
+    this.name = "IncompleteSubtaskPermissionDenied";
+  }
+}
+
+function isSerializationFailure(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "40001"
+  );
+}
 
 async function hasWritableProjectAccess(
   user: SessionUser,
   projectId: string,
 ): Promise<boolean> {
-  const membership = await getProjectMembership(user.id, projectId);
-  return canWriteMembership(user, membership);
+  return canWriteProjectId(user, projectId);
 }
 
 async function projectsShareTaskListSpace(
@@ -94,6 +133,43 @@ function dateSignature(value: Date | string | null | undefined): string {
 
 function jsonSignature(value: unknown): string {
   return JSON.stringify(value ?? null);
+}
+
+function computeNextRecurringScheduleForRule(
+  rule: typeof taskRecurrenceRules.$inferSelect,
+  startAt: DbTimestampValue,
+  endAt: DbTimestampValue,
+) {
+  const endCountExhausted =
+    !rule.recurForever &&
+    rule.endCount !== null &&
+    rule.endCount !== undefined &&
+    rule.endCount <= 1;
+  if (endCountExhausted) return null;
+
+  const currentStartAt = dbTimestampToLocalDate(startAt);
+  if (!currentStartAt) return null;
+
+  const parsed = parseRrule(rule.rrule);
+  return computeNextRecurringScheduleAfter({
+    currentStartAt,
+    currentEndAt: dbTimestampToLocalDate(endAt),
+    config: {
+      freq: parsed.freq,
+      interval: parsed.interval,
+      byDay: parsed.byDay,
+      skipWeekend: rule.skipWeekend,
+      skipHoliday: rule.skipHoliday,
+      skipMode: rule.skipMode,
+      endCount: rule.recurForever ? null : rule.endCount,
+      endDate: rule.recurForever
+        ? null
+        : rule.endDate
+          ? serializeDbTimestamp(rule.endDate)
+          : null,
+    },
+    after: currentStartAt,
+  });
 }
 
 function calendarNotificationFieldsChanged(
@@ -191,8 +267,7 @@ export async function GET(
       { status: 404 },
     );
   }
-  const membership = await getProjectMembership(user.id, task.projectId);
-  if (!membership) {
+  if (!(await canReadProjectId(user, task.projectId))) {
     return NextResponse.json(
       { detail: "タスクが見つかりません" },
       { status: 404 },
@@ -252,7 +327,10 @@ export async function GET(
     .where(eq(timeEntries.taskId, id))
     .orderBy(desc(timeEntries.startedAt));
 
-  const result = taskToSnake(task as unknown as Record<string, unknown>);
+  const result = serializeAutoCloseOnDue(
+    task,
+    taskToSnake(task as unknown as Record<string, unknown>),
+  );
   result.assignees = assigneeRows.map((a) => ({
     id: a.id,
     task_id: a.taskId,
@@ -302,7 +380,10 @@ export async function GET(
     for (const r of subRecRows) subtaskRecurrenceIds.add(r.taskId);
   }
   result.subtasks = subtaskRows.map((s) => {
-    const sub = taskToSnake(s as unknown as Record<string, unknown>);
+    const sub = serializeAutoCloseOnDue(
+      s,
+      taskToSnake(s as unknown as Record<string, unknown>),
+    );
     sub.assignees = [];
     sub.tags = [];
     sub.active_time_entry = null;
@@ -334,7 +415,7 @@ export async function PATCH(
   const { id } = await params;
   const body = await request.json();
 
-  const [priorTask] = await db
+  let [priorTask] = await db
     .select()
     .from(tasks)
     .where(and(eq(tasks.id, id), isNull(tasks.deletedAt)))
@@ -345,20 +426,12 @@ export async function PATCH(
       { status: 404 },
     );
   }
-  const sourceMembership = await getProjectMembership(
-    user.id,
-    priorTask.projectId,
-  );
-  if (!sourceMembership) {
+  if (!(await canWriteProjectId(user, priorTask.projectId))) {
     return NextResponse.json(
       { detail: "タスクが見つかりません" },
       { status: 404 },
     );
   }
-  if (!canWriteMembership(user, sourceMembership)) {
-    return NextResponse.json({ detail: "権限がありません" }, { status: 403 });
-  }
-
   const updateData: Record<string, unknown> = { updatedAt: new Date() };
   let normalizedBodyStatus: string | undefined;
   let recurrenceRuleForStatusChange:
@@ -433,6 +506,9 @@ export async function PATCH(
       : null;
   if (body.notifications_enabled !== undefined)
     updateData.notificationsEnabled = !!body.notifications_enabled;
+  if (body.auto_close_on_due !== undefined) {
+    updateData.autoCloseOnDue = Boolean(body.auto_close_on_due);
+  }
   const requestedParentTaskId =
     body.parent_task_id !== undefined
       ? normalizeOptionalUuid(body.parent_task_id)
@@ -557,11 +633,359 @@ export async function PATCH(
   ) {
     updateData.taskMetadata = body.metadata;
   }
-  const [updated] = await db
-    .update(tasks)
-    .set(updateData)
-    .where(eq(tasks.id, id))
-    .returning();
+
+  let recurringNextScheduleBeforeUpdate: ReturnType<
+    typeof computeNextRecurringScheduleAfter
+  > | null = null;
+  if (willTriggerRecurrence && recurrenceRuleForStatusChange?.createNew) {
+    const projectedStartAt = Object.prototype.hasOwnProperty.call(
+      updateData,
+      "startAt",
+    )
+      ? (updateData.startAt as DbTimestampValue)
+      : priorTask.startAt;
+    const projectedEndAt = Object.prototype.hasOwnProperty.call(
+      updateData,
+      "endAt",
+    )
+      ? (updateData.endAt as DbTimestampValue)
+      : priorTask.endAt;
+    recurringNextScheduleBeforeUpdate = computeNextRecurringScheduleForRule(
+      recurrenceRuleForStatusChange,
+      projectedStartAt,
+      projectedEndAt,
+    );
+    // A create-new recurrence transition inserts a task after the current
+    // task update.  Require read access up front only when that next task
+    // actually exists, so write-only members cannot create an invisible task
+    // while final/expired recurrences remain ordinary write-only updates.
+    if (
+      recurringNextScheduleBeforeUpdate &&
+      !(await canReadProjectId(user, priorTask.projectId))
+    ) {
+      return NextResponse.json({ detail: "権限がありません" }, { status: 403 });
+    }
+  }
+  let updated: typeof tasks.$inferSelect | undefined;
+  if (normalizedBodyStatus === "closed") {
+    const closeTaskAndChildren = () =>
+      db.transaction(
+        async (tx) => {
+          const lockedTask = projectWillChange
+            ? await lockTaskProjectMoveAndAssertNoDependencies(tx, {
+                taskId: id,
+                expectedProjectId: String(priorTask.projectId),
+                targetProjectId: projectWillChange
+                  ? requestedProjectId ?? undefined
+                  : undefined,
+                relatedTaskIds:
+                  projectWillChange && requestedParentTaskId
+                    ? [requestedParentTaskId]
+                    : undefined,
+              })
+            : body.parent_task_id !== undefined
+              ? (
+                  await lockTaskParentUpdate(tx, {
+                    taskId: id,
+                    expectedProjectId: String(priorTask.projectId),
+                    parentTaskId: requestedParentTaskId,
+                  })
+                ).task
+            : (
+                await tx
+                  .select()
+                  .from(tasks)
+                  .where(and(eq(tasks.id, id), isNull(tasks.deletedAt)))
+                  .for("update")
+                  .limit(1)
+              )[0];
+          if (!lockedTask) return undefined;
+
+          priorTask = lockedTask;
+          if (!(await canWriteProjectId(user, lockedTask.projectId))) {
+            throw new IncompleteSubtaskPermissionDenied();
+          }
+          const directChildren = await tx
+            .select({
+              id: tasks.id,
+              title: tasks.title,
+              status: tasks.status,
+              projectId: tasks.projectId,
+            })
+            .from(tasks)
+            .where(
+              and(eq(tasks.parentTaskId, id), isNull(tasks.deletedAt)),
+            )
+            .for("update");
+          if (projectWillChange && directChildren.length > 0) {
+            throw new TaskProjectMoveInvariantError(
+              409,
+              "task_project_move_has_children",
+              "子タスクがある親タスクは別のプロジェクトへ移動できません",
+            );
+          }
+          if (projectWillChange && requestedParentTaskId) {
+            const [targetParent] = await tx
+              .select({ projectId: tasks.projectId })
+              .from(tasks)
+              .where(
+                and(
+                  eq(tasks.id, requestedParentTaskId),
+                  isNull(tasks.deletedAt),
+                ),
+              )
+              .for("update")
+              .limit(1);
+            if (!targetParent || String(targetParent.projectId) !== requestedProjectId) {
+              throw new TaskProjectMoveInvariantError(
+                409,
+                "task_project_move_parent_project_mismatch",
+                "移動先の親タスクは移動先プロジェクトに属している必要があります",
+              );
+            }
+          }
+          const incompleteChildren = directChildren.filter(
+            (child) => normalizeTaskStatus(child.status) !== "closed",
+          );
+
+          for (const projectId of new Set(
+            incompleteChildren.map((child) => child.projectId),
+          )) {
+            if (!(await canWriteProjectId(user, projectId))) {
+              throw new IncompleteSubtaskPermissionDenied();
+            }
+          }
+
+          if (
+            incompleteChildren.length > 0 &&
+            body.close_incomplete_subtasks !== true
+          ) {
+            throw new IncompleteSubtasksConfirmationRequired(
+              incompleteChildren.map((child) => ({
+                id: child.id,
+                title: child.title,
+                status: normalizeTaskStatus(child.status),
+              })),
+            );
+          }
+
+          const completionTime = toDbLocalTimestamp(new Date());
+          const parentUpdateData = { ...updateData };
+          if (
+            normalizeTaskStatus(lockedTask.status) === "closed" &&
+            lockedTask.completedAt
+          ) {
+            parentUpdateData.completedAt = lockedTask.completedAt;
+          } else {
+            parentUpdateData.completedAt = completionTime;
+          }
+          const [parent] = await tx
+            .update(tasks)
+            .set(parentUpdateData)
+            .where(and(eq(tasks.id, id), isNull(tasks.deletedAt)))
+            .returning();
+          if (parent && projectWillChange) {
+            // Schedule placement is project-scoped. Moving a task must not
+            // leave a cross-project phase reference behind; datetime fields
+            // and dependency rows remain untouched.
+            await tx
+              .delete(taskSchedulePlacements)
+              .where(eq(taskSchedulePlacements.taskId, id));
+          }
+          if (!parent || incompleteChildren.length === 0) return parent;
+
+          const childIds = incompleteChildren.map((child) => child.id);
+          const changedAt = new Date();
+          await tx
+            .update(tasks)
+            .set({
+              status: "closed",
+              completedAt: completionTime,
+              updatedAt: changedAt,
+            })
+            .where(inArray(tasks.id, childIds));
+          await tx.insert(taskActivities).values([
+            ...incompleteChildren.map((child) => ({
+              taskId: child.id,
+              userId: user.id,
+              activityType: "closed_by_parent",
+              payload: {
+                parent_task_id: id,
+                previous_status: normalizeTaskStatus(child.status),
+              },
+            })),
+            {
+              taskId: id,
+              userId: user.id,
+              activityType: "subtasks_closed_with_parent",
+              payload: {
+                subtask_ids: childIds,
+                subtask_count: childIds.length,
+              },
+            },
+          ]);
+          return parent;
+        },
+        { isolationLevel: "serializable" },
+      );
+
+    try {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          updated = await closeTaskAndChildren();
+          break;
+        } catch (error) {
+          if (isSerializationFailure(error) && attempt < 2) continue;
+          throw error;
+        }
+      }
+    } catch (error) {
+      if (error instanceof IncompleteSubtasksConfirmationRequired) {
+        return NextResponse.json(
+          {
+            detail: error.message,
+            code: "incomplete_subtasks_confirmation_required",
+            incomplete_subtasks: error.subtasks,
+          },
+          { status: 409 },
+        );
+      }
+      if (error instanceof IncompleteSubtaskPermissionDenied) {
+        return NextResponse.json(
+          { detail: "タスクが見つかりません" },
+          { status: 404 },
+        );
+      }
+      if (error instanceof TaskProjectMoveInvariantError) {
+        return NextResponse.json(
+          { detail: error.message, code: error.code },
+          { status: error.status },
+        );
+      }
+      if (isSerializationFailure(error)) {
+        return NextResponse.json(
+          {
+            detail: "タスクの状態が変更されました。もう一度お試しください",
+            code: "task_completion_state_changed",
+          },
+          { status: 409 },
+        );
+      }
+      throw error;
+    }
+  } else if (projectWillChange) {
+    try {
+      updated = await db.transaction(async (tx) => {
+        priorTask = await lockTaskProjectMoveAndAssertNoDependencies(tx, {
+          taskId: id,
+          expectedProjectId: String(priorTask.projectId),
+          targetProjectId: requestedProjectId ?? undefined,
+          relatedTaskIds: requestedParentTaskId
+            ? [requestedParentTaskId]
+            : undefined,
+        });
+        if (requestedParentTaskId) {
+          const [targetParent] = await tx
+            .select({ projectId: tasks.projectId })
+            .from(tasks)
+            .where(
+              and(
+                eq(tasks.id, requestedParentTaskId),
+                isNull(tasks.deletedAt),
+              ),
+            )
+            .for("update")
+            .limit(1);
+          if (!targetParent || String(targetParent.projectId) !== requestedProjectId) {
+            throw new TaskProjectMoveInvariantError(
+              409,
+              "task_project_move_parent_project_mismatch",
+              "移動先の親タスクは移動先プロジェクトに属している必要があります",
+            );
+          }
+        }
+        const children = await tx
+          .select({ id: tasks.id })
+          .from(tasks)
+          .where(and(eq(tasks.parentTaskId, id), isNull(tasks.deletedAt)))
+          .for("update");
+        if (children.length > 0) {
+          throw new TaskProjectMoveInvariantError(
+            409,
+            "task_project_move_has_children",
+            "子タスクがある親タスクは別のプロジェクトへ移動できません",
+          );
+        }
+        const [movedTask] = await tx
+          .update(tasks)
+          .set(updateData)
+          .where(eq(tasks.id, id))
+          .returning();
+        if (movedTask) {
+          await tx
+            .delete(taskSchedulePlacements)
+            .where(eq(taskSchedulePlacements.taskId, id));
+        }
+        return movedTask;
+      });
+    } catch (error) {
+      if (error instanceof TaskProjectMoveInvariantError) {
+        return NextResponse.json(
+          { detail: error.message, code: error.code },
+          { status: error.status },
+        );
+      }
+      throw error;
+    }
+  } else {
+    if (body.parent_task_id === undefined) {
+      [updated] = await db
+        .update(tasks)
+        .set(updateData)
+        .where(eq(tasks.id, id))
+        .returning();
+    } else {
+      try {
+        updated = await db.transaction(async (tx) => {
+          const { task: lockedTask } = await lockTaskParentUpdate(tx, {
+            taskId: id,
+            expectedProjectId: String(priorTask.projectId),
+            parentTaskId: requestedParentTaskId,
+          });
+          if (!(await canWriteProjectId(user, lockedTask.projectId))) {
+            throw new TaskProjectMoveInvariantError(
+              404,
+              "task_not_found",
+              "タスクが見つかりません",
+            );
+          }
+          // The helper has revalidated the project while holding the advisory
+          // lock.  Keep the guarded predicate as a final row-identity check.
+          priorTask = lockedTask;
+          const [nextTask] = await tx
+            .update(tasks)
+            .set(updateData)
+            .where(
+              and(
+                eq(tasks.id, id),
+                eq(tasks.projectId, lockedTask.projectId),
+                isNull(tasks.deletedAt),
+              ),
+            )
+            .returning();
+          return nextTask;
+        });
+      } catch (error) {
+        if (error instanceof TaskProjectMoveInvariantError) {
+          return NextResponse.json(
+            { detail: error.message, code: error.code },
+            { status: error.status },
+          );
+        }
+        throw error;
+      }
+    }
+  }
   let responseTask = updated;
 
   if (!updated) {
@@ -634,141 +1058,117 @@ export async function PATCH(
       normalizeTaskStatus(rule.triggerStatus) === body.status &&
       updated.startAt
     ) {
-      const endCountExhausted =
-        !rule.recurForever &&
-        rule.endCount !== null &&
-        rule.endCount !== undefined &&
-        rule.endCount <= 1;
+      const nextSchedule =
+        recurringNextScheduleBeforeUpdate ??
+        computeNextRecurringScheduleForRule(rule, updated.startAt, updated.endAt);
 
-      if (!endCountExhausted) {
-        const parsed = parseRrule(rule.rrule);
-        const currentStartAt = dbTimestampToLocalDate(updated.startAt);
-        const nextSchedule = currentStartAt
-          ? computeNextRecurringScheduleAfter({
-              currentStartAt,
-              currentEndAt: dbTimestampToLocalDate(updated.endAt),
-              config: {
-                freq: parsed.freq,
-                interval: parsed.interval,
-                byDay: parsed.byDay,
-                skipWeekend: rule.skipWeekend,
-                skipHoliday: rule.skipHoliday,
-                endCount: rule.recurForever ? null : rule.endCount,
-                endDate: rule.recurForever
-                  ? null
-                  : rule.endDate
-                    ? serializeDbTimestamp(rule.endDate)
-                    : null,
-              },
-              after: currentStartAt,
-            })
-          : null;
+      if (nextSchedule) {
+        const newStart = nextSchedule.startAt;
+        const newEnd = nextSchedule.endAt;
+        const resetStatus = normalizeTaskStatus(rule.resetStatusTo || "open");
+        const newEndCount =
+          rule.endCount !== null && rule.endCount !== undefined
+            ? Math.max(0, rule.endCount - nextSchedule.advancedBy)
+            : null;
 
-        if (nextSchedule) {
-          const newStart = nextSchedule.startAt;
-          const newEnd = nextSchedule.endAt;
-          const resetStatus = normalizeTaskStatus(rule.resetStatusTo || "open");
-          const newEndCount =
-            rule.endCount !== null && rule.endCount !== undefined
-              ? Math.max(0, rule.endCount - nextSchedule.advancedBy)
-              : null;
+        if (rule.createNew) {
+          const recurringTaskInsertValues = {
+            projectId: updated.projectId,
+            title: updated.title,
+            description: updated.description,
+            status: resetStatus,
+            priority: updated.priority,
+            startAt: toDbLocalTimestamp(newStart),
+            endAt: newEnd ? toDbLocalTimestamp(newEnd) : null,
+            allDay: updated.allDay,
+            reminderOffsets: updated.reminderOffsets,
+            notificationsEnabled: updated.notificationsEnabled,
+            autoCloseOnDue: updated.autoCloseOnDue,
+            source: updated.source,
+            createdBy: updated.createdBy,
+            completedAt: null,
+            taskMetadata: stripGoogleCalendarMetadata(updated.taskMetadata),
+            estimatedHours: updated.estimatedHours,
+            sortOrder: updated.sortOrder,
+            parentTaskId: updated.parentTaskId,
+          };
+          const [newTask] = await db
+            .insert(tasks)
+            .values(recurringTaskInsertValues)
+            .returning();
+          recurringCreatedTaskId = newTask.id;
 
-          if (rule.createNew) {
-            const [newTask] = await db
-              .insert(tasks)
-              .values({
-                projectId: updated.projectId,
-                title: updated.title,
-                description: updated.description,
-                status: resetStatus,
-                priority: updated.priority,
-                startAt: toDbLocalTimestamp(newStart),
-                endAt: newEnd ? toDbLocalTimestamp(newEnd) : null,
-                allDay: updated.allDay,
-                reminderOffsets: updated.reminderOffsets,
-                notificationsEnabled: updated.notificationsEnabled,
-                source: updated.source,
-                createdBy: updated.createdBy,
-                completedAt: null,
-                taskMetadata: stripGoogleCalendarMetadata(updated.taskMetadata),
-                estimatedHours: updated.estimatedHours,
-                sortOrder: updated.sortOrder,
-                parentTaskId: updated.parentTaskId,
-              })
-              .returning();
-            recurringCreatedTaskId = newTask.id;
-
-            const origTags = await db
-              .select()
-              .from(taskTags)
-              .where(eq(taskTags.taskId, id));
-            const { tagIds: recurringTagIds } = await resolveProjectTagIds(
-              String(newTask.projectId),
-              origTags.map((tag) => tag.tagId),
+          const origTags = await db
+            .select()
+            .from(taskTags)
+            .where(eq(taskTags.taskId, id));
+          const { tagIds: recurringTagIds } = await resolveProjectTagIds(
+            String(newTask.projectId),
+            origTags.map((tag) => tag.tagId),
+          );
+          if (recurringTagIds.length > 0) {
+            await db.insert(taskTags).values(
+              recurringTagIds.map((tagId) => ({
+                taskId: newTask.id,
+                tagId,
+              })),
             );
-            if (recurringTagIds.length > 0) {
-              await db.insert(taskTags).values(
-                recurringTagIds.map((tagId) => ({
-                  taskId: newTask.id,
-                  tagId,
-                })),
-              );
-            }
+          }
 
-            const origAssignees = await db
-              .select()
-              .from(taskAssignees)
-              .where(eq(taskAssignees.taskId, id));
-            if (origAssignees.length > 0) {
-              await db.insert(taskAssignees).values(
-                origAssignees.map((a) => ({
-                  taskId: newTask.id,
-                  userId: a.userId,
-                  isPrimary: a.isPrimary,
-                })),
-              );
-            }
+          const origAssignees = await db
+            .select()
+            .from(taskAssignees)
+            .where(eq(taskAssignees.taskId, id));
+          if (origAssignees.length > 0) {
+            await db.insert(taskAssignees).values(
+              origAssignees.map((a) => ({
+                taskId: newTask.id,
+                userId: a.userId,
+                isPrimary: a.isPrimary,
+              })),
+            );
+          }
 
-            // task_recurrence_rules.task_id は UNIQUE のため旧側を削除してから移管
+          // task_recurrence_rules.task_id は UNIQUE のため旧側を削除してから移管
+          await db
+            .delete(taskRecurrenceRules)
+            .where(eq(taskRecurrenceRules.taskId, id));
+          await db.insert(taskRecurrenceRules).values({
+            taskId: newTask.id,
+            rrule: rule.rrule,
+            timezone: rule.timezone,
+            horizonDays: rule.horizonDays,
+            triggerStatus: rule.triggerStatus,
+            createNew: rule.createNew,
+            recurForever: rule.recurForever,
+            resetStatusTo: rule.resetStatusTo,
+            endCount: newEndCount,
+            endDate: rule.endDate,
+            skipWeekend: rule.skipWeekend,
+            skipHoliday: rule.skipHoliday,
+            skipMode: rule.skipMode,
+          });
+        } else {
+          const [nextTask] = await db
+            .update(tasks)
+            .set({
+              status: resetStatus,
+              startAt: toDbLocalTimestamp(newStart),
+              endAt: newEnd ? toDbLocalTimestamp(newEnd) : null,
+              completedAt: null,
+              updatedAt: new Date(),
+            })
+            .where(eq(tasks.id, id))
+            .returning();
+          if (nextTask) {
+            responseTask = nextTask;
+          }
+
+          if (newEndCount !== null) {
             await db
-              .delete(taskRecurrenceRules)
+              .update(taskRecurrenceRules)
+              .set({ endCount: newEndCount, updatedAt: new Date() })
               .where(eq(taskRecurrenceRules.taskId, id));
-            await db.insert(taskRecurrenceRules).values({
-              taskId: newTask.id,
-              rrule: rule.rrule,
-              timezone: rule.timezone,
-              horizonDays: rule.horizonDays,
-              triggerStatus: rule.triggerStatus,
-              createNew: rule.createNew,
-              recurForever: rule.recurForever,
-              resetStatusTo: rule.resetStatusTo,
-              endCount: newEndCount,
-              endDate: rule.endDate,
-              skipWeekend: rule.skipWeekend,
-              skipHoliday: rule.skipHoliday,
-            });
-          } else {
-            const [nextTask] = await db
-              .update(tasks)
-              .set({
-                status: resetStatus,
-                startAt: toDbLocalTimestamp(newStart),
-                endAt: newEnd ? toDbLocalTimestamp(newEnd) : null,
-                completedAt: null,
-                updatedAt: new Date(),
-              })
-              .where(eq(tasks.id, id))
-              .returning();
-            if (nextTask) {
-              responseTask = nextTask;
-            }
-
-            if (newEndCount !== null) {
-              await db
-                .update(taskRecurrenceRules)
-                .set({ endCount: newEndCount, updatedAt: new Date() })
-                .where(eq(taskRecurrenceRules.taskId, id));
-            }
           }
         }
       }
@@ -834,7 +1234,10 @@ export async function PATCH(
   }
 
   // GETと同じ形式でレスポンスを返す
-  const result = taskToSnake(finalTask as unknown as Record<string, unknown>);
+  const result = serializeAutoCloseOnDue(
+    finalTask,
+    taskToSnake(finalTask as unknown as Record<string, unknown>),
+  );
 
   const tagRows = await db
     .select({
@@ -926,39 +1329,52 @@ export async function DELETE(
       { status: 404 },
     );
   }
-  const membership = await getProjectMembership(user.id, targetTask.projectId);
-  if (!membership) {
-    return NextResponse.json(
-      { detail: "タスクが見つかりません" },
-      { status: 404 },
-    );
-  }
-  if (!canWriteMembership(user, membership)) {
+  if (!(await canWriteProjectId(user, targetTask.projectId))) {
     return NextResponse.json({ detail: "権限がありません" }, { status: 403 });
   }
 
+  // Task mutation authority lives in the FastAPI service.  In particular,
+  // DELETE must not fall back to the legacy Drizzle hard-delete helper: doing
+  // so would bypass the canonical tombstone/audit lifecycle and could leave
+  // the two stores with divergent trees.  A transport failure is surfaced as
+  // a bounded 502 rather than silently duplicating the mutation locally.
+  let response: Response;
   try {
-    const taskIds = await collectTaskTreeIds(id);
-    for (const taskId of taskIds) {
-      await deleteAutoGoogleCalendarForTask(taskId, user);
-    }
-
-    const deletedRows = await deleteTaskTreeRows(taskIds);
-    const deleted = deletedRows.some((row) => row.id === id);
-
-    if (!deleted) {
-      return NextResponse.json(
-        { detail: "タスクが見つかりません" },
-        { status: 404 },
-      );
-    }
-
-    return NextResponse.json({ success: true });
-  } catch (err) {
-    console.error("タスク削除エラー:", err);
+    response = await fetchPythonApi(`/api/tasks/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      user,
+    });
+  } catch (error) {
+    console.error("正規タスク削除APIへの接続に失敗しました:", error);
     return NextResponse.json(
-      { detail: "タスクの削除に失敗しました" },
-      { status: 500 },
+      { detail: "正規タスク削除サービスに接続できません" },
+      { status: 502 },
     );
   }
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    return new NextResponse(
+      body || JSON.stringify({ detail: "タスクの削除に失敗しました" }),
+      {
+        status: response.status,
+        headers: {
+          "content-type":
+            response.headers.get("content-type") ?? "application/json",
+        },
+      },
+    );
+  }
+
+  // FastAPI's canonical endpoint is 204. Preserve a non-empty body from a
+  // compatible deployment, but keep the historical empty success response for
+  // the normal case so taskApi.request<void>() remains valid.
+  if (response.status === 204) return new NextResponse(null, { status: 204 });
+  const body = await response.text().catch(() => "");
+  return new NextResponse(body || null, {
+    status: response.status,
+    headers: {
+      "content-type": response.headers.get("content-type") ?? "application/json",
+    },
+  });
 }

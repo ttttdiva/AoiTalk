@@ -3,7 +3,7 @@
 # docker-compose環境での設定
 # ============================================================================
 
-default_character: ずんだもん
+default_character: project_manager
 llm_model: gemini-3-flash-preview
 llm_provider: gemini
 
@@ -16,9 +16,18 @@ openrouter:
 # SGLang設定 (ローカルLLM使用時)
 sglang:
   auto_start: false  # Docker内での自動起動は無効
-  model: default
+  model: google/gemma-4-E4B-it
+  base_url: http://sglang:30000/v1
   port: 30000
   host: 0.0.0.0
+  dtype: bfloat16
+  reasoning_parser: gemma4
+  tool_call_parser: gemma4
+
+# ComfyUIのユーザーワークフローは永続化された書き込み領域へ保存
+comfyui:
+  workflows_dir: workspaces/comfyui_workflows
+  default_workflow: workspaces/comfyui_workflows/aoitalk_auto_sdxl.json
 
 runtime_feature_permissions:
   allowed_discord_user_ids: []
@@ -32,7 +41,7 @@ runtime_features:
   discord_text: false
   discord_vc_input: false
   discord_vc_output: false
-  console_input: true
+  console_input: false
 
 # 音声デバイス (Docker内では使用しない)
 device_index: 0
@@ -72,6 +81,13 @@ discord:
   default_mode: text
   max_history_length: 20
   memory_prefill_message_count: 12
+  coalesce_window_ms: 250
+  queue:
+    coalesce_window_ms: 250
+    max_images: 4
+    reply_timeout_seconds: 30
+    image_timeout_seconds: 15
+    max_image_bytes: 10485760
   sync_commands: false
 
 # 音声認識設定
@@ -111,7 +127,6 @@ tts_settings:
     codec_model_id: Aratako/MioCodec-25Hz-44.1kHz-v2
     refs_dir: config/miotts_refs
     presets_dir: config/miotts_presets
-    cache_dir: cache/miotts
     device: auto
     dtype: auto
     synthesis_timeout: 180.0
@@ -165,7 +180,7 @@ web_interface:
     username: ''
     password: ''
     secret: ''
-    session_ttl_minutes: 15768000
+    session_ttl_minutes: 1440
 
 # OS操作 (Docker内では制限)
 os_operations:
@@ -184,8 +199,6 @@ agents:
     enabled: true
   project_management:
     enabled: true
-  spotify:
-    enabled: false
 
 # モバイルUI設定
 mobile_ui:

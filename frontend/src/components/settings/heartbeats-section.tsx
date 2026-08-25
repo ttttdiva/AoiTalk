@@ -96,15 +96,6 @@ function toForm(heartbeat: Heartbeat): HeartbeatForm {
   };
 }
 
-function parseActionsJson(value: string): Array<Record<string, unknown>> {
-  const trimmed = value.trim();
-  if (!trimmed) return [];
-  const parsed = JSON.parse(trimmed);
-  if (!Array.isArray(parsed)) {
-    throw new Error("Actions must be a JSON array");
-  }
-  return parsed as Array<Record<string, unknown>>;
-}
 
 function buildPayload(form: HeartbeatForm, includeName: boolean) {
   const interval = Number(form.intervalMinutes);
@@ -114,7 +105,6 @@ function buildPayload(form: HeartbeatForm, includeName: boolean) {
     interval_minutes: Number.isFinite(interval) && interval > 0 ? Math.floor(interval) : 30,
     enabled: form.enabled,
     notify_channel: form.notifyChannel.trim() || "websocket",
-    actions: parseActionsJson(form.actionsJson),
   };
   if (includeName) payload.name = form.name.trim();
   if (form.activeStart.trim() || form.activeEnd.trim()) {
@@ -256,7 +246,7 @@ export function HeartbeatsSection() {
 
   return (
     <>
-      <Card size="sm">
+      <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0">
         <CardHeader className="cursor-pointer select-none" onClick={handleToggle}>
           <CardTitle className="flex items-center justify-between gap-3 text-sm">
             <span className="flex min-w-0 items-center gap-2">
@@ -357,7 +347,7 @@ export function HeartbeatsSection() {
       </Card>
 
       <Dialog open={editorOpen} onOpenChange={setEditorOpen}>
-        <DialogContent className="max-w-2xl">
+        <DialogContent size="2xl">
           <DialogHeader>
             <DialogTitle>{isNew ? "Add heartbeat" : "Edit heartbeat"}</DialogTitle>
           </DialogHeader>
@@ -453,31 +443,27 @@ export function HeartbeatsSection() {
               />
             </div>
             <div className="space-y-1">
-              <Label>Actions JSON</Label>
+              <Label>Actions JSON（YAML 管理・読み取り専用）</Label>
               <LongTextEditor
                 value={form.actionsJson}
-                onChange={(value) =>
-                  setForm((prev) => ({ ...prev, actionsJson: value }))
-                }
+                onChange={() => undefined}
+                readOnly
                 minHeight={180}
                 maxHeight={380}
                 fontFamily="monospace"
                 fontSize={12}
                 placeholder={`[
   {
-    "type": "run_script",
+    "type": "notify",
     "run_on": "alert",
     "config": {
-      "command": "powershell -NoProfile -File scripts/check.ps1",
-      "cwd": "D:/Dev/41_AoiTalk",
-      "timeout_seconds": 300
+      "message": "アラート内容"
     }
   }
 ]`}
               />
               <p className="text-xs text-muted-foreground">
-                types: run_script, run_skill, webhook, create_task, notify. run_on:
-                alert, ok, always.
+                actions は config/heartbeats/*.yaml で管理します。HTTP API からは変更できません。
               </p>
             </div>
             <div className="flex items-center justify-between gap-3">

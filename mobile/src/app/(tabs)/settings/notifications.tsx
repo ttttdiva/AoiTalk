@@ -1,14 +1,16 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Alert, ScrollView, StyleSheet, View } from "react-native";
+import { Alert, StyleSheet, View } from "react-native";
 import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
 import {
   Button,
-  IconButton,
   Surface,
   Switch,
   Text,
   TextInput,
 } from "react-native-paper";
+import { ScreenHeader } from "../../../components/screen-header";
+import { ScreenShell } from "../../../components/screen-primitives";
+import { goBackOrReplace } from "../../../lib/navigation";
 import {
   googleCalendarApi,
   type GoogleCalendarSettings,
@@ -117,24 +119,18 @@ export default function SettingsNotificationsScreen() {
   }, [loadGoogleCalendarSettings, params.google_calendar, params.message]);
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      <Surface style={styles.header} elevation={1}>
-        <View style={styles.headerRow}>
-          <IconButton
-            icon="arrow-left"
-            iconColor="#cdd6f4"
-            onPress={() => router.back()}
-          />
-          <View style={{ flex: 1 }}>
-            <Text variant="titleLarge" style={styles.headerTitle}>
-              Task notifications / Calendar
-            </Text>
-            <Text style={styles.headerSubtext}>
-              {selectedProject?.name || "No project selected"}
-            </Text>
-          </View>
-        </View>
-      </Surface>
+    <ScreenShell
+      scroll
+      style={styles.container}
+      contentContainerStyle={styles.content}
+      header={
+        <ScreenHeader
+          title="Task notifications / Calendar"
+          subtitle={selectedProject?.name || "No project selected"}
+          onBack={() => goBackOrReplace(router, "/(tabs)/settings")}
+        />
+      }
+    >
 
       <Surface style={styles.card} elevation={0}>
         <Text style={styles.cardTitle}>端末通知</Text>
@@ -409,22 +405,13 @@ export default function SettingsNotificationsScreen() {
           保存
         </Button>
       </Surface>
-    </ScrollView>
+    </ScreenShell>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b" },
   content: { paddingBottom: 32 },
-  header: {
-    paddingTop: 52,
-    paddingHorizontal: 8,
-    paddingBottom: 16,
-    backgroundColor: "#1e1e2e",
-  },
-  headerRow: { flexDirection: "row", alignItems: "center" },
-  headerTitle: { color: "#cdd6f4", fontWeight: "bold" },
-  headerSubtext: { color: "#a6adc8", marginTop: 2 },
   card: {
     backgroundColor: "#1e1e2e",
     borderRadius: 12,

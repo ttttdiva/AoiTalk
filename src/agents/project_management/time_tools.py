@@ -30,7 +30,7 @@ def build_time_tools() -> list:
             try:
                 parsed_task_id = UUID(task_id)
                 task = await session.get(Task, parsed_task_id)
-                if task is None:
+                if task is None or task.deleted_at is not None:
                     raise ValueError("Task not found.")
                 user_id, _ = await _resolve_actor_and_project(
                     session,
@@ -66,7 +66,7 @@ def build_time_tools() -> list:
                     entry = await session.get(TimeEntry, parsed_time_entry_id)
                     if entry is not None:
                         task = await session.get(Task, entry.task_id)
-                        if task is not None:
+                        if task is not None and task.deleted_at is None:
                             project_id_for_actor = str(task.project_id)
                 user_id, _ = await _resolve_actor_and_project(
                     session,
@@ -102,7 +102,7 @@ def build_time_tools() -> list:
             try:
                 parsed_task_id = UUID(task_id)
                 task = await session.get(Task, parsed_task_id)
-                if task is None:
+                if task is None or task.deleted_at is not None:
                     raise ValueError("Task not found.")
                 user_id, _ = await _resolve_actor_and_project(
                     session,

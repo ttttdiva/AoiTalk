@@ -4,14 +4,6 @@ Services package for AoiTalk.
 Contains service modules for various functionalities.
 """
 
-from .git_service import (
-    GitService,
-    GitServiceError,
-    ensure_user_git_repository,
-    ensure_project_git_repository,
-    get_user_directory,
-    get_project_directory,
-)
 from .project_context import (
     ProjectContextResolver,
     build_project_context,
@@ -25,14 +17,15 @@ from .project_context import (
     sanitize_project_context_for_chat,
     set_runtime_project_context,
 )
+from .mention_resolver import (
+    CanonicalMention,
+    MentionResolution,
+    MentionResolver,
+    normalize_mentions,
+    resolve_mentions,
+)
 
 __all__ = [
-    "GitService",
-    "GitServiceError",
-    "ensure_user_git_repository",
-    "ensure_project_git_repository",
-    "get_user_directory",
-    "get_project_directory",
     "ProjectContextResolver",
     "build_project_context",
     "format_minimal_project_context_for_chat_prompt",
@@ -44,4 +37,9 @@ __all__ = [
     "reset_runtime_project_context",
     "sanitize_project_context_for_chat",
     "set_runtime_project_context",
+    "CanonicalMention",
+    "MentionResolution",
+    "MentionResolver",
+    "normalize_mentions",
+    "resolve_mentions",
 ]

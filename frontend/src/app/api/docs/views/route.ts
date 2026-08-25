@@ -38,7 +38,7 @@ export async function POST(request: NextRequest) {
     .where(
       and(
         eq(knowledgeSupertags.id, supertagId),
-        eq(knowledgeSupertags.workspaceId, workspace.id),
+        eq(knowledgeSupertags.docsLibraryId, workspace.id),
       ),
     )
     .limit(1);
@@ -51,7 +51,7 @@ export async function POST(request: NextRequest) {
     .from(knowledgeSavedViews)
     .where(
       and(
-        eq(knowledgeSavedViews.workspaceId, workspace.id),
+        eq(knowledgeSavedViews.docsLibraryId, workspace.id),
         eq(knowledgeSavedViews.supertagId, supertagId),
       ),
     );
@@ -60,7 +60,7 @@ export async function POST(request: NextRequest) {
   const [view] = await db
     .insert(knowledgeSavedViews)
     .values({
-      workspaceId: workspace.id,
+      docsLibraryId: workspace.id,
       supertagId,
       name,
       layout,

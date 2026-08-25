@@ -51,7 +51,13 @@ class MobileCommandsMixin:
                 return cmd
         return None
 
-    async def _execute_mobile_command(self, command_id: str) -> Dict[str, Any]:
+    async def _execute_mobile_command(
+        self,
+        command_id: str,
+        *,
+        sender_user_id: str = "default_user",
+        sender_is_admin: bool = False,
+    ) -> Dict[str, Any]:
         command = self._get_mobile_command_by_id(command_id)
         if not command:
             raise HTTPException(
@@ -66,10 +72,15 @@ class MobileCommandsMixin:
             payload = (command.get("payload") or "").strip()
             if not payload:
                 raise HTTPException(status_code=400, detail="Command payload is empty")
+            resolved_sender_user_id = str(sender_user_id or "default_user").strip()
+            if not resolved_sender_user_id:
+                resolved_sender_user_id = "default_user"
             await self._handle_user_message(
                 {
                     "message": payload,
                     "metadata": {"source": "mobile_command", "command_id": command_id},
+                    "_sender_user_id": resolved_sender_user_id,
+                    "_sender_is_admin": bool(sender_is_admin),
                 }
             )
             result = "user_message_sent"

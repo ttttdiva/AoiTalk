@@ -2,49 +2,24 @@ import { NextRequest, NextResponse } from "next/server";
 import fs from "node:fs";
 import path from "node:path";
 import { db } from "@/db";
-import { taskAttachments, tasks } from "@/db/schema";
-import { desc, eq } from "drizzle-orm";
+import { projectMembers, projects, taskAttachments, tasks, users } from "@/db/schema";
+import { and, desc, eq, isNull } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
-import { ensureProjectStorageRoot } from "@/lib/server/project-workspace-management";
 import {
-  canWriteMembership,
-  getProjectMembership,
+  ensureProjectStorageRoot,
+  isPathInsideProjectStorageRoot,
+  calculateProjectStorageUsage,
+} from "@/lib/server/project-workspace-management";
+import { hasProjectPermission } from "@/lib/server/project-permissions";
+import {
+  canReadProjectId,
+  canWriteProjectId,
 } from "@/lib/server/task-route-utils";
-
-const BLOCKED_EXTENSIONS = new Set([
-  ".exe",
-  ".bat",
-  ".cmd",
-  ".sh",
-  ".ps1",
-  ".vbs",
-  ".scr",
-  ".com",
-]);
-
-function sanitizeFileName(name: string): string {
-  const cleaned = name
-    .replace(/[/\\:*?"<>|]/g, "")
-    .replace(/[\u0000-\u001f]/g, "")
-    .trim()
-    .replace(/^\.+$/, "");
-  return cleaned.slice(0, 180) || "uploaded-file";
-}
-
-function uniqueTargetPath(dir: string, fileName: string): string {
-  const parsed = path.parse(fileName);
-  let candidate = path.join(/*turbopackIgnore: true*/ dir, fileName);
-  let index = 1;
-  while (fs.existsSync(candidate)) {
-    candidate = path.join(
-      /*turbopackIgnore: true*/
-      dir,
-      `${parsed.name}-${index}${parsed.ext}`,
-    );
-    index += 1;
-  }
-  return candidate;
-}
+import {
+  exceedsUploadSizeLimit,
+  sanitizeUploadFileName,
+  writeUniqueUploadFile,
+} from "@/lib/server/attachment-upload";
 
 function projectRelativePath(storageRoot: string, targetPath: string): string {
   return path.relative(storageRoot, targetPath).replace(/\\/g, "/");
@@ -56,6 +31,20 @@ function attachmentKind(mimeType: string | null, fileName: string): "image" | "f
   return [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"].includes(ext)
     ? "image"
     : "file";
+}
+
+class ProjectQuotaExceededError extends Error {
+  constructor() {
+    super("Project storage quota exceeded");
+    this.name = "ProjectQuotaExceededError";
+  }
+}
+
+class ProjectPermissionError extends Error {
+  constructor() {
+    super("Permission denied");
+    this.name = "ProjectPermissionError";
+  }
 }
 
 function serializeAttachment(
@@ -82,7 +71,7 @@ async function loadTask(id: string) {
   const [task] = await db
     .select({ id: tasks.id, projectId: tasks.projectId })
     .from(tasks)
-    .where(eq(tasks.id, id))
+    .where(and(eq(tasks.id, id), isNull(tasks.deletedAt)))
     .limit(1);
   return task ?? null;
 }
@@ -101,8 +90,7 @@ export async function GET(
   if (!task) {
     return NextResponse.json({ detail: "Task not found" }, { status: 404 });
   }
-  const membership = await getProjectMembership(user.id, task.projectId);
-  if (!membership && user.role !== "admin") {
+  if (!(await canReadProjectId(user, task.projectId))) {
     return NextResponse.json({ detail: "Permission denied" }, { status: 403 });
   }
 
@@ -129,8 +117,7 @@ export async function POST(
   if (!task) {
     return NextResponse.json({ detail: "Task not found" }, { status: 404 });
   }
-  const membership = await getProjectMembership(user.id, task.projectId);
-  if (!canWriteMembership(user, membership)) {
+  if (!(await canWriteProjectId(user, task.projectId))) {
     return NextResponse.json({ detail: "Permission denied" }, { status: 403 });
   }
 
@@ -139,15 +126,14 @@ export async function POST(
   if (!(file instanceof File)) {
     return NextResponse.json({ detail: "file is required" }, { status: 400 });
   }
-
-  const fileName = sanitizeFileName(file.name || "uploaded-file");
-  const ext = path.extname(fileName).toLowerCase();
-  if (BLOCKED_EXTENSIONS.has(ext)) {
+  if (exceedsUploadSizeLimit(file.size)) {
     return NextResponse.json(
-      { detail: "This file extension cannot be uploaded" },
-      { status: 400 },
+      { detail: "ファイルサイズは 50 MB までです" },
+      { status: 413 },
     );
   }
+
+  const fileName = sanitizeUploadFileName(file.name || "uploaded-file");
 
   const storageRoot = ensureProjectStorageRoot(task.projectId);
   const targetDir = path.resolve(
@@ -161,28 +147,123 @@ export async function POST(
   if (relativeToRoot.startsWith("..") || path.isAbsolute(relativeToRoot)) {
     return NextResponse.json({ detail: "Invalid attachment path" }, { status: 400 });
   }
+  if (!isPathInsideProjectStorageRoot(storageRoot, targetDir)) {
+    return NextResponse.json({ detail: "Invalid attachment path" }, { status: 400 });
+  }
 
-  fs.mkdirSync(targetDir, { recursive: true });
   const buffer = Buffer.from(await file.arrayBuffer());
-  const targetPath = uniqueTargetPath(targetDir, fileName);
-  fs.writeFileSync(targetPath, buffer);
+  let createdPath: string | null = null;
+  let transactionCommitted = false;
+  try {
+    const attachment = await db.transaction(async (tx) => {
+      const [project] = await tx
+        .select()
+        .from(projects)
+        .where(eq(projects.id, task.projectId))
+        .limit(1)
+        .for("update");
+      if (!project || project.deletedAt) throw new Error("Project not found");
 
-  const relativePath = projectRelativePath(storageRoot, targetPath);
-  const mimeType = file.type || null;
-  const [attachment] = await db
-    .insert(taskAttachments)
-    .values({
-      taskId: id,
-      projectId: task.projectId,
-      filePath: relativePath,
-      displayName: path.basename(targetPath),
-      mimeType,
-      sizeBytes: buffer.byteLength,
-      kind: attachmentKind(mimeType, fileName),
-      createdBy: user.id,
-      attachmentMetadata: {},
-    })
-    .returning();
+      const [principal] = await tx
+        .select({ role: users.role })
+        .from(users)
+        .where(eq(users.id, user.id))
+        .limit(1);
+      const [membership] = await tx
+        .select({ permissions: projectMembers.permissions })
+        .from(projectMembers)
+        .where(
+          and(
+            eq(projectMembers.projectId, task.projectId),
+            eq(projectMembers.userId, user.id),
+          ),
+        )
+        .limit(1);
+      const canWrite =
+        principal?.role === "admin" ||
+        project.ownerId === user.id ||
+        hasProjectPermission(membership?.permissions, "write");
+      if (!canWrite) throw new ProjectPermissionError();
 
-  return NextResponse.json(serializeAttachment(attachment, id), { status: 201 });
+      const lockedStorageRoot = ensureProjectStorageRoot(task.projectId);
+      const lockedTargetDir = path.resolve(
+        /*turbopackIgnore: true*/
+        lockedStorageRoot,
+        "attachments",
+        "tasks",
+        id,
+      );
+      if (!isPathInsideProjectStorageRoot(lockedStorageRoot, lockedTargetDir)) {
+        throw new Error("Invalid attachment path");
+      }
+
+      const usage = calculateProjectStorageUsage(lockedStorageRoot);
+      const quotaMb =
+        project.storageQuotaMb === null
+          ? 1000
+          : Math.max(0, Number(project.storageQuotaMb));
+      if (usage.totalBytes + buffer.byteLength > quotaMb * 1024 * 1024) {
+        throw new ProjectQuotaExceededError();
+      }
+
+      fs.mkdirSync(lockedTargetDir, { recursive: true });
+      if (!isPathInsideProjectStorageRoot(lockedStorageRoot, lockedTargetDir)) {
+        throw new Error("Invalid attachment path");
+      }
+      createdPath = writeUniqueUploadFile(lockedTargetDir, fileName, buffer);
+      if (!isPathInsideProjectStorageRoot(lockedStorageRoot, createdPath)) {
+        throw new Error("Invalid attachment path");
+      }
+
+      const relativePath = projectRelativePath(lockedStorageRoot, createdPath);
+      const mimeType = file.type || null;
+      const [row] = await tx
+        .insert(taskAttachments)
+        .values({
+          taskId: id,
+          projectId: task.projectId,
+          filePath: relativePath,
+          displayName: path.basename(createdPath),
+          mimeType,
+          sizeBytes: buffer.byteLength,
+          kind: attachmentKind(mimeType, fileName),
+          createdBy: user.id,
+          attachmentMetadata: {},
+        })
+        .returning();
+      await tx
+        .update(projects)
+        .set({
+          storageUsedMb: (usage.totalBytes + buffer.byteLength) / (1024 * 1024),
+          updatedAt: new Date(),
+        })
+        .where(eq(projects.id, task.projectId));
+      return row;
+    });
+    transactionCommitted = true;
+    return NextResponse.json(serializeAttachment(attachment, id), { status: 201 });
+  } catch (error) {
+    if (!transactionCommitted && createdPath) {
+      try {
+        if (isPathInsideProjectStorageRoot(storageRoot, createdPath)) {
+          const item = fs.lstatSync(createdPath);
+          if (!item.isSymbolicLink() && item.isFile()) {
+            fs.rmSync(createdPath, { force: true });
+          }
+        }
+      } catch {
+        console.warn("Failed to remove orphaned task attachment", createdPath);
+      }
+    }
+    if (error instanceof ProjectQuotaExceededError) {
+      return NextResponse.json({ detail: error.message }, { status: 413 });
+    }
+    if (error instanceof ProjectPermissionError) {
+      return NextResponse.json({ detail: error.message }, { status: 403 });
+    }
+    if (error instanceof Error && error.message === "Project not found") {
+      return NextResponse.json({ detail: error.message }, { status: 404 });
+    }
+    throw error;
+  }
 }

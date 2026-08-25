@@ -9,7 +9,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import stat
+import tempfile
+import asyncio
+from os import PathLike
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 from urllib.parse import quote
@@ -23,16 +28,14 @@ from ..memory.models import (
     ConversationParticipant,
     ConversationSession,
     KnowledgeNode,
-    KnowledgeWorkspace,
-    Project,
-    ProjectMember,
-    Space,
+    DocsLibrary,
     Tag,
     Task,
     TaskAttachment,
     TaskReference,
 )
 from ..memory.project_repository import ProjectRepository
+from ..services.docs_acl import can_read_node
 from ..services.google_calendar_service import (
     GoogleCalendarService,
     GoogleCalendarServiceError,
@@ -41,6 +44,15 @@ from ..services.task_management_service import (
     TaskManagementError,
     TaskManagementService,
 )
+from ..services.space_access import (
+    can_write_space as _space_can_write_space,
+    get_readable_space as _space_get_readable_space,
+    is_admin_user as _space_is_admin_user,
+    is_inbox_space as _space_is_inbox_space,
+    load_space as _space_load_space,
+    member_space_ids as _space_member_space_ids,
+)
+from ..tools.file_explorer.storage_context import calculate_storage_usage
 from .routes.tasks import (
     register_attachment_routes,
     register_google_calendar_routes,
@@ -70,6 +82,8 @@ from .routes.tasks._shared import (  # noqa: F401  (既存 import 面を維持)
     UpdateTaskPayload,
     UpdateTimeEntryPayload,
     UserNotificationPreferencesPayload,
+    WebPushSubscriptionPayload,
+    WebPushSubscriptionDeletePayload,
     _build_update_task_updates,
     _deep_merge_settings,
     _parse_datetime,
@@ -89,24 +103,31 @@ def create_task_router(
     get_user_from_request,
     require_auth_dependency,
     broadcaster=None,
+    workspace_root: "str | PathLike[str] | None" = None,
 ) -> APIRouter:
-    """Create task management router with injected dependencies."""
+    """Create task management router with injected dependencies.
+
+    Args:
+        workspace_root: App/Project library root。``None`` なら
+            ``AOITALK_WORKSPACES_DIR`` 由来の既定 root を使う。Space 削除は配下
+            Project の library を消すため、ロック取得先と削除先が同じ root に
+            なるよう、この値をそのまま ``TaskRouterContext`` へ透過する。
+    """
 
     router = APIRouter(prefix="/api", tags=["tasks"])
     service = TaskManagementService(broadcaster=broadcaster)
     google_calendar = GoogleCalendarService()
-    from ..tools.file_explorer import get_root_dir as get_workspace_root
+    from ..tools.file_explorer import (
+        get_root_dir as get_workspace_root,
+        is_safe_workspace_path,
+    )
 
-    blocked_attachment_extensions = {
-        ".exe",
-        ".bat",
-        ".cmd",
-        ".sh",
-        ".ps1",
-        ".vbs",
-        ".scr",
-        ".com",
-    }
+    effective_workspace_root = (
+        Path(workspace_root).expanduser().resolve()
+        if workspace_root is not None
+        else get_workspace_root().resolve()
+    )
+    effective_workspace_root.mkdir(parents=True, exist_ok=True)
 
     async def _get_current_user(request: Request) -> tuple[UUID, dict[str, Any]]:
         user_info = await get_user_from_request(request)
@@ -138,10 +159,44 @@ def create_task_router(
         stem = candidate.stem
         suffix = candidate.suffix
         index = 1
-        while candidate.exists():
+        while True:
+            try:
+                candidate.lstat()
+            except FileNotFoundError:
+                return candidate
+            except OSError:
+                pass
             candidate = target_dir / f"{stem}-{index}{suffix}"
             index += 1
-        return candidate
+
+    def _write_unique_target_file(
+        target_dir: Path, file_name: str, content: bytes
+    ) -> Path:
+        """Publish one attachment atomically under the project row lock."""
+        target_dir.mkdir(parents=True, exist_ok=True)
+        candidate = _unique_target_path(target_dir, file_name)
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=target_dir,
+                prefix=".aoitalk-upload-",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, candidate)
+            temporary_path = None
+            return candidate
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Failed to remove temporary attachment: %s", temporary_path)
 
     def _attachment_kind(mime_type: Optional[str], file_name: str) -> str:
         if mime_type and mime_type.startswith("image/"):
@@ -252,8 +307,8 @@ def create_task_router(
                 node_id = None
             if node_id:
                 result = await session.execute(
-                    select(KnowledgeNode, KnowledgeWorkspace.owner_user_id)
-                    .join(KnowledgeWorkspace, KnowledgeNode.workspace_id == KnowledgeWorkspace.id)
+                    select(KnowledgeNode, DocsLibrary.owner_user_id)
+                    .join(DocsLibrary, KnowledgeNode.docs_library_id == DocsLibrary.id)
                     .where(
                         KnowledgeNode.id == node_id,
                         KnowledgeNode.archived_at.is_(None),
@@ -262,18 +317,7 @@ def create_task_router(
                 row = result.first()
                 if row:
                     candidate, owner_id = row
-                    if candidate.project_id:
-                        try:
-                            await service.require_project_permission(
-                                session,
-                                project_id=candidate.project_id,
-                                user_id=user_id,
-                                permission="read",
-                            )
-                            node = candidate
-                        except TaskManagementError:
-                            pass
-                    elif owner_id == user_id:
+                    if await can_read_node(session, candidate, user_id):
                         node = candidate
             if node is None:
                 data.update({"subtitle": "参照先が見つかりません", "exists": False})
@@ -292,7 +336,7 @@ def create_task_router(
                 except (HTTPException, OSError):
                     exists = False
                 data["exists"] = exists
-                data["subtitle"] = "workspace" if exists else "参照先が見つかりません"
+                data["subtitle"] = "library" if exists else "参照先が見つかりません"
         elif reference.reference_type == "url":
             data["subtitle"] = "URL"
             data["exists"] = bool(reference.target_url)
@@ -311,17 +355,20 @@ def create_task_router(
 
     async def _project_storage_root(project_id: UUID) -> tuple[str, Path]:
         storage_root = await ProjectRepository.get_storage_path(project_id)
-        root_path = get_workspace_root() / storage_root
+        root_path = effective_workspace_root / storage_root
+        if not is_safe_workspace_path(effective_workspace_root, root_path):
+            raise HTTPException(status_code=400, detail="Invalid project storage path")
         root_path.mkdir(parents=True, exist_ok=True)
+        if not is_safe_workspace_path(effective_workspace_root, root_path):
+            raise HTTPException(status_code=400, detail="Invalid project storage path")
         return storage_root, root_path
 
     def _resolve_attachment_file(root_path: Path, file_path: str) -> Path:
         clean = _validate_project_relative_path(file_path)
-        target = (root_path / clean).resolve()
-        root_resolved = root_path.resolve()
-        if root_resolved not in target.parents and target != root_resolved:
+        lexical_target = root_path / clean
+        if not is_safe_workspace_path(root_path, lexical_target):
             raise HTTPException(status_code=400, detail="Invalid attachment path")
-        return target
+        return lexical_target.resolve()
 
     def _with_pending_agent_triage(metadata: Optional[dict[str, Any]]) -> dict[str, Any]:
         next_metadata = dict(metadata or {})
@@ -345,7 +392,7 @@ def create_task_router(
         if re.search(r"backend|api|db|database|migration", text, re.I):
             execution.append("Align backend API, DB model/migration, and permission checks.")
         if re.search(r"upload|file|attachment", text, re.I):
-            execution.append("Implement storage path, blocked-extension handling, UI refresh, and failure handling.")
+            execution.append("Implement storage path, UI refresh, and failure handling.")
         if re.search(r"bug|fix|overflow|position|failure|error", text, re.I):
             execution.append("Lock down reproduction and make the smallest compatible fix.")
         if not execution and not investigation:
@@ -371,60 +418,15 @@ def create_task_router(
     ) -> HTTPException:
         return HTTPException(status_code=exc.status_code, detail=exc.message)
 
-    def _is_inbox_space(space: Space) -> bool:
-        """ユーザー専用 Inbox スペースかどうか（Web BFF の isInboxSpace と同期）。"""
-        return space.slug == f"inbox-{space.owner_id}"
-
-    def _is_admin_user(user_info: dict[str, Any]) -> bool:
-        return str(user_info.get("role") or "") == "admin"
-
-    async def _member_space_ids(session, user_id: UUID) -> set[UUID]:
-        result = await session.execute(
-            select(Project.space_id)
-            .join(ProjectMember, ProjectMember.project_id == Project.id)
-            .where(
-                ProjectMember.user_id == user_id,
-                Project.space_id.isnot(None),
-            )
-        )
-        return set(result.scalars().all())
-
-    async def _load_space(session, space_id: str) -> Optional[Space]:
-        parsed = parse_uuid_or_400(space_id, "space_id")
-        result = await session.execute(select(Space).where(Space.id == parsed))
-        return result.scalar_one_or_none()
-
-    async def _get_readable_space(
-        session, *, space_id: str, user_id: UUID, user_info: dict[str, Any]
-    ) -> Optional[Space]:
-        space = await _load_space(session, space_id)
-        if space is None:
-            return None
-        if _is_inbox_space(space):
-            return space if space.owner_id == user_id else None
-        if space.owner_id == user_id or _is_admin_user(user_info):
-            return space
-        result = await session.execute(
-            select(ProjectMember.project_id)
-            .join(Project, Project.id == ProjectMember.project_id)
-            .where(
-                ProjectMember.user_id == user_id,
-                Project.space_id == space.id,
-            )
-            .limit(1)
-        )
-        return space if result.scalar_one_or_none() is not None else None
-
-    async def _can_write_space(
-        session, *, space_id: str, user_id: UUID, user_info: dict[str, Any]
-    ) -> tuple[bool, Optional[Space]]:
-        """スペースへの書き込み可否（Web BFF の canWriteSpace と同期）。"""
-        space = await _load_space(session, space_id)
-        if space is None:
-            return False, None
-        if _is_inbox_space(space):
-            return space.owner_id == user_id, space
-        return space.owner_id == user_id or _is_admin_user(user_info), space
+    # Space の ACL は Files API と同じ共有 policy を使う。各 callable を
+    # Context へ詰めることで、既存の register モジュール／テストの注入面を
+    # 変えずに既存 TaskRouterContext の挙動を維持する。
+    _is_inbox_space = _space_is_inbox_space
+    _is_admin_user = _space_is_admin_user
+    _member_space_ids = _space_member_space_ids
+    _load_space = _space_load_space
+    _get_readable_space = _space_get_readable_space
+    _can_write_space = _space_can_write_space
 
     async def _load_task_for_google_calendar(
         session, *, user_id: UUID, task_id: str
@@ -514,18 +516,19 @@ def create_task_router(
         require_auth_dependency=require_auth_dependency,
         service=service,
         google_calendar=google_calendar,
-        blocked_attachment_extensions=blocked_attachment_extensions,
         get_current_user=_get_current_user,
         space_slug=_space_slug,
         sanitize_file_name=_sanitize_file_name,
         validate_project_relative_path=_validate_project_relative_path,
         unique_target_path=_unique_target_path,
+        write_unique_target_file=_write_unique_target_file,
         attachment_kind=_attachment_kind,
         serialize_attachment=_serialize_attachment,
         serialize_task_reference=_serialize_task_reference,
         load_task_for_attachment=_load_task_for_attachment,
         project_storage_root=_project_storage_root,
         resolve_attachment_file=_resolve_attachment_file,
+        is_safe_workspace_path=is_safe_workspace_path,
         with_pending_agent_triage=_with_pending_agent_triage,
         triage_task=_triage_task,
         translate_google_calendar_error=_translate_google_calendar_error,
@@ -540,6 +543,7 @@ def create_task_router(
         delete_google_calendar_warning_only=_delete_google_calendar_warning_only,
         load_tag=_load_tag,
         translate_service_error=_translate_service_error,
+        workspace_root=workspace_root,
     )
 
     register_space_routes(router, ctx)

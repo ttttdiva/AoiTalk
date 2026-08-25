@@ -1,4 +1,4 @@
-"""Shared helpers for resolving the canonical Docs workspace."""
+"""Shared helpers for resolving the canonical Docs library."""
 
 from __future__ import annotations
 
@@ -10,17 +10,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..memory.models import (
     KnowledgeField,
+    KnowledgeNode,
+    KnowledgeNodeSupertag,
     KnowledgeSupertag,
     KnowledgeSupertagField,
-    KnowledgeWorkspace,
+    DocsLibrary,
+    Project,
 )
+from ..memory.project_repository import ProjectRepository
 
-DOCS_WORKSPACE_NAME = "Personal Docs"
-DOCS_WORKSPACE_DESCRIPTION = "AoiTalk DBを正本にするDocsワークスペース"
-DOCS_WORKSPACE_SETTINGS: dict[str, Any] = {
+DOCS_LIBRARY_NAME = "Personal Docs"
+DOCS_LIBRARY_DESCRIPTION = "AoiTalk DBを正本にするDocsライブラリ"
+DOCS_LIBRARY_SETTINGS: dict[str, Any] = {
     "canonical_store": "postgresql",
     "derived_index": "qdrant",
 }
+
+# Legacy constant aliases for extensions that still import the old names.
+DOCS_WORKSPACE_NAME = DOCS_LIBRARY_NAME
+DOCS_WORKSPACE_DESCRIPTION = DOCS_LIBRARY_DESCRIPTION
+DOCS_WORKSPACE_SETTINGS = DOCS_LIBRARY_SETTINGS
 
 DEFAULT_DOCS_SUPERTAGS: list[dict[str, Any]] = [
     {
@@ -108,6 +117,69 @@ DEFAULT_DOCS_SUPERTAGS: list[dict[str, Any]] = [
         "ai_instructions": "1メール=1ノード。ヘッダー、本文、原本パスを保持し、同一プロジェクト内の質問へ根拠として使う。",
     },
     {
+        "name": "メールメッセージ",
+        "system_key": "email_message",
+        "base_type": "email",
+        "description": "メール原本の引用チェーンから復元した、個別に参照できる1通",
+        "icon": "mail-open",
+        "color": "#0ea5e9",
+        "pinned_field_names": ["送信日時", "From"],
+        "fields": [
+            {"name": "件名", "system_key": "email_message_subject", "field_type": "text"},
+            {"name": "送信日時", "system_key": "email_message_date", "field_type": "text"},
+            {"name": "From", "system_key": "email_message_from", "field_type": "text"},
+            {"name": "To", "system_key": "email_message_to", "field_type": "long_text"},
+            {"name": "CC", "system_key": "email_message_cc", "field_type": "long_text"},
+            {"name": "本文", "system_key": "email_message_body", "field_type": "long_text"},
+            {"name": "原本", "system_key": "email_message_source", "field_type": "reference"},
+            {"name": "復元キー", "system_key": "email_message_source_key", "field_type": "text"},
+        ],
+        "ai_instructions": "メールの経緯を裏付ける個別メッセージ。要約の事実は該当メッセージへ直接リンクする。",
+    },
+    {
+        "name": "Inbox項目",
+        "system_key": "work_intake",
+        "base_type": "record",
+        "description": "/inboxで受け付けた問い合わせ・依頼・情報共有の管理単位",
+        "icon": "inbox",
+        "color": "#6366f1",
+        "pinned_field_names": ["Inbox ID", "対応状態", "受付日時"],
+        "fields": [
+            {"name": "Inbox ID", "system_key": "inbox_item_id", "field_type": "text"},
+            {
+                "name": "分類",
+                "system_key": "inbox_classification",
+                "field_type": "options",
+                "options_json": {"values": ["質問", "依頼", "情報共有"]},
+            },
+            {
+                "name": "対応状態",
+                "system_key": "inbox_status",
+                "field_type": "options",
+                "options_json": {
+                    "values": ["受付", "対応中", "確認待ち", "レビュー待ち", "完了", "保存のみ"]
+                },
+                "default_value_json": "受付",
+            },
+            {
+                "name": "受付元",
+                "system_key": "inbox_source_type",
+                "field_type": "options",
+                "options_json": {"values": ["チャット", "メール", "複合"]},
+            },
+            {"name": "受付日時", "system_key": "inbox_received_at", "field_type": "date"},
+            {"name": "最終更新", "system_key": "inbox_last_updated_at", "field_type": "date"},
+            {"name": "受付内容", "system_key": "inbox_instruction", "field_type": "long_text"},
+            {"name": "取りまとめ", "system_key": "inbox_summary", "field_type": "long_text"},
+        ],
+        "ai_instructions": (
+            "1回の/inbox受付を1つのInbox項目として扱う。"
+            "概要を最優先し、内容に必要な章だけを作る。複数回の応酬は経緯を意味的に要約し、"
+            "各事実の直下へ根拠をリンクする。確認事項・次の対応・参考資料・更新履歴を固定で作らない。"
+            "追加情報は同じUUIDの文書全体へ統合し、新しい項目を推測で作らない。"
+        ),
+    },
+    {
         "name": "Day",
         "system_key": "day",
         "base_type": "day",
@@ -152,11 +224,11 @@ DEFAULT_DOCS_SUPERTAGS: list[dict[str, Any]] = [
 ]
 
 
-async def seed_default_docs_supertags(session: AsyncSession, workspace: KnowledgeWorkspace) -> None:
+async def seed_default_docs_supertags(session: AsyncSession, library: DocsLibrary) -> None:
     """Ensure Python-side Docs tools see the same system tags as the Next.js UI."""
 
     result = await session.execute(
-        select(KnowledgeSupertag).where(KnowledgeSupertag.workspace_id == workspace.id)
+        select(KnowledgeSupertag).where(KnowledgeSupertag.docs_library_id == library.id)
     )
     existing_tags = list(result.scalars().all())
     tags_by_name = {tag.name: tag for tag in existing_tags}
@@ -168,7 +240,7 @@ async def seed_default_docs_supertags(session: AsyncSession, workspace: Knowledg
         tag = tag or tags_by_name.get(spec["name"])
         if tag is None:
             tag = KnowledgeSupertag(
-                workspace_id=workspace.id,
+                docs_library_id=library.id,
                 system_key=system_key,
                 name=spec["name"],
                 base_type=spec["base_type"],
@@ -187,6 +259,19 @@ async def seed_default_docs_supertags(session: AsyncSession, workspace: Knowledg
                 tags_by_system_key[tag.system_key] = tag
         else:
             changed = False
+            desired_name = spec.get("name")
+            name_conflict = (
+                next(
+                    (
+                        other
+                        for other in existing_tags
+                        if other.id != tag.id and other.name == desired_name
+                    ),
+                    None,
+                )
+                if desired_name
+                else None
+            )
             for attr, key in [
                 ("system_key", "system_key"),
                 ("base_type", "base_type"),
@@ -199,6 +284,9 @@ async def seed_default_docs_supertags(session: AsyncSession, workspace: Knowledg
                 if value and getattr(tag, attr) != value:
                     setattr(tag, attr, value)
                     changed = True
+            if desired_name and tag.name != desired_name and name_conflict is None:
+                tag.name = desired_name
+                changed = True
             # config_json.tools を spec と同期する(既存キーは温存しマージ)。
             spec_config = spec.get("config_json")
             if spec_config is not None:
@@ -225,7 +313,7 @@ async def seed_default_docs_supertags(session: AsyncSession, workspace: Knowledg
             field = field or fields_by_name.get(field_spec["name"])
             if field is None:
                 field = KnowledgeField(
-                    workspace_id=workspace.id,
+                    docs_library_id=library.id,
                     supertag_id=tag.id,
                     system_key=field_key,
                     name=field_spec["name"],
@@ -272,48 +360,214 @@ async def seed_default_docs_supertags(session: AsyncSession, workspace: Knowledg
     await session.flush()
 
 
-async def ensure_docs_workspace(
+async def ensure_docs_library(
     session: AsyncSession,
     *,
     owner_user_id: UUID | None,
-) -> KnowledgeWorkspace:
-    """Return the single canonical Docs workspace for a user."""
+) -> DocsLibrary:
+    """Return the single canonical Docs library for a user."""
 
-    workspace_result = await session.execute(
-        select(KnowledgeWorkspace)
-        .where(KnowledgeWorkspace.owner_user_id == owner_user_id)
+    library_result = await session.execute(
+        select(DocsLibrary)
+        .where(DocsLibrary.owner_user_id == owner_user_id)
         .order_by(
-            (KnowledgeWorkspace.name == DOCS_WORKSPACE_NAME).desc(),
-            KnowledgeWorkspace.created_at,
+            (DocsLibrary.name == DOCS_LIBRARY_NAME).desc(),
+            DocsLibrary.created_at,
         )
         .limit(1)
     )
-    workspace = workspace_result.scalar_one_or_none()
-    if workspace is None:
-        workspace = KnowledgeWorkspace(
-            name=DOCS_WORKSPACE_NAME,
-            description=DOCS_WORKSPACE_DESCRIPTION,
-            owner_user_id=owner_user_id,
-            settings_json=DOCS_WORKSPACE_SETTINGS,
-        )
-        session.add(workspace)
+    library = library_result.scalar_one_or_none()
+    if library is None:
+        kwargs: dict[str, Any] = {
+            "name": DOCS_LIBRARY_NAME,
+            "description": DOCS_LIBRARY_DESCRIPTION,
+            "owner_user_id": owner_user_id,
+            "settings_json": DOCS_LIBRARY_SETTINGS,
+        }
+        kwargs["library_type"] = "personal"
+        library = DocsLibrary(**kwargs)
+        session.add(library)
         await session.flush()
-        await seed_default_docs_supertags(session, workspace)
-        return workspace
+        await seed_default_docs_supertags(session, library)
+        return library
 
     changed = False
-    if workspace.name != DOCS_WORKSPACE_NAME:
-        workspace.name = DOCS_WORKSPACE_NAME
+    if getattr(library, "library_type", "personal") != "personal":
+        # A legacy row keyed only by owner_user_id is necessarily personal;
+        # do not let stale settings classify it as a shared Project library.
+        library.library_type = "personal"
         changed = True
-    if not workspace.description:
-        workspace.description = DOCS_WORKSPACE_DESCRIPTION
+    if library.name != DOCS_LIBRARY_NAME:
+        library.name = DOCS_LIBRARY_NAME
         changed = True
-    current_settings = workspace.settings_json if isinstance(workspace.settings_json, dict) else {}
-    merged_settings = {**DOCS_WORKSPACE_SETTINGS, **current_settings}
+    if not library.description:
+        library.description = DOCS_LIBRARY_DESCRIPTION
+        changed = True
+    current_settings = library.settings_json if isinstance(library.settings_json, dict) else {}
+    merged_settings = {**DOCS_LIBRARY_SETTINGS, **current_settings}
     if merged_settings != current_settings:
-        workspace.settings_json = merged_settings
+        library.settings_json = merged_settings
         changed = True
     if changed:
         await session.flush()
-    await seed_default_docs_supertags(session, workspace)
-    return workspace
+    await seed_default_docs_supertags(session, library)
+    return library
+
+
+async def get_project_docs_library(
+    session: AsyncSession,
+    *,
+    project_id: UUID,
+    actor_user_id: UUID | None = None,
+) -> DocsLibrary | None:
+    """Read the project owner's canonical Personal Docs Library.
+
+    This resolver is intentionally SELECT-only: it never creates, repairs or
+    seeds a library/supertag.  Callers that only have Project ``read``
+    permission must use it so a GET/sync request cannot mutate the database.
+    ``None`` means the Project or canonical library is missing/invalid and
+    callers should map it to a uniform 404 response.
+    """
+
+    try:
+        normalized_project_id = UUID(str(project_id))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Projectが見つかりません") from exc
+
+    project = await session.get(Project, normalized_project_id)
+    if project is None or project.deleted_at is not None:
+        return None
+    if actor_user_id is not None:
+        try:
+            actor = UUID(str(actor_user_id))
+        except (TypeError, ValueError) as exc:
+            raise PermissionError("Projectへの読み取り権限がありません") from exc
+        allowed = await ProjectRepository.has_permission(
+            session,
+            project_id=normalized_project_id,
+            user_id=actor,
+            permission="read",
+        )
+        if not allowed:
+            raise PermissionError("Projectへの読み取り権限がありません")
+
+    # Project Docs are no longer stored in a project-scoped library. Resolve
+    # the pointer node and return its owner's Personal Docs Library only when
+    # the pointer is already a valid project root. Read paths never create or
+    # repair a missing pointer; the write/bootstrap helper below does that.
+    pointer_id = getattr(project, "knowledge_node_id", None)
+    if pointer_id is None:
+        return None
+    node = await session.get(KnowledgeNode, pointer_id)
+    if node is None or node.project_id != normalized_project_id:
+        return None
+    # Runtime reads must validate the complete canonical pointer contract;
+    # accepting an arbitrary project-tagged node would let a stale pointer
+    # expose unrelated Personal metadata.  Do not repair anything here.
+    library = await session.get(DocsLibrary, node.docs_library_id)
+    if library is None:
+        return None
+    if (
+        str(getattr(library, "library_type", "personal") or "personal").lower()
+        != "personal"
+        or getattr(library, "owner_user_id", None) != project.owner_id
+        or getattr(node, "archived_at", None) is not None
+        or str(getattr(node, "system_key", "") or "")
+        != f"project_information:{normalized_project_id}"
+        or getattr(node, "parent_id", None) is None
+    ):
+        return None
+
+    hub = await session.get(KnowledgeNode, node.parent_id)
+    if (
+        hub is None
+        or hub.id != node.parent_id
+        or hub.docs_library_id != library.id
+        or getattr(hub, "archived_at", None) is not None
+        or str(getattr(hub, "system_key", "") or "")
+        != "project_information_root"
+        or getattr(hub, "parent_id", None) is not None
+        or getattr(hub, "project_id", None) is not None
+        or getattr(hub, "root_page_id", None) not in (None, hub.id)
+        or getattr(node, "root_page_id", None) != hub.id
+    ):
+        return None
+
+    # The canonical Project Information supertag is part of the pointer
+    # identity.  A node merely carrying an arbitrary tag must not be adopted
+    # as the project root.
+    tag_result = await session.execute(
+        select(KnowledgeNodeSupertag.node_id)
+        .join(KnowledgeSupertag, KnowledgeSupertag.id == KnowledgeNodeSupertag.supertag_id)
+        .where(
+            KnowledgeNodeSupertag.node_id == node.id,
+            KnowledgeSupertag.docs_library_id == library.id,
+            KnowledgeSupertag.system_key == "project_info",
+        )
+        .limit(1)
+    )
+    if tag_result.scalar_one_or_none() is None:
+        return None
+    return library
+
+
+async def ensure_project_docs_library(
+    session: AsyncSession,
+    *,
+    project_id: UUID,
+    actor_user_id: UUID | None = None,
+) -> DocsLibrary:
+    """Return the owner's Personal Docs Library for one Project.
+
+    Project identity remains on the canonical root/descendant nodes.  This
+    deprecated resolver name is retained for callers during the rolling rename;
+    it never creates a project-scoped library row.
+    """
+
+    normalized_project_id = UUID(str(project_id))
+    project = await session.get(Project, normalized_project_id)
+    if project is None or project.deleted_at is not None:
+        raise ValueError("Projectが見つかりません")
+    if actor_user_id is None:
+        raise PermissionError("Project Docsへの書き込み権限がありません")
+    try:
+        actor = UUID(str(actor_user_id))
+    except (TypeError, ValueError) as exc:
+        raise PermissionError("Project Docsへの書き込み権限がありません") from exc
+    allowed = await ProjectRepository.has_permission(
+        session,
+        project_id=normalized_project_id,
+        user_id=actor,
+        permission="write",
+    )
+    if not allowed:
+        raise PermissionError("Project Docsへの書き込み権限がありません")
+
+    # The canonical scope is always the project owner's Personal Docs Library.
+    # Only the owner may bootstrap/repair that library or seed default
+    # metadata.  A ProjectMember writer must consume the already validated
+    # owner library and canonical hub/project node without any write side
+    # effects (including name/settings/default-tag repair).
+    if actor == project.owner_id:
+        return await ensure_docs_library(
+            session,
+            owner_user_id=project.owner_id,
+        )
+
+    library = await get_project_docs_library(
+        session,
+        project_id=normalized_project_id,
+        actor_user_id=actor,
+    )
+    if library is None:
+        raise PermissionError(
+            "Project Docsのcanonical libraryまたは正本nodeが未初期化または不正です"
+        )
+    return library
+
+
+    # Deprecated Python aliases kept for integrations during the rolling rename.
+# New code should import the ``*_library`` names above.
+ensure_docs_workspace = ensure_docs_library
+get_project_docs_workspace = get_project_docs_library
+ensure_project_docs_workspace = ensure_project_docs_library

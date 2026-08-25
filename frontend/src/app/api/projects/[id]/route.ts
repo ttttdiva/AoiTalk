@@ -1,9 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
-import { projects, projectMembers } from "@/db/schema";
+import { projects } from "@/db/schema";
 import { eq, and, isNull } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
-import { getAccessibleProject } from "@/lib/server/project-access";
+import {
+  getAccessibleProject,
+  getProjectSettingsProject,
+} from "@/lib/server/project-access";
 import { proxyRequestToPythonApi } from "@/lib/server/python-api-proxy";
 import { canWriteSpace } from "@/lib/server/space-access";
 
@@ -77,10 +80,16 @@ export async function GET(
   const { id } = await params;
 
   const result = await getAccessibleProject(id, user.id);
-  if (!result) {
+  if (result === undefined) {
     return NextResponse.json(
       { detail: "プロジェクトが見つかりません" },
       { status: 404 }
+    );
+  }
+  if (result === null) {
+    return NextResponse.json(
+      { detail: "権限がありません" },
+      { status: 403 },
     );
   }
 
@@ -111,16 +120,8 @@ export async function PATCH(
     metadata,
   } = body;
 
-  // プロジェクトのadminメンバーか確認
-  const [membership] = await db
-    .select()
-    .from(projectMembers)
-    .where(
-      and(eq(projectMembers.projectId, id), eq(projectMembers.userId, user.id))
-    )
-    .limit(1);
-
-  if (!membership || (membership.role !== "admin" && user.role !== "admin")) {
+  const settingsProject = await getProjectSettingsProject(id, user);
+  if (!settingsProject) {
     return NextResponse.json(
       { detail: "権限がありません" },
       { status: 403 }
@@ -151,35 +152,45 @@ export async function PATCH(
   }
   if (is_completed !== undefined) updates.isCompleted = Boolean(is_completed);
 
-  if (
-    aliases !== undefined ||
-    color !== undefined ||
-    metadata !== undefined
-  ) {
-    const [current] = await db
-      .select({ projectMetadata: projects.projectMetadata })
+  // Project metadata also contains the bounded management upload
+  // idempotency ledger.  Lock and re-read the row in the write transaction so
+  // a concurrent upload cannot be erased by a stale metadata snapshot.
+  const updated = await db.transaction(async (tx) => {
+    const [current] = await tx
+      .select()
       .from(projects)
       .where(and(eq(projects.id, id), isNull(projects.deletedAt)))
-      .limit(1);
-    const mergedMetadata = {
-      ...parseProjectMetadata(current?.projectMetadata),
-      ...parseProjectMetadata(metadata),
-    };
-    if (aliases !== undefined) {
-      mergedMetadata.aliases = normalizeAliases(aliases);
-    }
-    if (color !== undefined) {
-      mergedMetadata.color =
-        typeof color === "string" && color.trim() ? color.trim() : null;
-    }
-    updates.projectMetadata = mergedMetadata;
-  }
+      .limit(1)
+      .for("update");
+    if (!current) return undefined;
 
-  const [updated] = await db
-    .update(projects)
-    .set(updates)
-    .where(and(eq(projects.id, id), isNull(projects.deletedAt)))
-    .returning();
+    const transactionUpdates: Record<string, unknown> = { ...updates };
+    if (
+      aliases !== undefined ||
+      color !== undefined ||
+      metadata !== undefined
+    ) {
+      const mergedMetadata = {
+        ...parseProjectMetadata(current.projectMetadata),
+        ...parseProjectMetadata(metadata),
+      };
+      if (aliases !== undefined) {
+        mergedMetadata.aliases = normalizeAliases(aliases);
+      }
+      if (color !== undefined) {
+        mergedMetadata.color =
+          typeof color === "string" && color.trim() ? color.trim() : null;
+      }
+      transactionUpdates.projectMetadata = mergedMetadata;
+    }
+
+    const [row] = await tx
+      .update(projects)
+      .set(transactionUpdates)
+      .where(and(eq(projects.id, id), isNull(projects.deletedAt)))
+      .returning();
+    return row;
+  });
 
   if (!updated) {
     return NextResponse.json(

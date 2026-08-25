@@ -15,15 +15,28 @@ from ..memory.models import (
     KnowledgeRevision,
     KnowledgeSearchIndex,
     KnowledgeSupertag,
+    DocsLibrary,
     Project,
 )
-from .docs_workspace import ensure_docs_workspace
+from .docs_workspace import ensure_project_docs_library
 from .docs_graph_service import DocsGraphService
 
 
 PROJECT_INFORMATION_SUPERTAG = "案件情報"
 PROJECT_INFORMATION_SYSTEM_KEY = "project_info"
 PROJECT_INFORMATION_ROOT_SYSTEM_KEY = "project_information_root"
+PROJECT_INFORMATION_SECTIONS = (
+    "概要",
+    "進捗",
+    "課題管理",
+    "決定事項",
+    "確認事項",
+    "要確認",
+    "構成",
+    "詳細設計",
+    "検証",
+    "参照",
+)
 
 
 def _clean_markdown(value: Any, *, max_chars: int = 200000) -> str:
@@ -50,31 +63,65 @@ def is_default_inbox_project(project: Project) -> bool:
 async def ensure_project_information_root(
     session: AsyncSession,
     *,
-    workspace_id: UUID,
+    docs_library_id: UUID,
     user_id: UUID | None,
 ) -> KnowledgeNode:
+    library = await session.get(DocsLibrary, docs_library_id)
+    if library is None:
+        raise ValueError("Docs Libraryが見つかりません")
+    owner_id = getattr(library, "owner_user_id", None)
+    if (
+        str(getattr(library, "library_type", "personal") or "personal").lower()
+        != "personal"
+        or owner_id is None
+    ):
+        raise ValueError("案件情報hubはowner付きPersonal Docs Libraryに限られます")
+
     await session.execute(
         text("select pg_advisory_xact_lock(hashtext(:lock_key))"),
-        {"lock_key": f"{workspace_id}:project-information-root"},
+        {"lock_key": f"{docs_library_id}:project-information-root"},
     )
     result = await session.execute(
         select(KnowledgeNode)
         .where(
-            KnowledgeNode.workspace_id == workspace_id,
+            KnowledgeNode.docs_library_id == docs_library_id,
             KnowledgeNode.system_key == PROJECT_INFORMATION_ROOT_SYSTEM_KEY,
         )
         .limit(1)
     )
     root = result.scalar_one_or_none()
+    is_owner = str(user_id or "") == str(owner_id or "")
     if root is None:
+        # The hub is owner-private Personal metadata.  A Project writer may
+        # create/edit project-bound children, but may not bootstrap or repair
+        # this hub on behalf of the owner.
+        if not is_owner:
+            raise PermissionError("案件情報hubの作成・修復はPersonal Library所有者のみ許可されています")
+        root_creator = owner_id or user_id
         root = await DocsGraphService(session).create_node(
-            workspace_id=workspace_id,
-            user_id=user_id,
+            docs_library_id=docs_library_id,
+            user_id=root_creator,
             title="案件情報",
             system_key=PROJECT_INFORMATION_ROOT_SYSTEM_KEY,
             body_json={"format": "project_information_collection"},
             sort_order=1,
         )
+    else:
+        root_needs_repair = bool(
+            root.docs_library_id != docs_library_id
+            or getattr(root, "system_key", None) != PROJECT_INFORMATION_ROOT_SYSTEM_KEY
+            or getattr(root, "parent_id", None) is not None
+            or getattr(root, "project_id", None) is not None
+            or getattr(root, "archived_at", None) is not None
+            or getattr(root, "root_page_id", None) not in (None, root.id)
+        )
+        if root_needs_repair and not is_owner:
+            raise PermissionError("案件情報hubの修復はPersonal Library所有者のみ許可されています")
+        # A valid hub is owner-private metadata.  Project members may resolve
+        # it as a read-only parent for their project-bound child, but must not
+        # rewrite its title/body, updated_by, search index, or timestamps.
+        if not root_needs_repair and not is_owner:
+            return root
     root.title = "案件情報"
     root.body_text = root.title
     root.parent_id = None
@@ -110,7 +157,7 @@ async def _upsert_search_index(session: AsyncSession, node: KnowledgeNode) -> No
     if row is None:
         row = KnowledgeSearchIndex(node_id=node.id)
         session.add(row)
-    row.workspace_id = node.workspace_id
+    row.docs_library_id = node.docs_library_id
     row.project_id = node.project_id
     row.title_text = node.title or ""
     row.body_text_plain = node.body_text or ""
@@ -128,42 +175,107 @@ async def ensure_project_information_doc(
     if is_default_inbox_project(project):
         raise ValueError("Inboxは案件情報Docsの保存先にできません。実案件を指定してください。")
 
-    workspace = await ensure_docs_workspace(session, owner_user_id=user_id)
+    # Project information lives in the owner's Personal Docs Library.  The
+    # resolver checks Project write membership; node mutations re-check that
+    # ACL from ``project_id`` even though the parent hub itself is personal.
+    library = await ensure_project_docs_library(
+        session,
+        project_id=project.id,
+        actor_user_id=user_id,
+    )
+    if (
+        str(getattr(library, "library_type", "personal") or "personal").lower()
+        != "personal"
+        or getattr(library, "owner_user_id", None) != project.owner_id
+    ):
+        raise ValueError("案件情報Docsは案件所有者のPersonal Docs Libraryに限られます")
+
+    # Project members may write existing project-bound children, but they may
+    # not bootstrap or repair owner-private library metadata, the Personal
+    # 案件情報 hub, or the canonical Project Information root/tag.  The
+    # member resolver above is SELECT-only and validates the complete pointer
+    # contract; return that exact node without fallback-tag adoption,
+    # supertag creation/rename, or timestamp/search-index writes.
+    if str(user_id or "") != str(project.owner_id or ""):
+        pointer_id = project.knowledge_node_id
+        node = await session.get(KnowledgeNode, pointer_id) if pointer_id else None
+        if (
+            node is None
+            or node.docs_library_id != library.id
+            or node.project_id != project.id
+            or node.archived_at is not None
+            or node.system_key != f"project_information:{project.id}"
+            or node.parent_id is None
+            or node.root_page_id != node.parent_id
+        ):
+            raise PermissionError(
+                "Project Docsのcanonical正本は所有者以外には作成・修復できません"
+            )
+        exact_tag = await session.scalar(
+            select(KnowledgeNodeSupertag.node_id)
+            .join(KnowledgeSupertag, KnowledgeSupertag.id == KnowledgeNodeSupertag.supertag_id)
+            .where(
+                KnowledgeNodeSupertag.node_id == node.id,
+                KnowledgeSupertag.docs_library_id == library.id,
+                KnowledgeSupertag.system_key == PROJECT_INFORMATION_SYSTEM_KEY,
+            )
+            .limit(1)
+        )
+        if exact_tag is None:
+            raise PermissionError(
+                "Project Docsのcanonical project_infoタグは所有者以外には作成・修復できません"
+            )
+        return node
+
     root = await ensure_project_information_root(
         session,
-        workspace_id=workspace.id,
+        docs_library_id=library.id,
         user_id=user_id,
     )
     await session.execute(
         text("select pg_advisory_xact_lock(hashtext(:lock_key))"),
-        {"lock_key": f"{workspace.id}:project-information:{project.id}"},
+        {"lock_key": f"{library.id}:project-information:{project.id}"},
     )
 
     node = None
     if project.knowledge_node_id:
         node = await session.get(KnowledgeNode, project.knowledge_node_id)
         if node and (
-            node.workspace_id != workspace.id
+            node.docs_library_id != library.id
             or node.project_id != project.id
             or node.archived_at is not None
+            or node.parent_id != root.id
+            or node.root_page_id != root.id
+            or node.system_key != f"project_information:{project.id}"
         ):
             node = None
 
+    # Prefer the canonical system key.  A historical row may have retained
+    # only the display name; it can be upgraded by the Project owner before
+    # searching for a canonical node, but an arbitrary tag is never treated as
+    # the Project Information identity.
     tag_result = await session.execute(
         select(KnowledgeSupertag)
         .where(
-            KnowledgeSupertag.workspace_id == workspace.id,
-            or_(
-                KnowledgeSupertag.system_key == PROJECT_INFORMATION_SYSTEM_KEY,
-                KnowledgeSupertag.name == PROJECT_INFORMATION_SUPERTAG,
-            ),
+            KnowledgeSupertag.docs_library_id == library.id,
+            KnowledgeSupertag.system_key == PROJECT_INFORMATION_SYSTEM_KEY,
         )
         .limit(1)
     )
-    supertag = tag_result.scalar_one_or_none()
+    supertag = tag_result.scalars().first()
+    if supertag is None:
+        tag_result = await session.execute(
+            select(KnowledgeSupertag)
+            .where(
+                KnowledgeSupertag.docs_library_id == library.id,
+                KnowledgeSupertag.name == PROJECT_INFORMATION_SUPERTAG,
+            )
+            .limit(1)
+        )
+        supertag = tag_result.scalars().first()
     if supertag is None:
         supertag = KnowledgeSupertag(
-            workspace_id=workspace.id,
+            docs_library_id=library.id,
             system_key=PROJECT_INFORMATION_SYSTEM_KEY,
             name=PROJECT_INFORMATION_SUPERTAG,
             base_type="project_information",
@@ -179,16 +291,29 @@ async def ensure_project_information_doc(
         )
         session.add(supertag)
         await session.flush()
+    elif supertag.system_key != PROJECT_INFORMATION_SYSTEM_KEY:
+        # This is a canonical owner-side metadata migration, not adoption of
+        # an arbitrary tag.  The selected row is constrained to this library
+        # and exact display name above.
+        supertag.system_key = PROJECT_INFORMATION_SYSTEM_KEY
+        await session.flush()
 
-    if node is None and project.knowledge_node_id:
-        node = await session.get(KnowledgeNode, project.knowledge_node_id)
-        if node and (
-            node.workspace_id != workspace.id
-            or node.project_id != project.id
-            or node.archived_at is not None
-        ):
+    if node is not None:
+        pointer_tag = await session.scalar(
+            select(KnowledgeNodeSupertag.node_id).where(
+                KnowledgeNodeSupertag.node_id == node.id,
+                KnowledgeNodeSupertag.supertag_id == supertag.id,
+            )
+        )
+        if pointer_tag is None:
+            # A pointer to an ordinary/stale node is not repaired in place;
+            # leave that row untouched and create a fresh canonical root.
             node = None
 
+    # If a pointer was stale/malformed, search only for an already canonical
+    # candidate.  A stale ordinary node is never adopted, while an existing
+    # canonical candidate is reused so repeated repair cannot create duplicate
+    # rows (or race into a unique-key IntegrityError).
     if node is None:
         node_result = await session.execute(
             select(KnowledgeNode)
@@ -196,22 +321,30 @@ async def ensure_project_information_doc(
                 KnowledgeNodeSupertag,
                 KnowledgeNodeSupertag.node_id == KnowledgeNode.id,
             )
+            .join(
+                KnowledgeSupertag,
+                KnowledgeSupertag.id == KnowledgeNodeSupertag.supertag_id,
+            )
             .where(
-                KnowledgeNode.workspace_id == workspace.id,
+                KnowledgeNode.docs_library_id == library.id,
                 KnowledgeNode.project_id == project.id,
                 KnowledgeNode.archived_at.is_(None),
-                KnowledgeNodeSupertag.supertag_id == supertag.id,
+                KnowledgeNode.system_key == f"project_information:{project.id}",
+                KnowledgeNode.parent_id == root.id,
+                KnowledgeNode.root_page_id == root.id,
+                KnowledgeSupertag.docs_library_id == library.id,
+                KnowledgeSupertag.system_key == PROJECT_INFORMATION_SYSTEM_KEY,
             )
-            .order_by(KnowledgeNode.updated_at.desc())
+            .order_by(KnowledgeNode.updated_at.desc(), KnowledgeNode.id)
             .limit(1)
         )
-        node = node_result.scalar_one_or_none()
+        node = node_result.scalars().first()
 
     created = False
     if node is None:
         node_title = project.name
         node = KnowledgeNode(
-            workspace_id=workspace.id,
+            docs_library_id=library.id,
             parent_id=root.id,
             root_page_id=root.id,
             project_id=project.id,
@@ -239,7 +372,7 @@ async def ensure_project_information_doc(
     if previous_root_id is not None:
         descendants = await session.scalars(
             select(KnowledgeNode).where(
-                KnowledgeNode.workspace_id == workspace.id,
+                KnowledgeNode.docs_library_id == library.id,
                 KnowledgeNode.project_id == project.id,
                 KnowledgeNode.root_page_id == previous_root_id,
                 KnowledgeNode.id != node.id,
@@ -254,11 +387,11 @@ async def ensure_project_information_doc(
         legacy_root_body = node.body_text
     node.body_text = node.title.strip()
 
-    if node.workspace_id != supertag.workspace_id:
+    if node.docs_library_id != supertag.docs_library_id:
         tag_result = await session.execute(
             select(KnowledgeSupertag)
             .where(
-                KnowledgeSupertag.workspace_id == node.workspace_id,
+                KnowledgeSupertag.docs_library_id == node.docs_library_id,
                 or_(
                     KnowledgeSupertag.system_key == PROJECT_INFORMATION_SYSTEM_KEY,
                     KnowledgeSupertag.name == PROJECT_INFORMATION_SUPERTAG,
@@ -269,7 +402,7 @@ async def ensure_project_information_doc(
         supertag = tag_result.scalar_one_or_none()
         if supertag is None:
             supertag = KnowledgeSupertag(
-                workspace_id=node.workspace_id,
+                docs_library_id=node.docs_library_id,
                 system_key=PROJECT_INFORMATION_SYSTEM_KEY,
                 name=PROJECT_INFORMATION_SUPERTAG,
                 base_type="project_information",
@@ -388,6 +521,16 @@ async def update_project_information_doc(
             source_refs=source_refs,
         )
     )
+    # Keep source mutation and stale marking in the same transaction.  The
+    # caller owns commit/enqueue so a rollback cannot leave a false stale
+    # marker or schedule a rebuild for a failed Docs write.
+    from .project_context_pack_service import invalidate_project_context_pack
+
+    await invalidate_project_context_pack(
+        session=session,
+        project_id=project.id,
+        reason="project_information_doc_updated",
+    )
     await session.flush()
     return node
 
@@ -395,7 +538,7 @@ async def update_project_information_doc(
 def serialize_project_information_node(node: KnowledgeNode) -> dict[str, Any]:
     return {
         "id": str(node.id),
-        "workspace_id": str(node.workspace_id),
+        "docs_library_id": str(node.docs_library_id),
         "parent_id": str(node.parent_id) if node.parent_id else None,
         "root_page_id": str(node.root_page_id) if node.root_page_id else None,
         "project_id": str(node.project_id) if node.project_id else None,

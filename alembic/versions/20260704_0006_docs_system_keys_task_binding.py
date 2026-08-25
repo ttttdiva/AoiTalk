@@ -20,32 +20,115 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def _table_exists(table_name: str) -> bool:
-    return table_name in sa.inspect(op.get_bind()).get_table_names()
+    """Return whether ``table_name`` exists in the active schema.
+
+    ``Inspector.get_table_names()`` does not include temporary PostgreSQL
+    schemas (``pg_temp``), which are used by our disposable migration tests.
+    Query ``information_schema`` first so guards operate on the same schema
+    that Alembic is upgrading; retain the inspector fallback for offline and
+    non-PostgreSQL test binds.
+    """
+    bind = op.get_bind()
+    try:
+        return (
+            bind.execute(
+                sa.text(
+                    """
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema = current_schema()
+                      AND table_name = :table_name
+                    LIMIT 1
+                    """
+                ),
+                {"table_name": table_name},
+            ).first()
+            is not None
+        )
+    except Exception:
+        return table_name in sa.inspect(bind).get_table_names()
 
 
 def _column_exists(table_name: str, column_name: str) -> bool:
-    inspector = sa.inspect(op.get_bind())
-    if table_name not in inspector.get_table_names():
-        return False
-    return any(column["name"] == column_name for column in inspector.get_columns(table_name))
+    bind = op.get_bind()
+    try:
+        return (
+            bind.execute(
+                sa.text(
+                    """
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = :table_name
+                      AND column_name = :column_name
+                    LIMIT 1
+                    """
+                ),
+                {"table_name": table_name, "column_name": column_name},
+            ).first()
+            is not None
+        )
+    except Exception:
+        inspector = sa.inspect(bind)
+        if table_name not in inspector.get_table_names():
+            return False
+        return any(column["name"] == column_name for column in inspector.get_columns(table_name))
 
 
 def _index_exists(table_name: str, index_name: str) -> bool:
-    inspector = sa.inspect(op.get_bind())
-    if table_name not in inspector.get_table_names():
-        return False
-    return any(index["name"] == index_name for index in inspector.get_indexes(table_name))
+    bind = op.get_bind()
+    try:
+        return (
+            bind.execute(
+                sa.text(
+                    """
+                    SELECT 1
+                    FROM pg_indexes
+                    WHERE schemaname = current_schema()
+                      AND tablename = :table_name
+                      AND indexname = :index_name
+                    LIMIT 1
+                    """
+                ),
+                {"table_name": table_name, "index_name": index_name},
+            ).first()
+            is not None
+        )
+    except Exception:
+        inspector = sa.inspect(bind)
+        if table_name not in inspector.get_table_names():
+            return False
+        return any(index["name"] == index_name for index in inspector.get_indexes(table_name))
 
 
 def _constraint_exists(table_name: str, constraint_name: str) -> bool:
-    inspector = sa.inspect(op.get_bind())
-    if table_name not in inspector.get_table_names():
-        return False
-    constraints = [
-        *inspector.get_unique_constraints(table_name),
-        *inspector.get_foreign_keys(table_name),
-    ]
-    return any(item.get("name") == constraint_name for item in constraints)
+    bind = op.get_bind()
+    try:
+        return (
+            bind.execute(
+                sa.text(
+                    """
+                    SELECT 1
+                    FROM information_schema.table_constraints
+                    WHERE table_schema = current_schema()
+                      AND table_name = :table_name
+                      AND constraint_name = :constraint_name
+                    LIMIT 1
+                    """
+                ),
+                {"table_name": table_name, "constraint_name": constraint_name},
+            ).first()
+            is not None
+        )
+    except Exception:
+        inspector = sa.inspect(bind)
+        if table_name not in inspector.get_table_names():
+            return False
+        constraints = [
+            *inspector.get_unique_constraints(table_name),
+            *inspector.get_foreign_keys(table_name),
+        ]
+        return any(item.get("name") == constraint_name for item in constraints)
 
 
 def upgrade() -> None:

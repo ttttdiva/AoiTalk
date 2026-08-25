@@ -1,0 +1,276 @@
+{
+  "after_counts": {
+    "attachments": 0,
+    "nodes": 216,
+    "revisions": 399
+  },
+  "apply": {
+    "applied_count": 4,
+    "candidate_count": 4,
+    "conflict_count": 0,
+    "results": [
+      {
+        "created_child_ids": [
+          "3af3f1a2-f198-4fa2-847c-ceb68322b5b9"
+        ],
+        "node_id": "2ba28918-e937-426b-85ec-7d256d190e48",
+        "removed_legacy_keys": [
+          "verbatim_blocks",
+          "verbatim_content"
+        ],
+        "sha256": [
+          "b4592ec241d852c1d03963011604e7992de5b61696dd54195324519b855c5419"
+        ],
+        "status": "applied",
+        "title": "H3LT X2 Riding POV I2Vモデル"
+      },
+      {
+        "created_child_ids": [
+          "9f9fa354-6125-4c52-be09-903afc76c65c"
+        ],
+        "node_id": "dcc72c6b-d026-4851-8084-19b8d095272a",
+        "removed_legacy_keys": [
+          "verbatim_blocks",
+          "verbatim_content"
+        ],
+        "sha256": [
+          "a338b514110b0e4e4975e87d0681b247be648ef7aaafdb2302c9e1f35275e2ec"
+        ],
+        "status": "applied",
+        "title": "MiniMax H3公式リポジトリ／prompt-writingスキル"
+      },
+      {
+        "created_child_ids": [
+          "532e459d-4074-4df4-aaed-9ca1657f4343"
+        ],
+        "node_id": "94b6330a-3073-40a4-a6d3-aed49b9a15e8",
+        "removed_legacy_keys": [
+          "verbatim_blocks",
+          "verbatim_content"
+        ],
+        "sha256": [
+          "7d0c19e87d5d389ca9df5f9397146ab5840cbe2103340e8ce61589dd94ca98d9"
+        ],
+        "status": "applied",
+        "title": "ComfyUI-H3-Multishotリポジトリ"
+      },
+      {
+        "created_child_ids": [
+          "3437ee3c-1a69-4d15-baa4-4c76880c35ac",
+          "b77bc7a6-ea55-488d-911d-fc37635bef7f"
+        ],
+        "node_id": "0cdec5fa-4a2c-5ce6-bce3-0c3e1d56a13c",
+        "removed_legacy_keys": [
+          "verbatim_blocks",
+          "verbatim_content"
+        ],
+        "sha256": [
+          "2a6f5e05771afa5560275f066a4ab6624cf0b8e8d6cc58f16a2abb6a968fc224",
+          "99d7e6a4dab022a557436f52f10950ad4a8b1b81e722536531fe05ef70cccbfb"
+        ],
+        "status": "applied",
+        "title": "MiniMax H3参照素材プロンプト構文（未整理）"
+      }
+    ]
+  },
+  "before_counts": {
+    "attachments": 0,
+    "nodes": 211,
+    "revisions": 390
+  },
+  "db_write_scope": "only the four approved MiniMax H3 parents and their five typed children",
+  "dry_run": {
+    "candidate_count": 4,
+    "conflict_count": 0,
+    "ready_count": 4,
+    "results": [
+      {
+        "block_count": 1,
+        "node_id": "2ba28918-e937-426b-85ec-7d256d190e48",
+        "sha256": [
+          "b4592ec241d852c1d03963011604e7992de5b61696dd54195324519b855c5419"
+        ],
+        "status": "ready",
+        "title": "H3LT X2 Riding POV I2Vモデル"
+      },
+      {
+        "block_count": 1,
+        "node_id": "dcc72c6b-d026-4851-8084-19b8d095272a",
+        "sha256": [
+          "a338b514110b0e4e4975e87d0681b247be648ef7aaafdb2302c9e1f35275e2ec"
+        ],
+        "status": "ready",
+        "title": "MiniMax H3公式リポジトリ／prompt-writingスキル"
+      },
+      {
+        "block_count": 1,
+        "node_id": "94b6330a-3073-40a4-a6d3-aed49b9a15e8",
+        "sha256": [
+          "7d0c19e87d5d389ca9df5f9397146ab5840cbe2103340e8ce61589dd94ca98d9"
+        ],
+        "status": "ready",
+        "title": "ComfyUI-H3-Multishotリポジトリ"
+      },
+      {
+        "block_count": 2,
+        "node_id": "0cdec5fa-4a2c-5ce6-bce3-0c3e1d56a13c",
+        "sha256": [
+          "2a6f5e05771afa5560275f066a4ab6624cf0b8e8d6cc58f16a2abb6a968fc224",
+          "99d7e6a4dab022a557436f52f10950ad4a8b1b81e722536531fe05ef70cccbfb"
+        ],
+        "status": "ready",
+        "title": "MiniMax H3参照素材プロンプト構文（未整理）"
+      }
+    ]
+  },
+  "generated_at": "2026-08-22T11:16:56.098036+00:00",
+  "historical_audit_unchanged": true,
+  "legacy_keys_remaining": [],
+  "migration_id": "docs-verbatim-content-to-typed-blocks-v1",
+  "mode": "typed_block_migration",
+  "parent_ids": [
+    "2ba28918-e937-426b-85ec-7d256d190e48",
+    "dcc72c6b-d026-4851-8084-19b8d095272a",
+    "94b6330a-3073-40a4-a6d3-aed49b9a15e8",
+    "0cdec5fa-4a2c-5ce6-bce3-0c3e1d56a13c"
+  ],
+  "root_body_unchanged": true,
+  "schema_version": 1,
+  "typed_children": [
+    {
+      "block_type": "markdown",
+      "body_json_digest": "16f9e568678cd628db2a968af077791de0447e654938abb1135787d34110602e",
+      "clip_ingest": {
+        "blank_line_count": 0,
+        "char_count": 75,
+        "end_line": 27,
+        "legacy_source_id": "source:1",
+        "line_count": 5,
+        "metrics": {
+          "blank_line_count": 0,
+          "char_count": 75,
+          "line_count": 5
+        },
+        "sha256": "b4592ec241d852c1d03963011604e7992de5b61696dd54195324519b855c5419",
+        "source_id": "source:1",
+        "source_type": "direct",
+        "source_url": "https://civitai.red/models/2446218/h3ltx2-riding-pov-i2v?modelVersionId=3203205",
+        "start_line": 23
+      },
+      "content_sha256": "b4592ec241d852c1d03963011604e7992de5b61696dd54195324519b855c5419",
+      "id": "3af3f1a2-f198-4fa2-847c-ceb68322b5b9",
+      "label": "開始用プロンプト例",
+      "parent_id": "2ba28918-e937-426b-85ec-7d256d190e48",
+      "parent_title": "H3LT X2 Riding POV I2Vモデル",
+      "title": "開始用プロンプト例"
+    },
+    {
+      "block_type": "markdown",
+      "body_json_digest": "76d25afbf1c3c5ef138ab613eba35ad3d73b57d801edef00dc1ae9ec3b94e7f0",
+      "clip_ingest": {
+        "blank_line_count": 0,
+        "char_count": 81,
+        "end_line": 32,
+        "legacy_source_id": "source:1",
+        "line_count": 1,
+        "metrics": {
+          "blank_line_count": 0,
+          "char_count": 81,
+          "line_count": 1
+        },
+        "sha256": "a338b514110b0e4e4975e87d0681b247be648ef7aaafdb2302c9e1f35275e2ec",
+        "source_id": "source:1",
+        "source_type": "direct",
+        "source_url": "https://github.com/MiniMax-AI/MiniMax-H3",
+        "start_line": 32
+      },
+      "content_sha256": "a338b514110b0e4e4975e87d0681b247be648ef7aaafdb2302c9e1f35275e2ec",
+      "id": "9f9fa354-6125-4c52-be09-903afc76c65c",
+      "label": "h3-prompt-writingのインストールコマンド",
+      "parent_id": "dcc72c6b-d026-4851-8084-19b8d095272a",
+      "parent_title": "MiniMax H3公式リポジトリ／prompt-writingスキル",
+      "title": "h3-prompt-writingのインストールコマンド"
+    },
+    {
+      "block_type": "code",
+      "body_json_digest": "14132a72d7359e8f880ca25a95a02b31858ad97f1f10779cc1442fb7f9fc42f4",
+      "clip_ingest": {
+        "blank_line_count": 0,
+        "char_count": 98,
+        "end_line": 64,
+        "legacy_source_id": "source:1",
+        "line_count": 4,
+        "metrics": {
+          "blank_line_count": 0,
+          "char_count": 98,
+          "line_count": 4
+        },
+        "sha256": "7d0c19e87d5d389ca9df5f9397146ab5840cbe2103340e8ce61589dd94ca98d9",
+        "source_id": "source:1",
+        "source_type": "direct",
+        "source_url": "https://github.com/jlucasmcrell/ComfyUI-H3-Multishot",
+        "start_line": 61
+      },
+      "content_sha256": "7d0c19e87d5d389ca9df5f9397146ab5840cbe2103340e8ce61589dd94ca98d9",
+      "id": "532e459d-4074-4df4-aaed-9ca1657f4343",
+      "label": "Gitによるインストールコマンド",
+      "parent_id": "94b6330a-3073-40a4-a6d3-aed49b9a15e8",
+      "parent_title": "ComfyUI-H3-Multishotリポジトリ",
+      "title": "Gitによるインストールコマンド"
+    },
+    {
+      "block_type": "markdown",
+      "body_json_digest": "66bc182cf397720cdbd752b6022fdd6d9481ab70933a614638a613fed0de0dfe",
+      "clip_ingest": {
+        "blank_line_count": 0,
+        "char_count": 194,
+        "end_line": 7,
+        "legacy_source_id": "source:0",
+        "line_count": 3,
+        "metrics": {
+          "blank_line_count": 0,
+          "char_count": 194,
+          "line_count": 3
+        },
+        "sha256": "2a6f5e05771afa5560275f066a4ab6624cf0b8e8d6cc58f16a2abb6a968fc224",
+        "source_id": "source:0",
+        "source_type": "input",
+        "source_url": "",
+        "start_line": 5
+      },
+      "content_sha256": "2a6f5e05771afa5560275f066a4ab6624cf0b8e8d6cc58f16a2abb6a968fc224",
+      "id": "3437ee3c-1a69-4d15-baa4-4c76880c35ac",
+      "label": "Subjectと参照素材の指定例",
+      "parent_id": "0cdec5fa-4a2c-5ce6-bce3-0c3e1d56a13c",
+      "parent_title": "MiniMax H3参照素材プロンプト構文（未整理）",
+      "title": "Subjectと参照素材の指定例"
+    },
+    {
+      "block_type": "markdown",
+      "body_json_digest": "931e885f96c46bbd7ab5b298bd3a060d5471a7e11623d9bf6cf2087f218fbdd5",
+      "clip_ingest": {
+        "blank_line_count": 0,
+        "char_count": 44,
+        "end_line": 10,
+        "legacy_source_id": "source:0",
+        "line_count": 1,
+        "metrics": {
+          "blank_line_count": 0,
+          "char_count": 44,
+          "line_count": 1
+        },
+        "sha256": "99d7e6a4dab022a557436f52f10950ad4a8b1b81e722536531fe05ef70cccbfb",
+        "source_id": "source:0",
+        "source_type": "input",
+        "source_url": "",
+        "start_line": 10
+      },
+      "content_sha256": "99d7e6a4dab022a557436f52f10950ad4a8b1b81e722536531fe05ef70cccbfb",
+      "id": "b77bc7a6-ea55-488d-911d-fc37635bef7f",
+      "label": "画像をキーフレームとして使わない指定",
+      "parent_id": "0cdec5fa-4a2c-5ce6-bce3-0c3e1d56a13c",
+      "parent_title": "MiniMax H3参照素材プロンプト構文（未整理）",
+      "title": "画像をキーフレームとして使わない指定"
+    }
+  ]
+}

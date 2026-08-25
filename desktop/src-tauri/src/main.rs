@@ -67,7 +67,7 @@ fn main() {
 
 fn setup_aoitalk(app: &mut tauri::App, state: &BackendState) -> Result<(), String> {
     let repo_root = resolve_repo_root()?;
-    let log_path = repo_root.join("logs").join("desktop-tauri-backend.log");
+    let log_path = repo_root.join("logs").join("desktop").join("desktop-tauri-backend.log");
 
     if is_port_open(FRONTEND_HOST, FRONTEND_PORT, Duration::from_millis(500)) {
         append_desktop_log(

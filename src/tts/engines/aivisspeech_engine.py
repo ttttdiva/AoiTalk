@@ -11,11 +11,23 @@ from typing import Optional, Dict, Any
 import requests
 import httpx
 
+from ..engine_startup import (
+    DEFAULT_ENGINE_STARTUP_TIMEOUT_SECONDS,
+    wait_for_http_readiness,
+)
+
 
 class AivisSpeechEngine:
     """AivisSpeech Text-to-Speech engine"""
     
-    def __init__(self, engine_path: Optional[str] = None, host: str = "127.0.0.1", port: int = 10101, use_gpu: bool = False):
+    def __init__(
+        self,
+        engine_path: Optional[str] = None,
+        host: str = "127.0.0.1",
+        port: int = 10101,
+        use_gpu: bool = False,
+        startup_timeout_seconds: float = DEFAULT_ENGINE_STARTUP_TIMEOUT_SECONDS,
+    ):
         """Initialize AivisSpeech engine
         
         Args:
@@ -23,11 +35,13 @@ class AivisSpeechEngine:
             host: Host address for AivisSpeech server
             port: Port number for AivisSpeech server (default: 10101)
             use_gpu: Whether to use GPU acceleration on Windows
+            startup_timeout_seconds: Absolute startup readiness deadline
         """
         self.engine_path = engine_path
         self.host = host
         self.port = port
         self.use_gpu = use_gpu
+        self.startup_timeout_seconds = max(1.0, float(startup_timeout_seconds))
         self.base_url = f"http://{host}:{port}"
         self.process = None
         self.client = None  # Persistent httpx client
@@ -238,32 +252,24 @@ class AivisSpeechEngine:
                 
                 self.process = subprocess.Popen(
                     cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,  # Separate stderr to capture errors better
-                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
                     shell=False,
                     cwd=os.path.dirname(self.engine_path),
                     env=env,
-                    universal_newlines=True,
-                    bufsize=1,
-                    encoding='utf-8',
-                    errors='replace',  # Replace invalid characters instead of ignoring
                     startupinfo=startupinfo,
-                    creationflags=subprocess.CREATE_NO_WINDOW  # Use CREATE_NO_WINDOW instead
+                    creationflags=subprocess.CREATE_NO_WINDOW,
                 )
             else:
                 self.process = subprocess.Popen(
                     cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
                     shell=False,
                     cwd=os.path.dirname(self.engine_path),
                     env=os.environ.copy(),
-                    universal_newlines=True,
-                    bufsize=1,
-                    encoding='utf-8',
-                    errors='ignore'
                 )
             
             print(f"Process ID: {self.process.pid}")
@@ -282,80 +288,43 @@ class AivisSpeechEngine:
                 return False
             
             # Wait for engine to start
-            start_time = time.time()
-            
+            deadline = time.monotonic() + self.startup_timeout_seconds
+            startup_started_at = time.monotonic()
+
             print("Waiting for AivisSpeech engine to start...")
             if os.name == 'nt':
                 print("[AivisSpeech] Note: Dictionary optimizations enabled")
                 print("[AivisSpeech] Windows: This may take longer on first run")
-            
-            while True:
-                # Check if process died
-                if self.process.poll() is not None:
-                    # Read remaining output and error
-                    remaining_output = ""
-                    remaining_error = ""
-                    try:
-                        remaining_output = self.process.stdout.read() if self.process.stdout else ""
-                        remaining_error = self.process.stderr.read() if self.process.stderr else ""
-                    except Exception:
-                        pass
-                    
-                    print(f"AivisSpeech engine failed to start (exit code: {self.process.returncode})")
-                    if remaining_output:
-                        print(f"Output: {remaining_output}")
-                    if remaining_error:
-                        print(f"Error: {remaining_error}")
-                    
-                    # Provide helpful error guidance for Windows
-                    if os.name == 'nt' and self.process.returncode != 0:
-                        print("[AivisSpeech] Windows troubleshooting suggestions:")
-                        print("1. Check if Microsoft Visual C++ Redistributable is installed")
-                        print("2. Verify the engine path points to the correct run.exe")
-                        print("3. Try running the engine manually first to check for errors")
-                        print("4. Check Windows Defender/antivirus blocking the executable")
-                    
-                    return False
-                
-                # Read process output
-                try:
-                    line = self.process.stdout.readline()
-                    if line and line.strip():
-                        print(f"AivisSpeech: {line.strip()}")
-                    
-                    # Check stderr for error messages (Windows compatible)
-                    if os.name == 'nt':
-                        try:
-                            # Check if stderr has data available (Windows compatible)
-                            if self.process.stderr and hasattr(self.process.stderr, 'peek'):
-                                # Try peek first to avoid blocking
-                                peek_data = self.process.stderr.peek(1)
-                                if peek_data:
-                                    error_line = self.process.stderr.readline()
-                                    if error_line and error_line.strip():
-                                        print(f"AivisSpeech Error: {error_line.strip()}")
-                        except Exception:
-                            # Ignore stderr reading errors to prevent blocking
-                            pass
-                except Exception:
-                    pass
-                
-                # Test HTTP connection
+
+            started = wait_for_http_readiness(
+                self.base_url,
+                deadline=deadline,
+                process_alive=lambda: self.process is not None and self.process.poll() is None,
+            )
+            if started:
                 try:
                     response = requests.get(f"{self.base_url}/version", timeout=2)
-                    if response.status_code == 200:
-                        version_info = response.text.strip().replace('"', '')
-                        elapsed_time = int(time.time() - start_time)
-                        print(f"AivisSpeech engine started successfully after {elapsed_time} seconds")
-                        print(f"Version: {version_info}")
-                        return True
+                    version_info = response.text.strip().replace('"', '')
                 except requests.exceptions.RequestException:
-                    pass
-                    
-                time.sleep(1)
+                    version_info = "unknown"
+                elapsed_time = int(time.monotonic() - startup_started_at)
+                print(f"AivisSpeech engine started successfully after {elapsed_time} seconds")
+                print(f"Version: {version_info}")
+                return True
+
+            if self.process.poll() is not None:
+                print(f"AivisSpeech engine failed to start (exit code: {self.process.returncode})")
+            else:
+                print(
+                    "AivisSpeech engine startup timed out after "
+                    f"{int(self.startup_timeout_seconds)} seconds"
+                )
+            self.stop_engine()
+            return False
             
         except Exception as e:
             print(f"Failed to start AivisSpeech engine: {e}")
+            self.stop_engine()
             return False
             
     def stop_engine(self):

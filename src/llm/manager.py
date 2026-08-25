@@ -1,5 +1,6 @@
 """LLM client manager for OpenAI, OpenRouter, Gemini, Ollama, SGLang, and CLI backends."""
 
+import copy
 import os
 import logging
 import re
@@ -23,9 +24,19 @@ from ..tools import init_spotify_manager
 from ..memory.manager import ConversationMemoryManager
 from ..memory.config import MemoryConfig
 from ..reasoning import ReasoningManager
-from .runtime_tool_registry import build_runtime_tool_registry
+from .runtime_tool_registry import (
+    build_runtime_tool_registry,
+    build_runtime_tool_registry_for_client,
+)
+from .tool_packs import ensure_load_tool_pack_tool
 from .generation_policy import DEFAULT_GENERATION_POLICY
+from .planning_policy import DEFAULT_PLANNING_POLICY
 from .conversation_context import conversation_state_mode
+from .deployment_resolver import (
+    effective_config_overrides,
+    preflight_deployment,
+    resolve_llm_deployment,
+)
 from .manager_parts import (
     AgentSetupMixin,
     ContextBuildingMixin,
@@ -95,6 +106,17 @@ class AgentLLMClient(
 ):
     """Character-based LLM client using the AoiTalk-native agent runtime."""
 
+    # Discord ingress must not inject user-scoped legacy history for this
+    # client.  Native generation calls
+    # ``_sync_history_with_current_session`` against the durable
+    # ConversationSession before constructing each provider request.
+    manages_conversation_session_history = True
+
+    # The native runtime records the user turn before model execution.  When
+    # ResponseHandler restarts after Ctrl+Enter, send only the new instruction
+    # so the original user message is not persisted twice.
+    steering_retry_uses_existing_history = True
+
     def __init__(
         self,
         api_key: str,
@@ -121,10 +143,10 @@ class AgentLLMClient(
         self.capabilities = ProviderCapabilities(
             supports_stream=True,
             supports_tools=self._native_tools_enabled,
-            supports_response_format=provider_label == "openai",
+            supports_response_format=provider_label in {"openai", "deepseek", "deepinfra"},
             supports_model_pull=False,
             supports_model_delete=False,
-            supports_extra_body=False,
+            supports_extra_body=provider_label in {"openrouter", "deepseek", "deepinfra"},
         )
         self._openai_client = create_async_openai_client(
             api_key=api_key,
@@ -155,17 +177,26 @@ class AgentLLMClient(
 
         self.session_user_id = "default_user"
         self.session_metadata: Dict[str, Any] = {}
+        # Loaded per-session/project privacy policy metadata.  The policy is
+        # refreshed at the start of every turn and inherited by Agent Team
+        # children through the privacy contextvar.
+        self._privacy_session_context: Dict[str, Any] = {}
+        self._privacy_project_metadata: Dict[str, Any] = {}
         self.current_session_id: Optional[str] = (
             None  # For session-specific message storage
         )
+        self.current_assistant_message_id: Optional[str] = None
         self.current_project_id: Optional[str] = None
         self.generation_policy = DEFAULT_GENERATION_POLICY
+        self.planning_policy = DEFAULT_PLANNING_POLICY
         self.current_edit_message_id: Optional[str] = None
         self._current_context_bundle: Optional[ContextBundle] = None
         self._last_context_snapshots: list[dict[str, Any]] = []
         self._loaded_history_session_id: Optional[str] = None
         self._model_transcript: list[dict[str, Any]] = []
         self._last_model_transcript: list[dict[str, Any]] = []
+        self._history_authoritative_model_transcript: list[dict[str, Any]] = []
+        self._history_active_model_transcript: list[dict[str, Any]] = []
         self._provider_state_mode = conversation_state_mode(config, provider_label)
         self._provider_state = {"previous_response_id": None, "fingerprint": None}
 
@@ -206,7 +237,12 @@ class AgentLLMClient(
             )
 
         self._cleanup_registered = False  # Track if cleanup is registered
-        self._tool_registry = build_runtime_tool_registry(config)
+        self._tool_registry = build_runtime_tool_registry_for_client(
+            build_runtime_tool_registry,
+            config,
+            client=self,
+        )
+        ensure_load_tool_pack_tool(self._tool_registry, self)
 
         # Initialize reasoning manager
         self.reasoning_manager = None
@@ -234,8 +270,9 @@ class AgentLLMClient(
         elif not spotify_enabled:
             print("[AgentLLMClient] Spotify feature is disabled")
 
-        # Register cleanup handler
-        self._register_cleanup()
+        # 常駐clientだけprocess終了hookを持つ。短命clientは所有者がcleanupする。
+        if _config_bool(config, "runtime.register_process_cleanup", True):
+            self._register_cleanup()
 
 
 class TargetConfig:
@@ -248,6 +285,19 @@ class TargetConfig:
     def get(self, key: str, default: Any = None) -> Any:
         if key in self._overrides:
             return self._overrides[key]
+        # Deployment overlays commonly replace a nested provider mapping (for
+        # example ``openai_compatible_local``).  Honour dotted reads against
+        # that replacement before falling back to the persisted config.
+        for prefix, value in self._overrides.items():
+            if not isinstance(value, dict) or not key.startswith(f"{prefix}."):
+                continue
+            current: Any = value
+            for part in key[len(prefix) + 1 :].split("."):
+                if not isinstance(current, dict) or part not in current:
+                    break
+                current = current[part]
+            else:
+                return current
         return _config_get(self._base, key, default)
 
     def set(self, key: str, value: Any) -> None:
@@ -266,6 +316,116 @@ class TargetConfig:
         return getattr(self._base, name)
 
 
+TARGET_CLIENT_PROVIDERS = {
+    "openai",
+    "gemini",
+    "openrouter",
+    "deepseek",
+    "deepinfra",
+    "kimi",
+    "sglang",
+    "ollama",
+    "openai_compatible_local",
+    "routing-profile",
+    "antigravity-cli",
+    "claude-cli",
+    "codex-cli",
+    "grok-cli",
+}
+
+_LLAMA_CPP_TARGET_RUNTIME_KEYS = (
+    "model_path",
+    "model_alias",
+    "context_size",
+    "extra_args",
+    "gpu_layers",
+    "auto_start",
+    "reasoning_effort",
+    "mtp_enabled",
+    "mtp_model_path",
+    "mtp_supported",
+    "mtp_available",
+    "mtp_status",
+    "mtp_reason",
+    "mtp_artifact_path",
+    "mtp_resolved_model_path",
+    "mtp_mode",
+)
+
+
+def _overlay_openai_compatible_local_target_runtime(
+    config: Any,
+    overrides: Dict[str, Any],
+    model: str,
+) -> None:
+    """Copy persist local settings and overlay resolved llama.cpp runtime.
+
+    The persist dict is never mutated.  ``local-model`` stays an external
+    endpoint and does not receive managed launch settings.
+    """
+
+    base_local = _config_get(config, "openai_compatible_local", {})
+    if not isinstance(base_local, dict):
+        base_local = {}
+    local_copy = copy.deepcopy(base_local)
+    target_model = str(model or "").strip()
+    local_copy["model"] = target_model
+    if target_model.casefold() != "local-model":
+        from src.service_manager._local_llm_servers import _llama_cpp_settings
+        from .openai_compatible_local_profiles import llama_cpp_reasoning_effort_metadata
+
+        resolved = _llama_cpp_settings(config, model=target_model)
+        llama_cpp = local_copy.get("llama_cpp")
+        if not isinstance(llama_cpp, dict):
+            llama_cpp = {}
+        else:
+            llama_cpp = dict(llama_cpp)
+        for key in _LLAMA_CPP_TARGET_RUNTIME_KEYS:
+            if key in resolved:
+                llama_cpp[key] = resolved[key]
+        metadata = llama_cpp_reasoning_effort_metadata(target_model)
+        if metadata:
+            requested_effort = str(
+                overrides.get("runtime.target_reasoning_effort") or ""
+            ).strip().lower()
+            # ``effort`` is applied by the caller below through a target-only
+            # override; a malformed value must fail closed rather than map to
+            # another Qwen mode.
+            if requested_effort and requested_effort not in metadata["options"]:
+                raise ValueError(
+                    "Unsupported reasoning effort for managed local profile: "
+                    f"{requested_effort!r}; expected one of {metadata['options']}"
+                )
+            if requested_effort:
+                llama_cpp["reasoning_effort"] = requested_effort
+        local_copy["llama_cpp"] = llama_cpp
+    else:
+        # ``local-model`` is an operator-owned external endpoint.  Remove
+        # stale managed MTP controls from the request-scoped overlay so they
+        # cannot be projected back into an external target or accidentally
+        # influence a later managed launch.
+        llama_cpp = local_copy.get("llama_cpp")
+        if isinstance(llama_cpp, dict):
+            llama_cpp = dict(llama_cpp)
+            for key in (
+                "mtp_enabled",
+                "mtp_model_path",
+                "mtp_supported",
+                "mtp_available",
+                "mtp_status",
+                "mtp_reason",
+                "mtp_artifact_path",
+                "mtp_resolved_model_path",
+                "mtp_mode",
+            ):
+                # Explicit ``None`` prevents TargetConfig dotted reads from
+                # falling through to stale persisted values while keeping the
+                # external overlay free of managed MTP semantics.
+                llama_cpp[key] = None
+            local_copy["llama_cpp"] = llama_cpp
+    overrides["openai_compatible_local"] = local_copy
+
+
 def create_llm_client_for_target(
     config: Any,
     *,
@@ -279,6 +439,25 @@ def create_llm_client_for_target(
 ):
     """明示provider/model/credentialからターン専用clientを生成する。"""
 
+    provider = str(provider or "").strip().lower()
+    if provider not in TARGET_CLIENT_PROVIDERS:
+        raise ValueError(f"未対応のターン専用LLM providerです: {provider or '(empty)'}")
+    # Enterprise deployment constraints are checked before any provider
+    # adapter is imported.  In particular, a stale persisted ``sglang``
+    # selection must never start an SGLang client when the release is fixed to
+    # Gemma/vLLM (or another backend).
+    deployment = resolve_llm_deployment(config)
+    if deployment is not None:
+        preflight_deployment(
+            config,
+            provider=provider,
+            model=model,
+            base_url=base_url or None,
+        )
+    if provider == "sglang":
+        from .sglang_url import enforce_enterprise_sglang_model
+
+        model = enforce_enterprise_sglang_model(config, provider, model)
     options = dict(provider_options or {})
     resolved_key = api_key or str(
         getattr(credential_profile, "api_key", "") or ""
@@ -289,27 +468,43 @@ def create_llm_client_for_target(
     overrides: Dict[str, Any] = {
         "llm_provider": provider,
         "llm_model": model,
+        "runtime.target_model": model,
+        "runtime.register_process_cleanup": False,
         "conversation_state.mode": "stateless",
-        "free_team.max_output_tokens": max(
-            1, int(options.get("max_output_tokens") or 2048)
-        ),
         # 通常利用のfallback文言は維持し、無料Teamだけrouting層へ元例外を返す。
         "free_team.propagate_errors": True,
     }
+    if options.get("max_output_tokens") is not None:
+        overrides["runtime.target_max_output_tokens"] = max(
+            1, int(options["max_output_tokens"])
+        )
+    if options.get("ephemeral_session_client"):
+        overrides["runtime.ephemeral_session_client"] = True
+        overrides["memory.enabled"] = False
+    if resolved_key:
+        overrides["runtime.target_api_key"] = resolved_key
+    if resolved_base_url:
+        overrides["runtime.target_base_url"] = resolved_base_url
+    if options.get("defer_server_start"):
+        overrides["runtime.defer_server_start"] = True
+    if options.get("disable_server_auto_start"):
+        overrides["runtime.disable_server_auto_start"] = True
     if provider == "openai":
-        overrides["openai_api_key"] = resolved_key
+        if resolved_key:
+            overrides["openai_api_key"] = resolved_key
         overrides["openai.model"] = model
         if effort:
             overrides["openai.reasoning_effort"] = effort
     elif provider == "gemini":
-        overrides["gemini_api_key"] = resolved_key
+        if resolved_key:
+            overrides["gemini_api_key"] = resolved_key
         overrides["gemini.model"] = model
     elif provider == "openrouter":
-        overrides["openrouter_api_key"] = resolved_key
+        if resolved_key:
+            overrides["openrouter_api_key"] = resolved_key
         overrides["openrouter.model"] = model
-        overrides["openrouter.base_url"] = (
-            resolved_base_url or "https://openrouter.ai/api/v1"
-        )
+        if resolved_base_url:
+            overrides["openrouter.base_url"] = resolved_base_url
         overrides["openrouter.enable_tools"] = "tools" in set(
             options.get("capabilities") or []
         ) or bool(options.get("enable_tools", True))
@@ -319,20 +514,67 @@ def create_llm_client_for_target(
                 "max_price": {"prompt": 0, "completion": 0},
             },
         }
+    elif provider == "deepseek":
+        if resolved_key:
+            overrides["deepseek_api_key"] = resolved_key
+        overrides["deepseek.model"] = model
+        if resolved_base_url:
+            overrides["deepseek.base_url"] = resolved_base_url
+            overrides["deepseek_base_url"] = resolved_base_url
+        selected_effort = str(
+            effort or options.get("reasoning_effort") or "high"
+        ).strip().lower()
+        if selected_effort not in {"none", "high", "max"}:
+            selected_effort = "high"
+        overrides["deepseek.reasoning_effort"] = selected_effort
+    elif provider == "deepinfra":
+        if resolved_key:
+            overrides["deepinfra_api_key"] = resolved_key
+        overrides["deepinfra.model"] = model
+        if resolved_base_url:
+            overrides["deepinfra.base_url"] = resolved_base_url
+            overrides["deepinfra_base_url"] = resolved_base_url
+        selected_effort = str(
+            effort or options.get("reasoning_effort") or "high"
+        ).strip().lower()
+        if selected_effort not in {"none", "low", "medium", "high"}:
+            selected_effort = "high"
+        overrides["deepinfra.reasoning_effort"] = selected_effort
     elif provider == "kimi":
-        overrides["kimi_api_key"] = resolved_key
+        if resolved_key:
+            overrides["kimi_api_key"] = resolved_key
         overrides["kimi.model"] = model
-        overrides["kimi.base_url"] = (
-            resolved_base_url or "https://api.moonshot.ai/v1"
-        )
+        if resolved_base_url:
+            overrides["kimi.base_url"] = resolved_base_url
+            overrides["kimi_base_url"] = resolved_base_url
         overrides["kimi.reasoning_effort"] = "max"
     elif provider == "codex-cli" and effort:
         overrides["codex_cli.reasoning_effort"] = effort
     elif provider == "claude-cli" and effort:
         overrides["claude_cli.reasoning_effort"] = effort
+    elif provider == "openai_compatible_local":
+        from .openai_compatible_local_profiles import llama_cpp_reasoning_effort_metadata
+
+        local_metadata = llama_cpp_reasoning_effort_metadata(model)
+        if effort and local_metadata:
+            normalized_effort = str(effort).strip().lower()
+            if normalized_effort not in local_metadata["options"]:
+                raise ValueError(
+                    "Unsupported reasoning effort for managed local profile: "
+                    f"{effort!r}; expected one of {local_metadata['options']}"
+                )
+            overrides["runtime.target_reasoning_effort"] = normalized_effort
+        _overlay_openai_compatible_local_target_runtime(config, overrides, model)
+    elif provider == "routing-profile":
+        clean_model = str(model or "").strip()
+        if clean_model != "free-team":
+            raise ValueError(
+                f"未対応のルーティングプロファイルです: {clean_model or '(empty)'}"
+            )
+        overrides["llm_provider"] = "routing-profile"
+        overrides["llm_model"] = "free-team"
     if resolved_base_url and provider not in {"openrouter"}:
         overrides[f"{provider}.base_url"] = resolved_base_url
-    options["max_output_tokens"] = overrides["free_team.max_output_tokens"]
     target_config = TargetConfig(config, overrides)
     return create_llm_client(target_config)
 
@@ -348,7 +590,18 @@ def create_llm_client(
     Returns:
         Configured LLM client instance
     """
-    llm_provider = config.get("llm_provider", "openai").lower()
+    # ``Config`` remains the persisted source of truth, but an Enterprise
+    # deployment may expose a fixed runtime backend.  Apply only an in-memory
+    # TargetConfig overlay so DB values remain available for diagnostics and
+    # are not silently rewritten on startup.
+    deployment = resolve_llm_deployment(config)
+    if deployment is not None:
+        preflight_deployment(config)
+        overrides = effective_config_overrides(config)
+        if overrides:
+            config = TargetConfig(config, overrides)
+
+    llm_provider = str(config.get("llm_provider", "openai") or "openai").lower()
 
     if llm_provider == "routing-profile":
         model = str(config.get("llm_model", "") or "")
@@ -460,6 +713,60 @@ def create_llm_client(
             default_headers=headers,
             force_chat_completions=True,
             supports_tools=_config_bool(config, "openrouter.enable_tools", False),
+        )
+
+    elif llm_provider == "deepseek":
+        print("[LLM Factory] DeepSeek APIクライアントを作成")
+        api_key = config.get("deepseek_api_key") or os.getenv("DEEPSEEK_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "DeepSeekを使用するには DEEPSEEK_API_KEY を設定してください"
+            )
+        base_url = (
+            config.get("deepseek_base_url")
+            or os.getenv("DEEPSEEK_BASE_URL")
+            or config.get("deepseek.base_url")
+            or "https://api.deepseek.com"
+        )
+        return AgentLLMClient(
+            api_key=api_key,
+            model=(
+                config.get("llm_model")
+                or config.get("deepseek.model")
+                or "deepseek-v4-flash"
+            ),
+            config=config,
+            provider_label="deepseek",
+            base_url=base_url,
+            force_chat_completions=True,
+            supports_tools=True,
+        )
+
+    elif llm_provider == "deepinfra":
+        print("[LLM Factory] DeepInfra APIクライアントを作成")
+        api_key = config.get("deepinfra_api_key") or os.getenv("DEEPINFRA_TOKEN")
+        if not api_key:
+            raise RuntimeError(
+                "DeepInfraを使用するには DEEPINFRA_TOKEN を設定してください"
+            )
+        base_url = (
+            config.get("deepinfra.base_url")
+            or config.get("deepinfra_base_url")
+            or os.getenv("DEEPINFRA_BASE_URL")
+            or "https://api.deepinfra.com/v1/openai"
+        )
+        return AgentLLMClient(
+            api_key=api_key,
+            model=(
+                config.get("llm_model")
+                or config.get("deepinfra.model")
+                or "deepseek-ai/DeepSeek-V4-Flash"
+            ),
+            config=config,
+            provider_label="deepinfra",
+            base_url=base_url,
+            force_chat_completions=True,
+            supports_tools=True,
         )
 
     elif llm_provider == "kimi":

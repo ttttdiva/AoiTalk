@@ -11,6 +11,7 @@ import json
 import re
 import time
 import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path, PurePath
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from typing import Any, Dict, Optional
@@ -20,7 +21,9 @@ from ..response_handler import ResponseHandler
 from ..chat_turn_persistence import (
     ChatTurnPersistence,
     apply_turn_user_context_to_client,
+    reset_turn_generation_metadata,
     restore_turn_user_context_on_client,
+    without_cached_generation_metadata,
 )
 from ..chat_attachment_utils import (
     build_message_with_attachment_context,
@@ -31,6 +34,9 @@ from ...llm.context_budget import clip_text
 from ...llm.agentic_completion import response_looks_like_unfinished_work
 from ...llm.generation_policy import generation_policy_for_profile
 from ...llm.generation_error import empty_response_failure
+from ...llm.generation_cancellation import (
+    get_current_generation_cancellation,
+)
 from ...llm.tool_policy import (
     PROJECT_MANAGEMENT_MUTATION_TOOL_NAMES,
     protect_untrusted_command_context,
@@ -39,15 +45,12 @@ from ...llm.tool_policy import (
 from ...runtime_features import runtime_feature_manager
 from ...services.agent_run_service import (
     AgentRunService,
+    get_current_agent_run_id,
+    redact_sensitive_chat_metadata,
     reset_current_agent_run_id,
     set_current_agent_run_id,
 )
-from ...services.agent_team_service import (
-    AGENT_TEAM_MEMBER_LABELS,
-    agent_team_delegate_member,
-    agent_team_member_for,
-    config_get,
-)
+from ...services.agent_team_service import agent_team_orchestration_mode
 from ...services.turn_context import reset_turn_context, set_turn_context
 
 
@@ -56,14 +59,13 @@ from ...services.turn_context import reset_turn_context, set_turn_context
 # 維持するため、ここで再 export する。
 from .agent_run_events import (  # noqa: F401
     AgentRunEventEmitter,
-    _AGENT_RUN_DELEGATION_TOOL_MEMBERS,
+    AGENT_RUN_DELEGATION_TOOL_SUBAGENTS,
     _DOCS_SEARCH_HIT_RE,
     _PROVIDER_MODEL_KEYS,
     _SEARCH_TOOL_URL_RE,
     _SEARCH_URL_LIMIT,
     _agent_run_completion_failure_message,
     _agent_run_completion_result,
-    _agent_run_member_context,
     _agent_run_tool_call_payload,
     _agent_run_tool_context,
     _agent_run_tool_operation_signature,
@@ -76,7 +78,7 @@ from .agent_run_events import (  # noqa: F401
     _main_agent_run_provider,
     _should_fail_agent_run_completion,
 )
-from .terminal_commands import TerminalCommandsMixin
+from .terminal_commands import TerminalCommandsMixin, WorkIntakeHandledError
 
 
 class TerminalMode(TerminalCommandsMixin, BaseAssistant):
@@ -245,7 +247,9 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     "image_name": image_data.get("name"),
                 }
             )
-        return metadata
+        if not include_generation_metrics:
+            metadata = without_cached_generation_metadata(metadata)
+        return redact_sensitive_chat_metadata(metadata)
 
     async def _broadcast_conversation_persisted(
         self,
@@ -253,15 +257,22 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
         session_id: Optional[str],
         role: str,
         message_id: Optional[str] = None,
+        agent_run_id: Optional[str] = None,
     ) -> None:
         if not self.web_interface or not session_id:
             return
         broadcaster = getattr(self.web_interface, "broadcast_stream_event", None)
         if not broadcaster:
             return
+        effective_run_id = agent_run_id or get_current_agent_run_id()
         result = broadcaster(
             "conversation_persisted",
-            {"session_id": session_id, "role": role, "message_id": message_id},
+            {
+                "session_id": session_id,
+                "role": role,
+                "message_id": message_id,
+                "agent_run_id": effective_run_id,
+            },
         )
         if inspect.isawaitable(result):
             await result
@@ -440,7 +451,7 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                 raw = raw.split(marker, 1)[-1]
                 break
         lines = raw.strip().splitlines()
-        if lines and lines[0].strip().casefold() in {"/clip", "/inbox"}:
+        if lines and lines[0].strip().casefold() == "/inbox":
             return "\n".join(lines[1:]).strip()
         return raw.strip()
 
@@ -609,6 +620,7 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
         session_id=None,
         project_id=None,
         generation_profile=None,
+        planning_policy=None,
         include_project_context=False,
         edit_message_id=None,
         response_model=None,
@@ -627,6 +639,8 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
         command_capabilities=None,
         tools_required=None,
         media_recognition_metadata=None,
+        docs_reference_ids=None,
+        verified_project_attachment=False,
     ):
         """Process user message sent from the WebUI
 
@@ -661,7 +675,16 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
         turn_context_token = set_turn_context(
             user_id=sender_user_id,
             project_id=project_id,
+            include_project_context=bool(include_project_context),
+            session_id=session_id,
+            message_id=persisted_user_message_id,
+            client_message_id=client_message_id,
+            # These values come from the authenticated server boundary.  Do
+            # not rediscover UUIDs or attachment paths from prompt text here.
+            docs_reference_ids=docs_reference_ids,
+            verified_project_attachment=bool(verified_project_attachment),
         )
+        planning_scope_cm = None
 
         emitter = AgentRunEventEmitter(
             agent_run_service=agent_run_service,
@@ -703,13 +726,26 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
             except Exception as e:
                 print(f"[TerminalMode] ユーザーメッセージ保存エラー: {e}")
 
-        async def persist_assistant_reply(reply: Optional[str]) -> None:
+        async def persist_assistant_reply(
+            reply: Optional[str],
+            *,
+            include_generation_metrics: bool = True,
+        ) -> None:
             if not reply or not session_id:
                 return
+            if agent_run_id:
+                fence_checker = getattr(
+                    self.web_interface, "_is_fenced_generation_run", None
+                )
+                if callable(fence_checker) and fence_checker(session_id, agent_run_id):
+                    print(
+                        f"[TerminalMode] fenced late assistant persistence skipped: {agent_run_id}"
+                    )
+                    return
             try:
                 metadata = self._get_chat_turn_metadata(
                     llm_client,
-                    include_generation_metrics=True,
+                    include_generation_metrics=include_generation_metrics,
                 )
                 if isinstance(response_started_at_monotonic, (int, float)):
                     elapsed_ms = int(
@@ -733,11 +769,13 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     sender_type=assistant_sender_type,
                     sender_id=assistant_sender_id,
                     sender_display_name=assistant_sender_display_name,
+                    message_id=getattr(llm_client, "current_assistant_message_id", None),
                 )
                 await self._broadcast_conversation_persisted(
                     session_id=session_id,
                     role="assistant",
                     message_id=str(assistant_message.id) if assistant_message else None,
+                    agent_run_id=agent_run_id,
                 )
                 await maybe_generate_and_broadcast_session_title(
                     web_interface=self.web_interface,
@@ -768,7 +806,10 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                                     reply, session_id=session_id
                                 )
                                 self.web_interface.add_system_message(msg_data.get("message", ""))
-                            await persist_assistant_reply(reply)
+                            await persist_assistant_reply(
+                                reply,
+                                include_generation_metrics=False,
+                            )
                             await emitter.complete(reply)
                             return
 
@@ -785,7 +826,10 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                                 self.web_interface.add_assistant_message(
                                     reply, session_id=session_id
                                 )
-                            await persist_assistant_reply(reply)
+                            await persist_assistant_reply(
+                                reply,
+                                include_generation_metrics=False,
+                            )
                             await emitter.complete(reply)
                             return
 
@@ -796,7 +840,10 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                                 self.web_interface.add_assistant_message(
                                     reply, session_id=session_id
                                 )
-                            await persist_assistant_reply(reply)
+                            await persist_assistant_reply(
+                                reply,
+                                include_generation_metrics=False,
+                            )
 
                     elif keyword_result.message:
                         reply = keyword_result.message
@@ -805,7 +852,10 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                             self.web_interface.add_assistant_message(
                                 reply, session_id=session_id
                             )
-                        await persist_assistant_reply(reply)
+                        await persist_assistant_reply(
+                            reply,
+                            include_generation_metrics=False,
+                        )
 
                     if keyword_result.bypass_llm:
                         await emitter.complete(locals().get("reply"))
@@ -813,12 +863,67 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
             except Exception as e:
                 print(f"[キーワード検出] エラー: {e}")
 
-            async with self._chat_turn_lock:
+            session_character_name = None
+
+            @asynccontextmanager
+            async def bind_session_memory_character():
+                nonlocal session_character_name
+                token = None
+                try:
+                    session_character_name = (
+                        await chat_persistence.resolve_session_character_name(
+                            session_id
+                        )
+                        if session_id
+                        else None
+                    )
+                except Exception as exc:
+                    print(
+                        "[TerminalMode] セッションの記憶キャラクター解決を"
+                        f"スキップしました: {exc}"
+                    )
+                    raise RuntimeError(
+                        "セッションのキャラクターを解決できないため、"
+                        "別キャラクターで応答せず処理を中断しました"
+                    ) from exc
+                try:
+                    fallback_character_name = str(
+                        getattr(self._get_active_llm_client(), "character_name", "")
+                        or ""
+                    ).strip()
+                    character_name = (
+                        str(session_character_name or "").strip()
+                        or fallback_character_name
+                        or None
+                    )
+                    if character_name:
+                        from ...tools.memory.memory_tools import (
+                            set_current_memory_character_name,
+                        )
+
+                        token = set_current_memory_character_name(character_name)
+                except Exception as exc:
+                    print(
+                        "[TerminalMode] 記憶キャラクターのbindを"
+                        f"スキップしました: {exc}"
+                    )
+                try:
+                    yield
+                finally:
+                    if token is not None:
+                        from ...tools.memory.memory_tools import (
+                            reset_current_memory_character_name,
+                        )
+
+                        reset_current_memory_character_name(token)
+
+            async with self._chat_turn_lock, bind_session_memory_character():
                 base_llm_client = self._get_active_llm_client()
                 llm_client = self._get_response_model_client(
                     response_model,
                     base_llm_client,
                 )
+                reset_turn_generation_metadata(llm_client)
                 await emitter.mark_running(llm_client)
                 chat_persistence = self._get_chat_turn_persistence(base_llm_client)
                 original_handler_client = getattr(
@@ -830,6 +935,9 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     self.response_handler.llm_client = llm_client
                 turn_user_context_snapshot = None
                 prompt_history: list[dict[str, str]] = []
+                orchestration_mode = agent_team_orchestration_mode(
+                    getattr(self, "config", None)
+                )
                 if llm_client and session_id:
                     exclude_message_id = (
                         str(user_message.id)
@@ -840,11 +948,47 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                         session_id=session_id,
                         exclude_message_id=exclude_message_id,
                     )
-                    chat_persistence.apply_prompt_history_to_client(
-                        llm_client,
-                        session_id=session_id,
-                        prompt_history=prompt_history,
-                    )
+                    if session_character_name:
+                        current_character_name = str(
+                            getattr(llm_client, "character_name", "") or ""
+                        ).strip()
+                        if current_character_name != session_character_name:
+                            try:
+                                if hasattr(llm_client, "set_character"):
+                                    llm_client.set_character(session_character_name)
+                                elif hasattr(llm_client, "update_character"):
+                                    llm_client.update_character(session_character_name)
+                                else:
+                                    raise RuntimeError(
+                                        "LLMクライアントがキャラクター切替に対応していません"
+                                    )
+                            except Exception as exc:
+                                if self.response_handler:
+                                    self.response_handler.llm_client = (
+                                        original_handler_client
+                                    )
+                                raise RuntimeError(
+                                    "セッションのキャラクターを適用できないため、"
+                                    f"別キャラクターで応答せず処理を中断しました: "
+                                    f"{session_character_name}: {exc}"
+                                )
+                        if str(
+                            getattr(llm_client, "character_name", "") or ""
+                        ).strip() != session_character_name:
+                            if self.response_handler:
+                                self.response_handler.llm_client = original_handler_client
+                            raise RuntimeError(
+                                "セッションのキャラクター設定が反映されませんでした: "
+                                f"{session_character_name}"
+                            )
+                        if self.response_handler:
+                            self.response_handler.character_name = session_character_name
+                    if orchestration_mode != "director":
+                        chat_persistence.apply_prompt_history_to_client(
+                            llm_client,
+                            session_id=session_id,
+                            prompt_history=prompt_history,
+                        )
 
                 if llm_client:
                     turn_user_context_snapshot = apply_turn_user_context_to_client(
@@ -867,6 +1011,9 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     llm_client.generation_policy = generation_policy_for_profile(
                         generation_profile
                     )
+                    from ...llm.planning_policy import resolve_planning_policy
+
+                    llm_client.planning_policy = resolve_planning_policy(planning_policy)
                     llm_client.current_include_project_context = bool(
                         include_project_context
                     )
@@ -875,6 +1022,321 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     llm_client.external_persistence_enabled = bool(
                         user_message or (skip_user_persistence and session_id)
                     )
+                    from ...services.planning_runtime import planning_turn_scope
+
+                    planning_scope_cm = planning_turn_scope(
+                        user_input=str(persist_content or message or ""),
+                        generation_policy=generation_policy_for_profile(
+                            generation_profile
+                        ),
+                        planning_policy=planning_policy,
+                    )
+                    planning_scope_cm.__enter__()
+
+                if orchestration_mode == "director":
+                    from ...llm.director_controller import DirectorTurnController
+
+                    director_streaming = bool(
+                        self.web_interface
+                        and hasattr(self.web_interface, "broadcast_stream_event")
+                    )
+
+                    async def _director_stream_callback(
+                        event_type: str,
+                        data: dict,
+                    ) -> None:
+                        if not director_streaming:
+                            return
+                        event_data = _enrich_agent_run_event_payload(
+                            getattr(self, "config", None),
+                            dict(data),
+                        )
+                        if session_id:
+                            event_data["session_id"] = session_id
+                        if agent_run_id:
+                            event_data["agent_run_id"] = agent_run_id
+                        try:
+                            result = self.web_interface.broadcast_stream_event(
+                                event_type,
+                                event_data,
+                            )
+                            if inspect.isawaitable(result):
+                                await result
+                        except Exception as exc:
+                            print(
+                                "[TerminalMode] Director進捗イベント送信エラー: "
+                                f"{exc}"
+                            )
+
+                    project_name = str(project_id or "").strip() or "未選択"
+                    director_project_metadata: dict[str, Any] = {}
+                    trusted_parent_context = None
+                    qa_browser_coordinator = None
+                    qa_playwright = None
+                    try:
+                        from ...services.agent_run_scope_service import (
+                            TRUSTED_PARENT_CONTEXT_KEY,
+                            create_parent_run_context_from_config,
+                            resolve_trusted_parent_run_context,
+                        )
+                        from ...services.project_context import get_runtime_project_context
+
+                        runtime_context = get_runtime_project_context()
+                        candidate_context = (
+                            runtime_context
+                            if isinstance(runtime_context, dict)
+                            else director_project_metadata
+                        )
+                        if isinstance(candidate_context, dict):
+                            trusted_parent_context = resolve_trusted_parent_run_context(
+                                candidate_context.get(TRUSTED_PARENT_CONTEXT_KEY),
+                                parent_run_id=agent_run_id,
+                            )
+                    except Exception as exc:
+                        # A malformed/untrusted marker must never widen the
+                        # Director run.  It simply leaves publication/scope
+                        # integration disabled for this legacy turn.
+                        print(
+                            "[TerminalMode] Director parent scope markerを"
+                            f"無視しました: {exc}"
+                        )
+                    if trusted_parent_context is None and agent_run_id:
+                        try:
+                            # The production Director entrypoint may create a
+                            # parent scope only from its dedicated trusted
+                            # setting.  Project ``workspace_root`` and model
+                            # text are intentionally never considered here.
+                            trusted_parent_context = (
+                                create_parent_run_context_from_config(
+                                    getattr(self, "config", None),
+                                    parent_run_id=agent_run_id,
+                                )
+                            )
+                        except Exception as exc:
+                            # An absent/invalid explicit repository setting
+                            # keeps ordinary Director reads available; any
+                            # write-capable worker will fail closed in the
+                            # runtime registry instead of widening scope.
+                            print(
+                                "[TerminalMode] Director親run scope factoryを"
+                                f"利用できません: {exc}"
+                            )
+                    resolver = getattr(llm_client, "_resolve_project_context", None)
+                    if callable(resolver):
+                        try:
+                            resolved_project = resolver()
+                            if inspect.isawaitable(resolved_project):
+                                resolved_project = await resolved_project
+                            if isinstance(resolved_project, dict):
+                                # Director's graph resolver consumes the
+                                # existing project context as read-only data;
+                                # do not infer context from Team IDs.
+                                director_project_metadata = dict(resolved_project)
+                                project_name = str(
+                                    resolved_project.get("name")
+                                    or resolved_project.get("title")
+                                    or resolved_project.get("id")
+                                    or project_name
+                                )
+                                if trusted_parent_context is None:
+                                    trusted_parent_context = resolve_trusted_parent_run_context(
+                                        resolved_project.get(TRUSTED_PARENT_CONTEXT_KEY),
+                                        parent_run_id=agent_run_id,
+                                    )
+                        except Exception as exc:
+                            print(
+                                "[TerminalMode] Director用プロジェクト名の解決を"
+                                f"スキップしました: {exc}"
+                            )
+                    # QA Browser is an explicit parent setting.  It is never
+                    # inferred from Project/model text and is not started for
+                    # ordinary Director conversations.  When enabled, the
+                    # parent owns Playwright/profile/transport and injects
+                    # only the opaque capability facade into the Operator.
+                    try:
+                        config_value = getattr(getattr(self, "config", None), "get", None)
+                        config_obj = getattr(self, "config", None)
+
+                        def _qa_config_value(key: str, default: Any = None) -> Any:
+                            value = None
+                            if callable(config_value):
+                                try:
+                                    value = config_value(key, None)
+                                except TypeError:
+                                    value = config_value(key)
+                            if value is not None:
+                                return value
+                            raw = (
+                                config_obj
+                                if isinstance(config_obj, dict)
+                                else getattr(config_obj, "config", None)
+                            )
+                            current = raw
+                            for part in key.split("."):
+                                if not isinstance(current, dict) or part not in current:
+                                    return default
+                                current = current[part]
+                            return current
+
+                        qa_enabled = _qa_config_value(
+                            "agent_operator.qa_browser_enabled",
+                            False,
+                        )
+                        qa_origins = _qa_config_value(
+                            "agent_operator.qa_allowed_origins",
+                            None,
+                        )
+                        if isinstance(qa_origins, str) and "," in qa_origins:
+                            qa_origins = [
+                                item.strip() for item in qa_origins.split(",") if item.strip()
+                            ]
+                        if (
+                            str(qa_enabled).strip().lower() in {"1", "true", "yes", "on"}
+                            and trusted_parent_context is not None
+                            and qa_origins
+                        ):
+                            from playwright.async_api import async_playwright
+
+                            from ...services.qa_browser_coordinator import (
+                                create_qa_browser_coordinator,
+                            )
+
+                            qa_playwright = await async_playwright().start()
+                            qa_browser_coordinator = (
+                                await create_qa_browser_coordinator(
+                                    allowed_origins=qa_origins,
+                                    trusted_parent_context=trusted_parent_context,
+                                    playwright=qa_playwright,
+                                    role="ui_qa_worker",
+                                )
+                            )
+                    except Exception as exc:
+                        if qa_browser_coordinator is not None:
+                            try:
+                                await qa_browser_coordinator.close(
+                                    "QA Browser setup failed"
+                                )
+                            except Exception:
+                                pass
+                            qa_browser_coordinator = None
+                        if qa_playwright is not None:
+                            try:
+                                await qa_playwright.stop()
+                            except Exception:
+                                pass
+                            qa_playwright = None
+                        print(
+                            "[TerminalMode] QA Browser parent laneを"
+                            f"開始できません: {exc}"
+                        )
+                    try:
+                        controller = DirectorTurnController(
+                            config=getattr(self, "config", {}),
+                            session_id=session_id,
+                            user_id=sender_user_id,
+                            project_id=project_id,
+                            project_name=project_name,
+                            parent_run_id=agent_run_id,
+                            generation_profile=generation_profile,
+                            chat_persistence=chat_persistence,
+                            agent_run_service=agent_run_service,
+                            progress_callback=_director_stream_callback,
+                            session_context={
+                                "session_id": session_id,
+                                "generation_profile": generation_profile,
+                            },
+                            project_metadata=director_project_metadata,
+                            trusted_parent_context=trusted_parent_context,
+                            qa_browser_coordinator=qa_browser_coordinator,
+                            require_parent_scope=True,
+                        )
+                        if director_streaming:
+                            await _director_stream_callback(
+                                "stream_start",
+                                {
+                                    "status": "director",
+                                    "message": "Directorが依頼を確認しています",
+                                },
+                            )
+                        response = await controller.run(
+                            llm_message,
+                            attachments=attachments,
+                            history=prompt_history,
+                        )
+                        await persist_assistant_reply(
+                            response,
+                            include_generation_metrics=False,
+                        )
+                        await emitter.complete(response, llm_client)
+                        if director_streaming:
+                            await _director_stream_callback(
+                                "stream_end",
+                                {"content": response},
+                            )
+                        print(f"{self.character_name}: {response}")
+                        if self.web_interface and not director_streaming:
+                            self.web_interface.add_assistant_message(
+                                response,
+                                session_id=session_id,
+                            )
+                        return response
+                    except asyncio.CancelledError:
+                        if director_streaming:
+                            await _director_stream_callback(
+                                "stream_cancelled",
+                                {
+                                    "status": "cancelled",
+                                    "message": "Director処理を停止しました",
+                                },
+                            )
+                        raise
+                    except Exception:
+                        if director_streaming:
+                            await _director_stream_callback(
+                                "stream_end",
+                                {
+                                    "status": "failed",
+                                    "message": "Director処理中にエラーが発生しました",
+                                },
+                            )
+                        raise
+                    finally:
+                        if qa_browser_coordinator is not None:
+                            try:
+                                await qa_browser_coordinator.close(
+                                    "Director parent turn finished"
+                                )
+                            except Exception as exc:
+                                print(
+                                    "[TerminalMode] QA Browser cleanup error: "
+                                    f"{exc}"
+                                )
+                        if qa_playwright is not None:
+                            try:
+                                await qa_playwright.stop()
+                            except Exception as exc:
+                                print(
+                                    "[TerminalMode] QA Browser Playwright cleanup error: "
+                                    f"{exc}"
+                                )
+                        if self.response_handler:
+                            self.response_handler.llm_client = original_handler_client
+                        if llm_client:
+                            llm_client.current_session_id = None
+                            llm_client.current_project_id = None
+                            llm_client.generation_policy = generation_policy_for_profile(
+                                None
+                            )
+                            llm_client.current_include_project_context = None
+                            llm_client.current_edit_message_id = None
+                            llm_client.current_response_model = None
+                            llm_client.current_command_capabilities = ()
+                            llm_client.current_tool_required = None
+                            llm_client.external_persistence_enabled = False
+                            restore_turn_user_context_on_client(
+                                llm_client,
+                                turn_user_context_snapshot,
+                            )
 
                 stream_callback = None
                 steering_callback = None
@@ -902,15 +1364,35 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     steering_callback = _steering_callback
 
                 if (
-                    supports_streaming
-                    and self.web_interface
+                    self.web_interface
                     and hasattr(self.web_interface, "broadcast_stream_event")
                 ):
                     web_iface = self.web_interface
+                    # 最終応答の描画経路を運ぶイベント群。非ストリーミングクライアント
+                    # では add_assistant_message が最終応答を届けるため、これらを流すと
+                    # 二重描画になる。ツール・途中経過・思考イベントだけを通す。
+                    content_stream_events = {
+                        "stream_start",
+                        "stream_token",
+                        "stream_end",
+                        "stream_cancelled",
+                    }
 
                     async def _stream_callback(event_type: str, data: dict):
                         nonlocal used_streaming
-                        used_streaming = True
+                        cancellation_handle = (
+                            get_current_generation_cancellation()
+                        )
+                        if (
+                            cancellation_handle is not None
+                            and cancellation_handle.cancel_requested.is_set()
+                        ):
+                            return
+                        if not supports_streaming:
+                            if event_type in content_stream_events:
+                                return
+                        else:
+                            used_streaming = True
                         try:
                             event_data = _enrich_agent_run_event_payload(
                                 getattr(self, "config", None),
@@ -1116,69 +1598,74 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     try:
                         response = await self._run_work_intake_command(
                             llm_client=llm_client,
-                            current_request=self._extract_command_current_request(message),
+                            current_request=self._extract_command_current_request(
+                                persist_content
+                            ),
                             project_id=project_id,
                             sender_user_id=sender_user_id,
                             attachments=attachments,
                             stream_callback=stream_callback,
                             agent_run_service=agent_run_service,
                             agent_run_id=agent_run_id,
+                            session_id=session_id,
+                            source_message_id=(
+                                str(user_message.id)
+                                if user_message is not None
+                                else persisted_user_message_id
+                            ),
+                            client_message_id=client_message_id,
                         )
+                    except WorkIntakeHandledError as exc:
+                        work_intake_succeeded = False
+                        response = exc.user_response
                     except Exception as exc:
                         work_intake_succeeded = False
-                        response = f"Work Inbox処理を完了できませんでした: {exc}"
+                        print(f"[TerminalMode] Work Inbox処理エラー: {exc}")
+                        try:
+                            from ...services.failure_recorder import record_failure_event
+
+                            await record_failure_event(
+                                source="backend",
+                                operation="work_intake",
+                                error=exc,
+                                project_id=(str(project_id) if project_id else None),
+                                conversation_id=session_id,
+                                run_id=agent_run_id,
+                                input_summary={
+                                    "attachment_count": len(attachments or []),
+                                    "has_text": bool(
+                                        self._extract_command_current_request(
+                                            persist_content
+                                        ).strip()
+                                    ),
+                                },
+                            )
+                        except Exception as record_error:
+                            print(
+                                "[TerminalMode] Work Inboxエラー記録失敗: "
+                                f"{record_error}"
+                            )
+                        response = (
+                            "Work Inbox処理を完了できませんでした。"
+                            "内部エラーを記録しました。"
+                        )
                     await persist_assistant_reply(response)
                     if work_intake_succeeded:
-                        await emitter.complete(response, llm_client)
+                        # /inbox専用ハンドラが正常復帰した場合は、その結果を
+                        # 完了の信頼できる根拠とする。確認待ちや不足情報を
+                        # 含む正当な応答を汎用の計画語検出で失敗へ戻さない。
+                        await emitter.complete(
+                            response,
+                            llm_client,
+                            completion_confirmed=True,
+                        )
                     else:
-                        await emitter.fail("Work intake failed", response)
+                        await emitter.fail("Work intake failed", response, llm_client)
                     if stream_callback:
                         await stream_callback("stream_end", {"content": response})
                     if self.web_interface and not used_streaming:
                         self.web_interface.add_assistant_message(response)
                     return response
-
-                if "docs_ingest" in normalized_command_capabilities:
-                    docs_ingest_succeeded = True
-                    try:
-                        response = await self._run_docs_ingest_command(
-                            llm_client=llm_client,
-                            current_request=self._extract_command_current_request(message),
-                            project_id=project_id,
-                            sender_user_id=sender_user_id,
-                            stream_callback=stream_callback,
-                            agent_run_service=agent_run_service,
-                            agent_run_id=agent_run_id,
-                        )
-                    except Exception as exc:
-                        docs_ingest_succeeded = False
-                        response = (
-                            "Docs取り込みを完了できませんでした。"
-                            f"Docsは変更していません。理由: {exc}"
-                        )
-                    await persist_assistant_reply(response)
-                    if docs_ingest_succeeded:
-                        await emitter.complete(response, llm_client)
-                    else:
-                        await emitter.fail("Docs ingest failed", response)
-                    if stream_callback:
-                        await stream_callback("stream_end", {"content": response})
-                    if self.web_interface and not used_streaming:
-                        self.web_interface.add_assistant_message(response, session_id=session_id)
-                    if self.response_handler:
-                        self.response_handler.llm_client = original_handler_client
-                    if llm_client:
-                        llm_client.current_session_id = None
-                        llm_client.current_project_id = None
-                        llm_client.generation_policy = generation_policy_for_profile(None)
-                        llm_client.current_include_project_context = None
-                        llm_client.current_edit_message_id = None
-                        llm_client.current_response_model = None
-                        llm_client.current_command_capabilities = ()
-                        llm_client.current_tool_required = None
-                        llm_client.external_persistence_enabled = False
-                        restore_turn_user_context_on_client(llm_client, turn_user_context_snapshot)
-                    return
 
                 if "web_search" in normalized_command_capabilities:
                     response = await self._run_required_web_search_command(
@@ -1228,6 +1715,13 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                         generation_signature = inspect.signature(
                             self.response_handler._generate_response_only
                         )
+                        parameters = generation_signature.parameters
+                        accepts_kwargs = any(
+                            parameter.kind == inspect.Parameter.VAR_KEYWORD
+                            for parameter in parameters.values()
+                        )
+                        if accepts_kwargs or "evidence_user_input" in parameters:
+                            generation_kwargs["evidence_user_input"] = persist_content
                         if "steering_callback" in generation_signature.parameters:
                             generation_kwargs["steering_callback"] = steering_callback
                     except (TypeError, ValueError):
@@ -1281,6 +1775,7 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     await emitter.fail(
                         fail_detail,
                         failure_reply,
+                        llm_client,
                     )
                     if stream_callback:
                         # WebUIの生成ステータスにも分類済みの理由を届ける。
@@ -1308,13 +1803,15 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     print(
                         f"[TerminalMode] エラー応答の保存に失敗しました: {persist_error}"
                     )
-            await emitter.fail(str(e), error_reply)
+            await emitter.fail(str(e), error_reply, llm_client)
             if self.web_interface:
                 self.web_interface.add_assistant_message(
                     error_reply,
                     session_id=session_id,
                 )
         finally:
+            if planning_scope_cm is not None:
+                planning_scope_cm.__exit__(None, None, None)
             reset_turn_context(turn_context_token)
             if agent_run_context_token is not None:
                 reset_current_agent_run_id(agent_run_context_token)

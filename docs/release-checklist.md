@@ -1,37 +1,81 @@
-# Release Checklist
+# Release / Push Checklist
 
-APK、EXE、installer、GitHub Release asset など公開用 artifact を作る merge/release では、この checklist と既存の README、docs、scripts を先に確認する。
+この文書は通常の `main` push、Mobile release、public publish、Enterprise handoff の入口をまとめます。細かな契約をここへ複製せず、それぞれの script / canonical runbook を正本にします。
 
-## Common Gate
+## 0. 最初に確認するもの
 
-- 作業前と完了前に `git status --short --branch` を確認する。
-- ユーザーが明示的に `releaseなし` / `APK不要` / `upload不要` と言わない限り、公開対象の build、upload、metadata 更新を省略しない。
-- version、tag、asset 名、公開先リポジトリ、`latest.json` などの前提が不足している場合は、merge だけ先に進めない。
-- 既存の release / publish / build script がある場合は、その script と引数を優先する。
+- `AGENTS.md`
+- `CLAUDE.md`
+- `git status --short --branch`
+- 今回の対象差分
 
-## APK
+通常のリポジトリ作業は現在の checkout（通常 `main`）へ直接 commit / push します。ユーザーが branch / PR を明示した場合だけその運用へ切り替えます。
 
-- `scripts/check_mobile_release_gate.ps1` がある場合は先に実行し、`RELEASE_REQUIRED=True` なら release 対応を完了条件に含める。
-- `app.json`、`mobile/app.json`、`android/`、`modules/*/android/` など mobile 関連差分を確認する。
-- release version と versionCode を更新する。
-- APK / AAB をビルドし、成果物のパスと version を確認する。
-- GitHub Release に asset を upload する運用の場合は、公開先と tag を確認して upload する。
-- 自動更新を使う場合は、公開用 `latest.json` を同じ version、APK URL、notes、date に更新する。
+## 1. 通常のコード / docs 変更
 
-## EXE / Desktop
+1. 対象差分だけを変更する。
+2. 変更範囲に必要な targeted verification を行う。
+3. WebUI のユーザー挙動を変更した場合は [ai_webui_qa.md](ai_webui_qa.md) の独立 AI browser QA を通す。
+4. 最終差分を確認する。
+5. commit → current branch（通常 `main`）へ push。
+6. `scripts/wait_ci.ps1` で push commit の GitHub Actions を確認する。
 
-- desktop build script、Tauri / Electron / PyInstaller / installer 設定を確認する。
-- EXE / installer をビルドし、成果物のパス、version、起動可否を確認する。
-- GitHub Release や配布先へ upload する運用の場合は、tag、asset 名、公開先を確認して upload する。
-- 生成物を開発リポジトリに残す必要がない場合は、追跡対象に含めない。
+CI status の定義は `AGENTS.md` / `CLAUDE.md` を正本とします。billing / quota 等で CI 自体が起動不能な場合を PASS と書き換えません。
 
-## Report
+## 2. Mobile 変更 / release gate
 
-完了報告では、少なくとも次を明記する。
+merge/release の前に、存在する `scripts/check_mobile_release_gate.ps1` を先に実行します。
 
-- mobile changed
-- release required
-- build
-- upload
-- metadata
-- debug
+`RELEASE_REQUIRED=True` なら、ユーザーが今回明示的に release / APK / upload 不要と指定していない限り、次を完了条件に含めます。
+
+1. `mobile/app.json` の release version を確認 / 必要なら更新
+2. mobile target verification
+3. APK build（`scripts/build_apk.bat` または platform 対応 script）
+4. public `ttttdiva/AoiTalk` GitHub Release へ `aoitalk-mobile.apk` を upload
+5. public repo の `latest.json` を同じ version / URL / notes / date へ更新
+6. Release と `latest.json` の remote 実体を確認
+
+詳細は [mobile-auto-update-standard.md](mobile-auto-update-standard.md) を正本とします。
+
+Mobile に差分がない通常 docs/backend/frontend 作業では APK release を発生させません。
+
+## 3. Public publish
+
+開発 repo から public `ttttdiva/AoiTalk` を更新するときだけ [public_publish.md](public_publish.md) と `scripts/publish_public.ps1` を使います。
+
+まず validation:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\publish_public.ps1 -ValidateOnly
+```
+
+実 publish は source checkout が clean で、公開対象 commit が確定してから行います。public tree の exclusion / secret scan / navigation defaults / `latest.json` preservation は script が正本です。
+
+## 4. Enterprise handoff
+
+Enterprise 配布の人間向け正本は **`README.enterprise.md` だけ**です。生成入口は `scripts/build_enterprise_handoff.ps1` です。
+
+この checklist に model revision、file count、SHA256、Docker image digest を複製しません。それらは handoff builder が生成・検証する manifest と `README.enterprise.md` / deployment scripts の現行値を使います。値を二重管理すると release 時に古い checklist が勝ってしまうためです。
+
+基本入口:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_enterprise_handoff.ps1
+```
+
+対象 PC での checksum / manifest / model download / atomic activation / container startup / diagnose / HTTPS smoke は `README.enterprise.md` の順序に従います。
+
+## 5. 完了報告
+
+少なくとも次を明記します。
+
+- commit SHA / push 先
+- targeted verification 結果
+- CI 結果
+- WebUI QA required / result
+- mobile changed: yes/no
+- release required: yes/no
+- APK build/upload/latest.json: required の場合のみ結果
+- Enterprise/public publish を実施した場合は生成物 / remote verification
+
+実行していない検証を PASS と報告しません。

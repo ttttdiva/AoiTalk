@@ -31,7 +31,7 @@ export async function POST(request: NextRequest) {
       .where(
         and(
           eq(knowledgeSupertags.id, parentSupertagId),
-          eq(knowledgeSupertags.workspaceId, workspace.id),
+          eq(knowledgeSupertags.docsLibraryId, workspace.id),
         ),
       )
       .limit(1);
@@ -43,7 +43,7 @@ export async function POST(request: NextRequest) {
   const [row] = await db
     .insert(knowledgeSupertags)
     .values({
-      workspaceId: workspace.id,
+      docsLibraryId: workspace.id,
       parentSupertagId,
       name,
       baseType: cleanString(body.base_type, "note", 40),

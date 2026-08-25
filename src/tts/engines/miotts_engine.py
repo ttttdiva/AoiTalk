@@ -11,7 +11,6 @@ import asyncio
 import base64
 import importlib.util
 import io
-import os
 import re
 import tempfile
 from contextlib import contextmanager
@@ -42,7 +41,6 @@ class MioTTSEngine:
         codec_model_id: Optional[str] = None,
         refs_dir: Optional[str] = None,
         presets_dir: Optional[str] = None,
-        cache_dir: Optional[str] = None,
         device: str = "auto",
         dtype: str = "auto",
         default_preset_id: Optional[str] = None,
@@ -65,7 +63,6 @@ class MioTTSEngine:
         self.codec_model_id = codec_model_id or self.DEFAULT_CODEC_MODEL_ID
         self.refs_dir = self._resolve_path(refs_dir or "config/miotts_refs")
         self.presets_dir = self._resolve_path(presets_dir or "config/miotts_presets")
-        self.cache_dir = self._resolve_path(cache_dir or "cache/miotts")
         self.device = str(device or "auto")
         self.dtype = str(dtype or "auto")
         self.default_preset_id = default_preset_id or None
@@ -97,7 +94,6 @@ class MioTTSEngine:
         try:
             self.refs_dir.mkdir(parents=True, exist_ok=True)
             self.presets_dir.mkdir(parents=True, exist_ok=True)
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
 
             if self._runtime is None:
                 missing = self._missing_dependencies()
@@ -139,7 +135,6 @@ class MioTTSEngine:
                     model_id=self.model_id,
                     codec_model_id=self.codec_model_id,
                     presets_dir=self.presets_dir,
-                    cache_dir=self.cache_dir,
                     device=self.device,
                     dtype=self.dtype,
                     trust_remote_code=self.trust_remote_code,
@@ -313,7 +308,6 @@ class _EmbeddedMioTTSRuntime:
         model_id: str,
         codec_model_id: str,
         presets_dir: Path,
-        cache_dir: Path,
         device: str,
         dtype: str,
         trust_remote_code: bool,
@@ -323,7 +317,6 @@ class _EmbeddedMioTTSRuntime:
         self.model_id = model_id
         self.codec_model_id = codec_model_id
         self.presets_dir = presets_dir
-        self.cache_dir = cache_dir
         self.requested_device = device
         self.requested_dtype = dtype
         self.trust_remote_code = trust_remote_code
@@ -341,8 +334,6 @@ class _EmbeddedMioTTSRuntime:
         if self._loaded:
             return
 
-        hf_cache = self._prepare_cache()
-
         import torch
         import transformers
         from transformers import AutoTokenizer
@@ -354,13 +345,12 @@ class _EmbeddedMioTTSRuntime:
             print(f"[MioTTS] Loading model: {self.model_id} ({device}, {self.requested_dtype})")
             tokenizer = AutoTokenizer.from_pretrained(
                 self.model_id,
-                cache_dir=str(hf_cache),
                 trust_remote_code=self.trust_remote_code,
             )
             if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
                 tokenizer.pad_token = tokenizer.eos_token
 
-            model = self._load_model(transformers, hf_cache, dtype)
+            model = self._load_model(transformers, dtype)
             self._tokenizer = tokenizer
             self._model = model.eval().to(device)
 
@@ -368,20 +358,10 @@ class _EmbeddedMioTTSRuntime:
         self._load_codec_only()
         self._loaded = True
 
-    def _prepare_cache(self) -> Path:
-        hf_home = self.cache_dir / "hf_home"
-        hf_cache = self.cache_dir / "hf"
-        hf_home.mkdir(parents=True, exist_ok=True)
-        hf_cache.mkdir(parents=True, exist_ok=True)
-        os.environ.setdefault("HF_HOME", str(hf_home))
-        os.environ.setdefault("HF_HUB_CACHE", str(hf_cache))
-        return hf_cache
-
     def _load_codec_only(self) -> None:
         if self._codec is not None and self._load_audio is not None and self._torch is not None:
             return
 
-        self._prepare_cache()
         import torch
         from miocodec import MioCodecModel
         from miocodec.util import load_audio
@@ -394,7 +374,7 @@ class _EmbeddedMioTTSRuntime:
         self._codec = codec.eval().to(device)
         self._load_audio = load_audio
 
-    def _load_model(self, transformers: Any, hf_cache: Path, dtype: Any) -> Any:
+    def _load_model(self, transformers: Any, dtype: Any) -> Any:
         candidates = []
         causal_cls = getattr(transformers, "AutoModelForCausalLM", None)
         multimodal_cls = getattr(transformers, "AutoModelForMultimodalLM", None)
@@ -408,7 +388,6 @@ class _EmbeddedMioTTSRuntime:
             try:
                 return model_cls.from_pretrained(
                     self.model_id,
-                    cache_dir=str(hf_cache),
                     dtype=dtype,
                     low_cpu_mem_usage=True,
                     trust_remote_code=self.trust_remote_code,

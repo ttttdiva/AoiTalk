@@ -7,6 +7,13 @@ MOBILE_DIR="$PROJECT_DIR/mobile"
 ANDROID_DIR="$MOBILE_DIR/android"
 APK_NAME="aoitalk-mobile.apk"
 RELEASE_REPO="ttttdiva/AoiTalk"
+VERSION=$(cd "$PROJECT_DIR" && node -e "console.log(require('./mobile/app.json').expo.version)")
+if [ -z "$VERSION" ]; then
+  echo "[ERROR] Failed to read mobile/app.json expo.version"
+  exit 1
+fi
+ARTIFACT_DIR="$PROJECT_DIR/artifacts/releases/mobile/v${VERSION}"
+APK_PATH="$ARTIFACT_DIR/$APK_NAME"
 
 if [ -z "${JAVA_HOME:-}" ]; then
   JAVA_HOME="$(find "/c/Program Files/Microsoft" -maxdepth 1 -type d -name 'jdk-17*' 2>/dev/null | sort -r | head -n 1)"
@@ -29,6 +36,7 @@ export GRADLE_OPTS="-Djdk.net.unixdomain.tmpdir=C:\\tmp"
 export NODE_ENV="production"
 
 mkdir -p /c/tmp
+mkdir -p "$ARTIFACT_DIR"
 
 echo "[INFO] Running local Expo prebuild for Android..."
 cd "$MOBILE_DIR"
@@ -57,16 +65,10 @@ PY
 
 cd "$ANDROID_DIR"
 ./gradlew assembleRelease --no-daemon -PreactNativeArchitectures=arm64-v8a,x86_64
-cp app/build/outputs/apk/release/app-release.apk "$PROJECT_DIR/$APK_NAME"
+cp app/build/outputs/apk/release/app-release.apk "$APK_PATH"
 
 cd "$PROJECT_DIR"
-VERSION=$(node -e "console.log(require('./mobile/app.json').expo.version)")
 DATE=$(date +%Y-%m-%d)
-
-if [ -z "$VERSION" ]; then
-  echo "[ERROR] Failed to read mobile/app.json expo.version"
-  exit 1
-fi
 
 if ! gh auth status -h github.com >/dev/null 2>&1; then
   echo "[ERROR] GitHub CLI authentication is required for release upload and latest.json update."
@@ -75,9 +77,9 @@ if ! gh auth status -h github.com >/dev/null 2>&1; then
 fi
 
 if gh release view "v${VERSION}" --repo "$RELEASE_REPO" > /dev/null 2>&1; then
-  gh release upload "v${VERSION}" "$APK_NAME" --clobber --repo "$RELEASE_REPO"
+  gh release upload "v${VERSION}" "$APK_PATH" --clobber --repo "$RELEASE_REPO"
 else
-  gh release create "v${VERSION}" "$APK_NAME" --repo "$RELEASE_REPO" --title "v${VERSION}" --notes "v${VERSION} リリース"
+  gh release create "v${VERSION}" "$APK_PATH" --repo "$RELEASE_REPO" --title "v${VERSION}" --notes "v${VERSION} リリース"
 fi
 
 JSON_CONTENT=$(cat <<JSONEOF
@@ -108,4 +110,4 @@ else
     --field "sha=${FILE_SHA}"
 fi
 
-echo "Built local $APK_NAME and published v${VERSION}"
+echo "Built $APK_PATH and published v${VERSION}"

@@ -6,6 +6,7 @@
 import "server-only";
 import {
   datasetInfo,
+  deleteFiles,
   whoAmI,
   listModels,
   listDatasets,
@@ -101,6 +102,41 @@ export async function uploadRepoFile(params: {
     file: { path: params.path, content: params.file },
     commitTitle: `AoiTalkから ${params.path} をアップロード`,
   });
+}
+
+/**
+ * HF リポジトリ上のファイルを削除する（1コミットにまとめる）。
+ * HF にはゴミ箱が無く、この操作は元に戻せない。
+ */
+export async function deleteRepoFiles(params: {
+  accessToken: string;
+  repoId: string;
+  repoType: RepoType;
+  paths: string[];
+}): Promise<void> {
+  if (params.paths.length === 0) return;
+  await deleteFiles({
+    accessToken: params.accessToken,
+    repo: { type: params.repoType, name: params.repoId },
+    paths: params.paths,
+    commitTitle: `AoiTalkから ${params.paths.length}件を削除`,
+  });
+}
+
+/**
+ * ディレクトリ配下のファイルパスを再帰列挙する（削除対象の展開用）。
+ * HF の削除 API はファイル単位なので、フォルダ選択時はここで実ファイルへ展開する。
+ */
+export async function listRepoFilePathsRecursive(
+  accessToken: string | undefined,
+  repoId: string,
+  repoType: RepoType,
+  path: string,
+): Promise<string[]> {
+  const entries = await listRepoTree(accessToken, repoId, repoType, path, {
+    recursive: true,
+  });
+  return entries.filter((entry) => entry.type === "file").map((e) => e.path);
 }
 
 export async function listUserRepos(

@@ -10,11 +10,13 @@ from sqlalchemy import (
     Text,
     Integer,
     DateTime,
+    Date,
     Float,
     JSON,
     ForeignKey,
     Boolean,
     UniqueConstraint,
+    CheckConstraint,
     Index,
     text,
 )
@@ -22,6 +24,7 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
 from ...task_time import DEFAULT_TASK_TIMEZONE
+from ...task_recurrence import normalize_skip_mode
 from ...services.project_color_service import extract_project_color
 from .base import Base, _encrypted_text_property
 
@@ -156,6 +159,10 @@ class Task(Base):
     start_at = Column(DateTime, nullable=True, index=True)
     end_at = Column(DateTime, nullable=True, index=True)
     all_day = Column(Boolean, default=False, nullable=False)
+    # Due-date automation is opt-in.  Keeping this on the canonical task row
+    # lets both one-off tasks and materialized recurring occurrences share the
+    # same policy without changing the occurrence identity.
+    auto_close_on_due = Column(Boolean, default=False, nullable=False)
     reminder_offsets = Column(JSON, default=list)
     notifications_enabled = Column(Boolean, default=True, nullable=False)
     source = Column(String(32), default="local", nullable=False)
@@ -169,6 +176,11 @@ class Task(Base):
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
     )
     deleted_at = Column(DateTime, nullable=True, index=True)  # tombstone for sync
+    # A single deletion operation assigns one batch id to the complete live
+    # task tree and its materialized occurrence/time rows.  The value remains
+    # nullable for rows created before the deletion lifecycle migration and
+    # for ordinary (non-deleted) tasks.
+    deletion_batch_id = Column(UUID(as_uuid=True), nullable=True, index=True)
     task_metadata = Column(JSON, default=dict)
     estimated_hours = Column(Float, nullable=True)
     sort_order = Column(Float, default=0, nullable=False)
@@ -209,6 +221,12 @@ class Task(Base):
     occurrences = relationship(
         "TaskOccurrence", back_populates="task", cascade="all, delete-orphan"
     )
+    schedule_placement = relationship(
+        "TaskSchedulePlacement",
+        back_populates="task",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
     time_entries = relationship(
         "TimeEntry", back_populates="task", cascade="all, delete-orphan"
     )
@@ -236,6 +254,7 @@ class Task(Base):
             "start_at": self.start_at.isoformat() if self.start_at else None,
             "end_at": self.end_at.isoformat() if self.end_at else None,
             "all_day": self.all_day,
+            "auto_close_on_due": bool(self.auto_close_on_due),
             "reminder_offsets": list(self.reminder_offsets or []),
             "notifications_enabled": self.notifications_enabled,
             "source": self.source,
@@ -247,6 +266,9 @@ class Task(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "deleted_at": self.deleted_at.isoformat() if self.deleted_at else None,
+            "deletion_batch_id": (
+                str(self.deletion_batch_id) if self.deletion_batch_id else None
+            ),
             "metadata": self.task_metadata or {},
             "estimated_hours": self.estimated_hours,
             "sort_order": self.sort_order,
@@ -266,6 +288,112 @@ class Task(Base):
                 for tt in self.task_tags
                 if tt.tag is not None
             ],
+        }
+
+
+class ProjectSchedulePhase(Base):
+    """Project-level schedule phase (a large period container)."""
+
+    __tablename__ = "project_schedule_phases"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name = Column(String(255), nullable=False)
+    start_on = Column(Date, nullable=False)
+    end_on = Column(Date, nullable=False)
+    sort_order = Column(Float, nullable=False, default=0)
+    created_by = Column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    project = relationship("Project", back_populates="schedule_phases")
+    creator = relationship("User", foreign_keys=[created_by])
+    placements = relationship(
+        "TaskSchedulePlacement",
+        back_populates="phase",
+        passive_deletes=True,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "end_on >= start_on", name="ck_project_schedule_phases_date_range"
+        ),
+        Index(
+            "ix_project_schedule_phases_project_sort",
+            "project_id",
+            "sort_order",
+            "start_on",
+        ),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": str(self.id),
+            "project_id": str(self.project_id),
+            "name": self.name,
+            "start_on": self.start_on.isoformat() if self.start_on else None,
+            "end_on": self.end_on.isoformat() if self.end_on else None,
+            "sort_order": self.sort_order,
+            "created_by": str(self.created_by) if self.created_by else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class TaskSchedulePlacement(Base):
+    """Two-dimensional schedule placement, independent of task datetimes."""
+
+    __tablename__ = "task_schedule_placements"
+
+    task_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("tasks.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    phase_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("project_schedule_phases.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    x_ratio = Column(Float, nullable=False, default=0)
+    y = Column(Float, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    task = relationship("Task", back_populates="schedule_placement")
+    phase = relationship("ProjectSchedulePhase", back_populates="placements")
+
+    __table_args__ = (
+        CheckConstraint(
+            "x_ratio = x_ratio AND x_ratio >= 0 AND x_ratio <= 1",
+            name="ck_task_schedule_placements_x_ratio",
+        ),
+        CheckConstraint(
+            "y = y AND y >= -100000 AND y <= 100000",
+            name="ck_task_schedule_placements_y",
+        ),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "task_id": str(self.task_id),
+            "phase_id": str(self.phase_id) if self.phase_id else None,
+            "x_ratio": self.x_ratio,
+            "y": self.y,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
 
 
@@ -441,6 +569,61 @@ class TaskReference(Base):
         }
 
 
+class TaskRelation(Base):
+    """タスク同士の対称な関連。UUIDの小さい側をtask_a_idへ保存する。"""
+
+    __tablename__ = "task_relations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_a_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("tasks.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    task_b_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("tasks.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    relation_type = Column(String(32), nullable=False, default="related")
+    created_by = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    task_a = relationship("Task", foreign_keys=[task_a_id])
+    task_b = relationship("Task", foreign_keys=[task_b_id])
+    creator = relationship("User", foreign_keys=[created_by])
+
+    __table_args__ = (
+        CheckConstraint(
+            "task_a_id < task_b_id",
+            name="ck_task_relations_canonical_order",
+        ),
+        UniqueConstraint(
+            "task_a_id",
+            "task_b_id",
+            "relation_type",
+            name="uq_task_relations_pair",
+        ),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": str(self.id),
+            "task_a_id": str(self.task_a_id),
+            "task_b_id": str(self.task_b_id),
+            "relation_type": self.relation_type,
+            "created_by": str(self.created_by) if self.created_by else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class TaskActivity(Base):
     """Task activity log used for audit and live updates."""
 
@@ -529,6 +712,8 @@ class TaskRecurrenceRule(Base):
     end_date = Column(DateTime, nullable=True)
     skip_weekend = Column(Boolean, default=False, nullable=False)
     skip_holiday = Column(Boolean, default=False, nullable=False)
+    # 土日・祝日に当たった回の扱い: shift_forward / omit
+    skip_mode = Column(String(32), default="shift_forward", nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
@@ -553,6 +738,7 @@ class TaskRecurrenceRule(Base):
             "end_date": self.end_date.isoformat() if self.end_date else None,
             "skip_weekend": bool(self.skip_weekend),
             "skip_holiday": bool(self.skip_holiday),
+            "skip_mode": normalize_skip_mode(self.skip_mode),
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -579,6 +765,7 @@ class TaskOccurrence(Base):
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
     )
     deleted_at = Column(DateTime, nullable=True, index=True)  # tombstone for sync
+    deletion_batch_id = Column(UUID(as_uuid=True), nullable=True, index=True)
 
     task = relationship("Task", back_populates="occurrences")
     time_entries = relationship("TimeEntry", back_populates="occurrence")
@@ -611,6 +798,11 @@ class TaskOccurrence(Base):
             "start_at": self.start_at.isoformat() if self.start_at else None,
             "end_at": self.end_at.isoformat() if self.end_at else None,
             "all_day": self.all_day,
+            "auto_close_on_due": bool(
+                self.task.auto_close_on_due
+                if self.task is not None
+                else False
+            ),
             "reminder_offsets": list(self.reminder_offsets or []),
             "tags": [
                 {**tt.tag.to_dict(), "project_id": str(self.task.project_id)}
@@ -621,6 +813,10 @@ class TaskOccurrence(Base):
             "is_generated": self.is_generated,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "deleted_at": self.deleted_at.isoformat() if self.deleted_at else None,
+            "deletion_batch_id": (
+                str(self.deletion_batch_id) if self.deletion_batch_id else None
+            ),
         }
 
 
@@ -648,6 +844,7 @@ class TimeEntry(Base):
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
     )
     deleted_at = Column(DateTime, nullable=True, index=True)  # tombstone for sync
+    deletion_batch_id = Column(UUID(as_uuid=True), nullable=True, index=True)
     entry_metadata = Column(JSON, default=dict)
 
     task = relationship("Task", back_populates="time_entries")
@@ -680,6 +877,9 @@ class TimeEntry(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "deleted_at": self.deleted_at.isoformat() if self.deleted_at else None,
+            "deletion_batch_id": (
+                str(self.deletion_batch_id) if self.deletion_batch_id else None
+            ),
             "metadata": self.entry_metadata or {},
             "username": self.user.username if self.user else None,
             "display_name": self.user.display_name if self.user else None,

@@ -26,6 +26,8 @@ import {
 
 export function useReportsEditEntry({
   remoteReadOnly,
+  isEntryReadOnly,
+  isProjectReadOnly,
   allProjects,
   spaces,
   fetchReport,
@@ -33,6 +35,8 @@ export function useReportsEditEntry({
   setSelectedTaskId,
 }: {
   remoteReadOnly: boolean;
+  isEntryReadOnly: (entry: TimeEntry) => boolean;
+  isProjectReadOnly: (projectId: string | null | undefined) => boolean;
   allProjects: Project[];
   spaces: Space[];
   fetchReport: () => void;
@@ -81,7 +85,7 @@ export function useReportsEditEntry({
 
   // --- エントリクリック編集 ---
   const openEditDialog = useCallback((entry: TimeEntry) => {
-    if (remoteReadOnly) return;
+    if (remoteReadOnly || isEntryReadOnly(entry)) return;
     if (!entry.started_at) return;
     const start = new Date(entry.started_at);
     const end = entry.ended_at ? new Date(entry.ended_at) : new Date();
@@ -95,7 +99,7 @@ export function useReportsEditEntry({
     setEditEnd(toLocalHM(end));
     setEditDuration(formatDurationInput(durationSec));
     setEditNote(entry.note || "");
-  }, [remoteReadOnly]);
+  }, [isEntryReadOnly, remoteReadOnly]);
 
   const closeEditDialog = useCallback(() => {
     setEditingEntry(null);
@@ -163,7 +167,7 @@ export function useReportsEditEntry({
   const saveEditEntry = useCallback(
     async (keepOpen: boolean) => {
       if (!editingEntry) return;
-      if (remoteReadOnly) return;
+      if (remoteReadOnly || isEntryReadOnly(editingEntry)) return;
       if (!editDate || !editStart) return;
       const newStart = combineDateTime(editDate, editStart);
       setEditSaving(true);
@@ -205,6 +209,7 @@ export function useReportsEditEntry({
       isEditingRunning,
       closeEditDialog,
       fetchReport,
+      isEntryReadOnly,
       remoteReadOnly,
     ],
   );
@@ -234,7 +239,7 @@ export function useReportsEditEntry({
 
   const handleEditDelete = useCallback(async () => {
     if (!editingEntry) return;
-    if (remoteReadOnly) return;
+    if (remoteReadOnly || isEntryReadOnly(editingEntry)) return;
     setEditSaving(true);
     try {
       await taskApi.deleteTimeEntry(editingEntry.id);
@@ -246,11 +251,11 @@ export function useReportsEditEntry({
     } finally {
       setEditSaving(false);
     }
-  }, [editingEntry, closeEditDialog, fetchReport, remoteReadOnly]);
+  }, [editingEntry, closeEditDialog, fetchReport, isEntryReadOnly, remoteReadOnly]);
 
   const handleEditDuplicate = useCallback(async () => {
     if (!editingEntry) return;
-    if (remoteReadOnly) return;
+    if (remoteReadOnly || isEntryReadOnly(editingEntry)) return;
     if (!editingEntry.started_at || !editingEntry.ended_at) {
       alert("計測中のエントリは複製できません");
       return;
@@ -271,11 +276,11 @@ export function useReportsEditEntry({
     } finally {
       setEditSaving(false);
     }
-  }, [editingEntry, closeEditDialog, fetchReport, remoteReadOnly]);
+  }, [editingEntry, closeEditDialog, fetchReport, isEntryReadOnly, remoteReadOnly]);
 
   const handleEditRestartTimer = useCallback(async () => {
     if (!editingEntry) return;
-    if (remoteReadOnly) return;
+    if (remoteReadOnly || isEntryReadOnly(editingEntry)) return;
     setEditSaving(true);
     try {
       const started = await taskApi.startTimer(editingEntry.task_id);
@@ -293,11 +298,11 @@ export function useReportsEditEntry({
     } finally {
       setEditSaving(false);
     }
-  }, [editingEntry, closeEditDialog, fetchReport, remoteReadOnly]);
+  }, [editingEntry, closeEditDialog, fetchReport, isEntryReadOnly, remoteReadOnly]);
 
   const handleEditStopTimer = useCallback(async () => {
     if (!editingEntry) return;
-    if (remoteReadOnly) return;
+    if (remoteReadOnly || isEntryReadOnly(editingEntry)) return;
     setEditSaving(true);
     try {
       await taskApi.stopTimer(editingEntry.id);
@@ -315,7 +320,7 @@ export function useReportsEditEntry({
     } finally {
       setEditSaving(false);
     }
-  }, [editingEntry, closeEditDialog, fetchReport, remoteReadOnly]);
+  }, [editingEntry, closeEditDialog, fetchReport, isEntryReadOnly, remoteReadOnly]);
 
   const handleEditRevertToOriginal = useCallback(() => {
     if (!editingEntry?.original_started_at || !editingEntry?.original_ended_at)
@@ -341,7 +346,6 @@ export function useReportsEditEntry({
 
   const handleEditMoveTaskProject = useCallback(
     async (projectId: string) => {
-      if (remoteReadOnly) return;
       if (
         !editingEntry ||
         !projectId ||
@@ -349,6 +353,11 @@ export function useReportsEditEntry({
       ) {
         return;
       }
+      const targetProject = allProjects.find(
+        (project) => project.id === projectId,
+      );
+      if (!targetProject || isProjectReadOnly(targetProject.id)) return;
+      if (remoteReadOnly || isEntryReadOnly(editingEntry)) return;
       setEditSaving(true);
       try {
         await taskApi.moveTask(editingEntry.task_id, {
@@ -379,7 +388,15 @@ export function useReportsEditEntry({
         setEditSaving(false);
       }
     },
-    [allProjects, editingEntry, fetchReport, remoteReadOnly, spaces],
+    [
+      allProjects,
+      editingEntry,
+      fetchReport,
+      isEntryReadOnly,
+      isProjectReadOnly,
+      remoteReadOnly,
+      spaces,
+    ],
   );
 
   const handleEditMoveTaskSpace = useCallback(
@@ -389,10 +406,11 @@ export function useReportsEditEntry({
         currentEditingSpace?.id ?? editingEntry?.space_id ?? null;
       if (spaceId === currentSpaceId) return;
       const targetProject = allProjects.find(
-        (project) => project.space_id === spaceId,
+        (project) =>
+          project.space_id === spaceId && !isProjectReadOnly(project.id),
       );
       if (!targetProject) {
-        alert("このスペースに移動できるプロジェクトがありません");
+        alert("このスペースに移動できる書き込み可能なプロジェクトがありません");
         return;
       }
       await handleEditMoveTaskProject(targetProject.id);
@@ -402,6 +420,7 @@ export function useReportsEditEntry({
       currentEditingSpace?.id,
       editingEntry?.space_id,
       handleEditMoveTaskProject,
+      isProjectReadOnly,
     ],
   );
 

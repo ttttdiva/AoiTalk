@@ -14,6 +14,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from .outbound_privacy_service import OutboundPrivacyGateway
+
 logger = logging.getLogger(__name__)
 
 OUTPUT_DIR = Path("temp/generated_images")
@@ -159,8 +161,30 @@ async def generate_codex_image(
     model: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     timeout_seconds: Optional[int] = None,
+    config: Any | None = None,
+    session_id: str | None = None,
+    user_id: str | None = None,
+    session_context: Dict[str, Any] | None = None,
+    project_metadata: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Generate a TRPG image through Codex CLI and return metadata for logs."""
+
+    # Codex CLI owns its own external model/workspace transport and cannot be
+    # safely wrapped by the normal payload gateway.  It is therefore a direct
+    # only route; protected/local_only policy must stop before creating files
+    # or spawning the subprocess.  Gateway construction inherits the current
+    # request context when callers omit explicit metadata.
+    privacy_gateway = OutboundPrivacyGateway(
+        config,
+        session_id=session_id,
+        user_id=user_id,
+        session_context=session_context,
+        project_metadata=project_metadata,
+    )
+    if privacy_gateway.mode != "direct":
+        raise CodexImageGenerationError(
+            "保護クラウド / ローカル限定モードではCodex CLI画像生成を使用できません。"
+        )
 
     root = _repo_root()
     target_dir = (root / (output_dir or OUTPUT_DIR)).resolve()

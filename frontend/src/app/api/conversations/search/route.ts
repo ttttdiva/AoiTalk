@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { and, desc, eq, isNotNull, isNull, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { db } from "@/db";
 import {
   conversationMessages,
@@ -8,6 +8,11 @@ import {
 } from "@/db/schema";
 import { getSession } from "@/lib/auth";
 import { decryptTextIfNeeded } from "@/lib/server/field-crypto";
+import {
+  canReadProject,
+  ConversationScopeError,
+} from "@/lib/server/conversation-route-utils";
+import { getReadableProjectIds } from "@/lib/server/task-route-utils";
 
 type SearchMatchType = "message" | "session";
 const MESSAGE_SCAN_LIMIT = 2000;
@@ -35,19 +40,15 @@ function createSnippet(content: string, query: string, maxLength = 160): string 
   return `${prefix}${normalizedContent.slice(start, end)}${suffix}`;
 }
 
-function isScenarioWorkflowSession(row: {
+function isStoryWorkflowSession(row: {
   characterName?: string | null;
   title?: string | null;
 }): boolean {
   const characterName = row.characterName || "";
   const title = row.title || "";
   return (
-    /^scenario_roleplay:[^:]+:[^:]+$/.test(characterName) ||
-    characterName.startsWith("scenario_") ||
-    characterName.startsWith("trpg_room_") ||
-    title.startsWith("[シナリオ]") ||
-    title.startsWith("[執筆") ||
-    title.startsWith("[TRPG]")
+    characterName.startsWith("story_") ||
+    title.startsWith("[執筆]")
   );
 }
 
@@ -103,6 +104,22 @@ export async function GET(request: NextRequest) {
   const projectId = searchParams.get("project_id");
   const pattern = `%${escapeLikeTerm(query)}%`;
 
+  let readableProjectIds: string[] | null = null;
+  if (projectId) {
+    try {
+      if (!(await canReadProject(projectId, user))) {
+        return NextResponse.json({ detail: "Projectを閲覧できません" }, { status: 403 });
+      }
+    } catch (error) {
+      if (error instanceof ConversationScopeError) {
+        return NextResponse.json({ detail: error.message }, { status: error.status });
+      }
+      throw error;
+    }
+  } else {
+    readableProjectIds = await getReadableProjectIds(user.id);
+  }
+
   const sessionConditions = [
     or(
       eq(conversationSessions.userId, user.id),
@@ -112,6 +129,15 @@ export async function GET(request: NextRequest) {
   ];
   if (projectId) {
     sessionConditions.push(eq(conversationSessions.projectId, projectId));
+  } else if (readableProjectIds?.length) {
+    sessionConditions.push(
+      or(
+        isNull(conversationSessions.projectId),
+        inArray(conversationSessions.projectId, readableProjectIds),
+      ),
+    );
+  } else {
+    sessionConditions.push(isNull(conversationSessions.projectId));
   }
 
   const messageRows = await db
@@ -130,10 +156,7 @@ export async function GET(request: NextRequest) {
         eq(conversationParticipants.sessionId, conversationSessions.id),
         eq(conversationParticipants.participantType, "user"),
         eq(conversationParticipants.participantId, user.id),
-        or(
-          eq(conversationParticipants.status, "joined"),
-          eq(conversationParticipants.status, "invited"),
-        ),
+        eq(conversationParticipants.status, "joined"),
       ),
     )
     .where(
@@ -152,7 +175,7 @@ export async function GET(request: NextRequest) {
   const results: ReturnType<typeof toResult>[] = [];
   for (const row of messageRows) {
     if (results.length >= limit) break;
-    if (isScenarioWorkflowSession(row.session)) continue;
+    if (isStoryWorkflowSession(row.session)) continue;
     const content = decryptTextIfNeeded(
       row.message.content,
       "conversation_messages.content",
@@ -181,10 +204,7 @@ export async function GET(request: NextRequest) {
           eq(conversationParticipants.sessionId, conversationSessions.id),
           eq(conversationParticipants.participantType, "user"),
           eq(conversationParticipants.participantId, user.id),
-          or(
-            eq(conversationParticipants.status, "joined"),
-            eq(conversationParticipants.status, "invited"),
-          ),
+          eq(conversationParticipants.status, "joined"),
         ),
       )
       .where(
@@ -209,7 +229,7 @@ export async function GET(request: NextRequest) {
         ? row.conversation_sessions
         : row;
       if (matchedSessionIds.has(session.id)) continue;
-      if (isScenarioWorkflowSession(session)) continue;
+      if (isStoryWorkflowSession(session)) continue;
       results.push(toResult({ matchType: "session", session, query }));
     }
   }

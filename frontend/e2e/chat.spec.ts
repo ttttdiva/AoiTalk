@@ -10,14 +10,16 @@ test.describe("チャットページ", () => {
 
   test("チャットUIが表示される", async ({ page }) => {
     // ヘッダーのナビタブで「チャット」がアクティブ
-    const chatTab = page.locator("header nav a").filter({ hasText: "チャット" });
+    const chatTab = page
+      .getByRole("navigation", { name: "Workspace" })
+      .getByRole("link", { name: "チャット", exact: true });
     await expect(chatTab).toBeVisible();
   });
 
   test("サイドバーに新規会話ボタンが表示される", async ({ page }) => {
     // アプリサイドバー内に新規会話ボタンがある
-    const newChatBtn = page.locator("[data-sidebar] button, aside button").filter({ hasText: /新規会話|\+/ });
-    await expect(newChatBtn.first()).toBeVisible();
+    const newChatBtn = page.getByRole("button", { name: "新規会話", exact: true });
+    await expect(newChatBtn).toBeVisible();
   });
 
   test("初期状態でローディングまたは案内が表示される", async ({ page }) => {
@@ -31,8 +33,9 @@ test.describe("チャットページ", () => {
 
   test("セッション一覧がサイドバーに統合されている", async ({ page }) => {
     // サイドバー内に「会話履歴」セクションがある
-    const historyLabel = page.locator("[data-sidebar], aside").filter({ hasText: "会話履歴" });
-    await expect(historyLabel.first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("History", { exact: true })).toBeVisible({
+      timeout: 5000,
+    });
   });
 });
 
@@ -49,8 +52,8 @@ test.describe("チャット送受信（Python API起動時）", () => {
 
   test("新規会話を作成してメッセージを送信できる", async ({ page }) => {
     // 新規会話ボタンをクリック
-    const newChatBtn = page.locator("[data-sidebar] button, aside button").filter({ hasText: /新規会話|\+/ });
-    await newChatBtn.first().click();
+    const newChatBtn = page.getByRole("button", { name: "新規会話", exact: true });
+    await newChatBtn.click();
 
     // URLに ?s= パラメータが付くのを待つ
     await expect(page).toHaveURL(/\?s=/, { timeout: 5000 });

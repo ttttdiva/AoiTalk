@@ -6,8 +6,6 @@ import React, { useState } from "react";
 import {
   View,
   StyleSheet,
-  KeyboardAvoidingView,
-  Platform,
   ScrollView,
   Switch,
 } from "react-native";
@@ -117,10 +115,7 @@ export default function LoginScreen() {
   };
 
   return (
-    <KeyboardAvoidingView
-      style={styles.container}
-      behavior={Platform.OS === "ios" ? "padding" : "height"}
-    >
+    <View style={styles.container}>
       <ScrollView
         contentContainerStyle={styles.scrollContent}
         keyboardShouldPersistTaps="handled"
@@ -300,7 +295,7 @@ export default function LoginScreen() {
           ) : null}
         </Surface>
       </ScrollView>
-    </KeyboardAvoidingView>
+    </View>
   );
 }
 

@@ -30,6 +30,10 @@ export const CHAT_SHORTCUT_HELP_ITEMS: ShortcutHelpItem[] = [
     description: "Project contextを切り替え",
   },
   {
+    keys: ["Alt", "Shift", "P"],
+    description: "Project contextを切り替え（代替）",
+  },
+  {
     keys: ["Ctrl", "Shift", "F"],
     description: "Web検索を切り替え",
   },
@@ -58,12 +62,12 @@ export function getChatComposerShortcutAction(
     return "project_context";
   }
 
-  // Legacy shortcut kept for users who already learned it.
+  // Alt+Shift+P: Alt+P のグローバルメモ帳追加に伴う Project context の代替キー。
   if (
     event.altKey &&
     !event.ctrlKey &&
     !event.metaKey &&
-    !event.shiftKey &&
+    event.shiftKey &&
     key === "p"
   ) {
     return "project_context";

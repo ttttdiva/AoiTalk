@@ -3,13 +3,18 @@
 /* eslint-disable @next/next/no-img-element */
 
 import { useRef, useEffect, useState, useCallback } from "react";
-import { Compartment, EditorState, type Extension } from "@codemirror/state";
+import { Compartment, EditorState, StateEffect, type Extension } from "@codemirror/state";
 import {
+  Decoration,
+  type DecorationSet,
   EditorView,
   keymap,
   lineNumbers,
   highlightActiveLine,
   highlightActiveLineGutter,
+  ViewPlugin,
+  WidgetType,
+  type ViewUpdate,
 } from "@codemirror/view";
 import { foldGutter } from "@codemirror/language";
 import { highlightSelectionMatches } from "@codemirror/search";
@@ -21,15 +26,32 @@ import {
 } from "@codemirror/autocomplete";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { snippetCompletionSource } from "./snippet-completion";
-import { createLinkEmbedPlugin } from "./link-embed-plugin";
-import { Save, X, MessageSquare, Eye, Code2 } from "lucide-react";
+import {
+  createLinkEmbedPlugin,
+  updateLinkEmbedConfigEffect,
+  type LinkDisplayModeChangeHandler,
+  type LinkDisplayModeMap,
+} from "./link-embed-plugin";
+import { Save, X, MessageSquare, Eye, Code2, FileCode2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { explorerSave } from "@/lib/explorer-api";
+import {
+  ExplorerUploadError,
+  explorerSave,
+  explorerUpload,
+} from "@/lib/explorer-api";
+import type { ExplorerUploadBatchResult } from "@/lib/explorer-api";
 import { cn } from "@/lib/utils";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { baseTextEditorExtensions } from "./code-mirror-shared";
+import type { EditorImageInsertHandler } from "./image-insert-extension";
+import {
+  isMarkdownImageExtension,
+  resolveRelativeMarkdownImage,
+} from "@/lib/editor-image-files";
 import { useUserSettings } from "@/contexts/user-settings-context";
+import { useTheme } from "@/contexts/theme-context";
+import { toast } from "sonner";
 
 interface DocumentEditorProps {
   filePath: string;
@@ -39,6 +61,14 @@ interface DocumentEditorProps {
   onClose: () => void;
   onAskAI?: (selectedText: string, filePath: string) => void;
   snippets?: import("@/lib/snippets-api").Snippet[];
+  /** Focus the CodeMirror surface after it is mounted. */
+  autoFocus?: boolean;
+  /** Disable image uploads while keeping the existing editor surface intact. */
+  readOnly?: boolean;
+  /** Per-URL link preview display overrides, when supplied by the caller. */
+  linkDisplayModes?: LinkDisplayModeMap | null;
+  /** Called when a user toggles a link preview's display mode. */
+  onLinkDisplayModeChange?: LinkDisplayModeChangeHandler;
 }
 
 const documentEditorTheme = EditorView.theme({
@@ -54,6 +84,146 @@ const documentEditorTheme = EditorView.theme({
   },
 });
 
+const markdownImagePreviewRefresh = StateEffect.define<void>();
+
+type MarkdownImagePreviewContext = {
+  filePathRef: { current: string };
+  enabledRef: { current: boolean };
+};
+
+const MARKDOWN_IMAGE_PATTERN = /!\[((?:\\.|[^\]\\\n])*)\]\((<[^>\n]+>|[^)\n]+)\)/g;
+
+function markdownImageReference(fileName: string): string {
+  const safeName = fileName.replace(/[\r\n]/g, " ");
+  const alt = safeName.replace(/[\\[\]]/g, "\\$&");
+  const destination = `./${safeName}`;
+  const markdownDestination = /[\s()?#]/.test(destination)
+    ? `<${destination}>`
+    : destination;
+  return `![${alt}](${markdownDestination})`;
+}
+
+function imageSourceWithoutTitle(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("<") && trimmed.endsWith(">")) {
+    // Keep the angle wrapper so a literal `#`/`?` in a local filename is not
+    // mistaken for a URL fragment/query by the shared resolver.
+    return trimmed;
+  }
+  // A quoted Markdown title follows the URL.  Keep spaces in filenames while
+  // removing only an unambiguous trailing title segment.
+  return trimmed
+    .replace(/\s+(?:"[^"]*"|'[^']*')\s*$/u, "")
+    .trim();
+}
+
+class MarkdownImageWidget extends WidgetType {
+  constructor(
+    private readonly source: string,
+    private readonly alt: string,
+    private readonly filePathRef: { current: string },
+  ) {
+    super();
+  }
+
+  eq(other: MarkdownImageWidget): boolean {
+    return (
+      this.source === other.source &&
+      this.alt === other.alt &&
+      this.filePathRef === other.filePathRef
+    );
+  }
+
+  toDOM(): HTMLElement {
+    const image = document.createElement("img");
+    image.className = "cm-markdown-image";
+    image.alt = this.alt;
+    image.src = resolveRelativeMarkdownImage(this.source, this.filePathRef.current);
+    image.draggable = false;
+    image.style.maxWidth = "min(100%, 640px)";
+    image.style.maxHeight = "360px";
+    image.style.objectFit = "contain";
+    image.style.borderRadius = "0.5rem";
+    image.style.verticalAlign = "middle";
+    image.addEventListener("error", () => {
+      image.classList.add("cm-markdown-image-error");
+    });
+    return image;
+  }
+
+  ignoreEvent(): boolean {
+    // Let CodeMirror map clicks into the replaced range.  The decoration is
+    // rebuilt when the selection changes so users can edit the raw Markdown.
+    return false;
+  }
+}
+
+function buildMarkdownImageDecorations(
+  view: EditorView,
+  context: MarkdownImagePreviewContext,
+): DecorationSet {
+  if (!context.enabledRef.current) return Decoration.none;
+
+  const ranges = [];
+  for (let lineNumber = 1; lineNumber <= view.state.doc.lines; lineNumber += 1) {
+    const line = view.state.doc.line(lineNumber);
+    MARKDOWN_IMAGE_PATTERN.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = MARKDOWN_IMAGE_PATTERN.exec(line.text)) !== null) {
+      const source = imageSourceWithoutTitle(match[2] ?? "");
+      if (!source) continue;
+      const from = line.from + match.index;
+      const to = from + match[0].length;
+      const selected = view.state.selection.ranges.some((selection) =>
+        selection.empty
+          ? selection.head > from && selection.head < to
+          : selection.from < to && selection.to > from,
+      );
+      if (selected) continue;
+      ranges.push(
+        Decoration.replace({
+          widget: new MarkdownImageWidget(
+            source,
+            match[1] ?? "",
+            context.filePathRef,
+          ),
+          inclusive: false,
+        }).range(from, to),
+      );
+    }
+  }
+
+  return Decoration.set(ranges, true);
+}
+
+function createMarkdownImagePreviewExtension(
+  context: MarkdownImagePreviewContext,
+): Extension {
+  return ViewPlugin.fromClass(
+    class {
+      decorations: DecorationSet;
+
+      constructor(view: EditorView) {
+        this.decorations = buildMarkdownImageDecorations(view, context);
+      }
+
+      update(update: ViewUpdate): void {
+        if (
+          update.docChanged ||
+          update.selectionSet ||
+          update.viewportChanged ||
+          update.transactions.some((transaction) =>
+            transaction.effects.some((effect) => effect.is(markdownImagePreviewRefresh)),
+          )
+        ) {
+          this.decorations = buildMarkdownImageDecorations(update.view, context);
+        }
+      }
+    },
+    { decorations: (value) => value.decorations },
+  );
+}
+
 export function DocumentEditor({
   filePath,
   initialContent,
@@ -62,11 +232,17 @@ export function DocumentEditor({
   onClose,
   onAskAI,
   snippets,
+  autoFocus = false,
+  readOnly = false,
+  linkDisplayModes,
+  onLinkDisplayModeChange,
 }: DocumentEditorProps) {
   const { editorLinkDefaultDisplayMode } = useUserSettings();
+  const { resolvedTheme } = useTheme();
   const editorRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const linkEmbedCompartmentRef = useRef(new Compartment());
+  const themeCompartmentRef = useRef(new Compartment());
   const [isDirty, setIsDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [cursorInfo, setCursorInfo] = useState({ line: 1, col: 1 });
@@ -74,13 +250,118 @@ export function DocumentEditor({
   const [previewContent, setPreviewContent] = useState(initialContent);
   const contentRef = useRef(initialContent);
   const filePathRef = useRef(filePath);
+  const fileIdentityRef = useRef(0);
+  const extensionRef = useRef(extension);
+  const readOnlyRef = useRef(readOnly);
+  const markdownImagePreviewEnabledRef = useRef(
+    isMarkdownImageExtension(extension),
+  );
 
-  const isMarkdown = extension === ".md" || extension === ".markdown";
+  const isMarkdown = isMarkdownImageExtension(extension);
 
   // Keep refs in sync
   useEffect(() => {
     filePathRef.current = filePath;
+    fileIdentityRef.current += 1;
   }, [filePath]);
+
+  useEffect(() => {
+    extensionRef.current = extension;
+    markdownImagePreviewEnabledRef.current = isMarkdownImageExtension(extension);
+    viewRef.current?.dispatch({ effects: markdownImagePreviewRefresh.of(undefined) });
+  }, [extension]);
+
+  useEffect(() => {
+    viewRef.current?.dispatch({ effects: markdownImagePreviewRefresh.of(undefined) });
+    setPreviewContent(initialContent);
+  }, [filePath, initialContent]);
+
+  useEffect(() => {
+    readOnlyRef.current = readOnly;
+  }, [readOnly]);
+
+  /**
+   * Upload pasted/dropped images next to the Markdown file and return only
+   * references for files the server actually accepted.  The shared
+   * CodeMirror extension owns the insertion position and event semantics;
+   * this handler deliberately does not mutate the document itself.
+   */
+  const handleImageFiles = useCallback<EditorImageInsertHandler>(
+    async (files) => {
+      if (readOnlyRef.current || !isMarkdownImageExtension(extensionRef.current)) {
+        return null;
+      }
+
+      const imageFiles = Array.from(files);
+      if (imageFiles.length === 0) return null;
+
+      const currentFilePath = filePathRef.current.replace(/\\/g, "/");
+      const separator = currentFilePath.lastIndexOf("/");
+      const directory = separator >= 0 ? currentFilePath.slice(0, separator) : "";
+
+      let batchResult: ExplorerUploadBatchResult;
+      try {
+        batchResult = await explorerUpload(directory, imageFiles);
+      } catch (error) {
+        // explorerUpload rejects only after all files have been attempted.  A
+        // batch may still contain successful uploads, which must remain
+        // insertable while failed files leave the document untouched.
+        if (error instanceof ExplorerUploadError) {
+          batchResult = error.batchResult;
+          if (batchResult.successCount === 0) {
+            toast.error("画像のアップロードに失敗しました");
+          } else if (batchResult.failureCount > 0) {
+            toast.warning(
+              `${batchResult.successCount}件をアップロードし、${batchResult.failureCount}件は失敗しました`,
+            );
+          }
+        } else {
+          const candidate =
+            error && typeof error === "object" && "batchResult" in error
+              ? (error as { batchResult?: unknown }).batchResult
+              : null;
+          if (
+            !candidate ||
+            typeof candidate !== "object" ||
+            !Array.isArray((candidate as { results?: unknown }).results)
+          ) {
+            toast.error(
+              error instanceof Error
+                ? error.message
+                : "画像のアップロードに失敗しました",
+            );
+            return null;
+          }
+          batchResult = candidate as ExplorerUploadBatchResult;
+        }
+      }
+
+      const references = batchResult.results
+        .map((result) => {
+          if (!result || typeof result !== "object") return null;
+          const payload = result as Record<string, unknown>;
+          if (payload.success === false) return null;
+
+          // Prefer the persisted path's basename (the server's final target)
+          // and keep `name` as a fallback for project/remote implementations
+          // that omit the path. Always reduce it to a portable basename.
+          const nameValue =
+            typeof payload.path === "string"
+              ? payload.path
+              : typeof payload.name === "string"
+                ? payload.name
+                : "";
+          const normalizedName = nameValue.replace(/\\/g, "/");
+          const name = normalizedName.slice(normalizedName.lastIndexOf("/") + 1);
+          if (!name) return null;
+          return markdownImageReference(name);
+        })
+        .filter((reference): reference is string => Boolean(reference));
+
+      return references.length > 0 ? references.join("\n") : null;
+    },
+    [],
+  );
 
   // Toggle markdown preview with Ctrl+Shift+V
   const togglePreview = useCallback(() => {
@@ -115,12 +396,16 @@ export function DocumentEditor({
       } else {
         const result = await explorerSave(filePathRef.current, content);
         if (!result.success) {
-          console.error("Save failed:", result.message);
+          toast.error(result.message || "ファイルの保存に失敗しました");
           return;
         }
       }
       setIsDirty(false);
       contentRef.current = content;
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "ファイルの保存に失敗しました",
+      );
     } finally {
       setSaving(false);
     }
@@ -150,7 +435,18 @@ export function DocumentEditor({
       ),
       highlightActiveLine(),
       highlightSelectionMatches(),
-      ...baseTextEditorExtensions({ language: extension, includeSearch: true }),
+      ...baseTextEditorExtensions({
+        language: extension,
+        includeSearch: true,
+        imageInsertHandler: handleImageFiles,
+        imageInsertEnabled: () => isMarkdownImageExtension(extensionRef.current),
+        imageInsertOwnerKey: () => fileIdentityRef.current,
+        imageInsertReadOnly: () => readOnlyRef.current,
+      }),
+      createMarkdownImagePreviewExtension({
+        filePathRef,
+        enabledRef: markdownImagePreviewEnabledRef,
+      }),
       keymap.of([
         ...closeBracketsKeymap,
         ...completionKeymap,
@@ -179,10 +475,14 @@ export function DocumentEditor({
       }),
       // Link embed (URL → OGP preview card)
       linkEmbedCompartmentRef.current.of(
-        createLinkEmbedPlugin(editorLinkDefaultDisplayMode),
+        createLinkEmbedPlugin(editorLinkDefaultDisplayMode, {
+          displayModes: linkDisplayModes,
+          onDisplayModeChange: onLinkDisplayModeChange,
+          readOnly,
+        }),
       ),
       // Theme
-      oneDark,
+      themeCompartmentRef.current.of(resolvedTheme === "dark" ? oneDark : []),
       documentEditorTheme,
     ];
 
@@ -197,6 +497,7 @@ export function DocumentEditor({
     });
 
     viewRef.current = view;
+    if (autoFocus) view.focus();
 
     return () => {
       view.destroy();
@@ -205,14 +506,34 @@ export function DocumentEditor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // CodeMirror's oneDark extension sets a dark editor surface explicitly. Keep
+  // it in a compartment so switching the app theme updates an already-open
+  // Files editor without recreating the editor (and losing unsaved content).
   useEffect(() => {
     if (!viewRef.current) return;
     viewRef.current.dispatch({
-      effects: linkEmbedCompartmentRef.current.reconfigure(
-        createLinkEmbedPlugin(editorLinkDefaultDisplayMode),
+      effects: themeCompartmentRef.current.reconfigure(
+        resolvedTheme === "dark" ? oneDark : [],
       ),
     });
-  }, [editorLinkDefaultDisplayMode]);
+  }, [resolvedTheme]);
+
+  useEffect(() => {
+    if (!viewRef.current) return;
+    viewRef.current.dispatch({
+      effects: updateLinkEmbedConfigEffect.of({
+        defaultDisplayMode: editorLinkDefaultDisplayMode,
+        displayModes: linkDisplayModes,
+        onDisplayModeChange: onLinkDisplayModeChange,
+        readOnly,
+      }),
+    });
+  }, [
+    editorLinkDefaultDisplayMode,
+    linkDisplayModes,
+    onLinkDisplayModeChange,
+    readOnly,
+  ]);
 
   // Update content when a new file is loaded (initialContent prop changes)
   // NOTE: isDirty is intentionally NOT in deps — triggering on isDirty=false after
@@ -221,6 +542,7 @@ export function DocumentEditor({
     if (!viewRef.current) return;
     const currentContent = viewRef.current.state.doc.toString();
     if (currentContent !== initialContent) {
+      fileIdentityRef.current += 1;
       viewRef.current.dispatch({
         changes: {
           from: 0,
@@ -230,12 +552,13 @@ export function DocumentEditor({
       });
       contentRef.current = initialContent;
       setIsDirty(false);
+      setPreviewContent(initialContent);
     }
   }, [initialContent]);
 
   const fileName = filePath.split("/").pop() || filePath;
   const langLabel =
-    extension === ".md"
+    extension.toLowerCase() === ".md" || extension.toLowerCase() === ".markdown"
       ? "Markdown"
       : extension === ".py"
         ? "Python"
@@ -252,12 +575,14 @@ export function DocumentEditor({
                   : extension.replace(".", "").toUpperCase() || "Text";
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-background">
+    <div className="flex h-full min-h-0 flex-col bg-background text-foreground">
       {/* Toolbar */}
-      <div className="flex shrink-0 items-center justify-between border-b px-3 py-1.5">
-        <div className="flex items-center gap-2">
+      <div className="flex h-12 shrink-0 items-center justify-between border-b border-border bg-background px-4">
+        <div className="flex min-w-0 items-center gap-2 text-[13px]">
+          <span className="truncate text-muted-foreground">Files</span>
+          <span className="text-muted-foreground/60">›</span>
           <span
-            className="text-sm font-medium truncate max-w-[300px]"
+            className="max-w-[300px] truncate font-semibold"
             title={filePath}
           >
             {fileName}
@@ -269,7 +594,7 @@ export function DocumentEditor({
             />
           )}
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-1 text-muted-foreground">
           {isMarkdown && (
             <Button
               variant={previewMode ? "secondary" : "ghost"}
@@ -316,16 +641,25 @@ export function DocumentEditor({
             variant="ghost"
             size="icon"
             onClick={onClose}
-            className="size-7"
+            className="size-7 text-muted-foreground hover:bg-muted hover:text-foreground"
+            title="閉じる"
           >
             <X className="size-3.5" />
           </Button>
         </div>
       </div>
 
+      <div className="flex h-10 shrink-0 items-stretch overflow-x-auto border-b border-border bg-card/50">
+        <div className="flex min-w-[170px] items-center gap-2 border-r border-border border-t-2 border-t-primary bg-background px-4 text-[12px] font-medium">
+          <FileCode2 className="size-3.5 text-primary" />
+          <span className="truncate">{fileName}</span>
+          {isDirty && <span className="size-1.5 rounded-full bg-amber-400" title="未保存" />}
+        </div>
+      </div>
+
       {/* Editor / Preview */}
       {previewMode && isMarkdown ? (
-        <div className="min-h-0 flex-1 overflow-auto p-6">
+        <div className="min-h-0 flex-1 overflow-auto bg-background p-6">
           <div className="max-w-none text-sm leading-relaxed">
             <ReactMarkdown
               remarkPlugins={[remarkGfm]}
@@ -427,13 +761,19 @@ export function DocumentEditor({
                   </td>
                 ),
                 hr: () => <hr className="my-5 border-border" />,
-                img: ({ src, alt }) => (
-                  <img
-                    src={src}
-                    alt={alt}
-                    className="my-3 max-w-full rounded-lg"
-                  />
-                ),
+                img: ({ src, alt }) => {
+                  const resolvedSrc = resolveRelativeMarkdownImage(
+                    typeof src === "string" ? src : "",
+                    filePath,
+                  );
+                  return (
+                    <img
+                      src={resolvedSrc}
+                      alt={alt}
+                      className="my-3 max-w-full rounded-lg"
+                    />
+                  );
+                },
               }}
             >
               {previewContent}
@@ -441,11 +781,11 @@ export function DocumentEditor({
           </div>
         </div>
       ) : (
-        <div ref={editorRef} className="min-h-0 flex-1 overflow-hidden" />
+        <div ref={editorRef} className="min-h-0 flex-1 overflow-hidden bg-background" />
       )}
 
       {/* Status Bar */}
-      <div className="flex shrink-0 items-center justify-between border-t bg-muted/50 px-3 py-0.5 text-xs text-muted-foreground">
+      <div className="flex h-6 shrink-0 items-center justify-between border-t border-border bg-card/70 px-3 text-[11px] text-muted-foreground">
         <div className="flex items-center gap-3">
           {previewMode ? (
             <span>プレビュー表示中</span>

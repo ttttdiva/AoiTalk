@@ -406,6 +406,7 @@ def build_wbs_tools() -> list:
                     session,
                     project=project,
                     project_id=project_id,
+                    permission="write" if not dry_run else "read",
                 )
                 if not context or not context.get("id"):
                     return {"error": "No active or matching project context."}
@@ -428,7 +429,9 @@ def build_wbs_tools() -> list:
                         },
                     }
                 user_id, resolved_project_id = await _resolve_actor_and_project(
-                    session, project_id=str(context["id"])
+                    session,
+                    project_id=str(context["id"]),
+                    permission="write" if not dry_run else "read",
                 )
                 record_sync = await _sync_issue_record_table(
                     session,
@@ -776,6 +779,7 @@ def build_wbs_tools() -> list:
                     session,
                     project=project,
                     project_id=project_id,
+                    permission="write" if not dry_run else "read",
                 )
                 if not context or not context.get("id"):
                     return {"error": "No active or matching project context."}
@@ -808,7 +812,9 @@ def build_wbs_tools() -> list:
                         },
                     }
                 user_id, resolved_project_id = await _resolve_actor_and_project(
-                    session, project_id=str(context["id"])
+                    session,
+                    project_id=str(context["id"]),
+                    permission="write" if not dry_run else "read",
                 )
                 record_sync = await _sync_wbs_record_table(
                     session,

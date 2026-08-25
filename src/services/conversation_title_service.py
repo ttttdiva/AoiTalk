@@ -95,22 +95,34 @@ async def _update_generated_title(
     repo,
     session_id: str,
     generated: GeneratedConversationTitle,
+    expected_title: str,
 ) -> bool:
     update_title = getattr(repo, "update_session_title")
     signature = inspect.signature(update_title)
+    concurrency_kwargs = (
+        {"expected_title": expected_title}
+        if "expected_title" in signature.parameters
+        else {}
+    )
     if "source" in signature.parameters:
         return await update_title(
             session_id,
             generated.title,
             source=generated.source,
+            **concurrency_kwargs,
         )
     if "title_source" in signature.parameters:
         return await update_title(
             session_id,
             generated.title,
             title_source=generated.source,
+            **concurrency_kwargs,
         )
-    return await update_title(session_id, generated.title)
+    return await update_title(
+        session_id,
+        generated.title,
+        **concurrency_kwargs,
+    )
 
 
 def _has_title_context(messages: Sequence[ConversationMessage]) -> bool:
@@ -208,7 +220,8 @@ async def ensure_conversation_title(
     else:
         messages = await repo.get_session_messages(session_id)
 
-    current_title = _compact_text(session.title or "")
+    current_title_raw = str(session.title or "")
+    current_title = _compact_text(current_title_raw)
     current_source = _title_generation_source(session)
     current_title_is_rejected = is_rejected_generated_title(current_title)
     can_replace_current = (
@@ -228,5 +241,21 @@ async def ensure_conversation_title(
     if current_title and generated.source != "llm" and not current_title_is_rejected:
         return None
 
-    updated = await _update_generated_title(repo, session_id, generated)
+    # Generation may take seconds. A user can manually rename the session while
+    # it is in flight, so re-read before persisting and only update the title
+    # state that this generation started from.
+    latest_session = await repo.get_session_by_id(session_id, with_messages=False)
+    if not latest_session:
+        return None
+    latest_title = _compact_text(latest_session.title or "")
+    latest_source = _title_generation_source(latest_session)
+    if latest_title != current_title or latest_source != current_source:
+        return None
+
+    updated = await _update_generated_title(
+        repo,
+        session_id,
+        generated,
+        expected_title=current_title_raw,
+    )
     return generated if updated else None

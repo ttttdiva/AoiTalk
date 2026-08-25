@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DocsWorkspace } from "@/components/docs/docs-workspace";
 import type { DocsNode, DocsNodeSupertag, DocsSupertag } from "@/components/docs/types";
 import { RecordTableEditor } from "@/components/records/record-table-editor";
@@ -484,28 +484,69 @@ function formatDate(value?: string | null) {
 }
 
 export function ProjectInformationPanel({ project }: { project: ProjectInfo }) {
-  const [data, setData] = useState<ProjectInformationResponse | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [selectedTableId, setSelectedTableId] = useState<string | null>(null);
+  const [loadedData, setLoadedData] = useState<{
+    projectId: string;
+    response: ProjectInformationResponse;
+  } | null>(null);
+  const [errorState, setErrorState] = useState<{
+    projectId: string;
+    message: string;
+  } | null>(null);
+  const [selectedTableState, setSelectedTableState] = useState<{
+    projectId: string;
+    tableId: string;
+  } | null>(null);
+  const [loadingProjectId, setLoadingProjectId] = useState<string | null>(null);
+  const requestGenerationRef = useRef(0);
+  const requestControllerRef = useRef<AbortController | null>(null);
+
+  const data = loadedData?.projectId === project.id ? loadedData.response : null;
+  const error = errorState?.projectId === project.id ? errorState.message : "";
+  const loading =
+    loadingProjectId === project.id || (data === null && error.length === 0);
+  const selectedTableId =
+    selectedTableState?.projectId === project.id
+      ? selectedTableState.tableId
+      : null;
 
   const load = useCallback(async () => {
-    setLoading(true);
-    setError("");
+    const requestProjectId = project.id;
+    const requestGeneration = ++requestGenerationRef.current;
+    requestControllerRef.current?.abort();
+    const controller = new AbortController();
+    requestControllerRef.current = controller;
+    setLoadingProjectId(requestProjectId);
+    setErrorState(null);
     try {
       const response = await apiFetch<ProjectInformationResponse>(
-        `/api/projects/${project.id}/information`,
+        `/api/projects/${requestProjectId}/information`,
+        { signal: controller.signal },
       );
-      setData(response);
+      if (requestGeneration !== requestGenerationRef.current) return;
+      setLoadedData({ projectId: requestProjectId, response });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "案件情報の取得に失敗しました");
+      if (
+        controller.signal.aborted ||
+        requestGeneration !== requestGenerationRef.current
+      ) {
+        return;
+      }
+      setErrorState({
+        projectId: requestProjectId,
+        message: err instanceof Error ? err.message : "案件情報の取得に失敗しました",
+      });
     } finally {
-      setLoading(false);
+      if (requestGeneration === requestGenerationRef.current) {
+        setLoadingProjectId(null);
+      }
     }
   }, [project.id]);
 
   useEffect(() => {
     void load();
+    return () => {
+      requestControllerRef.current?.abort();
+    };
   }, [load]);
 
   const recordTables = useMemo(() => data?.record_tables ?? [], [data?.record_tables]);
@@ -538,8 +579,8 @@ export function ProjectInformationPanel({ project }: { project: ProjectInfo }) {
   }
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b pb-3">
+    <div className="flex min-h-0 flex-1 flex-col gap-4 pb-8">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             <BookOpen className="size-4 text-primary" />
@@ -566,15 +607,18 @@ export function ProjectInformationPanel({ project }: { project: ProjectInfo }) {
       )}
 
       {data?.node.id && (
-        <section className="min-h-[680px] overflow-hidden border bg-background">
-          <DocsWorkspace initialNodeId={data.node.id} />
+        <section className="min-h-[560px] overflow-hidden rounded-md border border-border bg-card">
+          <DocsWorkspace
+            key={`${project.id}:${data.node.id}`}
+            initialNodeId={data.node.id}
+          />
         </section>
       )}
 
-      <DailyIntakeSection project={project} onApplied={load} />
+      <DailyIntakeSection key={project.id} project={project} onApplied={load} />
 
       <div className="grid gap-4 xl:grid-cols-2">
-          <section className="rounded-md border bg-background">
+          <section className="rounded-md border border-border bg-card">
             <div className="flex items-center justify-between border-b px-3 py-2">
               <div className="text-sm font-medium">Q&A</div>
               <Badge variant="secondary">{data?.qa_entries.length ?? 0}</Badge>
@@ -601,7 +645,7 @@ export function ProjectInformationPanel({ project }: { project: ProjectInfo }) {
             </div>
           </section>
 
-          <section className="rounded-md border bg-background">
+          <section className="rounded-md border border-border bg-card">
             <div className="flex items-center justify-between border-b px-3 py-2">
               <div className="flex items-center gap-2 text-sm font-medium">
                 <Database className="size-4" />
@@ -618,8 +662,13 @@ export function ProjectInformationPanel({ project }: { project: ProjectInfo }) {
                     <button
                       key={table.id}
                       type="button"
-                      onClick={() => setSelectedTableId(table.id)}
-                      className="w-full rounded-md border p-3 text-left hover:bg-muted"
+                      onClick={() =>
+                        setSelectedTableState({
+                          projectId: project.id,
+                          tableId: table.id,
+                        })
+                      }
+          className="w-full rounded-md border border-border p-3 text-left transition-colors hover:bg-accent"
                     >
                       <div className="flex items-center gap-2 text-sm font-medium">
                         <Table2 className="size-4" />
@@ -639,7 +688,7 @@ export function ProjectInformationPanel({ project }: { project: ProjectInfo }) {
       </div>
 
       {selectedTable && (
-        <div className="rounded-md border bg-background p-3">
+        <div className="rounded-md border border-border bg-card p-3">
           <div className="mb-3 flex items-center justify-between">
             <div>
               <h4 className="text-sm font-semibold">{selectedTable.name}</h4>
@@ -647,14 +696,14 @@ export function ProjectInformationPanel({ project }: { project: ProjectInfo }) {
                 <p className="text-xs text-muted-foreground">{selectedTable.description}</p>
               )}
             </div>
-            <Button variant="outline" size="sm" onClick={() => setSelectedTableId(null)}>
+            <Button variant="outline" size="sm" onClick={() => setSelectedTableState(null)}>
               閉じる
             </Button>
           </div>
           <RecordTableEditor
             projectId={project.id}
             tableId={selectedTable.id}
-            onClose={() => setSelectedTableId(null)}
+            onClose={() => setSelectedTableState(null)}
             onChanged={load}
           />
         </div>

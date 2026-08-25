@@ -1,9 +1,9 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useMemo, type ReactNode } from "react";
 import { useExplorer } from "@/contexts/explorer-context";
 import type { ExplorerDirectory, ExplorerFile } from "@/lib/explorer-api";
-import { explorerMove } from "@/lib/explorer-api";
+import { useFilerOperations } from "@/hooks/use-filer-operations";
 import {
   sortExplorerDirectories,
   sortExplorerFiles,
@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { isRecordTableFile } from "@/lib/record-tables-api";
+import { formatExplorerDateTime } from "@/lib/explorer-format";
 
 function formatSize(bytes?: number): string {
   if (bytes == null) return "-";
@@ -55,6 +56,9 @@ interface FileListProps {
     e: React.MouseEvent,
     item: ExplorerDirectory | ExplorerFile,
   ) => void;
+  directories?: ExplorerDirectory[];
+  files?: ExplorerFile[];
+  headerAddon?: ReactNode;
 }
 
 interface SortHeaderProps {
@@ -72,7 +76,7 @@ function SortHeader({
 }: SortHeaderProps) {
   return (
     <th
-      className="cursor-pointer px-2 py-1 text-left text-xs font-medium text-muted-foreground hover:text-foreground"
+      className="cursor-pointer px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wide text-muted-foreground hover:text-foreground"
       onClick={() => onToggle(columnKey)}
     >
       <span className="inline-flex items-center gap-0.5">
@@ -83,7 +87,13 @@ function SortHeader({
   );
 }
 
-export function FileList({ onFileClick, onContextMenu }: FileListProps) {
+export function FileList({
+  onFileClick,
+  onContextMenu,
+  directories,
+  files,
+  headerAddon,
+}: FileListProps) {
   const {
     browseData,
     navigate,
@@ -98,8 +108,18 @@ export function FileList({ onFileClick, onContextMenu }: FileListProps) {
     sortDir,
     setSort,
     isHydrusMode,
+    capabilities,
   } = useExplorer();
+  const { transfer } = useFilerOperations({ capabilities, refresh });
   const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const displayedPathSet = useMemo(
+    () =>
+      new Set([
+        ...(directories ?? browseData?.directories ?? []).map((item) => item.path),
+        ...(files ?? browseData?.files ?? []).map((item) => item.path),
+      ]),
+    [browseData?.directories, browseData?.files, directories, files],
+  );
 
   const toggleSort = useCallback(
     (key: SortKey) => {
@@ -141,12 +161,15 @@ export function FileList({ onFileClick, onContextMenu }: FileListProps) {
   const handleDragStart = useCallback(
     (e: React.DragEvent, item: ExplorerDirectory | ExplorerFile) => {
       const paths = selectedItems.has(item.path)
-        ? Array.from(selectedItems)
+        ? Array.from(selectedItems).filter((path) => displayedPathSet.has(path))
         : [item.path];
       e.dataTransfer.setData(DND_MIME, JSON.stringify(paths));
-      e.dataTransfer.effectAllowed = "move";
+      // Folder targets still request `move`; the bookmark/launcher rail
+      // requests `copy` and never mutates the source.  Advertise both so the
+      // browser can render the target-selected operation correctly.
+      e.dataTransfer.effectAllowed = "copyMove";
     },
-    [selectedItems],
+    [displayedPathSet, selectedItems],
   );
 
   const handleDragOverFolder = useCallback(
@@ -175,38 +198,34 @@ export function FileList({ onFileClick, onContextMenu }: FileListProps) {
       const paths: string[] = JSON.parse(raw);
       if (paths.includes(destPath)) return;
 
-      for (const src of paths) {
-        try {
-          await explorerMove(src, destPath);
-        } catch {
-          break;
-        }
-      }
-      refresh();
+      // 実行・Undo登録は filer-operations 側へ集約
+      await transfer({ paths, destDir: destPath, operation: "move" });
     },
-    [refresh],
+    [transfer],
   );
 
   if (!browseData) return null;
 
   // Hydrus は検索時に Hydrus 側で全件ソート済みのため、1ページ分だけを
   // フロント側で並べ替えると全体の順序が壊れる。API 応答順のまま描画する。
+  const sourceDirectories = directories ?? browseData.directories;
+  const sourceFiles = files ?? browseData.files;
   const sortedDirs = isHydrusMode
-    ? browseData.directories
-    : sortExplorerDirectories(browseData.directories, sortKey, sortDir);
+    ? sourceDirectories
+    : sortExplorerDirectories(sourceDirectories, sortKey, sortDir);
   const sortedFiles = isHydrusMode
-    ? browseData.files
-    : sortExplorerFiles(browseData.files, sortKey, sortDir);
+    ? sourceFiles
+    : sortExplorerFiles(sourceFiles, sortKey, sortDir);
   const orderedPaths = [
     ...sortedDirs.map((dir) => dir.path),
     ...sortedFiles.map((file) => file.path),
   ];
 
   return (
-    <div className="overflow-auto p-1">
-      <table className="w-full text-xs">
+    <div className="overflow-auto rounded-md border border-border bg-card/20">
+      <table className="w-full text-[13px]">
         <thead>
-          <tr className="border-b">
+          <tr className="border-b border-border bg-muted/25">
             <th className="w-6 px-1" />
             <SortHeader
               label="名前"
@@ -226,10 +245,17 @@ export function FileList({ onFileClick, onContextMenu }: FileListProps) {
               activeSortKey={sortKey}
               onToggle={toggleSort}
             />
-            <th className="px-2 py-1 text-left text-xs font-medium text-muted-foreground">
+            <th className="px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
               種別
             </th>
           </tr>
+          {headerAddon && (
+            <tr className="border-b border-border">
+              <th colSpan={5} className="p-1 text-left font-normal">
+                {headerAddon}
+              </th>
+            </tr>
+          )}
         </thead>
         <tbody>
           {sortedDirs.map((dir) => (
@@ -238,14 +264,13 @@ export function FileList({ onFileClick, onContextMenu }: FileListProps) {
               data-explorer-item-path={dir.path}
               draggable
               className={cn(
-                "cursor-pointer transition-opacity hover:bg-muted",
-                selectedItems.has(dir.path) && "bg-accent",
-                focusedItemPath === dir.path && "outline outline-2 outline-primary/45",
+                "cursor-pointer border-b border-border/70 transition-colors hover:bg-muted/45",
+                selectedItems.has(dir.path) && "bg-primary/5",
+                focusedItemPath === dir.path && "outline outline-1 outline-primary/45 outline-offset-[-1px]",
                 clipboard?.operation === "cut" &&
                   clipboard.paths.includes(dir.path) &&
                   "opacity-50",
-                dropTarget === dir.path &&
-                  "ring-2 ring-blue-400 bg-blue-500/10",
+                dropTarget === dir.path && "ring-1 ring-primary bg-primary/10",
               )}
               onClick={(e) => handleClick(e, dir)}
               onDoubleClick={() => handleDoubleClick(dir, true)}
@@ -260,19 +285,17 @@ export function FileList({ onFileClick, onContextMenu }: FileListProps) {
               onDragLeave={handleDragLeaveFolder}
               onDrop={(e) => handleDropOnFolder(e, dir.path)}
             >
-              <td className="px-1">
-                <Folder className="size-4 text-blue-500" />
+              <td className="w-10 px-3 py-2">
+                <Folder className="size-4 text-tertiary" />
               </td>
-              <td className="px-2 py-1">{dir.name}</td>
-              <td className="px-2 py-1 text-muted-foreground">
+              <td className="max-w-[34rem] px-3 py-2 font-medium">{dir.name}</td>
+              <td className="px-3 py-2 text-muted-foreground">
                 {dir.item_count != null ? `${dir.item_count}件` : "-"}
               </td>
-              <td className="px-2 py-1 text-muted-foreground">
-                {dir.modified_at
-                  ? new Date(dir.modified_at).toLocaleDateString("ja-JP")
-                  : "-"}
+              <td className="whitespace-nowrap px-3 py-2 text-muted-foreground">
+                {formatExplorerDateTime(dir.modified_at)}
               </td>
-              <td className="px-2 py-1 text-muted-foreground">フォルダ</td>
+              <td className="px-3 py-2 text-muted-foreground">フォルダ</td>
             </tr>
           ))}
           {sortedFiles.map((file) => (
@@ -281,9 +304,9 @@ export function FileList({ onFileClick, onContextMenu }: FileListProps) {
               data-explorer-item-path={file.path}
               draggable={!isRecordTableFile(file)}
               className={cn(
-                "cursor-pointer transition-opacity hover:bg-muted",
-                selectedItems.has(file.path) && "bg-accent",
-                focusedItemPath === file.path && "outline outline-2 outline-primary/45",
+                "cursor-pointer border-b border-border/70 transition-colors hover:bg-muted/45",
+                selectedItems.has(file.path) && "bg-primary/5",
+                focusedItemPath === file.path && "outline outline-1 outline-primary/45 outline-offset-[-1px]",
                 clipboard?.operation === "cut" &&
                   clipboard.paths.includes(file.path) &&
                   "opacity-50",
@@ -301,19 +324,17 @@ export function FileList({ onFileClick, onContextMenu }: FileListProps) {
                 handleDragStart(e, file);
               }}
             >
-              <td className="px-1">{fileTypeIcon(file)}</td>
-              <td className="px-2 py-1">{file.name}</td>
-              <td className="px-2 py-1 text-muted-foreground">
+              <td className="w-10 px-3 py-2">{fileTypeIcon(file)}</td>
+              <td className="max-w-[34rem] px-3 py-2 font-medium">{file.name}</td>
+              <td className="px-3 py-2 text-muted-foreground">
                 {isRecordTableFile(file)
                   ? `${file.row_count ?? 0}行`
                   : formatSize(file.size)}
               </td>
-              <td className="px-2 py-1 text-muted-foreground">
-                {file.modified_at
-                  ? new Date(file.modified_at).toLocaleDateString("ja-JP")
-                  : "-"}
+              <td className="whitespace-nowrap px-3 py-2 text-muted-foreground">
+                {formatExplorerDateTime(file.modified_at)}
               </td>
-              <td className="px-2 py-1 text-muted-foreground">
+              <td className="px-3 py-2 text-muted-foreground">
                 {isRecordTableFile(file)
                   ? "DBテーブル"
                   : file.extension?.toUpperCase() || "ファイル"}

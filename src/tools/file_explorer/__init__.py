@@ -3,9 +3,14 @@ from importlib import import_module
 
 from .file_explorer_service import (
     get_root_dir,
+    workspace_root_context,
+    is_safe_workspace_path,
     list_directory,
+    resolve_workspace_path,
+    resolve_upload_target,
     create_directory,
     upload_file,
+    upload_file_stream,
     download_file,
     download_items,
     resolve_file_path,
@@ -15,11 +20,12 @@ from .file_explorer_service import (
     archive_items,
     extract_archives,
     delete_item,
+    restore_from_trash,
     get_file_info,
     get_preview,
     get_directory_tree,
-    inspect_workspace_tree,
-    find_workspace_items,
+    walk_workspace_tree,
+    search_workspace_entries,
     # Editor functions
     save_file,
     get_full_content,
@@ -29,18 +35,14 @@ from .file_explorer_service import (
     clear_folder_thumbnail,
 )
 _TOOL_EXPORTS = {
-    "list_workspace_files": "list_workspace_files",
-    "find_workspace_items_tool": "find_workspace_items",
-    "inspect_workspace_tree_tool": "inspect_workspace_tree",
     "create_workspace_directory": "create_workspace_directory",
     "upload_workspace_file": "upload_workspace_file",
-    "read_workspace_file": "read_workspace_file",
     "delete_workspace_item": "delete_workspace_item",
     "move_workspace_item": "move_workspace_item",
+    "copy_workspace_item": "copy_workspace_item",
+    "list_workspace_tree": "list_workspace_tree",
     "get_workspace_file_info": "get_workspace_file_info",
 }
-
-
 def __getattr__(name: str):
     if name not in _TOOL_EXPORTS:
         raise AttributeError(name)
@@ -52,9 +54,12 @@ def __getattr__(name: str):
 __all__ = [
     # Service functions
     "get_root_dir",
+    "workspace_root_context",
+    "is_safe_workspace_path",
     "list_directory",
     "create_directory",
     "upload_file",
+    "upload_file_stream",
     "download_file",
     "download_items",
     "resolve_file_path",
@@ -64,11 +69,14 @@ __all__ = [
     "archive_items",
     "extract_archives",
     "delete_item",
+    "restore_from_trash",
     "get_file_info",
     "get_preview",
     "get_directory_tree",
-    "inspect_workspace_tree",
-    "find_workspace_items",
+    "walk_workspace_tree",
+    "search_workspace_entries",
+    "resolve_workspace_path",
+    "resolve_upload_target",
     # Editor functions
     "save_file",
     "get_full_content",
@@ -77,13 +85,11 @@ __all__ = [
     "set_folder_thumbnail",
     "clear_folder_thumbnail",
     # LLM Tools
-    "list_workspace_files",
-    "find_workspace_items_tool",
-    "inspect_workspace_tree_tool",
     "create_workspace_directory",
     "upload_workspace_file",
-    "read_workspace_file",
     "delete_workspace_item",
     "move_workspace_item",
+    "copy_workspace_item",
+    "list_workspace_tree",
     "get_workspace_file_info",
 ]

@@ -10,16 +10,18 @@ full upstream application.
 from __future__ import annotations
 
 import asyncio
+import copy
 import html
 import json
 import logging
 import os
 import re
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterable, Optional
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 import xml.etree.ElementTree as ET
 
@@ -30,11 +32,20 @@ from ..llm.agent_runtime import (
     reset_verified_tool_execution_claims,
     set_verified_tool_execution_claims,
 )
+from ..llm.conversation_context import normalize_usage, persist_usage_sync
+from ..llm.sglang_url import resolve_sglang_base_url, resolve_sglang_model
+from .outbound_privacy_service import (
+    ExternalProviderBlocked,
+    OutboundPrivacyGateway,
+    PrivacyError,
+)
+from .turn_context import get_turn_context
 
 logger = logging.getLogger(__name__)
 
 
 DEFAULT_ENGINES = ["searxng", "wikipedia", "arxiv", "openalex", "pubmed"]
+DEFAULT_YAHOO_REALTIME_URL = "https://search.yahoo.co.jp/realtime/search"
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 
 
@@ -133,6 +144,12 @@ class DeepResearchRequest:
     project_id: Optional[str] = None
     actor_user_id: Optional[str] = None
     is_admin: bool = False
+    # Optional request scope used by direct/background callers.  HTTP routes
+    # may omit these fields; the runner then falls back to the current
+    # TurnContext and an isolated job id for privacy/usage scoping.
+    session_id: Optional[str] = None
+    session_context: Optional[Mapping[str, Any]] = None
+    project_metadata: Optional[Mapping[str, Any]] = None
 
     def normalized(self) -> "DeepResearchRequest":
         mode = self.mode if self.mode in {"quick", "detailed", "report"} else "detailed"
@@ -149,6 +166,17 @@ class DeepResearchRequest:
             project_id=self.project_id,
             actor_user_id=self.actor_user_id,
             is_admin=bool(self.is_admin),
+            session_id=str(self.session_id).strip() if self.session_id else None,
+            session_context=(
+                dict(self.session_context)
+                if isinstance(self.session_context, Mapping)
+                else None
+            ),
+            project_metadata=(
+                dict(self.project_metadata)
+                if isinstance(self.project_metadata, Mapping)
+                else None
+            ),
         )
 
 
@@ -269,17 +297,370 @@ class DeepResearchJobStore:
 class DeepResearchLLMAdapter:
     """Tool-free LLM adapter for research planning and synthesis."""
 
-    def __init__(self, config: Any, user_id: str = "default_user") -> None:
+    def __init__(
+        self,
+        config: Any,
+        user_id: str = "default_user",
+        *,
+        session_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        session_context: Optional[Mapping[str, Any]] = None,
+        project_metadata: Optional[Mapping[str, Any]] = None,
+        agent_name: str = "deep_research",
+        request_type: str = "deep_research",
+    ) -> None:
         self.config = config
         self.user_id = user_id
+        self.session_id = session_id
+        self.project_id = project_id
+        self.session_context = (
+            dict(session_context) if isinstance(session_context, Mapping) else None
+        )
+        self.project_metadata = (
+            dict(project_metadata) if isinstance(project_metadata, Mapping) else None
+        )
+        if self.project_id:
+            self.project_metadata = dict(self.project_metadata or {})
+            self.project_metadata.setdefault("project_id", self.project_id)
+        self.agent_name = agent_name
+        self.request_type = request_type
+        self._recorded_usage_responses: list[Any] = []
+        self._deployment = None
+        self._apply_deployment_contract()
+        self._privacy_gateway = OutboundPrivacyGateway(
+            self.config,
+            user_id=str(user_id or "default_user"),
+            session_id=str(session_id or ""),
+            session_context=self.session_context,
+            project_metadata=self.project_metadata,
+        )
+
+    def _apply_deployment_contract(self) -> None:
+        """Project fixed Enterprise settings onto direct research SDK paths."""
+
+        from ..llm.deployment_resolver import (
+            effective_config_overrides,
+            resolve_llm_deployment,
+        )
+
+        deployment = resolve_llm_deployment(self.config)
+        self._deployment = deployment
+        if deployment is None:
+            return
+
+        persisted_provider = str(
+            _config_get(self.config, "llm_provider", "gemini") or "gemini"
+        ).strip().lower()
+        available, _ = deployment.provider_available(persisted_provider)
+        if deployment.fixed or not available:
+            # Deep Research does not accept a per-request provider override;
+            # an out-of-contract persisted provider is therefore stale state,
+            # not an explicit engine switch.  Use the effective endpoint/model
+            # and leave the persisted config untouched for diagnostics.
+            overrides = effective_config_overrides(self.config)
+            if overrides:
+                from ..llm.manager import TargetConfig
+
+                self.config = TargetConfig(self.config, overrides)
+
+    def set_usage_context(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        session_context: Optional[Mapping[str, Any]] = None,
+        project_metadata: Optional[Mapping[str, Any]] = None,
+        agent_name: Optional[str] = None,
+        request_type: Optional[str] = None,
+    ) -> None:
+        """Attach the research job scope to direct SDK usage rows.
+
+        The normal provider client owns usage persistence.  Direct SDK calls
+        in this adapter do not have that client, so keep the job scope here
+        and pass it through a lightweight persistence proxy below.
+        """
+
+        if user_id:
+            self.user_id = str(user_id)
+        if session_id is not None:
+            self.session_id = str(session_id) if session_id else None
+        if project_id is not None:
+            self.project_id = str(project_id) if project_id else None
+        if session_context is not None:
+            self.session_context = dict(session_context)
+        if project_metadata is not None:
+            self.project_metadata = dict(project_metadata)
+        if self.project_id:
+            self.project_metadata = dict(self.project_metadata or {})
+            self.project_metadata.setdefault("project_id", self.project_id)
+        if agent_name:
+            self.agent_name = str(agent_name)
+        if request_type:
+            self.request_type = str(request_type)
+        # The adapter may be created before the runner knows the durable
+        # conversation scope. Keep the privacy gateway bound to the same
+        # actor/session/project context as usage telemetry rather than leaving
+        # a process-wide anonymous alias bucket behind.
+        old_identity = (
+            self._privacy_gateway.user_id,
+            self._privacy_gateway.session_id,
+        )
+        new_identity = (str(self.user_id or "default_user"), str(self.session_id or ""))
+        if old_identity != new_identity:
+            self._privacy_gateway._raw_to_alias.clear()
+            self._privacy_gateway._alias_to_raw.clear()
+            self._privacy_gateway._counters.clear()
+        self._privacy_gateway.user_id, self._privacy_gateway.session_id = new_identity
+        self._privacy_gateway.update_policy_context(
+            session_context=self.session_context,
+            project_metadata=self.project_metadata,
+        )
+
+    class _UsageClient:
+        def __init__(
+            self,
+            *,
+            user_id: Optional[str],
+            session_id: Optional[str],
+            project_id: Optional[str],
+            agent_name: Optional[str],
+        ) -> None:
+            self.current_session_id = session_id
+            self.current_project_id = project_id
+            self.character_name = agent_name
+            self._user_id = user_id
+
+        def _get_session_user_id(self) -> str:
+            return str(self._user_id or "default_user")
+
+    @staticmethod
+    def _as_mapping(value: Any) -> dict[str, Any]:
+        if isinstance(value, Mapping):
+            return {str(key): item for key, item in value.items()}
+        for method_name in ("model_dump", "to_dict", "dict"):
+            method = getattr(value, method_name, None)
+            if callable(method):
+                try:
+                    dumped = method()
+                except Exception:
+                    continue
+                if isinstance(dumped, Mapping):
+                    return {str(key): item for key, item in dumped.items()}
+        raw = getattr(value, "__dict__", None)
+        if isinstance(raw, Mapping):
+            return {
+                str(key): item
+                for key, item in raw.items()
+                if not str(key).startswith("_")
+            }
+        return {}
+
+    @classmethod
+    def _response_usage(cls, response: Any, *, provider: str) -> dict[str, Any]:
+        """Normalize a successful direct SDK response without inventing usage."""
+
+        raw = getattr(response, "usage", None)
+        if raw is None:
+            raw = getattr(response, "usage_metadata", None)
+        if raw is None:
+            raw = getattr(response, "usageMetadata", None)
+        if raw is None and isinstance(response, Mapping):
+            raw = (
+                response.get("usage")
+                or response.get("usage_metadata")
+                or response.get("usageMetadata")
+            )
+        if raw is None:
+            return {}
+
+        payload = cls._as_mapping(raw)
+        # google-generativeai exposes usage_metadata with Gemini-specific names.
+        if not payload:
+            for source, target in (
+                ("prompt_token_count", "input_tokens"),
+                ("promptTokenCount", "input_tokens"),
+                ("candidates_token_count", "output_tokens"),
+                ("candidatesTokenCount", "output_tokens"),
+                ("cached_content_token_count", "cache_read_tokens"),
+                ("cachedContentTokenCount", "cache_read_tokens"),
+                ("cached_content_token_count", "cached_tokens"),
+                ("cachedContentTokenCount", "cached_tokens"),
+                ("thoughts_token_count", "reasoning_tokens"),
+                ("thoughtsTokenCount", "reasoning_tokens"),
+            ):
+                value = getattr(raw, source, None)
+                if value is not None:
+                    payload[target] = value
+        else:
+            # model_dump() can preserve Gemini names; map them before the
+            # common normalizer so zero/None semantics stay provider-owned.
+            aliases = {
+                "prompt_token_count": "input_tokens",
+                "promptTokenCount": "input_tokens",
+                "candidates_token_count": "output_tokens",
+                "candidatesTokenCount": "output_tokens",
+                "cached_content_token_count": "cache_read_tokens",
+                "cachedContentTokenCount": "cache_read_tokens",
+                "thoughts_token_count": "reasoning_tokens",
+                "thoughtsTokenCount": "reasoning_tokens",
+            }
+            for source, target in aliases.items():
+                if source in payload and target not in payload:
+                    payload[target] = payload[source]
+            for cache_key in ("cached_content_token_count", "cachedContentTokenCount"):
+                if cache_key in payload and "cached_tokens" not in payload:
+                    payload["cached_tokens"] = payload[cache_key]
+
+        resolved_model = getattr(response, "model", None) or getattr(
+            response, "model_version", None
+        )
+        if resolved_model is None and isinstance(response, Mapping):
+            resolved_model = (
+                response.get("model")
+                or response.get("model_version")
+                or response.get("modelVersion")
+            )
+        normalized = normalize_usage(
+            payload,
+            provider=provider,
+            resolved_model=str(resolved_model) if resolved_model else None,
+        )
+        # ``normalize_usage`` intentionally leaves unavailable fields as None.
+        # Do not persist a row when the provider gave no token dimensions.
+        if normalized.get("input_tokens") is None and normalized.get("output_tokens") is None:
+            return {}
+        return normalized
+
+    def _record_direct_usage(
+        self,
+        response: Any,
+        *,
+        provider: str,
+        model: str,
+        started: float,
+    ) -> None:
+        try:
+            usage = self._response_usage(response, provider=provider)
+            if not usage:
+                return
+            if self._mark_usage_recorded(response):
+                return
+            turn = get_turn_context()
+            user_id = self.user_id or turn.user_id
+            session_id = self.session_id or turn.session_id
+            project_id = self.project_id or turn.project_id
+            proxy = self._UsageClient(
+                user_id=user_id,
+                session_id=session_id,
+                project_id=project_id,
+                agent_name=self.agent_name,
+            )
+            persist_usage_sync(
+                proxy,
+                provider=provider,
+                model=model,
+                requested_model=model,
+                resolved_model=usage.get("resolved_model"),
+                usage=usage,
+                request_type=self.request_type,
+                latency_ms=max(0, int((time.perf_counter() - started) * 1000)),
+            )
+        except Exception:
+            # Usage telemetry must never turn a successful research response
+            # into a failed job.
+            logger.debug("Direct deep research usage persistence failed", exc_info=True)
+
+    def _apply_client_usage_context(self, client: Any) -> None:
+        """Apply research scope to a newly-created fallback provider client."""
+
+        if client is None:
+            return
+        turn = get_turn_context()
+        user_id = self.user_id or turn.user_id
+        session_id = self.session_id or turn.session_id
+        project_id = self.project_id or turn.project_id
+        try:
+            setter = getattr(client, "set_session_context", None)
+            if callable(setter) and user_id:
+                setter(user_id=str(user_id))
+        except Exception:
+            logger.debug("Deep research fallback user context setup failed", exc_info=True)
+        if self.agent_name and hasattr(client, "character_name"):
+            try:
+                client.character_name = self.agent_name
+            except Exception:
+                logger.debug("Deep research fallback agent context setup failed", exc_info=True)
+        for attribute, value in (
+            ("current_session_id", session_id),
+            ("current_project_id", project_id),
+        ):
+            if value is None or not hasattr(client, attribute):
+                continue
+            try:
+                setattr(client, attribute, str(value))
+            except Exception:
+                logger.debug(
+                    "Deep research fallback %s context setup failed",
+                    attribute,
+                    exc_info=True,
+                )
+
+    def _mark_usage_recorded(self, response: Any) -> bool:
+        """Avoid duplicate rows when a caller reuses one SDK response."""
+
+        try:
+            if getattr(response, "_aoitalk_usage_recorded", False):
+                return True
+            setattr(response, "_aoitalk_usage_recorded", True)
+            return False
+        except Exception:
+            recorded = getattr(self, "_recorded_usage_responses", None)
+            if recorded is None:
+                recorded = []
+                self._recorded_usage_responses = recorded
+            if any(item is response for item in recorded):
+                return True
+            recorded.append(response)
+            del recorded[:-8]
+            return False
 
     async def generate(self, prompt: str, *, max_tokens: int = 2048) -> str:
-        provider = str(_config_get(self.config, "llm_provider", "gemini")).lower()
+        provider = str(_config_get(self.config, "llm_provider", "gemini")).strip().lower()
         try:
             if provider == "gemini":
                 return await self._generate_gemini(prompt)
             if provider == "openai":
                 return await self._generate_openai(prompt, max_tokens=max_tokens)
+            if provider == "openai_compatible_local" and self._deployment is not None:
+                return await self._generate_openai_compatible(
+                    prompt,
+                    base_url=(
+                        _config_get(self.config, "runtime.target_base_url", "")
+                        or _config_get(
+                            self.config,
+                            "openai_compatible_local.base_url",
+                            "http://127.0.0.1:8080/v1",
+                        )
+                    ),
+                    api_key=(
+                        _config_get(self.config, "runtime.target_api_key", "")
+                        or _config_get(
+                            self.config,
+                            "openai_compatible_local.api_key",
+                            "dummy",
+                        )
+                    ),
+                    model=(
+                        _config_get(self.config, "runtime.target_model", "")
+                        or _config_get(
+                            self.config,
+                            "openai_compatible_local.model",
+                            "local-model",
+                        )
+                    ),
+                    max_tokens=max_tokens,
+                )
             if provider == "ollama":
                 return await self._generate_openai_compatible(
                     prompt,
@@ -290,16 +671,18 @@ class DeepResearchLLMAdapter:
                     max_tokens=max_tokens,
                 )
             if provider == "sglang":
-                host = _config_get(self.config, "sglang.host", "127.0.0.1")
-                port = _config_get(self.config, "sglang.port", 30000)
                 return await self._generate_openai_compatible(
                     prompt,
-                    base_url=f"http://{host}:{port}/v1",
+                    base_url=resolve_sglang_base_url(self.config),
                     api_key="sglang",
-                    model=_config_get(self.config, "sglang.model", None)
-                    or _config_get(self.config, "llm_model", "default"),
+                    model=resolve_sglang_model(self.config, fallback="default"),
                     max_tokens=max_tokens,
                 )
+        except PrivacyError:
+            # A blocked/redaction-failed outbound request must never fall back
+            # to the existing client, which could bypass this adapter's
+            # transport gate and send the raw research prompt externally.
+            raise
         except Exception as exc:
             logger.warning("Direct deep research LLM call failed: %s", exc)
 
@@ -318,11 +701,24 @@ class DeepResearchLLMAdapter:
         genai.configure(api_key=api_key)
         model_name = _config_get(self.config, "llm_model", "gemini-3-flash-preview")
         model = genai.GenerativeModel(model_name=model_name)
+        started = time.perf_counter()
+        protected = await self._privacy_gateway.protect(
+            {"prompt": prompt},
+            provider="gemini",
+            source_kind="deep_research_model_request",
+        )
+        outbound_prompt = str((protected.payload or {}).get("prompt") or "")
         if hasattr(model, "generate_content_async"):
-            response = await model.generate_content_async(prompt)
+            response = await model.generate_content_async(outbound_prompt)
         else:
-            response = await asyncio.to_thread(model.generate_content, prompt)
-        return getattr(response, "text", str(response)) or ""
+            response = await asyncio.to_thread(model.generate_content, outbound_prompt)
+        self._record_direct_usage(
+            response,
+            provider="gemini",
+            model=str(model_name),
+            started=started,
+        )
+        return self._privacy_gateway.restore(getattr(response, "text", str(response)) or "")
 
     async def _generate_openai(self, prompt: str, *, max_tokens: int) -> str:
         api_key = _config_get(self.config, "openai_api_key", "") or os.getenv("OPENAI_API_KEY")
@@ -331,14 +727,31 @@ class DeepResearchLLMAdapter:
         from openai import AsyncOpenAI
 
         client = AsyncOpenAI(api_key=api_key)
-        response = await client.responses.create(
-            model=_config_get(self.config, "llm_model", "gpt-4o"),
-            instructions="You write concise, citation-grounded research reports.",
-            input=prompt,
-            temperature=0.2,
-            max_output_tokens=max_tokens,
+        model_name = str(_config_get(self.config, "llm_model", "gpt-4o"))
+        started = time.perf_counter()
+        request_kwargs = {
+            "model": model_name,
+            "instructions": "You write concise, citation-grounded research reports.",
+            "input": prompt,
+            "temperature": 0.2,
+            "max_output_tokens": max_tokens,
+        }
+        protected = await self._privacy_gateway.protect(
+            request_kwargs,
+            provider="openai",
+            base_url=str(getattr(client, "base_url", "") or ""),
+            source_kind="deep_research_model_request",
         )
-        return getattr(response, "output_text", "") or ""
+        response = await client.responses.create(
+            **protected.payload
+        )
+        self._record_direct_usage(
+            response,
+            provider="openai",
+            model=model_name,
+            started=started,
+        )
+        return self._privacy_gateway.restore(getattr(response, "output_text", "") or "")
 
     async def _generate_openai_compatible(
         self,
@@ -352,36 +765,237 @@ class DeepResearchLLMAdapter:
         from openai import AsyncOpenAI
 
         client = AsyncOpenAI(base_url=base_url.rstrip("/"), api_key=api_key or "local")
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[
+        started = time.perf_counter()
+        request_kwargs = {
+            "model": model,
+            "messages": [
                 {"role": "system", "content": "You write concise, citation-grounded research reports."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.2,
-            max_tokens=max_tokens,
+            "temperature": 0.2,
+            "max_tokens": max_tokens,
+        }
+        protected = await self._privacy_gateway.protect(
+            request_kwargs,
+            provider=str(_config_get(self.config, "llm_provider", "openai_compatible_local")),
+            base_url=base_url,
+            source_kind="deep_research_model_request",
         )
-        return response.choices[0].message.content or ""
+        response = await client.chat.completions.create(
+            **protected.payload
+        )
+        self._record_direct_usage(
+            response,
+            provider=str(_config_get(self.config, "llm_provider", "openai_compatible_local")),
+            model=str(model),
+            started=started,
+        )
+        return self._privacy_gateway.restore(response.choices[0].message.content or "")
 
     async def _generate_with_existing_client(self, prompt: str) -> str:
+        provider = str(_config_get(self.config, "llm_provider", "gemini")).strip().lower()
+        base_url = ""
+        if provider == "openai":
+            base_url = str(_config_get(self.config, "openai_base_url", "") or "")
+        elif provider in {"ollama", "sglang", "openai_compatible_local"}:
+            base_url = str(
+                _config_get(self.config, f"{provider}.base_url", "")
+                or _config_get(self.config, f"{provider}_base_url", "")
+                or ""
+            )
+        # Existing-client fallback is still an outbound model transport.  Do
+        # the same local-only preflight here so a direct-provider failure cannot
+        # silently route the raw prompt through an un-gated client.
+        self._privacy_gateway.ensure_provider_allowed(provider, base_url=base_url)
         from ..llm.manager import create_llm_client
 
         client = create_llm_client(self.config)
-        if hasattr(client, "set_session_context"):
-            client.set_session_context(user_id=self.user_id)
+        self._apply_client_usage_context(client)
         if hasattr(client, "clear_history"):
             client.clear_history()
+        protected = await self._privacy_gateway.protect(
+            {"prompt": prompt},
+            provider=provider,
+            base_url=base_url,
+            source_kind="deep_research_model_request_fallback",
+        )
+        outbound_prompt = str((protected.payload or {}).get("prompt") or "")
         if hasattr(client, "generate_response_async"):
-            return await client.generate_response_async(prompt)
-        return await asyncio.to_thread(client.generate_response, prompt)
+            result = await client.generate_response_async(outbound_prompt)
+        else:
+            result = await asyncio.to_thread(client.generate_response, outbound_prompt)
+        return self._privacy_gateway.restore(result or "")
 
 
 class DeepResearchSearchClient:
     """Citation-ready source collection across local/free search engines."""
 
-    def __init__(self, config: Any = None, timeout_seconds: float = 15.0) -> None:
+    def __init__(
+        self,
+        config: Any = None,
+        timeout_seconds: float = 15.0,
+        *,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        session_context: Optional[Mapping[str, Any]] = None,
+        project_metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
         self.config = config
         self.timeout = httpx.Timeout(timeout_seconds, connect=8.0)
+        self.user_id = str(user_id or "")
+        self.session_id = str(session_id or "")
+        self.project_id = str(project_id or "") or None
+        self.session_context = (
+            dict(session_context) if isinstance(session_context, Mapping) else None
+        )
+        self.project_metadata = (
+            dict(project_metadata) if isinstance(project_metadata, Mapping) else None
+        )
+        self._privacy_gateway = OutboundPrivacyGateway(
+            config,
+            user_id=self.user_id,
+            session_id=self.session_id,
+            session_context=self.session_context,
+            project_metadata=self.project_metadata,
+        )
+
+    def bind_context(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        session_context: Optional[Mapping[str, Any]] = None,
+        project_metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Bind one research job to the outbound search privacy scope.
+
+        ``DeepResearchSearchClient`` is reused by the lightweight search
+        service, so context is refreshed per call rather than captured once at
+        process startup.  Existing callers that omit all fields retain their
+        previous behaviour while still inheriting TurnContext policy.
+        """
+
+        if user_id is not None:
+            self.user_id = str(user_id or "")
+        if session_id is not None:
+            self.session_id = str(session_id or "")
+        if project_id is not None:
+            self.project_id = str(project_id or "") or None
+        if session_context is not None:
+            self.session_context = dict(session_context)
+        if project_metadata is not None:
+            self.project_metadata = dict(project_metadata)
+        if self.project_id:
+            self.project_metadata = dict(self.project_metadata or {})
+            self.project_metadata.setdefault("project_id", self.project_id)
+        old_identity = (
+            self._privacy_gateway.user_id,
+            self._privacy_gateway.session_id,
+        )
+        new_identity = (self.user_id, self.session_id)
+        if old_identity != new_identity:
+            self._privacy_gateway._raw_to_alias.clear()
+            self._privacy_gateway._alias_to_raw.clear()
+            self._privacy_gateway._counters.clear()
+        self._privacy_gateway.user_id, self._privacy_gateway.session_id = new_identity
+        self._privacy_gateway.update_policy_context(
+            session_context=self.session_context,
+            project_metadata=self.project_metadata,
+        )
+
+    @staticmethod
+    def _external_base_url(provider: str) -> str:
+        # The privacy gateway classifies the provider id as external. Keeping
+        # a concrete URL makes the audit record and local-only preflight
+        # unambiguous without making an HTTP request.
+        return {
+            "duckduckgo": "https://html.duckduckgo.com/html/",
+            "yahoo_realtime": DEFAULT_YAHOO_REALTIME_URL,
+            "wikipedia": "https://en.wikipedia.org/w/api.php",
+            "arxiv": "https://export.arxiv.org/api/query",
+            "openalex": "https://api.openalex.org/works",
+            "pubmed": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/",
+        }.get(provider, "https://example.invalid/")
+
+    async def _protect_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        provider: str,
+        base_url: str,
+        source_kind: str,
+    ) -> dict[str, Any]:
+        """Protect one request immediately before its network transport."""
+
+        protected = await self._privacy_gateway.protect(
+            dict(payload),
+            provider=provider,
+            base_url=base_url,
+            source_kind=source_kind,
+        )
+        if isinstance(protected.payload, Mapping):
+            return dict(protected.payload)
+        return dict(payload)
+
+    async def _protected_query(
+        self,
+        query: str,
+        *,
+        provider: str,
+        base_url: str,
+        source_kind: str = "deep_research_search",
+    ) -> str:
+        payload = await self._protect_payload(
+            {"query": str(query or "")},
+            provider=provider,
+            base_url=base_url,
+            source_kind=source_kind,
+        )
+        return str(payload.get("query") or query or "")
+
+    def _request_scope(
+        self,
+        *,
+        user_id: Optional[str],
+        actor_user_id: Optional[str],
+        session_id: Optional[str],
+        project_id: Optional[str],
+        session_context: Optional[Mapping[str, Any]],
+        project_metadata: Optional[Mapping[str, Any]],
+    ) -> "DeepResearchSearchClient":
+        """Return an isolated client view for one concurrent search job.
+
+        ``DeepResearchSearchClient`` is shared by quick-search and queued
+        research jobs.  The previous implementation mutated ``self`` while
+        ``asyncio.gather`` was running, so one user's gateway/alias map could
+        be replaced by another user's scope.  A shallow copy safely shares
+        immutable configuration and timeout settings while giving each job a
+        private identity, metadata, and gateway.
+        """
+
+        scoped = copy.copy(self)
+        scoped.user_id = str(user_id or actor_user_id or "")
+        scoped.session_id = str(session_id or "")
+        scoped.project_id = str(project_id or "") or None
+        scoped.session_context = (
+            dict(session_context) if isinstance(session_context, Mapping) else None
+        )
+        scoped.project_metadata = (
+            dict(project_metadata) if isinstance(project_metadata, Mapping) else None
+        )
+        if scoped.project_id:
+            scoped.project_metadata = dict(scoped.project_metadata or {})
+            scoped.project_metadata.setdefault("project_id", scoped.project_id)
+        scoped._privacy_gateway = OutboundPrivacyGateway(
+            scoped.config,
+            user_id=scoped.user_id,
+            session_id=scoped.session_id,
+            session_context=scoped.session_context,
+            project_metadata=scoped.project_metadata,
+        )
+        return scoped
 
     async def search(
         self,
@@ -393,10 +1007,141 @@ class DeepResearchSearchClient:
         include_local_knowledge: bool = False,
         actor_user_id: Optional[str] = None,
         is_admin: bool = False,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        session_context: Optional[Mapping[str, Any]] = None,
+        project_metadata: Optional[Mapping[str, Any]] = None,
     ) -> list[DeepResearchSource]:
+        # Never mutate the shared search client while concurrent jobs are in
+        # flight.  All provider methods below run on this request-local copy.
+        scoped = self._request_scope(
+            user_id=user_id,
+            actor_user_id=actor_user_id,
+            session_id=session_id,
+            project_id=project_id,
+            session_context=session_context,
+            project_metadata=project_metadata,
+        )
+        return await scoped._search_bound(
+            query,
+            engines=engines,
+            max_results_per_engine=max_results_per_engine,
+            project_id=project_id,
+            include_local_knowledge=include_local_knowledge,
+            actor_user_id=actor_user_id,
+            is_admin=is_admin,
+            user_id=user_id,
+            session_id=session_id,
+            session_context=session_context,
+            project_metadata=project_metadata,
+        )
+
+    async def _search_bound(
+        self,
+        query: str,
+        *,
+        engines: Iterable[str],
+        max_results_per_engine: int,
+        project_id: Optional[str] = None,
+        include_local_knowledge: bool = False,
+        actor_user_id: Optional[str] = None,
+        is_admin: bool = False,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        session_context: Optional[Mapping[str, Any]] = None,
+        project_metadata: Optional[Mapping[str, Any]] = None,
+    ) -> list[DeepResearchSource]:
+        # ``search`` is the request boundary; clear a previous caller's
+        # identity when this invocation omits optional scope instead of
+        # allowing aliases/project bindings to bleed across jobs.
+        self.user_id = str(user_id or actor_user_id or "")
+        self.session_id = str(session_id or "")
+        self.project_id = str(project_id or "") or None
+        self.session_context = (
+            dict(session_context) if isinstance(session_context, Mapping) else None
+        )
+        self.project_metadata = (
+            dict(project_metadata) if isinstance(project_metadata, Mapping) else None
+        )
+        if self.project_id:
+            self.project_metadata = dict(self.project_metadata or {})
+            self.project_metadata.setdefault("project_id", self.project_id)
+        old_identity = (
+            self._privacy_gateway.user_id,
+            self._privacy_gateway.session_id,
+        )
+        new_identity = (self.user_id, self.session_id)
+        if old_identity != new_identity:
+            self._privacy_gateway._raw_to_alias.clear()
+            self._privacy_gateway._alias_to_raw.clear()
+            self._privacy_gateway._counters.clear()
+        self._privacy_gateway.user_id, self._privacy_gateway.session_id = new_identity
+        self._privacy_gateway.update_policy_context(
+            session_context=self.session_context,
+            project_metadata=self.project_metadata,
+        )
         tasks: list[Awaitable[list[DeepResearchSource]]] = []
         selected = [engine.lower() for engine in engines]
+        # Fail closed before opening an AsyncClient or scheduling any external
+        # search transport.  In particular, local_only must not degrade to an
+        # empty result set that looks like a successful search.
+        searxng_url = self._searxng_url()
+        if "searxng" in selected and searxng_url:
+            self._privacy_gateway.ensure_provider_allowed(
+                "openai_compatible_local",
+                base_url=searxng_url,
+            )
+        external_engines = {
+            "duckduckgo",
+            "yahoo_realtime",
+            "wikipedia",
+            "arxiv",
+            "openalex",
+            "pubmed",
+        }
+        yahoo_url = self._yahoo_realtime_url()
+        # X links/posts have a substantially more reliable source in Yahoo's
+        # realtime index than generic web engines.  Always put that request
+        # first for an X-intent query, and keep it out of the subsequent
+        # gather so Yahoo and SearXNG (or another provider) cannot start at
+        # the same time.  If the caller did not explicitly select Yahoo, the
+        # intent still opts it in when the endpoint is available; this keeps
+        # direct URL/post research deterministic without changing ordinary
+        # query behaviour.
+        x_intent = self._is_x_intent_query(query)
+        if x_intent and yahoo_url and "yahoo_realtime" not in selected:
+            selected.insert(0, "yahoo_realtime")
+        if "yahoo_realtime" in selected and yahoo_url:
+            self._privacy_gateway.ensure_provider_allowed(
+                "yahoo_realtime",
+                base_url=yahoo_url,
+            )
+        for engine in set(selected).intersection(external_engines):
+            if engine == "yahoo_realtime":
+                # The Yahoo endpoint is checked above using the configured
+                # URL.  Keep the provider allowlist explicit even when the
+                # caller supplied an alias in ``engines``.
+                continue
+            self._privacy_gateway.ensure_provider_allowed(
+                "openai",
+                base_url=self._external_base_url(engine),
+            )
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+            batches: list[Any] = []
+            if x_intent and "yahoo_realtime" in selected and yahoo_url:
+                try:
+                    # This await is intentional; do not move Yahoo into the
+                    # gather below.  URL/post evidence must settle before
+                    # generic search providers can race it.
+                    batches.append(
+                        await self._search_yahoo_realtime(
+                            client, query, max_results_per_engine
+                        )
+                    )
+                except (ExternalProviderBlocked, PrivacyError):
+                    raise
+                except Exception as exc:  # provider failure must not hide others
+                    logger.debug("Yahoo realtime search failed: %s", exc)
             if "searxng" in selected:
                 if self._searxng_url():
                     tasks.append(self._search_searxng(client, query, max_results_per_engine))
@@ -404,6 +1149,13 @@ class DeepResearchSearchClient:
                     tasks.append(self._search_duckduckgo(client, query, max_results_per_engine))
             if "duckduckgo" in selected:
                 tasks.append(self._search_duckduckgo(client, query, max_results_per_engine))
+            if "yahoo_realtime" in selected and not (x_intent and yahoo_url):
+                if yahoo_url:
+                    tasks.append(
+                        self._search_yahoo_realtime(
+                            client, query, max_results_per_engine
+                        )
+                    )
             if "wikipedia" in selected:
                 tasks.append(self._search_wikipedia(client, query, max_results_per_engine))
             if "arxiv" in selected:
@@ -423,11 +1175,13 @@ class DeepResearchSearchClient:
                     )
                 )
 
-            batches = await asyncio.gather(*tasks, return_exceptions=True)
+            batches.extend(await asyncio.gather(*tasks, return_exceptions=True))
 
         results: list[DeepResearchSource] = []
         for batch in batches:
             if isinstance(batch, Exception):
+                if isinstance(batch, (ExternalProviderBlocked, PrivacyError)):
+                    raise batch
                 logger.debug("Deep research search batch failed: %s", batch)
                 continue
             results.extend(batch)
@@ -437,6 +1191,11 @@ class DeepResearchSearchClient:
         searxng_url = self._searxng_url()
         return [
             {"id": "searxng", "label": "SearXNG", "available": bool(searxng_url)},
+            {
+                "id": "yahoo_realtime",
+                "label": "Yahoo!リアルタイム検索",
+                "available": bool(self._yahoo_realtime_url()),
+            },
             {"id": "duckduckgo", "label": "DuckDuckGo HTML", "available": True},
             {"id": "wikipedia", "label": "Wikipedia", "available": True},
             {"id": "arxiv", "label": "arXiv", "available": True},
@@ -452,12 +1211,69 @@ class DeepResearchSearchClient:
         )
         return str(configured).rstrip("/") if configured else ""
 
+    def _yahoo_realtime_url(self) -> str:
+        """Return the configured Yahoo! realtime search endpoint.
+
+        The public Yahoo endpoint is the safe default.  A deployment may
+        point at a same-contract proxy (for example, for egress auditing) via
+        the explicit URL setting; the outbound privacy gateway still owns the
+        local-only/external decision immediately before transport.
+        """
+
+        configured = (
+            os.getenv("AOITALK_DEEP_RESEARCH_YAHOO_REALTIME_URL")
+            or os.getenv("AOITALK_YAHOO_REALTIME_URL")
+            or _config_get(self.config, "deep_research.yahoo_realtime_url", "")
+            or _config_get(self.config, "search.yahoo_realtime_url", "")
+        )
+        return str(configured or DEFAULT_YAHOO_REALTIME_URL).rstrip("/")
+
+    @staticmethod
+    def _is_x_intent_query(query: str) -> bool:
+        """Return whether a query is asking for X/Twitter post evidence.
+
+        URL-shaped status references are unambiguous.  The token checks cover
+        natural-language requests (Japanese and English) while deliberately
+        avoiding a bare single-letter ``x`` match.
+        """
+
+        value = str(query or "").strip()
+        if not value:
+            return False
+        # A direct status URL is always an X intent, even when it is supplied
+        # without an imperative verb (the URL-ingest caller uses this shape).
+        try:
+            from .yahoo_realtime_search_service import x_status_id
+
+            if any(x_status_id(token.rstrip(".,。！？!?")) for token in re.findall(r"https?://[^\s<>]+", value)):
+                return True
+            from .yahoo_realtime_search_service import looks_like_x_search_request
+
+            return bool(looks_like_x_search_request(value))
+        except Exception:
+            # Keep search usable when the optional Yahoo parser is unavailable
+            # during a partial installation; only unambiguous URL forms are
+            # accepted by this fallback.
+            return bool(
+                re.search(
+                    r"https?://(?:www\.|mobile\.)?(?:x\.com|twitter\.com)/[^\s?#]*/?(?:status|statuses)/\d+",
+                    value,
+                    flags=re.IGNORECASE,
+                )
+            )
+
     async def _search_duckduckgo(
         self, client: httpx.AsyncClient, query: str, limit: int
     ) -> list[DeepResearchSource]:
+        outbound_query = await self._protected_query(
+            query,
+            provider="openai",
+            base_url=self._external_base_url("duckduckgo"),
+            source_kind="deep_research_search_duckduckgo",
+        )
         response = await client.get(
             "https://html.duckduckgo.com/html/",
-            params={"q": query, "kl": "jp-jp"},
+            params={"q": outbound_query, "kl": "jp-jp"},
             headers={
                 "User-Agent": (
                     "Mozilla/5.0 (compatible; AoiTalkLocalSearch/0.1; "
@@ -499,15 +1315,116 @@ class DeepResearchSearchClient:
             )
         return sources
 
+    async def search_yahoo_realtime(
+        self,
+        client: httpx.AsyncClient,
+        query: str,
+        limit: int = 5,
+    ) -> list[DeepResearchSource]:
+        """Delegate Yahoo transport/parsing to the shared search service."""
+
+        from .yahoo_realtime_search_service import search_yahoo_realtime
+
+        posts_result = await search_yahoo_realtime(
+            client,
+            query,
+            limit=limit,
+            privacy_gateway=self._privacy_gateway,
+            base_url=self._yahoo_realtime_url(),
+        )
+        result_status = str(
+            getattr(posts_result, "status", "")
+            if not isinstance(posts_result, Mapping)
+            else posts_result.get("status", "")
+        ).strip().lower()
+        if result_status in {"blocked", "privacy_blocked"}:
+            raise ExternalProviderBlocked(
+                "Yahoo realtime search was blocked by the privacy policy"
+            )
+        # The shared service returns a typed result envelope.  Accepting a
+        # plain list/mapping as well keeps this boundary compatible with small
+        # test doubles and older embedders without reintroducing a parser.
+        if hasattr(posts_result, "posts"):
+            posts = list(getattr(posts_result, "posts", ()) or ())
+        elif isinstance(posts_result, Mapping):
+            posts = posts_result.get("posts") or posts_result.get("results") or []
+        else:
+            posts = list(posts_result or ())
+        sources: list[DeepResearchSource] = []
+        for post in posts:
+            if isinstance(post, Mapping):
+                url = str(post.get("url") or "")
+                title = str(post.get("title") or "")
+                text = str(post.get("text") or post.get("body") or post.get("snippet") or "")
+                author = str(
+                    post.get("author")
+                    or post.get("author_name")
+                    or post.get("author_handle")
+                    or ""
+                )
+                published = str(post.get("published_at") or "")
+                raw = dict(post)
+            else:
+                url = str(getattr(post, "url", "") or "")
+                title = str(getattr(post, "title", "") or "")
+                text = str(
+                    getattr(post, "text", "")
+                    or getattr(post, "body", "")
+                    or getattr(post, "snippet", "")
+                    or ""
+                )
+                author = str(
+                    getattr(post, "author", "")
+                    or getattr(post, "author_name", "")
+                    or getattr(post, "author_handle", "")
+                    or ""
+                )
+                published = str(getattr(post, "published_at", "") or "")
+                raw = dict(getattr(post, "raw", {}) or {})
+            if not url:
+                continue
+            raw.setdefault("author", author)
+            raw.setdefault("text", text)
+            raw.setdefault("published_at", published)
+            sources.append(
+                DeepResearchSource(
+                    id=0,
+                    title=title or text[:120] or url,
+                    url=url,
+                    snippet=text,
+                    engine="yahoo-realtime",
+                    query=query,
+                    published_at=published or None,
+                    raw=raw,
+                )
+            )
+        return sources[: max(1, int(limit or 1))]
+
+    async def _search_yahoo_realtime(
+        self, client: httpx.AsyncClient, query: str, limit: int
+    ) -> list[DeepResearchSource]:
+        return await self.search_yahoo_realtime(client, query, limit)
+
     async def _search_searxng(
         self, client: httpx.AsyncClient, query: str, limit: int
     ) -> list[DeepResearchSource]:
         base_url = self._searxng_url()
         if not base_url:
             return []
+        outbound_query = await self._protected_query(
+            query,
+            provider="openai_compatible_local",
+            base_url=base_url,
+            source_kind="deep_research_search_searxng",
+        )
         response = await client.get(
             f"{base_url}/search",
-            params={"q": query, "format": "json", "language": "ja-JP", "safesearch": 1},
+            params={
+                "q": outbound_query,
+                "format": "json",
+                "language": "ja-JP",
+                "safesearch": 1,
+            },
         )
         response.raise_for_status()
         data = response.json()
@@ -534,12 +1451,18 @@ class DeepResearchSearchClient:
         self, client: httpx.AsyncClient, query: str, limit: int
     ) -> list[DeepResearchSource]:
         async def run_language(lang: str) -> list[DeepResearchSource]:
+            outbound_query = await self._protected_query(
+                query,
+                provider="openai",
+                base_url=f"https://{lang}.wikipedia.org/w/api.php",
+                source_kind="deep_research_search_wikipedia",
+            )
             response = await client.get(
                 f"https://{lang}.wikipedia.org/w/api.php",
                 params={
                     "action": "query",
                     "list": "search",
-                    "srsearch": query,
+                    "srsearch": outbound_query,
                     "format": "json",
                     "srlimit": limit,
                     "utf8": 1,
@@ -575,6 +1498,8 @@ class DeepResearchSearchClient:
         sources: list[DeepResearchSource] = []
         for batch in batches:
             if isinstance(batch, Exception):
+                if isinstance(batch, (ExternalProviderBlocked, PrivacyError)):
+                    raise batch
                 continue
             sources.extend(batch)
         return sources[:limit]
@@ -582,7 +1507,15 @@ class DeepResearchSearchClient:
     async def _search_arxiv(
         self, client: httpx.AsyncClient, query: str, limit: int
     ) -> list[DeepResearchSource]:
-        params = urlencode({"search_query": f"all:{query}", "start": 0, "max_results": limit})
+        outbound_query = await self._protected_query(
+            query,
+            provider="openai",
+            base_url=self._external_base_url("arxiv"),
+            source_kind="deep_research_search_arxiv",
+        )
+        params = urlencode(
+            {"search_query": f"all:{outbound_query}", "start": 0, "max_results": limit}
+        )
         response = await client.get(f"https://export.arxiv.org/api/query?{params}")
         response.raise_for_status()
         root = ET.fromstring(response.text)
@@ -610,9 +1543,19 @@ class DeepResearchSearchClient:
     async def _search_openalex(
         self, client: httpx.AsyncClient, query: str, limit: int
     ) -> list[DeepResearchSource]:
+        outbound_query = await self._protected_query(
+            query,
+            provider="openai",
+            base_url=self._external_base_url("openalex"),
+            source_kind="deep_research_search_openalex",
+        )
         response = await client.get(
             "https://api.openalex.org/works",
-            params={"search": query, "per-page": limit, "sort": "relevance_score:desc"},
+            params={
+                "search": outbound_query,
+                "per-page": limit,
+                "sort": "relevance_score:desc",
+            },
             headers={"User-Agent": "AoiTalkDeepResearch/0.1 (mailto:local@example.invalid)"},
         )
         response.raise_for_status()
@@ -641,18 +1584,43 @@ class DeepResearchSearchClient:
     async def _search_pubmed(
         self, client: httpx.AsyncClient, query: str, limit: int
     ) -> list[DeepResearchSource]:
+        outbound_query = await self._protected_query(
+            query,
+            provider="openai",
+            base_url=self._external_base_url("pubmed"),
+            source_kind="deep_research_search_pubmed",
+        )
         search = await client.get(
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
-            params={"db": "pubmed", "term": query, "retmode": "json", "retmax": limit},
+            params={
+                "db": "pubmed",
+                "term": outbound_query,
+                "retmode": "json",
+                "retmax": limit,
+            },
             headers={"User-Agent": "AoiTalkDeepResearch/0.1"},
         )
         search.raise_for_status()
         ids = search.json().get("esearchresult", {}).get("idlist", [])
         if not ids:
             return []
+        summary_payload = await self._protect_payload(
+            {
+                "db": "pubmed",
+                "id": ",".join(str(item) for item in ids),
+                "retmode": "json",
+            },
+            provider="openai",
+            base_url=self._external_base_url("pubmed"),
+            source_kind="deep_research_search_pubmed_summary",
+        )
         summary = await client.get(
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
-            params={"db": "pubmed", "id": ",".join(ids), "retmode": "json"},
+            params={
+                "db": str(summary_payload.get("db") or "pubmed"),
+                "id": str(summary_payload.get("id") or ",".join(ids)),
+                "retmode": str(summary_payload.get("retmode") or "json"),
+            },
             headers={"User-Agent": "AoiTalkDeepResearch/0.1"},
         )
         summary.raise_for_status()
@@ -789,6 +1757,52 @@ class DeepResearchRunner:
 
         try:
             llm = self.llm_factory(job.user_id)
+            turn = get_turn_context()
+            effective_session_id = (
+                request.session_id
+                or turn.session_id
+                or f"deep-research:{job.id}"
+            )
+            effective_user_id = request.actor_user_id or job.user_id
+            # The default adapter records direct SDK usage itself.  Preserve
+            # the request scope without requiring custom test/caller factories
+            # to change their one-argument contract.
+            set_usage_context = getattr(llm, "set_usage_context", None)
+            if callable(set_usage_context):
+                try:
+                    try:
+                        set_usage_context(
+                            user_id=job.user_id,
+                            session_id=effective_session_id,
+                            project_id=request.project_id,
+                            session_context=request.session_context,
+                            project_metadata=request.project_metadata,
+                            agent_name="deep_research",
+                            request_type="deep_research",
+                        )
+                    except TypeError:
+                        # Preserve the one-argument/custom adapter contract
+                        # used by existing embedding callers.
+                        set_usage_context(
+                            user_id=job.user_id,
+                            project_id=request.project_id,
+                            agent_name="deep_research",
+                            request_type="deep_research",
+                        )
+                except Exception:
+                    logger.debug("Deep research usage context setup failed", exc_info=True)
+            bind_search_context = getattr(self.search_client, "bind_context", None)
+            if callable(bind_search_context):
+                try:
+                    bind_search_context(
+                        user_id=effective_user_id,
+                        session_id=effective_session_id,
+                        project_id=request.project_id,
+                        session_context=request.session_context,
+                        project_metadata=request.project_metadata,
+                    )
+                except Exception:
+                    logger.debug("Deep research search context setup failed", exc_info=True)
             all_sources: list[DeepResearchSource] = []
             seen: set[str] = set()
 
@@ -817,25 +1831,54 @@ class DeepResearchRunner:
                     "search",
                     {"iteration": iteration, "questions": questions},
                 )
+
+                def _search_question(question: str):
+                    """Call custom/legacy search clients without losing scope."""
+
+                    common_kwargs = {
+                        "engines": request.engines,
+                        "max_results_per_engine": request.max_results_per_query,
+                        "project_id": request.project_id,
+                        "include_local_knowledge": request.include_local_knowledge,
+                        "actor_user_id": request.actor_user_id,
+                        "is_admin": request.is_admin,
+                    }
+                    scoped_kwargs = {
+                        **common_kwargs,
+                        "user_id": effective_user_id,
+                        "session_id": effective_session_id,
+                        "session_context": request.session_context,
+                        "project_metadata": request.project_metadata,
+                    }
+                    try:
+                        return self.search_client.search(question, **scoped_kwargs)
+                    except TypeError as exc:
+                        # Embedders may provide the pre-privacy search client
+                        # contract.  Fall back only for an unsupported scope
+                        # keyword; never swallow an internal TypeError.
+                        message = str(exc)
+                        if not any(
+                            f"unexpected keyword argument '{name}'" in message
+                            for name in (
+                                "user_id",
+                                "session_id",
+                                "session_context",
+                                "project_metadata",
+                            )
+                        ):
+                            raise
+                        return self.search_client.search(question, **common_kwargs)
+
                 batches = await asyncio.gather(
-                    *[
-                        self.search_client.search(
-                            question,
-                            engines=request.engines,
-                            max_results_per_engine=request.max_results_per_query,
-                            project_id=request.project_id,
-                            include_local_knowledge=request.include_local_knowledge,
-                            actor_user_id=request.actor_user_id,
-                            is_admin=request.is_admin,
-                        )
-                        for question in questions
-                    ],
+                    *[_search_question(question) for question in questions],
                     return_exceptions=True,
                 )
 
                 added = 0
                 for batch in batches:
                     if isinstance(batch, Exception):
+                        if isinstance(batch, (ExternalProviderBlocked, PrivacyError)):
+                            raise batch
                         logger.debug("Deep research query failed: %s", batch)
                         continue
                     for source in batch:
@@ -1112,6 +2155,7 @@ class DeepResearchManager:
                 "project_id": normalized.project_id,
                 "actor_user_id": normalized.actor_user_id,
                 "is_admin": normalized.is_admin,
+                "session_id": normalized.session_id,
             },
         )
         job.emit("キューに追加しました", 0, "queued")

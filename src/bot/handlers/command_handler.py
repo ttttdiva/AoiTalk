@@ -12,8 +12,13 @@ from discord.ext import commands
 
 logger = logging.getLogger(__name__)
 
-from ...runtime_features import runtime_feature_manager
-from ..utils.nanobanana_service import NanobananaProService
+from ...runtime_features import (
+    RuntimeFeatureRollbackError,
+    runtime_feature_coordinator,
+    runtime_feature_manager,
+)
+from ..service import discord_bot_service
+from ..utils.nanobanana_service import NanobananaProService, NanobananaUsageContext
 
 
 class CommandHandler:
@@ -369,11 +374,34 @@ class CommandHandler:
                 guild_id=interaction.guild_id,
                 user_id=interaction.user.id
             )
-            session.character = name
-            
-            # DiscordModeのキャラクターも変更
-            if session.assistant:
-                session.assistant.set_character(name, user_id=interaction.user.id)
+
+            async def apply_character() -> None:
+                session.character = name
+
+                # DiscordModeのキャラクターも変更
+                if session.assistant:
+                    # Context is guild-scoped; omitting guild_id would mutate
+                    # the DM/other-guild context for users present in
+                    # multiple guilds.
+                    session.assistant.set_character(
+                        name,
+                        user_id=interaction.user.id,
+                        guild_id=interaction.guild_id,
+                    )
+
+            # Character replacement mutates the same client/context state as
+            # generation.  Use the per-session reset barrier when available
+            # so an active worker cannot observe a half-applied character or
+            # persist a turn with the wrong context.
+            reset_factory = getattr(session.assistant, "session_reset", None) if session.assistant else None
+            if callable(reset_factory):
+                async with reset_factory(
+                    user_id=interaction.user.id,
+                    guild_id=interaction.guild_id,
+                ):
+                    await apply_character()
+            else:
+                await apply_character()
             
             await interaction.response.send_message(
                 f"✅ キャラクターを **{name}** に変更しました！"
@@ -488,7 +516,12 @@ class CommandHandler:
             return
 
         try:
-            status = runtime_feature_manager.update_feature(feature, enabled, persist=True)
+            status = await runtime_feature_coordinator.update_feature(
+                feature,
+                enabled,
+                config=self.bot.config,
+                discord_service=discord_bot_service,
+            )
             definition = next(
                 (item for item in status["definitions"] if item["key"] == feature),
                 None,
@@ -504,6 +537,15 @@ class CommandHandler:
             )
         except ValueError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
+        except RuntimeFeatureRollbackError as exc:
+            logger.critical("Discord runtime feature rollback failed", exc_info=True)
+            await interaction.response.send_message(str(exc), ephemeral=True)
+        except Exception as exc:
+            logger.error("Discord runtime feature update failed: %s", exc, exc_info=True)
+            await interaction.response.send_message(
+                f"ランタイム機能の変更に失敗しました: {exc}",
+                ephemeral=True,
+            )
 
     def _is_runtime_feature_actor_allowed(self, actor_id: int | str) -> bool:
         allowed_ids = self.bot.config.get(
@@ -564,11 +606,65 @@ class CommandHandler:
             logger.warning("Failed to defer nanobanana command: %s", exc)
 
         try:
-            summary = await asyncio.to_thread(self.nanobanana_service.fetch_summary)
+            # SessionManager owns the canonical DiscordSession id.  Build an
+            # immutable request proxy and pass it to both provider calls; the
+            # shared Nanobanana service never stores a last-writer identity.
+            session = None
+            try:
+                session = await self.bot.session_handler.get_or_create_session(
+                    guild_id=getattr(interaction, "guild_id", None),
+                    user_id=interaction.user.id,
+                )
+            except Exception:
+                logger.debug("Failed to resolve Discord session for Nanobanana", exc_info=True)
+
+            # Nanobanana usage is request telemetry, so carry the runtime turn
+            # UUID.  The durable ConversationSession ID remains owned by the
+            # assistant's LLM context and is resolved separately above.
+            runtime_session_id = getattr(session, "runtime_id", None) or getattr(session, "id", None)
+            conversation_id = getattr(session, "conversation_id", None)
+            # Slash commands do not necessarily run through a normal LLM
+            # turn, so explicitly thread any effective session/project policy
+            # already published by the current Discord assistant.  The
+            # service still resolves a persisted Config fallback, but never
+            # falls back to an unscoped ``None`` gateway.
+            assistant = getattr(session, "assistant", None)
+            policy_owner = getattr(assistant, "llm_client", None) or assistant
+            session_context = getattr(policy_owner, "_privacy_session_context", None)
+            project_metadata = getattr(policy_owner, "_privacy_project_metadata", None)
+            if not isinstance(session_context, dict):
+                session_context = {}
+            else:
+                session_context = dict(session_context)
+            session_context.setdefault("session_id", runtime_session_id)
+            session_context.setdefault("user_id", interaction.user.id)
+            if not isinstance(project_metadata, dict):
+                project_metadata = {}
+            else:
+                project_metadata = dict(project_metadata)
+            project_id = getattr(policy_owner, "current_project_id", None)
+            if project_id is not None:
+                project_metadata.setdefault("project_id", project_id)
+            usage_context = NanobananaUsageContext.from_discord(
+                interaction.user.id,
+                getattr(interaction, "guild_id", None),
+                session_id=runtime_session_id,
+                conversation_id=conversation_id,
+                character_name=getattr(session, "character", None) or getattr(self.bot, "default_character", None),
+                config=getattr(self.bot, "config", None),
+                session_context=session_context,
+                project_metadata=project_metadata,
+            )
+
+            summary = await asyncio.to_thread(
+                self.nanobanana_service.fetch_summary,
+                usage_context=usage_context,
+            )
             description = self.nanobanana_service.build_embed_description(summary)
             image_bytes, prompt = await asyncio.to_thread(
                 self.nanobanana_service.generate_image,
-                summary
+                summary,
+                usage_context=usage_context,
             )
 
             embed = discord.Embed(
@@ -751,21 +847,31 @@ class CommandHandler:
                 guild_id=interaction.guild_id,
                 user_id=interaction.user.id
             )
-            
-            # DiscordModeのコンテキストをクリア
-            if session.assistant:
-                session.assistant.clear_context(user_id=interaction.user.id)
-                memory_manager = getattr(session.assistant.llm_client, 'memory_manager', None)
-                if memory_manager:
-                    memory_user_id = session.assistant._build_memory_user_id(
-                        interaction.user.id,
-                        interaction.guild_id
-                    )
-                    await memory_manager.start_new_session(
-                        memory_user_id,
-                        session.character or self.bot.default_character
-                    )
-                session.memory_prefilled = True
+
+            # ``/clear`` must rotate the durable row even before the first
+            # text/voice turn (when no assistant has been attached yet).
+            # Initialize the same DiscordMode used by the normal message
+            # path so its memory manager can deactivate the old active row.
+            if session.assistant is None:
+                from ..modes.discord_mode import DiscordMode
+
+                session.assistant = DiscordMode(
+                    config=self.bot.config,
+                    character=session.character or self.bot.default_character,
+                )
+
+            # Pause this session's DiscordMode worker while clearing context
+            # and rotating the durable row.  Legacy assistants without the
+            # barrier retain the same clear semantics without queue support.
+            reset_factory = getattr(session.assistant, "session_reset", None)
+            if callable(reset_factory):
+                async with reset_factory(
+                    user_id=interaction.user.id,
+                    guild_id=interaction.guild_id,
+                ):
+                    await self._rotate_session_state(session, interaction)
+            else:
+                await self._rotate_session_state(session, interaction)
 
             await interaction.response.send_message(
                 "🗑️ 会話履歴をクリアしました。\n"
@@ -875,6 +981,75 @@ class CommandHandler:
                 "❌ Spotifyコマンドの実行に失敗しました。認証と設定を確認してください。",
                 ephemeral=True
             )
+
+    async def _rotate_session_state(self, session: Any, interaction: discord.Interaction) -> None:
+        """Clear local history and rotate the durable ConversationSession."""
+        if not session.assistant:
+            return
+        # Advance the resolver generation before any await.  In-flight
+        # get_or_create_session calls that started against the old row will
+        # discard their result when they resume.
+        session.conversation_generation = (
+            getattr(session, "conversation_generation", 0) + 1
+        )
+        # Invalidate the old durable identity before rotating the repository
+        # row.  If persistence is temporarily unavailable, the next turn will
+        # re-resolve instead of writing to a conversation that was cleared.
+        session.conversation_id = None
+        llm_client = getattr(session.assistant, "llm_client", None)
+        if llm_client is not None and hasattr(llm_client, "current_session_id"):
+            llm_client.current_session_id = None
+        memory_manager = getattr(llm_client, "memory_manager", None)
+        session.conversation_invalidated = memory_manager is not None
+        try:
+            session.assistant.clear_context(
+                user_id=interaction.user.id,
+                guild_id=interaction.guild_id,
+            )
+            if memory_manager:
+                memory_user_id = session.assistant._build_memory_user_id(
+                    interaction.user.id,
+                    interaction.guild_id,
+                )
+                new_persistent = await memory_manager.start_new_session(
+                    memory_user_id,
+                    session.character or self.bot.default_character,
+                )
+                # Store the new durable row so queued turns after /clear cannot
+                # be persisted to the old conversation.
+                new_id = getattr(new_persistent, "id", None)
+                if new_id is None and isinstance(new_persistent, (str, bytes)):
+                    new_id = new_persistent
+                if new_id is not None:
+                    session.conversation_id = str(new_id)
+                    session.conversation_invalidated = False
+                    if hasattr(llm_client, "current_session_id"):
+                        llm_client.current_session_id = str(new_id)
+        finally:
+            # A new session is empty and may prefill once.  More importantly,
+            # a repository failure leaves the fail-safe (None, runtime)
+            # identity published, so delayed pre-clear turns cannot restore
+            # the old DB row.
+            session.memory_prefilled = False
+            set_identity = getattr(session.assistant, "set_session_identity", None)
+            if callable(set_identity):
+                identity_kwargs = {
+                    "user_id": interaction.user.id,
+                    "guild_id": interaction.guild_id,
+                    "session_id": getattr(session, "conversation_id", None),
+                    "runtime_session_id": (
+                        getattr(session, "runtime_id", None)
+                        or getattr(session, "id", None)
+                    ),
+                    "force": True,
+                }
+                try:
+                    set_identity(**identity_kwargs)
+                except TypeError as exc:
+                    if "force" not in str(exc):
+                        raise
+                    identity_kwargs.pop("force", None)
+                    set_identity(**identity_kwargs)
 
     async def _handle_spotify_auth(self, interaction: discord.Interaction):
         from ...tools.entertainment.spotify import setup_spotify_auth

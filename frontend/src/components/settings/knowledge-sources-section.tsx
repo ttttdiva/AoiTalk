@@ -308,8 +308,8 @@ export function KnowledgeSourcesSection() {
   }, [query, selectedProjectId]);
 
   return (
-    <Card size="sm">
-      <CardHeader className="cursor-pointer select-none" onClick={handleExpand}>
+    <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0" data-settings-surface="knowledge-sources">
+      <CardHeader className="cursor-pointer select-none border-b border-border dark:border-[#333335] px-3 py-3 transition-colors hover:bg-muted dark:bg-[#242426]" onClick={handleExpand}>
         <CardTitle className="flex items-center justify-between gap-3 text-sm">
           <span className="flex min-w-0 items-center gap-2">
             <FileSearch className="size-4" />
@@ -323,8 +323,8 @@ export function KnowledgeSourcesSection() {
       </CardHeader>
 
       {expanded && (
-        <CardContent className="space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border p-3">
+        <CardContent className="space-y-4 px-3 py-3">
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-border dark:border-[#333335] bg-muted/50 dark:bg-[#242426]/50 p-3">
             <Label className="flex items-center gap-2 text-sm">
               <Checkbox
                 checked={knowledgeEnabled}
@@ -355,7 +355,7 @@ export function KnowledgeSourcesSection() {
           </div>
 
           {showGrowiForm && (
-            <div className="space-y-3 rounded-md border p-3">
+            <div className="space-y-3 rounded-md border border-border dark:border-[#333335] bg-muted/50 dark:bg-[#242426]/50 p-3">
               <p className="text-sm font-medium">社内Wiki (GROWI) を接続</p>
               <div className="space-y-2">
                 <Label className="text-xs text-muted-foreground">表示名</Label>
@@ -421,9 +421,9 @@ export function KnowledgeSourcesSection() {
           </div>
 
           {results.length > 0 && (
-            <div className="space-y-2 rounded-md border p-3">
+            <div className="space-y-2 rounded-md border border-border dark:border-[#333335] bg-background dark:bg-[#131313] p-3">
               {results.map((result) => (
-                <div key={`${result.document.id}-${result.chunk.text.slice(0, 20)}`} className="space-y-1 border-b pb-2 last:border-b-0 last:pb-0">
+                   <div key={`${result.document.id}-${result.chunk.text.slice(0, 20)}`} className="space-y-1 border-b border-border dark:border-[#333335] pb-2 last:border-b-0 last:pb-0">
                   <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
                     {result.url ? (
                       <a
@@ -466,7 +466,7 @@ export function KnowledgeSourcesSection() {
                 };
                 const busy = busySourceId === source.id;
                 return (
-                  <div key={source.id} className="space-y-2 rounded-md border p-3">
+               <div key={source.id} className="space-y-2 rounded-md border border-border dark:border-[#333335] bg-muted/40 dark:bg-[#242426]/40 p-3 transition-colors hover:bg-muted/70 dark:bg-[#242426]/70">
                     <div className="flex flex-wrap items-start justify-between gap-3">
                       <div className="min-w-0 space-y-1">
                         <div className="flex flex-wrap items-center gap-2">
@@ -514,7 +514,7 @@ export function KnowledgeSourcesSection() {
                         </Button>
                       </div>
                     </div>
-                    <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
+                     <div className="flex flex-wrap gap-3 border-t border-border dark:border-[#333335] pt-2 text-xs text-muted-foreground">
                       <span>{source.document_count} docs</span>
                       <span>{source.chunk_count} chunks</span>
                       {source.last_synced_at && (

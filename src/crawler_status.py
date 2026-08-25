@@ -84,21 +84,10 @@ class CrawlerStatusChecker:
         elif crawler_name == "EventMonitor":
             return self._is_process_running("main.py", EVENT_MONITOR_PATH)
         elif crawler_name == "HydrusClient":
-            # Hydrus Client API health check
-            try:
-                hydrus_url = os.environ.get('HYDRUS_API_URL', 'http://127.0.0.1:45869')
-                hydrus_key = os.environ.get('HYDRUS_ACCESS_KEY')
-                if not hydrus_key:
-                    return False
-                
-                async with httpx.AsyncClient(timeout=5) as client:
-                    response = await client.get(
-                        f"{hydrus_url}/api_version",
-                        headers={"Hydrus-Client-API-Access-Key": hydrus_key}
-                    )
-                    return response.status_code == 200
-            except:
-                return False
+            # Hydrus credentials are user-scoped and must never be read from
+            # process-wide HYDRUS_* environment variables.  The per-user
+            # /api/hydrus/health route performs the authenticated check.
+            return False
         elif crawler_name == "VideoCrawler":
             # HuggingFace Space health check
             if not VIDEO_CRAWLER_RUNTIME_URL:
@@ -193,56 +182,11 @@ class CrawlerStatusChecker:
             "is_alive": False
         }
         
-        try:
-            hydrus_url = os.environ.get('HYDRUS_API_URL', 'http://127.0.0.1:45869')
-            hydrus_key = os.environ.get('HYDRUS_ACCESS_KEY')
-            
-            if not hydrus_key:
-                result["status"] = "not_configured"
-                result["error"] = "HYDRUS_ACCESS_KEY not set"
-                result["can_restart"] = True
-                return result
-            
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                # Try to get API version to check if service is running
-                response = await client.get(
-                    f"{hydrus_url}/api_version",
-                    headers={"Hydrus-Client-API-Access-Key": hydrus_key}
-                )
-                
-                if response.status_code == 200:
-                    api_data = response.json()
-                    result["status"] = "running"
-                    result["is_alive"] = True
-                    result["details"] = {
-                        "api_version": api_data.get("version", "unknown"),
-                        "hydrus_version": api_data.get("hydrus_version", "unknown"),
-                        "api_url": hydrus_url
-                    }
-                elif response.status_code == 401 or response.status_code == 403:
-                    result["status"] = "auth_error"
-                    result["error"] = "Invalid API key"
-                    result["is_alive"] = False
-                else:
-                    result["status"] = "error"
-                    result["error"] = f"API returned status {response.status_code}"
-                    result["can_restart"] = True
-                    result["is_alive"] = False
-                    
-        except httpx.TimeoutException:
-            result["status"] = "timeout"
-            result["error"] = "Request timed out"
-            result["can_restart"] = True
-        except httpx.RequestError as e:
-            result["status"] = "stopped"
-            result["error"] = f"Connection failed: {e}"
-            result["can_restart"] = True
-        except Exception as e:
-            result["status"] = "error"
-            result["error"] = str(e)
-            result["can_restart"] = True
-            logger.error(f"Failed to get HydrusClient status: {e}")
-        
+        # Credentials are deliberately not available to this legacy crawler
+        # status endpoint.  Use the authenticated per-user Hydrus route for a
+        # connection check instead of falling back to global environment state.
+        result["status"] = "not_configured"
+        result["error"] = "ユーザーごとのHydrus設定画面から接続確認してください"
         return result
 
     
@@ -266,9 +210,6 @@ class CrawlerStatusChecker:
             "error": None
         }
         
-        # Get HuggingFace token from environment (optional for browser but good to have)
-        hf_token = os.environ.get('HUGGINGFACE_API_KEY') or os.environ.get('HF_TOKEN')
-        
         try:
             from playwright.async_api import async_playwright
         except ImportError:
@@ -290,9 +231,6 @@ class CrawlerStatusChecker:
                 # Create context with English locale to ensure text matches "Restart this Space"
                 context = await browser.new_context(
                     locale='en-US',
-                    extra_http_headers={
-                        "Authorization": f"Bearer {hf_token}"
-                    } if hf_token else {}
                 )
                 page = await context.new_page()
                 

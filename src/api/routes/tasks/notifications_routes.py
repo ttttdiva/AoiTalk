@@ -5,12 +5,14 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ....memory.user_repository import UserRepository
+from ....services.clip_ingest_policy import sanitize_clip_ingest_settings
 from ....services.task_management_service import TaskManagementError
 from ._shared import (
     NotificationSettingsPayload,
     TaskRouterContext,
     UserNotificationPreferencesPayload,
-    _deep_merge_settings,
+    WebPushSubscriptionPayload,
+    WebPushSubscriptionDeletePayload,
 )
 from ...uuid_http import parse_uuid_or_400
 
@@ -77,6 +79,53 @@ def register_notification_routes(router: APIRouter, ctx: TaskRouterContext) -> N
         finally:
             await session.close()
 
+    @router.get("/web-push/vapid-public-key")
+    async def get_web_push_vapid_public_key(
+        _request: Request,
+        _auth=Depends(require_auth_dependency),
+    ):
+        return await service.get_web_push_vapid_public_key()
+
+    @router.post("/web-push/subscription")
+    async def upsert_web_push_subscription(
+        payload: WebPushSubscriptionPayload,
+        request: Request,
+        _auth=Depends(require_auth_dependency),
+    ):
+        user_id, _ = await _get_current_user(request)
+        session = await get_db_manager().get_session()
+        try:
+            return await service.upsert_web_push_subscription(
+                session,
+                user_id=user_id,
+                endpoint=payload.endpoint,
+                p256dh=payload.p256dh,
+                auth=payload.auth,
+                expiration_time=payload.expiration_time,
+                content_encoding=payload.content_encoding,
+            )
+        except TaskManagementError as exc:
+            raise _translate_service_error(exc)
+        finally:
+            await session.close()
+
+    @router.delete("/web-push/subscription")
+    async def remove_web_push_subscription(
+        payload: WebPushSubscriptionDeletePayload,
+        request: Request,
+        _auth=Depends(require_auth_dependency),
+    ):
+        user_id, _ = await _get_current_user(request)
+        session = await get_db_manager().get_session()
+        try:
+            return await service.remove_web_push_subscription(
+                session, user_id=user_id, endpoint=payload.endpoint
+            )
+        except TaskManagementError as exc:
+            raise _translate_service_error(exc)
+        finally:
+            await session.close()
+
     @router.get("/users/me/settings")
     async def get_user_settings(
         request: Request,
@@ -88,7 +137,12 @@ def register_notification_routes(router: APIRouter, ctx: TaskRouterContext) -> N
             user = await UserRepository.get_by_id(session, user_id)
             if not user:
                 raise HTTPException(status_code=404, detail="User not found")
-            return {"settings": user.user_settings or {}}
+            settings = await sanitize_clip_ingest_settings(
+                session,
+                user_id,
+                dict(user.user_settings) if isinstance(user.user_settings, dict) else {},
+            )
+            return {"settings": settings}
         finally:
             await session.close()
 
@@ -101,21 +155,32 @@ def register_notification_routes(router: APIRouter, ctx: TaskRouterContext) -> N
         try:
             body = await request.json()
         except Exception:
-            body = {}
-        updates = body if isinstance(body, dict) else {}
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Settings patch must be an object")
+        updates = body
+        if "account_lifecycle" in updates:
+            raise HTTPException(
+                status_code=400,
+                detail="account_lifecycle is managed by the administrator",
+            )
 
         session = await get_db_manager().get_session()
         try:
-            user = await UserRepository.get_by_id(session, user_id)
-            if not user:
-                raise HTTPException(status_code=404, detail="User not found")
+            async with session.begin():
+                async def sanitize(merged: dict):
+                    return await sanitize_clip_ingest_settings(session, user_id, merged)
 
-            merged = _deep_merge_settings(dict(user.user_settings or {}), updates)
-            await UserRepository.update_user(
-                session=session,
-                user_id=user_id,
-                user_settings=merged,
-            )
+                user = await UserRepository.patch_user_settings(
+                    session=session,
+                    user_id=user_id,
+                    patch=updates,
+                    commit=False,
+                    transform=sanitize,
+                )
+                if not user:
+                    raise HTTPException(status_code=404, detail="User not found")
+                merged = dict(user.user_settings or {})
             return {"settings": merged}
         finally:
             await session.close()
@@ -170,7 +235,7 @@ def register_notification_routes(router: APIRouter, ctx: TaskRouterContext) -> N
                 session,
                 project_id=parsed_project_id,
                 user_id=user_id,
-                permission="read",
+                permission="manage_settings",
             )
             setting = await service.get_or_create_notification_setting(
                 session, project_id=parsed_project_id

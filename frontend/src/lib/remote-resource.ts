@@ -59,6 +59,7 @@ export function decorateRemoteSpace<T extends Space>(
     remote_server_color: profileColor,
     remote_server_base_url: profileBaseUrl,
     resource_id: space.id,
+    can_write: false,
   } as T;
 }
 
@@ -82,6 +83,7 @@ export function decorateRemoteProject<T extends Project>(
     remote_server_base_url: profileBaseUrl,
     resource_id: project.id,
     can_write: false,
+    can_manage_settings: false,
   } as T;
 }
 

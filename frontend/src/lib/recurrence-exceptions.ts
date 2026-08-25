@@ -72,6 +72,23 @@ export function isRecurrenceOverrideSourceKind(
   );
 }
 
+export function canReuseOccurrenceRowForOverride(
+  sourceKind: string | null | undefined,
+  reuseOccurrenceId: boolean,
+): boolean {
+  return (
+    isRecurrenceOverrideSourceKind(sourceKind) ||
+    (reuseOccurrenceId && !isRecurrenceSkipSourceKind(sourceKind))
+  );
+}
+
+export function shouldFindOccurrenceByStartAt(
+  occurrenceId: string | null | undefined,
+  reuseOccurrenceId: boolean,
+): boolean {
+  return reuseOccurrenceId && !occurrenceId;
+}
+
 export function parseRecurrenceOriginalStartAt(
   sourceKind: string | null | undefined,
 ): string | null {
@@ -81,6 +98,26 @@ export function parseRecurrenceOriginalStartAt(
   }
   const compact = sourceKind!.slice(RECURRENCE_OVERRIDE_PREFIX.length);
   return parseCompactOriginalStartAt(compact) ?? compact ?? null;
+}
+
+/**
+ * 「今回以降を削除」で、保存済みオカレンス行の cutoff 判定にどの開始時刻を使うかを決める。
+ *
+ * - 別日へ移動した回（ro: / recurrence_override:）は、行自身の開始時刻が移動先なので
+ *   source_kind に埋め込まれた「元の回」の時刻で判定する。
+ * - それ以外（recurrence_skip、materialize 済みの recurrence、task_schedule）は
+ *   行自身の開始時刻で判定する。
+ *
+ * 以前は override 以外を一律 対象外にしていたため、実体行 (source_kind="recurrence") が
+ * 1件も削除されず「今回以降を削除」を押しても表示が変わらなかった。
+ */
+export function resolveOccurrenceCutoffSource(
+  sourceKind: string | null | undefined,
+): { from: "original"; originalStartAt: string } | { from: "row" } {
+  const originalStartAt = parseRecurrenceOriginalStartAt(sourceKind);
+  return originalStartAt
+    ? { from: "original", originalStartAt }
+    : { from: "row" };
 }
 
 export function resolveOccurrenceOriginalStartAt(

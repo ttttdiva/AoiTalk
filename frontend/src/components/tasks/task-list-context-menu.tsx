@@ -24,6 +24,7 @@ import {
   PRIORITY_COLORS,
   PRIORITY_LABELS,
   STATUS_DOT_COLORS,
+  getTaskDisplayStatus,
   STATUS_KEY_HINTS,
   STATUS_LABELS,
 } from "@/lib/tasks-page-utils";
@@ -97,7 +98,8 @@ export function TaskListContextMenu({
                 mnemonic={STATUS_KEY_HINTS[status]}
                 className={cn(
                   "flex w-full items-center justify-between gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default",
-                  contextMenu.task.status === status && "font-bold",
+                  getTaskDisplayStatus(contextMenu.task) === status &&
+                    "font-bold",
                 )}
                 onClick={() => onStatusChange(status)}
               >
@@ -193,7 +195,7 @@ export function TaskListContextMenu({
       {/* 複製 */}
       <MenuMnemonicButton
         className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default"
-        mnemonic="C"
+        mnemonic="U"
         onClick={onDuplicate}
       >
         <Copy className="size-4" />
@@ -203,7 +205,7 @@ export function TaskListContextMenu({
       {/* タスクIDコピー */}
       <MenuMnemonicButton
         className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default"
-        mnemonic="I"
+        mnemonic="C"
         onClick={onCopyTaskId}
       >
         <Hash className="size-4" />

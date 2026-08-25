@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-22T11:32:37.291626+00:00",
+  "setting_key": "model_routing.classes.clip_ingest",
+  "director_approval": "A: inherit branch default reset; ChatGPT Director Gate approval in active conversation",
+  "before": {
+    "inherit": false,
+    "provider": "openai",
+    "model": "gpt-5.6-luna",
+    "base_url": "",
+    "api_key": "",
+    "reasoning_effort": "xhigh",
+    "mode": "xhigh"
+  },
+  "after": {
+    "inherit": true,
+    "provider": "",
+    "model": "",
+    "base_url": "",
+    "api_key": "",
+    "reasoning_effort": ""
+  },
+  "reason": "OpenAI /v1/responses HTTP429 organization_spend_limit_exceeded was wrapped as AoiTalk HTTP503; main local llama-server is healthy",
+  "main_chat_impact": "none intended; clip_ingest only returns to request-scoped main local client",
+  "rollback": "restore before branch through same Config.save_to_file persistence path",
+  "server_restart": {
+    "performed": true,
+    "health": {
+      "status": "ok",
+      "boot_id": "a298db71-ef21-4a3c-af93-9e0746847e1f"
+    }
+  },
+  "knowledge_tree_write": "none",
+  "notes": "Persistent app-config change is separate from semantic KnowledgeNode finalization."
+}

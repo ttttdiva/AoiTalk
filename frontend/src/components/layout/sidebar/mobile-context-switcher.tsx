@@ -1,5 +1,7 @@
 "use client";
 
+import { AppSelect } from "@/components/ui/app-select";
+
 import { FolderOpen, Layers } from "lucide-react";
 import { useProject } from "@/contexts/project-context";
 
@@ -24,7 +26,7 @@ export function MobileContextSwitcher() {
       {spaces.length > 0 && (
         <div className="flex items-center gap-2">
           <Layers className="size-4 shrink-0 text-muted-foreground" />
-          <select
+          <AppSelect
             value={selectedSpaceId ?? ""}
             onChange={(e) => setSelectedSpaceId(e.target.value)}
             className={mobileSelectClassName}
@@ -36,13 +38,13 @@ export function MobileContextSwitcher() {
                 {s.name}
               </option>
             ))}
-          </select>
+          </AppSelect>
         </div>
       )}
       {projects.length > 0 && (
         <div className="flex items-center gap-2">
           <FolderOpen className="size-4 shrink-0 text-muted-foreground" />
-          <select
+          <AppSelect
             value={selectedProjectId ?? ""}
             onChange={(e) => setSelectedProjectId(e.target.value)}
             className={mobileSelectClassName}
@@ -54,7 +56,7 @@ export function MobileContextSwitcher() {
                 {p.name}
               </option>
             ))}
-          </select>
+          </AppSelect>
         </div>
       )}
     </div>

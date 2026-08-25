@@ -18,17 +18,24 @@ import {
   decodeTokenPayload,
   saveApiUrl,
 } from "../lib/auth";
-import { fetchApi, clearApiUrlCache, tryRefreshToken } from "../lib/api-client";
+import {
+  fetchApi,
+  clearApiUrlCache,
+  tryRefreshToken,
+  subscribeAuthInvalidated,
+} from "../lib/api-client";
 import { clearFilesApiCaches } from "../lib/files-api";
 import { filesLocationCache } from "../lib/files-location-cache";
 import { clearLocalSyncCache } from "../repositories/sync-cache";
-import { runAuthScopeTransition } from "../sync/engine";
+import { runAuthScopeTransition, runSync } from "../sync/engine";
 import type { AuthResult, UserInfo } from "../types/api";
 
 interface AuthContextValue {
   isLoading: boolean;
   isAuthenticated: boolean;
   isAnonymous: boolean;
+  /** True after a terminal 401 until the user signs in again. */
+  reauthRequired: boolean;
   canUseApp: boolean;
   user: UserInfo | null;
   continueAsGuest: () => Promise<void>;
@@ -44,6 +51,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [authMode, setAuthMode] = useState<
     "signed_out" | "anonymous" | "authenticated"
   >("anonymous");
+  const [reauthRequired, setReauthRequired] = useState(false);
+
+  // fetchApi is deliberately UI-agnostic.  Listen for a terminal 401 only
+  // while an account is active; failed login attempts for a signed-out user
+  // must not put the app into a spurious re-auth state.
+  useEffect(() => {
+    if (authMode !== "authenticated" || !user) return;
+    return subscribeAuthInvalidated(() => {
+      setReauthRequired(true);
+      // Drop the credential so background sync cannot repeatedly submit with
+      // a known-invalid JWT.  Keep `user`/auth scope in React state so the
+      // pending outbox remains attributable and same-user login can replay it.
+      void runAuthScopeTransition(() => removeToken());
+    });
+  }, [authMode, user]);
 
   // 起動時にトークン確認
   useEffect(() => {
@@ -130,7 +152,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           role: result.role!,
         });
         setAuthMode("authenticated");
+        setReauthRequired(false);
       });
+      // The transition has committed the new token/scope.  Start exactly one
+      // sync for the restored account; runSync itself coalesces concurrent
+      // focus/network requests.
+      void runSync();
     },
     [authMode, user],
   );
@@ -146,6 +173,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       await saveAuthMode("anonymous");
       setUser(null);
       setAuthMode("anonymous");
+      setReauthRequired(false);
     });
   }, [authMode, user]);
 
@@ -160,6 +188,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       await saveAuthMode("anonymous");
       setUser(null);
       setAuthMode("anonymous");
+      setReauthRequired(false);
     });
   }, [authMode, user]);
 
@@ -167,8 +196,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     <AuthContext.Provider
       value={{
         isLoading,
-        isAuthenticated: authMode === "authenticated" && !!user,
+        isAuthenticated:
+          authMode === "authenticated" && !!user && !reauthRequired,
         isAnonymous: authMode === "anonymous",
+        reauthRequired,
         canUseApp: true,
         user,
         continueAsGuest,

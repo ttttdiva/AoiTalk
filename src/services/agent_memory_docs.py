@@ -7,7 +7,8 @@ Docsノードとして保持する。案件情報（``project_information_docs.p
 索引ノードは案件情報正本（``Project.knowledge_node_id``）の子ではなく、専用の
 ルートハブ「エージェントメモリ」配下へ置く。これにより案件情報タブが引く
 ``tree_nodes``（案件情報正本ノード配下のDocsWorkspaceビュー）へ混入しない一方、
-Docsワークスペース本体からは通常のページとして閲覧・編集できる。
+既存互換の読み取り専用データとして残すが、通常のDocs編集からは変更できない。
+新規書込みはsystem migration時だけfeature flagで明示的に許可する。
 """
 
 from __future__ import annotations
@@ -26,7 +27,14 @@ from ..memory.models import (
     Project,
 )
 from .docs_graph_service import DocsGraphService
-from .docs_workspace import ensure_docs_workspace
+from .docs_workspace import ensure_project_docs_library
+from .docs_acl import can_read_node, library_can_write
+from .managed_docs_policy import (
+    LEGACY_AGENT_MEMORY_DOMAIN,
+    ManagedDocsPolicy,
+    managed_display_props,
+)
+from .scoped_memory_flags import legacy_agent_memory_write_enabled
 
 
 # Supertag（型定義）と索引ノード system_key の接頭辞に用いる基底キー。
@@ -39,6 +47,11 @@ AGENT_MEMORY_ROOT_SYSTEM_KEY = "agent_memory_root"
 AGENT_MEMORY_SUPERTAG_NAME = "エージェントメモリ"
 AGENT_MEMORY_ROOT_TITLE = "エージェントメモリ"
 AGENT_MEMORY_EMPTY_PLACEHOLDER = "(まだ記憶はありません)"
+
+_LEGACY_POLICY = ManagedDocsPolicy(
+    managed_domain=LEGACY_AGENT_MEMORY_DOMAIN,
+    allowed_tools=frozenset({"legacy_agent_memory_migration"}),
+)
 
 # Supertag.ai_instructions に埋め込む保存基準。
 AGENT_MEMORY_AI_INSTRUCTIONS = (
@@ -86,19 +99,20 @@ def _revision(
 async def _ensure_agent_memory_root(
     session: AsyncSession,
     *,
-    workspace_id: UUID,
+    docs_library_id: UUID,
     user_id: UUID | None,
+    system_migration: bool,
 ) -> KnowledgeNode:
     """全プロジェクトの索引ノードを束ねるルートハブを ensure する。"""
 
     await session.execute(
         text("select pg_advisory_xact_lock(hashtext(:lock_key))"),
-        {"lock_key": f"{workspace_id}:agent-memory-root"},
+        {"lock_key": f"{docs_library_id}:agent-memory-root"},
     )
     result = await session.execute(
         select(KnowledgeNode)
         .where(
-            KnowledgeNode.workspace_id == workspace_id,
+            KnowledgeNode.docs_library_id == docs_library_id,
             KnowledgeNode.system_key == AGENT_MEMORY_ROOT_SYSTEM_KEY,
         )
         .limit(1)
@@ -106,19 +120,26 @@ async def _ensure_agent_memory_root(
     root = result.scalar_one_or_none()
     if root is None:
         root = await DocsGraphService(session).create_node(
-            workspace_id=workspace_id,
+            docs_library_id=docs_library_id,
             user_id=user_id,
             title=AGENT_MEMORY_ROOT_TITLE,
             system_key=AGENT_MEMORY_ROOT_SYSTEM_KEY,
             body_json={"format": "agent_memory_collection"},
             sort_order=2,
         )
+    elif root.archived_at is not None and not system_migration:
+        raise PermissionError("archived legacy Agent Memory root cannot be revived")
     root.title = AGENT_MEMORY_ROOT_TITLE
     root.body_text = _title_mirror(root.title)
     root.parent_id = None
     root.root_page_id = root.id
     root.project_id = None
-    root.archived_at = None
+    if system_migration:
+        root.archived_at = None
+    root.display_props = managed_display_props(
+        _LEGACY_POLICY,
+        root.display_props if isinstance(root.display_props, dict) else None,
+    )
     root.updated_by = user_id
     await session.flush()
     return root
@@ -127,14 +148,14 @@ async def _ensure_agent_memory_root(
 async def _ensure_agent_memory_supertag(
     session: AsyncSession,
     *,
-    workspace_id: UUID,
+    docs_library_id: UUID,
 ) -> KnowledgeSupertag:
     """エージェントメモリ用 Supertag を ensure する。"""
 
     result = await session.execute(
         select(KnowledgeSupertag)
         .where(
-            KnowledgeSupertag.workspace_id == workspace_id,
+            KnowledgeSupertag.docs_library_id == docs_library_id,
             or_(
                 KnowledgeSupertag.system_key == AGENT_MEMORY_SUPERTAG_SYSTEM_KEY,
                 KnowledgeSupertag.name == AGENT_MEMORY_SUPERTAG_NAME,
@@ -145,7 +166,7 @@ async def _ensure_agent_memory_supertag(
     supertag = result.scalar_one_or_none()
     if supertag is None:
         supertag = KnowledgeSupertag(
-            workspace_id=workspace_id,
+            docs_library_id=docs_library_id,
             system_key=AGENT_MEMORY_SUPERTAG_SYSTEM_KEY,
             name=AGENT_MEMORY_SUPERTAG_NAME,
             # base_type は ck_knowledge_supertags_base_type の許容値内に限る。
@@ -173,6 +194,8 @@ async def _ensure_agent_memory_supertag(
 async def ensure_agent_memory_doc(
     session: AsyncSession,
     project: Project,
+    *,
+    system_migration: bool = False,
 ) -> KnowledgeNode:
     """対象プロジェクトのエージェントメモリ索引ノードを ensure して返す。
 
@@ -181,17 +204,29 @@ async def ensure_agent_memory_doc(
     ``Project.knowledge_node_id``（案件情報正本）は変更しない。
     """
 
+    if not system_migration and not legacy_agent_memory_write_enabled():
+        raise PermissionError("legacy Agent Memory writes are disabled")
+
     user_id = project.owner_id
-    workspace = await ensure_docs_workspace(session, owner_user_id=user_id)
+    library = await ensure_project_docs_library(
+        session,
+        project_id=project.id,
+        actor_user_id=user_id,
+    )
+    if not await library_can_write(session, library, user_id):
+        raise PermissionError("Project Docsへの書き込み権限がありません")
     root = await _ensure_agent_memory_root(
-        session, workspace_id=workspace.id, user_id=user_id
+        session,
+        docs_library_id=library.id,
+        user_id=user_id,
+        system_migration=system_migration,
     )
     await session.execute(
         text("select pg_advisory_xact_lock(hashtext(:lock_key))"),
-        {"lock_key": f"{workspace.id}:agent-memory:{project.id}"},
+        {"lock_key": f"{library.id}:agent-memory:{project.id}"},
     )
 
-    supertag = await _ensure_agent_memory_supertag(session, workspace_id=workspace.id)
+    supertag = await _ensure_agent_memory_supertag(session, docs_library_id=library.id)
     node_system_key = _agent_memory_node_system_key(project.id)
 
     # 存在チェックは archived 込みで引く。uq_knowledge_nodes_workspace_system_key
@@ -203,7 +238,7 @@ async def ensure_agent_memory_doc(
     result = await session.execute(
         select(KnowledgeNode)
         .where(
-            KnowledgeNode.workspace_id == workspace.id,
+            KnowledgeNode.docs_library_id == library.id,
             KnowledgeNode.project_id == project.id,
             KnowledgeNode.system_key == node_system_key,
         )
@@ -214,7 +249,7 @@ async def ensure_agent_memory_doc(
     created = False
     if node is None:
         node = KnowledgeNode(
-            workspace_id=workspace.id,
+            docs_library_id=library.id,
             parent_id=root.id,
             root_page_id=root.id,
             project_id=project.id,
@@ -236,11 +271,19 @@ async def ensure_agent_memory_doc(
         node.root_page_id = root.id
         node.project_id = project.id
         node.system_key = node_system_key
-        node.archived_at = None
+        if node.archived_at is not None and not system_migration:
+            raise PermissionError("archived legacy Agent Memory nodes cannot be revived")
+        if system_migration:
+            node.archived_at = None
         if not (node.title or "").strip():
             node.title = project.name
         node.body_text = _title_mirror(node.title)
         node.updated_by = user_id
+
+    node.display_props = managed_display_props(
+        _LEGACY_POLICY,
+        node.display_props if isinstance(node.display_props, dict) else None,
+    )
 
     current_body_json = node.body_json if isinstance(node.body_json, dict) else {}
     if current_body_json.get("format") != "agent_memory_doc_block":
@@ -268,16 +311,6 @@ async def ensure_agent_memory_doc(
                 change_summary="エージェントメモリDocsを作成",
             )
         )
-        # 初期の可視プレースホルダは本文正本ではなく子ノードとして持つ
-        # （不変条件: body_text は title ミラー固定）。
-        await service.create_node(
-            workspace_id=workspace.id,
-            user_id=user_id,
-            parent=node,
-            project_id=project.id,
-            title=AGENT_MEMORY_EMPTY_PLACEHOLDER,
-        )
-
     await service.upsert_search_index(node)
     await session.flush()
     return node
@@ -286,6 +319,7 @@ async def ensure_agent_memory_doc(
 async def get_agent_memory_doc(
     session: AsyncSession,
     project_id: UUID,
+    user_id: UUID | None = None,
 ) -> KnowledgeNode | None:
     """存在すればエージェントメモリ索引ノードを返す（副作用なし・archived除外）。"""
 
@@ -298,13 +332,18 @@ async def get_agent_memory_doc(
         )
         .limit(1)
     )
-    return result.scalar_one_or_none()
+    node = result.scalar_one_or_none()
+    if node is not None and user_id is not None and not await can_read_node(
+        session, node, user_id
+    ):
+        return None
+    return node
 
 
 def serialize_agent_memory_node(node: KnowledgeNode) -> dict[str, Any]:
     return {
         "id": str(node.id),
-        "workspace_id": str(node.workspace_id),
+        "docs_library_id": str(node.docs_library_id),
         "parent_id": str(node.parent_id) if node.parent_id else None,
         "root_page_id": str(node.root_page_id) if node.root_page_id else None,
         "project_id": str(node.project_id) if node.project_id else None,

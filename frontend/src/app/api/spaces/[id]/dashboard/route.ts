@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSession } from "@/lib/auth";
 import { getDashboardData } from "@/lib/server/dashboard-data";
-import { getReadableProjectIdsForSpace } from "@/lib/server/space-access";
+import { getReadableSpace } from "@/lib/server/space-access";
+import { getParticipatingProjectIds } from "@/lib/server/project-access";
 
 export async function GET(
   _request: NextRequest,
@@ -16,10 +17,14 @@ export async function GET(
   }
 
   const { id: spaceId } = await params;
-  const projectIds = await getReadableProjectIdsForSpace(spaceId, user);
-  if (projectIds === null) {
+  const space = await getReadableSpace(spaceId, user);
+  if (!space) {
     return NextResponse.json({ detail: "権限がありません" }, { status: 403 });
   }
+  // Dashboard is an operational aggregate. Global-admin visibility of every
+  // project is retained for direct/admin project APIs, but an admin who is
+  // not an owner/member must not see this space's task/time rollups.
+  const projectIds = await getParticipatingProjectIds(user.id, { spaceId });
 
   const data = await getDashboardData({
     type: "space",

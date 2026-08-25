@@ -2,12 +2,21 @@ import type { ConversationSession } from "../../types/api";
 import type {
   ConnectionCapability,
   ConversationCommand,
+  ConversationDiagnostics,
   RunState,
   SessionCapability,
   SessionKind,
   TransportState,
   UserCapability,
 } from "./models";
+
+export type ConnectionStatusPresentation = {
+  label: string;
+  detail: string;
+  color: string;
+  /** 正常接続。true のときヘッダーはドットだけ表示しラベルを省く。 */
+  healthy: boolean;
+};
 
 export function inferSessionKind(session: ConversationSession | null): SessionKind {
   if (!session) return "normal";
@@ -60,6 +69,60 @@ export function buildTransportState(args: {
 }): TransportState {
   if (!args.isAuthenticated || args.online === false) return "offline";
   return args.isConnected ? "websocket-connected" : "rest-dispatch";
+}
+
+export function buildConnectionStatusPresentation(
+  diagnostics: ConversationDiagnostics,
+): ConnectionStatusPresentation {
+  if (diagnostics.connectionCapability === "local-only") {
+    return {
+      label: "ローカル",
+      detail: "端末内で保存",
+      color: "#89b4fa",
+      healthy: false,
+    };
+  }
+  if (diagnostics.connectionCapability === "offline") {
+    return {
+      label: "オフライン",
+      detail: "ネットワークなし",
+      color: "#f9e2af",
+      healthy: false,
+    };
+  }
+  if (
+    diagnostics.connectionCapability === "degraded" &&
+    !diagnostics.serverCheckedAt
+  ) {
+    return {
+      label: "サーバー確認中",
+      detail: "接続を確認しています",
+      color: "#a6adc8",
+      healthy: false,
+    };
+  }
+  if (diagnostics.connectionCapability === "degraded") {
+    return {
+      label: "サーバー未接続",
+      detail: "ローカル保存で継続",
+      color: "#f38ba8",
+      healthy: false,
+    };
+  }
+  if (diagnostics.transportState === "websocket-connected") {
+    return {
+      label: "サーバー接続済み",
+      detail: "リアルタイム",
+      color: "#a6e3a1",
+      healthy: true,
+    };
+  }
+  return {
+    label: "サーバー利用可",
+    detail: "REST接続",
+    color: "#a6e3a1",
+    healthy: true,
+  };
 }
 
 export function buildSessionCapabilities(args: {

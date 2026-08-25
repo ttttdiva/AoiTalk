@@ -6,14 +6,22 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import ipaddress
 import json
 import logging
 import os
 import random
+import re
+import socket
+import stat
 import time
 import uuid
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -25,7 +33,6 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ワークフローディレクトリ
 WORKFLOWS_DIR = Path("config/comfyui_workflows")
-WORKFLOWS_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_AUTO_WORKFLOW = WORKFLOWS_DIR / "aoitalk_auto_sdxl.json"
 DEFAULT_NEGATIVE_PROMPT = (
     "lowres, bad anatomy, bad hands, extra fingers, missing fingers, "
@@ -38,6 +45,239 @@ class ComfyUIError(Exception):
     """ComfyUI操作のエラー"""
 
 
+_COMFYUI_ALLOWED_HOSTS_ENV = "AOITALK_COMFYUI_ALLOWED_HOSTS"
+_HOSTNAME_RE = re.compile(
+    r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z"
+)
+_WORKFLOW_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,126}\.json\Z")
+_UPLOAD_FILENAME_RE = re.compile(
+    r"[0-9a-f]{64}\.(?:png|jpe?g|webp|gif|bmp|avif)\Z"
+)
+_UPLOAD_SUBFOLDER_COMPONENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_UPLOAD_MIME_TYPES = {
+    "image/avif",
+    "image/bmp",
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
+_UPLOAD_SUFFIX_BY_MIME = {
+    "image/avif": ".avif",
+    "image/bmp": ".bmp",
+    "image/gif": ".gif",
+    "image/jpeg": (".jpg", ".jpeg"),
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    return bool(
+        stat.S_ISLNK(metadata.st_mode)
+        or (
+            getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            and getattr(metadata, "st_file_attributes", 0)
+            & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        )
+    )
+
+
+def _normalized_hostname(value: str) -> str:
+    candidate = value.strip().rstrip(".").casefold()
+    if not candidate or "%" in candidate:
+        raise ValueError("ComfyUI URLのhostが不正です")
+    try:
+        normalized = candidate.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError("ComfyUI URLのhostが不正です") from exc
+    if not _HOSTNAME_RE.fullmatch(normalized):
+        raise ValueError("ComfyUI URLのhostが不正です")
+    return normalized
+
+
+def _comfyui_host_is_allowed(host: str, allowlist: str | None) -> bool:
+    """Allow loopback by default and exact hostname/IP/CIDR env entries."""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        normalized = _normalized_hostname(host)
+        if normalized == "localhost":
+            return True
+        for raw_entry in (allowlist or "").split(","):
+            entry = raw_entry.strip()
+            if not entry or "/" in entry:
+                continue
+            try:
+                if _normalized_hostname(entry.strip("[]")) == normalized:
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    if address.is_loopback:
+        return True
+    for raw_entry in (allowlist or "").split(","):
+        entry = raw_entry.strip().strip("[]")
+        if not entry:
+            continue
+        try:
+            if "/" in entry:
+                if address in ipaddress.ip_network(entry, strict=False):
+                    return True
+            elif address == ipaddress.ip_address(entry):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _comfyui_address_is_allowed(address: str, allowlist: str | None) -> bool:
+    parsed = ipaddress.ip_address(address)
+    if parsed.is_loopback:
+        return True
+    for raw_entry in (allowlist or "").split(","):
+        entry = raw_entry.strip().strip("[]")
+        if not entry:
+            continue
+        try:
+            network = ipaddress.ip_network(entry, strict=False)
+        except ValueError:
+            continue
+        if parsed in network:
+            return True
+    return False
+
+
+class _PinnedPolicyResolver(aiohttp.abc.AbstractResolver):
+    """Resolve once per request and reject if any answer escapes IP policy."""
+
+    def __init__(self, allowlist: str, *, getaddrinfo: Any | None = None) -> None:
+        self.allowlist = allowlist
+        self._getaddrinfo = getaddrinfo
+
+    async def resolve(
+        self, host: str, port: int = 0, family: socket.AddressFamily = socket.AF_INET
+    ) -> list[dict[str, Any]]:
+        resolver = self._getaddrinfo or asyncio.get_running_loop().getaddrinfo
+        infos = await resolver(
+            host,
+            port,
+            type=socket.SOCK_STREAM,
+            family=family,
+        )
+        results: list[dict[str, Any]] = []
+        seen: set[tuple[int, str]] = set()
+        for resolved_family, _, proto, _, sockaddr in infos:
+            address = str(sockaddr[0])
+            identity = (int(resolved_family), address)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if not _comfyui_address_is_allowed(address, self.allowlist):
+                raise OSError("ComfyUI DNS address is outside the allowed IP policy")
+            results.append(
+                {
+                    "hostname": host,
+                    "host": address,
+                    "port": port,
+                    "family": resolved_family,
+                    "proto": proto,
+                    "flags": socket.AI_NUMERICHOST,
+                }
+            )
+        if not results:
+            raise OSError("ComfyUI DNS resolution returned no addresses")
+        return results
+
+    async def close(self) -> None:
+        return None
+
+
+def validate_comfyui_base_url(
+    value: str,
+    *,
+    allowed_hosts: str | None = None,
+) -> str:
+    """Return a canonical SSRF-safe ComfyUI origin.
+
+    Non-loopback hosts must be explicitly listed in
+    ``AOITALK_COMFYUI_ALLOWED_HOSTS`` as an exact hostname, IP address, or CIDR.
+    Only a bare HTTP(S) origin is accepted because API paths are server-owned.
+    """
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError("ComfyUI URLが不正です")
+    if "\\" in value or any(ord(char) < 32 for char in value):
+        raise ValueError("ComfyUI URLが不正です")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+        host = parsed.hostname
+    except ValueError as exc:
+        raise ValueError("ComfyUI URLが不正です") from exc
+    if parsed.scheme.casefold() not in {"http", "https"}:
+        raise ValueError("ComfyUI URLはhttp/httpsのみ利用できます")
+    if not host or parsed.username is not None or parsed.password is not None:
+        raise ValueError("ComfyUI URLにuserinfoは指定できません")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise ValueError("ComfyUI URLにはpath/query/fragmentを指定できません")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("ComfyUI URLのportが不正です")
+    configured_allowlist = (
+        os.environ.get(_COMFYUI_ALLOWED_HOSTS_ENV, "")
+        if allowed_hosts is None
+        else allowed_hosts
+    )
+    if not _comfyui_host_is_allowed(host, configured_allowlist):
+        raise ValueError("ComfyUI URLのhostは許可されていません")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        normalized_host = _normalized_hostname(host)
+    else:
+        normalized_host = f"[{address.compressed}]" if address.version == 6 else str(address)
+    authority = normalized_host if port is None else f"{normalized_host}:{port}"
+    return f"{parsed.scheme.casefold()}://{authority}"
+
+
+async def validate_comfyui_connection_url(
+    value: str,
+    *,
+    allowed_hosts: str | None = None,
+    getaddrinfo: Any | None = None,
+) -> str:
+    """Validate an origin and every DNS answer using the connection policy."""
+    normalized = validate_comfyui_base_url(value, allowed_hosts=allowed_hosts)
+    parsed = urlsplit(normalized)
+    host = parsed.hostname or ""
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        configured_allowlist = (
+            os.environ.get(_COMFYUI_ALLOWED_HOSTS_ENV, "")
+            if allowed_hosts is None
+            else allowed_hosts
+        )
+        resolver = _PinnedPolicyResolver(
+            configured_allowlist,
+            getaddrinfo=getaddrinfo,
+        )
+        try:
+            await resolver.resolve(
+                host,
+                parsed.port or (443 if parsed.scheme == "https" else 80),
+                family=socket.AF_UNSPEC,
+            )
+        except OSError as exc:
+            raise ValueError("ComfyUI hostnameのDNS addressが許可されていません") from exc
+    return normalized
+
+
 class ComfyUIService:
     """ComfyUI REST APIクライアント"""
 
@@ -45,17 +285,45 @@ class ComfyUIService:
         self,
         enabled: bool = True,
         base_url: str = "http://127.0.0.1:8188",
-        default_workflow_path: str = str(DEFAULT_AUTO_WORKFLOW),
+        default_workflow_path: Optional[str] = None,
+        workflows_dir: Optional[str] = None,
         timeout_seconds: int = 180,
+        max_download_bytes: int = 64 * 1024 * 1024,
+        max_upload_bytes: int = 32 * 1024 * 1024,
+        max_upload_response_bytes: int = 64 * 1024,
     ):
         self.enabled = bool(enabled)
-        self.base_url = base_url.rstrip("/")
-        self.default_workflow_path = default_workflow_path
+        self.base_url = validate_comfyui_base_url(base_url)
+        if workflows_dir:
+            self.workflows_dir = Path(workflows_dir)
+        elif default_workflow_path:
+            self.workflows_dir = Path(default_workflow_path).parent
+        else:
+            self.workflows_dir = WORKFLOWS_DIR
+        self.default_workflow_path = default_workflow_path or str(
+            self.workflows_dir / DEFAULT_AUTO_WORKFLOW.name
+        )
         self.timeout_seconds = timeout_seconds
+        self.max_download_bytes = max(1, int(max_download_bytes))
+        self.max_upload_bytes = max(1, int(max_upload_bytes))
+        self.max_upload_response_bytes = max(1, int(max_upload_response_bytes))
         self.client_id = str(uuid.uuid4())
         
         # ワークフローディレクトリの確保
-        WORKFLOWS_DIR.mkdir(parents=True, exist_ok=True)
+        self.workflows_dir.mkdir(parents=True, exist_ok=True)
+
+    def _http_session(self, timeout: aiohttp.ClientTimeout) -> aiohttp.ClientSession:
+        # Revalidate policy at request time, then pin the connector to the exact
+        # validated DNS answer set so a second lookup cannot redirect the socket.
+        validate_comfyui_base_url(self.base_url)
+        allowlist = os.environ.get(_COMFYUI_ALLOWED_HOSTS_ENV, "")
+        resolver = _PinnedPolicyResolver(allowlist)
+        connector = aiohttp.TCPConnector(
+            resolver=resolver,
+            use_dns_cache=True,
+            ttl_dns_cache=None,
+        )
+        return aiohttp.ClientSession(timeout=timeout, connector=connector)
 
     @classmethod
     def from_config(cls, config) -> "ComfyUIService":
@@ -66,9 +334,8 @@ class ComfyUIService:
         return cls(
             enabled=comfyui_conf.get("enabled", True),
             base_url=comfyui_conf.get("url", "http://127.0.0.1:8188"),
-            default_workflow_path=comfyui_conf.get(
-                "default_workflow", str(DEFAULT_AUTO_WORKFLOW)
-            ),
+            default_workflow_path=comfyui_conf.get("default_workflow"),
+            workflows_dir=comfyui_conf.get("workflows_dir"),
             timeout_seconds=comfyui_conf.get("timeout_seconds", 120),
         )
 
@@ -77,64 +344,495 @@ class ComfyUIService:
         if not self.enabled:
             return False
         try:
-            async with aiohttp.ClientSession() as session:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with self._http_session(timeout) as session:
                 async with session.get(
                     f"{self.base_url}/system_stats",
-                    timeout=aiohttp.ClientTimeout(total=5),
+                    allow_redirects=False,
                 ) as resp:
                     return resp.status == 200
         except Exception:
             return False
 
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: Mapping[str, Any] | None = None,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        timeout = aiohttp.ClientTimeout(
+            total=float(timeout_seconds or min(self.timeout_seconds, 30))
+        )
+        try:
+            async with self._http_session(timeout) as session:
+                async with session.request(
+                    method,
+                    f"{self.base_url}{path}",
+                    json=dict(payload) if payload is not None else None,
+                    allow_redirects=False,
+                ) as response:
+                    if 300 <= response.status < 400:
+                        raise ComfyUIError(
+                            f"ComfyUI {path} redirectは許可されていません"
+                        )
+                    if response.status < 200 or response.status >= 300:
+                        raise ComfyUIError(
+                            f"ComfyUI {path} 失敗: HTTP {response.status}"
+                        )
+                    body = await response.text()
+                    if not body.strip():
+                        value = {}
+                    else:
+                        try:
+                            value = json.loads(body)
+                        except json.JSONDecodeError as exc:
+                            raise ComfyUIError(
+                                f"ComfyUI {path} の応答がJSONではありません"
+                            ) from exc
+        except ComfyUIError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise ComfyUIError(f"ComfyUI {path} 通信失敗: {exc}") from exc
+        if not isinstance(value, Mapping):
+            raise ComfyUIError(f"ComfyUI {path} の応答がJSON objectではありません")
+        return dict(value)
+
+    async def system_stats(self) -> dict[str, Any]:
+        return await self._request_json("GET", "/system_stats", timeout_seconds=5)
+
+    async def object_info(self, node_type: str | None = None) -> dict[str, Any]:
+        suffix = f"/{node_type}" if node_type else ""
+        return await self._request_json("GET", f"/object_info{suffix}")
+
+    async def submit_prompt(
+        self,
+        prompt: Mapping[str, Any],
+        *,
+        extra_data: Mapping[str, Any] | None = None,
+        client_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> str:
+        if not isinstance(prompt, Mapping) or not prompt:
+            raise ValueError("ComfyUI API promptは空でないJSON objectが必要です")
+        payload: dict[str, Any] = {
+            "prompt": json.loads(json.dumps(prompt, ensure_ascii=False)),
+            "client_id": str(client_id or self.client_id),
+        }
+        if extra_data:
+            payload["extra_data"] = json.loads(json.dumps(extra_data, ensure_ascii=False))
+        result = await self._request_json(
+            "POST", "/prompt", payload=payload, timeout_seconds=timeout_seconds
+        )
+        if result.get("error"):
+            raise ComfyUIError(f"ComfyUI prompt validation失敗: {result['error']}")
+        prompt_id = str(result.get("prompt_id") or "").strip()
+        if not prompt_id:
+            raise ComfyUIError("ComfyUI /prompt 応答にprompt_idがありません")
+        return prompt_id
+
+    @staticmethod
+    def _validate_upload_subfolder(value: str) -> str:
+        subfolder = str(value or "").strip()
+        if (
+            not subfolder
+            or len(subfolder) > 512
+            or "\\" in subfolder
+            or subfolder.startswith("/")
+            or subfolder.endswith("/")
+        ):
+            raise ValueError("ComfyUI upload subfolderが不正です")
+        parts = subfolder.split("/")
+        if any(
+            part in {"", ".", ".."}
+            or not _UPLOAD_SUBFOLDER_COMPONENT_RE.fullmatch(part)
+            for part in parts
+        ):
+            raise ValueError("ComfyUI upload subfolderが不正です")
+        return "/".join(parts)
+
+    async def upload_image(
+        self,
+        content: bytes,
+        *,
+        filename: str,
+        subfolder: str,
+        mime_type: str,
+        expected_checksum_sha256: str,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, str]:
+        """Upload deterministic verified input bytes without following redirects."""
+        if not isinstance(content, bytes) or not content:
+            raise ValueError("ComfyUI upload contentは空でないbytesが必要です")
+        if len(content) > self.max_upload_bytes:
+            raise ValueError("ComfyUI upload sizeが上限を超えています")
+        safe_filename = str(filename or "").strip().casefold()
+        if not _UPLOAD_FILENAME_RE.fullmatch(safe_filename):
+            raise ValueError("ComfyUI upload filenameが不正です")
+        safe_subfolder = self._validate_upload_subfolder(subfolder)
+        safe_mime = str(mime_type or "").strip().casefold()
+        if safe_mime not in _UPLOAD_MIME_TYPES:
+            raise ValueError("ComfyUI upload MIMEが不正です")
+        allowed_suffix = _UPLOAD_SUFFIX_BY_MIME[safe_mime]
+        if not safe_filename.endswith(allowed_suffix):
+            raise ValueError("ComfyUI upload filenameとMIMEが一致しません")
+        checksum = str(expected_checksum_sha256 or "").strip().casefold()
+        if not re.fullmatch(r"[0-9a-f]{64}", checksum):
+            raise ValueError("ComfyUI upload checksumが不正です")
+        if hashlib.sha256(content).hexdigest() != checksum:
+            raise ValueError("ComfyUI upload checksumがbytesと一致しません")
+        form = aiohttp.FormData()
+        form.add_field(
+            "image",
+            content,
+            filename=safe_filename,
+            content_type=safe_mime,
+        )
+        form.add_field("type", "input")
+        form.add_field("subfolder", safe_subfolder)
+        form.add_field("overwrite", "true")
+        timeout = aiohttp.ClientTimeout(
+            total=float(timeout_seconds or min(self.timeout_seconds, 30))
+        )
+        try:
+            async with self._http_session(timeout) as session:
+                async with session.request(
+                    "POST",
+                    f"{self.base_url}/upload/image",
+                    data=form,
+                    allow_redirects=False,
+                ) as response:
+                    if 300 <= response.status < 400:
+                        raise ComfyUIError(
+                            "ComfyUI /upload/image redirectは許可されていません"
+                        )
+                    if response.status < 200 or response.status >= 300:
+                        raise ComfyUIError(
+                            f"ComfyUI /upload/image 失敗: HTTP {response.status}"
+                        )
+                    chunks: list[bytes] = []
+                    response_size = 0
+                    while True:
+                        chunk = await response.content.read(16 * 1024)
+                        if not chunk:
+                            break
+                        response_size += len(chunk)
+                        if response_size > self.max_upload_response_bytes:
+                            raise ComfyUIError(
+                                "ComfyUI /upload/image 応答sizeが上限を超えています"
+                            )
+                        chunks.append(chunk)
+                    body = b"".join(chunks)
+        except ComfyUIError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise ComfyUIError(f"ComfyUI /upload/image 通信失敗: {exc}") from exc
+        try:
+            value = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ComfyUIError(
+                "ComfyUI /upload/image 応答がJSONではありません"
+            ) from exc
+        if not isinstance(value, Mapping):
+            raise ComfyUIError(
+                "ComfyUI /upload/image 応答がJSON objectではありません"
+            )
+        returned_name = str(value.get("name") or "").strip()
+        returned_subfolder = str(value.get("subfolder") or "").strip()
+        returned_type = str(value.get("type") or "").strip().casefold()
+        try:
+            validated_subfolder = self._validate_upload_subfolder(returned_subfolder)
+        except ValueError as exc:
+            raise ComfyUIError(
+                "ComfyUI /upload/image 応答subfolderが不正です"
+            ) from exc
+        if (
+            returned_name != safe_filename
+            or not _UPLOAD_FILENAME_RE.fullmatch(returned_name)
+            or validated_subfolder != safe_subfolder
+            or returned_type != "input"
+        ):
+            raise ComfyUIError(
+                "ComfyUI /upload/image 応答locatorがrequestと一致しません"
+            )
+        return {
+            "filename": returned_name,
+            "subfolder": validated_subfolder,
+            "type": returned_type,
+        }
+
+    async def queue(self) -> dict[str, Any]:
+        return await self._request_json("GET", "/queue")
+
+    async def history(self, prompt_id: str | None = None) -> dict[str, Any]:
+        suffix = f"/{prompt_id}" if prompt_id else ""
+        return await self._request_json("GET", f"/history{suffix}")
+
+    @staticmethod
+    def output_locators(history_entry: Mapping[str, Any]) -> list[dict[str, Any]]:
+        locators: list[dict[str, Any]] = []
+        outputs = history_entry.get("outputs")
+        if not isinstance(outputs, Mapping):
+            return locators
+        for node_id in sorted(outputs, key=str):
+            node_output = outputs[node_id]
+            if not isinstance(node_output, Mapping):
+                continue
+            images = node_output.get("images")
+            if not isinstance(images, list):
+                continue
+            for index, image in enumerate(images):
+                if not isinstance(image, Mapping) or not image.get("filename"):
+                    continue
+                filename = str(image["filename"])
+                subfolder = str(image.get("subfolder") or "")
+                type_ = str(image.get("type") or "output")
+                locators.append(
+                    {
+                        "engine_output_key": f"{node_id}:{index}:{subfolder}:{filename}",
+                        "node_id": str(node_id),
+                        "index": index,
+                        "filename": filename,
+                        "subfolder": subfolder,
+                        "type": type_,
+                    }
+                )
+        return locators
+
+    @staticmethod
+    def _queue_contains(entries: Any, prompt_id: str) -> bool:
+        if not isinstance(entries, list):
+            return False
+        for entry in entries:
+            if isinstance(entry, Mapping) and str(entry.get("prompt_id") or "") == prompt_id:
+                return True
+            if isinstance(entry, (list, tuple)) and any(
+                str(value) == prompt_id for value in entry[:3]
+            ):
+                return True
+        return False
+
+    async def recover(self, prompt_id: str) -> dict[str, Any]:
+        normalized = str(prompt_id or "").strip()
+        if not normalized:
+            raise ValueError("prompt_idは必須です")
+        history = await self.history(normalized)
+        entry = history.get(normalized)
+        if isinstance(entry, Mapping):
+            status = entry.get("status") if isinstance(entry.get("status"), Mapping) else {}
+            status_str = str(status.get("status_str") or "").lower()
+            if status_str in {"error", "failed", "execution_error"}:
+                return {
+                    "state": "error",
+                    "prompt_id": normalized,
+                    "history": dict(entry),
+                    "outputs": self.output_locators(entry),
+                    "evidence": {"status": dict(status)},
+                }
+            if status.get("completed"):
+                state = "completed" if status_str == "success" else "error"
+                return {
+                    "state": state,
+                    "prompt_id": normalized,
+                    "history": dict(entry),
+                    "outputs": self.output_locators(entry),
+                    "evidence": {"status": dict(status)},
+                }
+        queue = await self.queue()
+        if self._queue_contains(queue.get("queue_running"), normalized):
+            state = "running"
+        elif self._queue_contains(queue.get("queue_pending"), normalized):
+            state = "queued"
+        else:
+            state = "unknown"
+        return {
+            "state": state,
+            "prompt_id": normalized,
+            "outputs": [],
+            "evidence": {"queue": queue},
+        }
+
+    async def delete_queued(self, prompt_id: str) -> bool:
+        await self._request_json(
+            "POST", "/queue", payload={"delete": [str(prompt_id)]}
+        )
+        return True
+
+    async def interrupt(self, prompt_id: str | None = None) -> bool:
+        payload = {"prompt_id": str(prompt_id)} if prompt_id else {}
+        await self._request_json("POST", "/interrupt", payload=payload)
+        return True
+
+    async def cancel_prompt(self, prompt_id: str) -> dict[str, Any]:
+        recovered = await self.recover(prompt_id)
+        state = recovered["state"]
+        if state == "completed":
+            return {**recovered, "action": "too_late"}
+        if state == "queued":
+            await self.delete_queued(prompt_id)
+            after = await self.recover(prompt_id)
+            if after["state"] == "completed":
+                return {**after, "action": "too_late"}
+            return {
+                **recovered,
+                "state": "cancel_requested",
+                "action": "queue_delete",
+                "command_acknowledged": True,
+            }
+        if state == "running":
+            await self.interrupt(prompt_id)
+            after = await self.recover(prompt_id)
+            if after["state"] == "completed":
+                return {**after, "action": "too_late"}
+            return {
+                **recovered,
+                "state": "cancel_requested",
+                "action": "interrupt",
+                "command_acknowledged": True,
+            }
+        return {**recovered, "action": "not_found"}
+
+    async def wait_for_terminal(
+        self,
+        prompt_id: str,
+        *,
+        timeout_seconds: float | None = None,
+        poll_interval: float = 1.0,
+    ) -> dict[str, Any]:
+        timeout = float(timeout_seconds or self.timeout_seconds)
+        deadline = asyncio.get_running_loop().time() + max(0.01, timeout)
+        last: dict[str, Any] = {"state": "unknown", "prompt_id": prompt_id}
+        while asyncio.get_running_loop().time() < deadline:
+            last = await self.recover(prompt_id)
+            if last["state"] in {"completed", "error"}:
+                return last
+            await asyncio.sleep(max(0.001, poll_interval))
+        raise ComfyUIError(
+            f"ComfyUI prompt {prompt_id} の待機が{timeout:g}秒でtimeoutしました"
+        )
+
+    async def view_bytes(self, locator: Mapping[str, Any]) -> bytes:
+        params = {
+            "filename": str(locator.get("filename") or ""),
+            "subfolder": str(locator.get("subfolder") or ""),
+            "type": str(locator.get("type") or "output"),
+        }
+        if not params["filename"]:
+            raise ValueError("output locatorにfilenameが必要です")
+        timeout = aiohttp.ClientTimeout(total=min(self.timeout_seconds, 30))
+        try:
+            async with self._http_session(timeout) as session:
+                async with session.get(
+                    f"{self.base_url}/view",
+                    params=params,
+                    allow_redirects=False,
+                ) as response:
+                    if 300 <= response.status < 400:
+                        raise ComfyUIError("ComfyUI /view redirectは許可されていません")
+                    if response.status != 200:
+                        raise ComfyUIError(
+                            f"ComfyUI /view 失敗: HTTP {response.status}"
+                        )
+                    content_type = str(response.headers.get("Content-Type") or "")
+                    if not content_type.lower().startswith("image/"):
+                        raise ComfyUIError("ComfyUI /view がimage content-typeではありません")
+                    declared = response.content_length
+                    if declared is not None and declared > self.max_download_bytes:
+                        raise ComfyUIError("ComfyUI /view の画像が上限を超えています")
+                    chunks: list[bytes] = []
+                    received = 0
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        received += len(chunk)
+                        if received > self.max_download_bytes:
+                            raise ComfyUIError("ComfyUI /view の画像が上限を超えています")
+                        chunks.append(chunk)
+                    return b"".join(chunks)
+        except ComfyUIError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise ComfyUIError(f"ComfyUI /view 通信失敗: {exc}") from exc
+
     async def list_workflows(self) -> list[dict[str, Any]]:
         """利用可能なワークフローJSONの一覧を取得する。"""
         workflows = []
-        for p in WORKFLOWS_DIR.glob("*.json"):
-            workflows.append({
-                "name": p.name,
-                "path": str(p.absolute()),
-                "is_default": str(p.absolute()) == str(Path(self.default_workflow_path).absolute()) if self.default_workflow_path else False,
-                "mtime": p.stat().st_mtime
-            })
+        root = self._workflow_root()
+        default_name = (
+            Path(self.default_workflow_path).name if self.default_workflow_path else None
+        )
+        for path in root.glob("*.json"):
+            try:
+                target = self._workflow_target(path.name, require_existing=True)
+                metadata = target.stat()
+            except (OSError, ValueError):
+                continue
+            workflows.append(
+                {
+                    "name": target.name,
+                    "is_default": target.name == default_name,
+                    "mtime": metadata.st_mtime,
+                }
+            )
         return sorted(workflows, key=lambda x: x["mtime"], reverse=True)
 
-    async def save_workflow(self, name: str, content: str | dict) -> str:
+    def _workflow_root(self) -> Path:
+        root = self.workflows_dir.absolute()
+        if not root.exists() or not root.is_dir() or _is_link_or_reparse(root):
+            raise ValueError("workflow rootが安全な通常directoryではありません")
+        return root.resolve(strict=True)
+
+    def _workflow_target(self, name: str, *, require_existing: bool = False) -> Path:
+        if (
+            not isinstance(name, str)
+            or name != Path(name).name
+            or "/" in name
+            or "\\" in name
+            or ":" in name
+            or ".." in name
+            or not _WORKFLOW_NAME_RE.fullmatch(name)
+        ):
+            raise ValueError("workflow nameが不正です")
+        root = self._workflow_root()
+        target = root / name
+        resolved = target.resolve(strict=require_existing)
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("workflow pathがroot外です") from exc
+        if target.exists() and (
+            not target.is_file() or _is_link_or_reparse(target) or resolved != target
+        ):
+            raise ValueError("workflow fileが安全な通常fileではありません")
+        return target
+
+    async def save_workflow(self, name: str, content: str | dict) -> dict[str, Any]:
         """ワークフローJSONを保存する。"""
-        if not name.endswith(".json"):
-            name += ".json"
-        
-        target_path = WORKFLOWS_DIR / name
-        
+        target_path = self._workflow_target(name)
         if isinstance(content, dict):
             content_str = json.dumps(content, indent=2, ensure_ascii=False)
         else:
             content_str = content
             # JSONバリデーション
             json.loads(content_str)
-            
+
         target_path.write_text(content_str, encoding="utf-8")
-        return str(target_path.absolute())
+        return {"name": target_path.name, "is_default": False}
 
     async def delete_workflow(self, name: str) -> bool:
         """ワークフローJSONを削除する。"""
-        if not name.endswith(".json"):
-            name += ".json"
-        
-        target_path = WORKFLOWS_DIR / name
+        target_path = self._workflow_target(name)
         if target_path.exists():
+            self._workflow_target(name, require_existing=True)
             target_path.unlink()
             return True
         return False
 
     async def get_workflow_content(self, name: str) -> dict:
         """ワークフローJSONの内容を取得する。"""
-        if not name.endswith(".json"):
-            name += ".json"
-        
-        target_path = WORKFLOWS_DIR / name
+        target_path = self._workflow_target(name)
         if not target_path.exists():
             raise FileNotFoundError(f"Workflow not found: {name}")
-            
+        self._workflow_target(name, require_existing=True)
         return self._load_workflow(str(target_path))
 
     def update_config(
@@ -147,7 +845,7 @@ class ComfyUIService:
         if enabled is not None:
             self.enabled = bool(enabled)
         if base_url is not None:
-            self.base_url = base_url.rstrip("/")
+            self.base_url = validate_comfyui_base_url(base_url)
         if default_workflow_path is not None:
             self.default_workflow_path = default_workflow_path
 
@@ -205,7 +903,7 @@ class ComfyUIService:
     async def ensure_default_workflow(self, overrides: Optional[Dict[str, Any]] = None) -> str:
         """利用可能な実モデルから標準 txt2img ワークフローを作成して返す。"""
         overrides = overrides or {}
-        target = Path(self.default_workflow_path) if self.default_workflow_path else DEFAULT_AUTO_WORKFLOW
+        target = Path(self.default_workflow_path) if self.default_workflow_path else self.workflows_dir / DEFAULT_AUTO_WORKFLOW.name
         if target.exists():
             self.default_workflow_path = str(target)
             return str(target)
@@ -233,11 +931,14 @@ class ComfyUIService:
     async def _select_available_checkpoint(self) -> str:
         """ComfyUI に登録されている checkpoint から実在するものを選ぶ。"""
         try:
-            async with aiohttp.ClientSession() as session:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with self._http_session(timeout) as session:
                 async with session.get(
                     f"{self.base_url}/object_info/CheckpointLoaderSimple",
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    allow_redirects=False,
                 ) as resp:
+                    if 300 <= resp.status < 400:
+                        raise ComfyUIError("checkpoint 一覧のredirectは許可されていません")
                     if resp.status != 200:
                         raise ComfyUIError(f"checkpoint 一覧取得失敗: HTTP {resp.status}")
                     info = await resp.json()
@@ -511,56 +1212,15 @@ class ComfyUIService:
 
     async def _queue_prompt(self, prompt: dict) -> str:
         """ComfyUI にプロンプトをキュー投入する。"""
-        payload = {
-            "prompt": prompt,
-            "client_id": self.client_id,
-        }
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{self.base_url}/prompt",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    raise ComfyUIError(f"プロンプト投入失敗 (HTTP {resp.status}): {error_text}")
-
-                result = await resp.json()
-                if "error" in result:
-                    raise ComfyUIError(f"プロンプトバリデーションエラー: {result['error']}")
-
-                return result["prompt_id"]
+        return await self.submit_prompt(prompt)
 
     async def _wait_for_completion(self, prompt_id: str) -> dict:
         """ジョブ完了を待機してhistoryデータを返す。"""
-        import asyncio
-
-        start = time.time()
-        while time.time() - start < self.timeout_seconds:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/history/{prompt_id}",
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    if resp.status != 200:
-                        await asyncio.sleep(1)
-                        continue
-
-                    history = await resp.json()
-                    if prompt_id in history:
-                        entry = history[prompt_id]
-                        status = entry.get("status", {})
-                        if status.get("completed"):
-                            if status.get("status_str") == "success":
-                                return entry
-                            else:
-                                msgs = status.get("messages", [])
-                                raise ComfyUIError(f"生成失敗: {msgs}")
-
-            await asyncio.sleep(1)
-
-        raise ComfyUIError(f"タイムアウト ({self.timeout_seconds}秒)")
+        recovered = await self.wait_for_terminal(prompt_id)
+        if recovered["state"] == "error":
+            status = recovered.get("evidence", {}).get("status", {})
+            raise ComfyUIError(f"生成失敗: {status.get('messages', [])}")
+        return dict(recovered.get("history") or {})
 
     async def _download_result_image(self, history_entry: dict) -> Path:
         """生成結果の画像をダウンロードしてローカルに保存する。"""
@@ -574,25 +1234,14 @@ class ComfyUIService:
                 filename = img_info["filename"]
                 subfolder = img_info.get("subfolder", "")
 
-                params = {"filename": filename, "type": "output"}
-                if subfolder:
-                    params["subfolder"] = subfolder
-
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        f"{self.base_url}/view",
-                        params=params,
-                        timeout=aiohttp.ClientTimeout(total=30),
-                    ) as resp:
-                        if resp.status != 200:
-                            raise ComfyUIError(f"画像ダウンロード失敗: HTTP {resp.status}")
-
-                        content = await resp.read()
-                        ext = Path(filename).suffix or ".png"
-                        output_name = f"comfyui_{int(time.time())}_{random.randint(1000, 9999)}{ext}"
-                        output_path = OUTPUT_DIR / output_name
-                        output_path.write_bytes(content)
-                        return output_path.resolve()
+                content = await self.view_bytes(
+                    {"filename": filename, "subfolder": subfolder, "type": "output"}
+                )
+                ext = Path(filename).suffix or ".png"
+                output_name = f"comfyui_{int(time.time())}_{random.randint(1000, 9999)}{ext}"
+                output_path = OUTPUT_DIR / output_name
+                output_path.write_bytes(content)
+                return output_path.resolve()
 
         raise ComfyUIError("生成結果に画像が含まれていません")
 

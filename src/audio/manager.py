@@ -21,7 +21,13 @@ class SpeechRecognitionManager:
     # Cache for loaded engine classes
     _loaded_engines: Dict[str, Type[SpeechRecognizerInterface]] = {}
     
-    def __init__(self, engine_name: str = 'whisper', config: Dict[str, Any] = None):
+    def __init__(
+        self,
+        engine_name: str = 'whisper',
+        config: Dict[str, Any] = None,
+        usage_client: Any = None,
+        usage_context: Any = None,
+    ):
         """Initialize speech recognition manager
         
         Args:
@@ -30,6 +36,11 @@ class SpeechRecognitionManager:
         """
         self.engine_name = engine_name
         self.config = config or {}
+        # Optional defaults are references only; request-scoped values passed
+        # to recognize/process methods take precedence and are never written
+        # back to shared configuration.
+        self.usage_client = usage_client
+        self.usage_context = usage_context
         self.recognizer = self._create_recognizer()
         
         # Initialize hallucination filter
@@ -121,7 +132,60 @@ class SpeechRecognitionManager:
                 engine_config['api_key'] = gemini_api_key
         
         print(f"[SpeechRecognitionManager] Creating {self.engine_name} recognizer instance")
-        return engine_class(engine_config)
+        recognizer = engine_class(engine_config)
+        if self.engine_name == 'gemini':
+            setter = getattr(recognizer, 'set_usage_context', None)
+            if callable(setter) and (
+                self.usage_client is not None or self.usage_context is not None
+            ):
+                setter(
+                    usage_client=self.usage_client,
+                    usage_context=self.usage_context,
+                )
+        return recognizer
+
+    def set_usage_context(
+        self,
+        *,
+        usage_client: Any = None,
+        usage_context: Any = None,
+    ) -> None:
+        """Set manager-scoped defaults for Gemini usage persistence.
+
+        Existing callers can ignore this API.  For concurrent/request-scoped
+        calls prefer passing context directly to ``recognize`` and stream
+        methods instead of mutating these defaults between requests.
+        """
+        self.usage_client = usage_client
+        self.usage_context = usage_context
+        if self.engine_name == 'gemini':
+            setter = getattr(self.recognizer, 'set_usage_context', None)
+            if callable(setter):
+                setter(
+                    usage_client=usage_client,
+                    usage_context=usage_context,
+                )
+
+    def _usage_kwargs(
+        self,
+        usage_client: Any = None,
+        usage_context: Any = None,
+    ) -> Dict[str, Any]:
+        """Build optional Gemini-only kwargs without affecting other engines."""
+        if self.engine_name != 'gemini':
+            return {}
+        resolved_client = (
+            usage_client if usage_client is not None else self.usage_client
+        )
+        resolved_context = (
+            usage_context if usage_context is not None else self.usage_context
+        )
+        if resolved_client is None and resolved_context is None:
+            return {}
+        return {
+            'usage_client': resolved_client,
+            'usage_context': resolved_context,
+        }
     
     @classmethod
     def register_engine(cls, name: str, import_path: str) -> None:
@@ -421,13 +485,16 @@ class SpeechRecognitionManager:
     
     # Delegate all recognition methods to the current engine
     
-    def recognize(self, 
-                  audio_data: bytes, 
+    def recognize(self,
+                  audio_data: bytes,
                   sample_rate: int = 16000,
                   channels: int = 1,
                   sample_width: int = 2,
                   language: str = None,
-                  prompt: Optional[str] = None) -> Optional[str]:
+                  prompt: Optional[str] = None,
+                  *,
+                  usage_client: Any = None,
+                  usage_context: Any = None) -> Optional[str]:
         """Recognize speech from audio data
         
         Args:
@@ -454,21 +521,37 @@ class SpeechRecognitionManager:
             
         # Call engine-specific recognition
         raw_result = self.recognizer.recognize(
-            audio_data, sample_rate, channels, sample_width, language, prompt
+            audio_data,
+            sample_rate,
+            channels,
+            sample_width,
+            language,
+            prompt,
+            **self._usage_kwargs(usage_client, usage_context),
         )
         
         # Apply common post-processing
         return self._post_process_recognition(raw_result)
     
-    def start_stream(self) -> None:
+    def start_stream(
+        self,
+        *,
+        usage_client: Any = None,
+        usage_context: Any = None,
+    ) -> None:
         """Start a new streaming session"""
-        self.recognizer.start_stream()
+        self.recognizer.start_stream(
+            **self._usage_kwargs(usage_client, usage_context)
+        )
     
-    def process_audio_chunk(self, 
+    def process_audio_chunk(self,
                            audio_data: bytes,
                            sample_rate: int = 16000,
                            channels: int = 1,
-                           sample_width: int = 2) -> Generator[Tuple[bool, Optional[str]], None, None]:
+                           sample_width: int = 2,
+                           *,
+                           usage_client: Any = None,
+                           usage_context: Any = None) -> Generator[Tuple[bool, Optional[str]], None, None]:
         """Process audio chunk and yield transcription results
         
         Args:
@@ -481,16 +564,27 @@ class SpeechRecognitionManager:
             Tuple of (is_final, text) where is_final indicates if the segment is complete
         """
         return self.recognizer.process_audio_chunk(
-            audio_data, sample_rate, channels, sample_width
+            audio_data,
+            sample_rate,
+            channels,
+            sample_width,
+            **self._usage_kwargs(usage_client, usage_context),
         )
-    
-    def finish_stream(self) -> Optional[str]:
+
+    def finish_stream(
+        self,
+        *,
+        usage_client: Any = None,
+        usage_context: Any = None,
+    ) -> Optional[str]:
         """Finish streaming and get final transcription
         
         Returns:
             Final transcription text or None
         """
-        return self.recognizer.finish_stream()
+        return self.recognizer.finish_stream(
+            **self._usage_kwargs(usage_client, usage_context)
+        )
 
 
 # Decorator for registering speech engines

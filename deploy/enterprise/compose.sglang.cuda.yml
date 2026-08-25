@@ -1,0 +1,54 @@
+# Optional generic NVIDIA CUDA SGLang backend.  This file is deliberately not
+# the company default and makes no AMD/ROCm claim.  AMD gfx1151 uses
+# compose.gemma-vllm.yml instead.
+services:
+  aoitalk:
+    environment:
+      AOITALK_BACKEND: sglang-cuda
+      AOITALK_ACTIVE_DEPLOYMENT_BACKEND: sglang-cuda
+      AOITALK_LLM_MODE: sglang
+      AOITALK_EFFECTIVE_LLM_PROVIDER: openai_compatible_local
+      AOITALK_EXTERNAL_PROVIDER: openai_compatible_local
+      AOITALK_EXTERNAL_MODEL: ${SGLANG_MODEL:-google/gemma-4-E4B-it}
+      AOITALK_EXTERNAL_BASE_URL: http://sglang:30000/v1
+      OPENAI_COMPATIBLE_LOCAL_MODEL: ${SGLANG_MODEL:-google/gemma-4-E4B-it}
+      OPENAI_COMPATIBLE_LOCAL_BASE_URL: http://sglang:30000/v1
+      OPENAI_COMPATIBLE_LOCAL_SERVER_PROFILE: sglang
+      OPENAI_COMPATIBLE_LOCAL_TOOLS: "true"
+      OPENAI_COMPATIBLE_LOCAL_API_KEY_FILE: /run/secrets/openai_compatible_local_api_key
+    depends_on:
+      sglang-cuda:
+        condition: service_healthy
+        required: true
+
+  sglang-cuda:
+    image: ${AOITALK_SGLANG_IMAGE:?AOITALK_SGLANG_IMAGE must be an immutable repository@sha256 digest}
+    environment:
+      SGLANG_MODEL: ${SGLANG_MODEL:-google/gemma-4-E4B-it}
+      SGLANG_REASONING_PARSER: ${SGLANG_REASONING_PARSER:-gemma4}
+      SGLANG_TOOL_CALL_PARSER: ${SGLANG_TOOL_CALL_PARSER:-gemma4}
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        test -f "/models/gemma/${AOITALK_GEMMA_MODEL_FILE:-model.safetensors}";
+        exec sglang serve --model-path /models/gemma --served-model-name "$${SGLANG_MODEL:-google/gemma-4-E4B-it}" --dtype bfloat16 --reasoning-parser "$${SGLANG_REASONING_PARSER:-gemma4}" --tool-call-parser "$${SGLANG_TOOL_CALL_PARSER:-gemma4}" --mem-fraction-static 0.80 --host 0.0.0.0 --port 30000
+    volumes:
+      - ${AOITALK_GEMMA_MODEL_DIR:-${AOITALK_DATA_ROOT:?AOITALK_DATA_ROOT is required}/huggingface/gemma-4E4B-it}:/models/gemma:ro
+    expose:
+      - "30000"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:30000/health', timeout=5)"
+    gpus: all
+    shm_size: "32gb"
+    networks:
+      - aoitalk-network
+    restart: unless-stopped
+
+secrets:
+  openai_compatible_local_api_key:
+    file: ${AOITALK_SECRETS_DIR:?AOITALK_SECRETS_DIR is required}/openai_compatible_local_api_key

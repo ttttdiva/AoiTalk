@@ -181,7 +181,7 @@ export function RemoteTaskDialog({
 
   return (
     <Dialog open={!!target} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent size="md">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <span

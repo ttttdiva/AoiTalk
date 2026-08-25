@@ -9,7 +9,48 @@
 
 import { getDb, schema } from '../db/client';
 import type { OutboxEnqueue } from './types';
+import { getToken, getTokenAuthScope } from '../lib/auth';
 import { asc, eq, and, isNull, like } from 'drizzle-orm';
+
+/**
+ * Resolve the account scope used for an outbox operation.  A missing token is
+ * represented as `null` and is intentionally never replayed; all existing
+ * mutation call sites enqueue only after a token check.  Keeping legacy NULL
+ * rows untouched prevents an unknown old mutation from being attributed to a
+ * newly signed-in account.
+ */
+async function resolveAuthScope(
+  requested?: string | null,
+): Promise<string | null> {
+  if (requested !== undefined) return requested;
+  const token = await getToken();
+  return token
+    ? typeof getTokenAuthScope === 'function'
+      ? getTokenAuthScope(token)
+      : null
+    : null;
+}
+
+function scopePredicate(
+  authScope: string | null,
+): ReturnType<typeof eq> | ReturnType<typeof isNull> {
+  return authScope === null
+    ? isNull(schema.outbox.authScope)
+    : eq(schema.outbox.authScope, authScope);
+}
+
+function inferDocsScopeKey(op: OutboxEnqueue): string | null {
+  if (!op.table.startsWith('knowledge_')) return null;
+  const payload = op.payload && typeof op.payload === 'object'
+    ? op.payload as Record<string, unknown>
+    : null;
+  const workspaceId = payload?.workspace_id ?? payload?.workspaceId;
+  const projectId = payload?.project_id ?? payload?.projectId;
+  if (workspaceId) {
+    return `${String(workspaceId)}|project:${projectId ? String(projectId) : ''}`;
+  }
+  return null;
+}
 
 export function randomId(): string {
   // Lightweight uuid v4 generator (no dependency).
@@ -28,17 +69,57 @@ export function randomId(): string {
 
 export async function enqueueOutbox(op: OutboxEnqueue): Promise<string> {
   const db = getDb();
-  const existing = await db
-    .select()
-    .from(schema.outbox)
-    .where(
-      and(
-        eq(schema.outbox.tableName, op.table),
-        eq(schema.outbox.entityId, op.entityId),
-      ),
-    )
-    .orderBy(asc(schema.outbox.createdAt));
+  const authScope = await resolveAuthScope(op.authScope);
+  let inferredDocsScopeKey = op.docsScopeKey ?? inferDocsScopeKey(op);
+  // Updates/deletes often carry only a composite entity id.  Resolve the
+  // scope from persisted membership when exactly one active scope owns it;
+  // ambiguity remains NULL and is quarantined conservatively on revocation.
+  if (!inferredDocsScopeKey && authScope && schema.docsScopeMembership) {
+    try {
+      const memberships = await db
+        .select({ scopeKey: schema.docsScopeMembership.scopeKey })
+        .from(schema.docsScopeMembership)
+        .where(
+          and(
+            eq(schema.docsScopeMembership.authScope, authScope),
+            eq(schema.docsScopeMembership.tableName, op.table),
+            eq(schema.docsScopeMembership.entityKey, op.entityId),
+            eq(schema.docsScopeMembership.state, 'active'),
+          ),
+        );
+      const keys = [...new Set(memberships.map((row) => row.scopeKey))];
+      if (keys.length === 1) inferredDocsScopeKey = keys[0];
+    } catch {
+      // Rolling databases/test doubles may not have the membership table yet.
+    }
+  }
+  const ambiguousDocsScope = op.table.startsWith('knowledge_') && !inferredDocsScopeKey;
+  // Without a verified composite key this operation cannot be attributed to
+  // one of two sibling scopes that share an entity UUID.  Do not merge it
+  // into an ambiguous legacy NULL row; retaining separate operations is the
+  // fail-closed choice and lets a later membership migration resolve them.
+  const existing = op.table.startsWith('knowledge_') && !inferredDocsScopeKey
+    ? []
+    : await db
+        .select()
+        .from(schema.outbox)
+        .where(
+          and(
+            scopePredicate(authScope),
+            eq(schema.outbox.tableName, op.table),
+            eq(schema.outbox.entityId, op.entityId),
+            op.table.startsWith('knowledge_')
+              ? inferredDocsScopeKey
+                ? eq(schema.outbox.docsScopeKey, inferredDocsScopeKey)
+                : undefined
+              : undefined,
+          ),
+        )
+        .orderBy(asc(schema.outbox.createdAt));
   const mergeable = existing[existing.length - 1];
+  const docsScopePatch = inferredDocsScopeKey
+    ? { docsScopeKey: inferredDocsScopeKey }
+    : {};
   if (
     mergeable &&
     (mergeable.action === 'update' || mergeable.action === 'create') &&
@@ -55,6 +136,22 @@ export async function enqueueOutbox(op: OutboxEnqueue): Promise<string> {
         lastError: null,
         retryCount: 0,
         conflictPayload: null,
+        ...docsScopePatch,
+      })
+      .where(eq(schema.outbox.opId, mergeable.opId));
+    return mergeable.opId;
+  }
+  if (mergeable && mergeable.action === 'reorder' && op.action === 'reorder') {
+    // Reorder is a first-class operation: retain only the latest canonical
+    // order for this account + table/entity scope.
+    await db
+      .update(schema.outbox)
+      .set({
+        payload: JSON.stringify(op.payload ?? {}),
+        lastError: null,
+        retryCount: 0,
+        conflictPayload: null,
+        ...docsScopePatch,
       })
       .where(eq(schema.outbox.opId, mergeable.opId));
     return mergeable.opId;
@@ -67,7 +164,7 @@ export async function enqueueOutbox(op: OutboxEnqueue): Promise<string> {
   ) {
     await db
       .update(schema.outbox)
-      .set({ action: 'delete' })
+      .set({ action: 'delete', ...docsScopePatch })
       .where(eq(schema.outbox.opId, mergeable.opId));
     return mergeable.opId;
   }
@@ -88,6 +185,7 @@ export async function enqueueOutbox(op: OutboxEnqueue): Promise<string> {
         lastError: null,
         retryCount: 0,
         conflictPayload: null,
+        ...docsScopePatch,
       })
       .where(eq(schema.outbox.opId, mergeable.opId));
     return mergeable.opId;
@@ -100,35 +198,64 @@ export async function enqueueOutbox(op: OutboxEnqueue): Promise<string> {
     action: op.action,
     entityId: op.entityId,
     payload: JSON.stringify(op.payload ?? {}),
+    authScope,
     baseUpdatedAt: op.baseUpdatedAt ?? null,
     basePayload: op.basePayload ?? null,
     conflictPayload: null,
     retryCount: 0,
     lastError: null,
+    docsScopeKey: inferredDocsScopeKey,
+    // A new Docs mutation without a verified composite identity must never be
+    // replayed into whichever sibling project happens to share its UUID.
+    // Migration can later resolve this row from membership/payload and clear
+    // the block through an explicit unblock operation.
+    blockedReason: ambiguousDocsScope ? 'docs_scope_ambiguous' : null,
   });
   return opId;
 }
 
-export async function listPendingOutbox(limit?: number) {
+export async function listPendingOutbox(
+  limit?: number,
+  requestedAuthScope?: string | null,
+) {
   const db = getDb();
+  const authScope = await resolveAuthScope(requestedAuthScope);
+  // No token means no authenticated mutation may be sent.  In particular,
+  // legacy NULL rows must not be adopted by an anonymous/new account.
+  if (authScope === null) return [];
   const query = db
     .select()
     .from(schema.outbox)
+    .where(scopePredicate(authScope))
     .orderBy(asc(schema.outbox.createdAt));
   const rows = limit ? await query.limit(limit) : await query;
   return rows.filter(
     (row) =>
-      row.retryCount < 5 ||
-      (row.lastError ?? '').startsWith('conflict:'),
+      row.authScope === authScope &&
+      row.blockedReason == null &&
+      (row.retryCount < 5 ||
+        (row.lastError ?? '').startsWith('conflict:')),
   );
 }
 
-export async function hasPendingOutbox(table: string, entityId: string): Promise<boolean> {
+export async function hasPendingOutbox(
+  table: string,
+  entityId: string,
+  requestedAuthScope?: string | null,
+): Promise<boolean> {
   const db = getDb();
+  const authScope = await resolveAuthScope(requestedAuthScope);
+  if (authScope === null) return false;
   const rows = await db
     .select({ opId: schema.outbox.opId })
     .from(schema.outbox)
-    .where(and(eq(schema.outbox.tableName, table), eq(schema.outbox.entityId, entityId)))
+    .where(
+      and(
+        scopePredicate(authScope),
+        eq(schema.outbox.tableName, table),
+        eq(schema.outbox.entityId, entityId),
+      ),
+    )
     .limit(1);
   return rows.length > 0;
 }
@@ -137,12 +264,21 @@ export async function recordOutboxServerSnapshot(
   table: string,
   entityId: string,
   payload: unknown,
+  requestedAuthScope?: string | null,
 ): Promise<void> {
   const db = getDb();
+  const authScope = await resolveAuthScope(requestedAuthScope);
+  if (authScope === null) return;
   const rows = await db
     .select({ opId: schema.outbox.opId })
     .from(schema.outbox)
-    .where(and(eq(schema.outbox.tableName, table), eq(schema.outbox.entityId, entityId)))
+    .where(
+      and(
+        scopePredicate(authScope),
+        eq(schema.outbox.tableName, table),
+        eq(schema.outbox.entityId, entityId),
+      ),
+    )
     .orderBy(asc(schema.outbox.createdAt));
   const row = rows[0];
   if (!row) return;
@@ -170,12 +306,21 @@ export async function rebaseOutboxOp(
     .where(eq(schema.outbox.opId, opId));
 }
 
-export async function listOutboxConflicts() {
+export async function listOutboxConflicts(
+  requestedAuthScope?: string | null,
+) {
   const db = getDb();
+  const authScope = await resolveAuthScope(requestedAuthScope);
+  if (authScope === null) return [];
   return db
     .select()
     .from(schema.outbox)
-    .where(like(schema.outbox.lastError, 'conflict:%'))
+    .where(
+      and(
+        scopePredicate(authScope),
+        like(schema.outbox.lastError, 'conflict:%'),
+      ),
+    )
     .orderBy(asc(schema.outbox.createdAt));
 }
 

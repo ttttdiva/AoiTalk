@@ -1,7 +1,11 @@
 "use client";
 
 import { forwardRef } from "react";
-import { LongTextEditor, type LongTextEditorHandle } from "./long-text-editor";
+import {
+  LongTextEditor,
+  type EditorImageInsertHandler,
+  type LongTextEditorHandle,
+} from "./long-text-editor";
 import {
   type LinkDisplayMode,
   type LinkDisplayModeChangeHandler,
@@ -9,6 +13,7 @@ import {
 } from "./link-embed-plugin";
 
 export type { LinkDisplayMode, LinkDisplayModeMap };
+export type { EditorImageInsertHandler };
 
 interface TaskDescriptionEditorProps {
   value: string;
@@ -22,6 +27,7 @@ interface TaskDescriptionEditorProps {
   onLinkDisplayModeChange?: LinkDisplayModeChangeHandler;
   onSubmitIntent?: (value: string) => void;
   onArrowUpFromStart?: () => void;
+  onImageInsert?: EditorImageInsertHandler;
 }
 
 export type TaskDescriptionEditorHandle = LongTextEditorHandle;
@@ -42,6 +48,7 @@ export const TaskDescriptionEditor = forwardRef<
     onLinkDisplayModeChange,
     onSubmitIntent,
     onArrowUpFromStart,
+    onImageInsert,
   },
   ref,
 ) {
@@ -61,6 +68,7 @@ export const TaskDescriptionEditor = forwardRef<
       onLinkDisplayModeChange={onLinkDisplayModeChange}
       onSubmitIntent={onSubmitIntent}
       onArrowUpFromStart={onArrowUpFromStart}
+      onImageInsert={onImageInsert}
     />
   );
 });

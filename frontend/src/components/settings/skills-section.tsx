@@ -1,6 +1,8 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { AppSelect } from "@/components/ui/app-select";
+
+import { useState, useCallback, useEffect } from "react";
 import useSWR from "swr";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -16,6 +18,12 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
   Wand2,
   ChevronDown,
   ChevronUp,
@@ -24,7 +32,10 @@ import {
   Trash2,
   Loader2,
   TestTube,
+  Video,
 } from "lucide-react";
+import { SkillRecorderDialog } from "@/components/skills/skill-recorder-dialog";
+import { isScreenRecordingSupported } from "@/lib/skill-recording";
 
 interface Skill {
   name: string;
@@ -76,6 +87,12 @@ export function SkillsSection() {
   const [saving, setSaving] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
+  const [recorderOpen, setRecorderOpen] = useState(false);
+  // 画面録画対応可否はクライアントでのみ判定する（SSR ミスマッチ回避）。
+  const [recordingSupported, setRecordingSupported] = useState(false);
+  useEffect(() => {
+    setRecordingSupported(isScreenRecordingSupported());
+  }, []);
 
   // フォーム状態
   const [formName, setFormName] = useState("");
@@ -206,7 +223,7 @@ export function SkillsSection() {
 
   return (
     <>
-      <Card size="sm">
+      <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0">
         <CardHeader
           className="cursor-pointer select-none"
           onClick={handleToggle}
@@ -234,10 +251,36 @@ export function SkillsSection() {
               <Button variant="outline" size="sm" onClick={fetchSkills}>
                 更新
               </Button>
-              <Button size="sm" onClick={() => openEditor(null)}>
-                <Plus className="size-3 mr-1" />
-                新規作成
-              </Button>
+              <div className="flex gap-2">
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger
+                      render={
+                        <span className={recordingSupported ? "" : "cursor-not-allowed"} />
+                      }
+                    >
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setRecorderOpen(true)}
+                        disabled={!recordingSupported}
+                      >
+                        <Video className="size-3 mr-1" />
+                        録画して作成
+                      </Button>
+                    </TooltipTrigger>
+                    {!recordingSupported && (
+                      <TooltipContent>
+                        このブラウザは画面録画に対応していません。
+                      </TooltipContent>
+                    )}
+                  </Tooltip>
+                </TooltipProvider>
+                <Button size="sm" onClick={() => openEditor(null)}>
+                  <Plus className="size-3 mr-1" />
+                  新規作成
+                </Button>
+              </div>
             </div>
             {loading ? (
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -308,7 +351,7 @@ export function SkillsSection() {
 
       {/* 編集ダイアログ */}
       <Dialog open={!!editSkill} onOpenChange={(v) => !v && setEditSkill(null)}>
-        <DialogContent className="sm:max-w-lg max-h-[80vh] overflow-auto">
+        <DialogContent size="lg" className="max-h-[80vh] overflow-auto">
           <DialogHeader>
             <DialogTitle>{isNew ? "スキル作成" : "スキル編集"}</DialogTitle>
           </DialogHeader>
@@ -345,7 +388,7 @@ export function SkillsSection() {
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1">
                 <Label className="text-xs">トリガーモード</Label>
-                <select
+                <AppSelect
                   value={formTrigger}
                   onChange={(e) => setFormTrigger(e.target.value)}
                   className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
@@ -353,7 +396,7 @@ export function SkillsSection() {
                   <option value="manual">手動</option>
                   <option value="auto">自動</option>
                   <option value="keyword">キーワード</option>
-                </select>
+                </AppSelect>
               </div>
               <div className="space-y-1">
                 <Label className="text-xs">エイリアス（カンマ区切り）</Label>
@@ -401,6 +444,13 @@ export function SkillsSection() {
           </div>
         </DialogContent>
       </Dialog>
+
+      {/* 録画してスキルを作成 */}
+      <SkillRecorderDialog
+        open={recorderOpen}
+        onOpenChange={setRecorderOpen}
+        onSaved={fetchSkills}
+      />
     </>
   );
 }

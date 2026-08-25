@@ -3,7 +3,7 @@ import { db } from "@/db";
 import { timeEntries, tasks, users, projects } from "@/db/schema";
 import { eq, and, gte, lte, desc, inArray } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
-import { getReadableProjectIds } from "@/lib/server/task-route-utils";
+import { getParticipatingProjectIds } from "@/lib/server/task-route-utils";
 import {
   correctLikelyTimerStartedAt,
   dbTimestampToLocalDate,
@@ -53,7 +53,7 @@ export async function GET(request: NextRequest) {
     by_user: [],
     by_project: [],
   };
-  const readableProjectIds = await getReadableProjectIds(user.id, {
+  const readableProjectIds = await getParticipatingProjectIds(user.id, {
     projectId,
     spaceId: projectId ? null : spaceId,
   });

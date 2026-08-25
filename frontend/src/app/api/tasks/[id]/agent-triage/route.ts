@@ -1,12 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { taskComments, tasks } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
 import { decryptTextIfNeeded, encryptText } from "@/lib/server/field-crypto";
 import {
-  canWriteMembership,
-  getProjectMembership,
+  canWriteProjectId,
 } from "@/lib/server/task-route-utils";
 
 const TRIAGE_MARKER = "[aoitalk-agent-triage]";
@@ -44,7 +43,7 @@ function triageTask(task: {
     execution.push("Align backend API, DB model/migration, and permission checks.");
   }
   if (/upload|file|attachment/i.test(text)) {
-    execution.push("Implement storage path, blocked-extension handling, UI refresh, and failure handling.");
+    execution.push("Implement storage path, UI refresh, and failure handling.");
   }
   if (/bug|fix|overflow|position|failure|error/i.test(text)) {
     execution.push("Lock down reproduction and make the smallest compatible fix.");
@@ -79,13 +78,12 @@ export async function POST(
   const [task] = await db
     .select()
     .from(tasks)
-    .where(eq(tasks.id, id))
+    .where(and(eq(tasks.id, id), isNull(tasks.deletedAt)))
     .limit(1);
   if (!task) {
     return NextResponse.json({ detail: "Task not found" }, { status: 404 });
   }
-  const membership = await getProjectMembership(user.id, task.projectId);
-  if (!canWriteMembership(user, membership)) {
+  if (!(await canWriteProjectId(user, task.projectId))) {
     return NextResponse.json({ detail: "Permission denied" }, { status: 403 });
   }
 

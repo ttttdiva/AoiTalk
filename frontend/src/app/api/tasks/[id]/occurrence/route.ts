@@ -1,20 +1,23 @@
 import { NextRequest, NextResponse } from "next/server";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "@/db";
 import {
   notificationDeliveries,
   taskOccurrences,
   taskRecurrenceRules,
   tasks,
+  timeEntries,
 } from "@/db/schema";
 import { getSession } from "@/lib/auth";
 import { normalizeTaskStatus } from "@/lib/task-status";
 import {
   buildRecurrenceOverrideSourceKind,
   buildRecurrenceSkipSourceKind,
+  canReuseOccurrenceRowForOverride,
   isRecurrenceOverrideSourceKind,
   isRecurrenceSkipSourceKind,
-  parseRecurrenceOriginalStartAt,
+  resolveOccurrenceCutoffSource,
+  shouldFindOccurrenceByStartAt,
 } from "@/lib/recurrence-exceptions";
 import {
   dbTimestampToLocalDate,
@@ -22,10 +25,8 @@ import {
   serializeDbTimestamp,
   toDbLocalTimestamp,
 } from "@/lib/server/db-time";
-import {
-  collectTaskTreeIds,
-  deleteTaskTreeRows,
-} from "@/lib/server/task-delete";
+import { fetchPythonApi } from "@/lib/server/python-api-proxy";
+import { canWriteProjectId } from "@/lib/server/task-route-utils";
 
 function parseDate(value: unknown, fieldName: string): Date {
   const parsed =
@@ -93,7 +94,7 @@ async function getTaskWithRecurrence(taskId: string) {
   const [task] = await db
     .select()
     .from(tasks)
-    .where(eq(tasks.id, taskId))
+    .where(and(eq(tasks.id, taskId), isNull(tasks.deletedAt)))
     .limit(1);
   if (!task) return { task: null, rule: null };
 
@@ -170,6 +171,7 @@ async function upsertOverrideRow(params: {
   taskId: string;
   originalStartAtText: string;
   occurrenceId?: string | null;
+  reuseOccurrenceId?: boolean;
   nextStartAt: Date;
   nextEndAt: Date;
   status: string | null;
@@ -180,6 +182,7 @@ async function upsertOverrideRow(params: {
     taskId,
     originalStartAtText,
     occurrenceId,
+    reuseOccurrenceId = false,
     nextStartAt,
     nextEndAt,
     status,
@@ -204,7 +207,43 @@ async function upsertOverrideRow(params: {
       )[0] ?? null)
     : null;
 
-  if (!existing || !isRecurrenceOverrideSourceKind(existing.sourceKind)) {
+  if (shouldFindOccurrenceByStartAt(occurrenceId, reuseOccurrenceId)) {
+    existing =
+      (
+        await db
+          .select()
+          .from(taskOccurrences)
+          .where(
+            and(
+              eq(taskOccurrences.taskId, taskId),
+              eq(
+                taskOccurrences.startAt,
+                toDbLocalTimestamp(nextStartAt),
+              ),
+            ),
+          )
+          .limit(1)
+      )[0] ?? null;
+  }
+
+  if (existing && reuseOccurrenceId) {
+    const existingStartAt = dbTimestampToLocalDate(existing.startAt);
+    if (
+      !existingStartAt ||
+      existingStartAt.getTime() !== nextStartAt.getTime() ||
+      isRecurrenceSkipSourceKind(existing.sourceKind)
+    ) {
+      throw new Error("Occurrence does not match requested start");
+    }
+  }
+
+  if (
+    !existing ||
+    !canReuseOccurrenceRowForOverride(
+      existing.sourceKind,
+      reuseOccurrenceId,
+    )
+  ) {
     existing =
       (
         await db
@@ -268,6 +307,9 @@ export async function PATCH(
         { status: 404 },
       );
     }
+    if (!(await canWriteProjectId(user, task.projectId))) {
+      return NextResponse.json({ detail: "Permission denied" }, { status: 403 });
+    }
 
     const occurrenceStartAt = parseDate(
       body.occurrence_start_at,
@@ -291,6 +333,7 @@ export async function PATCH(
         originalStartAtText,
         occurrenceId:
           typeof body.occurrence_id === "string" ? body.occurrence_id : null,
+        reuseOccurrenceId: true,
         nextStartAt: occurrenceStartAt,
         nextEndAt: occurrenceEndAt,
         status: normalizeTaskStatus(body.status || "open") || "open",
@@ -406,6 +449,9 @@ export async function DELETE(
         { status: 404 },
       );
     }
+    if (!(await canWriteProjectId(user, task.projectId))) {
+      return NextResponse.json({ detail: "Permission denied" }, { status: 403 });
+    }
 
     const mode = body.mode === "future" ? "future" : "single";
     const occurrenceStartAt = parseDate(
@@ -456,10 +502,30 @@ export async function DELETE(
     }
 
     const cutoffStartAt = serializeDbTimestamp(originalStartAt);
-    const taskStartAt = dbTimestampToLocalDate(task.startAt);
+    // 開始日時が未設定の繰り返しタスクは、GET 側 (task-occurrences/route.ts) が
+    // end_at を base 回の開始として扱う。ここも同じ基準に揃えないと、
+    // start_at が NULL の繰り返しタスクはこの分岐に入れず、
+    // どの回で「今回以降を削除」を押してもタスク本体が消えないままになる。
+    const taskStartAt = dbTimestampToLocalDate(task.startAt ?? task.endAt);
     if (taskStartAt && taskStartAt.getTime() >= originalStartAt.getTime()) {
       await deleteDueSoonNotifications(id);
-      await deleteTaskTreeRows(await collectTaskTreeIds(id));
+      const upstream = await fetchPythonApi(`/api/tasks/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+        user,
+      });
+      if (!upstream.ok) {
+        const body = await upstream.text().catch(() => "");
+        return new NextResponse(
+          body || JSON.stringify({ detail: "タスクの削除に失敗しました" }),
+          {
+            status: upstream.status,
+            headers: {
+              "content-type":
+                upstream.headers.get("content-type") ?? "application/json",
+            },
+          },
+        );
+      }
       return NextResponse.json({ success: true, deleted_task: true });
     }
 
@@ -468,27 +534,42 @@ export async function DELETE(
       .from(taskOccurrences)
       .where(eq(taskOccurrences.taskId, id));
 
+    // cutoff 以降の回に対応する保存済みオカレンスは、source_kind を問わず削除する。
+    // 判定に使う時刻は「元々どの回だったか」であり、
+    //   - 別日へ移動した回（ro: / recurrence_override:）は source_kind に埋まった元の開始時刻
+    //   - それ以外（recurrence_skip、materialize 済みの recurrence、task_schedule）は行自身の開始時刻
+    // を見る。
+    // 以前は override 以外を一律 false にしていたため、Python 側が materialize した
+    // source_kind="recurrence" の実体行が1件も消えず、繰り返しルールの endDate だけが
+    // 更新されていた。ルール行は残るので GET 側の innerJoin を通過し続け、
+    // 「今回以降を削除」を押してもカレンダーの表示が一切変わらなかった。
     const staleOccurrenceIds = taskOccurrenceRows
       .filter((row) => {
-        if (isRecurrenceSkipSourceKind(row.sourceKind)) {
-          const rowStartAt = dbTimestampToLocalDate(row.startAt);
-          return (
-            !!rowStartAt && rowStartAt.getTime() >= originalStartAt.getTime()
-          );
-        }
-        const original = parseRecurrenceOriginalStartAt(row.sourceKind);
-        if (!original) return false;
-        return (
-          parseDate(original, "original_start_at").getTime() >=
-          originalStartAt.getTime()
-        );
+        const cutoffSource = resolveOccurrenceCutoffSource(row.sourceKind);
+        const anchor =
+          cutoffSource.from === "original"
+            ? parseDate(cutoffSource.originalStartAt, "original_start_at")
+            : dbTimestampToLocalDate(row.startAt);
+        return !!anchor && anchor.getTime() >= originalStartAt.getTime();
       })
       .map((row) => row.id);
 
-    for (const occurrenceId of staleOccurrenceIds) {
+    if (staleOccurrenceIds.length > 0) {
+      // notification_deliveries.occurrence_id と time_entries.occurrence_id は
+      // ON DELETE 指定の無い外部キーなので、参照を残したまま消すと
+      // ForeignKeyViolation になり削除リクエストごと 400 で失敗する。
+      // タスク自体は残るため、配信済み通知や実績時間の記録は消さず参照だけ外す。
+      await db
+        .update(notificationDeliveries)
+        .set({ occurrenceId: null })
+        .where(inArray(notificationDeliveries.occurrenceId, staleOccurrenceIds));
+      await db
+        .update(timeEntries)
+        .set({ occurrenceId: null })
+        .where(inArray(timeEntries.occurrenceId, staleOccurrenceIds));
       await db
         .delete(taskOccurrences)
-        .where(eq(taskOccurrences.id, occurrenceId));
+        .where(inArray(taskOccurrences.id, staleOccurrenceIds));
     }
 
     await db

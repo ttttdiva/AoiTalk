@@ -42,13 +42,20 @@ function DropdownMenuContent({
   alignOffset = 0,
   side = "bottom",
   sideOffset = 4,
+  anchor,
+  positionMethod,
   className,
   onKeyDownCapture,
   ...props
 }: MenuPrimitive.Popup.Props &
   Pick<
     MenuPrimitive.Positioner.Props,
-    "align" | "alignOffset" | "side" | "sideOffset"
+    | "align"
+    | "alignOffset"
+    | "side"
+    | "sideOffset"
+    | "anchor"
+    | "positionMethod"
   >) {
   const popupRef = React.useRef<HTMLDivElement | null>(null);
 
@@ -74,6 +81,8 @@ function DropdownMenuContent({
         alignOffset={alignOffset}
         side={side}
         sideOffset={sideOffset}
+        {...(anchor === undefined ? {} : { anchor })}
+        {...(positionMethod === undefined ? {} : { positionMethod })}
       >
         <MenuPrimitive.Popup
           ref={popupRef}
@@ -163,14 +172,20 @@ function DropdownMenuSubTrigger({
   className,
   inset,
   children,
+  mnemonic,
+  showMnemonic = true,
   ...props
 }: MenuPrimitive.SubmenuTrigger.Props & {
   inset?: boolean;
-}) {
+} & DropdownMenuMnemonicProps) {
+  const normalizedMnemonic = normalizeMenuMnemonic(mnemonic);
+
   return (
     <MenuPrimitive.SubmenuTrigger
       data-slot="dropdown-menu-sub-trigger"
       data-inset={inset}
+      data-menu-mnemonic={normalizedMnemonic ?? undefined}
+      aria-keyshortcuts={normalizedMnemonic ?? undefined}
       className={cn(
         "flex cursor-default items-center gap-1.5 rounded-md px-1.5 py-1 text-sm outline-hidden select-none focus:bg-accent focus:text-accent-foreground not-data-[variant=destructive]:focus:**:text-accent-foreground data-inset:pl-7 data-popup-open:bg-accent data-popup-open:text-accent-foreground data-open:bg-accent data-open:text-accent-foreground [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
         className,
@@ -178,7 +193,12 @@ function DropdownMenuSubTrigger({
       {...props}
     >
       {children}
-      <ChevronRightIcon className="ml-auto" />
+      {showMnemonic && normalizedMnemonic ? (
+        <DropdownMenuShortcut className="ml-auto">
+          {normalizedMnemonic}
+        </DropdownMenuShortcut>
+      ) : null}
+      <ChevronRightIcon className="shrink-0" />
     </MenuPrimitive.SubmenuTrigger>
   );
 }

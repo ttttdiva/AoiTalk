@@ -6,6 +6,23 @@ export function sessionActivityTime(session: ConversationSession): number {
   return new Date(session.last_activity ?? session.session_start ?? 0).getTime();
 }
 
+/** App開発チャットの進行中表示をサイドバーで共有する判定。 */
+export function isChatSessionWorking(session: ConversationSession): boolean {
+  return session.development_status === "working" && session.message_count > 0;
+}
+
+/** 現在開いていない完了応答だけを未読マーカーの対象にする。 */
+export function isChatSessionUnread(
+  session: ConversationSession,
+  activeSessionId?: string | null,
+): boolean {
+  return (
+    session.is_unread === true &&
+    activeSessionId !== session.id &&
+    !isChatSessionWorking(session)
+  );
+}
+
 export function sortChatSessions(sessions: ConversationSession[]) {
   return [...sessions].sort(
     (a, b) =>

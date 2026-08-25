@@ -12,8 +12,10 @@ import { Skeleton } from "@/components/ui/skeleton";
 
 interface SettingsPayload {
   settings?: {
+    /** Canonical shared-integration settings (schema v3). */
+    integrations?: { spotify?: { enabled?: boolean } };
+    /** Legacy read-only fallback for settings created before schema v3. */
     spotify?: { enabled?: boolean };
-    agents?: { spotify?: { enabled?: boolean } };
   };
 }
 
@@ -32,10 +34,11 @@ async function pyFetch<T = unknown>(path: string, init?: RequestInit): Promise<T
 
 interface SpotifyState {
   enabled: boolean | null;
-  agentEnabled: boolean | null;
 }
 
-const INITIAL_SPOTIFY_STATE: SpotifyState = { enabled: null, agentEnabled: null };
+// Spotify is a shared integration, not an Agent/Team toggle.  It is disabled
+// by default when no canonical value has been persisted yet.
+const INITIAL_SPOTIFY_STATE: SpotifyState = { enabled: null };
 
 export function SpotifySection() {
   const [expanded, setExpanded] = useState(false);
@@ -48,8 +51,13 @@ export function SpotifySection() {
       try {
         const payload = await pyFetch<SettingsPayload>("/settings");
         return {
-          enabled: payload.settings?.spotify?.enabled ?? true,
-          agentEnabled: payload.settings?.agents?.spotify?.enabled ?? false,
+          // Read the v3 location first.  Legacy locations are accepted only
+          // while reading so existing installs can be migrated without
+          // keeping their old write paths alive.
+          enabled:
+            payload.settings?.integrations?.spotify?.enabled
+            ?? payload.settings?.spotify?.enabled
+            ?? false,
         };
       } catch (error) {
         toast.error(error instanceof Error ? error.message : "Spotify設定を取得できませんでした");
@@ -66,7 +74,7 @@ export function SpotifySection() {
     },
   );
   stateRef.current = data;
-  const { enabled, agentEnabled } = data;
+  const { enabled } = data;
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
 
@@ -83,23 +91,19 @@ export function SpotifySection() {
     void loadSettings();
   }, [loadSettings]);
 
-  const updateSetting = useCallback(async (
-    key: "spotify.enabled" | "agents.spotify.enabled",
-    value: boolean,
-  ) => {
+  const updateSetting = useCallback(async (value: boolean) => {
     // 楽観的更新：保存中はローカルキャッシュを即時反映する。
     await mutateSpotify(
-      (current = INITIAL_SPOTIFY_STATE) =>
-        key === "spotify.enabled"
-          ? { ...current, enabled: value }
-          : { ...current, agentEnabled: value },
+      (current = INITIAL_SPOTIFY_STATE) => ({ ...current, enabled: value }),
       { revalidate: false },
     );
     setSaving(true);
     try {
       await pyFetch("/settings", {
         method: "PATCH",
-        body: JSON.stringify({ key, value }),
+        // Canonical v3 setting.  Never write spotify.enabled or
+        // agents.spotify.enabled from this UI.
+        body: JSON.stringify({ key: "integrations.spotify.enabled", value }),
       });
       toast.success("Spotify設定を保存しました");
     } catch (error) {
@@ -111,9 +115,9 @@ export function SpotifySection() {
   }, [mutateSpotify]);
 
   return (
-    <Card size="sm">
+    <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0" data-settings-surface="spotify">
       <CardHeader
-        className="cursor-pointer select-none"
+        className="cursor-pointer select-none border-b border-border dark:border-[#333335] px-3 py-3 transition-colors hover:bg-muted dark:bg-[#242426]"
         onClick={() => setExpanded((value) => !value)}
       >
         <CardTitle className="flex items-center justify-between gap-3 text-sm">
@@ -128,7 +132,7 @@ export function SpotifySection() {
         </CardTitle>
       </CardHeader>
       {expanded && (
-        <CardContent className="space-y-3">
+      <CardContent className="space-y-3 px-3 py-3">
           {loading ? (
             <Skeleton className="h-8 w-64 rounded" />
           ) : (
@@ -151,30 +155,7 @@ export function SpotifySection() {
                     checked={enabled === true}
                     disabled={saving || enabled === null}
                     onCheckedChange={(value) =>
-                      updateSetting("spotify.enabled", value === true)
-                    }
-                  />
-                </div>
-              </div>
-              <div className="flex items-start justify-between gap-3 rounded border p-3">
-                <div className="space-y-1">
-                  <Label htmlFor="spotify-agent-enabled" className="text-sm font-medium">
-                    Spotifyエージェント
-                  </Label>
-                  <p className="text-xs text-muted-foreground">
-                    会話中にSpotify操作用エージェントを呼び出せるようにします。
-                  </p>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Badge variant={agentEnabled ? "default" : "secondary"}>
-                    {agentEnabled === null ? "読込中" : agentEnabled ? "ON" : "OFF"}
-                  </Badge>
-                  <Checkbox
-                    id="spotify-agent-enabled"
-                    checked={agentEnabled === true}
-                    disabled={saving || agentEnabled === null}
-                    onCheckedChange={(value) =>
-                      updateSetting("agents.spotify.enabled", value === true)
+                      updateSetting(value === true)
                     }
                   />
                 </div>

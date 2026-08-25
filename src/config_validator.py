@@ -9,6 +9,19 @@ import yaml
 from pydantic import BaseModel, Field, field_validator, ValidationError
 from typing import Union
 
+try:
+    from .config_errors import (
+        CharacterLookupError,
+        CharacterNotFoundError,
+        build_character_lookup_error,
+    )
+except ImportError:  # pragma: no cover - supports direct script execution
+    from config_errors import (  # type: ignore[no-redef]
+        CharacterLookupError,
+        CharacterNotFoundError,
+        build_character_lookup_error,
+    )
+
 
 class TTSEngineConfig(BaseModel):
     """TTSエンジン設定のバリデーションモデル"""
@@ -61,7 +74,7 @@ class Config(BaseModel):
     default_character: str
     llm_model: str
     llm_provider: str = Field(
-        pattern="^(openai|openrouter|kimi|gemini|antigravity-cli|claude-cli|codex-cli|grok-cli|ollama|sglang|openai_compatible_local)$"
+        pattern="^(openai|openrouter|deepseek|deepinfra|kimi|gemini|antigravity-cli|claude-cli|codex-cli|grok-cli|ollama|sglang|openai_compatible_local)$"
     )
     device_index: int = Field(0, ge=0)
 
@@ -122,13 +135,39 @@ class ConfigValidator:
 
     def _character_config_exists(self, character_name: str) -> bool:
         """Check whether a character config exists in DB."""
+        service_not_found_error_type = None
         try:
-            from .services.character_service import get_character_for_prompt, _run_sync
+            from .services.character_service import (
+                CharacterNotFoundError as _service_not_found_error_type,
+                get_character_for_prompt,
+                _run_sync,
+            )
+
+            service_not_found_error_type = _service_not_found_error_type
 
             char = _run_sync(get_character_for_prompt(character_name))
             return char is not None
-        except Exception:
-            return False
+        except Exception as exc:
+            # A true row miss is a validation error, not a database outage.
+            if (
+                isinstance(exc, CharacterNotFoundError)
+                or (
+                    service_not_found_error_type is not None
+                    and isinstance(exc, service_not_found_error_type)
+                )
+                or (
+                    type(exc).__name__ == "CharacterNotFoundError"
+                    and getattr(exc, "status_code", None) == 404
+                )
+            ):
+                return False
+            if isinstance(exc, CharacterLookupError):
+                # Do not convert an outage/auth/schema failure into a false
+                # "character not found" validation result.
+                raise
+            # Older service implementations may raise a raw DBAPI exception;
+            # normalize it before it crosses the validator boundary.
+            raise build_character_lookup_error(exc) from None
 
     def validate(self, environment: Optional[str] = None) -> bool:
         """設定ファイルをバリデートする
@@ -208,7 +247,9 @@ def validate_config(environment: Optional[str] = None) -> bool:
 
 if __name__ == "__main__":
     # 環境変数から環境名を取得
-    env = os.environ.get("AIVTUBER_ENV", "development")
+    env = os.environ.get("AIVTUBER_ENV") or os.environ.get(
+        "AOITALK_PROFILE", "development"
+    )
 
     print(f"Validating configuration for environment: {env}")
     if validate_config(env):

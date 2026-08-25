@@ -14,7 +14,7 @@ import dataclasses
 import json
 import logging
 import os
-import re
+import time
 import urllib.request
 from datetime import datetime
 from typing import Any, Dict, Generator, List, Optional, Union
@@ -25,11 +25,15 @@ from ..config import Config
 from ..memory.history import HistoryManager
 from ..services.project_context import (
     ProjectContextResolver,
+    project_context_enabled_for_client,
     reset_runtime_project_context,
     set_runtime_project_context,
 )
 from ..services.context_builder import ContextBuilder, ContextBundle
+from ..services.turn_context import get_turn_context
 from ..services.user_settings_service import get_user_custom_instructions_sync
+from ..services.story_chat_context import run_story_chat_context_sync
+from ..services.outbound_privacy_service import OutboundPrivacyGateway
 from ..tools.adapters import OpenAIAPIAdapter
 from ..tools.registry import ToolRegistry
 from .generation_policy import (
@@ -39,15 +43,18 @@ from .generation_policy import (
     reset_current_generation_policy,
     set_current_generation_policy,
 )
+from .generation_cancellation import GenerationInterrupted
+from .generation_error import GenerationErrorKind, classify_generation_error
 from .agentic_completion import (
     agentic_max_rounds,
+    format_tool_execution_evidence,
     render_messages_for_review,
     run_agentic_completion_loop_sync,
+    successful_empty_task_search,
+    tool_loop_completion_confirmed,
 )
 from .agent_runtime import (
-    DIRECT_FILESYSTEM_TOOL_HINT_NAMES,
     DIRECT_PROJECT_TOOL_HINT_NAMES,
-    DIRECT_SEARCH_TOOL_HINT_NAMES,
     build_tool_hint_context_sync,
     compose_tool_hint_user_message,
     guard_tool_execution_claims,
@@ -67,6 +74,10 @@ from .context_budget import (
 )
 from .openai_compatible_local_profiles import (
     DEFAULT_OPENAI_COMPATIBLE_LOCAL_BASE_URL,
+    llama_cpp_model_profile,
+    llama_cpp_profile_capabilities,
+    llama_cpp_reasoning_effort_metadata,
+    llama_cpp_reasoning_effort_request_extra_body,
     openai_compatible_local_base_url,
     openai_compatible_server_profile,
 )
@@ -81,19 +92,57 @@ from .context_snapshot import component, context_bundle_components, message_comp
 from .multimodal import openai_content_parts
 from .prompts import build_unified_instructions
 from .provider_capabilities import ProviderCapabilities
-from .runtime_tool_registry import build_runtime_tool_registry
+from .runtime_tool_registry import (
+    build_runtime_tool_registry,
+    build_runtime_tool_registry_for_client,
+)
+from .tool_packs import (
+    LOAD_TOOL_PACK_TOOL_NAME,
+    auto_load_packs_for_tool_names,
+    ensure_load_tool_pack_tool,
+    tool_pack_session_for_client,
+)
+from .tool_exposure import (
+    filter_tools_for_client,
+    filtered_registry_for_client,
+)
+from .turn_stream_events import (
+    SyncStreamEmitter,
+    bind_stream_callback_loop,
+    emit_thinking,
+    make_sync_stream_emitter,
+    thinking_text_from_message,
+)
 from .tool_policy import (
+    PROJECT_COMMAND_CAPABILITIES,
     command_capability_active,
-    looks_like_bare_search_followup_request,
-    looks_like_filesystem_request,
-    looks_like_media_request,
+    command_capabilities_from_text,
+    mutation_execution_forbidden,
+    looks_like_managed_workspace_request,
     looks_like_project_management_request,
-    looks_like_search_request,
-    looks_like_utility_request,
     project_management_required_mutation_tools,
     project_progress_review_active,
     reset_current_user_input,
+    sanitize_command_capabilities,
     set_current_user_input,
+)
+
+# A constrained native schema must expose the same safe, high-level set for
+# an explicit ``workspace_file_operation`` command and for a server-verified
+# Project attachment.  Keep this set deliberately narrower than every legacy
+# filesystem tool (no native shell/repository mutation tools).
+MANAGED_WORKSPACE_NATIVE_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "list_workspace_tree",
+        "list_directory",
+        "read_file",
+        "create_workspace_directory",
+        "copy_workspace_item",
+        "move_workspace_item",
+        "docs_read",
+        "docs_attach_workspace_file",
+        "docs_place_workspace_file",
+    }
 )
 
 logger = logging.getLogger(__name__)
@@ -104,6 +153,10 @@ DEFAULT_LOCAL_API_KEY = "dummy"
 CONSTRAINED_NATIVE_TOOL_SCHEMA_CHAR_BUDGET = 9000
 LOCAL_MODEL_LOADING_RESPONSE = (
     "ローカルLLMはモデルを読み込み中です。少し待ってからもう一度送信してください。"
+)
+LOCAL_MODEL_SERVER_START_FAILED_RESPONSE = (
+    "ローカルLLMサーバー（llama-server）を起動できませんでした。"
+    "logs/models/llama_cpp.log と、選択したprofileのruntime要件を確認してから再試行してください。"
 )
 LOCAL_MODEL_CONTEXT_OVERFLOW_RESPONSE = (
     "ローカルLLMのコンテキスト上限を超えたため、通常の応答生成に失敗しました。"
@@ -134,10 +187,6 @@ def _current_date_context() -> str:
         "- Resolve relative dates such as today, tomorrow, this week, and 今週 against this date.\n"
         "- Treat this week as Monday through Sunday unless the user specifies another range."
     )
-
-
-def _is_qwopus_model(model: str) -> bool:
-    return "qwopus" in str(model or "").strip().lower()
 
 
 def _deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -246,6 +295,10 @@ def _is_context_overflow_error(exc: Exception) -> bool:
     return any(term in text for term in overflow_terms)
 
 
+def _is_connection_error(exc: Exception) -> bool:
+    return classify_generation_error(exc).kind == GenerationErrorKind.CONNECTION
+
+
 def _as_plain_dict(value: Any) -> Dict[str, Any]:
     if isinstance(value, dict):
         return dict(value)
@@ -299,6 +352,23 @@ def _as_non_negative_int(value: Any) -> Optional[int]:
     return int(number)
 
 
+def _llama_cpp_profile_capability(
+    profile: Optional[Dict[str, Any]],
+    capability: str,
+) -> Optional[bool]:
+    """Return an explicitly declared capability from a runtime profile.
+
+    ``None`` means the profile is unknown or does not declare the capability;
+    callers must preserve the generic external local-model behaviour in that
+    case.  Only an explicit ``False`` disables a legacy opt-in feature.
+    """
+
+    capabilities = llama_cpp_profile_capabilities(profile=profile)
+    if not isinstance(capabilities, dict) or capability not in capabilities:
+        return None
+    return bool(capabilities.get(capability))
+
+
 class OpenAICompatibleLocalClient:
     """Client for generic local OpenAI-compatible chat completion servers."""
 
@@ -315,11 +385,24 @@ class OpenAICompatibleLocalClient:
         extra_body: Optional[Dict[str, Any]] = None,
     ):
         self.config = config
+        self._privacy_gateway = OutboundPrivacyGateway(config)
         self.base_url = _normalize_base_url(base_url)
         self.model_name = model or DEFAULT_LOCAL_MODEL
         self.api_key = api_key or DEFAULT_LOCAL_API_KEY
         self.client = OpenAI(base_url=self.base_url, api_key=self.api_key)
-        self.enable_tools = bool(enable_tools)
+        self._llama_cpp_profile = llama_cpp_model_profile(self.model_name)
+        profile_tools = _llama_cpp_profile_capability(
+            self._llama_cpp_profile,
+            "tools",
+        )
+        profile_reasoning = _llama_cpp_profile_capability(
+            self._llama_cpp_profile,
+            "reasoning",
+        )
+        # A profile-declared limitation wins over the provider's opt-in
+        # setting.  Unknown profiles (including ``local-model``) keep the
+        # historical config-controlled behaviour.
+        self.enable_tools = bool(enable_tools) and profile_tools is not False
         self.enable_response_format = bool(enable_response_format)
         self.enable_extra_body = bool(enable_extra_body)
         self.extra_body = extra_body if isinstance(extra_body, dict) else {}
@@ -328,7 +411,7 @@ class OpenAICompatibleLocalClient:
         )
         self.capabilities = ProviderCapabilities(
             supports_stream=True,
-            supports_tools=True,
+            supports_tools=profile_tools is not False,
             supports_response_format=True,
             supports_model_pull=False,
             supports_model_delete=False,
@@ -344,12 +427,19 @@ class OpenAICompatibleLocalClient:
 
         self.history_manager = HistoryManager()
         if config and _config_get(config, "use_tools", True):
-            self._tool_registry = build_runtime_tool_registry(config)
+            self._tool_registry = build_runtime_tool_registry_for_client(
+                build_runtime_tool_registry,
+                config,
+                client=self,
+            )
+            ensure_load_tool_pack_tool(self._tool_registry, self)
         else:
             self._tool_registry = ToolRegistry()
 
         self.session_user_id = "default_user"
         self.session_metadata: Dict[str, Any] = {}
+        self._privacy_session_context: Dict[str, Any] = {}
+        self._privacy_project_metadata: Dict[str, Any] = {}
         self._current_session_id: Optional[str] = None
         self._history_session_id: Optional[str] = None
         self.current_project_id: Optional[str] = None
@@ -367,7 +457,20 @@ class OpenAICompatibleLocalClient:
         self._last_model_transcript: List[Dict[str, Any]] = []
         self._last_usage: Dict[str, Any] = {}
         self._last_tool_loop_messages: List[Dict[str, Any]] = []
-        self._current_llm_mode = "fast"
+        self._last_tool_loop_completion_confirmed = False
+        self._last_audit_tool_calls: List[Any] = []
+        self._current_turn_system_content = ""
+        self._last_local_server_ensure_error: Optional[str] = None
+        self._llama_cpp_generation_lease_tickets: set[Any] = set()
+        self._runtime_unavailable_reason: Optional[str] = None
+        self._runtime_unavailable_at: float = 0.0
+        # Managed profiles use the profile-owned reasoning contract.  A known
+        # profile that explicitly disables reasoning has no generic
+        # fast/thinking mode; unknown external endpoints retain legacy fast.
+        self._profile_reasoning_supported = profile_reasoning
+        self._current_llm_mode = self._effective_reasoning_effort() or (
+            "" if profile_reasoning is False else "fast"
+        )
         self.system_prompt = self._build_system_prompt()
 
         logger.info("[OpenAICompatibleLocalClient] initialized")
@@ -384,6 +487,30 @@ class OpenAICompatibleLocalClient:
             return self.session_user_id
         metadata_user_id = self.session_metadata.get("user_id")
         return str(metadata_user_id) if metadata_user_id else "default_user"
+
+    def _sync_privacy_gateway(self) -> OutboundPrivacyGateway:
+        user_id = str(self._get_session_user_id() or "default_user")
+        session_id = str(getattr(self, "current_session_id", None) or "")
+        if (
+            self._privacy_gateway.user_id != user_id
+            or self._privacy_gateway.session_id != session_id
+        ):
+            self._privacy_gateway = OutboundPrivacyGateway(
+                self.config,
+                user_id=user_id,
+                session_id=session_id,
+                session_context=self._privacy_session_context,
+                project_metadata=self._privacy_project_metadata,
+            )
+        else:
+            if self._privacy_session_context or self._privacy_project_metadata:
+                self._privacy_gateway.update_policy_context(
+                    session_context=self._privacy_session_context,
+                    project_metadata=self._privacy_project_metadata,
+                )
+            else:
+                self._privacy_gateway.update_policy_context()
+        return self._privacy_gateway
 
     def _get_memory_metadata(self) -> Dict[str, Any]:
         return self.session_metadata.copy() if self.session_metadata else {}
@@ -444,11 +571,17 @@ class OpenAICompatibleLocalClient:
         self._last_context_snapshots.append(item)
         self._last_context_snapshots = self._last_context_snapshots[-8:]
 
-    def _capture_generation_metrics(self, response: Any) -> None:
+    def _capture_generation_metrics(self, response: Any) -> Dict[str, Any]:
         payload = _as_plain_dict(response)
         timings = _as_plain_dict(payload.get("timings"))
         usage = _as_plain_dict(payload.get("usage"))
-        normalized_usage = normalize_usage(usage, provider="openai_compatible_local")
+        normalized_usage = normalize_usage(
+            usage,
+            provider="openai_compatible_local",
+            resolved_model=(
+                str(payload.get("model")) if payload.get("model") else None
+            ),
+        )
         self._last_usage = {
             key: value for key, value in normalized_usage.items() if value is not None
         }
@@ -479,7 +612,7 @@ class OpenAICompatibleLocalClient:
 
         if tokens_per_second is None and output_tokens is None:
             self._last_generation_metrics = None
-            return
+            return dict(self._last_usage)
 
         metrics: Dict[str, Any] = {
             "provider": "openai_compatible_local",
@@ -502,6 +635,30 @@ class OpenAICompatibleLocalClient:
             self._last_context_snapshots[-1] = reconcile_snapshot(
                 self._last_context_snapshots[-1], prompt_tokens
             )
+        return dict(self._last_usage)
+
+    def _capture_and_persist_usage(
+        self,
+        response: Any,
+        *,
+        request_type: str = "chat",
+        latency_ms: int = 0,
+        is_streaming: bool = False,
+    ) -> Dict[str, Any]:
+        """Capture and persist one successful local completion response."""
+
+        usage = self._capture_generation_metrics(response)
+        if usage:
+            persist_usage_sync(
+                self,
+                provider="openai_compatible_local",
+                model=self.model_name,
+                usage=usage,
+                request_type=request_type,
+                latency_ms=latency_ms,
+                is_streaming=is_streaming,
+            )
+        return usage
 
     def _build_system_prompt(self) -> str:
         if not self.config:
@@ -520,7 +677,11 @@ class OpenAICompatibleLocalClient:
             return build_unified_instructions(
                 character_name=self.character_name,
                 config=self.config,
+                include_static_tool_reference=False,
                 custom_instructions=custom_instructions,
+                # This client uses OpenAI-compatible function tool calls (or
+                # a tool-free completion), never the CLI textual protocol.
+                tool_protocol="native",
             )
         except Exception as exc:
             logger.warning(
@@ -546,7 +707,55 @@ class OpenAICompatibleLocalClient:
             return
         self.system_prompt = prompt
 
+    def _reasoning_effort_metadata(self) -> Optional[Dict[str, Any]]:
+        if _llama_cpp_profile_capability(
+            getattr(self, "_llama_cpp_profile", None),
+            "reasoning",
+        ) is False:
+            return None
+        return llama_cpp_reasoning_effort_metadata(self.model_name)
+
+    def _configured_reasoning_effort(self) -> Optional[str]:
+        metadata = self._reasoning_effort_metadata()
+        if not metadata:
+            return None
+        values = (
+            _config_get(self.config, "runtime.target_reasoning_effort"),
+            _config_get(
+                self.config,
+                "openai_compatible_local.llama_cpp.reasoning_effort",
+            ),
+            _config_get(self.config, "openai_compatible_local.reasoning_effort"),
+        )
+        for value in values:
+            normalized = str(value or "").strip().lower()
+            if normalized in metadata["options"]:
+                return normalized
+        return None
+
+    def _effective_reasoning_effort(self) -> Optional[str]:
+        metadata = self._reasoning_effort_metadata()
+        if not metadata:
+            return None
+        configured = self._configured_reasoning_effort()
+        return configured or str(metadata["default"])
+
     def set_llm_mode(self, mode: str) -> None:
+        metadata = self._reasoning_effort_metadata()
+        if metadata:
+            normalized = str(mode or "").strip().lower()
+            if normalized not in metadata["options"]:
+                raise ValueError(
+                    "Unsupported reasoning effort for managed local profile: "
+                    f"{mode!r}; expected one of {metadata['options']}"
+                )
+            self._current_llm_mode = normalized
+            return
+        if getattr(self, "_profile_reasoning_supported", None) is False:
+            # Do not persist or expose a synthetic fast/thinking value for a
+            # known profile whose registry explicitly disables reasoning.
+            self._current_llm_mode = ""
+            return
         if mode not in {"fast", "thinking"}:
             mode = "fast"
         self._current_llm_mode = mode
@@ -582,10 +791,43 @@ class OpenAICompatibleLocalClient:
         if metadata:
             sanitized = {k: str(v) for k, v in metadata.items() if v is not None}
             self.session_metadata = {**self.session_metadata, **sanitized}
+            if "privacy_mode" in metadata:
+                self._privacy_session_context["privacy_mode"] = str(
+                    metadata.get("privacy_mode") or ""
+                )
         self.system_prompt = self._build_system_prompt()
 
     def _include_project_context_enabled(self) -> bool:
-        return getattr(self, "current_include_project_context", True) is not False
+        return project_context_enabled_for_client(self)
+
+    def _context_bundle_for_turn(
+        self,
+        bundle: Optional[ContextBundle] = None,
+    ) -> Optional[ContextBundle]:
+        """Hide stale selected-Project layers when Project Context is OFF.
+
+        The normal ContextBuilder call already receives the immutable turn
+        flag, but direct-client fallbacks and test doubles may hand this
+        provider a previously-built bundle.  Never let that stale bundle
+        re-introduce the selected project's scope into a turn that explicitly
+        disabled Project Context; user/session memory remains available.
+        """
+
+        current = (
+            getattr(self, "_current_context_bundle", None)
+            if bundle is None
+            else bundle
+        )
+        if current is None or self._include_project_context_enabled():
+            return current
+        return dataclasses.replace(
+            current,
+            project_context_block="",
+            project_information_block="",
+            agent_memory_block="",
+            project_pack_block="",
+            task_context_block="",
+        )
 
     def _context_budget(self, max_tokens: Optional[int] = None) -> ContextBudget:
         return resolve_context_budget(
@@ -668,7 +910,8 @@ class OpenAICompatibleLocalClient:
         return "\n".join(
             [
                 "You are AoiTalk's assistant. Answer in the user's language.",
-                "Use selected project context, project information Docs, and confirmed tool results as ground truth.",
+                "Docs are AoiTalk's KnowledgeNode outline, Projects are case scopes, and Workspaces store files; keep these concepts separate.",
+                "When Project Context is OFF, the Selected Project is only weak UI state, not the request target; inspect Project information only when the request requires it.",
                 "Use tool hints as short candidate reminders and decide tool use from the full request.",
                 "Do not claim search, file reading, project updates, time/weather lookup, or calculation unless a successful tool result exists.",
                 "Do not invent case details. If evidence is insufficient, say what is missing and answer only from available facts.",
@@ -713,6 +956,9 @@ class OpenAICompatibleLocalClient:
             project_context,
             context_budget,
         )
+        # Keep direct/fallback ContextBuilder implementations subject to the
+        # immutable Project Context OFF boundary as well.
+        context_bundle = self._context_bundle_for_turn()
         tool_hint_context = self._build_tool_hint_context(
             user_input,
             context_budget,
@@ -723,7 +969,7 @@ class OpenAICompatibleLocalClient:
             "",
         )
         context_block = self._context_block_for_budget(
-            self._current_context_bundle,
+            context_bundle,
             context_budget,
             has_tool_hints=bool(tool_hint_context),
         )
@@ -780,6 +1026,7 @@ class OpenAICompatibleLocalClient:
                     messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    request_type="retry",
                     tools_enabled=bool(required_tool_name),
                     context_budget=context_budget,
                     fallback_user_input=user_input,
@@ -820,6 +1067,18 @@ class OpenAICompatibleLocalClient:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             return pool.submit(asyncio.run, coro).result()
 
+    def _get_story_chat_context_sync(self):
+        """Resolve the trusted StoryWritingSession for this conversation."""
+        # Lightweight provider instances used by review/schema paths may be
+        # created with ``__new__`` before the history-session property is
+        # initialized.  Read the backing field directly so that an ordinary
+        # non-Story context remains ``None`` rather than becoming a resolver
+        # error and failing the whole tool schema closed.
+        session_id = getattr(self, "_current_session_id", None)
+        if not session_id:
+            return None
+        return run_story_chat_context_sync(self._run_async_sync, str(session_id))
+
     def _resolve_project_context_sync(self) -> Optional[dict[str, Any]]:
         current_project_id = getattr(self, "current_project_id", None)
         current_session_id = getattr(self, "current_session_id", None)
@@ -832,6 +1091,7 @@ class OpenAICompatibleLocalClient:
                 resolver.resolve_context(
                     project_id=current_project_id,
                     session_id=current_session_id,
+                    user_id=self._get_session_user_id(),
                 )
             )
         except Exception as exc:
@@ -848,7 +1108,7 @@ class OpenAICompatibleLocalClient:
     ) -> str:
         return build_tool_hint_context_sync(
             user_input=user_input,
-            registry=self._tool_registry,
+            registry=filtered_registry_for_client(self, self._tool_registry),
             policy=get_client_generation_policy(self),
             log_prefix="OpenAICompatibleLocalClient",
             max_result_chars=context_budget.tool_hint_context_chars,
@@ -873,7 +1133,43 @@ class OpenAICompatibleLocalClient:
         if not (self.current_project_id or self.current_session_id):
             return None
 
-        required_tools = project_management_required_mutation_tools(user_input)
+        # The UI/controller capability is authority to perform a requested
+        # mutation, not authority to override an explicit user prohibition.
+        # Keep the turn read-only even when task_update/project_db_update was
+        # carried on the client from the trusted command surface.
+        if mutation_execution_forbidden(user_input):
+            return None
+
+        explicit_capabilities = set(
+            getattr(self, "current_command_capabilities", ()) or ()
+        ) | command_capabilities_from_text(user_input)
+        if not explicit_capabilities.intersection(PROJECT_COMMAND_CAPABILITIES):
+            # Natural-language task/DB/WBS wording is not proof that a
+            # particular mutation is required.  Let the model choose the
+            # appropriate direct tool instead of setting tool_choice to a
+            # fixed function.
+            return None
+
+        required_tools: set[str] = set(
+            project_management_required_mutation_tools(user_input)
+        )
+        # Terminal/voice callers also carry capabilities on the client while
+        # passing the raw user text.  Preserve explicit command semantics even
+        # when the trusted preamble is not present in ``user_input``.
+        if "project_db_update" in explicit_capabilities:
+            required_tools.update(
+                {
+                    "organize_project_information_from_folder",
+                    "patch_project_information_doc",
+                    "attach_project_information_reference",
+                }
+            )
+        if "task_update" in explicit_capabilities:
+            required_tools.update({"create_task", "update_task"})
+        if "wbs_sync" in explicit_capabilities:
+            required_tools.add("sync_wbs_tasks")
+        # 強制するツールは実効集合（コア + ロード済み pack）の中から選ぶ。
+        exposed = filtered_registry_for_client(self, self._tool_registry)
         for tool_name in (
             "organize_project_information_from_folder",
             "sync_wbs_tasks",
@@ -883,16 +1179,99 @@ class OpenAICompatibleLocalClient:
             "create_task",
             "update_task",
         ):
-            if tool_name in required_tools and tool_name in self._tool_registry:
+            if tool_name in required_tools and tool_name in exposed:
                 return tool_name
         return None
 
     def _requires_project_context_read(self, user_input: str | None) -> bool:
         return (
-            getattr(self, "current_include_project_context", None) is True
-            and not looks_like_bare_search_followup_request(user_input or "")
+            project_context_enabled_for_client(self, default=False)
             and bool(self.current_project_id or self.current_session_id)
+            and looks_like_project_management_request(str(user_input or ""))
         )
+
+    def _is_managed_llama_cpp_runtime(self) -> bool:
+        """True when AoiTalk may launch or relaunch an owned llama-server."""
+
+        return self._can_attempt_managed_llama_cpp_recovery()
+
+    def _can_attempt_managed_llama_cpp_recovery(self) -> bool:
+        if not self.config:
+            return False
+        try:
+            from src.service_manager import llama_cpp_managed_launch_configured
+
+            return llama_cpp_managed_launch_configured(
+                self.config,
+                model=self.model_name,
+            )
+        except Exception:
+            return False
+
+    def _managed_llama_cpp_launch_configuration_error(self) -> Optional[str]:
+        if not self.config:
+            return None
+        try:
+            from src.service_manager import llama_cpp_managed_launch_configuration_error
+
+            return llama_cpp_managed_launch_configuration_error(
+                self.config,
+                model=self.model_name,
+            )
+        except Exception:
+            return None
+
+    def _is_manual_managed_llama_cpp_runtime(self) -> bool:
+        if not self.config:
+            return False
+        try:
+            from src.service_manager import llama_cpp_manual_managed_runtime
+
+            return llama_cpp_manual_managed_runtime(
+                self.config,
+                model=self.model_name,
+            )
+        except Exception:
+            return False
+
+    def _mark_runtime_unavailable(self, reason: str) -> None:
+        detail = str(reason or "").strip()
+        if not detail:
+            return
+        self._runtime_unavailable_reason = detail
+        self._runtime_unavailable_at = time.monotonic()
+
+    def _clear_runtime_unavailability(self) -> None:
+        self._runtime_unavailable_reason = None
+        self._runtime_unavailable_at = 0.0
+
+    def is_runtime_known_unavailable(self) -> bool:
+        return bool(str(self._runtime_unavailable_reason or "").strip())
+
+    def _uses_llama_cpp_tool_choice_transport(self) -> bool:
+        if self.server_profile.get("name") == "llama.cpp":
+            return True
+        if llama_cpp_model_profile(self.model_name) is not None:
+            return True
+        if not self.config:
+            return False
+        try:
+            from src.service_manager._local_llm_servers import (
+                _llama_cpp_selected_model,
+                _llama_cpp_settings,
+            )
+
+            selected_model = _llama_cpp_selected_model(self.config, self.model_name)
+            settings = _llama_cpp_settings(self.config, model=selected_model)
+            return bool(str(settings.get("model_path") or "").strip())
+        except Exception:
+            return False
+
+    def _is_llama_cpp_server(self) -> bool:
+        return self._uses_llama_cpp_tool_choice_transport()
+
+    def _format_last_tool_calls_evidence(self) -> str:
+        return format_tool_execution_evidence(self._last_tool_calls)
 
     def _required_project_context_read_tool_name(
         self,
@@ -900,16 +1279,97 @@ class OpenAICompatibleLocalClient:
     ) -> Optional[str]:
         if not self._requires_project_context_read(user_input):
             return None
-        for tool_name in project_context_required_read_tool_names(self._tool_registry):
+
+        # Grounding is request-local.  Once a successful project read has
+        # been recorded during this turn, do not force the same read again on
+        # an agentic continuation.  The audit ledger is reset at the start of
+        # ``generate_response`` and deliberately excludes prior turns.
+        if self._project_context_read_already_satisfied():
+            return None
+
+        # Task mutations need task identity/status/parent information as the
+        # first grounding read.  Prefer ``list_tasks`` over a generic project
+        # information read when it is available; the latter cannot resolve
+        # ordinal task references such as "6, 7, 8".
+        task_mutation_tools = {
+            "create_task",
+            "update_task",
+            "delete_task",
+            "assign_task",
+            "schedule_task",
+        }
+        required_mutations = project_management_required_mutation_tools(user_input)
+        exposed = filtered_registry_for_client(self, self._tool_registry)
+        if required_mutations.intersection(task_mutation_tools) and "list_tasks" in exposed:
+            return "list_tasks"
+
+        for tool_name in project_context_required_read_tool_names(exposed):
             return tool_name
         return None
 
+    def _project_context_read_already_satisfied(self) -> bool:
+        """Return whether this request already has a successful grounding read.
+
+        Only ``_last_audit_tool_calls`` is considered.  It is reset at the
+        beginning of every ``generate_response`` request, so evidence from a
+        prior turn cannot suppress the current turn's initial grounding.
+        """
+
+        required_reads = set(project_context_required_read_tool_names())
+        if not required_reads:
+            return False
+        for record in getattr(self, "_last_audit_tool_calls", ()) or ():
+            if isinstance(record, dict):
+                tool_name = str(record.get("tool") or record.get("name") or "")
+                explicit_success = record.get("successful", record.get("success"))
+                result = record.get("result", record.get("output", ""))
+            else:
+                tool_name = str(
+                    getattr(record, "tool", None)
+                    or getattr(record, "name", None)
+                    or ""
+                )
+                explicit_success = getattr(record, "successful", None)
+                if explicit_success is None:
+                    explicit_success = getattr(record, "success", None)
+                result = getattr(record, "result", "")
+            if tool_name not in required_reads:
+                continue
+            if isinstance(explicit_success, bool):
+                if explicit_success:
+                    return True
+                continue
+            # Older provider records may omit an explicit success flag.  Keep
+            # the same conservative error-prefix semantics as the shared
+            # record helpers rather than treating arbitrary failures as reads.
+            lowered = str(result or "").strip().casefold()
+            if not lowered.startswith(
+                ("error:", "tool not found:", "tool execution error:")
+            ):
+                return True
+        return False
+
     def _required_tool_name(self, user_input: str) -> Optional[str]:
-        return self._required_command_tool_name(
+        required = self._required_command_tool_name(
             user_input
         ) or self._required_project_context_read_tool_name(
             user_input
         ) or self._required_project_management_tool_name(user_input)
+        if required:
+            return required
+        required_mutations = project_management_required_mutation_tools(
+            user_input
+        )
+        if "create_task" in required_mutations and (
+            successful_empty_task_search(
+                getattr(self, "_last_audit_tool_calls", None)
+            )
+            is True
+        ):
+            exposed = filtered_registry_for_client(self, self._tool_registry)
+            if "create_task" in exposed:
+                return "create_task"
+        return None
 
     def _build_context_bundle_sync(
         self,
@@ -917,10 +1377,10 @@ class OpenAICompatibleLocalClient:
         project_context: Optional[dict[str, Any]],
         context_budget: ContextBudget,
     ) -> Optional[ContextBundle]:
-        include_project_context = (
-            self._include_project_context_enabled()
-            and not looks_like_bare_search_followup_request(user_input)
-        )
+        # Project Context is governed by the request-scoped flag (or the
+        # provider compatibility flag), never by exact natural-language
+        # phrases such as "検索してね".
+        include_project_context = self._include_project_context_enabled()
         if (
             include_project_context
             and not project_context
@@ -936,6 +1396,7 @@ class OpenAICompatibleLocalClient:
                     user_id=self._get_session_user_id(),
                     message=user_input,
                     project_id=self.current_project_id if include_project_context else None,
+                    task_id=get_turn_context().task_id,
                     session_id=self.current_session_id,
                     project_context=project_context if include_project_context else None,
                     include_project_context=include_project_context,
@@ -950,13 +1411,71 @@ class OpenAICompatibleLocalClient:
             return None
 
     def _mode_extra_body(self) -> Dict[str, Any]:
-        if not _is_qwopus_model(self.model_name):
+        metadata = self._reasoning_effort_metadata()
+        if not metadata:
             return {}
-        return {
-            "chat_template_kwargs": {
-                "enable_thinking": self._current_llm_mode == "thinking",
-            }
-        }
+        effort = str(self._current_llm_mode or "").strip().lower()
+        if effort not in metadata["options"]:
+            effort = str(metadata["default"])
+        # The profile owns transport/path; malformed metadata fails closed
+        # rather than silently reverting to a stale hard-coded wire shape.
+        extra_body = llama_cpp_reasoning_effort_request_extra_body(
+            self.model_name,
+            effort,
+        )
+        if extra_body is None:
+            raise ValueError(
+                "Managed local profile has invalid reasoning effort wire metadata"
+            )
+        return extra_body
+
+    def _profile_disables_thinking(self) -> bool:
+        """Return whether the selected managed profile is non-reasoning.
+
+        A profile capability of ``reasoning=false`` is stronger than generic
+        local-server defaults.  Some llama.cpp Jinja templates otherwise
+        leave their thinking channel implicit when no effort metadata exists,
+        causing a non-reasoning chat profile such as Melody to spend its
+        entire response budget on hidden planning text.
+        """
+
+        return getattr(self, "_profile_reasoning_supported", None) is False
+
+    def _should_run_agentic_completion_review(self) -> bool:
+        """Keep the generic review pass for capable profiles only.
+
+        A known profile that advertises neither reasoning nor native tools has
+        no actionable review/tool contract.  In the normal chat profile, and
+        in an autonomous-work turn that has no command/tool requirement, a
+        second full LLM request only makes short replies appear stuck.  Keep
+        explicit assisted-work/review turns and work commands unchanged, as
+        well as all unknown/Qwen profiles.
+        """
+
+        if not (
+            self._profile_disables_thinking()
+            and _llama_cpp_profile_capability(
+                getattr(self, "_llama_cpp_profile", None),
+                "tools",
+            )
+            is False
+        ):
+            return True
+
+        profile = get_client_generation_policy(self).profile
+        if profile == GenerationProfile.CHAT:
+            return False
+        if profile != GenerationProfile.AUTONOMOUS_WORK:
+            return True
+
+        # The chat composer can retain ``autonomous_work`` from a previous
+        # setting even when the current message is an ordinary prompt.  Do
+        # not pay for a review that cannot execute tools in that case, while
+        # preserving review for explicit command/tool turns.
+        command_capabilities = getattr(self, "current_command_capabilities", ())
+        if command_capabilities:
+            return True
+        return getattr(self, "current_tool_required", None) is True
 
     def _set_chat_template_thinking(
         self, api_kwargs: Dict[str, Any], enabled: bool
@@ -971,15 +1490,8 @@ class OpenAICompatibleLocalClient:
         )
         return retry_kwargs
 
-    def _set_qwopus_thinking(
-        self, api_kwargs: Dict[str, Any], enabled: bool
-    ) -> Dict[str, Any]:
-        return self._set_chat_template_thinking(api_kwargs, enabled)
-
     def _with_stream_safe_extra_body(self, api_kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        if not _is_qwopus_model(self.model_name):
-            return api_kwargs
-        return self._set_chat_template_thinking(api_kwargs, False)
+        return api_kwargs
 
     def _build_api_kwargs(
         self,
@@ -1012,14 +1524,25 @@ class OpenAICompatibleLocalClient:
             if tools_enabled
             else []
         )
+        if required_tool_name and self._is_llama_cpp_server():
+            narrowed_tools = [
+                tool_def
+                for tool_def in tools
+                if str(getattr(tool_def, "name", "")) == required_tool_name
+            ]
+            if narrowed_tools:
+                tools = narrowed_tools
         if tools:
             api_kwargs["tools"] = OpenAIAPIAdapter.convert_all(tools)
             available_names = {str(getattr(tool_def, "name", "")) for tool_def in tools}
             if required_tool_name and required_tool_name in available_names:
-                api_kwargs["tool_choice"] = {
-                    "type": "function",
-                    "function": {"name": required_tool_name},
-                }
+                if self._is_llama_cpp_server():
+                    api_kwargs["tool_choice"] = "required"
+                else:
+                    api_kwargs["tool_choice"] = {
+                        "type": "function",
+                        "function": {"name": required_tool_name},
+                    }
             else:
                 api_kwargs["tool_choice"] = "auto"
         if self.enable_response_format:
@@ -1034,6 +1557,32 @@ class OpenAICompatibleLocalClient:
         mode_extra_body = self._mode_extra_body()
         if mode_extra_body:
             extra_body = _deep_merge_dict(extra_body, mode_extra_body)
+        if self._reasoning_effort_metadata():
+            # Profile-owned Qwen3.8 requests must use one canonical wire.  A
+            # stale generic ``enable_thinking``/top-level effort from persisted
+            # extra_body settings must not leak into the request projection.
+            template_kwargs = extra_body.get("chat_template_kwargs")
+            if isinstance(template_kwargs, dict):
+                template_kwargs.pop("enable_thinking", None)
+                effort = str(self._current_llm_mode or "").strip().lower()
+                metadata = self._reasoning_effort_metadata() or {}
+                if effort not in metadata.get("options", []):
+                    effort = str(metadata.get("default") or "xhigh")
+                template_kwargs["reasoning_effort"] = effort
+            extra_body.pop("reasoning_effort", None)
+            extra_body.pop("enable_thinking", None)
+        elif self._profile_disables_thinking():
+            # Melody and other explicitly non-reasoning profiles must opt out
+            # of template thinking even when no effort wire is declared.  A
+            # user-provided true value cannot override the profile contract.
+            template_kwargs = extra_body.get("chat_template_kwargs")
+            if not isinstance(template_kwargs, dict):
+                template_kwargs = {}
+                extra_body["chat_template_kwargs"] = template_kwargs
+            template_kwargs.pop("reasoning_effort", None)
+            template_kwargs["enable_thinking"] = False
+            extra_body.pop("reasoning_effort", None)
+            extra_body.pop("enable_thinking", None)
         if extra_body:
             api_kwargs["extra_body"] = extra_body
         self._cache_key = stable_cache_key(
@@ -1058,11 +1607,34 @@ class OpenAICompatibleLocalClient:
         required_tool_name: Optional[str] = None,
         user_input: Optional[str] = None,
     ) -> List[Any]:
-        if not self.enable_tools:
+        if (
+            not getattr(self, "enable_tools", False)
+            or _llama_cpp_profile_capability(
+                getattr(self, "_llama_cpp_profile", None),
+                "tools",
+            )
+            is False
+        ):
             return []
         if len(self._tool_registry) <= 0:
             return []
-        tools = self._tool_registry.get_all()
+
+        budget = context_budget or self._current_context_budget
+        constrained = bool(budget) and self._is_constrained_context_budget(budget)
+        allowed_names: set[str] = set()
+        if constrained:
+            allowed_names = self._constrained_native_tool_names(user_input)
+            if allowed_names:
+                # 狭コンテキストで名指しした deferred ツールは、対応する pack を
+                # 先にロードしてから実効集合を作る。ロード手段自体を失わないよう
+                # `load_tool_pack` も常に許可名へ含める。
+                auto_load_packs_for_tool_names(
+                    tool_pack_session_for_client(self),
+                    allowed_names,
+                )
+                allowed_names = {*allowed_names, LOAD_TOOL_PACK_TOOL_NAME}
+
+        tools = filter_tools_for_client(self, self._tool_registry.get_all())
         if required_tool_name:
             if not any(
                 str(getattr(tool_def, "name", "")) == required_tool_name
@@ -1073,13 +1645,19 @@ class OpenAICompatibleLocalClient:
                     required_tool_name,
                 )
 
-        budget = context_budget or self._current_context_budget
-        if not budget or not self._is_constrained_context_budget(budget):
+        if not constrained:
             return tools
 
-        allowed_names = self._constrained_native_tool_names(user_input)
         if not allowed_names:
-            return []
+            # No natural-language classifier selected a domain.  Keep the
+            # model's normal choice available instead of silently hiding all
+            # tools; deferred specialist packs remain represented by the
+            # `load_tool_pack` meta-tool in ``tools``.
+            return self._fit_native_tools_to_schema_budget(
+                tools,
+                budget,
+                required_tool_name=required_tool_name,
+            )
         selected = [
             tool_def
             for tool_def in tools
@@ -1094,7 +1672,11 @@ class OpenAICompatibleLocalClient:
                 for tool_def in tools
                 if str(getattr(tool_def, "name", "")) == required_tool_name
             ] + selected
-        return self._fit_native_tools_to_schema_budget(selected, budget)
+        return self._fit_native_tools_to_schema_budget(
+            selected,
+            budget,
+            required_tool_name=required_tool_name,
+        )
 
     def _constrained_native_tool_names(
         self,
@@ -1105,12 +1687,27 @@ class OpenAICompatibleLocalClient:
             return set()
 
         names: set[str] = set()
-        if command_capability_active(text, "web_search"):
+        explicit_capabilities = set(
+            sanitize_command_capabilities(
+                getattr(self, "current_command_capabilities", ()) or ()
+            )
+        ) | command_capabilities_from_text(text)
+
+        # Only trusted command capabilities and server-verified references
+        # constrain a narrow schema.  Natural Docs/Files/Project/utility/media
+        # wording must not hide the other tools from the model.
+        if "web_search" in explicit_capabilities:
             names.add("web_search")
-        if command_capability_active(text, "project_progress_review"):
+        if "project_progress_review" in explicit_capabilities:
             names.update(DIRECT_PROJECT_TOOL_HINT_NAMES)
-        if command_capability_active(text, "project_db_update"):
-            names.update(project_management_required_mutation_tools(text))
+        if "project_db_update" in explicit_capabilities:
+            names.update(
+                {
+                    "organize_project_information_from_folder",
+                    "patch_project_information_doc",
+                    "attach_project_information_reference",
+                }
+            )
             names.update(
                 {
                     "get_project_context",
@@ -1118,41 +1715,56 @@ class OpenAICompatibleLocalClient:
                     "list_record_tables",
                 }
             )
-        if command_capability_active(text, "task_update"):
+        if "task_update" in explicit_capabilities:
             names.update({"list_tasks", "create_task", "update_task"})
-        if command_capability_active(text, "wbs_sync"):
+        if "wbs_sync" in explicit_capabilities:
             names.update({"sync_wbs_tasks", "get_upcoming_wbs_tasks", "list_tasks"})
-
-        if looks_like_search_request(text):
-            names.update(DIRECT_SEARCH_TOOL_HINT_NAMES)
-        if looks_like_filesystem_request(text):
-            names.update(DIRECT_FILESYSTEM_TOOL_HINT_NAMES)
-        if (
-            looks_like_project_management_request(text)
-            or project_progress_review_active(text)
-        ):
-            names.update(DIRECT_PROJECT_TOOL_HINT_NAMES)
-            names.update(project_management_required_mutation_tools(text))
-        if looks_like_utility_request(text):
-            names.add("utility_assistant")
-        if looks_like_media_request(text):
+        if "image_generation" in explicit_capabilities:
             names.add("media_assistant")
+        if "workspace_file_operation" in explicit_capabilities:
+            names.update(MANAGED_WORKSPACE_NATIVE_TOOL_NAMES)
+        if looks_like_managed_workspace_request(text):
+            # ``looks_like_managed_workspace_request`` is true only for the
+            # trusted command capability or the server-set
+            # ``TurnContext.verified_project_attachment`` flag.  Raw prompt
+            # markers and ordinary workspace wording do not reach this path.
+            names.update(MANAGED_WORKSPACE_NATIVE_TOOL_NAMES)
         return names
 
     def _fit_native_tools_to_schema_budget(
         self,
         tools: List[Any],
         context_budget: ContextBudget,
+        *,
+        required_tool_name: Optional[str] = None,
     ) -> List[Any]:
         if len(tools) <= 1:
             return tools
+        ordered_tools = list(tools)
+        required_name = str(required_tool_name or "").strip()
+        if required_name:
+            required_tools = [
+                tool_def
+                for tool_def in ordered_tools
+                if str(getattr(tool_def, "name", "") or "") == required_name
+            ]
+            if required_tools:
+                ordered_tools = [
+                    *required_tools,
+                    *[
+                        tool_def
+                        for tool_def in ordered_tools
+                        if str(getattr(tool_def, "name", "") or "")
+                        != required_name
+                    ],
+                ]
         limit = min(
             CONSTRAINED_NATIVE_TOOL_SCHEMA_CHAR_BUDGET,
             max(3500, int(context_budget.message_budget_chars * 0.9)),
         )
         selected: List[Any] = []
         selected_specs: list[Dict[str, Any]] = []
-        for tool_def in tools:
+        for tool_def in ordered_tools:
             spec = OpenAIAPIAdapter.convert(tool_def)
             candidate_specs = [*selected_specs, spec]
             candidate_size = len(
@@ -1165,10 +1777,10 @@ class OpenAICompatibleLocalClient:
             if candidate_size <= limit or not selected:
                 selected.append(tool_def)
                 selected_specs.append(spec)
-        if len(selected) < len(tools):
+        if len(selected) < len(ordered_tools):
             logger.warning(
                 "[OpenAICompatibleLocalClient] Pruned native tool schemas for constrained local context: %s -> %s",
-                len(tools),
+                len(ordered_tools),
                 len(selected),
             )
         return selected
@@ -1182,13 +1794,14 @@ class OpenAICompatibleLocalClient:
         template_kwargs = extra_body.get("chat_template_kwargs")
         if not isinstance(template_kwargs, dict):
             return {}
-        if "enable_thinking" not in template_kwargs:
-            return {}
-        return {
-            "chat_template_kwargs": {
-                "enable_thinking": template_kwargs["enable_thinking"],
-            }
+        keys = {
+            key: template_kwargs[key]
+            for key in ("reasoning_effort", "enable_thinking")
+            if key in template_kwargs
         }
+        if not keys:
+            return {}
+        return {"chat_template_kwargs": keys}
 
     def _compatibility_retry_kwargs(
         self, api_kwargs: Dict[str, Any]
@@ -1200,7 +1813,11 @@ class OpenAICompatibleLocalClient:
                 retry_kwargs.pop(key, None)
                 removed.append(key)
         if "extra_body" in retry_kwargs:
-            mode_extra_body = self._mode_extra_body_from_kwargs(api_kwargs)
+            mode_extra_body = (
+                self._mode_extra_body()
+                if self._reasoning_effort_metadata()
+                else self._mode_extra_body_from_kwargs(api_kwargs)
+            )
             if mode_extra_body:
                 if retry_kwargs["extra_body"] != mode_extra_body:
                     retry_kwargs["extra_body"] = mode_extra_body
@@ -1210,33 +1827,269 @@ class OpenAICompatibleLocalClient:
                 removed.append("extra_body")
         return retry_kwargs, removed
 
-    def _create_completion_with_fallback(self, api_kwargs: Dict[str, Any]) -> Any:
+    def _wait_for_local_server_health(self, *, timeout_seconds: float = 30.0) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        while time.monotonic() < deadline:
+            if self.health_check().get("ok"):
+                return True
+            time.sleep(0.5)
+        return False
+
+    def _served_local_model_ids(self) -> set[str]:
+        served: set[str] = set()
         try:
-            self._capture_context_request(api_kwargs, reason="chat.completions")
-            return self.client.chat.completions.create(**api_kwargs)
-        except Exception as exc:
-            if _is_context_overflow_error(exc) and "tools" in api_kwargs:
-                retry_kwargs = dict(api_kwargs)
-                retry_kwargs.pop("tools", None)
-                retry_kwargs.pop("tool_choice", None)
-                logger.warning(
-                    "[OpenAICompatibleLocalClient] Context overflow with native tools; retrying without tools: %s",
-                    exc,
+            from src.service_manager import (
+                _llama_cpp_model_ids_exact,
+                _local_openai_model_ids,
+            )
+
+            served = {
+                str(item).strip()
+                for item in (_llama_cpp_model_ids_exact(self.base_url) or set())
+                if str(item).strip()
+            }
+            if not served:
+                served = {
+                    str(item).strip()
+                    for item in (_local_openai_model_ids(self.base_url) or set())
+                    if str(item).strip()
+                }
+        except Exception:
+            served = set()
+        if served:
+            return served
+        try:
+            return {
+                str(item.get("id") or "").strip()
+                for item in self.list_models()
+                if isinstance(item, dict) and str(item.get("id") or "").strip()
+            }
+        except Exception:
+            return set()
+
+    def _expected_local_model_is_served(self) -> bool:
+        expected = str(self.model_name or "").strip()
+        if not expected:
+            return False
+        return expected in self._served_local_model_ids()
+
+    def _release_managed_local_generation_lease(self, *, all: bool = False) -> None:
+        try:
+            from src.service_manager import _release_llama_cpp_generation_lease_for_holder
+        except Exception:
+            return
+        _release_llama_cpp_generation_lease_for_holder(self, all=all)
+
+    def _ensure_managed_local_server_ready(
+        self,
+        *,
+        acquire_generation_lease: bool = False,
+        lease_tickets: list[Any] | None = None,
+    ) -> bool:
+        if not self._can_attempt_managed_llama_cpp_recovery():
+            config_error = self._managed_llama_cpp_launch_configuration_error()
+            if config_error:
+                self._last_local_server_ensure_error = config_error
+                self._mark_runtime_unavailable(config_error)
+            elif self._is_manual_managed_llama_cpp_runtime():
+                message = (
+                    "手動接続先の llama-server に接続できません。"
+                    " endpoint が起動しているか確認してください。"
                 )
-                self._capture_context_request(retry_kwargs, reason="context_overflow_retry")
-                return self.client.chat.completions.create(**retry_kwargs)
-            if _is_local_model_loading_error(exc) or _is_context_overflow_error(exc):
-                raise
-            retry_kwargs, removed = self._compatibility_retry_kwargs(api_kwargs)
-            if not removed:
-                raise
+                self._last_local_server_ensure_error = message
+                self._mark_runtime_unavailable(message)
+            return False
+        if not self.config:
+            return False
+        self._last_local_server_ensure_error = None
+        ticket = None
+        try:
+            from src.service_manager import ensure_openai_compatible_local_server
+
+            acquired: list[Any] = []
+            try:
+                ensure_openai_compatible_local_server(
+                    self.config,
+                    raise_on_launch_error=True,
+                    force_restart=False,
+                    model=self.model_name,
+                    acquire_generation_lease=acquire_generation_lease,
+                    lease_holder=self if acquire_generation_lease else None,
+                    lease_tickets=acquired if acquire_generation_lease else None,
+                )
+            except TypeError as exc:
+                # Keep lightweight test/dry-run adapters which implement the
+                # pre-lease ensure signature working; the production service
+                # manager accepts the request-scoped lease keywords above.
+                if "acquire_generation_lease" not in str(exc):
+                    raise
+                ensure_openai_compatible_local_server(
+                    self.config,
+                    raise_on_launch_error=True,
+                    force_restart=False,
+                    model=self.model_name,
+                )
+            ticket = acquired[0] if acquired else None
+            if self._expected_local_model_is_served():
+                self._clear_runtime_unavailability()
+                if ticket is not None and lease_tickets is not None:
+                    lease_tickets.append(ticket)
+                elif ticket is not None and lease_tickets is None:
+                    ticket.release()
+                return True
+        except Exception as exc:
+            if ticket is not None:
+                ticket.release()
+            self._last_local_server_ensure_error = str(exc)
             logger.warning(
-                "[OpenAICompatibleLocalClient] Compatibility retry without %s: %s",
-                ", ".join(removed),
+                "[OpenAICompatibleLocalClient] Managed local server ensure failed: %s",
                 exc,
             )
-            self._capture_context_request(retry_kwargs, reason="compatibility_retry")
-            return self.client.chat.completions.create(**retry_kwargs)
+            self._mark_runtime_unavailable(str(exc))
+            return False
+        if ticket is not None:
+            ticket.release()
+        message = (
+            "llama-server は応答していますが、"
+            f"期待alias {str(self.model_name or '').strip()!r} が /v1/models にありません。"
+        )
+        self._last_local_server_ensure_error = message
+        self._mark_runtime_unavailable(message)
+        return False
+
+    def _prepare_managed_local_server_for_request(self) -> Any:
+        if self._can_attempt_managed_llama_cpp_recovery():
+            tickets: list[Any] = []
+            try:
+                ready = self._ensure_managed_local_server_ready(
+                    acquire_generation_lease=True,
+                    lease_tickets=tickets,
+                )
+            except TypeError as exc:
+                # Lightweight adapters may still expose the pre-lease helper
+                # signature; production implementations use the ticket args.
+                if "acquire_generation_lease" not in str(exc):
+                    raise
+                ready = self._ensure_managed_local_server_ready()
+            if ready:
+                return tickets[0] if tickets else None
+            reason = str(self._last_local_server_ensure_error or "").strip()
+            if not reason:
+                reason = "llama-server の準備に失敗しました。"
+                self._last_local_server_ensure_error = reason
+            self._mark_runtime_unavailable(reason)
+            raise ConnectionError(reason)
+        config_error = self._managed_llama_cpp_launch_configuration_error()
+        if config_error:
+            self._last_local_server_ensure_error = config_error
+            self._mark_runtime_unavailable(config_error)
+            raise ConnectionError(config_error)
+        return None
+
+    def _create_completion_with_fallback(
+        self,
+        api_kwargs: Dict[str, Any],
+        *,
+        request_type: str = "chat",
+        allow_connection_retry: bool = True,
+    ) -> Any:
+        self._sync_privacy_gateway()
+        protected = self._privacy_gateway.protect_sync(
+            api_kwargs,
+            provider="openai_compatible_local",
+            base_url=self.base_url,
+            source_kind="model_request",
+        )
+        api_kwargs = protected.payload
+        lease_ticket = self._prepare_managed_local_server_for_request()
+        try:
+            started_at = time.monotonic()
+            try:
+                self._capture_context_request(api_kwargs, reason="chat.completions")
+                response = self.client.chat.completions.create(**api_kwargs)
+                self._capture_and_persist_usage(
+                    response,
+                    request_type=request_type,
+                    latency_ms=max(0, int((time.monotonic() - started_at) * 1000)),
+                )
+                self._clear_runtime_unavailability()
+                return response
+            except Exception as exc:
+                if _is_context_overflow_error(exc) and "tools" in api_kwargs:
+                    retry_kwargs = dict(api_kwargs)
+                    retry_kwargs.pop("tools", None)
+                    retry_kwargs.pop("tool_choice", None)
+                    logger.warning(
+                        "[OpenAICompatibleLocalClient] Context overflow with native tools; retrying without tools: %s",
+                        exc,
+                    )
+                    self._capture_context_request(retry_kwargs, reason="context_overflow_retry")
+                    retry_started_at = time.monotonic()
+                    response = self.client.chat.completions.create(**retry_kwargs)
+                    self._capture_and_persist_usage(
+                        response,
+                        request_type="retry",
+                        latency_ms=max(
+                            0,
+                            int((time.monotonic() - retry_started_at) * 1000),
+                        ),
+                    )
+                    return response
+                if _is_local_model_loading_error(exc) or _is_context_overflow_error(exc):
+                    raise
+                if allow_connection_retry and _is_connection_error(exc):
+                    if self._can_attempt_managed_llama_cpp_recovery():
+                        recovered = self._ensure_managed_local_server_ready()
+                    elif self._managed_llama_cpp_launch_configuration_error():
+                        config_error = self._managed_llama_cpp_launch_configuration_error()
+                        self._last_local_server_ensure_error = str(config_error or "")
+                        self._mark_runtime_unavailable(self._last_local_server_ensure_error)
+                        recovered = False
+                    elif self._is_manual_managed_llama_cpp_runtime():
+                        message = (
+                            "手動接続先の llama-server に接続できません。"
+                            " endpoint が起動しているか確認してください。"
+                        )
+                        self._last_local_server_ensure_error = message
+                        self._mark_runtime_unavailable(message)
+                        recovered = False
+                    else:
+                        recovered = self._wait_for_local_server_health(timeout_seconds=5.0)
+                    if recovered:
+                        logger.warning(
+                            "[OpenAICompatibleLocalClient] Connection error; retrying after local server recovery: %s",
+                            exc,
+                        )
+                        return self._create_completion_with_fallback(
+                            api_kwargs,
+                            request_type=request_type,
+                            allow_connection_retry=False,
+                        )
+                if _is_connection_error(exc):
+                    if not self.is_runtime_known_unavailable():
+                        reason = str(self._last_local_server_ensure_error or exc)
+                        self._mark_runtime_unavailable(reason)
+                    raise
+                retry_kwargs, removed = self._compatibility_retry_kwargs(api_kwargs)
+                if not removed:
+                    raise
+                logger.warning(
+                    "[OpenAICompatibleLocalClient] Compatibility retry without %s: %s",
+                    ", ".join(removed),
+                    exc,
+                )
+                self._capture_context_request(retry_kwargs, reason="compatibility_retry")
+                retry_started_at = time.monotonic()
+                response = self.client.chat.completions.create(**retry_kwargs)
+                self._capture_and_persist_usage(
+                    response,
+                    request_type="retry",
+                    latency_ms=max(0, int((time.monotonic() - retry_started_at) * 1000)),
+                )
+                return response
+        finally:
+            if lease_ticket is not None:
+                lease_ticket.release()
 
     def _message_content(self, message: Any) -> str:
         content = _message_field(message, "content")
@@ -1274,18 +2127,28 @@ class OpenAICompatibleLocalClient:
     def _should_retry_without_thinking(
         self, message: Any, api_kwargs: Dict[str, Any]
     ) -> bool:
+        # Managed Qwen3.8 has no disable-thinking switch.  A reasoning-only
+        # response may still be retried, but the same profile effort must be
+        # preserved instead of adding enable_thinking=false.
+        if self._reasoning_effort_metadata():
+            return _message_has_reasoning_output(message)
         if self._chat_template_thinking_value(api_kwargs) is False:
             return False
         if _message_has_reasoning_output(message):
             return True
-        if _is_qwopus_model(self.model_name):
-            return self._chat_template_thinking_value(api_kwargs) is True
         return False
 
     def _create_completion_retrying_empty_reasoning(
-        self, api_kwargs: Dict[str, Any], *, reason: str
+        self,
+        api_kwargs: Dict[str, Any],
+        *,
+        reason: str,
+        request_type: str = "chat",
     ) -> Any:
-        response = self._create_completion_with_fallback(api_kwargs)
+        response = self._create_completion_with_fallback(
+            api_kwargs,
+            request_type=request_type,
+        )
         choice = response.choices[0]
         message = choice.message
         if getattr(message, "tool_calls", None) or self._message_content(message):
@@ -1297,10 +2160,25 @@ class OpenAICompatibleLocalClient:
             "retrying with thinking disabled (%s)",
             reason,
         )
-        retry_kwargs = self._set_chat_template_thinking(api_kwargs, False)
+        if self._reasoning_effort_metadata():
+            retry_kwargs = dict(api_kwargs)
+            retry_extra = retry_kwargs.get("extra_body")
+            retry_extra = retry_extra if isinstance(retry_extra, dict) else {}
+            retry_extra = _deep_merge_dict(retry_extra, self._mode_extra_body())
+            retry_template = retry_extra.get("chat_template_kwargs")
+            if isinstance(retry_template, dict):
+                retry_template.pop("enable_thinking", None)
+            retry_extra.pop("reasoning_effort", None)
+            retry_extra.pop("enable_thinking", None)
+            retry_kwargs["extra_body"] = retry_extra
+        else:
+            retry_kwargs = self._set_chat_template_thinking(api_kwargs, False)
         api_kwargs.clear()
         api_kwargs.update(retry_kwargs)
-        return self._create_completion_with_fallback(api_kwargs)
+        return self._create_completion_with_fallback(
+            api_kwargs,
+            request_type="retry",
+        )
 
     def _empty_response_fallback(self) -> str:
         return LOCAL_MODEL_EMPTY_RESPONSE
@@ -1309,6 +2187,7 @@ class OpenAICompatibleLocalClient:
         response = self._create_completion_retrying_empty_reasoning(
             api_kwargs,
             reason="tool follow-up",
+            request_type="tool",
         )
         self._capture_generation_metrics(response)
         return response
@@ -1379,24 +2258,39 @@ class OpenAICompatibleLocalClient:
         response = self._create_completion_retrying_empty_reasoning(
             api_kwargs,
             reason=f"minimal retry after {reason}",
+            request_type="retry",
         )
         self._capture_generation_metrics(response)
         message = response.choices[0].message
         content = self._message_content(message)
         if content:
-            return guard_tool_execution_claims(content, tool_calls)
+            return self._privacy_gateway.restore(
+                guard_tool_execution_claims(content, tool_calls)
+            )
         if "extra_body" in api_kwargs:
             retry_kwargs = dict(api_kwargs)
-            retry_kwargs.pop("extra_body", None)
+            if self._reasoning_effort_metadata():
+                # Keep the selected managed-profile effort on the final
+                # fallback too.  Dropping extra_body here would silently
+                # change a low/medium/xhigh request into template default.
+                retry_kwargs["extra_body"] = self._mode_extra_body()
+            else:
+                retry_kwargs.pop("extra_body", None)
             logger.warning(
-                "[OpenAICompatibleLocalClient] Minimal empty-response retry returned empty; retrying without extra_body (%s)",
+                "[OpenAICompatibleLocalClient] Minimal empty-response retry returned empty; retrying with %s extra_body (%s)",
+                "managed effort" if self._reasoning_effort_metadata() else "no",
                 reason,
             )
-            response = self._create_completion_with_fallback(retry_kwargs)
+            response = self._create_completion_with_fallback(
+                retry_kwargs,
+                request_type="retry",
+            )
             message = response.choices[0].message
             content = self._message_content(message)
             if content:
-                return guard_tool_execution_claims(content, tool_calls)
+                return self._privacy_gateway.restore(
+                    guard_tool_execution_claims(content, tool_calls)
+                )
         return ""
 
     def chat(
@@ -1405,11 +2299,13 @@ class OpenAICompatibleLocalClient:
         *,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
+        request_type: str = "chat",
         tools_enabled: bool = True,
         context_budget: Optional[ContextBudget] = None,
         fallback_user_input: Optional[str] = None,
         required_tool_name: Optional[str] = None,
         native_tool_user_input: Optional[str] = None,
+        event_callback: Optional[SyncStreamEmitter] = None,
     ) -> str:
         api_kwargs = self._build_api_kwargs(
             messages,
@@ -1423,6 +2319,7 @@ class OpenAICompatibleLocalClient:
         response = self._create_completion_retrying_empty_reasoning(
             api_kwargs,
             reason="chat completion",
+            request_type=request_type,
         )
         self._capture_generation_metrics(response)
         choice = response.choices[0]
@@ -1435,9 +2332,11 @@ class OpenAICompatibleLocalClient:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 fallback_user_input=fallback_user_input,
+                required_tool_name=required_tool_name,
+                event_callback=event_callback,
             )
             self._record_model_transcript(messages, result)
-            return result
+            return self._privacy_gateway.restore(result)
         content = self._message_content(choice.message)
         if fallback_user_input and project_progress_review_active(fallback_user_input):
             result = self._handle_tool_calls(
@@ -1448,9 +2347,17 @@ class OpenAICompatibleLocalClient:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 fallback_user_input=fallback_user_input,
+                required_tool_name=required_tool_name,
+                event_callback=event_callback,
             )
             self._record_model_transcript(messages, result)
-            return result
+            return self._privacy_gateway.restore(result)
+        # ツール往復が無い応答でも reasoning が返っていれば thinking として配信する。
+        emit_thinking(
+            event_callback,
+            thinking_text_from_message(choice.message),
+            round_index=0,
+        )
         if required_tool_name:
             logger.warning(
                 "[OpenAICompatibleLocalClient] required tool %s was not called",
@@ -1463,7 +2370,7 @@ class OpenAICompatibleLocalClient:
         if content:
             result = guard_tool_execution_claims(content, [])
             self._record_model_transcript(messages, result)
-            return result
+            return self._privacy_gateway.restore(result)
         logger.warning(
             "[OpenAICompatibleLocalClient] local model returned empty content"
         )
@@ -1476,7 +2383,7 @@ class OpenAICompatibleLocalClient:
                 reason="chat completion",
             )
             if retry_content:
-                return retry_content
+                return self._privacy_gateway.restore(retry_content)
         return self._empty_response_fallback()
 
     def stream_chat(
@@ -1486,6 +2393,7 @@ class OpenAICompatibleLocalClient:
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
     ) -> Generator[str, None, None]:
+        self._sync_privacy_gateway()
         stream_kwargs = self._build_api_kwargs(
             messages,
             temperature,
@@ -1497,13 +2405,31 @@ class OpenAICompatibleLocalClient:
         stream_kwargs.pop("tool_choice", None)
         stream_kwargs.pop("response_format", None)
         stream_kwargs = self._with_stream_safe_extra_body(stream_kwargs)
-        self._capture_context_request(stream_kwargs, reason="stream")
-        stream = self.client.chat.completions.create(**stream_kwargs)
-        for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
-            else:
-                self._capture_generation_metrics(chunk)
+        stream_kwargs = self._privacy_gateway.protect_sync(
+            stream_kwargs,
+            provider="openai_compatible_local",
+            base_url=self.base_url,
+            source_kind="model_request",
+        ).payload
+        lease_ticket = self._prepare_managed_local_server_for_request()
+        try:
+            self._capture_context_request(stream_kwargs, reason="stream")
+            stream = self.client.chat.completions.create(**stream_kwargs)
+            for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    yield self._privacy_gateway.restore_aliases(
+                        chunk.choices[0].delta.content
+                    )
+                previous_usage = dict(getattr(self, "_last_usage", {}) or {})
+                captured_usage = self._capture_generation_metrics(chunk)
+                # Some servers attach usage only to an intermediate/final chunk;
+                # do not erase the last confirmed metrics when a content-only
+                # chunk follows it.
+                if not captured_usage and previous_usage:
+                    self._last_usage = previous_usage
+        finally:
+            if lease_ticket is not None:
+                lease_ticket.release()
 
     def _handle_tool_calls(
         self,
@@ -1515,17 +2441,37 @@ class OpenAICompatibleLocalClient:
         temperature: float,
         max_tokens: Optional[int],
         fallback_user_input: Optional[str] = None,
+        required_tool_name: Optional[str] = None,
         max_rounds: int = 5,
+        event_callback: Optional[SyncStreamEmitter] = None,
     ) -> str:
         effective_max_rounds = max(
             max_rounds,
             agentic_max_rounds(self, fallback_user_input),
         )
+
+        # llama.cpp requires the initial grounding tool to be selected with a
+        # native ``tool_choice=required`` request.  Its initial schema is
+        # intentionally narrowed to that single tool, but reusing those
+        # kwargs for the follow-up would permanently hide mutation tools.  The
+        # assistant message already contains the required read call, so
+        # rebuild a normal effective schema for the loop's subsequent calls.
+        loop_api_kwargs = api_kwargs
+        if required_tool_name and self._is_llama_cpp_server():
+            loop_api_kwargs = self._build_api_kwargs(
+                messages,
+                temperature,
+                max_tokens,
+                context_budget=context_budget,
+                tools_enabled=True,
+                required_tool_name=None,
+                native_tool_user_input=fallback_user_input,
+            )
         result = run_openai_tool_call_loop(
             initial_messages=messages,
             assistant_message=assistant_message,
-            api_kwargs=api_kwargs,
-            registry=self._tool_registry,
+            api_kwargs=loop_api_kwargs,
+            registry=filtered_registry_for_client(self, self._tool_registry),
             create_completion=self._tool_loop_completion,
             log_prefix="OpenAICompatibleLocalClient",
             max_rounds=effective_max_rounds,
@@ -1534,16 +2480,29 @@ class OpenAICompatibleLocalClient:
             message_content=self._message_content,
             config=self.config,
             user_input=fallback_user_input,
-            require_project_context_read=self._requires_project_context_read(
-                fallback_user_input,
+            require_project_context_read=(
+                self._requires_project_context_read(fallback_user_input)
+                and not self._project_context_read_already_satisfied()
             ),
+            skip_final_response_check_on_empty=True,
+            event_callback=event_callback,
+            restore_tool_arguments=self._privacy_gateway.restore_tool_arguments,
         )
         self._last_tool_calls.extend(result.tool_calls)
         self._last_tool_loop_messages = [
             dict(message) for message in getattr(result, "messages", [])
         ]
+        execution_records = list(getattr(result, "audit_tool_calls", None) or [])
+        self._last_audit_tool_calls.extend(execution_records)
+        self._last_tool_loop_completion_confirmed = tool_loop_completion_confirmed(
+            execution_records,
+            result.final_output,
+            stopped_reason=getattr(result, "stopped_reason", None),
+        )
         if result.final_output:
-            return guard_tool_execution_claims(result.final_output, result.tool_calls)
+            return self._privacy_gateway.restore(
+                guard_tool_execution_claims(result.final_output, result.tool_calls)
+            )
         logger.warning(
             "[OpenAICompatibleLocalClient] tool call loop returned empty content"
         )
@@ -1561,7 +2520,7 @@ class OpenAICompatibleLocalClient:
                 executed_tool_calls=result.tool_calls,
             )
             if retry_content:
-                return retry_content
+                return self._privacy_gateway.restore(retry_content)
         return self._empty_response_fallback()
 
     def _run_agentic_review_once(
@@ -1577,8 +2536,8 @@ class OpenAICompatibleLocalClient:
             {
                 "role": "system",
                 "content": (
-                    "You are a careful AoiTalk agent. Follow the user's verifier "
-                    "or continuation instruction exactly."
+                    "You are a careful AoiTalk completion verifier. "
+                    "Return exactly one JSON review object and do not call tools."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -1587,10 +2546,51 @@ class OpenAICompatibleLocalClient:
             review_messages,
             temperature=temperature,
             max_tokens=max_tokens,
-            tools_enabled=True,
+            request_type="review",
+            tools_enabled=False,
             context_budget=context_budget,
             fallback_user_input=user_input,
             native_tool_user_input=user_input,
+        )
+
+    def _run_agentic_continuation_once(
+        self,
+        prompt: str,
+        *,
+        temperature: float,
+        max_tokens: Optional[int],
+        context_budget: ContextBudget,
+        user_input: str,
+        event_callback: Optional[SyncStreamEmitter] = None,
+        system_content: str = "",
+    ) -> str:
+        continuation_messages = [
+            {
+                "role": "system",
+                "content": (
+                    system_content
+                    or self._current_turn_system_content
+                    or (
+                        self._system_prompt_for_budget(context_budget)
+                        + "\n\n"
+                        + _current_date_context()
+                    )
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+        required_tool_name = self._required_tool_name(user_input)
+        return self.chat(
+            continuation_messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            request_type="continuation",
+            tools_enabled=True,
+            context_budget=context_budget,
+            fallback_user_input=user_input,
+            required_tool_name=required_tool_name,
+            native_tool_user_input=user_input,
+            event_callback=event_callback,
         )
 
     def generate_response(
@@ -1609,6 +2609,9 @@ class OpenAICompatibleLocalClient:
         self._last_model_transcript = []
         self._last_usage = {}
         self._last_tool_loop_messages = []
+        self._last_tool_loop_completion_confirmed = False
+        self._last_audit_tool_calls = []
+        self._current_turn_system_content = ""
         project_token = None
         specialist_provider_token = set_runtime_specialist_provider(
             "openai_compatible_local"
@@ -1623,6 +2626,13 @@ class OpenAICompatibleLocalClient:
             self._current_context_budget = context_budget
             project_context = self._resolve_project_context_sync()
             project_token = set_runtime_project_context(project_context)
+            self._privacy_project_metadata = (
+                dict((project_context or {}).get("metadata") or {})
+                if isinstance(project_context, dict)
+                and isinstance((project_context or {}).get("metadata"), dict)
+                else {}
+            )
+            self._sync_privacy_gateway()
             messages, tool_hint_context = self._build_model_messages_for_budget(
                 user_input,
                 project_context,
@@ -1633,9 +2643,13 @@ class OpenAICompatibleLocalClient:
                     str(messages[-1].get("content") or ""),
                     image_data,
                 )
+            self._current_turn_system_content = str(
+                messages[0].get("content") or ""
+            )
             required_tool_name = self._required_tool_name(user_input)
             if stream:
                 return self._stream_response(messages, temperature, max_tokens, user_input)
+            turn_event_emitter = make_sync_stream_emitter(stream_callback)
             response_text = self.chat(
                 messages,
                 temperature=temperature,
@@ -1645,6 +2659,7 @@ class OpenAICompatibleLocalClient:
                 fallback_user_input=user_input,
                 required_tool_name=required_tool_name,
                 native_tool_user_input=user_input,
+                event_callback=turn_event_emitter,
             )
 
             def _agentic_event_callback(event_type: str, data: Dict[str, Any]) -> None:
@@ -1654,30 +2669,48 @@ class OpenAICompatibleLocalClient:
                 if stream_callback:
                     self._run_async_sync(stream_callback(event_type, data))
 
-            response_text = run_agentic_completion_loop_sync(
-                client=self,
-                run_once=lambda prompt: self._run_agentic_review_once(
-                    prompt,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    context_budget=context_budget,
+            if self._should_run_agentic_completion_review():
+                response_text = run_agentic_completion_loop_sync(
+                    client=self,
+                    run_once=lambda prompt: self._run_agentic_continuation_once(
+                        prompt,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        context_budget=context_budget,
+                        user_input=user_input,
+                        event_callback=turn_event_emitter,
+                        system_content=self._current_turn_system_content,
+                    ),
+                    run_review_once=lambda prompt: self._run_agentic_review_once(
+                        prompt,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        context_budget=context_budget,
+                        user_input=user_input,
+                    ),
+                    run_continuation_once=lambda prompt: self._run_agentic_continuation_once(
+                        prompt,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        context_budget=context_budget,
+                        user_input=user_input,
+                        event_callback=turn_event_emitter,
+                        system_content=self._current_turn_system_content,
+                    ),
+                    context=render_messages_for_review(messages),
                     user_input=user_input,
-                ),
-                context=render_messages_for_review(messages),
-                user_input=user_input,
-                initial_response=response_text,
-                event_callback=_agentic_event_callback,
-            )
+                    initial_response=response_text,
+                    event_callback=_agentic_event_callback,
+                    tool_evidence_provider=self._format_last_tool_calls_evidence,
+                    completion_confirmed_provider=lambda: self._last_tool_loop_completion_confirmed,
+                    audit_tool_calls_provider=lambda: list(self._last_audit_tool_calls),
+                )
             self._record_model_transcript(messages, response_text)
-            persist_usage_sync(
-                self,
-                provider="openai_compatible_local",
-                model=self.model_name,
-                usage=self._last_usage,
-            )
             self.history_manager.add_message("user", user_input)
             self.history_manager.add_message("assistant", response_text)
             return response_text
+        except GenerationInterrupted:
+            raise
         except Exception as exc:
             fallback = self._get_error_response(exc)
             if _is_local_model_loading_error(exc):
@@ -1751,14 +2784,76 @@ class OpenAICompatibleLocalClient:
             tools_enabled=False,
         )
         api_kwargs.pop("response_format", None)
-        if _is_qwopus_model(self.model_name):
-            api_kwargs = self._set_chat_template_thinking(api_kwargs, False)
         response = self._create_completion_retrying_empty_reasoning(
             api_kwargs,
             reason="title generation",
+            request_type="title",
         )
         self._capture_generation_metrics(response)
         return self._message_content(response.choices[0].message)
+
+    def _generate_plain_text(
+        self,
+        prompt: str,
+        *,
+        system_prompt: Optional[str] = None,
+        request_type: str = "plain",
+    ) -> str:
+        """Generate text without normal chat context, tools, or history."""
+        self._last_generation_metrics = None
+        context_budget = self._context_budget(1024)
+        messages = [
+            {
+                "role": "system",
+                "content": system_prompt
+                or "You are a concise assistant. Do not call tools or modify files.",
+            },
+            {"role": "user", "content": prompt},
+        ]
+        api_kwargs = self._build_api_kwargs(
+            messages,
+            temperature=0.2,
+            max_tokens=1024,
+            context_budget=context_budget,
+            tools_enabled=False,
+        )
+        api_kwargs.pop("response_format", None)
+        response = self._create_completion_retrying_empty_reasoning(
+            api_kwargs,
+            reason="ephemeral text generation",
+            request_type=request_type,
+        )
+        self._capture_generation_metrics(response)
+        return self._message_content(response.choices[0].message)
+
+    async def generate_plain_text_async(
+        self,
+        prompt: str,
+        *,
+        system_prompt: Optional[str] = None,
+    ) -> str:
+        """Generate text without mutating normal conversation history."""
+        return await asyncio.to_thread(
+            self._generate_plain_text,
+            prompt,
+            system_prompt=system_prompt,
+            request_type="plain",
+        )
+
+    async def generate_memory_extraction_async(
+        self,
+        prompt: str,
+        *,
+        system_prompt: str,
+    ) -> str:
+        """Generate memory extraction text without mutating chat history."""
+
+        return await asyncio.to_thread(
+            self._generate_plain_text,
+            prompt,
+            system_prompt=system_prompt,
+            request_type="memory_extraction",
+        )
 
     def _stream_response(
         self,
@@ -1768,14 +2863,24 @@ class OpenAICompatibleLocalClient:
         user_input: str,
     ) -> Generator[str, None, None]:
         full_response = ""
+        # Keep a request-local ledger.  ``_last_usage`` is also used by
+        # non-streaming calls, so reset it before starting and never persist a
+        # value left over from an earlier request when stream creation fails
+        # or yields no chunks.
+        self._last_usage = {}
+        stream_usage: Dict[str, Any] = {}
         try:
             for content in self.stream_chat(
                 messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
             ):
+                if self._last_usage:
+                    stream_usage = dict(self._last_usage)
                 full_response += content
                 yield content
+        except GenerationInterrupted:
+            raise
         except Exception as exc:
             full_response = self._get_error_response(exc)
             if _is_local_model_loading_error(exc):
@@ -1798,13 +2903,21 @@ class OpenAICompatibleLocalClient:
             yield full_response
         finally:
             self._record_model_transcript(messages, full_response)
-            persist_usage_sync(
-                self,
-                provider="openai_compatible_local",
-                model=self.model_name,
-                usage=self._last_usage,
-                is_streaming=True,
-            )
+            # The final stream chunk can carry usage without content; retain
+            # that observation while avoiding stale usage on an empty/failed
+            # stream.  Persist exactly once for the whole stream.
+            if self._last_usage:
+                stream_usage = dict(self._last_usage)
+            self._last_usage = dict(stream_usage)
+            if stream_usage:
+                persist_usage_sync(
+                    self,
+                    provider="openai_compatible_local",
+                    model=self.model_name,
+                    usage=stream_usage,
+                    request_type="chat",
+                    is_streaming=True,
+                )
             self.history_manager.add_message("user", user_input)
             self.history_manager.add_message("assistant", full_response)
 
@@ -1813,6 +2926,36 @@ class OpenAICompatibleLocalClient:
             return LOCAL_MODEL_LOADING_RESPONSE
         if _is_context_overflow_error(exc):
             return self._get_context_overflow_fallback_response()
+        if _is_connection_error(exc):
+            config_error = self._managed_llama_cpp_launch_configuration_error()
+            if config_error:
+                try:
+                    from src.service_manager import llama_cpp_runtime_requirement
+
+                    requirement = llama_cpp_runtime_requirement(
+                        self.config,
+                        model=self.model_name,
+                    )
+                except Exception:
+                    requirement = None
+                requirement_hint = (
+                    f" {requirement}"
+                    if requirement
+                    else ""
+                )
+                return (
+                    "ローカルLLMサーバー（llama-server）を起動できませんでした。"
+                    "logs/models/llama_cpp.log を確認し、"
+                    "選択したprofileのruntime要件を満たすllama.cppを用意してから再試行してください。"
+                    f"{requirement_hint}"
+                    f"\n\n詳細:\n{config_error}"
+                )
+            if self._can_attempt_managed_llama_cpp_recovery() or self._uses_llama_cpp_tool_choice_transport():
+                detail = str(self._last_local_server_ensure_error or "").strip()
+                if detail:
+                    return f"{LOCAL_MODEL_SERVER_START_FAILED_RESPONSE}\n\n詳細: {detail}"
+                return LOCAL_MODEL_SERVER_START_FAILED_RESPONSE
+            return "ローカルLLMサーバーへ接続できません。サーバーが起動しているか、base_url 設定を確認してください。"
         return self._get_fallback_response()
 
     def _reduce_context_budget_after_overflow(self) -> None:
@@ -1835,12 +2978,13 @@ class OpenAICompatibleLocalClient:
         evidence_blocks: list[str] = []
         if self._current_tool_hint_context:
             evidence_blocks.append(self._current_tool_hint_context)
-        if self._current_context_bundle:
+        context_bundle = self._context_bundle_for_turn()
+        if context_bundle:
             evidence_blocks.extend(
                 [
-                    self._current_context_bundle.project_context_block,
-                    self._current_context_bundle.project_information_block,
-                    self._current_context_bundle.project_pack_block,
+                    context_bundle.project_context_block,
+                    context_bundle.project_information_block,
+                    context_bundle.project_pack_block,
                 ]
             )
         evidence = "\n\n".join(block.strip() for block in evidence_blocks if block and block.strip())
@@ -1897,6 +3041,27 @@ class OpenAICompatibleLocalClient:
         image_data: Optional[Dict[str, Any]] = None,
         stream_callback: Any = None,
     ) -> str:
+        from ..services.session_llm_generation import run_session_aware_generation
+
+        return await run_session_aware_generation(
+            self,
+            self.config,
+            user_input,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            image_data=image_data,
+            stream_callback=stream_callback,
+        )
+
+    async def _generate_response_async_impl(
+        self,
+        user_input: str,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        image_data: Optional[Dict[str, Any]] = None,
+        stream_callback: Any = None,
+    ) -> str:
+        # worker thread では実行中ループが見えないため、ここでループを束ねておく。
         return await asyncio.to_thread(
             self.generate_response,
             user_input,
@@ -1904,7 +3069,7 @@ class OpenAICompatibleLocalClient:
             max_tokens,
             False,
             image_data,
-            stream_callback,
+            bind_stream_callback_loop(stream_callback),
         )
 
     async def generate_title_async(self, prompt: str) -> str:
@@ -1923,6 +3088,7 @@ class OpenAICompatibleLocalClient:
         return self.history_manager.get_all()
 
     async def cleanup(self) -> None:
+        self._release_managed_local_generation_lease(all=True)
         logger.info("[OpenAICompatibleLocalClient] cleanup complete")
 
 
@@ -1934,15 +3100,20 @@ def create_openai_compatible_local_client(config: Config) -> OpenAICompatibleLoc
         else None
     )
     model = (
-        response_model
+        _config_get(config, "runtime.target_model")
+        or response_model
         or os.getenv("OPENAI_COMPATIBLE_LOCAL_MODEL")
         or _config_get(config, "llm_model")
         or _config_get(config, "openai_compatible_local.model")
         or DEFAULT_LOCAL_MODEL
     )
-    base_url = openai_compatible_local_base_url(config, model=model)
+    base_url = _config_get(
+        config,
+        "runtime.target_base_url",
+    ) or openai_compatible_local_base_url(config, model=model)
     api_key = (
-        os.getenv("OPENAI_COMPATIBLE_LOCAL_API_KEY")
+        _config_get(config, "runtime.target_api_key")
+        or os.getenv("OPENAI_COMPATIBLE_LOCAL_API_KEY")
         or _config_get(config, "openai_compatible_local.api_key")
         or DEFAULT_LOCAL_API_KEY
     )

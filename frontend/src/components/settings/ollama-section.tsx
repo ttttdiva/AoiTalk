@@ -182,9 +182,9 @@ export function OllamaSection() {
   const percent = Math.max(0, Math.min(100, task?.percent ?? 0));
 
   return (
-    <Card size="sm">
+    <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0" data-settings-surface="ollama">
       <CardHeader
-        className="cursor-pointer select-none"
+        className="cursor-pointer select-none border-b border-border dark:border-[#333335] px-3 py-3 transition-colors hover:bg-muted dark:bg-[#242426]"
         onClick={() => setExpanded((value) => !value)}
       >
         <CardTitle className="flex items-center justify-between gap-3 text-sm">
@@ -209,7 +209,7 @@ export function OllamaSection() {
         </CardTitle>
       </CardHeader>
       {expanded && (
-        <CardContent className="space-y-4">
+      <CardContent className="space-y-4 px-3 py-3">
           <div className="flex flex-wrap items-end gap-2">
             <div className="min-w-64 flex-1 space-y-1">
               <Label className="text-xs">Model tag</Label>

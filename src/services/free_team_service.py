@@ -54,8 +54,9 @@ class RouteIntent:
     runner: str = ""
     routing_profile_id: str = ""
     pool_id: str = ""
-    member_key: str = ""
-    group_id: str = ""
+    team_id: str = ""
+    subagent_id: str = ""
+    llm_profile_id: str = ""
     effort_policy: str = ""
     tool_mode: str = ""
     candidate_ids: tuple[str, ...] = ()
@@ -88,11 +89,17 @@ class RouteLease:
     cli_auth_reference: str = field(default="", repr=False)
     provider_options: dict[str, Any] = field(default_factory=dict, repr=False)
     fallback_count: int = 0
+    team_id: str = ""
+    subagent_id: str = ""
+    llm_profile_id: str = ""
 
     def safe_metadata(self) -> dict[str, Any]:
         return {
             "routing_profile": self.routing_profile_id,
             "pool": self.pool_id,
+            "team_id": self.team_id or None,
+            "subagent_id": self.subagent_id or None,
+            "llm_profile_id": self.llm_profile_id or None,
             "credential_profile": self.credential_profile_id,
             "candidate": self.candidate_id,
             "provider": self.provider,
@@ -129,26 +136,47 @@ def free_team_profile(config: Any) -> dict[str, Any]:
                         **stored_pool,
                     }
             profile["pools"] = merged_pools
-        elif key == "agent_team" and isinstance(value, dict):
-            merged_team = dict(profile["agent_team"])
-            for section in ("model_groups", "members"):
-                stored_section = value.get(section)
-                if isinstance(stored_section, dict):
-                    merged_team[section] = {
-                        **dict(merged_team.get(section) or {}),
-                        **stored_section,
-                    }
-            merged_team.update(
-                {
-                    section: section_value
-                    for section, section_value in value.items()
-                    if section not in {"model_groups", "members"}
+        elif key == "llm_profiles" and isinstance(value, dict):
+            # Free Team may overlay the target of an existing canonical LLM
+            # Profile, but it must not copy or replace the Team/Subagent graph.
+            merged_profiles = dict(profile["llm_profiles"])
+            for profile_id, stored_profile in value.items():
+                if not isinstance(stored_profile, dict):
+                    continue
+                profile_key = str(profile_id).strip()
+                if not profile_key:
+                    continue
+                merged_profiles[profile_key] = {
+                    **dict(merged_profiles.get(profile_key) or {}),
+                    **stored_profile,
+                    "profile_id": str(
+                        stored_profile.get("profile_id") or profile_key
+                    ),
+                    "routing_profile_id": str(
+                        stored_profile.get("routing_profile_id")
+                        or FREE_TEAM_PROFILE_ID
+                    ),
                 }
-            )
-            profile["agent_team"] = merged_team
+            profile["llm_profiles"] = merged_profiles
+        elif key in {"agent_team", "agent_team_enabled"}:
+            # A v2 routing overlay is migration input only.  Never expose it
+            # back to runtime or persist it as part of the Free Team profile.
+            continue
         else:
             profile[key] = value
     return profile
+
+
+def free_team_llm_profile(
+    config: Any, profile_id: str | None
+) -> dict[str, Any] | None:
+    """Return one Free Team profile overlay without touching topology."""
+
+    clean_id = str(profile_id or "").strip()
+    if not clean_id:
+        return None
+    value = free_team_profile(config).get("llm_profiles", {}).get(clean_id)
+    return dict(value) if isinstance(value, dict) else None
 
 
 def main_route_intent(config: Any) -> RouteIntent:
@@ -160,7 +188,6 @@ def main_route_intent(config: Any) -> RouteIntent:
             kind="pool",
             routing_profile_id=FREE_TEAM_PROFILE_ID,
             pool_id=pool_id,
-            member_key="main",
             tool_mode=str(pool.get("tool_mode") or "auto"),
             candidate_ids=tuple(str(value) for value in (pool.get("candidate_ids") or [])),
         )
@@ -174,25 +201,48 @@ def main_route_intent(config: Any) -> RouteIntent:
 def pool_route_intent(
     config: Any,
     *,
-    member_key: str,
-    group_id: str,
-    group: Mapping[str, Any],
+    subagent_id: str = "",
+    llm_profile_id: str = "",
+    profile: Mapping[str, Any] | None = None,
+    team_id: str = "",
+    # These aliases are accepted only while callers migrate to the v3
+    # subagent/profile vocabulary; they are never returned or persisted.
+    member_key: str = "",
+    group_id: str = "",
+    group: Mapping[str, Any] | None = None,
 ) -> RouteIntent | None:
-    if str(group.get("target_type") or "").strip().lower() != "pool":
+    selected_profile = profile
+    if selected_profile is None and llm_profile_id:
+        selected_profile = free_team_llm_profile(config, llm_profile_id)
+    # Legacy callers may still pass a group mapping at the migration boundary.
+    if selected_profile is None and isinstance(group, Mapping):
+        selected_profile = group
+    selected_profile = selected_profile if isinstance(selected_profile, Mapping) else {}
+    if str(selected_profile.get("target_type") or "").strip().lower() != "pool":
         return None
-    pool_id = str(group.get("pool_id") or "").strip()
+    pool_id = str(selected_profile.get("pool_id") or "").strip()
     if not pool_id:
         return None
     profile = free_team_profile(config)
     pool = (profile.get("pools") or {}).get(pool_id, {}) or {}
+    resolved_subagent_id = str(subagent_id or member_key or "").strip()
+    resolved_profile_id = str(
+        llm_profile_id
+        or selected_profile.get("profile_id")
+        or group_id
+        or ""
+    ).strip()
     return RouteIntent(
         kind="pool",
-        routing_profile_id=str(group.get("routing_profile_id") or FREE_TEAM_PROFILE_ID),
+        routing_profile_id=str(
+            selected_profile.get("routing_profile_id") or FREE_TEAM_PROFILE_ID
+        ),
         pool_id=pool_id,
-        member_key=member_key,
-        group_id=group_id,
-        effort_policy=str(group.get("effort_policy") or ""),
-        effort=str(group.get("effort") or ""),
+        team_id=str(team_id or "").strip(),
+        subagent_id=resolved_subagent_id,
+        llm_profile_id=resolved_profile_id,
+        effort_policy=str(selected_profile.get("effort_policy") or ""),
+        effort=str(selected_profile.get("effort") or ""),
         tool_mode=str(pool.get("tool_mode") or "auto"),
         candidate_ids=tuple(str(value) for value in (pool.get("candidate_ids") or [])),
     )
@@ -626,6 +676,10 @@ async def acquire_route_lease(
     *,
     prompt: str,
     required_capabilities: Iterable[str] = ("text",),
+    subagent_id: str = "",
+    team_id: str = "",
+    # ``member_key`` is retained only as an input compatibility alias for
+    # callers that have not yet moved their lease call to v3 metadata.
     member_key: str = "",
     excluded_candidate_ids: Iterable[str] = (),
     fallback_count: int = 0,
@@ -769,7 +823,12 @@ async def acquire_route_lease(
                     candidate_id=candidate.id,
                     routing_profile_id=intent.routing_profile_id or FREE_TEAM_PROFILE_ID,
                     pool_id=intent.pool_id,
-                    member_key=member_key or intent.member_key or None,
+                    member_key=(
+                        subagent_id
+                        or member_key
+                        or intent.subagent_id
+                        or None
+                    ),
                     status="reserved",
                     estimated_usage={
                         "metrics": {key: float(value) for key, value in estimates.items()},
@@ -802,6 +861,9 @@ async def acquire_route_lease(
                     cli_auth_reference=str(credential.cli_auth_reference or ""),
                     provider_options=options,
                     fallback_count=reservation.fallback_count,
+                    team_id=team_id or intent.team_id,
+                    subagent_id=subagent_id or intent.subagent_id,
+                    llm_profile_id=intent.llm_profile_id,
                 )
             if lease is not None:
                 return lease

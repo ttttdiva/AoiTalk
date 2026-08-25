@@ -1,0 +1,76 @@
+# Official AoiTalk Enterprise AMD gfx1151 backend.
+#
+# This is an internal-only overlay.  It deliberately uses a staged local
+# model directory with offline Hugging Face flags; no container command may
+# download weights on a production host.
+services:
+  aoitalk:
+    environment:
+      AOITALK_BACKEND: gemma-vllm
+      AOITALK_ACTIVE_DEPLOYMENT_BACKEND: gemma-vllm
+      AOITALK_LLM_MODE: openai_compatible_local
+      AOITALK_EFFECTIVE_LLM_PROVIDER: openai_compatible_local
+      AOITALK_EXTERNAL_PROVIDER: openai_compatible_local
+      AOITALK_EXTERNAL_MODEL: ${AOITALK_GEMMA_SERVED_MODEL:-google/gemma-4-E4B-it}
+      AOITALK_EXTERNAL_BASE_URL: ${AOITALK_GEMMA_VLLM_BASE_URL:-http://gemma-vllm:8000/v1}
+      OPENAI_COMPATIBLE_LOCAL_MODEL: ${AOITALK_GEMMA_SERVED_MODEL:-google/gemma-4-E4B-it}
+      OPENAI_COMPATIBLE_LOCAL_BASE_URL: ${AOITALK_GEMMA_VLLM_BASE_URL:-http://gemma-vllm:8000/v1}
+      OPENAI_COMPATIBLE_LOCAL_SERVER_PROFILE: vllm
+      OPENAI_COMPATIBLE_LOCAL_TOOLS: "true"
+      OPENAI_COMPATIBLE_LOCAL_API_KEY_FILE: /run/secrets/openai_compatible_local_api_key
+      AOITALK_GEMMA_MODEL_REVISION: ${AOITALK_GEMMA_MODEL_REVISION:-ee0ef6023621cff504d758262d4e04895a5af4a2}
+    depends_on:
+      gemma-vllm:
+        condition: service_healthy
+        required: true
+
+  gemma-vllm:
+    image: ${AOITALK_GEMMA_VLLM_IMAGE:?AOITALK_GEMMA_VLLM_IMAGE must be an immutable repository@sha256 digest}
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_DATASETS_OFFLINE: "1"
+      NVIDIA_VISIBLE_DEVICES: ""
+      VLLM_NO_USAGE_STATS: "1"
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        test -f "/models/gemma/${AOITALK_GEMMA_MODEL_FILE:-model.safetensors}";
+        test "$$(stat -c %s "/models/gemma/${AOITALK_GEMMA_MODEL_FILE:-model.safetensors}")" = "${AOITALK_GEMMA_MODEL_SIZE_BYTES:-15992595884}";
+        export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1;
+        exec vllm serve /models/gemma
+        --served-model-name "${AOITALK_GEMMA_SERVED_MODEL:-google/gemma-4-E4B-it}"
+        --revision "${AOITALK_GEMMA_MODEL_REVISION:-ee0ef6023621cff504d758262d4e04895a5af4a2}"
+        --dtype "${AOITALK_GEMMA_VLLM_DTYPE:-bfloat16}"
+        --max-model-len "${AOITALK_GEMMA_VLLM_CONTEXT_LENGTH:-32768}"
+        --gpu-memory-utilization "${AOITALK_GEMMA_VLLM_MEM_UTIL:-0.80}"
+        --host 0.0.0.0 --port "${AOITALK_GEMMA_VLLM_PORT:-8000}"
+        --enable-auto-tool-choice --tool-call-parser gemma4
+        --reasoning-parser gemma4
+    volumes:
+      - ${AOITALK_GEMMA_MODEL_DIR:-${AOITALK_DATA_ROOT:?AOITALK_DATA_ROOT is required}/huggingface/gemma-4E4B-it}:/models/gemma:ro
+    expose:
+      - "${AOITALK_GEMMA_VLLM_PORT:-8000}"
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+    shm_size: "16gb"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import json,urllib.request;
+          d=json.load(urllib.request.urlopen('http://127.0.0.1:${AOITALK_GEMMA_VLLM_PORT:-8000}/v1/models', timeout=5));
+          names=[x.get('id') for x in d.get('data',[])];
+          raise SystemExit(0 if '${AOITALK_GEMMA_SERVED_MODEL:-google/gemma-4-E4B-it}' in names else 1)"
+    networks:
+      - aoitalk-network
+    restart: unless-stopped
+
+secrets:
+  openai_compatible_local_api_key:
+    file: ${AOITALK_SECRETS_DIR:?AOITALK_SECRETS_DIR is required}/openai_compatible_local_api_key

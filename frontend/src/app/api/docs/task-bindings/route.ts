@@ -1,9 +1,14 @@
 import { NextResponse } from "next/server";
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { and, inArray, isNull } from "drizzle-orm";
 import { db } from "@/db";
 import { knowledgeNodes, tasks } from "@/db/schema";
 import { getSession } from "@/lib/auth";
-import { ensureDocsWorkspace } from "@/lib/server/knowledge-docs-utils";
+import { getAccessibleProject } from "@/lib/server/project-access";
+import {
+  ensureDocsWorkspace,
+  getDocsLibraryIdsForReadableProjects,
+  getDocsNodeAccessMap,
+} from "@/lib/server/knowledge-docs-utils";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -22,12 +27,17 @@ export async function POST(request: Request) {
   }
 
   const workspace = await ensureDocsWorkspace(user);
+  const workspaceIds = await getDocsLibraryIdsForReadableProjects(user.id, [workspace.id]);
   const accessibleNodes = await db
     .select({ id: knowledgeNodes.id })
     .from(knowledgeNodes)
-    .where(and(eq(knowledgeNodes.workspaceId, workspace.id), inArray(knowledgeNodes.id, nodeIds), isNull(knowledgeNodes.archivedAt)));
+    .where(and(inArray(knowledgeNodes.docsLibraryId, workspaceIds), inArray(knowledgeNodes.id, nodeIds), isNull(knowledgeNodes.archivedAt)));
+  const accessMap = await getDocsNodeAccessMap(
+    accessibleNodes.map((node) => node.id),
+    user,
+  );
   const accessibleNodeIds = accessibleNodes
-    .filter((node) => nodeIds.includes(node.id))
+    .filter((node) => accessMap.has(node.id))
     .map((node) => node.id);
 
   if (accessibleNodeIds.length === 0 || !workspace.id) {
@@ -45,7 +55,35 @@ export async function POST(request: Request) {
     .from(tasks)
     .where(and(inArray(tasks.knowledgeNodeId, accessibleNodeIds), isNull(tasks.deletedAt), isNull(tasks.archivedAt)));
 
-  const byNodeId = new Map(rows.filter((task) => task.knowledgeNodeId).map((task) => [task.knowledgeNodeId as string, task]));
+  const nodeAccessById = new Map(
+    Array.from(accessMap.entries()).map(([nodeId, nodeAccess]) => [nodeId, nodeAccess]),
+  );
+  const identityRows = rows.filter((task) => {
+    if (!task.knowledgeNodeId) return false;
+    const nodeAccess = nodeAccessById.get(task.knowledgeNodeId);
+    return Boolean(nodeAccess && task.projectId === nodeAccess.node.projectId);
+  });
+  const projectIds = Array.from(new Set(
+    identityRows
+      .map((task) => task.projectId)
+      .filter((projectId): projectId is string => Boolean(projectId)),
+  ));
+  const projectAccessRows = await Promise.all(
+    projectIds.map(async (projectId) => [projectId, await getAccessibleProject(projectId, user.id)] as const),
+  );
+  const projectAccessById = new Map(projectAccessRows);
+  const visibleRows = identityRows.filter((task) => {
+    if (!task.knowledgeNodeId) return false;
+    const nodeAccess = nodeAccessById.get(task.knowledgeNodeId);
+    if (!nodeAccess) return false;
+    if (task.projectId) return Boolean(projectAccessById.get(task.projectId));
+    return (
+      nodeAccess.node.projectId === null
+      && nodeAccess.workspace.libraryType === "personal"
+      && nodeAccess.workspace.ownerUserId === user.id
+    );
+  });
+  const byNodeId = new Map(visibleRows.map((task) => [task.knowledgeNodeId as string, task]));
   return NextResponse.json({
     bindings: nodeIds.map((nodeId) => {
       const task = byNodeId.get(nodeId) ?? null;

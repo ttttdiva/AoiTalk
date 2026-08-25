@@ -95,10 +95,9 @@ aliases:
   - 資料更新
 bound_tools:
   - get_project_context
-  - find_workspace_items
-  - inspect_workspace_tree
-  - read_workspace_file
-  - view_file
+  - search_files
+  - list_directory
+  - read_file
   - execute_command
 examples:
   - "/draft_document 詳細設計書を最新のヒアリングシートの内容で更新したい"

@@ -18,8 +18,14 @@ def setup_discord_logging(project_root: Path | None = None) -> Path:
     if project_root is None:
         project_root = Path(__file__).resolve().parents[2]
 
-    log_dir = project_root / "logs" / "discord"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    from src.utils.log_layout import get_log_layout
+    from src.utils.log_housekeeping import run_log_housekeeping
+
+    layout = get_log_layout(project_root)
+    layout.ensure_dirs()
+    run_log_housekeeping(layout)
+
+    log_dir = layout.discord_dir
 
     if _LOG_PATH is None or _LOG_PATH.parent != log_dir:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

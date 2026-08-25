@@ -13,6 +13,13 @@ import { create } from 'zustand';
 import NetInfo, { type NetInfoState } from '@react-native-community/netinfo';
 
 interface NetworkStoreState {
+  /**
+   * 何らかのネットワークへ接続している（NetInfo.isConnected）。
+   *
+   * `online` と分けているのは、AoiTalkサーバーがLAN内にある構成があるため。
+   * インターネットへ出られなくても、同じLANのサーバーへは到達できる。
+   */
+  connected: boolean;
   online: boolean;
   serverReachable: boolean;
   serverCheckedAt: number | null;
@@ -24,6 +31,7 @@ interface NetworkStoreState {
 }
 
 export const useNetworkStore = create<NetworkStoreState>((set, get) => ({
+  connected: true,
   online: true,
   serverReachable: false,
   serverCheckedAt: null,
@@ -33,10 +41,12 @@ export const useNetworkStore = create<NetworkStoreState>((set, get) => ({
   start: () => {
     if (get()._unsubscribe) return;
     const handler = (state: NetInfoState) => {
-      const online = Boolean(state.isConnected && state.isInternetReachable !== false);
+      const connected = Boolean(state.isConnected);
+      const online = Boolean(connected && state.isInternetReachable !== false);
       set({
+        connected,
         online,
-        serverReachable: online ? get().serverReachable : false,
+        serverReachable: connected ? get().serverReachable : false,
         lastChange: Date.now(),
       });
     };
@@ -52,14 +62,25 @@ export const useNetworkStore = create<NetworkStoreState>((set, get) => ({
   },
 
   setServerReachable: (ok: boolean) =>
-    set({ serverReachable: ok, serverCheckedAt: Date.now(), lastChange: Date.now() }),
+    set((state) => {
+      // 成功応答のたびに同じ到達状態を再通知すると、チャット画面を含む
+      // 購読コンポーネントが不要に再描画される。状態が変わらない成功は
+      // そのまま維持し、失敗や復旧時だけ疎通時刻も更新する。
+      if (ok && state.serverReachable) return state;
+      const now = Date.now();
+      return { serverReachable: ok, serverCheckedAt: now, lastChange: now };
+    }),
 }));
 
-/** 直近の疎通失敗を、送信前に再度長時間待たないための短期キャッシュとして使う。 */
-export function isServerKnownUnreachable(maxAgeMs = 90_000): boolean {
+/**
+ * 直近の疎通失敗を、送信前に再度長時間待たないための短期キャッシュとして使う。
+ * ローカル環境ではバックエンド再起動などで一時的な失敗が起きやすいため、
+ * ブロック時間が長引かないよう TTL は短め（既定 30 秒）に保つ。
+ */
+export function isServerKnownUnreachable(maxAgeMs = 30_000): boolean {
   const state = useNetworkStore.getState();
   return (
-    state.online &&
+    state.connected &&
     state.serverReachable === false &&
     state.serverCheckedAt !== null &&
     Date.now() - state.serverCheckedAt <= maxAgeMs

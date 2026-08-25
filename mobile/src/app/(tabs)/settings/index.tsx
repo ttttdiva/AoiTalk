@@ -5,13 +5,21 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { ActivityIndicator, ScrollView, StyleSheet, View } from "react-native";
+import {
+  ActivityIndicator,
+  Alert,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  View,
+} from "react-native";
 import {
   Button,
   Dialog,
   Divider,
   List,
   Portal,
+  ProgressBar,
   RadioButton,
   Surface,
   Switch,
@@ -19,17 +27,22 @@ import {
   TextInput,
 } from "react-native-paper";
 import { useRouter } from "expo-router";
+import { ScreenHeader } from "../../../components/screen-header";
+import { ScreenShell } from "../../../components/screen-primitives";
 import { useAuth } from "../../../contexts/AuthContext";
-import { useProject } from "../../../contexts/ProjectContext";
 import {
+  getClipIngestConfig,
+  getDirectReasoningEffortOptions,
   getFallbackConfig,
   getMainSlot,
   getProviderProfile,
   isDirectProvider,
+  saveClipIngestConfig,
   saveFallbackConfig,
   saveMainSlot,
   saveProviderProfile,
   testMobileLlmConnection,
+  type MobileLlmClipIngestConfig,
   type MobileLlmFallbackConfig,
   type MobileLlmProviderProfile,
   type MobileLlmSlotSelection,
@@ -54,6 +67,10 @@ import {
 import { taskApi } from "../../../lib/task-api";
 import { getCurrentVersion } from "../../../lib/update-service";
 import {
+  forceDocsResync,
+  type DocsResyncProgress,
+} from "../../../sync/engine";
+import {
   DEFAULT_AUDIO_PLAYER_SETTINGS,
   getAudioPlayerSettings,
   serializeAudioPlayerSettings,
@@ -61,9 +78,39 @@ import {
 } from "../../../lib/audio-player-settings";
 import type { UserSettings } from "../../../types/api";
 
-type ModelSlot = "main" | "fallback";
+type ModelSlot = "main" | "fallback" | "clipIngest";
 
 const CUSTOM_MODEL_VALUE = "__custom__";
+
+function SelectorRow({
+  label,
+  value,
+  onPress,
+  disabled = false,
+}: {
+  label: string;
+  value: string;
+  onPress: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`${label}を選択。現在は${value}`}
+      disabled={disabled}
+      onPress={onPress}
+      style={[styles.selectorRow, disabled ? styles.selectorRowDisabled : null]}
+    >
+      <View style={styles.selectorRowText}>
+        <Text style={styles.settingLabel}>{label}</Text>
+        <Text style={styles.settingValue} numberOfLines={1}>
+          {value}
+        </Text>
+      </View>
+      <Text style={styles.selectorChevron}>›</Text>
+    </Pressable>
+  );
+}
 
 const EMPTY_PROVIDER_PROFILES: Record<
   DirectMobileLlmProvider,
@@ -79,17 +126,19 @@ const EMPTY_PROVIDER_PROFILES: Record<
   {} as Record<DirectMobileLlmProvider, MobileLlmProviderProfile>,
 );
 
+function formatDocsResyncError(error: unknown): string {
+  if (
+    error instanceof Error &&
+    error.message.includes("Docs sync snapshot changed")
+  ) {
+    return "サーバー側でDocsが更新されたため、再同期を完了できませんでした。少し待ってからもう一度実行してください。";
+  }
+  return error instanceof Error ? error.message : "Docsの再取得に失敗しました。";
+}
+
 export default function SettingsScreen() {
   const router = useRouter();
   const { user, logout, isAuthenticated, isAnonymous } = useAuth();
-  const {
-    spaces,
-    projects,
-    selectedSpaceId,
-    selectedProjectId,
-    setSelectedSpaceId,
-    setSelectedProjectId,
-  } = useProject();
   const [userSettings, setUserSettings] = useState<UserSettings>({});
   const [customInstructions, setCustomInstructions] = useState("");
   const [settingsSaving, setSettingsSaving] = useState(false);
@@ -98,16 +147,27 @@ export default function SettingsScreen() {
   const [audioPlayerSettings, setAudioPlayerSettings] =
     useState<AudioPlayerSettings>(DEFAULT_AUDIO_PLAYER_SETTINGS);
   const [audioSettingsSaving, setAudioSettingsSaving] = useState(false);
+  const [docsResyncing, setDocsResyncing] = useState(false);
+  const [docsResyncProgress, setDocsResyncProgress] =
+    useState<DocsResyncProgress | null>(null);
   const [audioSettingsDialogVisible, setAudioSettingsDialogVisible] =
     useState(false);
   const [mainSlot, setMainSlot] = useState<MobileLlmSlotSelection>({
     provider: "server",
     model: "",
+    reasoningEffort: "",
   });
   const [fallback, setFallback] = useState<MobileLlmFallbackConfig>({
     enabled: false,
     provider: "openai",
     model: "",
+    reasoningEffort: "",
+  });
+  const [clipIngest, setClipIngest] = useState<MobileLlmClipIngestConfig>({
+    enabled: false,
+    provider: "openai",
+    model: "",
+    reasoningEffort: "",
   });
   const [providerProfiles, setProviderProfiles] =
     useState<Record<DirectMobileLlmProvider, MobileLlmProviderProfile>>(
@@ -115,6 +175,9 @@ export default function SettingsScreen() {
     );
   // スロット編集ダイアログのドラフト状態。
   const [slotDialog, setSlotDialog] = useState<ModelSlot | null>(null);
+  const [slotSelector, setSlotSelector] = useState<
+    "provider" | "model" | "effort" | null
+  >(null);
   const [draftProvider, setDraftProvider] =
     useState<MobileLlmProvider>("server");
   const [draftSelectedModel, setDraftSelectedModel] = useState("");
@@ -122,6 +185,9 @@ export default function SettingsScreen() {
   const [draftApiKey, setDraftApiKey] = useState("");
   const [draftBaseUrl, setDraftBaseUrl] = useState("");
   const [draftFallbackEnabled, setDraftFallbackEnabled] = useState(true);
+  // クリップ取り込みスロットの「個別に指定する」トグルと reasoning effort。
+  const [draftClipIngestEnabled, setDraftClipIngestEnabled] = useState(false);
+  const [draftEffort, setDraftEffort] = useState("");
   const [slotSaving, setSlotSaving] = useState(false);
   const [slotSaveError, setSlotSaveError] = useState<string | null>(null);
   const [connTesting, setConnTesting] = useState(false);
@@ -140,7 +206,23 @@ export default function SettingsScreen() {
   const [serverEngineSaving, setServerEngineSaving] = useState(false);
   const [serverEngineDialogVisible, setServerEngineDialogVisible] =
     useState(false);
-  const [scopeDialogVisible, setScopeDialogVisible] = useState(false);
+
+  const visibleDirectProviders = DIRECT_PROVIDER_ORDER;
+  const visibleStandardDirectProviders = useMemo(
+    () =>
+      visibleDirectProviders.filter(
+        (provider) => !getProviderDefinition(provider).advanced,
+      ),
+    [visibleDirectProviders],
+  );
+  const visibleAdvancedDirectProviders = useMemo(
+    () =>
+      visibleDirectProviders.filter((provider) =>
+        getProviderDefinition(provider).advanced,
+      ),
+    [visibleDirectProviders],
+  );
+  const visibleServerEngineOptions = serverEngine?.available ?? [];
 
   const loadProviderProfiles = useCallback(async () => {
     const entries = await Promise.all(
@@ -159,12 +241,14 @@ export default function SettingsScreen() {
 
   useEffect(() => {
     void (async () => {
-      const [slot, fallbackConfig] = await Promise.all([
+      const [slot, fallbackConfig, clipIngestConfig] = await Promise.all([
         getMainSlot(),
         getFallbackConfig(),
+        getClipIngestConfig(),
       ]);
       setMainSlot(slot);
       setFallback(fallbackConfig);
+      setClipIngest(clipIngestConfig);
       await loadProviderProfiles();
       if (!isAuthenticated) {
         return;
@@ -260,13 +344,17 @@ export default function SettingsScreen() {
 
   const openSlotDialog = useCallback(
     (slot: ModelSlot) => {
+      setSlotSelector(null);
       setSlotSaveError(null);
       setConnResult(null);
+      setDraftEffort("");
       if (slot === "main") {
         const provider = mainSlot.provider;
         setDraftProvider(provider);
         initDraftModel(provider, mainSlot.model);
+        setDraftEffort(mainSlot.reasoningEffort ?? "");
         setDraftFallbackEnabled(true);
+        setDraftClipIngestEnabled(false);
         if (isDirectProvider(provider)) {
           const profile = providerProfiles[provider];
           const apiKey = profile?.apiKey ?? "";
@@ -281,10 +369,17 @@ export default function SettingsScreen() {
           setDraftModelChoices([]);
         }
       } else {
-        const provider = fallback.provider;
+        const config = slot === "clipIngest" ? clipIngest : fallback;
+        const provider = config.provider;
         setDraftProvider(provider);
-        initDraftModel(provider, fallback.model);
+        initDraftModel(provider, config.model);
         setDraftFallbackEnabled(fallback.enabled);
+        setDraftClipIngestEnabled(clipIngest.enabled);
+        setDraftEffort(
+          slot === "clipIngest"
+            ? clipIngest.reasoningEffort
+            : fallback.reasoningEffort ?? "",
+        );
         const profile = providerProfiles[provider];
         const apiKey = profile?.apiKey ?? "";
         const baseUrl =
@@ -295,7 +390,14 @@ export default function SettingsScreen() {
       }
       setSlotDialog(slot);
     },
-    [fallback, initDraftModel, loadModelChoices, mainSlot, providerProfiles],
+    [
+      clipIngest,
+      fallback,
+      initDraftModel,
+      loadModelChoices,
+      mainSlot,
+      providerProfiles,
+    ],
   );
 
   // ダイアログ内でプロバイダーを切り替えたら、そのプロバイダーの
@@ -305,6 +407,8 @@ export default function SettingsScreen() {
       setDraftProvider(provider);
       setConnResult(null);
       setSlotSaveError(null);
+      // プロバイダーが変わると effort の選択肢も変わるので既定へ戻す。
+      setDraftEffort("");
       if (!isDirectProvider(provider)) {
         setDraftApiKey("");
         setDraftBaseUrl("");
@@ -328,6 +432,17 @@ export default function SettingsScreen() {
     draftSelectedModel === CUSTOM_MODEL_VALUE
       ? draftCustomModel.trim()
       : draftSelectedModel.trim();
+
+  // 「メインと同じ」を選んでいる間は、プロバイダー・モデル欄を出さない。
+  const slotFieldsVisible = slotDialog !== "clipIngest" || draftClipIngestEnabled;
+
+  const draftEffortOptions = useMemo(
+    () =>
+      isDirectProvider(draftProvider)
+        ? getDirectReasoningEffortOptions(draftProvider, draftEffectiveModel)
+        : [],
+    [draftEffectiveModel, draftProvider],
+  );
 
   // 動的一覧が届いた後、カスタム入力中のモデルが一覧に含まれていれば
   // ラジオ選択へ昇格させる（一覧取得前は候補外＝カスタム扱いだったもの）。
@@ -359,6 +474,17 @@ export default function SettingsScreen() {
     );
   }, [draftModelChoices, modelFilter]);
 
+  const orderedModelChoices = useMemo(() => {
+    const selected = draftEffectiveModel;
+    if (!selected || !filteredModelChoices.includes(selected)) {
+      return filteredModelChoices;
+    }
+    return [
+      selected,
+      ...filteredModelChoices.filter((model) => model !== selected),
+    ];
+  }, [draftEffectiveModel, filteredModelChoices]);
+
   const handleRefreshModels = useCallback(() => {
     void loadModelChoices(draftProvider, draftApiKey, draftBaseUrl);
   }, [draftApiKey, draftBaseUrl, draftProvider, loadModelChoices]);
@@ -386,12 +512,35 @@ export default function SettingsScreen() {
     if (!slot) return;
     setSlotSaveError(null);
 
+    // クリップ取り込みで「メインと同じ」を選んだ場合はモデル指定不要。
+    if (slot === "clipIngest" && !draftClipIngestEnabled) {
+      setSlotSaving(true);
+      try {
+        const next: MobileLlmClipIngestConfig = {
+          ...clipIngest,
+          enabled: false,
+        };
+        await saveClipIngestConfig(next);
+        setClipIngest(next);
+        setSlotSelector(null);
+        setSlotDialog(null);
+      } catch (error) {
+        setSlotSaveError(
+          error instanceof Error ? error.message : "保存に失敗しました。",
+        );
+      } finally {
+        setSlotSaving(false);
+      }
+      return;
+    }
+
     // メインスロットで Server を選択した場合はモデル不要。
     if (slot === "main" && !isDirectProvider(draftProvider)) {
       setSlotSaving(true);
       try {
-        await saveMainSlot("server", "");
-        setMainSlot({ provider: "server", model: "" });
+        await saveMainSlot("server", "", "");
+        setMainSlot({ provider: "server", model: "", reasoningEffort: "" });
+        setSlotSelector(null);
         setSlotDialog(null);
       } catch (error) {
         setSlotSaveError(
@@ -415,6 +564,10 @@ export default function SettingsScreen() {
       setSlotSaveError("Base URL を入力してください。");
       return;
     }
+    const efforts = getDirectReasoningEffortOptions(draftProvider, model);
+    const reasoningEffort = efforts.includes(draftEffort)
+      ? draftEffort
+      : efforts[0] ?? "";
 
     setSlotSaving(true);
     try {
@@ -427,13 +580,24 @@ export default function SettingsScreen() {
         baseUrl,
       };
       if (slot === "main") {
-        await saveMainSlot(draftProvider, model);
-        setMainSlot({ provider: draftProvider, model });
+        await saveMainSlot(draftProvider, model, reasoningEffort);
+        setMainSlot({ provider: draftProvider, model, reasoningEffort });
+      } else if (slot === "clipIngest") {
+        const nextClipIngest: MobileLlmClipIngestConfig = {
+          enabled: true,
+          provider: draftProvider,
+          model,
+          // 対応しないモデルへ effort を残すと無効な値を送ってしまうので捨てる。
+          reasoningEffort: efforts.includes(draftEffort) ? draftEffort : "",
+        };
+        await saveClipIngestConfig(nextClipIngest);
+        setClipIngest(nextClipIngest);
       } else {
         const nextFallback: MobileLlmFallbackConfig = {
           enabled: draftFallbackEnabled,
           provider: draftProvider,
           model,
+          reasoningEffort,
         };
         await saveFallbackConfig(nextFallback);
         setFallback(nextFallback);
@@ -442,6 +606,7 @@ export default function SettingsScreen() {
         ...prev,
         [draftProvider]: nextProfile,
       }));
+      setSlotSelector(null);
       setSlotDialog(null);
     } catch (error) {
       setSlotSaveError(
@@ -451,9 +616,12 @@ export default function SettingsScreen() {
       setSlotSaving(false);
     }
   }, [
+    clipIngest,
     draftApiKey,
     draftBaseUrl,
+    draftClipIngestEnabled,
     draftEffectiveModel,
+    draftEffort,
     draftFallbackEnabled,
     draftProvider,
     slotDialog,
@@ -481,6 +649,44 @@ export default function SettingsScreen() {
   const handleLogout = async () => {
     await logout();
     router.replace("/(auth)/login");
+  };
+
+  const handleForceDocsResync = () => {
+    if (!isAuthenticated || docsResyncing) return;
+    Alert.alert(
+      "Docs再同期",
+      "端末のDocsと未送信の編集を破棄して、サーバーから再取得します。サーバー上のデータは削除されません。",
+      [
+        { text: "キャンセル", style: "cancel" },
+        {
+          text: "再同期",
+          style: "destructive",
+          onPress: () => {
+            void (async () => {
+              setDocsResyncing(true);
+              setDocsResyncProgress({
+                phase: "preparing",
+                completed: 0,
+                total: null,
+                page: 0,
+              });
+              try {
+                await forceDocsResync(setDocsResyncProgress);
+                Alert.alert("Docs再同期完了", "サーバーからDocsを再取得しました。");
+              } catch (error) {
+                Alert.alert(
+                  "Docs再同期失敗",
+                  formatDocsResyncError(error),
+                );
+              } finally {
+                setDocsResyncing(false);
+                setDocsResyncProgress(null);
+              }
+            })();
+          },
+        },
+      ],
+    );
   };
 
   const handleSaveUserSettings = async () => {
@@ -549,24 +755,6 @@ export default function SettingsScreen() {
     return options.length > 0 ? `${scope} / ${options.join(" / ")}` : scope;
   }, [audioPlayerSettings]);
 
-  const selectedScopeValue = selectedSpaceId
-    ? `space:${selectedSpaceId}`
-    : selectedProjectId
-      ? `project:${selectedProjectId}`
-      : "";
-
-  const selectedScopeLabel = useMemo(() => {
-    if (selectedSpaceId) {
-      const space = spaces.find((item) => item.id === selectedSpaceId);
-      return space ? `Space: ${space.name}` : "Selected space";
-    }
-    if (selectedProjectId) {
-      const project = projects.find((item) => item.id === selectedProjectId);
-      return project ? `Project: ${project.name}` : "Selected project";
-    }
-    return "All projects";
-  }, [projects, selectedProjectId, selectedSpaceId, spaces]);
-
   const directSlotSummary = useCallback(
     (provider: DirectMobileLlmProvider, model: string) => {
       const modelLabel = model.trim() || "モデル未設定";
@@ -582,40 +770,46 @@ export default function SettingsScreen() {
     if (!isDirectProvider(mainSlot.provider)) {
       return `Server / ${currentServerEngineLabel}`;
     }
-    return directSlotSummary(mainSlot.provider, mainSlot.model);
+    const base = directSlotSummary(mainSlot.provider, mainSlot.model);
+    return mainSlot.reasoningEffort
+      ? `${base} / effort: ${mainSlot.reasoningEffort}`
+      : base;
   }, [currentServerEngineLabel, directSlotSummary, mainSlot]);
 
   const fallbackSlotSummary = useMemo(() => {
     if (!fallback.enabled) return "無効（メインのみ使用）";
-    return directSlotSummary(fallback.provider, fallback.model);
+    const base = directSlotSummary(fallback.provider, fallback.model);
+    return fallback.reasoningEffort
+      ? `${base} / effort: ${fallback.reasoningEffort}`
+      : base;
   }, [directSlotSummary, fallback]);
+
+  const clipIngestSlotSummary = useMemo(() => {
+    if (!clipIngest.enabled) return `メインと同じ（${mainSlotSummary}）`;
+    const base = directSlotSummary(clipIngest.provider, clipIngest.model);
+    return clipIngest.reasoningEffort
+      ? `${base} / effort: ${clipIngest.reasoningEffort}`
+      : base;
+  }, [clipIngest, directSlotSummary, mainSlotSummary]);
 
   const customInstructionsSummary = customInstructions.trim()
     ? "設定済み"
     : "未設定";
 
-  const handleSelectScope = (value: string) => {
-    if (value.startsWith("space:")) {
-      setSelectedSpaceId(value.slice("space:".length));
-    } else if (value.startsWith("project:")) {
-      setSelectedProjectId(value.slice("project:".length));
-    } else {
-      setSelectedProjectId(null);
-    }
-    setScopeDialogVisible(false);
-  };
-
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      <Surface style={styles.header} elevation={1}>
-        <Text variant="titleLarge" style={styles.headerTitle}>
-          Settings
-        </Text>
-        <Text style={styles.headerSubtitle}>
-          普段触る設定を上に、管理・接続・アプリ情報を下に分けています。
-        </Text>
-      </Surface>
+    <ScreenShell
+      scroll
+      style={styles.container}
+      contentContainerStyle={styles.content}
+      header={
+        <ScreenHeader
+          title="Settings"
+          subtitle="普段使う設定を上に、管理・接続・アプリ情報を下にまとめています。"
+          showSettings={false}
+        />
+      }
+    >
 
       <Surface style={styles.section} elevation={0}>
         <Text style={styles.sectionTitle}>アカウント</Text>
@@ -671,12 +865,87 @@ export default function SettingsScreen() {
         </Surface>
       </Surface>
 
+      {isAuthenticated ? (
+        <>
+          <Divider style={styles.divider} />
+
+          <Surface style={styles.section} elevation={0}>
+            <Text style={styles.sectionTitle}>データ管理</Text>
+            <List.Item
+              title="Docs再同期"
+              titleStyle={styles.navTitle}
+              description={
+                docsResyncProgress?.phase === "preparing"
+                  ? "再同期の準備中…"
+                  : docsResyncProgress?.phase === "finalizing"
+                    ? "端末データを仕上げています…"
+                    : docsResyncProgress?.phase === "downloading"
+                      ? docsResyncProgress.total != null
+                        ? `${docsResyncProgress.completed.toLocaleString()} / ${docsResyncProgress.total.toLocaleString()}件を取得済み`
+                        : `${docsResyncProgress.completed.toLocaleString()}件を取得済み`
+                      : "サーバーから再取得"
+              }
+              descriptionStyle={styles.navDescription}
+              left={(props) => (
+                <List.Icon
+                  {...props}
+                  icon="database-sync-outline"
+                  color="#f38ba8"
+                />
+              )}
+              right={() =>
+                docsResyncing ? (
+                  <ActivityIndicator color="#f38ba8" />
+                ) : (
+                  <List.Icon icon="chevron-right" color="#a6adc8" />
+                )
+              }
+              accessibilityLabel="Docs再同期"
+              disabled={docsResyncing}
+              onPress={handleForceDocsResync}
+            />
+            {docsResyncing ? (
+              <View style={styles.docsResyncProgress}>
+                <ProgressBar
+                  accessibilityLabel="Docs再同期の進捗"
+                  progress={
+                    docsResyncProgress?.total != null
+                      ? docsResyncProgress.total === 0
+                        ? 1
+                        : Math.min(
+                            1,
+                            docsResyncProgress.completed
+                              / docsResyncProgress.total,
+                          )
+                      : 0
+                  }
+                  indeterminate={docsResyncProgress?.total == null}
+                  color="#f38ba8"
+                  style={styles.docsResyncProgressBar}
+                />
+                <Text style={styles.docsResyncProgressText}>
+                  {docsResyncProgress?.total != null
+                    ? docsResyncProgress.total === 0
+                      ? "100%"
+                      : `${Math.floor(
+                          (docsResyncProgress.completed
+                            / docsResyncProgress.total)
+                            * 100,
+                        )}%`
+                    : "件数を確認中"}
+                </Text>
+              </View>
+            ) : null}
+          </Surface>
+        </>
+      ) : null}
+
       <Divider style={styles.divider} />
 
       <Surface style={styles.section} elevation={0}>
         <Text style={styles.sectionTitle}>会話・AI応答</Text>
         <Text style={styles.helperText}>
-          通常使うメインモデルと、メインの送信失敗時のみ使うフォールバックモデルを指定します。Direct各種は自分のクラウドAPIキーが必要です。
+          通常のモデルと、送信失敗時のフォールバックを設定します。
         </Text>
         <View style={styles.modelSlotList}>
           <Surface style={styles.modelSlotCard} elevation={0}>
@@ -722,7 +991,7 @@ export default function SettingsScreen() {
                   {fallbackSlotSummary}
                 </Text>
                 <Text style={styles.settingHint}>
-                  メインの送信失敗時のみ使用します。自分のクラウドAPIキーが必要です。
+                  メインの送信失敗時に使用します。
                 </Text>
               </View>
               <View style={styles.fallbackSlotControls}>
@@ -743,6 +1012,29 @@ export default function SettingsScreen() {
               </View>
             </View>
           </Surface>
+
+          <Surface style={styles.modelSlotCard} elevation={0}>
+            <View style={styles.modelSlotHeader}>
+              <View style={styles.modelSlotText}>
+                <Text style={styles.settingLabel}>クリップ取り込み</Text>
+                <Text style={styles.settingValue} numberOfLines={2}>
+                  {clipIngestSlotSummary}
+                </Text>
+                <Text style={styles.settingHint}>
+                  オフライン時のDocs取り込みに使います。
+                </Text>
+              </View>
+              <Button
+                accessibilityLabel="クリップ取り込み設定を開く"
+                mode="outlined"
+                compact
+                style={styles.compactButton}
+                onPress={() => openSlotDialog("clipIngest")}
+              >
+                設定
+              </Button>
+            </View>
+          </Surface>
         </View>
         <Divider style={styles.innerDivider} />
         <List.Item
@@ -751,7 +1043,7 @@ export default function SettingsScreen() {
           description={
             isAuthenticated
               ? customInstructionsSummary
-              : "サーバーログイン中のみ利用できます。"
+              : "サーバーログイン中のみ利用可"
           }
           descriptionStyle={styles.navDescription}
           left={(props) => (
@@ -763,7 +1055,7 @@ export default function SettingsScreen() {
         <List.Item
           title="キャラクター"
           titleStyle={styles.navTitle}
-          description="会話キャラクターとデフォルトキャラクター。"
+          description="会話キャラクターを設定"
           descriptionStyle={styles.navDescription}
           left={(props) => (
             <List.Icon {...props} icon="account-star-outline" color="#89b4fa" />
@@ -773,7 +1065,7 @@ export default function SettingsScreen() {
         <List.Item
           title="ユーザーメモリ"
           titleStyle={styles.navTitle}
-          description="会話で使うユーザーメモリ。"
+          description="会話で使うユーザーメモリ"
           descriptionStyle={styles.navDescription}
           left={(props) => <List.Icon {...props} icon="brain" color="#89b4fa" />}
           onPress={() => router.push("/(tabs)/settings/memory")}
@@ -794,16 +1086,6 @@ export default function SettingsScreen() {
           )}
           onPress={() => setAudioSettingsDialogVisible(true)}
         />
-        <List.Item
-          title="作業範囲"
-          titleStyle={styles.navTitle}
-          description={selectedScopeLabel}
-          descriptionStyle={styles.navDescription}
-          left={(props) => (
-            <List.Icon {...props} icon="target" color="#89b4fa" />
-          )}
-          onPress={() => setScopeDialogVisible(true)}
-        />
       </Surface>
 
       <Divider style={styles.divider} />
@@ -813,7 +1095,7 @@ export default function SettingsScreen() {
         <List.Item
           title="タスク通知 / カレンダー"
           titleStyle={styles.navTitle}
-          description="開始前通知、Google Calendar、プロジェクト別タスク既定値。"
+          description="通知とGoogle Calendar"
           descriptionStyle={styles.navDescription}
           left={(props) => (
             <List.Icon {...props} icon="bell-outline" color="#89b4fa" />
@@ -829,7 +1111,7 @@ export default function SettingsScreen() {
         <List.Item
           title="プロジェクト管理"
           titleStyle={styles.navTitle}
-          description="プロジェクトの作成・編集・メタデータ確認。"
+          description="プロジェクトを管理"
           descriptionStyle={styles.navDescription}
           left={(props) => (
             <List.Icon {...props} icon="folder-outline" color="#89b4fa" />
@@ -845,7 +1127,7 @@ export default function SettingsScreen() {
         <List.Item
           title="作業時間レポート"
           titleStyle={styles.navTitle}
-          description="記録した作業時間の集計。"
+          description="記録した作業時間の集計"
           descriptionStyle={styles.navDescription}
           left={(props) => (
             <List.Icon {...props} icon="chart-bar" color="#89b4fa" />
@@ -855,7 +1137,7 @@ export default function SettingsScreen() {
         <List.Item
           title="時間順の記録"
           titleStyle={styles.navTitle}
-          description="作業時間の記録と予定枠を時系列で確認。"
+          description="記録と予定枠を時系列で確認"
           descriptionStyle={styles.navDescription}
           left={(props) => (
             <List.Icon {...props} icon="timeline-clock-outline" color="#89b4fa" />
@@ -871,7 +1153,7 @@ export default function SettingsScreen() {
         <List.Item
           title="シナリオ"
           titleStyle={styles.navTitle}
-          description="シナリオ管理と執筆セッション。"
+          description="シナリオと執筆セッション"
           descriptionStyle={styles.navDescription}
           left={(props) => (
             <List.Icon {...props} icon="book-open-variant" color="#89b4fa" />
@@ -881,7 +1163,7 @@ export default function SettingsScreen() {
         <List.Item
           title="TRPG"
           titleStyle={styles.navTitle}
-          description="TRPGルームの作成・参加。"
+          description="TRPGルームの作成・参加"
           descriptionStyle={styles.navDescription}
           left={(props) => (
             <List.Icon
@@ -901,7 +1183,7 @@ export default function SettingsScreen() {
         <List.Item
           title="サーバー / ネットワーク"
           titleStyle={styles.navTitle}
-          description="API URLとWi-Fi別の接続先。"
+          description="API URLと接続先"
           descriptionStyle={styles.navDescription}
           left={(props) => (
             <List.Icon {...props} icon="lan-connect" color="#89b4fa" />
@@ -911,7 +1193,7 @@ export default function SettingsScreen() {
         <List.Item
           title="MCP / エージェント"
           titleStyle={styles.navTitle}
-          description="外部ツール連携とエージェント接続状態。"
+          description="外部ツール連携"
           descriptionStyle={styles.navDescription}
           left={(props) => (
             <List.Icon {...props} icon="robot-outline" color="#89b4fa" />
@@ -921,7 +1203,7 @@ export default function SettingsScreen() {
         <List.Item
           title="外部サーバー接続"
           titleStyle={styles.navTitle}
-          description="他のAoiTalkサーバーのタスクを表示・操作。"
+          description="他のAoiTalkサーバーへ接続"
           descriptionStyle={styles.navDescription}
           left={(props) => (
             <List.Icon {...props} icon="server-network" color="#89b4fa" />
@@ -935,9 +1217,23 @@ export default function SettingsScreen() {
       <Surface style={styles.section} elevation={0}>
         <Text style={styles.sectionTitle}>アプリ</Text>
         <List.Item
+          title="Apps"
+          titleStyle={styles.navTitle}
+          description="App管理・実行状況"
+          descriptionStyle={styles.navDescription}
+          left={(props) => (
+            <List.Icon
+              {...props}
+              icon="application-brackets-outline"
+              color="#89b4fa"
+            />
+          )}
+          onPress={() => router.push("/(tabs)/apps")}
+        />
+        <List.Item
           title="アプリ情報"
           titleStyle={styles.navTitle}
-          description="バージョン、更新確認、診断情報。"
+          description="バージョンと診断情報"
           descriptionStyle={styles.navDescription}
           left={(props) => (
             <List.Icon {...props} icon="information-outline" color="#89b4fa" />
@@ -978,6 +1274,150 @@ export default function SettingsScreen() {
             >
               保存
             </Button>
+          </Dialog.Actions>
+        </Dialog>
+
+        <Dialog
+          visible={slotSelector !== null}
+          onDismiss={() => setSlotSelector(null)}
+          style={styles.dialog}
+        >
+          <Dialog.Title style={styles.dialogTitle}>
+            {slotSelector === "provider"
+              ? "プロバイダーを選択"
+              : slotSelector === "model"
+                ? "モデルを選択"
+                : "Effortを選択"}
+          </Dialog.Title>
+          <Dialog.ScrollArea style={styles.dialogScrollArea}>
+            <ScrollView contentContainerStyle={styles.selectorDialogContent}>
+              {slotSelector === "provider" ? (
+                <>
+                  {slotDialog === "main" ? (
+                    <Button
+                      mode={draftProvider === "server" ? "contained" : "outlined"}
+                      buttonColor={draftProvider === "server" ? "#7c3aed" : undefined}
+                      textColor={draftProvider === "server" ? "#f5e9ff" : "#89b4fa"}
+                      style={styles.selectorButton}
+                      onPress={() => {
+                        applyDraftProvider("server");
+                        setSlotSelector(null);
+                      }}
+                    >
+                      Server / {currentServerEngineLabel}
+                    </Button>
+                  ) : null}
+                  {visibleStandardDirectProviders.map((provider) => (
+                    <Button
+                      key={provider}
+                      mode={draftProvider === provider ? "contained" : "outlined"}
+                      buttonColor={draftProvider === provider ? "#7c3aed" : undefined}
+                      textColor={draftProvider === provider ? "#f5e9ff" : "#89b4fa"}
+                      style={styles.selectorButton}
+                      onPress={() => {
+                        applyDraftProvider(provider);
+                        setSlotSelector(null);
+                      }}
+                    >
+                      {getProviderDefinition(provider).label}
+                    </Button>
+                  ))}
+                  {visibleAdvancedDirectProviders.length > 0 ? (
+                    <Text style={styles.advancedNote}>上級者向け</Text>
+                  ) : null}
+                  {visibleAdvancedDirectProviders.map((provider) => (
+                    <Button
+                      key={provider}
+                      mode={draftProvider === provider ? "contained" : "outlined"}
+                      buttonColor={draftProvider === provider ? "#7c3aed" : undefined}
+                      textColor={draftProvider === provider ? "#f5e9ff" : "#89b4fa"}
+                      style={styles.selectorButton}
+                      onPress={() => {
+                        applyDraftProvider(provider);
+                        setSlotSelector(null);
+                      }}
+                    >
+                      {getProviderDefinition(provider).label}
+                    </Button>
+                  ))}
+                </>
+              ) : null}
+              {slotSelector === "model" ? (
+                <>
+                  <TextInput
+                    label="モデルを絞り込み"
+                    value={modelFilter}
+                    onChangeText={setModelFilter}
+                    mode="outlined"
+                    style={styles.dialogInput}
+                    autoCapitalize="none"
+                    dense
+                  />
+                  {orderedModelChoices.map((id) => (
+                    <Button
+                      key={id}
+                      mode={draftEffectiveModel === id ? "contained" : "outlined"}
+                      buttonColor={draftEffectiveModel === id ? "#7c3aed" : undefined}
+                      textColor={draftEffectiveModel === id ? "#f5e9ff" : "#89b4fa"}
+                      style={styles.selectorButton}
+                      onPress={() => {
+                        setDraftSelectedModel(id);
+                        setDraftCustomModel("");
+                        setSlotSelector(null);
+                      }}
+                    >
+                      {modelLabelById.get(id) ?? id}
+                    </Button>
+                  ))}
+                  <Button
+                    mode={draftSelectedModel === CUSTOM_MODEL_VALUE ? "contained" : "outlined"}
+                    buttonColor={draftSelectedModel === CUSTOM_MODEL_VALUE ? "#7c3aed" : undefined}
+                    textColor={draftSelectedModel === CUSTOM_MODEL_VALUE ? "#f5e9ff" : "#89b4fa"}
+                    style={styles.selectorButton}
+                    onPress={() => {
+                      setDraftSelectedModel(CUSTOM_MODEL_VALUE);
+                      setSlotSelector(null);
+                    }}
+                  >
+                    カスタムモデルID
+                  </Button>
+                </>
+              ) : null}
+              {slotSelector === "effort" ? (
+                <>
+                  <Button
+                    mode={!draftEffort ? "contained" : "outlined"}
+                    buttonColor={!draftEffort ? "#7c3aed" : undefined}
+                    textColor={!draftEffort ? "#f5e9ff" : "#89b4fa"}
+                    style={styles.selectorButton}
+                    onPress={() => {
+                      setDraftEffort("");
+                      setSlotSelector(null);
+                    }}
+                  >
+                    モデル既定
+                  </Button>
+                  {draftEffortOptions.map((effort) => (
+                    <Button
+                      key={effort}
+                      mode={draftEffort === effort ? "contained" : "outlined"}
+                      buttonColor={draftEffort === effort ? "#7c3aed" : undefined}
+                      textColor={draftEffort === effort ? "#f5e9ff" : "#89b4fa"}
+                      style={styles.selectorButton}
+                      onPress={() => {
+                        setDraftEffort(effort);
+                        setSlotSelector(null);
+                      }}
+                    >
+                      {effort}
+                    </Button>
+                  ))}
+                </>
+              ) : null}
+            </ScrollView>
+          </Dialog.ScrollArea>
+          <Dialog.Actions>
+            <Button onPress={() => setSlotSelector(null)}>閉じる</Button>
           </Dialog.Actions>
         </Dialog>
 
@@ -1058,20 +1498,45 @@ export default function SettingsScreen() {
         </Dialog>
 
         <Dialog
-          visible={slotDialog !== null}
-          onDismiss={() => setSlotDialog(null)}
+          visible={slotDialog !== null && slotSelector === null}
+          onDismiss={() => {
+            setSlotSelector(null);
+            setSlotDialog(null);
+          }}
           style={styles.dialog}
         >
           <Dialog.Title style={styles.dialogTitle}>
-            {slotDialog === "fallback" ? "フォールバック設定" : "メイン設定"}
+            {slotDialog === "fallback"
+              ? "フォールバック設定"
+              : slotDialog === "clipIngest"
+                ? "クリップ取り込み設定"
+                : "メイン設定"}
           </Dialog.Title>
           <Dialog.ScrollArea style={styles.dialogScrollArea}>
             <ScrollView contentContainerStyle={styles.dialogScrollContent}>
               <Text style={styles.settingHint}>
                 {slotDialog === "fallback"
                   ? "メインの送信失敗時のみ使うプロバイダーとモデルを設定します。"
-                  : "通常の会話応答に使うプロバイダーとモデルを設定します。"}
+                  : slotDialog === "clipIngest"
+                    ? "サーバー未接続時のクリップ取り込みで使うプロバイダーとモデルを設定します。"
+                    : "通常の会話応答に使うプロバイダーとモデルを設定します。"}
               </Text>
+
+              {slotDialog === "clipIngest" ? (
+                <View style={styles.switchRow}>
+                  <View style={styles.switchText}>
+                    <Text style={styles.settingLabel}>個別のモデルを指定する</Text>
+                    <Text style={styles.settingHint}>
+                      オフの間はメインと同じモデルを使います。
+                    </Text>
+                  </View>
+                  <Switch
+                    accessibilityLabel="クリップ取り込みの個別指定切替"
+                    value={draftClipIngestEnabled}
+                    onValueChange={setDraftClipIngestEnabled}
+                  />
+                </View>
+              ) : null}
 
               {slotDialog === "fallback" ? (
                 <View style={styles.switchRow}>
@@ -1090,49 +1555,17 @@ export default function SettingsScreen() {
                 </View>
               ) : null}
 
-              <Text style={styles.dialogSubheading}>プロバイダー</Text>
-              <RadioButton.Group
-                value={draftProvider}
-                onValueChange={(value) =>
-                  applyDraftProvider(value as MobileLlmProvider)
-                }
-              >
-                {slotDialog === "main" ? (
-                  <RadioButton.Item
-                    label={`Server / ${currentServerEngineLabel}`}
-                    value="server"
-                    labelStyle={styles.radioLabel}
-                    color="#7c3aed"
-                    uncheckedColor="#585b70"
+              {slotFieldsVisible ? (
+                <>
+                  <SelectorRow
+                    label="プロバイダー"
+                    value={
+                      draftProvider === "server"
+                        ? `Server / ${currentServerEngineLabel}`
+                        : getProviderDefinition(draftProvider).label
+                    }
+                    onPress={() => setSlotSelector("provider")}
                   />
-                ) : null}
-                {DIRECT_PROVIDER_ORDER.filter(
-                  (provider) => !getProviderDefinition(provider).advanced,
-                ).map((provider) => (
-                  <RadioButton.Item
-                    key={provider}
-                    label={getProviderDefinition(provider).label}
-                    value={provider}
-                    labelStyle={styles.radioLabel}
-                    color="#7c3aed"
-                    uncheckedColor="#585b70"
-                  />
-                ))}
-                <Divider style={styles.innerDivider} />
-                <Text style={styles.advancedNote}>上級者向け</Text>
-                {DIRECT_PROVIDER_ORDER.filter(
-                  (provider) => getProviderDefinition(provider).advanced,
-                ).map((provider) => (
-                  <RadioButton.Item
-                    key={provider}
-                    label={getProviderDefinition(provider).label}
-                    value={provider}
-                    labelStyle={styles.radioLabel}
-                    color="#7c3aed"
-                    uncheckedColor="#585b70"
-                  />
-                ))}
-              </RadioButton.Group>
 
               {isDirectProvider(draftProvider) ? (
                 <>
@@ -1143,7 +1576,16 @@ export default function SettingsScreen() {
                   ) : null}
 
                   <View style={styles.modelHeaderRow}>
-                    <Text style={styles.dialogSubheading}>モデル</Text>
+                    <SelectorRow
+                      label="モデル"
+                      value={
+                        draftEffectiveModel ||
+                        (draftSelectedModel === CUSTOM_MODEL_VALUE
+                          ? "カスタムモデルID"
+                          : "未選択")
+                      }
+                      onPress={() => setSlotSelector("model")}
+                    />
                     <View style={styles.modelHeaderActions}>
                       {modelListLoading ? (
                         <ActivityIndicator size={16} color="#89b4fa" />
@@ -1162,49 +1604,7 @@ export default function SettingsScreen() {
                   {modelListError ? (
                     <Text style={styles.settingHint}>{modelListError}</Text>
                   ) : null}
-                  {draftModelChoices.length > 8 ? (
-                    <TextInput
-                      label="モデルを絞り込み"
-                      value={modelFilter}
-                      onChangeText={setModelFilter}
-                      mode="outlined"
-                      style={styles.dialogInput}
-                      autoCapitalize="none"
-                      dense
-                    />
-                  ) : null}
-                  <View style={styles.modelListBox}>
-                    <ScrollView
-                      style={styles.modelList}
-                      nestedScrollEnabled
-                      keyboardShouldPersistTaps="handled"
-                    >
-                      <RadioButton.Group
-                        value={draftSelectedModel}
-                        onValueChange={setDraftSelectedModel}
-                      >
-                        {filteredModelChoices.map((id) => (
-                          <RadioButton.Item
-                            key={id}
-                            label={modelLabelById.get(id) ?? id}
-                            value={id}
-                            labelStyle={styles.radioLabel}
-                            color="#7c3aed"
-                            uncheckedColor="#585b70"
-                          />
-                        ))}
-                        <RadioButton.Item
-                          label="カスタムモデルID"
-                          value={CUSTOM_MODEL_VALUE}
-                          labelStyle={styles.radioLabel}
-                          color="#7c3aed"
-                          uncheckedColor="#585b70"
-                        />
-                      </RadioButton.Group>
-                    </ScrollView>
-                  </View>
-                  {draftModelChoices.length === 0 ||
-                  draftSelectedModel === CUSTOM_MODEL_VALUE ? (
+                  {draftSelectedModel === CUSTOM_MODEL_VALUE ? (
                     <TextInput
                       label="モデルID"
                       value={draftCustomModel}
@@ -1271,6 +1671,18 @@ export default function SettingsScreen() {
                 </>
               ) : null}
 
+              {draftEffortOptions.length > 0 && isDirectProvider(draftProvider) ? (
+                <>
+                  <SelectorRow
+                    label="Effort"
+                    value={draftEffort || "モデル既定"}
+                    onPress={() => setSlotSelector("effort")}
+                  />
+                </>
+              ) : null}
+                </>
+              ) : null}
+
               {slotSaveError ? (
                 <Text style={styles.errorText}>{slotSaveError}</Text>
               ) : null}
@@ -1311,7 +1723,7 @@ export default function SettingsScreen() {
                   }
                 }}
               >
-                {serverEngine?.available?.map((option) => (
+                {visibleServerEngineOptions.map((option) => (
                   <RadioButton.Item
                     key={`${option.provider}:${option.model}`}
                     label={option.label}
@@ -1332,127 +1744,127 @@ export default function SettingsScreen() {
           </Dialog.Actions>
         </Dialog>
 
-        <Dialog
-          visible={scopeDialogVisible}
-          onDismiss={() => setScopeDialogVisible(false)}
-          style={styles.dialog}
-        >
-          <Dialog.Title style={styles.dialogTitle}>Project / Space</Dialog.Title>
-          <Dialog.ScrollArea style={styles.dialogScrollArea}>
-            <ScrollView contentContainerStyle={styles.dialogScrollContent}>
-              <RadioButton.Group
-                value={selectedScopeValue}
-                onValueChange={handleSelectScope}
-              >
-                <RadioButton.Item
-                  label="All projects"
-                  value=""
-                  labelStyle={styles.radioLabel}
-                  color="#7c3aed"
-                  uncheckedColor="#585b70"
-                />
-                {spaces.map((space) => (
-                  <RadioButton.Item
-                    key={space.id}
-                    label={`Space: ${space.name}`}
-                    value={`space:${space.id}`}
-                    labelStyle={styles.radioLabel}
-                    color="#7c3aed"
-                    uncheckedColor="#585b70"
-                  />
-                ))}
-                {projects.map((project) => (
-                  <RadioButton.Item
-                    key={project.id}
-                    label={`Project: ${project.name}`}
-                    value={`project:${project.id}`}
-                    labelStyle={styles.radioLabel}
-                    color="#7c3aed"
-                    uncheckedColor="#585b70"
-                  />
-                ))}
-              </RadioButton.Group>
-            </ScrollView>
-          </Dialog.ScrollArea>
-          <Dialog.Actions>
-            <Button onPress={() => setScopeDialogVisible(false)}>Close</Button>
-          </Dialog.Actions>
-        </Dialog>
       </Portal>
-    </ScrollView>
+    </ScreenShell>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "#11111b" },
-  content: { paddingBottom: 40 },
-  header: { padding: 16, paddingTop: 56, backgroundColor: "#1e1e2e" },
-  headerTitle: { color: "#cdd6f4", fontWeight: "bold" },
-  headerSubtitle: { color: "#a6adc8", fontSize: 13, lineHeight: 19, marginTop: 6 },
-  section: { backgroundColor: "#11111b", padding: 16 },
-  sectionTitle: {
-    color: "#7c3aed",
-    fontSize: 14,
-    fontWeight: "bold",
-    marginBottom: 12,
-  },
-  helperText: { color: "#a6adc8", fontSize: 13, lineHeight: 19 },
-  accountCard: {
-    backgroundColor: "#1e1e2e",
-    borderColor: "#313244",
+  container: { flex: 1, backgroundColor: "#10101b" },
+  content: { paddingBottom: 32 },
+  section: {
+    marginHorizontal: 14,
+    marginTop: 12,
+    paddingHorizontal: 10,
+    paddingTop: 14,
+    paddingBottom: 6,
+    backgroundColor: "#1b1a2b",
+    borderColor: "#343149",
     borderWidth: 1,
-    borderRadius: 12,
-    padding: 14,
+    borderRadius: 14,
   },
-  accountHeaderRow: { flexDirection: "row", alignItems: "center", gap: 12 },
+  sectionTitle: {
+    color: "#bd9aff",
+    fontSize: 15,
+    fontWeight: "600",
+    marginHorizontal: 7,
+    marginBottom: 8,
+  },
+  helperText: {
+    color: "#a9a7c5",
+    fontSize: 11,
+    lineHeight: 16,
+    marginHorizontal: 7,
+    marginBottom: 4,
+  },
+  accountCard: {
+    backgroundColor: "transparent",
+    padding: 0,
+  },
+  accountHeaderRow: {
+    minHeight: 52,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
   accountAvatar: {
-    width: 42,
-    height: 42,
-    borderRadius: 21,
-    backgroundColor: "#7c3aed",
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: "#9558ff",
     alignItems: "center",
     justifyContent: "center",
   },
-  accountAvatarText: { color: "#f5f3ff", fontSize: 18, fontWeight: "bold" },
+  accountAvatarText: { color: "#ffffff", fontSize: 16, fontWeight: "600" },
   accountMainText: { flex: 1 },
   accountActions: {
     flexDirection: "row",
-    justifyContent: "space-between",
     alignItems: "center",
-    marginTop: 12,
+    gap: 8,
+    marginTop: 6,
+    paddingBottom: 2,
   },
-  radioLabel: { color: "#cdd6f4" },
-  navTitle: { color: "#cdd6f4" },
-  navDescription: { color: "#a6adc8" },
-  divider: { backgroundColor: "#313244" },
-  innerDivider: { backgroundColor: "#313244", marginVertical: 16 },
+  radioLabel: { color: "#e5e3ff" },
+  selectorRow: {
+    minHeight: 54,
+    flexDirection: "row",
+    alignItems: "center",
+    borderBottomWidth: 1,
+    borderBottomColor: "#2b2940",
+    paddingVertical: 8,
+    gap: 8,
+  },
+  selectorRowDisabled: { opacity: 0.5 },
+  selectorRowText: { flex: 1 },
+  selectorChevron: { color: "#89b4fa", fontSize: 24, lineHeight: 24 },
+  selectorDialogContent: { paddingVertical: 4, gap: 8 },
+  selectorButton: { marginVertical: 2 },
+  navTitle: { color: "#f0efff", fontSize: 13, fontWeight: "500" },
+  navDescription: { color: "#a9a7c5", fontSize: 11, lineHeight: 15 },
+  docsResyncProgress: {
+    paddingHorizontal: 16,
+    paddingBottom: 12,
+    gap: 6,
+  },
+  docsResyncProgressBar: {
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: "#343149",
+  },
+  docsResyncProgressText: {
+    color: "#a9a7c5",
+    fontSize: 11,
+    textAlign: "right",
+  },
+  divider: { height: 0, backgroundColor: "transparent" },
+  innerDivider: { backgroundColor: "#2b2940", marginVertical: 4 },
   accordion: { backgroundColor: "transparent", padding: 0 },
   loader: { paddingVertical: 16 },
   input: { marginBottom: 8 },
   saveButton: { borderColor: "#7c3aed" },
-  modelSlotList: { gap: 10, marginTop: 12 },
+  modelSlotList: { gap: 0, marginTop: 2 },
   modelSlotCard: {
-    backgroundColor: "#1e1e2e",
-    borderColor: "#313244",
-    borderWidth: 1,
-    borderRadius: 8,
-    padding: 12,
+    backgroundColor: "transparent",
+    borderBottomColor: "#2b2940",
+    borderBottomWidth: 1,
+    paddingVertical: 6,
+    paddingHorizontal: 0,
   },
   modelSlotHeader: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 12,
+    gap: 8,
   },
   modelSlotText: { flex: 1 },
   slotActions: {
     flexDirection: "row",
     flexWrap: "wrap",
     gap: 8,
-    marginTop: 8,
+    marginTop: 2,
   },
   fallbackSlotControls: {
     alignItems: "center",
-    gap: 8,
+    gap: 4,
   },
   dialogSubheading: {
     color: "#cdd6f4",
@@ -1475,9 +1887,9 @@ const styles = StyleSheet.create({
     padding: 12,
     marginBottom: 12,
   },
-  settingLabel: { color: "#a6adc8", fontSize: 12, marginBottom: 4 },
-  settingValue: { color: "#cdd6f4", fontSize: 15, fontWeight: "600" },
-  settingHint: { color: "#a6adc8", fontSize: 12, marginTop: 3 },
+  settingLabel: { color: "#a9a7c5", fontSize: 11, marginBottom: 2 },
+  settingValue: { color: "#f0efff", fontSize: 13, fontWeight: "500" },
+  settingHint: { color: "#a9a7c5", fontSize: 11, lineHeight: 15, marginTop: 2 },
   chatRouteBox: {
     backgroundColor: "#1e1e2e",
     borderColor: "#313244",
@@ -1533,7 +1945,7 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   switchText: { flex: 1 },
-  compactButton: { borderColor: "#7c3aed", alignSelf: "flex-start" },
+  compactButton: { borderColor: "#9558ff", alignSelf: "flex-start" },
   engineChangeButton: { marginTop: 10 },
   dialog: { backgroundColor: "#1e1e2e" },
   dialogTitle: { color: "#cdd6f4" },
@@ -1561,9 +1973,9 @@ const styles = StyleSheet.create({
   dialogScrollContent: { paddingVertical: 4 },
   inlineButton: { marginTop: 8, borderColor: "#7c3aed" },
   version: {
-    color: "#585b70",
+    color: "#777294",
     textAlign: "center",
-    marginTop: 24,
-    fontSize: 12,
+    marginTop: 18,
+    fontSize: 11,
   },
 });

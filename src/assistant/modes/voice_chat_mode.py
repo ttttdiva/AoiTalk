@@ -14,7 +14,9 @@ from ..response_handler import ResponseHandler
 from ..chat_turn_persistence import (
     ChatTurnPersistence,
     apply_turn_user_context_to_client,
+    reset_turn_generation_metadata,
     restore_turn_user_context_on_client,
+    without_cached_generation_metadata,
 )
 from ..chat_attachment_utils import (
     build_message_with_attachment_context,
@@ -23,6 +25,12 @@ from ..chat_attachment_utils import (
 from ..conversation_title_events import maybe_generate_and_broadcast_session_title
 from ...llm.generation_policy import generation_policy_for_profile
 from ...llm.generation_error import empty_response_failure
+from ...services.agent_run_service import (
+    redact_sensitive_chat_metadata,
+    reset_current_agent_run_id,
+    set_current_agent_run_id,
+)
+from ...services.turn_context import reset_turn_context, set_turn_context
 from src.tools.keyword.character_manager import get_character_manager
 
 
@@ -201,7 +209,9 @@ class VoiceChatMode(BaseAssistant):
                     "image_name": first_image.get("name"),
                 }
             )
-        return metadata
+        if not include_generation_metrics:
+            metadata = without_cached_generation_metadata(metadata)
+        return redact_sensitive_chat_metadata(metadata)
 
     async def _broadcast_conversation_persisted(
         self,
@@ -209,6 +219,7 @@ class VoiceChatMode(BaseAssistant):
         session_id: Optional[str],
         role: str,
         message_id: Optional[str] = None,
+        agent_run_id: Optional[str] = None,
     ) -> None:
         if not self.web_interface or not session_id:
             return
@@ -217,7 +228,12 @@ class VoiceChatMode(BaseAssistant):
             return
         result = broadcaster(
             "conversation_persisted",
-            {"session_id": session_id, "role": role, "message_id": message_id},
+            {
+                "session_id": session_id,
+                "role": role,
+                "message_id": message_id,
+                "agent_run_id": agent_run_id,
+            },
         )
         if inspect.isawaitable(result):
             await result
@@ -335,164 +351,15 @@ class VoiceChatMode(BaseAssistant):
         return engine_initialized
     
     async def _initialize_tts_engine(self, preferred_engine: str, character_config: dict) -> bool:
-        """Initialize TTS engine
-        
-        Args:
-            preferred_engine: Preferred engine name
-            character_config: Character configuration
-            
-        Returns:
-            True if engine initialized successfully
-        """
-        engine_initialized = False
-        
-        if preferred_engine == 'voiceroid':
-            print("VOICEROIDエンジンを初期化中...")
-            voiceroid_engine = await self.tts_manager.create_voiceroid_engine(character_config)
-            if voiceroid_engine:
-                self.tts_manager.register_engine("voiceroid", voiceroid_engine)
-                self.tts_manager.set_engine("voiceroid")
-                engine_initialized = True
-                print("VOICEROIDエンジンの初期化完了")
-            else:
-                print("VOICEROIDエンジンの初期化に失敗しました")
-                return False
-        
-        elif preferred_engine == 'aivoice':
-            print("A.I.VOICEエンジンを初期化中...")
-            aivoice_path = self.config.get('aivoice_engine_path')
-            aivoice_engine = await self.tts_manager.create_aivoice_engine(aivoice_path)
-            if aivoice_engine:
-                self.tts_manager.register_engine("aivoice", aivoice_engine)
-                self.tts_manager.set_engine("aivoice")
-                engine_initialized = True
-                print("A.I.VOICEエンジンの初期化完了")
-            else:
-                print("A.I.VOICEエンジンの初期化に失敗しました")
-                return False
-        
-        elif preferred_engine == 'aivisspeech':
-            print("AivisSpeechエンジンを初期化中...")
-            import os
-            import platform
-            
-            # Try primary path first
-            aivisspeech_path = os.getenv('AIVISSPEECH_ENGINE_PATH')
-            
-            # Handle path expansion based on platform
-            if aivisspeech_path:
-                # Replace Unix-style $HOME with Windows equivalent if needed
-                if platform.system() == 'Windows' and '$HOME' in aivisspeech_path:
-                    home_path = os.path.expanduser('~')
-                    aivisspeech_path = aivisspeech_path.replace('$HOME', home_path)
-                
-                # Now expand any remaining environment variables
-                aivisspeech_path = os.path.expandvars(aivisspeech_path)
-                
-                # If primary path doesn't exist, try fallback path
-                if not os.path.exists(aivisspeech_path):
-                    fallback_path = os.getenv('AIVISSPEECH_ENGINE_FALLBACK_PATH')
-                    if fallback_path:
-                        # Handle Windows path expansion for fallback
-                        if platform.system() == 'Windows' and '$HOME' in fallback_path:
-                            home_path = os.path.expanduser('~')
-                            fallback_path = fallback_path.replace('$HOME', home_path)
-                        fallback_path = os.path.expandvars(fallback_path)
-                        if os.path.exists(fallback_path):
-                            print(f"Using fallback path: {fallback_path}")
-                            aivisspeech_path = fallback_path
-            else:
-                # No primary path, try fallback directly
-                fallback_path = os.getenv('AIVISSPEECH_ENGINE_FALLBACK_PATH')
-                if fallback_path:
-                    # Handle Windows path expansion for fallback
-                    if platform.system() == 'Windows' and '$HOME' in fallback_path:
-                        home_path = os.path.expanduser('~')
-                        fallback_path = fallback_path.replace('$HOME', home_path)
-                    aivisspeech_path = os.path.expandvars(fallback_path)
-            
-            if aivisspeech_path and os.path.exists(aivisspeech_path):
-                aivisspeech_engine = await self.tts_manager.create_aivisspeech_engine(aivisspeech_path)
-                if aivisspeech_engine:
-                    self.tts_manager.register_engine("aivisspeech", aivisspeech_engine)
-                    self.tts_manager.set_engine("aivisspeech")
-                    engine_initialized = True
-                    print("AivisSpeechエンジンの初期化完了")
-                    print(f"[VoiceChatMode] AivisSpeechエンジンを登録・設定しました")
-                else:
-                    print("AivisSpeechエンジンの初期化に失敗しました")
-                    return False
-            else:
-                print(f"AivisSpeechエンジンが見つかりません: {aivisspeech_path}")
-                return False
-        
-        elif preferred_engine == 'nijivoice':
-            print("Nijivoiceエンジンを初期化中...")
-            nijivoice_api_key = self.config.get('nijivoice_api_key')
-            
-            if nijivoice_api_key:
-                nijivoice_engine = await self.tts_manager.create_nijivoice_engine(nijivoice_api_key)
-                if nijivoice_engine:
-                    self.tts_manager.register_engine("nijivoice", nijivoice_engine)
-                    self.tts_manager.set_engine("nijivoice")
-                    engine_initialized = True
-                    print("Nijivoiceエンジンの初期化完了")
-                else:
-                    print("Nijivoiceエンジンの初期化に失敗しました")
-                    return False
-            else:
-                print("NIJIVOICE_API_KEY環境変数が設定されていません")
-                return False
-        
-        # Only use VOICEVOX if explicitly specified
-        elif preferred_engine == 'voicevox':
-            print("VOICEVOXエンジンを初期化中...")
-            voicevox_engine = await self.tts_manager.create_voicevox_engine(
-                self.config.voicevox_path
-            )
-            if voicevox_engine:
-                self.tts_manager.register_engine("voicevox", voicevox_engine)
-                self.tts_manager.set_engine("voicevox")
-                engine_initialized = True
-                print("VOICEVOXエンジンの初期化完了")
-            else:
-                print("VOICEVOXエンジンの初期化に失敗しました")
-                return False
-        
-        elif preferred_engine == 'irodori_tts':
-            print("Irodori-TTSエンジンを初期化中...")
-            irodori_engine = await self.tts_manager.create_irodori_tts_engine()
-            if irodori_engine:
-                self.tts_manager.register_engine("irodori_tts", irodori_engine)
-                self.tts_manager.set_engine("irodori_tts")
-                engine_initialized = True
-                print("Irodori-TTSエンジンの初期化完了")
-            else:
-                print("Irodori-TTSエンジンの初期化に失敗しました")
-                return False
+        """Initialize TTS engine"""
+        from ...tts.engine_bootstrap import initialize_tts_engine
 
-        elif preferred_engine == 'miotts':
-            print("MioTTSエンジンを初期化中...")
-            miotts_engine = await self.tts_manager.create_miotts_engine()
-            if miotts_engine:
-                self.tts_manager.register_engine("miotts", miotts_engine)
-                self.tts_manager.set_engine("miotts")
-                engine_initialized = True
-                print("MioTTSエンジンの初期化完了")
-            else:
-                print("MioTTSエンジンの初期化に失敗しました")
-                return False
-
-        if not engine_initialized:
-            import traceback
-            print(f"指定されたTTSエンジン '{preferred_engine}' の初期化に失敗しました")
-            traceback.print_exc()
-            raise
-            
-        # Register character configuration
-        self.tts_manager.register_character(character_config.get('name', 'Unknown'), character_config)
-        
-        return engine_initialized
+        return await initialize_tts_engine(
+            self.tts_manager,
+            config=self.config,
+            preferred_engine=preferred_engine,
+            character_config=character_config,
+        )
         
     def _initialize_gui(self):
         """Initialize GUI components (placeholder for now)"""
@@ -562,7 +429,7 @@ class VoiceChatMode(BaseAssistant):
         
         # Set RMS callback for web interface
         def rms_callback(rms_value):
-            if self.web_interface:
+            if self.web_interface and self._running_flag[0]:
                 self.web_interface.update_rms(rms_value)
         
         # Set recording state callback
@@ -579,7 +446,7 @@ class VoiceChatMode(BaseAssistant):
             # Check if recording state changed
             new_voice_detected = result[0]
             if new_voice_detected != voice_detected:
-                if self.web_interface:
+                if self.web_interface and self._running_flag[0]:
                     self.web_interface.set_recording_state(new_voice_detected)
             
             return result
@@ -763,6 +630,8 @@ class VoiceChatMode(BaseAssistant):
         response_started_at_monotonic=None,
         command_capabilities=None,
         media_recognition_metadata=None,
+        docs_reference_ids=None,
+        verified_project_attachment=False,
     ):
         """Process user message from web interface
 
@@ -774,6 +643,21 @@ class VoiceChatMode(BaseAssistant):
         """
         if persist_content is None:
             persist_content = message
+        agent_run_context_token = (
+            set_current_agent_run_id(agent_run_id) if agent_run_id else None
+        )
+        turn_context_token = set_turn_context(
+            user_id=sender_user_id,
+            project_id=project_id,
+            include_project_context=bool(include_project_context),
+            session_id=session_id,
+            message_id=persisted_user_message_id,
+            client_message_id=client_message_id,
+            docs_reference_ids=docs_reference_ids,
+            # Trust only the structured value resolved at the authenticated
+            # request boundary; prompt attachment paths are not evidence.
+            verified_project_attachment=bool(verified_project_attachment),
+        )
         try:
             llm_client = (
                 self.response_handler.llm_client
@@ -809,60 +693,96 @@ class VoiceChatMode(BaseAssistant):
                         session_id=session_id,
                         role="user",
                         message_id=str(user_message.id) if user_message else None,
+                        agent_run_id=agent_run_id,
                     )
                 except Exception as e:
                     print(f"[VoiceChatMode] ユーザーメッセージ保存エラー: {e}")
 
-            async def persist_assistant_reply(reply: Optional[str]) -> None:
+            async def persist_assistant_reply(
+                reply: Optional[str],
+                *,
+                include_generation_metrics: bool = True,
+            ) -> None:
                 if not reply or not session_id:
                     return
-                try:
-                    metadata = self._get_chat_turn_metadata(
-                        llm_client,
-                        include_generation_metrics=True,
-                    )
-                    if isinstance(response_started_at_monotonic, (int, float)):
-                        elapsed_ms = int(
-                            max(
-                                0,
-                                round(
-                                    (
-                                        time.monotonic()
-                                        - response_started_at_monotonic
-                                    )
-                                    * 1000
-                                ),
-                            )
-                        )
-                        metadata["response_elapsed_ms"] = elapsed_ms
+                async def _persist() -> None:
                     if agent_run_id:
-                        metadata["agent_run_id"] = agent_run_id
-                    if search_tool_results:
-                        metadata["tool_results"] = list(search_tool_results)
-                    assistant_message = await chat_persistence.save_assistant_message(
-                        session_id=session_id,
-                        content=reply,
-                        metadata=metadata,
-                        sender_type=assistant_sender_type,
-                        sender_id=assistant_sender_id,
-                        sender_display_name=assistant_sender_display_name,
-                    )
-                    await self._broadcast_conversation_persisted(
-                        session_id=session_id,
-                        role="assistant",
-                        message_id=(
-                            str(assistant_message.id) if assistant_message else None
-                        ),
-                    )
-                    await maybe_generate_and_broadcast_session_title(
-                        web_interface=self.web_interface,
-                        session_id=session_id,
-                        chat_persistence=chat_persistence,
-                        config=self.config,
-                        log_prefix="VoiceChatMode",
-                    )
-                except Exception as e:
-                    print(f"[VoiceChatMode] アシスタントメッセージ保存エラー: {e}")
+                        fence_checker = getattr(
+                            self.web_interface, "_is_fenced_generation_run", None
+                        )
+                        if callable(fence_checker) and fence_checker(
+                            session_id, agent_run_id
+                        ):
+                            print(
+                                "[VoiceChatMode] fenced late assistant persistence "
+                                f"skipped: {agent_run_id}"
+                            )
+                            return
+                    try:
+                        metadata = self._get_chat_turn_metadata(
+                            llm_client,
+                            include_generation_metrics=include_generation_metrics,
+                        )
+                        if isinstance(response_started_at_monotonic, (int, float)):
+                            elapsed_ms = int(
+                                max(
+                                    0,
+                                    round(
+                                        (
+                                            time.monotonic()
+                                            - response_started_at_monotonic
+                                        )
+                                        * 1000
+                                    ),
+                                )
+                            )
+                            metadata["response_elapsed_ms"] = elapsed_ms
+                        if agent_run_id:
+                            metadata["agent_run_id"] = agent_run_id
+                        if search_tool_results:
+                            metadata["tool_results"] = list(search_tool_results)
+                        assistant_message = await chat_persistence.save_assistant_message(
+                            session_id=session_id,
+                            content=reply,
+                            metadata=metadata,
+                            sender_type=assistant_sender_type,
+                            sender_id=assistant_sender_id,
+                            sender_display_name=assistant_sender_display_name,
+                            message_id=getattr(
+                                llm_client, "current_assistant_message_id", None
+                            ),
+                        )
+                        await self._broadcast_conversation_persisted(
+                            session_id=session_id,
+                            role="assistant",
+                            message_id=(
+                                str(assistant_message.id) if assistant_message else None
+                            ),
+                            agent_run_id=agent_run_id,
+                        )
+                        await maybe_generate_and_broadcast_session_title(
+                            web_interface=self.web_interface,
+                            session_id=session_id,
+                            chat_persistence=chat_persistence,
+                            config=self.config,
+                            log_prefix="VoiceChatMode",
+                        )
+                    except Exception as e:
+                        print(f"[VoiceChatMode] アシスタントメッセージ保存エラー: {e}")
+
+                lock_getter = getattr(
+                    self.web_interface, "_generation_persistence_lock", None
+                )
+                lock = (
+                    lock_getter(session_id, agent_run_id)
+                    if callable(lock_getter) and agent_run_id
+                    else None
+                )
+                if lock is None:
+                    await _persist()
+                else:
+                    async with lock:
+                        await _persist()
 
             # Check for keywords using universal keyword detection system
             try:
@@ -894,7 +814,10 @@ class VoiceChatMode(BaseAssistant):
                                 self.web_interface.add_assistant_message(
                                     msg_data['goodbye_reply'], session_id=session_id
                                 )
-                            await persist_assistant_reply(msg_data['goodbye_reply'])
+                            await persist_assistant_reply(
+                                msg_data['goodbye_reply'],
+                                include_generation_metrics=False,
+                            )
                             
                             # goodbyeReplyを音声で読み上げ
                             if self.tts_manager and self.player:
@@ -920,7 +843,10 @@ class VoiceChatMode(BaseAssistant):
                                 self.web_interface.add_assistant_message(
                                     msg_data['greeting'], session_id=session_id
                                 )
-                            await persist_assistant_reply(msg_data['greeting'])
+                            await persist_assistant_reply(
+                                msg_data['greeting'],
+                                include_generation_metrics=False,
+                            )
                             
                             # greetingを音声で読み上げ
                             if self.tts_manager and self.player:
@@ -941,7 +867,10 @@ class VoiceChatMode(BaseAssistant):
                                 self.web_interface.add_assistant_message(
                                     msg_data['message'], session_id=session_id
                                 )
-                                await persist_assistant_reply(msg_data['message'])
+                                await persist_assistant_reply(
+                                    msg_data['message'],
+                                    include_generation_metrics=False,
+                                )
                                 
                                 # 音声でも読み上げ
                                 if self.tts_manager and self.player:
@@ -960,7 +889,10 @@ class VoiceChatMode(BaseAssistant):
                             self.web_interface.add_assistant_message(
                                 keyword_result.message, session_id=session_id
                             )
-                        await persist_assistant_reply(keyword_result.message)
+                        await persist_assistant_reply(
+                            keyword_result.message,
+                            include_generation_metrics=False,
+                        )
                         
                         # 音声でも読み上げ
                         if self.tts_manager and self.player:
@@ -986,6 +918,7 @@ class VoiceChatMode(BaseAssistant):
                     response_model,
                     base_llm_client,
                 )
+                reset_turn_generation_metadata(llm_client)
                 original_handler_client = getattr(
                     self.response_handler,
                     "llm_client",
@@ -1158,6 +1091,13 @@ class VoiceChatMode(BaseAssistant):
                         generation_signature = inspect.signature(
                             self.response_handler._generate_response_only
                         )
+                        parameters = generation_signature.parameters
+                        accepts_kwargs = any(
+                            parameter.kind == inspect.Parameter.VAR_KEYWORD
+                            for parameter in parameters.values()
+                        )
+                        if accepts_kwargs or "evidence_user_input" in parameters:
+                            generation_kwargs["evidence_user_input"] = persist_content
                         if "steering_callback" in generation_signature.parameters:
                             generation_kwargs["steering_callback"] = steering_callback
                     except (TypeError, ValueError):
@@ -1231,24 +1171,66 @@ class VoiceChatMode(BaseAssistant):
             error_reply = f"申し訳ありません。応答生成中にエラーが発生しました: {e}"
             if session_id:
                 try:
-                    llm_client = (
-                        self.response_handler.llm_client
-                        if hasattr(self.response_handler, "llm_client")
+                    async def _persist_error() -> None:
+                        llm_client = (
+                            self.response_handler.llm_client
+                            if hasattr(self.response_handler, "llm_client")
+                            else None
+                        )
+                        chat_persistence = self._get_chat_turn_persistence(llm_client)
+                        fence_checker = getattr(
+                            self.web_interface, "_is_fenced_generation_run", None
+                        )
+                        is_fenced = bool(
+                            agent_run_id
+                            and callable(fence_checker)
+                            and fence_checker(session_id, agent_run_id)
+                        )
+                        if not is_fenced:
+                            assistant_message = await chat_persistence.save_assistant_message(
+                                session_id=session_id,
+                                content=error_reply,
+                                metadata={
+                                    **self._get_chat_turn_metadata(llm_client),
+                                    **(
+                                        {"agent_run_id": agent_run_id}
+                                        if agent_run_id
+                                        else {}
+                                    ),
+                                },
+                                message_id=getattr(
+                                    llm_client, "current_assistant_message_id", None
+                                ),
+                            )
+                            await self._broadcast_conversation_persisted(
+                                session_id=session_id,
+                                role="assistant",
+                                message_id=(
+                                    str(assistant_message.id)
+                                    if assistant_message
+                                    else None
+                                ),
+                                agent_run_id=agent_run_id,
+                            )
+                        else:
+                            print(
+                                "[VoiceChatMode] fenced late error persistence skipped: "
+                                f"{agent_run_id}"
+                            )
+
+                    lock_getter = getattr(
+                        self.web_interface, "_generation_persistence_lock", None
+                    )
+                    lock = (
+                        lock_getter(session_id, agent_run_id)
+                        if callable(lock_getter) and agent_run_id
                         else None
                     )
-                    chat_persistence = self._get_chat_turn_persistence(llm_client)
-                    assistant_message = await chat_persistence.save_assistant_message(
-                        session_id=session_id,
-                        content=error_reply,
-                        metadata=self._get_chat_turn_metadata(llm_client),
-                    )
-                    await self._broadcast_conversation_persisted(
-                        session_id=session_id,
-                        role="assistant",
-                        message_id=(
-                            str(assistant_message.id) if assistant_message else None
-                        ),
-                    )
+                    if lock is None:
+                        await _persist_error()
+                    else:
+                        async with lock:
+                            await _persist_error()
                 except Exception as persist_error:
                     print(
                         f"[VoiceChatMode] エラー応答の保存に失敗しました: {persist_error}"
@@ -1261,34 +1243,76 @@ class VoiceChatMode(BaseAssistant):
                     )
             except Exception as web_error:
                 print(f"❌ Webインターフェースエラー送信失敗: {web_error}")
+        finally:
+            reset_turn_context(turn_context_token)
+            if agent_run_context_token is not None:
+                reset_current_agent_run_id(agent_run_context_token)
     
     async def _cleanup_mode_specific(self):
         """Cleanup voice chat mode specific resources"""
         # Stop voice handler
         self._running_flag[0] = False
         
-        # Stop recording
-        if self.voice_handler:
-            self.voice_handler.stop_recording()
-        
-        # Stop any ongoing playback
-        if self.player:
-            self.player.stop()
-        
-        # Cleanup TTS
-        if self.tts_manager:
-            if hasattr(self.tts_manager, 'cleanup'):
+        try:
+            # Stop recording
+            if self.voice_handler:
                 try:
-                    if asyncio.iscoroutinefunction(self.tts_manager.cleanup):
-                        await self.tts_manager.cleanup()
-                    else:
-                        self.tts_manager.cleanup()
+                    stop_result = self.voice_handler.stop_recording()
+                    if inspect.isawaitable(stop_result):
+                        await stop_result
                 except Exception as e:
-                    print(f"TTSクリーンアップエラー: {e}")
-        
-        # Cleanup web interface
-        if self.web_interface:
+                    # Do not leave the runtime voice status stuck in recording
+                    # when a device/worker teardown fails.  The outer
+                    # ``finally`` still resets all status fields.
+                    print(f"音声録音停止エラー: {e}")
+
+            # Stop any ongoing playback
+            if self.player:
+                self.player.stop()
+
+            # Cleanup TTS
+            if self.tts_manager:
+                if hasattr(self.tts_manager, 'cleanup'):
+                    try:
+                        if asyncio.iscoroutinefunction(self.tts_manager.cleanup):
+                            await self.tts_manager.cleanup()
+                        else:
+                            self.tts_manager.cleanup()
+                    except Exception as e:
+                        print(f"TTSクリーンアップエラー: {e}")
+
+            # Cleanup web interface
+            if self.web_interface:
+                try:
+                    print("[Web] Webインターフェースを終了しました")
+                except Exception as e:
+                    print(f"[Web] Webインターフェース終了エラー: {e}")
+        finally:
+            # Reset after every other teardown step so late callbacks cannot
+            # leave the final HTTP-polling snapshot stale.
+            self._reset_voice_status()
+
+    def _reset_voice_status(self) -> None:
+        """Reset the WebUI runtime voice status after voice mode exits.
+
+        ``RuntimeVoiceStatus`` is held by the WebChatServer instance rather
+        than by the recording worker.  If teardown only stops the worker, a
+        subsequent Context Rail poll can continue to see ``ready`` or stale
+        RMS/recording values.  Each setter is best effort so one failed
+        notification cannot prevent the remaining fields from being reset.
+        """
+        if not self.web_interface:
+            return
+
+        for method_name, value in (
+            ("set_voice_recognition_ready", False),
+            ("set_recording_state", False),
+            ("update_rms", 0.0),
+        ):
+            setter = getattr(self.web_interface, method_name, None)
+            if not callable(setter):
+                continue
             try:
-                print("[Web] Webインターフェースを終了しました")
+                setter(value)
             except Exception as e:
-                print(f"[Web] Webインターフェース終了エラー: {e}")
+                print(f"[Web] 音声ステータスリセットエラー ({method_name}): {e}")

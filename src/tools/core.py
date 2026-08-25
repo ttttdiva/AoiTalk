@@ -6,8 +6,20 @@ OpenAI API, Gemini API, CLI, SGLang 等のどのバックエンドでも
 """
 from dataclasses import dataclass, field
 from copy import deepcopy
-from typing import Any, Callable, Dict, Iterable, List, Optional, Union, get_type_hints
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 import asyncio
+import contextvars
 import inspect
 
 
@@ -67,19 +79,40 @@ class ToolDefinition:
             try:
                 loop = asyncio.get_running_loop()
                 import concurrent.futures
+                # ``asyncio.run`` in a fresh worker thread would otherwise
+                # start with an empty ContextVar context.  Tool execution is
+                # still part of the same logical turn, so copy the current
+                # context (including TurnContext/task/reference scope) into
+                # that thread before driving the coroutine.
+                current_context = contextvars.copy_context()
                 with concurrent.futures.ThreadPoolExecutor() as pool:
-                    future = pool.submit(asyncio.run, result)
+                    future = pool.submit(current_context.run, asyncio.run, result)
                     return future.result()
             except RuntimeError:
                 return asyncio.run(result)
         return result
 
     async def execute_async(self, **kwargs) -> Any:
-        """ツールを非同期実行"""
-        result = self.function(**kwargs)
-        if asyncio.iscoroutine(result):
-            return await result
-        return result
+        """ツールを非同期実行
+
+        同期ツールは必ずワーカースレッドへ逃がす。イベントループ上で直接呼ぶと、
+        重いコマンドやユーザー承認待ちの間ループ全体が停止し、SSE配信も
+        承認応答の受信も止まって実質フリーズする。
+        """
+        if self.is_async or inspect.iscoroutinefunction(self.function):
+            return await self._await_with_timeout(self.function(**kwargs))
+
+        return await self._await_with_timeout(
+            asyncio.to_thread(lambda: self.function(**kwargs))
+        )
+
+    async def _await_with_timeout(self, awaitable: Any) -> Any:
+        """timeout_seconds が設定されていれば外側からも打ち切る。"""
+        if asyncio.iscoroutine(awaitable) or asyncio.isfuture(awaitable):
+            if self.timeout_seconds and self.timeout_seconds > 0:
+                return await asyncio.wait_for(awaitable, timeout=self.timeout_seconds)
+            return await awaitable
+        return awaitable
 
 
 # Python型 → JSON Schema型のマッピング
@@ -95,17 +128,42 @@ _TYPE_MAP: Dict[type, str] = {
 
 def _resolve_type(py_type: Any) -> tuple:
     """Python型からJSON Schema型と optional フラグを解決する"""
-    origin = getattr(py_type, "__origin__", None)
+    origin = get_origin(py_type)
 
     # Optional[X] = Union[X, None] の処理
     if origin is Union:
-        args = py_type.__args__
+        args = get_args(py_type)
         non_none = [a for a in args if a is not type(None)]
         if len(non_none) == 1:
-            return _TYPE_MAP.get(non_none[0], "string"), True
+            inner_type, _ = _resolve_type(non_none[0])
+            return inner_type, True
         return "string", True
 
+    # List[str] / Dict[str, Any] のような generic alias は origin で判定する。
+    # ここを素の _TYPE_MAP 参照にすると list 系が全て "string" に落ち、
+    # モデルが配列引数を文字列で送って必ず0件になる。
+    if origin is not None:
+        return _TYPE_MAP.get(origin, "string"), False
+
     return _TYPE_MAP.get(py_type, "string"), False
+
+
+def _resolve_param_schema(py_type: Any, json_type: str) -> Optional[Dict[str, Any]]:
+    """配列パラメータに items を付けて、要素型までモデルへ伝える。"""
+    if json_type != "array":
+        return None
+
+    target = py_type
+    if get_origin(target) is Union:
+        non_none = [a for a in get_args(target) if a is not type(None)]
+        if len(non_none) == 1:
+            target = non_none[0]
+
+    item_args = get_args(target)
+    item_type = "string"
+    if item_args:
+        item_type = _TYPE_MAP.get(get_origin(item_args[0]) or item_args[0], "string")
+    return {"type": "array", "items": {"type": item_type}}
 
 
 def _extract_param_descriptions(docstring: str) -> Dict[str, str]:
@@ -193,6 +251,7 @@ def tool(fn: Callable) -> "ToolDefinition":
                 description=param_docs.get(name, ""),
                 required=not (is_optional or has_default),
                 default=param.default if has_default else None,
+                schema=_resolve_param_schema(py_type, json_type),
             )
         )
 

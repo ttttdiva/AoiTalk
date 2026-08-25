@@ -7,9 +7,9 @@
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-sans);
-  --font-mono: var(--font-geist-mono);
-  --font-heading: var(--font-sans);
+  --font-sans: "Inter", "IBM Plex Sans JP", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-heading: "Inter", "IBM Plex Sans JP", system-ui, sans-serif;
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -39,6 +39,82 @@
   --color-popover: var(--popover);
   --color-card-foreground: var(--card-foreground);
   --color-card: var(--card);
+  /* Shared Stitch Professional palette. */
+  --color-surface: var(--surface);
+  --color-surface-dim: var(--surface-dim);
+  --color-surface-bright: var(--surface-bright);
+  --color-surface-container-lowest: var(--surface-container-lowest);
+  --color-surface-container-low: var(--surface-container-low);
+  --color-surface-container: var(--surface-container);
+  --color-surface-container-high: var(--surface-container-high);
+  --color-surface-container-highest: var(--surface-container-highest);
+  --color-surface-charcoal: var(--surface-charcoal);
+  --color-surface-slate: var(--surface-slate);
+  --color-on-surface: var(--on-surface);
+  --color-on-surface-variant: var(--on-surface-variant);
+  --color-surface-variant: var(--surface-variant);
+  --color-surface-tint: var(--surface-tint);
+  --color-outline: var(--outline);
+  --color-primary-container: var(--primary-container);
+  --color-on-primary-container: var(--on-primary-container);
+  --color-secondary-container: var(--secondary-container);
+  --color-on-secondary-container: var(--on-secondary-container);
+  --color-tertiary: var(--tertiary);
+  --color-tertiary-container: var(--tertiary-container);
+  --color-on-tertiary: var(--on-tertiary);
+  --color-on-tertiary-container: var(--on-tertiary-container);
+  --color-error-container: var(--error-container);
+  --color-on-error: var(--on-error);
+  --color-on-error-container: var(--on-error-container);
+  --color-inverse-surface: var(--inverse-surface);
+  --color-inverse-on-surface: var(--inverse-on-surface);
+  --color-inverse-primary: var(--inverse-primary);
+  --color-primary-fixed: var(--primary-fixed);
+  --color-primary-fixed-dim: var(--primary-fixed-dim);
+  --color-on-primary-fixed: var(--on-primary-fixed);
+  --color-on-primary-fixed-variant: var(--on-primary-fixed-variant);
+  --color-secondary-fixed: var(--secondary-fixed);
+  --color-secondary-fixed-dim: var(--secondary-fixed-dim);
+  --color-on-secondary-fixed: var(--on-secondary-fixed);
+  --color-on-secondary-fixed-variant: var(--on-secondary-fixed-variant);
+  --color-tertiary-fixed: var(--tertiary-fixed);
+  --color-tertiary-fixed-dim: var(--tertiary-fixed-dim);
+  --color-on-tertiary-fixed: var(--on-tertiary-fixed);
+  --color-on-tertiary-fixed-variant: var(--on-tertiary-fixed-variant);
+  --color-outline-variant: var(--outline-variant);
+  --color-border-subtle: var(--border-subtle);
+  --color-runtime-active: var(--runtime-active);
+  --color-runtime-idle: var(--runtime-idle);
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+  --color-mention-file: var(--mention-file);
+  --color-mention-task: var(--mention-task);
+  --color-mention-project: var(--mention-project);
+  --color-mention-app: var(--mention-app);
+  --color-mention-docs: var(--mention-docs);
+  --color-mention-chat: var(--mention-chat);
+  --font-body-md: "Inter", "IBM Plex Sans JP", system-ui, sans-serif;
+  --font-body-sm: "Inter", "IBM Plex Sans JP", system-ui, sans-serif;
+  --font-body-lg: "Inter", "IBM Plex Sans JP", system-ui, sans-serif;
+  --font-headline-lg: "Inter", "IBM Plex Sans JP", system-ui, sans-serif;
+  --font-headline-md: "Inter", "IBM Plex Sans JP", system-ui, sans-serif;
+  --font-headline-sm: "Inter", "IBM Plex Sans JP", system-ui, sans-serif;
+  --font-label-md: "Inter", "IBM Plex Sans JP", system-ui, sans-serif;
+  --font-label-sm: "Inter", "IBM Plex Sans JP", system-ui, sans-serif;
+  --font-mono-code: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --text-body-sm: 13px;
+  --text-body-md: 14px;
+  --text-body-lg: 16px;
+  --text-headline-sm: 16px;
+  --text-headline-md: 20px;
+  --text-headline-lg: 24px;
+  --text-label-md: 12px;
+  --text-label-sm: 11px;
+  --text-mono-code: 13px;
+  --color-error: var(--destructive);
   --radius-sm: calc(var(--radius) * 0.6);
   --radius-md: calc(var(--radius) * 0.8);
   --radius-lg: var(--radius);
@@ -74,7 +150,9 @@
   --chart-3: #6366a8;
   --chart-4: #c48a2e;
   --chart-5: #c4574f;
-  --radius: 0.625rem;
+  /* Stitch uses a compact 4px shape language.  Keep the semantic radius
+     token so shadcn primitives and workspace-specific controls stay in sync. */
+  --radius: 0.25rem;
   --sidebar: #f1f4f8; /* サイドバー・ヘッダー面（本文の白より一段暗いグレー） */
   --sidebar-foreground: #172033;
   --sidebar-primary: #0f9fa8;
@@ -83,42 +161,155 @@
   --sidebar-accent-foreground: #172033;
   --sidebar-border: #dce3ea;
   --sidebar-ring: #0f9fa8;
+  --surface: #f7f8f8;
+  --surface-dim: #f0f1f1;
+  --surface-bright: #ffffff;
+  --surface-container-lowest: #ffffff;
+  --surface-container-low: #f5f6f6;
+  --surface-container: #eef0f0;
+  --surface-container-high: #e7e9e9;
+  --surface-container-highest: #dfe3e2;
+  --surface-charcoal: #f1f3f2;
+  --surface-slate: #e7e9e9;
+  --on-surface: #172033;
+  --on-surface-variant: #667085;
+  --primary-container: #b7f4e8;
+  --on-primary-container: #00382f;
+  --outline-variant: #c7d3cf;
+  --border-subtle: #dce3ea;
+  --runtime-active: #0f9fa8;
+  --runtime-idle: #83929a;
+  --text-primary: #172033;
+  --text-secondary: #667085;
+  --success: #166534;
+  --warning: #854d0e;
+  --info: #1d4ed8;
+  --mention-file: #1d4ed8;
+  --mention-task: #166534;
+  --mention-project: #6d28d9;
+  --mention-app: #9a3412;
+  --mention-docs: #4338ca;
+  --mention-chat: #0e6275;
+  --surface-variant: #dfe3e2;
+  --surface-tint: #0f9fa8;
+  --outline: #6f7d78;
+  --secondary-container: #c7eee7;
+  --on-secondary-container: #00302b;
+  --tertiary: #5b6971;
+  --tertiary-container: #d4dee3;
+  --on-tertiary: #263238;
+  --on-tertiary-container: #344047;
+  --error-container: #ffd9d5;
+  --on-error: #690005;
+  --on-error-container: #93000a;
+  --inverse-surface: #303030;
+  --inverse-on-surface: #f1f1f1;
+  --inverse-primary: #006b5c;
+  --primary-fixed: #68fadd;
+  --primary-fixed-dim: #44ddc1;
+  --on-primary-fixed: #00201a;
+  --on-primary-fixed-variant: #005145;
+  --secondary-fixed: #85f6e5;
+  --secondary-fixed-dim: #67d9c9;
+  --on-secondary-fixed: #00201c;
+  --on-secondary-fixed-variant: #005048;
+  --tertiary-fixed: #d7e4ec;
+  --tertiary-fixed-dim: #bbc8d0;
+  --on-tertiary-fixed: #111d23;
+  --on-tertiary-fixed-variant: #3c494f;
 }
 
 .dark {
-  /* ダーク: 濃紺 + 青緑アクセント #55D6C2 */
+  /* Stitch Professional dark surface system.  All existing semantic tokens
+     remain wired to shadcn primitives; only their visual values change. */
   color-scheme: dark;
-  --background: #0b172a; /* アプリ背景 */
-  --foreground: #d7e1f2; /* メイン文字 */
-  --card: #12233d; /* メイン面・カード・エディタ面 */
-  --card-foreground: #d7e1f2;
-  --popover: #12233d;
-  --popover-foreground: #d7e1f2;
-  --primary: #55d6c2; /* アクセント */
-  --primary-foreground: #0b172a;
-  --secondary: #172b49; /* 浮いた面・ホバー */
-  --secondary-foreground: #d7e1f2;
-  --muted: #172b49;
-  --muted-foreground: #91a2bf; /* 補助文字 */
-  --accent: #172b49;
-  --accent-foreground: #d7e1f2;
-  --destructive: #e5706b;
-  --border: #263b59;
-  --input: #263b59;
-  --ring: #55d6c2;
-  --chart-1: #55d6c2;
-  --chart-2: #5aa8e0;
-  --chart-3: #8b90d6;
-  --chart-4: #d9a84e;
-  --chart-5: #e5706b;
-  --sidebar: #0e1c31; /* サイドバー・ヘッダー面（本文 #12233d より一段暗い） */
-  --sidebar-foreground: #d7e1f2;
-  --sidebar-primary: #55d6c2;
-  --sidebar-primary-foreground: #0b172a;
-  --sidebar-accent: #172b49;
-  --sidebar-accent-foreground: #d7e1f2;
-  --sidebar-border: #263b59;
-  --sidebar-ring: #55d6c2;
+  --background: #131313;
+  --foreground: #e5e2e1;
+  --card: #201f1f;
+  --card-foreground: #e5e2e1;
+  --popover: #2a2a2a;
+  --popover-foreground: #e5e2e1;
+  --primary: #44ddc1;
+  --primary-foreground: #00382f;
+  --secondary: #242426;
+  --secondary-foreground: #e5e2e1;
+  --muted: #1c1b1b;
+  --muted-foreground: #9ba1a6;
+  --accent: #2a2a2a;
+  --accent-foreground: #e5e2e1;
+  --destructive: #ffb4ab;
+  --border: #333335;
+  --input: #333335;
+  --ring: #44ddc1;
+  --chart-1: #44ddc1;
+  --chart-2: #67d9c9;
+  --chart-3: #bbc8d0;
+  --chart-4: #9facb3;
+  --chart-5: #ffb4ab;
+  --sidebar: #1a1a1b;
+  --sidebar-foreground: #e5e2e1;
+  --sidebar-primary: #44ddc1;
+  --sidebar-primary-foreground: #00382f;
+  --sidebar-accent: #2a2a2a;
+  --sidebar-accent-foreground: #e5e2e1;
+  --sidebar-border: #333335;
+  --sidebar-ring: #44ddc1;
+  --surface: #131313;
+  --surface-dim: #131313;
+  --surface-bright: #393939;
+  --surface-container-lowest: #0e0e0e;
+  --surface-container-low: #1c1b1b;
+  --surface-container: #201f1f;
+  --surface-container-high: #2a2a2a;
+  --surface-container-highest: #353534;
+  --surface-charcoal: #1a1a1b;
+  --surface-slate: #242426;
+  --on-surface: #e5e2e1;
+  --on-surface-variant: #bbcac4;
+  --primary-container: #00bfa5;
+  --on-primary-container: #00473c;
+  --outline-variant: #3c4a46;
+  --border-subtle: #333335;
+  --runtime-active: #00bfa5;
+  --runtime-idle: #455a64;
+  --text-primary: #ffffff;
+  --text-secondary: #9ba1a6;
+  --success: #86efac;
+  --warning: #fde047;
+  --info: #93c5fd;
+  --mention-file: #93c5fd;
+  --mention-task: #86efac;
+  --mention-project: #d8b4fe;
+  --mention-app: #fdba74;
+  --mention-docs: #a5b4fc;
+  --mention-chat: #67e8f9;
+  --surface-variant: #353534;
+  --surface-tint: #44ddc1;
+  --outline: #85948f;
+  --secondary-container: #21a293;
+  --on-secondary-container: #00302b;
+  --tertiary: #bbc8d0;
+  --tertiary-container: #9facb3;
+  --on-tertiary: #263238;
+  --on-tertiary-container: #344047;
+  --error-container: #93000a;
+  --on-error: #690005;
+  --on-error-container: #ffdad6;
+  --inverse-surface: #e5e2e1;
+  --inverse-on-surface: #313030;
+  --inverse-primary: #006b5c;
+  --primary-fixed: #68fadd;
+  --primary-fixed-dim: #44ddc1;
+  --on-primary-fixed: #00201a;
+  --on-primary-fixed-variant: #005145;
+  --secondary-fixed: #85f6e5;
+  --secondary-fixed-dim: #67d9c9;
+  --on-secondary-fixed: #00201c;
+  --on-secondary-fixed-variant: #005048;
+  --tertiary-fixed: #d7e4ec;
+  --tertiary-fixed-dim: #bbc8d0;
+  --on-tertiary-fixed: #111d23;
+  --on-tertiary-fixed-variant: #3c494f;
 }
 
 @layer base {
@@ -138,7 +329,7 @@
 /* AoiTalk Custom Styles */
 @layer base {
   body {
-    font-family: "IBM Plex Sans JP", "Space Grotesk", system-ui, sans-serif;
+    font-family: "Inter", "IBM Plex Sans JP", "Space Grotesk", system-ui, sans-serif;
   }
 }
 
@@ -179,6 +370,147 @@
     min-height: 84px;
     border-bottom: 1px solid var(--sidebar-border);
     background: var(--sidebar);
+  }
+
+  /* AppsはProject内にも埋め込まれるため、viewportではなくApp詳細自身の幅で再配置する。 */
+  .apps-detail-page {
+    container: apps-detail / inline-size;
+  }
+
+  .apps-detail-page [role="tablist"] {
+    scrollbar-width: none;
+  }
+
+  .apps-detail-page [role="tablist"]::-webkit-scrollbar {
+    display: none;
+  }
+
+  .apps-flow {
+    flex-direction: column;
+  }
+
+  .apps-flow-arrow {
+    transform: rotate(90deg);
+  }
+
+  .apps-target-grid,
+  .apps-target-guides,
+  .apps-overview-grid,
+  .apps-summary-grid,
+  .apps-usage-grid,
+  .apps-files-grid,
+  .apps-operations-grid,
+  .apps-docs-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .apps-operations-wide {
+    grid-column: auto;
+  }
+
+  .apps-usage-visual {
+    display: none;
+  }
+
+  /* 埋め込み表示など幅が狭い場合でも、余白で間延びさせずに横並びへ切り替える。 */
+  @container apps-detail (min-width: 560px) {
+    .apps-summary-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .apps-flow {
+      flex-direction: row;
+      align-items: stretch;
+    }
+
+    .apps-flow-arrow {
+      transform: none;
+    }
+
+    .apps-target-grid,
+    .apps-target-guides {
+      grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+    }
+  }
+
+  @container apps-detail (min-width: 840px) {
+    .apps-overview-grid {
+      grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+    }
+
+    .apps-summary-grid {
+      grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1fr);
+    }
+
+    .apps-target-grid {
+      grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+    }
+
+    .apps-target-guides {
+      grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+    }
+
+    .apps-files-grid {
+      grid-template-columns: minmax(190px, 0.6fr) minmax(0, 1.7fr);
+    }
+
+    .apps-docs-grid {
+      grid-template-columns: 190px minmax(0, 1fr);
+    }
+
+    .apps-operations-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .apps-operations-wide {
+      grid-column: 1 / -1;
+    }
+
+    .apps-usage-grid {
+      grid-template-columns: minmax(0, 1fr) minmax(22rem, 0.95fr);
+      align-items: center;
+    }
+
+    .apps-usage-visual {
+      display: flex;
+    }
+  }
+}
+
+/* App詳細は1画面に載せる情報量が多いため、共通Cardより一段詰めた内側余白にする。
+   共通Cardコンポーネント自体を変えると他画面へ波及するので、Apps画面だけを対象にする。
+   Tailwindのutilities layerより後に評価させるため、意図的にlayer外へ置く。 */
+.apps-detail-page [data-slot="card"] {
+  gap: 0.5rem;
+  padding-block: 0.625rem;
+}
+
+.apps-detail-page [data-slot="card-header"],
+.apps-detail-page [data-slot="card-content"] {
+  padding-inline: 0.625rem;
+}
+
+.apps-detail-page [data-slot="card-header"] {
+  gap: 0.125rem;
+}
+
+.apps-detail-page [data-slot="card-footer"] {
+  padding: 0.625rem;
+}
+
+/* Chatの履歴レールはviewportではなく、実際のチャット列の幅で表示を切り替える。 */
+.chat-message-history-container {
+  container-type: inline-size;
+  container-name: chat-message-history;
+}
+
+.chat-message-history-rail {
+  display: none;
+}
+
+@container chat-message-history (min-width: 52rem) {
+  .chat-message-history-rail {
+    display: flex;
   }
 }
 
@@ -623,4 +955,1824 @@
   padding: 0.06rem 0.28rem;
   font-family: var(--font-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.9em;
+}
+
+/* ────────────────────────────────────────────────────────────────
+   AoiTalk Contextual Workspace Shell
+   Legacy workspace adapters remain slot-compatible while the shared semantic
+   surface tokens below provide the Stitch charcoal/slate visual foundation.
+   ──────────────────────────────────────────────────────────────── */
+.ao-shell-root {
+  --ao-global-rail-width: 3.5rem;
+  --ao-global-context-height: 3rem;
+  --ao-workspace-nav-width: 15.5rem;
+  --ao-context-rail-width: 20rem;
+  --ao-shell-main-min-width: 45rem;
+  isolation: isolate;
+}
+
+.ao-global-rail {
+  position: relative;
+  z-index: 80;
+  width: var(--ao-global-rail-width);
+  min-width: var(--ao-global-rail-width);
+  background: var(--sidebar);
+}
+
+.ao-global-rail-brand {
+  display: grid;
+  width: 100%;
+  min-height: 3rem;
+  place-items: center;
+  border-bottom: 1px solid var(--sidebar-border);
+  color: var(--sidebar-foreground);
+  outline: none;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+.ao-global-rail-brand:hover,
+.ao-global-rail-brand:focus-visible {
+  background: var(--sidebar-accent);
+  color: var(--primary);
+}
+
+.ao-global-rail-nav {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--sidebar-border) 80%, transparent) transparent;
+}
+
+.ao-global-rail-button {
+  position: relative;
+  display: inline-flex;
+  width: 2.5rem;
+  min-width: 2.5rem;
+  min-height: 2.5rem;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0.375rem;
+  color: var(--muted-foreground);
+  outline: none;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+.ao-global-rail-nav .ao-global-rail-button,
+.ao-global-rail-utility .ao-global-rail-button {
+  margin-inline: auto;
+}
+
+.ao-global-rail-button:hover,
+.ao-global-rail-button:focus-visible {
+  background: var(--sidebar-accent);
+  color: var(--sidebar-foreground);
+}
+
+.ao-global-rail-button.is-active,
+.ao-global-rail-button[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--primary) 15%, var(--sidebar));
+  color: var(--primary);
+}
+
+.ao-global-rail-button.is-active::before {
+  position: absolute;
+  left: -0.375rem;
+  top: 0.5rem;
+  bottom: 0.5rem;
+  width: 2px;
+  border-radius: 999px;
+  background: var(--primary);
+  content: "";
+}
+
+.ao-global-context {
+  min-height: var(--ao-global-context-height);
+  height: var(--ao-global-context-height);
+  background: var(--sidebar);
+}
+
+.ao-shell-content {
+  position: relative;
+  isolation: isolate;
+  background: var(--background);
+}
+
+.ao-workspace-nav-frame {
+  position: relative;
+  width: var(--ao-workspace-nav-width);
+  min-width: var(--ao-workspace-nav-width);
+  overflow: auto;
+  background: var(--sidebar);
+  transition: width 160ms ease, min-width 160ms ease;
+}
+
+/* The shell owns slot visibility/layout. Registered workspace components may
+ * carry legacy `hidden lg:flex` classes; those must not be able to bypass the
+ * drawer/frame state on compact viewports. */
+.ao-workspace-nav-frame > * {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  overflow: auto;
+}
+
+.ao-workspace-nav-frame.is-empty,
+.ao-workspace-nav-frame.is-collapsed,
+.ao-workspace-nav-frame.is-mobile-closed {
+  width: 0;
+  min-width: 0;
+}
+
+.ao-workspace-nav-panel {
+  width: var(--ao-workspace-nav-width);
+  min-width: var(--ao-workspace-nav-width);
+  height: 100%;
+  flex-direction: column;
+  overflow: hidden;
+  border-right: 1px solid var(--sidebar-border);
+  background: var(--sidebar);
+  color: var(--sidebar-foreground);
+}
+
+.ao-main-canvas {
+  min-width: min(var(--ao-shell-main-min-width), 100%);
+  background: var(--card);
+}
+
+.ao-main-canvas > .ao-main-scroll {
+  min-width: 0;
+}
+
+.ao-context-rail {
+  position: relative;
+  width: var(--ao-context-rail-width);
+  min-width: var(--ao-context-rail-width);
+  background: var(--card);
+}
+
+.ao-context-rail-close {
+  display: none;
+}
+
+.ao-runtime-panel {
+  max-height: calc(100dvh - var(--ao-global-context-height) - 1rem);
+  border-radius: 0 0 0.5rem 0.5rem;
+}
+
+@media (min-width: 2000px) {
+  .ao-shell-root {
+    --ao-workspace-nav-width: 15.5rem;
+    --ao-context-rail-width: 20rem;
+  }
+
+}
+
+@media (min-width: 1600px) and (max-width: 1999px) {
+  .ao-context-rail {
+    position: relative;
+    inset: auto;
+    width: var(--ao-context-rail-width);
+    min-width: var(--ao-context-rail-width);
+    border-left: 1px solid var(--border);
+    border-top: 0;
+    border-right: 0;
+    border-bottom: 0;
+    box-shadow: none;
+  }
+
+  .ao-context-rail-close {
+    display: none;
+  }
+}
+
+@media (min-width: 1920px) and (max-width: 1999px) {
+  .ao-context-rail {
+    position: relative;
+    inset: auto;
+    width: var(--ao-context-rail-width);
+    min-width: var(--ao-context-rail-width);
+    border-left: 1px solid var(--border);
+    border-top: 0;
+    border-right: 0;
+    border-bottom: 0;
+    box-shadow: none;
+  }
+
+  .ao-context-rail-close {
+    display: none;
+  }
+}
+
+@media (max-width: 1599px) {
+  .ao-shell-root {
+    --ao-workspace-nav-width: 15rem;
+  }
+
+  .ao-context-rail {
+    position: fixed;
+    z-index: 65;
+    top: var(--ao-global-context-height);
+    right: 0;
+    bottom: 0;
+    width: min(20rem, calc(100vw - var(--ao-global-rail-width)));
+    min-width: 0;
+    border: 1px solid var(--border);
+    box-shadow: 0 18px 44px -26px rgb(0 0 0 / 0.7);
+  }
+
+}
+
+@media (min-width: 768px) and (max-width: 1599px) {
+  .ao-workspace-nav-frame {
+    position: fixed;
+    z-index: 65;
+    top: var(--ao-global-context-height);
+    bottom: 0;
+    left: var(--ao-global-rail-width);
+    width: var(--ao-workspace-nav-width);
+    min-width: var(--ao-workspace-nav-width);
+    overflow: auto;
+    border: 1px solid var(--border);
+    box-shadow: 0 18px 44px -26px rgb(0 0 0 / 0.7);
+    transition: transform 160ms ease, visibility 160ms ease;
+  }
+
+  .ao-main-canvas {
+    min-width: 0;
+  }
+
+  .ao-workspace-nav-frame.is-empty,
+  .ao-workspace-nav-frame.is-collapsed {
+    width: 0;
+    min-width: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transform: translateX(-105%);
+  }
+
+  .ao-workspace-nav-frame > * {
+    position: static;
+    width: 100%;
+    min-width: 0;
+    height: 100%;
+    max-width: none;
+    overflow: auto;
+  }
+
+  .ao-context-rail {
+    position: relative;
+    inset: auto;
+    width: var(--ao-context-rail-width);
+    min-width: var(--ao-context-rail-width);
+    border-left: 1px solid var(--border);
+    border-top: 0;
+    border-right: 0;
+    border-bottom: 0;
+    box-shadow: none;
+  }
+
+}
+
+@media (max-width: 767px) {
+  .ao-global-rail {
+    display: none;
+  }
+
+  .ao-shell-root {
+    --ao-global-rail-width: 0px;
+    --ao-workspace-nav-width: 18rem;
+  }
+
+  .ao-main-canvas {
+    min-width: 0;
+  }
+
+  .ao-global-context {
+    min-height: 3rem;
+    height: auto;
+  }
+
+  .ao-workspace-nav-frame {
+    position: fixed;
+    z-index: 65;
+    top: 3rem;
+    bottom: 0;
+    left: 0;
+    width: min(var(--ao-workspace-nav-width), 92vw);
+    min-width: min(var(--ao-workspace-nav-width), 92vw);
+    overflow: auto;
+    border: 1px solid var(--border);
+    box-shadow: 0 18px 44px -26px rgb(0 0 0 / 0.7);
+    transition: transform 160ms ease, visibility 160ms ease;
+  }
+
+  .ao-workspace-nav-frame[data-mobile-open="false"],
+  .ao-workspace-nav-frame.is-empty {
+    width: 0;
+    min-width: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transform: translateX(-105%);
+  }
+
+  .ao-workspace-nav-frame > * {
+    position: static;
+    width: 100%;
+    min-width: 0;
+    height: 100%;
+    max-width: none;
+    overflow: auto;
+  }
+
+  .ao-context-rail {
+    position: fixed;
+    z-index: 65;
+    top: 3rem;
+    right: 0;
+    bottom: 0;
+    width: min(24rem, 92vw);
+    min-width: 0;
+    border: 1px solid var(--border);
+    box-shadow: 0 18px 44px -26px rgb(0 0 0 / 0.7);
+  }
+
+  .ao-context-rail-close {
+    position: absolute;
+    z-index: 2;
+    top: 0.5rem;
+    right: 0.5rem;
+    display: grid;
+    width: 2rem;
+    height: 2rem;
+    place-items: center;
+    border: 1px solid var(--border);
+    border-radius: 0.375rem;
+    background: color-mix(in srgb, var(--card) 90%, transparent);
+    color: var(--muted-foreground);
+  }
+
+  .ao-runtime-panel {
+    top: 3rem;
+    left: 0;
+    width: min(22rem, 92vw);
+    max-width: 92vw;
+  }
+}
+
+/* Project tree navigation needs a little more horizontal room for names and
+   its action buttons. Keep every other workspace rail on the shared width. */
+@media (min-width: 768px) {
+  .ao-workspace-nav-frame:has(> [data-workspace="projects"]) {
+    --ao-workspace-nav-width: 17rem;
+  }
+}
+
+/* ────────────────────────────────────────────────────────────────
+   Task list workspace light theme
+   Keep the shared palette and dark theme untouched.  The task list has a
+   denser table than the other workspaces, so its light surfaces and controls
+   use a local contract instead of the app-wide background token.
+   ──────────────────────────────────────────────────────────────── */
+html:not(.dark) .ao-tasks-canvas,
+html:not(.dark) .ao-task-list-view,
+html:not(.dark) .ao-tasks-navigation {
+  --ao-task-light-canvas: #f7f9fb;
+  --ao-task-light-surface: #ffffff;
+  --ao-task-light-surface-muted: #f1f5f8;
+  --ao-task-light-border: #c3d0db;
+  --ao-task-light-border-strong: #91a3b2;
+  --ao-task-light-control-border: #8295a5;
+  --ao-task-light-muted: #536575;
+  --ao-task-light-primary: #087f83;
+}
+
+html:not(.dark) .ao-tasks-canvas {
+  background: var(--ao-task-light-canvas);
+  color: var(--foreground);
+}
+
+html:not(.dark) .ao-tasks-mobile-header {
+  background: var(--ao-task-light-surface);
+  border-bottom-color: var(--ao-task-light-border);
+}
+
+/* The persistent left task navigation is a separate region from the list
+   canvas.  Override only task-owned sidebar utility classes. */
+html:not(.dark) .ao-tasks-navigation {
+  background: #f3f7fa;
+  border-right-color: var(--ao-task-light-border);
+  color: var(--foreground);
+}
+
+html:not(.dark) .ao-tasks-navigation [class*="border-sidebar-border"] {
+  border-color: var(--ao-task-light-border);
+}
+
+html:not(.dark) .ao-tasks-navigation [data-testid="task-view-switcher"] [role="group"] {
+  border-color: var(--ao-task-light-border);
+  background: #e8eff4;
+}
+
+html:not(.dark) .ao-tasks-navigation [data-testid="task-view-switcher"] button {
+  color: var(--ao-task-light-muted);
+}
+
+html:not(.dark) .ao-tasks-navigation [data-testid="task-view-switcher"] button:hover,
+html:not(.dark) .ao-tasks-navigation [data-testid="task-view-switcher"] button:focus-visible {
+  background: #dce8ee;
+  color: var(--foreground);
+}
+
+html:not(.dark) .ao-tasks-navigation [data-testid="task-view-switcher"] button[aria-pressed="true"] {
+  border: 1px solid var(--ao-task-light-border);
+  background: var(--ao-task-light-surface);
+  color: var(--foreground);
+}
+
+html:not(.dark) .ao-tasks-navigation [role="listbox"] > button {
+  border: 1px solid transparent;
+  color: var(--ao-task-light-muted);
+}
+
+html:not(.dark) .ao-tasks-navigation [role="listbox"] > button:hover,
+html:not(.dark) .ao-tasks-navigation [role="listbox"] > button:focus-visible {
+  border-color: var(--ao-task-light-border);
+  background: #e7eef3;
+  color: var(--foreground);
+}
+
+html:not(.dark) .ao-tasks-navigation [role="listbox"] > button[aria-selected="true"] {
+  border-color: color-mix(in srgb, var(--ao-task-light-primary) 42%, var(--ao-task-light-border));
+  background: color-mix(in srgb, var(--ao-task-light-primary) 9%, #e7eef3);
+  color: var(--foreground);
+}
+
+html:not(.dark) .ao-tasks-navigation [role="listbox"] > button[aria-selected="true"]::before {
+  background: var(--ao-task-light-primary);
+}
+
+/* Toolbar/header controls have explicit light surfaces and a visible focus
+   ring, while active Filter/Columns text keeps the existing primary utility. */
+html:not(.dark) .ao-task-list-toolbar,
+html:not(.dark) .ao-task-list-toolbar-mobile {
+  border-bottom-color: var(--ao-task-light-border);
+  background: var(--ao-task-light-surface);
+}
+
+html:not(.dark) .ao-task-toolbar-control {
+  border: 1px solid var(--ao-task-light-control-border);
+  background: var(--ao-task-light-surface);
+}
+
+html:not(.dark) .ao-task-toolbar-control:hover {
+  border-color: var(--ao-task-light-border-strong);
+  background: var(--ao-task-light-surface-muted);
+}
+
+html:not(.dark) .ao-task-toolbar-control:focus-visible {
+  border-color: var(--ao-task-light-primary);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ao-task-light-primary) 20%, transparent);
+}
+
+html:not(.dark) .ao-task-toolbar-control.text-primary {
+  border-color: var(--ao-task-light-primary);
+}
+
+html:not(.dark) .ao-task-search-input {
+  color: var(--foreground);
+}
+
+html:not(.dark) .ao-task-list-toolbar > span.h-5.w-px {
+  background: var(--ao-task-light-border);
+}
+
+html:not(.dark) .ao-task-list-view {
+  background: var(--ao-task-light-canvas);
+  color: var(--foreground);
+}
+
+html:not(.dark) .ao-task-list-view [data-slot="checkbox"] {
+  border-color: var(--ao-task-light-control-border);
+  background: var(--ao-task-light-surface);
+}
+
+html:not(.dark) .ao-task-list-view [data-slot="checkbox"][data-state="checked"],
+html:not(.dark) .ao-task-list-view [data-slot="checkbox"][data-checked] {
+  border-color: var(--ao-task-light-primary);
+  background: var(--ao-task-light-primary);
+  color: #ffffff;
+}
+
+/* The table itself is the primary work surface; the canvas margin remains a
+   very light grey so the header/table/nav boundaries stay readable. */
+html:not(.dark) .ao-task-list-table {
+  background: var(--ao-task-light-surface);
+}
+
+html:not(.dark) .ao-task-list-table thead tr {
+  border-bottom-color: var(--ao-task-light-border-strong);
+  background: var(--ao-task-light-surface-muted);
+}
+
+html:not(.dark) .ao-task-list-table thead th {
+  color: var(--ao-task-light-muted);
+}
+
+html:not(.dark) .ao-task-list-table tbody tr.ao-task-row {
+  border-bottom-color: #d5dfe7;
+  background: var(--ao-task-light-surface);
+}
+
+html:not(.dark) .ao-task-list-table tbody tr.ao-task-row:hover:not(.is-selected):not(.is-focused) {
+  background: #f2f6f8;
+}
+
+html:not(.dark) .ao-task-list-table tbody tr.ao-task-row.is-selected {
+  background: color-mix(in srgb, var(--ao-task-light-primary) 7%, var(--ao-task-light-surface));
+}
+
+html:not(.dark) .ao-task-list-table tbody tr.ao-task-row.is-focused {
+  background: color-mix(in srgb, var(--ao-task-light-primary) 12%, var(--ao-task-light-surface));
+  outline-color: color-mix(in srgb, var(--ao-task-light-primary) 68%, var(--ao-task-light-border));
+}
+
+html:not(.dark) .ao-task-card {
+  border-color: #d5dfe7;
+  background: var(--ao-task-light-surface);
+}
+
+html:not(.dark) .ao-task-card:hover:not(.is-selected) {
+  border-color: var(--ao-task-light-border-strong);
+  background: #f2f6f8;
+}
+
+html:not(.dark) .ao-task-card.is-selected {
+  border-color: color-mix(in srgb, var(--ao-task-light-primary) 55%, var(--ao-task-light-border));
+  background: color-mix(in srgb, var(--ao-task-light-primary) 7%, var(--ao-task-light-surface));
+}
+
+/* Project and date cells are editable controls, not bare text.  Keep the
+   overdue/today utility colors and their status-specific backgrounds intact. */
+html:not(.dark) .ao-task-project-select {
+  min-height: 1.75rem;
+  border: 1px solid var(--ao-task-light-control-border);
+  border-radius: 3px;
+  background: var(--ao-task-light-surface);
+  padding-inline: 0.375rem;
+}
+
+html:not(.dark) .ao-task-project-select:hover,
+html:not(.dark) .ao-task-project-select:focus-visible {
+  border-color: var(--ao-task-light-border-strong);
+  background: var(--ao-task-light-surface-muted);
+}
+
+html:not(.dark) .ao-task-date-button:not(.font-semibold):not(.text-red-500):not(.border-primary) {
+  border: 1px solid var(--ao-task-light-control-border);
+  border-radius: 3px;
+  background: var(--ao-task-light-surface);
+}
+
+html:not(.dark) .ao-task-date-button:not(.font-semibold):not(.text-red-500):not(.border-primary):hover {
+  border-color: var(--ao-task-light-border-strong);
+  background: var(--ao-task-light-surface-muted);
+  text-decoration: none;
+}
+
+html:not(.dark) .ao-task-date-button.font-semibold {
+  border-color: #c49a33;
+}
+
+html:not(.dark) .ao-task-date-button.text-red-500 {
+  border-color: #d58d8d;
+}
+
+html:not(.dark) .ao-task-date-button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--ao-task-light-primary) 55%, transparent);
+  outline-offset: 1px;
+}
+
+/* Calendar-only light theme tuning.  Keep the shared light palette intact and
+   raise contrast only inside this workspace so the grid stays legible. */
+html:not(.dark) .ao-calendar-navigation,
+html:not(.dark) .ao-calendar-canvas {
+  --ao-calendar-light-bg: #f7f9fb;
+  --ao-calendar-light-surface: #ffffff;
+  --ao-calendar-light-slate: #edf2f6;
+  --ao-calendar-light-border: #8293a1;
+  --ao-calendar-light-border-strong: #657a8a;
+  --ao-calendar-light-control-border: #6b7d89;
+  --ao-calendar-light-doc: #006b70;
+  --ao-calendar-light-doc-border: #007f86;
+  --ao-calendar-light-muted: #566575;
+  --ao-calendar-light-primary: #087f83;
+}
+
+html:not(.dark) .ao-calendar-navigation {
+  background: var(--ao-calendar-light-surface);
+  color: var(--foreground);
+}
+
+html:not(.dark) .ao-calendar-mini {
+  border-bottom-color: var(--ao-calendar-light-border);
+}
+
+html:not(.dark) .ao-calendar-icon-button:hover,
+html:not(.dark) .ao-calendar-icon-button:focus-visible,
+html:not(.dark) .ao-calendar-mini-day:hover,
+html:not(.dark) .ao-calendar-mini-day:focus-visible {
+  border-color: var(--ao-calendar-light-border-strong);
+  background: var(--ao-calendar-light-slate);
+}
+
+html:not(.dark) .ao-calendar-mini-day.is-selected {
+  border-color: var(--ao-calendar-light-primary);
+  background: var(--ao-calendar-light-primary);
+  color: #ffffff;
+}
+
+html:not(.dark) .ao-calendar-mini-day.is-today::after {
+  background: var(--ao-calendar-light-primary);
+}
+
+html:not(.dark) .ao-calendar-nav-heading {
+  color: var(--ao-calendar-light-muted);
+}
+
+html:not(.dark) .ao-calendar-scope-option,
+html:not(.dark) .ao-calendar-filter-option {
+  color: var(--ao-calendar-light-muted);
+}
+
+html:not(.dark) .ao-calendar-scope-option:hover,
+html:not(.dark) .ao-calendar-scope-option:focus-visible,
+html:not(.dark) .ao-calendar-filter-option:hover {
+  border-color: var(--ao-calendar-light-border);
+  background: var(--ao-calendar-light-slate);
+  color: var(--foreground);
+}
+
+html:not(.dark) .ao-calendar-scope-option.is-active {
+  border-color: color-mix(in srgb, var(--ao-calendar-light-primary) 42%, var(--ao-calendar-light-border));
+  background: color-mix(in srgb, var(--ao-calendar-light-primary) 9%, var(--ao-calendar-light-slate));
+  color: var(--foreground);
+}
+
+html:not(.dark) .ao-calendar-scope-option.is-active::before {
+  background: var(--ao-calendar-light-primary);
+}
+
+html:not(.dark) .ao-calendar-scope-option.is-active .ao-calendar-radio {
+  border-color: var(--ao-calendar-light-primary);
+  box-shadow: inset 0 0 0 4px var(--ao-calendar-light-slate), 0 0 0 1px var(--ao-calendar-light-primary);
+  background: var(--ao-calendar-light-primary);
+}
+
+html:not(.dark) .ao-calendar-filter-option [data-slot="checkbox"] {
+  border-color: var(--ao-calendar-light-control-border);
+  background: var(--ao-calendar-light-surface);
+}
+
+html:not(.dark) .ao-calendar-filter-option [data-slot="checkbox"][data-checked] {
+  border-color: var(--ao-calendar-light-primary);
+  background: var(--ao-calendar-light-primary);
+  color: #ffffff;
+}
+
+html:not(.dark) .ao-calendar-nav-hint {
+  border-top-color: var(--ao-calendar-light-border);
+  color: var(--ao-calendar-light-muted);
+}
+
+html:not(.dark) .ao-calendar-canvas {
+  background: var(--ao-calendar-light-bg);
+}
+
+html:not(.dark) .ao-calendar-canvas .ao-calendar-frame {
+  border-color: var(--ao-calendar-light-border);
+}
+
+html:not(.dark) .ao-calendar-canvas .fc {
+  --fc-border-color: var(--ao-calendar-light-border);
+  --fc-page-bg-color: var(--ao-calendar-light-bg);
+  --fc-neutral-bg-color: var(--ao-calendar-light-slate);
+  --fc-neutral-text-color: var(--ao-calendar-light-muted);
+  --fc-today-bg-color: color-mix(in srgb, var(--ao-calendar-light-primary) 10%, transparent);
+  background: var(--ao-calendar-light-bg);
+}
+
+html:not(.dark) .ao-calendar-canvas .fc .fc-toolbar {
+  border-bottom-color: var(--ao-calendar-light-border);
+  background: color-mix(in srgb, var(--ao-calendar-light-surface) 74%, var(--ao-calendar-light-bg));
+}
+
+html:not(.dark) .ao-calendar-canvas .fc .fc-button {
+  border-color: var(--ao-calendar-light-border);
+  background: var(--ao-calendar-light-surface);
+  color: var(--foreground);
+}
+
+html:not(.dark) .ao-calendar-canvas .fc .fc-button:hover,
+html:not(.dark) .ao-calendar-canvas .fc .fc-button:focus-visible {
+  border-color: var(--ao-calendar-light-border-strong);
+  background: var(--ao-calendar-light-slate);
+}
+
+html:not(.dark) .ao-calendar-canvas .fc .fc-button-primary:not(:disabled).fc-button-active,
+html:not(.dark) .ao-calendar-canvas .fc .fc-button-primary:not(:disabled):active {
+  border-color: color-mix(in srgb, var(--ao-calendar-light-primary) 58%, var(--ao-calendar-light-border));
+  background: color-mix(in srgb, var(--ao-calendar-light-primary) 12%, var(--ao-calendar-light-surface));
+  color: var(--ao-calendar-light-primary);
+}
+
+html:not(.dark) .ao-calendar-canvas .fc .fc-button-group {
+  border-color: var(--ao-calendar-light-border);
+  background: var(--ao-calendar-light-surface);
+}
+
+html:not(.dark) .ao-calendar-canvas .fc .fc-button-group .fc-button {
+  border-right-color: var(--ao-calendar-light-border);
+  background: transparent;
+}
+
+html:not(.dark) .ao-calendar-canvas .fc .fc-scrollgrid-section > *,
+html:not(.dark) .ao-calendar-canvas .fc .fc-scrollgrid-section-liquid > td {
+  border-color: var(--ao-calendar-light-border);
+}
+
+html:not(.dark) .ao-calendar-canvas .fc .fc-col-header-cell {
+  background: var(--ao-calendar-light-bg);
+}
+
+html:not(.dark) .ao-calendar-canvas .fc .fc-day-sat,
+html:not(.dark) .ao-calendar-canvas .fc .fc-day-sun {
+  background: color-mix(in srgb, var(--ao-calendar-light-slate) 62%, transparent);
+}
+
+html:not(.dark) .ao-calendar-canvas .fc .fc-daygrid-day.fc-day-today {
+  background: color-mix(in srgb, var(--ao-calendar-light-primary) 9%, var(--ao-calendar-light-surface));
+  box-shadow: inset 0 2px 0 var(--ao-calendar-light-primary);
+}
+
+html:not(.dark) .ao-calendar-canvas .fc .fc-daygrid-day.fc-day-today .fc-daygrid-day-number,
+html:not(.dark) .ao-calendar-canvas .fc .fc-timegrid-col.fc-day-today {
+  color: var(--ao-calendar-light-primary);
+}
+
+html:not(.dark) .ao-calendar-canvas .ao-cal-event-tag-none,
+html:not(.dark) .ao-calendar-canvas .ao-cal-event-tag-multi {
+  background: var(--ao-calendar-light-slate) !important;
+  border-color: var(--ao-calendar-light-border);
+}
+
+html:not(.dark) .ao-calendar-canvas .ao-cal-event.ao-cal-event-docs,
+html:not(.dark) .ao-calendar-canvas .ao-cal-event-list.ao-cal-event-docs {
+  background: color-mix(in srgb, #0ea5e9 13%, var(--ao-calendar-light-surface)) !important;
+}
+
+html:not(.dark) .ao-calendar-canvas .fc .fc-event.event-docs {
+  border-color: var(--ao-calendar-light-doc-border);
+}
+
+html:not(.dark) .ao-calendar-canvas .ao-cal-event-doc-icon,
+html:not(.dark) .ao-calendar-canvas .ao-cal-event-doc-label {
+  color: var(--ao-calendar-light-doc);
+}
+
+html:not(.dark) .ao-calendar-canvas .ao-calendar-toggle {
+  color: var(--ao-calendar-light-primary);
+}
+
+html:not(.dark) .ao-calendar-canvas .fc .event-closed,
+html:not(.dark) .ao-calendar-canvas .fc .event-done {
+  opacity: 0.68;
+}
+
+html:not(.dark) .ao-calendar-canvas .fc .event-cancelled {
+  opacity: 0.58;
+}
+
+/* ────────────────────────────────────────────────────────────────
+   Calendar workspace visual contract
+   The shared shell owns the global rail/header geometry. Calendar only
+   supplies the dense local navigation and canvas surfaces below.
+   ──────────────────────────────────────────────────────────────── */
+.ao-calendar-navigation {
+  box-sizing: border-box;
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  padding: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--surface-charcoal);
+  color: var(--foreground);
+}
+
+.ao-calendar-mini {
+  flex: 0 0 auto;
+  padding: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ao-calendar-mini-header {
+  display: flex;
+  min-height: 2rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.ao-calendar-nav-kicker {
+  margin: 0 0 2px;
+  color: var(--muted-foreground);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  line-height: 14px;
+  text-transform: uppercase;
+}
+
+.ao-calendar-mini-title {
+  margin: 0;
+  color: var(--foreground);
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 24px;
+}
+
+.ao-calendar-mini-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.ao-calendar-icon-button {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  transition: color 120ms ease, background-color 120ms ease, border-color 120ms ease;
+}
+
+.ao-calendar-icon-button:hover,
+.ao-calendar-icon-button:focus-visible {
+  border-color: var(--border);
+  background: var(--surface-slate);
+  color: var(--foreground);
+  outline: none;
+}
+
+.ao-calendar-mini-weekdays,
+.ao-calendar-mini-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  column-gap: 2px;
+  row-gap: 2px;
+  text-align: center;
+}
+
+.ao-calendar-mini-weekdays {
+  margin-bottom: 4px;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 20px;
+}
+
+.ao-calendar-mini-day {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  height: 28px;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--foreground);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 20px;
+  transition: color 120ms ease, background-color 120ms ease, border-color 120ms ease;
+}
+
+.ao-calendar-mini-day:hover,
+.ao-calendar-mini-day:focus-visible {
+  border-color: var(--border);
+  background: var(--surface-slate);
+  outline: none;
+}
+
+.ao-calendar-mini-day.is-outside {
+  color: color-mix(in srgb, var(--muted-foreground) 42%, transparent);
+}
+
+.ao-calendar-mini-day.is-today::after {
+  position: absolute;
+  bottom: 2px;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--primary);
+  content: "";
+  transform: translateX(-50%);
+}
+
+.ao-calendar-mini-day.is-selected {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: var(--primary-foreground);
+  font-weight: 700;
+}
+
+.ao-calendar-mini-day.is-selected::after {
+  background: currentColor;
+}
+
+.ao-calendar-nav-section {
+  flex: 0 0 auto;
+  padding: 20px 16px 0;
+}
+
+.ao-calendar-nav-heading {
+  margin: 0 0 8px;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  line-height: 16px;
+  text-transform: uppercase;
+}
+
+.ao-calendar-scope-label {
+  overflow: hidden;
+  margin: 0 0 8px;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ao-calendar-scope-options,
+.ao-calendar-filter-options {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ao-calendar-scope-option,
+.ao-calendar-filter-option {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted-foreground);
+  font-size: 13px;
+  line-height: 20px;
+  transition: color 120ms ease, background-color 120ms ease, border-color 120ms ease;
+}
+
+.ao-calendar-scope-option {
+  position: relative;
+  width: 100%;
+  padding: 5px 8px 5px 12px;
+  text-align: left;
+}
+
+.ao-calendar-scope-option:hover,
+.ao-calendar-scope-option:focus-visible,
+.ao-calendar-filter-option:hover {
+  border-color: var(--border);
+  background: color-mix(in srgb, var(--surface-slate) 75%, transparent);
+  color: var(--foreground);
+  outline: none;
+}
+
+.ao-calendar-scope-option.is-active {
+  border-color: color-mix(in srgb, var(--primary) 24%, var(--border));
+  background: color-mix(in srgb, var(--surface-slate) 88%, transparent);
+  color: var(--foreground);
+}
+
+.ao-calendar-scope-option.is-active::before {
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  left: 0;
+  width: 2px;
+  border-radius: 0 2px 2px 0;
+  background: var(--primary);
+  content: "";
+}
+
+.ao-calendar-radio {
+  display: inline-grid;
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid var(--muted-foreground);
+  border-radius: 50%;
+}
+
+.ao-calendar-scope-option.is-active .ao-calendar-radio {
+  border-color: var(--primary);
+  box-shadow: inset 0 0 0 4px var(--surface-slate), 0 0 0 1px var(--primary);
+  background: var(--primary);
+}
+
+.ao-calendar-filter-options {
+  padding-bottom: 20px;
+}
+
+.ao-calendar-filter-option {
+  min-height: 32px;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+
+.ao-calendar-filter-option > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ao-calendar-filter-option [data-slot="checkbox"] {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  border-color: var(--outline);
+  border-radius: 2px;
+}
+
+.ao-calendar-filter-option [data-slot="checkbox"][data-state="checked"] {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+
+.ao-calendar-readonly-note {
+  flex: 0 0 auto;
+  margin: 16px 16px 0;
+  border: 1px solid color-mix(in srgb, var(--primary) 34%, var(--border));
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--primary) 9%, transparent);
+  padding: 8px 10px;
+  color: var(--foreground);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.ao-calendar-nav-hint {
+  margin: auto 16px 16px;
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+  color: color-mix(in srgb, var(--muted-foreground) 72%, transparent);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.ao-calendar-canvas {
+  min-width: 0;
+  overflow: hidden;
+  background: var(--background);
+}
+
+.ao-calendar-canvas > .ao-calendar-mobile-controls {
+  flex: 0 0 auto;
+}
+
+.ao-calendar-canvas > [data-shell-region="calendar-canvas"] {
+  min-height: 0;
+}
+
+.ao-calendar-canvas > .ao-calendar-frame {
+  min-height: 0;
+}
+
+.ao-calendar-canvas [data-shell-region="calendar-canvas"] {
+  min-height: 0;
+}
+
+.ao-calendar-canvas .fc {
+  --fc-border-color: var(--border);
+  --fc-page-bg-color: var(--background);
+  --fc-neutral-bg-color: var(--surface-slate);
+  --fc-neutral-text-color: var(--muted-foreground);
+  --fc-today-bg-color: color-mix(in srgb, var(--primary) 7%, transparent);
+  height: 100%;
+  min-height: 0;
+  background: var(--background);
+  color: var(--foreground);
+  font-size: 13px;
+}
+
+.ao-calendar-canvas .fc .fc-toolbar {
+  min-height: 56px;
+  margin: 0;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface-charcoal) 72%, var(--background));
+  padding: 0 24px;
+}
+
+.ao-calendar-canvas .fc .fc-toolbar-chunk {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+}
+
+.ao-calendar-canvas .fc .fc-toolbar-title {
+  margin: 0 8px;
+  color: var(--foreground);
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 32px;
+}
+
+.ao-calendar-canvas .fc .fc-button {
+  min-height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface-slate);
+  color: var(--foreground);
+  box-shadow: none;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 18px;
+  transition: color 120ms ease, background-color 120ms ease, border-color 120ms ease;
+}
+
+.ao-calendar-canvas .fc .fc-button:hover,
+.ao-calendar-canvas .fc .fc-button:focus-visible {
+  border-color: var(--outline);
+  background: var(--surface-container-high);
+  color: var(--foreground);
+  outline: none;
+  box-shadow: none;
+}
+
+.ao-calendar-canvas .fc .fc-button-primary:not(:disabled).fc-button-active,
+.ao-calendar-canvas .fc .fc-button-primary:not(:disabled):active {
+  border-color: color-mix(in srgb, var(--primary) 45%, var(--border));
+  background: color-mix(in srgb, var(--primary) 17%, var(--surface-slate));
+  color: var(--primary);
+  box-shadow: none;
+}
+
+.ao-calendar-canvas .fc .fc-today-button {
+  margin-right: 8px;
+  border-color: var(--border);
+  background: transparent;
+}
+
+.ao-calendar-canvas .fc .fc-button-group {
+  display: inline-flex;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface-slate);
+}
+
+.ao-calendar-canvas .fc .fc-button-group .fc-button {
+  min-width: 58px;
+  border: 0;
+  border-right: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+}
+
+.ao-calendar-canvas .fc .fc-button-group .fc-button:last-child {
+  border-right: 0;
+}
+
+.ao-calendar-canvas .fc .fc-button-group .fc-button-primary:not(:disabled).fc-button-active {
+  background: var(--surface-container-high);
+  color: var(--primary);
+}
+
+.ao-calendar-canvas .fc .fc-scrollgrid {
+  border: 0;
+  border-top: 0;
+}
+
+.ao-calendar-canvas .fc .fc-scrollgrid-section > *,
+.ao-calendar-canvas .fc .fc-scrollgrid-section-liquid > td {
+  border-color: var(--border);
+}
+
+.ao-calendar-canvas .fc .fc-col-header-cell {
+  height: 42px;
+  background: var(--background);
+}
+
+.ao-calendar-canvas .fc .fc-col-header-cell-cushion {
+  display: block;
+  padding: 12px 12px 10px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: right;
+  text-decoration: none;
+}
+
+.ao-calendar-canvas .fc .fc-day-sat,
+.ao-calendar-canvas .fc .fc-day-sun {
+  background: color-mix(in srgb, var(--surface-container-lowest) 46%, transparent);
+}
+
+.ao-calendar-canvas .fc .fc-daygrid-day-frame {
+  min-height: 104px;
+  padding: 4px;
+}
+
+.ao-calendar-canvas .fc .fc-daygrid-day-number {
+  padding: 2px 4px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 20px;
+  text-decoration: none;
+}
+
+.ao-calendar-canvas .fc .fc-day-other .fc-daygrid-day-number {
+  color: color-mix(in srgb, var(--muted-foreground) 42%, transparent);
+}
+
+.ao-calendar-canvas .fc .fc-daygrid-day.fc-day-today {
+  background: color-mix(in srgb, var(--primary) 6%, transparent);
+  box-shadow: inset 0 2px 0 var(--primary);
+}
+
+.ao-calendar-canvas .fc .fc-daygrid-day.fc-day-today .fc-daygrid-day-number {
+  color: var(--primary);
+  font-weight: 700;
+}
+
+.ao-calendar-canvas .fc .fc-daygrid-day-events {
+  margin-top: 2px;
+}
+
+.ao-calendar-canvas .fc .fc-daygrid-event-harness {
+  margin-bottom: 2px;
+}
+
+.ao-calendar-canvas .fc .fc-event {
+  min-height: 22px;
+  border-width: 1px;
+  border-radius: 3px;
+  padding: 0;
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.ao-calendar-canvas .fc .fc-event.event-docs {
+  border-style: dashed;
+  border-color: #0ea5e9;
+}
+
+.ao-calendar-canvas .fc .fc-event .fc-event-main {
+  min-width: 0;
+  color: var(--foreground);
+}
+
+.ao-calendar-canvas .ao-cal-event {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: 30px;
+  align-items: stretch;
+  gap: 5px;
+  overflow: hidden;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  padding: 2px 5px 2px 7px;
+  color: var(--foreground);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.ao-calendar-canvas .ao-cal-event-bar {
+  width: 3px;
+  height: calc(100% - 4px);
+  flex: 0 0 auto;
+  margin: 2px 0;
+  border-radius: 0;
+  background: currentColor;
+}
+
+.ao-calendar-canvas .ao-cal-event-title {
+  min-width: 0;
+  overflow: hidden;
+  flex: 1 1 auto;
+  color: var(--foreground);
+  font-weight: 600;
+  line-height: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ao-calendar-canvas .ao-cal-event-content {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.ao-calendar-canvas .ao-cal-event-time {
+  flex: 0 0 auto;
+  color: var(--muted-foreground);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 11px;
+  white-space: nowrap;
+}
+
+.ao-calendar-canvas .ao-cal-event-list {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 5px;
+  border: 1px solid transparent;
+  border-left-width: 3px;
+  border-left-color: currentColor;
+}
+
+.ao-calendar-canvas .ao-cal-event-tag-none,
+.ao-calendar-canvas .ao-cal-event-tag-multi {
+  border-color: var(--border);
+}
+
+.ao-calendar-canvas .ao-cal-event-list-body {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.ao-calendar-canvas .ao-cal-event-doc-icon {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: #0ea5e9;
+}
+
+.ao-calendar-canvas .ao-cal-event-doc-label {
+  display: inline-block;
+  margin-right: 4px;
+  color: #0ea5e9;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  vertical-align: 1px;
+}
+
+.ao-calendar-canvas .ao-cal-event-tags {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 3px;
+}
+
+.ao-calendar-canvas .ao-cal-event-tag-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+}
+
+.ao-calendar-canvas .ao-cal-event-tag-count {
+  color: var(--muted-foreground);
+  font-size: 9px;
+  line-height: 12px;
+}
+
+.ao-calendar-canvas .ao-calendar-toggle {
+  display: inline-flex;
+  margin-top: 2px;
+  border: 0;
+  background: transparent;
+  color: var(--primary);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 16px;
+  padding: 0 4px;
+}
+
+.ao-calendar-canvas .ao-calendar-toggle:hover,
+.ao-calendar-canvas .ao-calendar-toggle:focus-visible {
+  color: var(--foreground);
+  outline: none;
+  text-decoration: underline;
+}
+
+.ao-calendar-canvas .fc .fc-list {
+  border: 0;
+  background: var(--background);
+}
+
+.ao-calendar-canvas .fc .fc-list-day-cushion {
+  background: var(--surface-slate);
+  color: var(--foreground);
+  padding: 8px 16px;
+}
+
+.ao-calendar-canvas .fc .fc-list-event:hover td {
+  background: var(--surface-container-high);
+}
+
+.ao-calendar-canvas .fc .fc-list-event-title {
+  color: var(--foreground);
+}
+
+.ao-calendar-canvas .fc .fc-list-empty {
+  background: transparent;
+  color: var(--muted-foreground);
+}
+
+.ao-calendar-canvas .fc .fc-timegrid-slot-label-cushion,
+.ao-calendar-canvas .fc .fc-timegrid-axis-cushion {
+  color: var(--muted-foreground);
+  font-size: 11px;
+}
+
+.ao-calendar-canvas .fc .fc-timegrid-slot {
+  height: 32px;
+}
+
+.ao-calendar-canvas .fc .fc-timegrid-now-indicator-line,
+.ao-calendar-canvas .fc .fc-timegrid-now-indicator-arrow {
+  border-color: var(--primary);
+}
+
+@media (max-width: 767px) {
+  .ao-calendar-canvas .fc .fc-toolbar {
+    flex-wrap: wrap;
+    min-height: 56px;
+    gap: 4px;
+    padding: 8px 12px;
+  }
+
+  .ao-calendar-canvas .fc .fc-toolbar-title {
+    margin: 0 4px;
+    font-size: 18px;
+    line-height: 24px;
+  }
+
+  .ao-calendar-canvas .fc .fc-toolbar-chunk:last-child {
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  .ao-calendar-canvas .fc .fc-daygrid-day-frame {
+    min-height: 78px;
+  }
+}
+
+/* ────────────────────────────────────────────────────────────────
+   Stitch Professional shared foundation
+   Keep this layer at the end of the file so it is the single visual source
+   for the shell even when legacy workspace adapters still carry Tailwind
+   surface/width utilities.  Behaviour and slot ownership stay in the
+   components above; these rules only establish the shared geometry, density,
+   and tonal layering.
+   ──────────────────────────────────────────────────────────────── */
+.ao-shell-root {
+  --ao-global-rail-width: 4rem;
+  --ao-global-context-height: 3.5rem;
+  --ao-workspace-nav-width: 15rem;
+  --ao-context-rail-width: 18.75rem;
+  --ao-shell-main-min-width: 0;
+  background: var(--background);
+}
+
+.ao-global-rail {
+  width: var(--ao-global-rail-width) !important;
+  min-width: var(--ao-global-rail-width) !important;
+  border-color: var(--border) !important;
+  background: var(--surface-charcoal) !important;
+  color: var(--foreground);
+}
+
+.ao-global-rail-brand {
+  min-height: var(--ao-global-context-height);
+  border-color: var(--border);
+  background: var(--surface-charcoal);
+}
+
+.ao-global-rail-brand > span {
+  border-radius: 4px !important;
+  background: var(--primary) !important;
+  color: var(--primary-foreground) !important;
+}
+
+.ao-global-rail-nav {
+  gap: 4px;
+  padding: 8px;
+}
+
+.ao-global-rail-nav .ao-global-rail-button {
+  width: 100%;
+  min-width: 0;
+  min-height: 2.75rem;
+  margin-inline: 0;
+  border-radius: 4px;
+  color: var(--muted-foreground);
+  font-size: 11px;
+}
+
+.ao-global-rail-nav .ao-global-rail-button:hover,
+.ao-global-rail-nav .ao-global-rail-button:focus-visible {
+  background: var(--surface-container-high);
+  color: var(--foreground);
+}
+
+.ao-global-rail-nav .ao-global-rail-button.is-active {
+  background: var(--surface-container-high);
+  color: var(--primary);
+}
+
+.ao-global-rail-button.is-active::before {
+  left: 0;
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  border-radius: 0;
+}
+
+.ao-global-rail-utility {
+  gap: 2px;
+  border-color: var(--border);
+  padding: 8px;
+}
+
+.ao-global-rail-utility .ao-global-rail-button {
+  width: 2.5rem;
+  min-width: 2.5rem;
+  min-height: 2.5rem;
+  border-radius: 4px;
+}
+
+.ao-global-context {
+  min-height: var(--ao-global-context-height);
+  height: var(--ao-global-context-height);
+  border-color: var(--border) !important;
+  background: var(--background) !important;
+}
+
+.ao-global-context-shell,
+.ao-global-context-shell > header {
+  background: var(--background);
+}
+
+.ao-shell-content {
+  background: var(--background);
+}
+
+.ao-workspace-nav-frame {
+  width: var(--ao-workspace-nav-width);
+  min-width: var(--ao-workspace-nav-width);
+  border-color: var(--border);
+  background: var(--surface-charcoal);
+}
+
+.ao-workspace-nav-panel {
+  width: var(--ao-workspace-nav-width);
+  min-width: var(--ao-workspace-nav-width);
+  border-color: var(--border);
+  background: var(--surface-charcoal);
+}
+
+.ao-sidebar-hero {
+  min-height: 3.5rem;
+  border-color: var(--border);
+  background: var(--surface-charcoal);
+}
+
+.ao-main-canvas {
+  min-width: 0;
+  border: 0;
+  background: var(--background);
+}
+
+.ao-main-scroll {
+  background: var(--background);
+}
+
+.ao-context-rail {
+  width: var(--ao-context-rail-width);
+  min-width: var(--ao-context-rail-width);
+  border-color: var(--border) !important;
+  background: var(--surface-charcoal) !important;
+}
+
+.ao-context-rail-content {
+  background: var(--surface-charcoal);
+}
+
+.ao-runtime-panel {
+  top: var(--ao-global-context-height) !important;
+  right: 0 !important;
+  left: auto !important;
+  width: min(var(--ao-context-rail-width), calc(100vw - var(--ao-global-rail-width))) !important;
+  max-width: calc(100vw - var(--ao-global-rail-width));
+  max-height: calc(100dvh - var(--ao-global-context-height));
+  border-color: var(--border) !important;
+  border-radius: 0 0 4px 4px;
+  background: var(--surface-slate) !important;
+  color: var(--foreground);
+  box-shadow: 0 18px 44px -26px rgb(0 0 0 / 0.72);
+}
+
+.ao-runtime-panel [data-slot="button"]:hover,
+.ao-runtime-panel button:hover {
+  background: var(--surface-container-high);
+}
+
+.ao-workspace-nav-scrim {
+  display: none;
+}
+
+@media (min-width: 2000px) {
+  .ao-shell-root {
+    --ao-workspace-nav-width: 15rem;
+    --ao-context-rail-width: 18.75rem;
+  }
+
+  .ao-context-rail {
+    position: relative;
+    inset: auto;
+  }
+
+}
+
+/* On wide desktop the context rail participates in shell geometry instead of
+   covering the main canvas. */
+@media (min-width: 1600px) and (max-width: 1919.98px) {
+  .ao-context-rail {
+    position: relative;
+    inset: auto;
+    width: var(--ao-context-rail-width);
+    min-width: var(--ao-context-rail-width);
+    border-left: 1px solid var(--border);
+    border-top: 0;
+    border-right: 0;
+    border-bottom: 0;
+    box-shadow: none;
+  }
+
+  .ao-context-rail-close {
+    display: none;
+  }
+}
+
+@media (min-width: 1920px) and (max-width: 1999px) {
+  .ao-context-rail {
+    position: relative;
+    inset: auto;
+    width: var(--ao-context-rail-width);
+    min-width: var(--ao-context-rail-width);
+    border-left: 1px solid var(--border);
+    border-top: 0;
+    border-right: 0;
+    border-bottom: 0;
+    box-shadow: none;
+  }
+
+  .ao-context-rail-close {
+    display: none;
+  }
+}
+
+@media (max-width: 1599px) {
+  .ao-workspace-nav-frame {
+    width: var(--ao-workspace-nav-width);
+    min-width: var(--ao-workspace-nav-width);
+  }
+
+  .ao-context-rail {
+    width: min(var(--ao-context-rail-width), calc(100vw - var(--ao-global-rail-width)));
+    min-width: 0;
+  }
+}
+
+@media (min-width: 768px) and (max-width: 1599px) {
+  .ao-workspace-nav-scrim {
+    display: none;
+  }
+
+  .ao-workspace-nav-frame {
+    position: relative;
+    inset: auto;
+    height: auto;
+    min-height: 0;
+    flex: 0 0 var(--ao-workspace-nav-width);
+    border: 0;
+    border-right: 1px solid var(--border);
+    box-shadow: none;
+    transform: none;
+  }
+
+  .ao-workspace-nav-frame.is-empty,
+  .ao-workspace-nav-frame.is-collapsed {
+    width: 0;
+    min-width: 0;
+    flex-basis: 0;
+    visibility: hidden;
+    pointer-events: none;
+  }
+
+  /* Tasks opts into the inline workspace rail at compact desktop widths so
+     the list canvas keeps a stable sidebar instead of an off-canvas drawer. */
+  .ao-workspace-nav-frame.is-desktop-persistent {
+    position: relative;
+    inset: auto;
+    width: var(--ao-workspace-nav-width);
+    min-width: var(--ao-workspace-nav-width);
+    height: auto;
+    min-height: 0;
+    flex: 0 0 var(--ao-workspace-nav-width);
+    overflow: auto;
+    border: 0;
+    border-right: 1px solid var(--border);
+    box-shadow: none;
+    transform: none;
+    visibility: visible;
+    pointer-events: auto;
+  }
+
+  .ao-workspace-nav-frame.is-desktop-persistent > * {
+    position: static;
+    width: 100%;
+    min-width: 0;
+    max-width: none;
+    height: 100%;
+    overflow: auto;
+  }
+
+  .ao-context-rail {
+    position: relative;
+    inset: auto;
+    width: var(--ao-context-rail-width);
+    min-width: var(--ao-context-rail-width);
+    border-left: 1px solid var(--border);
+    border-top: 0;
+    border-right: 0;
+    border-bottom: 0;
+    box-shadow: none;
+  }
+}
+
+@media (max-width: 767px) {
+  .ao-shell-root {
+    --ao-global-rail-width: 0px;
+    --ao-global-context-height: 3.5rem;
+    --ao-workspace-nav-width: 18rem;
+  }
+
+  .ao-global-context {
+    min-height: var(--ao-global-context-height);
+    height: auto;
+  }
+
+  .ao-workspace-nav-frame {
+    top: var(--ao-global-context-height);
+    width: min(var(--ao-workspace-nav-width), 92vw);
+    min-width: min(var(--ao-workspace-nav-width), 92vw);
+  }
+
+  .ao-context-rail {
+    top: var(--ao-global-context-height);
+    width: min(24rem, 92vw);
+  }
+
+  .ao-runtime-panel {
+    top: var(--ao-global-context-height) !important;
+    right: 0 !important;
+    left: auto !important;
+    width: min(22rem, 92vw) !important;
+    max-width: 92vw;
+  }
 }

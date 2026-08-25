@@ -3,7 +3,6 @@
 import {
   useCallback,
   type Dispatch,
-  type SetStateAction,
 } from "react";
 import type { useRouter } from "next/navigation";
 import { chatApi } from "@/lib/chat-api";
@@ -17,7 +16,7 @@ type UseGroupChatCreateArgs = {
   router: ReturnType<typeof useRouter>;
   activateSession: (sessionId: string) => void;
   addSession: (session: ConversationSession) => void;
-  setCurrentSession: Dispatch<SetStateAction<ConversationSession | null>>;
+  upsertSession: (session: ConversationSession) => void;
   dispatchChatTimeline: Dispatch<ChatTimelineAction>;
 };
 
@@ -30,7 +29,7 @@ export function useGroupChatCreate({
   router,
   activateSession,
   addSession,
-  setCurrentSession,
+  upsertSession,
   dispatchChatTimeline,
 }: UseGroupChatCreateArgs) {
   // ─── グループチャット作成 ───
@@ -50,7 +49,7 @@ export function useGroupChatCreate({
         );
         const session = data.session;
         addSession(session);
-        setCurrentSession(session);
+        upsertSession(session);
 
         // first_messages があれば初期メッセージとして追加
         if (data.first_messages && data.first_messages.length > 0) {
@@ -85,7 +84,7 @@ export function useGroupChatCreate({
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [activateSession, addSession, router],
+    [activateSession, addSession, router, upsertSession],
   );
 
   return { handleCreateGroupChat };

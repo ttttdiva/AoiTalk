@@ -4,7 +4,7 @@ Google Gemini speech recognition implementation
 import io
 import time
 import wave
-from typing import Optional, Generator, Tuple, Dict, Any
+from typing import Optional, Generator, Tuple, Dict, Any, Mapping
 from collections import deque
 
 try:
@@ -15,12 +15,28 @@ except ImportError:
     print("[GeminiRecognizer] google-generativeai not available")
 
 from ..base import SpeechRecognizerInterface
+from ...services.outbound_privacy_service import (
+    OutboundPrivacyGateway,
+    effective_privacy_mode,
+    get_privacy_policy_context,
+    privacy_config,
+)
 
+def persist_usage_sync(*args: Any, **kwargs: Any) -> bool:
+    """Lazy usage persistence import for optional audio deployments."""
+    from ...llm.conversation_context import persist_usage_sync as _persist
+
+    return bool(_persist(*args, **kwargs))
 
 class GeminiSpeechRecognizer(SpeechRecognizerInterface):
     """Google Gemini speech recognition implementation"""
     
-    def __init__(self, config: Dict[str, Any] = None):
+    def __init__(
+        self,
+        config: Dict[str, Any] = None,
+        usage_client: Any = None,
+        usage_context: Any = None,
+    ):
         """Initialize Gemini speech recognizer
         
         Args:
@@ -51,6 +67,302 @@ class GeminiSpeechRecognizer(SpeechRecognizerInterface):
         # Buffer for streaming mode
         self.audio_buffer = deque()
         self.buffer_duration = 0.0
+
+        # A Gemini response is normally consumed immediately, but keeping a
+        # small identity-based ledger prevents an adapter/caller from asking
+        # us to persist the same response twice.  Do not key this by ``id``:
+        # response objects may be short-lived and Python can reuse ids.
+        self._recorded_usage_responses = []
+        # These are immutable references used only as defaults.  A request
+        # may pass an explicit context to ``recognize``/stream methods without
+        # mutating shared recognizer state.
+        self.usage_client = usage_client
+        self.usage_context = usage_context
+        self._privacy_gateway = OutboundPrivacyGateway(
+            getattr(usage_client, "config", None) or self.config,
+        )
+        self._sync_privacy_gateway(usage_client=usage_client, usage_context=usage_context)
+        self._stream_usage_client = None
+        self._stream_usage_context = None
+
+    @staticmethod
+    def _context_value(context: Any, name: str, *aliases: str) -> Any:
+        keys = (name, *aliases)
+        if isinstance(context, Mapping):
+            for key in keys:
+                value = context.get(key)
+                if value is not None:
+                    return value
+        for key in keys:
+            value = getattr(context, key, None)
+            if value is not None:
+                return value
+        return None
+
+    def _sync_privacy_gateway(
+        self,
+        *,
+        usage_client: Any = None,
+        usage_context: Any = None,
+    ) -> None:
+        """Refresh request identity/policy before each Gemini upload."""
+
+        candidate = usage_client or usage_context or self.usage_client or self.usage_context
+        if usage_client is None and usage_context is None:
+            try:
+                from ...services.turn_context import get_turn_context
+
+                turn = get_turn_context()
+            except Exception:
+                turn = None
+            if turn is not None and any(
+                getattr(turn, field, None)
+                for field in ("user_id", "session_id", "project_id")
+            ):
+                candidate = turn
+        config = self._context_value(candidate, "config") or self.config
+        if config is not self._privacy_gateway.config:
+            self._privacy_gateway.config = config
+        user_id = self._context_value(candidate, "user_id", "session_user_id")
+        if user_id is None:
+            getter = getattr(candidate, "_get_session_user_id", None)
+            if callable(getter):
+                try:
+                    user_id = getter()
+                except Exception:
+                    user_id = None
+        session_id = self._context_value(candidate, "current_session_id", "session_id")
+        previous_identity = (
+            self._privacy_gateway.user_id,
+            self._privacy_gateway.session_id,
+        )
+        self._privacy_gateway.user_id = str(user_id or "")
+        self._privacy_gateway.session_id = str(session_id or "")
+        if previous_identity != (
+            self._privacy_gateway.user_id,
+            self._privacy_gateway.session_id,
+        ):
+            self._privacy_gateway._raw_to_alias.clear()
+            self._privacy_gateway._alias_to_raw.clear()
+
+        inherited = get_privacy_policy_context()
+        session_policy = self._context_value(candidate, "session_context", "privacy_context")
+        project_metadata = self._context_value(
+            candidate,
+            "project_metadata",
+            "project_metadata_context",
+        )
+        if not isinstance(session_policy, Mapping):
+            session_policy = inherited.session_context
+        if not isinstance(project_metadata, Mapping):
+            project_metadata = inherited.project_metadata
+        privacy_mode = self._context_value(candidate, "privacy_mode")
+        if privacy_mode is not None:
+            session_policy = dict(session_policy or {})
+            session_policy["privacy_mode"] = str(privacy_mode or "")
+        self._privacy_gateway.update_policy_context(
+            session_context=dict(session_policy or {}),
+            project_metadata=dict(project_metadata or {}),
+        )
+        settings = privacy_config(config)
+        self._privacy_gateway.settings = settings.__class__(
+            **{
+                **settings.__dict__,
+                "mode": effective_privacy_mode(
+                    config,
+                    session_context=self._privacy_gateway.session_context,
+                    project_metadata=self._privacy_gateway.project_metadata,
+                ),
+            }
+        )
+
+    def set_usage_context(
+        self,
+        *,
+        usage_client: Any = None,
+        usage_context: Any = None,
+    ) -> None:
+        """Set optional default usage context for manager-created recognizers.
+
+        The manager uses this only for a recognizer-scoped default.  Callers
+        handling concurrent requests should pass ``usage_client`` or
+        ``usage_context`` to the individual recognition method instead.
+        """
+        self.usage_client = usage_client
+        self.usage_context = usage_context
+        self._sync_privacy_gateway(usage_client=usage_client, usage_context=usage_context)
+
+    @staticmethod
+    def _usage_client_from_context(context: Any) -> Any:
+        """Adapt a request context into the client shape expected by usage DB."""
+        if context is None:
+            return None
+        if (
+            hasattr(context, "current_session_id")
+            or hasattr(context, "current_project_id")
+            or callable(getattr(context, "_get_session_user_id", None))
+        ):
+            return context
+        try:
+            from types import SimpleNamespace
+
+            def value(name: str, *aliases: str) -> Any:
+                if isinstance(context, dict):
+                    for key in (name, *aliases):
+                        item = context.get(key)
+                        if item is not None:
+                            return item
+                for key in (name, *aliases):
+                    item = getattr(context, key, None)
+                    if item is not None:
+                        return item
+                return None
+
+            user_id = value("user_id")
+            return SimpleNamespace(
+                current_session_id=value("current_session_id", "session_id"),
+                current_project_id=value("current_project_id", "project_id"),
+                character_name=value("character_name"),
+                _get_session_user_id=lambda: user_id,
+            )
+        except Exception:
+            return None
+
+    def _resolve_usage_client(
+        self,
+        usage_client: Any = None,
+        usage_context: Any = None,
+    ) -> Any:
+        if usage_client is not None:
+            return usage_client
+        if usage_context is not None:
+            return self._usage_client_from_context(usage_context)
+        if getattr(self, "usage_client", None) is not None:
+            return self.usage_client
+        if getattr(self, "usage_context", None) is not None:
+            return self._usage_client_from_context(self.usage_context)
+        return None
+
+    @staticmethod
+    def _usage_value(usage: Any, name: str) -> Any:
+        value = getattr(usage, name, None)
+        if value is None and isinstance(usage, dict):
+            value = usage.get(name)
+        return value
+
+    @classmethod
+    def _gemini_usage_payload(cls, response: Any) -> Optional[Dict[str, Any]]:
+        """Convert Gemini ``usage_metadata`` to the usage ledger shape.
+
+        Gemini's generative API does not expose OpenAI's ``usage`` object;
+        token counts are nested under ``usage_metadata`` instead.  Returning
+        ``None`` when both token counters are absent is intentional: callers
+        must not manufacture an STT cost when a provider did not report one.
+        """
+        usage = getattr(response, "usage_metadata", None)
+        if usage is None and isinstance(response, dict):
+            usage = response.get("usage_metadata")
+        if usage is None:
+            return None
+
+        def count(name: str) -> Optional[int]:
+            value = cls._usage_value(usage, name)
+            if value is None:
+                return None
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError):
+                return None
+
+        input_tokens = count("prompt_token_count")
+        output_tokens = count("candidates_token_count")
+        if input_tokens is None and output_tokens is None:
+            return None
+
+        cached_tokens = count("cached_content_token_count") or 0
+        payload: Dict[str, Any] = {
+            "input_tokens": input_tokens or 0,
+            "output_tokens": output_tokens or 0,
+            "cached_tokens": cached_tokens,
+            "cache_read_tokens": cached_tokens,
+            "reasoning_tokens": count("thoughts_token_count") or 0,
+            "cache_provider": "gemini",
+            "metrics_source": "gemini.usage_metadata",
+        }
+        resolved_model = getattr(response, "model_version", None)
+        if resolved_model is None and isinstance(response, dict):
+            resolved_model = response.get("model_version")
+        if resolved_model:
+            payload["resolved_model"] = str(resolved_model)
+        return payload
+
+    def _mark_usage_recorded(self, response: Any) -> bool:
+        """Return ``True`` if this exact response was already persisted."""
+        try:
+            if getattr(response, "_aoitalk_usage_recorded", False):
+                return True
+            object.__setattr__(response, "_aoitalk_usage_recorded", True)
+            return False
+        except Exception:
+            # Some SDK response objects are slotted/frozen.  Keep a bounded
+            # strong-reference list in that case so object identity remains
+            # stable even when Python reuses object ids.
+            recorded = getattr(self, "_recorded_usage_responses", None)
+            if recorded is None:
+                recorded = []
+                self._recorded_usage_responses = recorded
+            if any(item is response for item in recorded):
+                return True
+            recorded.append(response)
+            del recorded[:-8]
+            return False
+
+    def _record_gemini_usage(
+        self,
+        response: Any,
+        *,
+        latency_ms: int = 0,
+        usage_client: Any = None,
+        usage_context: Any = None,
+    ) -> None:
+        """Persist one successful Gemini STT response when usage is reported."""
+        try:
+            payload = self._gemini_usage_payload(response)
+            if not payload or self._mark_usage_recorded(response):
+                return
+            # A recognizer normally has no LLM client/session object.  Tests
+            # and Discord integrations may attach one as ``usage_client``;
+            # passing it through preserves user/session/project context when
+            # available while still allowing standalone STT accounting.
+            resolved_usage_client = self._resolve_usage_client(
+                usage_client,
+                usage_context,
+            )
+            if resolved_usage_client is None:
+                try:
+                    from types import SimpleNamespace
+
+                    from ...services.turn_context import get_turn_context
+
+                    turn = get_turn_context()
+                    resolved_usage_client = SimpleNamespace(
+                        current_session_id=turn.session_id,
+                        current_project_id=turn.project_id,
+                        character_name=None,
+                        _get_session_user_id=lambda: turn.user_id,
+                    )
+                except Exception:
+                    resolved_usage_client = None
+            persist_usage_sync(
+                resolved_usage_client,
+                provider="gemini",
+                model=str(self.model_name),
+                usage=payload,
+                request_type="stt",
+                latency_ms=max(int(latency_ms or 0), 0),
+            )
+        except Exception as exc:  # pragma: no cover - defensive telemetry path
+            print(f"[GeminiRecognizer] usage記録に失敗しました: {exc}")
         
     def configure(self, config: Dict[str, Any]) -> None:
         """Configure the recognition engine
@@ -75,6 +387,7 @@ class GeminiSpeechRecognizer(SpeechRecognizerInterface):
         self.model_name = self.config.get('model', self.model_name)
         self.language = self.config.get('language', self.language)
         self.chunk_length = self.config.get('chunk_length', self.chunk_length)
+        self._sync_privacy_gateway()
         
     def get_engine_info(self) -> Dict[str, Any]:
         """Get information about the recognition engine
@@ -92,17 +405,30 @@ class GeminiSpeechRecognizer(SpeechRecognizerInterface):
             'model_initialized': self.model is not None
         }
         
-    def start_stream(self):
+    def start_stream(
+        self,
+        *,
+        usage_client: Any = None,
+        usage_context: Any = None,
+    ):
         """Start a new streaming session"""
         self.audio_buffer.clear()
         self.buffer_duration = 0.0
+        # Stream-scoped defaults avoid requiring callers to repeat context on
+        # every chunk while keeping request context separate from other
+        # recognizer instances.
+        self._stream_usage_client = usage_client
+        self._stream_usage_context = usage_context
         print("[GeminiRecognizer] Started new streaming session")
         
-    def process_audio_chunk(self, 
+    def process_audio_chunk(self,
                            audio_data: bytes,
                            sample_rate: int = 16000,
                            channels: int = 1,
-                           sample_width: int = 2) -> Generator[Tuple[bool, Optional[str]], None, None]:
+                           sample_width: int = 2,
+                           *,
+                           usage_client: Any = None,
+                           usage_context: Any = None) -> Generator[Tuple[bool, Optional[str]], None, None]:
         """Process audio chunk and yield transcription results
         
         Args:
@@ -132,12 +458,32 @@ class GeminiSpeechRecognizer(SpeechRecognizerInterface):
             self.buffer_duration = 0.0
             
             # Transcribe the chunk
-            result = self.recognize(combined_audio, sample_rate, channels, sample_width)
+            result = self.recognize(
+                combined_audio,
+                sample_rate,
+                channels,
+                sample_width,
+                usage_client=(
+                    usage_client
+                    if usage_client is not None
+                    else self._stream_usage_client
+                ),
+                usage_context=(
+                    usage_context
+                    if usage_context is not None
+                    else self._stream_usage_context
+                ),
+            )
             
             if result:
                 yield (True, result)
                 
-    def finish_stream(self) -> Optional[str]:
+    def finish_stream(
+        self,
+        *,
+        usage_client: Any = None,
+        usage_context: Any = None,
+    ) -> Optional[str]:
         """Finish streaming and process remaining audio
         
         Returns:
@@ -153,15 +499,30 @@ class GeminiSpeechRecognizer(SpeechRecognizerInterface):
         self.audio_buffer.clear()
         self.buffer_duration = 0.0
         
-        return self.recognize(combined_audio)
+        return self.recognize(
+            combined_audio,
+            usage_client=(
+                usage_client
+                if usage_client is not None
+                else self._stream_usage_client
+            ),
+            usage_context=(
+                usage_context
+                if usage_context is not None
+                else self._stream_usage_context
+            ),
+        )
     
-    def recognize(self, 
-                  audio_data: bytes, 
+    def recognize(self,
+                  audio_data: bytes,
                   sample_rate: int = 16000,
                   channels: int = 1,
                   sample_width: int = 2,
                   language: str = None,
-                  prompt: Optional[str] = None) -> Optional[str]:
+                  prompt: Optional[str] = None,
+                  *,
+                  usage_client: Any = None,
+                  usage_context: Any = None) -> Optional[str]:
         """Recognize speech from audio data
         
         Args:
@@ -179,7 +540,12 @@ class GeminiSpeechRecognizer(SpeechRecognizerInterface):
             print("[GeminiRecognizer] Gemini model not initialized")
             return None
             
+        started = time.monotonic()
         try:
+            self._sync_privacy_gateway(
+                usage_client=usage_client,
+                usage_context=usage_context,
+            )
             # Create WAV file from audio data
             wav_data = self._create_wav_data(audio_data, sample_rate, channels, sample_width)
             
@@ -201,6 +567,14 @@ IMPORTANT INSTRUCTIONS:
             
             if prompt:
                 base_prompt += f" Context: {prompt}"
+
+            protected = self._privacy_gateway.protect_sync(
+                {"prompt": base_prompt, "media": wav_data},
+                provider="gemini",
+                source_kind="audio_transcription",
+            )
+            if isinstance(protected.payload, dict):
+                base_prompt = str(protected.payload.get("prompt") or base_prompt)
             
             # Upload and transcribe
             uploaded_file = genai.upload_file(audio_file, mime_type="audio/wav")
@@ -228,7 +602,17 @@ IMPORTANT INSTRUCTIONS:
                     
                     if cleaned_result != result:
                         print(f"[GeminiRecognizer] 幻聴部分を除去: '{result}' → '{cleaned_result}'")
-                    
+
+                    # Only successful transcription responses reach this
+                    # point.  If Gemini omitted usage_metadata the helper is a
+                    # no-op; estimated tokens are never fabricated.
+                    self._record_gemini_usage(
+                        response,
+                        latency_ms=int((time.monotonic() - started) * 1000),
+                        usage_client=usage_client,
+                        usage_context=usage_context,
+                    )
+
                     return cleaned_result
                 else:
                     print("[GeminiRecognizer] No transcription result")

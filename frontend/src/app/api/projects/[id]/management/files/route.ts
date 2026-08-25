@@ -2,30 +2,27 @@ import { NextRequest, NextResponse } from "next/server";
 import fs from "node:fs";
 import path from "node:path";
 import { db } from "@/db";
-import { projects } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { projectMembers, projects, users } from "@/db/schema";
+import { and, eq } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
 import {
   getAccessibleProject,
   getWritableProject,
 } from "@/lib/server/project-access";
 import {
+  calculateProjectStorageUsage,
   ensureProjectStorageRoot,
+  isPathInsideProjectStorageRoot,
   mergeManagementConfigIntoMetadata,
   normalizeProjectFilePath,
   normalizeProjectManagementConfig,
 } from "@/lib/server/project-workspace-management";
-
-const BLOCKED_EXTENSIONS = new Set([
-  ".exe",
-  ".bat",
-  ".cmd",
-  ".sh",
-  ".ps1",
-  ".vbs",
-  ".scr",
-  ".com",
-]);
+import { hasProjectPermission } from "@/lib/server/project-permissions";
+import {
+  exceedsUploadSizeLimit,
+  sanitizeUploadFileName,
+  writeUniqueUploadFile,
+} from "@/lib/server/attachment-upload";
 
 const MANAGEMENT_KINDS = new Set([
   "wbs",
@@ -35,24 +32,62 @@ const MANAGEMENT_KINDS = new Set([
   "attachment",
 ]);
 
-function sanitizeFileName(name: string): string {
-  const cleaned = name
-    .replace(/[/\\:*?"<>|]/g, "")
-    .replace(/[\u0000-\u001f]/g, "")
-    .trim()
-    .replace(/^\.+$/, "");
-  return cleaned.slice(0, 180) || "uploaded-file";
+const IDEMPOTENCY_HEADER = "x-idempotency-key";
+const IDEMPOTENCY_METADATA_KEY = "_upload_idempotency";
+const MAX_IDEMPOTENCY_KEY_LENGTH = 512;
+
+type IdempotencyRecord = {
+  relativePath: string;
+  name: string;
+  size: number;
+  kind: string;
+};
+
+function recordMap(value: unknown): Record<string, IdempotencyRecord> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const result: Record<string, IdempotencyRecord> = Object.create(null) as Record<
+    string,
+    IdempotencyRecord
+  >;
+  for (const [key, candidate] of Object.entries(value)) {
+    if (
+      candidate &&
+      typeof candidate === "object" &&
+      !Array.isArray(candidate) &&
+      typeof candidate.relativePath === "string" &&
+      typeof candidate.name === "string" &&
+      typeof candidate.size === "number" &&
+      typeof candidate.kind === "string"
+    ) {
+      result[key] = {
+        relativePath: candidate.relativePath,
+        name: candidate.name,
+        size: candidate.size,
+        kind: candidate.kind,
+      };
+    }
+  }
+  return result;
 }
 
-function uniqueTargetPath(dir: string, fileName: string): string {
-  const parsed = path.parse(fileName);
-  let candidate = path.join(dir, fileName);
-  let index = 1;
-  while (fs.existsSync(candidate)) {
-    candidate = path.join(dir, `${parsed.name}-${index}${parsed.ext}`);
-    index += 1;
+function metadataRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? { ...(value as Record<string, unknown>) }
+    : {};
+}
+
+class ProjectQuotaExceededError extends Error {
+  constructor() {
+    super("Project storage quota exceeded");
+    this.name = "ProjectQuotaExceededError";
   }
-  return candidate;
+}
+
+class ProjectPermissionError extends Error {
+  constructor() {
+    super("Permission denied");
+    this.name = "ProjectPermissionError";
+  }
 }
 
 function kindFromValue(value: FormDataEntryValue | null): string {
@@ -73,6 +108,7 @@ function resolveProjectDirectory(
   if (relativeToRoot.startsWith("..") || path.isAbsolute(relativeToRoot)) {
     return null;
   }
+  if (!isPathInsideProjectStorageRoot(storageRoot, targetDir)) return null;
   return targetDir;
 }
 
@@ -129,7 +165,13 @@ export async function GET(
 
   for (const entry of fs.readdirSync(targetDir, { withFileTypes: true })) {
     const absolutePath = path.join(targetDir, entry.name);
-    const stat = fs.statSync(absolutePath);
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(absolutePath);
+    } catch {
+      continue;
+    }
+    if (stat.isSymbolicLink()) continue;
     const relativePath = projectRelativePath(storageRoot, absolutePath);
     if (entry.isDirectory()) {
       directories.push({
@@ -190,12 +232,24 @@ export async function POST(
   if (!(file instanceof File)) {
     return NextResponse.json({ detail: "file が必要です" }, { status: 400 });
   }
-
-  const fileName = sanitizeFileName(file.name || "uploaded-file");
-  const ext = path.extname(fileName).toLowerCase();
-  if (BLOCKED_EXTENSIONS.has(ext)) {
+  if (exceedsUploadSizeLimit(file.size)) {
     return NextResponse.json(
-      { detail: "この拡張子のファイルはアップロードできません" },
+      { detail: "ファイルサイズは 50 MB までです" },
+      { status: 413 },
+    );
+  }
+
+  const fileName = sanitizeUploadFileName(file.name || "uploaded-file");
+  const idempotencyKey = request.headers.get(IDEMPOTENCY_HEADER)?.trim() || null;
+  if (idempotencyKey && idempotencyKey.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
+    return NextResponse.json(
+      { detail: "Idempotency key is too long" },
+      { status: 400 },
+    );
+  }
+  if (idempotencyKey && /[\u0000-\u001f\u007f]/u.test(idempotencyKey)) {
+    return NextResponse.json(
+      { detail: "Idempotency key contains invalid characters" },
       { status: 400 },
     );
   }
@@ -216,47 +270,214 @@ export async function POST(
       { status: 400 },
     );
   }
-
-  fs.mkdirSync(targetDir, { recursive: true });
-  const targetPath = uniqueTargetPath(targetDir, fileName);
-  const buffer = Buffer.from(await file.arrayBuffer());
-  fs.writeFileSync(targetPath, buffer);
-  const relativePath = path
-    .relative(storageRoot, targetPath)
-    .replace(/\\/g, "/");
-
-  let config = normalizeProjectManagementConfig(result.project.projectMetadata);
-  if (kind !== "attachment") {
-    const nextRequestFiles =
-      kind === "request"
-        ? [...new Set([...config.requestFiles, relativePath])]
-        : config.requestFiles;
-    const metadata = mergeManagementConfigIntoMetadata(
-      result.project.projectMetadata,
-      {
-        workspaceRoot: null,
-        wbsFile: kind === "wbs" ? relativePath : config.wbsFile,
-        issueFile: kind === "issue" ? relativePath : config.issueFile,
-        riskFile: kind === "risk" ? relativePath : config.riskFile,
-        requestFiles: nextRequestFiles,
-        taskRules: config.taskRules,
-      },
+  if (!isPathInsideProjectStorageRoot(storageRoot, targetDir)) {
+    return NextResponse.json(
+      { detail: "保存先に不正なシンボリックリンクがあります" },
+      { status: 400 },
     );
-    const [updated] = await db
-      .update(projects)
-      .set({ projectMetadata: metadata, updatedAt: new Date() })
-      .where(eq(projects.id, id))
-      .returning();
-    config = normalizeProjectManagementConfig(updated.projectMetadata);
   }
 
-  return NextResponse.json({
-    success: true,
-    kind,
-    name: fileName,
-    path: relativePath,
-    size: buffer.byteLength,
-    registered: kind !== "attachment",
-    config,
-  });
+  const buffer = Buffer.from(await file.arrayBuffer());
+  let createdPath: string | null = null;
+  let transactionCommitted = false;
+  try {
+    const upload = await db.transaction(async (tx) => {
+      const [project] = await tx
+        .select()
+        .from(projects)
+        .where(eq(projects.id, id))
+        .limit(1)
+        .for("update");
+      if (!project || project.deletedAt) {
+        throw new Error("Project not found");
+      }
+
+      const lockedStorageRoot = ensureProjectStorageRoot(id);
+      const projectMetadata = metadataRecord(project.projectMetadata);
+      const idempotency = recordMap(
+        projectMetadata[IDEMPOTENCY_METADATA_KEY],
+      );
+      // The row lock orders this ACL check with membership mutations.  Do
+      // not reuse the pre-transaction session snapshot after waiting for the
+      // lock; read the principal and membership in this transaction.
+      const [principal] = await tx
+        .select({ role: users.role })
+        .from(users)
+        .where(eq(users.id, user.id))
+        .limit(1);
+      const [membership] = await tx
+        .select({ permissions: projectMembers.permissions })
+        .from(projectMembers)
+        .where(
+          and(
+            eq(projectMembers.projectId, id),
+            eq(projectMembers.userId, user.id),
+          ),
+        )
+        .limit(1);
+      const canWrite =
+        principal?.role === "admin" ||
+        project.ownerId === user.id ||
+        hasProjectPermission(membership?.permissions, "write");
+      if (!canWrite) throw new ProjectPermissionError();
+
+      if (idempotencyKey && idempotency[idempotencyKey]) {
+        const existing = idempotency[idempotencyKey];
+        const existingPath = path.resolve(
+          /*turbopackIgnore: true*/ lockedStorageRoot,
+          existing.relativePath.replace(/\//g, path.sep),
+        );
+        if (
+          isPathInsideProjectStorageRoot(lockedStorageRoot, existingPath) &&
+          fs.existsSync(existingPath) &&
+          fs.statSync(existingPath).isFile()
+        ) {
+          return {
+            relativePath: existing.relativePath,
+            config: normalizeProjectManagementConfig(project.projectMetadata),
+            name: existing.name,
+            size: existing.size,
+            kind: existing.kind,
+            registered: existing.kind !== "attachment",
+          };
+        }
+        // A stale map entry must not make a successful retry return a missing
+        // file.  It is replaced by the new committed upload below.
+        delete idempotency[idempotencyKey];
+      }
+
+      const lockedTargetDir = path.resolve(
+        /*turbopackIgnore: true*/ lockedStorageRoot,
+        directory.replace(/\\/g, path.sep),
+      );
+      const lockedRelativeToRoot = path.relative(
+        lockedStorageRoot,
+        lockedTargetDir,
+      );
+      if (
+        lockedRelativeToRoot.startsWith("..") ||
+        path.isAbsolute(lockedRelativeToRoot) ||
+        !isPathInsideProjectStorageRoot(lockedStorageRoot, lockedTargetDir)
+      ) {
+        throw new Error("Project storage path changed outside the workspace");
+      }
+
+      const usage = calculateProjectStorageUsage(lockedStorageRoot);
+      const quotaMb = Math.max(0, Number(project.storageQuotaMb ?? 1000));
+      const quotaBytes = quotaMb * 1024 * 1024;
+      if (usage.totalBytes + buffer.byteLength > quotaBytes) {
+        throw new ProjectQuotaExceededError();
+      }
+
+      fs.mkdirSync(lockedTargetDir, { recursive: true });
+      if (!isPathInsideProjectStorageRoot(lockedStorageRoot, lockedTargetDir)) {
+        throw new Error("Project storage path changed outside the workspace");
+      }
+      createdPath = writeUniqueUploadFile(lockedTargetDir, fileName, buffer);
+      if (!isPathInsideProjectStorageRoot(lockedStorageRoot, createdPath)) {
+        throw new Error("Project upload path changed outside the workspace");
+      }
+
+      const relativePath = path
+        .relative(lockedStorageRoot, createdPath)
+        .replace(/\\/g, "/");
+      let config = normalizeProjectManagementConfig(project.projectMetadata);
+      const updates: {
+        storageUsedMb: number;
+        projectMetadata?: unknown;
+        updatedAt: Date;
+      } = {
+        storageUsedMb:
+          (usage.totalBytes + buffer.byteLength) / (1024 * 1024),
+        updatedAt: new Date(),
+      };
+      if (kind !== "attachment") {
+        const nextRequestFiles =
+          kind === "request"
+            ? [...new Set([...config.requestFiles, relativePath])]
+            : config.requestFiles;
+        const metadata = mergeManagementConfigIntoMetadata(
+          project.projectMetadata,
+          {
+            workspaceRoot: null,
+            wbsFile: kind === "wbs" ? relativePath : config.wbsFile,
+            issueFile: kind === "issue" ? relativePath : config.issueFile,
+            riskFile: kind === "risk" ? relativePath : config.riskFile,
+            requestFiles: nextRequestFiles,
+            taskRules: config.taskRules,
+          },
+        );
+        updates.projectMetadata = metadata;
+        config = normalizeProjectManagementConfig(metadata);
+      }
+
+      if (idempotencyKey) {
+        const nextIdempotency: Record<string, IdempotencyRecord> = {
+          ...idempotency,
+          [idempotencyKey]: {
+            relativePath,
+            name: fileName,
+            size: buffer.byteLength,
+            kind,
+          },
+        };
+        // Keep metadata bounded; keys are only a retry ledger and should not
+        // grow a project row without limit.
+        const recentEntries = Object.entries(nextIdempotency).slice(-64);
+        const nextMetadata = {
+          ...metadataRecord(updates.projectMetadata ?? project.projectMetadata),
+          [IDEMPOTENCY_METADATA_KEY]: Object.fromEntries(recentEntries),
+        };
+        updates.projectMetadata = nextMetadata;
+      }
+
+      await tx
+        .update(projects)
+        .set(updates)
+        .where(eq(projects.id, id));
+
+      return {
+        relativePath,
+        config,
+        name: fileName,
+        size: buffer.byteLength,
+        kind,
+        registered: kind !== "attachment",
+      };
+    });
+    transactionCommitted = true;
+
+    return NextResponse.json({
+      success: true,
+      kind,
+      name: upload.name,
+      path: upload.relativePath,
+      size: upload.size,
+      registered: upload.registered,
+      config: upload.config,
+    });
+  } catch (error) {
+    if (!transactionCommitted && createdPath) {
+      try {
+        if (isPathInsideProjectStorageRoot(storageRoot, createdPath)) {
+          fs.rmSync(createdPath, { force: true });
+        }
+      } catch {
+        console.warn("Failed to remove orphaned project upload", createdPath);
+      }
+    }
+    if (error instanceof ProjectQuotaExceededError) {
+      return NextResponse.json(
+        { detail: error.message },
+        { status: 413 },
+      );
+    }
+    if (error instanceof ProjectPermissionError) {
+      return NextResponse.json({ detail: error.message }, { status: 403 });
+    }
+    if (error instanceof Error && error.message === "Project not found") {
+      return NextResponse.json({ detail: error.message }, { status: 404 });
+    }
+    throw error;
+  }
 }

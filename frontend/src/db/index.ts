@@ -18,15 +18,33 @@ function getConnectionString(): string {
   return `postgres://${user}:${password}@${host}:${port}/${dbName}`;
 }
 
-const client = postgres(getConnectionString(), {
-  types: {
-    wallClockTimestamp: {
-      to: 1114,
-      from: [1114],
-      serialize: serializeDbTimestampInput,
-      parse: parseDbTimestampOutput,
+function createClient() {
+  return postgres(getConnectionString(), {
+    // 1プロセスあたりの上限を明示する（postgres の既定も10だが、
+    // PostgreSQL 側の max_connections を食い潰さないよう意図を残す）。
+    max: 10,
+    types: {
+      wallClockTimestamp: {
+        to: 1114,
+        from: [1114],
+        serialize: serializeDbTimestampInput,
+        parse: parseDbTimestampOutput,
+      },
     },
-  },
-});
+  });
+}
+
+// dev の HMR ではサーバー側モジュールが再評価されるたびに新しい接続プールが作られ、
+// 古いプールが閉じられないまま残るため、接続数が際限なく増えて PostgreSQL の
+// max_connections を使い切ってしまう（"残りの接続枠はSUPERUSER..." で全 API が失敗する）。
+// globalThis に載せてプロセス内で1つだけ使い回す。
+const globalForDb = globalThis as typeof globalThis & {
+  __aoitalkPostgresClient?: ReturnType<typeof createClient>;
+};
+
+const client = globalForDb.__aoitalkPostgresClient ?? createClient();
+if (process.env.NODE_ENV !== "production") {
+  globalForDb.__aoitalkPostgresClient = client;
+}
 
 export const db = drizzle(client as unknown as postgres.Sql, { schema });

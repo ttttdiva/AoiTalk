@@ -16,6 +16,7 @@ import {
   getTaskDisplayEndAt,
   getTaskDisplayStartAt,
 } from "@/lib/task-effective-date";
+import { getTaskDisplayStatus } from "@/lib/tasks-page-utils";
 import type { Task, Tag, Project } from "@/lib/task-api";
 
 export type FilterField =
@@ -160,8 +161,9 @@ function evaluateRule(
   const val = rule.value;
   switch (rule.field) {
     case "status": {
-      if (rule.op === "is") return task.status === val;
-      if (rule.op === "is_not") return task.status !== val;
+      const status = getTaskDisplayStatus(task);
+      if (rule.op === "is") return status === val;
+      if (rule.op === "is_not") return status !== val;
       return true;
     }
     case "priority": {
@@ -327,7 +329,7 @@ export function TaskFilterBuilder({
   const projectNames = useMemo(() => projects.map((p) => p.name), [projects]);
 
   return (
-    <div className="flex w-[520px] max-w-[90vw] flex-col gap-3 p-1">
+    <div className="flex w-full max-w-full min-w-0 flex-col gap-3 p-1">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium">フィルター条件</span>
@@ -380,7 +382,7 @@ export function TaskFilterBuilder({
           {config.rules.map((rule, idx) => (
             <div
               key={rule.id}
-              className="flex items-center gap-1.5 rounded-md border bg-muted/30 px-2 py-1.5"
+              className="flex min-w-0 flex-wrap items-center gap-1.5 rounded-md border bg-muted/30 px-2 py-1.5"
             >
               <span className="w-10 shrink-0 text-xs text-muted-foreground">
                 {idx === 0 ? "Where" : config.logic.toUpperCase()}
@@ -391,7 +393,7 @@ export function TaskFilterBuilder({
                   v && updateRule(rule.id, { field: v as FilterField })
                 }
               >
-                <SelectTrigger className="h-7 w-[110px] text-xs">
+                <SelectTrigger className="h-7 w-full min-w-0 text-xs sm:w-[110px]">
                   <SelectValue>{FIELD_LABELS[rule.field]}</SelectValue>
                 </SelectTrigger>
                 <SelectContent>
@@ -408,7 +410,7 @@ export function TaskFilterBuilder({
                   v && updateRule(rule.id, { op: v as FilterOperator })
                 }
               >
-                <SelectTrigger className="h-7 w-[110px] text-xs">
+                <SelectTrigger className="h-7 w-full min-w-0 text-xs sm:w-[110px]">
                   <SelectValue>{OPERATOR_LABELS[rule.op]}</SelectValue>
                 </SelectTrigger>
                 <SelectContent>
@@ -432,7 +434,7 @@ export function TaskFilterBuilder({
               <Button
                 variant="ghost"
                 size="icon"
-                className="ml-auto size-6"
+                className="ml-auto size-6 shrink-0"
                 onClick={() => removeRule(rule.id)}
                 title="条件を削除"
               >

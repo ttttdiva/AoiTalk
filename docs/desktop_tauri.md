@@ -48,8 +48,8 @@ AOITALK_ROOT=/path/to/AoiTalk npm run dev
 
 ## ログ
 
-Tauri から起動した `main.py` の stdout / stderr は `logs/desktop-tauri-backend.log` に追記されます。
-Next.js の既存サービスログは `logs/services/frontend.log` も参照してください。
+Tauri から起動した `main.py` の stdout / stderr は `logs/desktop/desktop-tauri-backend.log` に追記されます。
+Next.js の既存サービスログは `logs/web/frontend.log` も参照してください。
 
 ## 制限
 

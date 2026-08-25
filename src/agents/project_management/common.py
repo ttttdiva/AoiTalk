@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import concurrent.futures
 import json
 import re
@@ -20,8 +21,14 @@ def _run_async(coro):
     except RuntimeError:
         return asyncio.run(coro)
 
+    # Synchronous tool wrappers may be called from an agent's running event
+    # loop.  Running the coroutine in a helper thread is necessary there, but
+    # the authenticated turn identity lives in ContextVars and must follow it
+    # into that thread.  Without this snapshot, the project tools silently
+    # lose the principal and fail their authorization checks.
+    context = contextvars.copy_context()
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coro).result()
+        return pool.submit(context.run, asyncio.run, coro).result()
 
 
 _PROJECT_REFERENCE_SUFFIXES = (
@@ -156,25 +163,131 @@ def _coalesce_project_reference(project: str = "", project_id: str = "") -> str:
 
 async def _resolve_operator_user_id(session) -> UUID:
     from ...memory.models import User
+    from ...services.turn_context import get_turn_context
 
-    admin_result = await session.execute(
-        select(User).where(User.role == "admin").limit(1)
+    turn_user_id = get_turn_context().user_id
+    if not turn_user_id:
+        raise PermissionError("Authenticated project user context is required.")
+    try:
+        authenticated_user_id = UUID(str(turn_user_id))
+    except (TypeError, ValueError) as exc:
+        raise PermissionError("Authenticated project user context is invalid.") from exc
+
+    authenticated_user = await session.get(User, authenticated_user_id)
+    if authenticated_user is None:
+        raise PermissionError("Authenticated project user was not found.")
+    return authenticated_user.id
+
+
+async def _assert_project_permission(
+    session,
+    project_id: UUID,
+    user_id: UUID,
+    permission: str = "read",
+):
+    from ...memory.models import Project, User
+    from ...memory.project_repository import ProjectRepository
+    from ...services.project_permissions import has_effective_project_permission
+
+    project = await ProjectRepository.get_by_id(session, project_id)
+    if project is None:
+        raise ValueError("Project not found.")
+
+    user = await session.get(User, user_id)
+    if user is None:
+        raise PermissionError("Authenticated project user was not found.")
+    if has_effective_project_permission(
+        user_id=user_id,
+        user_role=user.role,
+        project_owner_id=project.owner_id,
+        member_permissions=None,
+        permission=permission,
+    ):
+        return project
+    member = await ProjectRepository.get_member(session, project_id, user_id)
+    if not has_effective_project_permission(
+        user_id=user_id,
+        user_role=user.role,
+        project_owner_id=project.owner_id,
+        member_permissions=member.permissions if member else None,
+        permission=permission,
+    ):
+        raise PermissionError(f"Project {permission} permission denied.")
+    return project
+
+
+def _project_matches_permission(
+    project: dict[str, Any],
+    permission: str,
+    *,
+    user_id: UUID | None = None,
+    user_role: str | None = None,
+) -> bool:
+    membership = project.get("membership")
+    from ...services.project_permissions import has_effective_project_permission
+
+    return has_effective_project_permission(
+        user_id=user_id,
+        user_role=user_role,
+        project_owner_id=project.get("owner_id"),
+        member_permissions=(
+            membership.get("permissions") if isinstance(membership, dict) else None
+        ),
+        permission=permission,
     )
-    admin_user = admin_result.scalar_one_or_none()
-    if admin_user:
-        return admin_user.id
 
-    first_user_result = await session.execute(select(User).limit(1))
-    first_user = first_user_result.scalar_one_or_none()
-    if first_user:
-        return first_user.id
 
-    raise ValueError("No local user exists to act as the task operator.")
+async def _get_project_reference_candidates(
+    session,
+    user_id: UUID,
+    *,
+    permission: str = "read",
+) -> list[dict[str, Any]]:
+    """Return active projects visible to a caller for reference resolution/listing."""
+    from ...memory.models import Project, User
+    from ...memory.project_repository import ProjectRepository
+
+    user = await session.get(User, user_id)
+    if user is None:
+        return []
+
+    if user.role == "admin":
+        result = await session.execute(
+            select(Project)
+            .where(Project.deleted_at.is_(None))
+            .order_by(Project.updated_at.desc())
+        )
+        return [project.to_dict() for project in result.scalars().all()]
+
+    projects = await ProjectRepository.get_user_projects(session, user_id=user_id)
+    owned_result = await session.execute(
+        select(Project)
+        .where(
+            Project.owner_id == user_id,
+            Project.deleted_at.is_(None),
+        )
+        .order_by(Project.updated_at.desc())
+    )
+    by_id = {str(project.get("id")): project for project in projects}
+    for project in owned_result.scalars().all():
+        project_dict = project.to_dict()
+        by_id.setdefault(str(project_dict.get("id")), project_dict)
+
+    return [
+        project
+        for project in by_id.values()
+        if _project_matches_permission(
+            project, permission, user_id=user_id, user_role=user.role
+        )
+    ]
 
 
 async def _resolve_project(
     session,
     project_ref: str = "",
+    *,
+    user_id: UUID | None = None,
+    permission: str = "read",
 ):
     from ...memory.models import Project
     from ...memory.project_repository import ProjectRepository
@@ -185,16 +298,16 @@ async def _resolve_project(
     if not target_project_ref and runtime_context and runtime_context.get("id"):
         target_project_ref = str(runtime_context["id"])
 
-    operator_user_id = await _resolve_operator_user_id(session)
+    operator_user_id = user_id or await _resolve_operator_user_id(session)
 
     if not target_project_ref:
         default_project_id = await ProjectRepository.get_user_inbox_project_id(
             session, operator_user_id
         )
-        return (
-            await session.get(Project, default_project_id)
-            if default_project_id
-            else None
+        if not default_project_id:
+            return None
+        return await _assert_project_permission(
+            session, default_project_id, operator_user_id, permission
         )
 
     try:
@@ -203,12 +316,14 @@ async def _resolve_project(
         parsed_project_id = None
 
     if parsed_project_id is not None:
-        project = await session.get(Project, parsed_project_id)
-        if project:
-            return project
+        return await _assert_project_permission(
+            session, parsed_project_id, operator_user_id, permission
+        )
 
-    projects = await ProjectRepository.get_user_projects(
-        session, user_id=operator_user_id
+    projects = await _get_project_reference_candidates(
+        session,
+        operator_user_id,
+        permission=permission,
     )
     ranked_matches = [
         (score, project)
@@ -222,31 +337,12 @@ async def _resolve_project(
             project for score, project in ranked_matches if score == best_score
         ]
         if len(best_matches) == 1:
-            return await session.get(Project, UUID(best_matches[0]["id"]))
-        raise ValueError(
-            f"Project reference is ambiguous: {target_project_ref}"
-        )
-
-    fallback_result = await session.execute(
-        select(Project).where(Project.deleted_at.is_(None)).limit(200)
-    )
-    fallback_ranked = [
-        (score, project)
-        for project in fallback_result.scalars().all()
-        if (
-            score := _project_reference_match_score(
-                project.to_dict(), target_project_ref
+            return await _assert_project_permission(
+                session,
+                UUID(best_matches[0]["id"]),
+                operator_user_id,
+                permission,
             )
-        )
-        > 0
-    ]
-    if fallback_ranked:
-        best_score = max(score for score, _ in fallback_ranked)
-        fallback_projects = [
-            project for score, project in fallback_ranked if score == best_score
-        ]
-        if len(fallback_projects) == 1:
-            return fallback_projects[0]
         raise ValueError(
             f"Project reference is ambiguous: {target_project_ref}"
         )
@@ -258,17 +354,18 @@ async def _resolve_actor_and_project(
     session,
     project: str = "",
     project_id: str = "",
+    *,
+    permission: str = "read",
 ) -> tuple[UUID, UUID | None]:
     operator_user_id = await _resolve_operator_user_id(session)
     resolved_project = await _resolve_project(
         session,
         _coalesce_project_reference(project, project_id),
+        user_id=operator_user_id,
+        permission=permission,
     )
     if resolved_project:
-        return (
-            resolved_project.owner_id or operator_user_id,
-            resolved_project.id,
-        )
+        return operator_user_id, resolved_project.id
     return operator_user_id, None
 
 
@@ -276,6 +373,8 @@ async def _resolve_wbs_project_context(
     session,
     project: str = "",
     project_id: str = "",
+    *,
+    permission: str = "read",
 ) -> dict[str, Any] | None:
     from ...services.project_context import (
         build_project_context,
@@ -284,11 +383,26 @@ async def _resolve_wbs_project_context(
 
     project_ref = _coalesce_project_reference(project, project_id)
     if project_ref:
-        project_obj = await _resolve_project(session, project_ref)
+        user_id = await _resolve_operator_user_id(session)
+        project_obj = await _resolve_project(
+            session,
+            project_ref,
+            user_id=user_id,
+            permission=permission,
+        )
         return build_project_context(project_obj) if project_obj else None
 
     runtime_context = get_runtime_project_context()
     if runtime_context and runtime_context.get("id"):
+        user_id = await _resolve_operator_user_id(session)
+        project_obj = await _resolve_project(
+            session,
+            str(runtime_context["id"]),
+            user_id=user_id,
+            permission=permission,
+        )
+        if project_obj is None:
+            return None
         return runtime_context
     return None
 

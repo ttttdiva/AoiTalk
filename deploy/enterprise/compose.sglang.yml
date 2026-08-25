@@ -1,0 +1,53 @@
+# GPU inference is deliberately an opt-in overlay.  The core bundle never
+# requests NVIDIA devices, so it can run on ordinary CPU-only Enterprise hosts.
+services:
+  aoitalk:
+    depends_on:
+      sglang:
+        condition: service_healthy
+        required: true
+    environment:
+      AOITALK_LLM_MODE: sglang
+      SGLANG_BASE_URL: http://sglang:30000/v1
+      SGLANG_MODEL: ${SGLANG_MODEL:-google/gemma-4-E4B-it}
+
+  sglang:
+    image: ${AOITALK_SGLANG_IMAGE:?AOITALK_SGLANG_IMAGE must be an immutable repository@sha256 digest}
+    environment:
+      SGLANG_MODEL: ${SGLANG_MODEL:-google/gemma-4-E4B-it}
+      SGLANG_REASONING_PARSER: ${SGLANG_REASONING_PARSER:-gemma4}
+      SGLANG_TOOL_CALL_PARSER: ${SGLANG_TOOL_CALL_PARSER:-gemma4}
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        test -f "/models/gemma/${AOITALK_GEMMA_MODEL_FILE:-model.safetensors}";
+        exec sglang serve
+        --model-path /models/gemma
+        --served-model-name "$${SGLANG_MODEL:-google/gemma-4-E4B-it}"
+        --dtype bfloat16
+        --reasoning-parser "$${SGLANG_REASONING_PARSER:-gemma4}"
+        --tool-call-parser "$${SGLANG_TOOL_CALL_PARSER:-gemma4}"
+        --mem-fraction-static 0.80
+        --host 0.0.0.0
+        --port 30000
+    volumes:
+      - ${AOITALK_GEMMA_MODEL_DIR:-${AOITALK_DATA_ROOT:?AOITALK_DATA_ROOT is required}/huggingface/gemma-4E4B-it}:/models/gemma:ro
+    expose:
+      - "30000"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:30000/health', timeout=5)"
+      interval: 10s
+      timeout: 10s
+      retries: ${SGLANG_HEALTHCHECK_RETRIES:-180}
+      start_period: ${SGLANG_HEALTHCHECK_START_PERIOD:-600s}
+    gpus: all
+    shm_size: "32gb"
+    networks:
+      - aoitalk-network
+    restart: unless-stopped

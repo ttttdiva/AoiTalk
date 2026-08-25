@@ -1,6 +1,9 @@
 import * as SecureStore from "expo-secure-store";
 import { CHAT_TIMEOUT, STORAGE_KEYS } from "../constants/config";
-import type { ConversationMessage } from "../types/api";
+import type {
+  CharacterProfileSnapshot,
+  ConversationMessage,
+} from "../types/api";
 import {
   CLOUD_PROVIDER_DEFINITIONS,
   getAdapterKind,
@@ -24,6 +27,8 @@ export interface MobileLlmProviderProfile {
 export interface MobileLlmSlotSelection {
   provider: MobileLlmProvider;
   model: string;
+  /** Direct スロットの reasoning effort。Server の場合は空。 */
+  reasoningEffort?: string;
 }
 
 /** フォールバック設定。APIキー / Base URL はプロバイダープロファイルを参照。 */
@@ -31,6 +36,18 @@ export interface MobileLlmFallbackConfig {
   enabled: boolean;
   provider: DirectMobileLlmProvider;
   model: string;
+  reasoningEffort?: string;
+}
+
+/**
+ * クリップ取り込み専用スロット。
+ * `enabled=false` は「メインと同じ」を意味し、メインスロットの解決結果を使う。
+ */
+export interface MobileLlmClipIngestConfig {
+  enabled: boolean;
+  provider: DirectMobileLlmProvider;
+  model: string;
+  reasoningEffort: string;
 }
 
 /** 1 回の呼び出しに必要な解決済み設定。 */
@@ -97,6 +114,16 @@ function getProfileStorageKeys(provider: DirectMobileLlmProvider): {
         apiKey: STORAGE_KEYS.CHAT_LLM_GEMINI_API_KEY,
         baseUrl: STORAGE_KEYS.CHAT_LLM_GEMINI_BASE_URL,
       };
+    case "deepseek":
+      return {
+        apiKey: STORAGE_KEYS.CHAT_LLM_DEEPSEEK_API_KEY,
+        baseUrl: STORAGE_KEYS.CHAT_LLM_DEEPSEEK_BASE_URL,
+      };
+    case "deepinfra":
+      return {
+        apiKey: STORAGE_KEYS.CHAT_LLM_DEEPINFRA_API_KEY,
+        baseUrl: STORAGE_KEYS.CHAT_LLM_DEEPINFRA_BASE_URL,
+      };
     case "kimi":
       return {
         apiKey: STORAGE_KEYS.CHAT_LLM_KIMI_API_KEY,
@@ -157,42 +184,69 @@ export async function saveProviderProfile(
 
 export async function getMainSlot(): Promise<MobileLlmSlotSelection> {
   await ensureMobileLlmMigrated();
-  const [providerRaw, modelRaw] = await Promise.all([
+  const [providerRaw, modelRaw, effortRaw] = await Promise.all([
     SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_PROVIDER),
     SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_MAIN_MODEL),
+    SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_MAIN_EFFORT),
   ]);
   const provider = normalizeMainProvider(providerRaw);
   const model = (modelRaw ?? "").trim();
-  return { provider, model };
+  const reasoningEffort = normalizeDirectReasoningEffort(
+    provider,
+    model,
+    effortRaw,
+  );
+  return {
+    provider,
+    model,
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+  };
 }
 
 export async function saveMainSlot(
   provider: MobileLlmProvider,
   model: string,
+  reasoningEffort?: string,
 ): Promise<void> {
   const trimmedModel = model.trim();
   if (isDirectProvider(provider) && !trimmedModel) {
     throw new Error("モデルIDを指定してください。");
   }
+  const normalizedEffort = normalizeDirectReasoningEffort(
+    provider,
+    trimmedModel,
+    reasoningEffort,
+  );
   await Promise.all([
     SecureStore.setItemAsync(STORAGE_KEYS.CHAT_LLM_PROVIDER, provider),
     SecureStore.setItemAsync(STORAGE_KEYS.CHAT_LLM_MAIN_MODEL, trimmedModel),
+    SecureStore.setItemAsync(
+      STORAGE_KEYS.CHAT_LLM_MAIN_EFFORT,
+      normalizedEffort,
+    ),
   ]);
 }
 
 export async function getFallbackConfig(): Promise<MobileLlmFallbackConfig> {
   await ensureMobileLlmMigrated();
-  const [enabledRaw, providerRaw, modelRaw] = await Promise.all([
+  const [enabledRaw, providerRaw, modelRaw, effortRaw] = await Promise.all([
     SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_FALLBACK_ENABLED),
     SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_FALLBACK_PROVIDER),
     SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_FALLBACK_MODEL),
+    SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_FALLBACK_EFFORT),
   ]);
   const provider = normalizeDirectProvider(providerRaw);
   const model = (modelRaw ?? "").trim();
+  const reasoningEffort = normalizeDirectReasoningEffort(
+    provider,
+    model,
+    effortRaw,
+  );
   return {
     enabled: enabledRaw === "1",
     provider,
     model,
+    ...(reasoningEffort ? { reasoningEffort } : {}),
   };
 }
 
@@ -203,6 +257,11 @@ export async function saveFallbackConfig(
   if (config.enabled && !trimmedModel) {
     throw new Error("フォールバックのモデルIDを指定してください。");
   }
+  const normalizedEffort = normalizeDirectReasoningEffort(
+    config.provider,
+    trimmedModel,
+    config.reasoningEffort,
+  );
   await Promise.all([
     SecureStore.setItemAsync(
       STORAGE_KEYS.CHAT_LLM_FALLBACK_ENABLED,
@@ -216,7 +275,77 @@ export async function saveFallbackConfig(
       STORAGE_KEYS.CHAT_LLM_FALLBACK_MODEL,
       trimmedModel,
     ),
+    SecureStore.setItemAsync(
+      STORAGE_KEYS.CHAT_LLM_FALLBACK_EFFORT,
+      normalizedEffort,
+    ),
   ]);
+}
+
+/* -------------------------------------------------------------------------- */
+/* クリップ取り込みスロット                                                    */
+/* -------------------------------------------------------------------------- */
+
+export async function getClipIngestConfig(): Promise<MobileLlmClipIngestConfig> {
+  await ensureMobileLlmMigrated();
+  const [enabledRaw, providerRaw, modelRaw, effortRaw] = await Promise.all([
+    SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_CLIP_INGEST_ENABLED),
+    SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_CLIP_INGEST_PROVIDER),
+    SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_CLIP_INGEST_MODEL),
+    SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_CLIP_INGEST_EFFORT),
+  ]);
+  return {
+    enabled: enabledRaw === "1",
+    provider: normalizeDirectProvider(providerRaw),
+    model: (modelRaw ?? "").trim(),
+    reasoningEffort: (effortRaw ?? "").trim(),
+  };
+}
+
+export async function saveClipIngestConfig(
+  config: MobileLlmClipIngestConfig,
+): Promise<void> {
+  const trimmedModel = config.model.trim();
+  if (config.enabled && !trimmedModel) {
+    throw new Error("クリップ取り込みのモデルIDを指定してください。");
+  }
+  await Promise.all([
+    SecureStore.setItemAsync(
+      STORAGE_KEYS.CHAT_LLM_CLIP_INGEST_ENABLED,
+      config.enabled ? "1" : "0",
+    ),
+    SecureStore.setItemAsync(
+      STORAGE_KEYS.CHAT_LLM_CLIP_INGEST_PROVIDER,
+      config.provider,
+    ),
+    SecureStore.setItemAsync(
+      STORAGE_KEYS.CHAT_LLM_CLIP_INGEST_MODEL,
+      trimmedModel,
+    ),
+    SecureStore.setItemAsync(
+      STORAGE_KEYS.CHAT_LLM_CLIP_INGEST_EFFORT,
+      config.reasoningEffort.trim(),
+    ),
+  ]);
+}
+
+/**
+ * クリップ取り込みで使う Direct 設定を解決する。
+ * 個別指定が無効なら、メインスロット（Direct でなければフォールバック）へ委ねる。
+ * 設定不足で直叩きできない場合は null。
+ */
+export async function getConfiguredClipIngestMobileLlmSettings(): Promise<MobileLlmSettings | null> {
+  const config = await getClipIngestConfig();
+  if (config.enabled) {
+    const settings = await resolveDirectSettings(
+      config.provider,
+      config.model,
+      config.reasoningEffort || undefined,
+    );
+    return isMobileLlmConfigured(settings) ? settings : null;
+  }
+  const main = await getMainSlot();
+  return getConfiguredDirectMobileLlmSettings(main.provider);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -230,12 +359,17 @@ async function resolveDirectSettings(
 ): Promise<MobileLlmSettings> {
   const profile = await getProviderProfile(provider);
   const resolvedModel = model.trim() || getDefaultModelForProvider(provider);
+  const resolvedEffort = normalizeDirectReasoningEffort(
+    provider,
+    resolvedModel,
+    reasoningEffort,
+  );
   return {
     provider,
     apiKey: profile.apiKey,
     model: resolvedModel,
     baseUrl: profile.baseUrl || getDefaultBaseUrlForProvider(provider),
-    reasoningEffort,
+    ...(resolvedEffort ? { reasoningEffort: resolvedEffort } : {}),
   };
 }
 
@@ -249,19 +383,88 @@ export async function getDirectMobileLlmSettings(
   );
 }
 
+// サーバー側 src/services/llm_model_catalog.py の
+// reasoning_effort_options_for_model と同じ表。モバイルだけ high 止まりにすると、
+// gpt-5.6 のように max を受け付けるモデルでも最上位を選べなくなる。
+const OPENAI_FULL_EFFORTS = ["none", "low", "medium", "high", "xhigh"];
+const OPENAI_GPT56_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"];
+const OPENAI_GPT5_EFFORTS = ["minimal", "low", "medium", "high"];
+const OPENAI_GPT51_EFFORTS = ["none", "low", "medium", "high"];
+const OPENAI_GPT52_PRO_EFFORTS = ["medium", "high", "xhigh"];
+const OPENAI_STANDARD_EFFORTS = ["low", "medium", "high"];
+const OPENAI_CODEX_EFFORTS = ["low", "medium", "high", "xhigh"];
+
+/** `openai/gpt-5.6` のような prefix 付きIDを素のモデルIDへ戻す。 */
+function normalizeModelIdForEffort(model: string): string {
+  const value = String(model || "").trim().toLowerCase();
+  return value.startsWith("openai/") ? value.slice("openai/".length) : value;
+}
+
+function gpt5MinorVersion(modelId: string): number | null {
+  const match = modelId.match(/^gpt-5\.(\d+)(?:[-.]|$)/);
+  if (!match) return null;
+  const minor = Number(match[1]);
+  return Number.isFinite(minor) ? minor : null;
+}
+
+function openaiReasoningEffortOptions(modelId: string): string[] {
+  if (modelId.includes("-codex") || modelId.startsWith("codex")) {
+    return OPENAI_CODEX_EFFORTS;
+  }
+  const minor = gpt5MinorVersion(modelId);
+  if (/-pro(?:-|$)/.test(modelId)) {
+    if (modelId.startsWith("gpt-5-pro")) return ["high"];
+    if (minor !== null && minor >= 2) return OPENAI_GPT52_PRO_EFFORTS;
+  }
+  if (minor === 6) return OPENAI_GPT56_EFFORTS;
+  if (modelId === "gpt-5.1") return OPENAI_GPT51_EFFORTS;
+  if (minor !== null && minor >= 2) return OPENAI_FULL_EFFORTS;
+  if (modelId === "gpt-5" || modelId.startsWith("gpt-5-")) {
+    return OPENAI_GPT5_EFFORTS;
+  }
+  if (modelId.startsWith("gpt-oss")) return OPENAI_STANDARD_EFFORTS;
+  // o系はサーバー表に項目が無いが、モバイルでは従来から選択できたため維持する。
+  if (/^o[134](?:[-.]|$)/.test(modelId)) return OPENAI_STANDARD_EFFORTS;
+  return [];
+}
+
 export function getDirectReasoningEffortOptions(
   provider: DirectMobileLlmProvider,
   model: string,
 ): string[] {
   const normalized = model.toLowerCase();
+  if (provider === "deepseek") return ["none", "high", "max"];
+  if (provider === "deepinfra") return ["none", "low", "medium", "high"];
   if (provider === "kimi" && normalized.includes("kimi-k3")) return ["max"];
   if (
-    (provider === "openai" || provider === "openrouter" || provider === "custom") &&
-    /(^|[/:-])(gpt-5|o[134])/.test(normalized)
+    provider === "openai" ||
+    provider === "openrouter" ||
+    provider === "custom"
   ) {
-    return ["low", "medium", "high"];
+    // openrouter/custom は `openai/gpt-5.6` のように prefix 付きで来る。
+    const modelId = normalizeModelIdForEffort(
+      normalized.includes("/") ? normalized.slice(normalized.lastIndexOf("/") + 1) : normalized,
+    );
+    return openaiReasoningEffortOptions(modelId);
   }
   return [];
+}
+
+/**
+ * 保存済みの effort をモデル変更後も安全に使える値へ正規化する。
+ * モデルが effort を公開していない場合は、互換性を壊さないため値を保持する。
+ */
+export function normalizeDirectReasoningEffort(
+  provider: MobileLlmProvider,
+  model: string,
+  effort: string | null | undefined,
+): string {
+  if (!isDirectProvider(provider)) return "";
+  const requested = String(effort ?? "").trim();
+  const options = getDirectReasoningEffortOptions(provider, model);
+  if (options.length === 0) return requested;
+  if (requested && options.includes(requested)) return requested;
+  return options[0] ?? "";
 }
 
 export async function getMobileLlmSettings(): Promise<MobileLlmSettings> {
@@ -274,7 +477,11 @@ export async function getMobileLlmSettings(): Promise<MobileLlmSettings> {
       baseUrl: "",
     };
   }
-  return resolveDirectSettings(slot.provider, slot.model);
+  return resolveDirectSettings(
+    slot.provider,
+    slot.model,
+    slot.reasoningEffort,
+  );
 }
 
 /**
@@ -289,7 +496,13 @@ export async function getConfiguredDirectMobileLlmSettings(
     const slot = await getMainSlot();
     const model =
       slot.provider === preferredProvider ? slot.model : "";
-    const settings = await resolveDirectSettings(preferredProvider, model);
+    const reasoningEffort =
+      slot.provider === preferredProvider ? slot.reasoningEffort : undefined;
+    const settings = await resolveDirectSettings(
+      preferredProvider,
+      model,
+      reasoningEffort,
+    );
     return isMobileLlmConfigured(settings) ? settings : null;
   }
   return getConfiguredFallbackMobileLlmSettings();
@@ -307,6 +520,7 @@ export async function getConfiguredFallbackMobileLlmSettings(
   const settings = await resolveDirectSettings(
     fallback.provider,
     fallback.model,
+    fallback.reasoningEffort,
   );
   return isMobileLlmConfigured(settings) ? settings : null;
 }
@@ -496,7 +710,19 @@ const openAiChatAdapter: LlmAdapter = {
       model: settings.model.trim(),
       messages: context,
     };
-    if (settings.provider === "kimi" && isKimiK3Model(settings.model)) {
+    if (settings.provider === "deepseek") {
+      const effort = settings.reasoningEffort || "high";
+      body.thinking = { type: effort === "none" ? "disabled" : "enabled" };
+      if (effort !== "none") body.reasoning_effort = effort;
+      if (typeof settings.maxTokens === "number" && settings.maxTokens > 0) {
+        body.max_tokens = Math.floor(settings.maxTokens);
+      }
+    } else if (settings.provider === "deepinfra") {
+      body.reasoning_effort = settings.reasoningEffort || "high";
+      if (typeof settings.maxTokens === "number" && settings.maxTokens > 0) {
+        body.max_tokens = Math.floor(settings.maxTokens);
+      }
+    } else if (settings.provider === "kimi" && isKimiK3Model(settings.model)) {
       body.reasoning_effort = settings.reasoningEffort || "max";
       if (typeof settings.maxTokens === "number" && settings.maxTokens > 0) {
         body.max_completion_tokens = Math.floor(settings.maxTokens);
@@ -658,10 +884,35 @@ function restoredKimiAssistantPayload(
   return record as ContextMessage;
 }
 
-function buildContext(
+function nonEmptyProfileText(value: string | null | undefined): string {
+  return String(value ?? "").trim();
+}
+
+/** Direct応答へ渡す選択キャラクターの不変snapshotからsystem指示を構築する。 */
+export function buildCharacterSystemPrompt(
+  profile: CharacterProfileSnapshot,
+): string {
+  const name = nonEmptyProfileText(profile.name) || profile.slug;
+  const sections = [`あなたは「${name}」です。`];
+  const fields: Array<[string, string | null | undefined]> = [
+    ["キャラクター設定", profile.description],
+    ["性格", profile.personality_summary],
+    ["シナリオ", profile.scenario],
+    ["会話例", profile.example_messages],
+    ["追加指示", profile.system_prompt],
+  ];
+  for (const [label, value] of fields) {
+    const text = nonEmptyProfileText(value);
+    if (text) sections.push(`## ${label}\n${text}`);
+  }
+  return sections.join("\n\n");
+}
+
+export function buildContext(
   settings: MobileLlmSettings,
   messages: ConversationMessage[],
   nextUserText: string,
+  characterProfile?: CharacterProfileSnapshot | null,
 ): ContextMessage[] {
   const recent: ContextMessage[] = messages
     .filter(
@@ -678,6 +929,12 @@ function buildContext(
         content: message.content,
       };
     });
+  if (characterProfile) {
+    recent.unshift({
+      role: "system",
+      content: buildCharacterSystemPrompt(characterProfile),
+    });
+  }
   recent.push({ role: "user", content: nextUserText });
   return recent;
 }
@@ -723,11 +980,15 @@ export async function generateMobileLlmReply(
   settings: MobileLlmSettings,
   messages: ConversationMessage[],
   nextUserText: string,
+  characterProfile?: CharacterProfileSnapshot | null,
 ): Promise<MobileLlmReply> {
   if (!isMobileLlmConfigured(settings)) {
     throw new Error("Mobile LLM is not configured.");
   }
-  return runAdapter(settings, buildContext(settings, messages, nextUserText));
+  return runAdapter(
+    settings,
+    buildContext(settings, messages, nextUserText, characterProfile),
+  );
 }
 
 export interface MobileLlmConnectionResult {

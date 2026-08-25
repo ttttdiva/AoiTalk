@@ -1,0 +1,23 @@
+/**
+ * Story map 専用の React Flow テーマ上書き。
+ * AoiTalk の semantic token を --xy-* へマップし、map scope 内に閉じる。
+ */
+[data-story-map] .react-flow {
+  --xy-background-color: var(--background);
+  --xy-background-pattern-dots-color: var(--border);
+  --xy-edge-stroke-default: var(--border);
+  --xy-edge-stroke-selected-default: var(--primary);
+  --xy-connectionline-stroke-default: var(--muted-foreground);
+  --xy-minimap-background-color: var(--card);
+  --xy-minimap-mask-background-color: color-mix(in oklch, var(--background) 72%, transparent);
+  --xy-minimap-node-background-color: color-mix(in oklch, var(--primary) 42%, var(--card));
+  --xy-minimap-node-stroke-color: var(--border);
+  --xy-controls-button-background-color: var(--card);
+  --xy-controls-button-background-color-hover: var(--accent);
+  --xy-controls-button-color: var(--foreground);
+  --xy-controls-button-color-hover: var(--foreground);
+  --xy-controls-button-border-color: var(--border);
+  --xy-controls-box-shadow: 0 0 0 1px color-mix(in oklch, var(--border) 80%, transparent);
+  --xy-edge-label-background-color: var(--card);
+  --xy-edge-label-color: var(--foreground);
+}

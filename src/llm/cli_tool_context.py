@@ -9,34 +9,36 @@ from ..tools.adapters import CLIAdapter
 from ..tools.core import ToolDefinition
 from ..tools.registry import ToolRegistry
 from .agent_runtime import (
-    DIRECT_FILESYSTEM_TOOL_HINT_NAMES,
-    DIRECT_MEMORY_TOOL_HINT_NAMES,
     DIRECT_PROJECT_TOOL_HINT_NAMES,
     DIRECT_SEARCH_TOOL_HINT_NAMES,
 )
+from .tool_packs import DEFERRED_TOOL_PACKS, LOAD_TOOL_PACK_TOOL_NAME
 from .tool_policy import (
-    FILESYSTEM_TOOL_NAMES,
-    PROJECT_MANAGEMENT_READ_TOOL_NAMES,
+    PROJECT_COMMAND_CAPABILITIES,
     SEARCH_TOOL_NAMES,
-    looks_like_filesystem_request,
-    looks_like_project_management_request,
+    command_capabilities_from_text,
     looks_like_search_request,
+    looks_like_managed_workspace_request,
+    FILESYSTEM_TOOL_NAMES,
+    DOCS_MUTATION_TOOL_NAMES,
+    DOCS_READ_TOOL_NAMES,
+    PROJECT_MANAGEMENT_READ_TOOL_NAMES,
     project_management_required_mutation_tools,
 )
 
 
 ENTRY_TOOL_NAMES: tuple[str, ...] = (
-    "agent_team_delegate",
-    "advanced_reasoning_assistant",
-    "utility_assistant",
+    LOAD_TOOL_PACK_TOOL_NAME,
     "media_assistant",
-    "scenario_assistant",
-    "writing_assistant",
-    "import_assistant",
+    "agent_team_delegate",
     "web_search",
-    "find_workspace_items",
-    "read_workspace_file",
+    "bm25_search",
+    "search_files",
+    "read_file",
     "get_project_context",
+    "get_current_time",
+    "get_weather_info",
+    "calculate",
 )
 
 TITLE_GENERATION_MARKERS: tuple[str, ...] = (
@@ -72,6 +74,7 @@ def select_cli_context_tools(
     user_input: str | None,
     registry: ToolRegistry,
     force_project_tools: bool = False,
+    loaded_pack_ids: Iterable[str] = (),
 ) -> CLIToolContextSelection:
     """Select the tools worth describing in the current CLI system prompt."""
     all_tools = registry.get_all()
@@ -98,10 +101,21 @@ def select_cli_context_tools(
 
     add_names(ENTRY_TOOL_NAMES, "入口")
 
-    # search_memory は読み取り専用の深掘りツール。キーワード一致に依らず、
-    # registry に存在すれば常に提示してモデルが必要な時に呼べるようにする。
-    add_names(DIRECT_MEMORY_TOOL_HINT_NAMES, "記憶")
+    loaded_packs = {str(pack_id).strip() for pack_id in loaded_pack_ids if str(pack_id).strip()}
+    if loaded_packs:
+        loaded_pack_names: list[str] = []
+        for pack in DEFERRED_TOOL_PACKS:
+            if pack.pack_id not in loaded_packs:
+                continue
+            loaded_pack_names.extend(
+                tool.name
+                for tool in all_tools
+                if pack.matches(tool.name, getattr(tool, "owner", ""))
+            )
+        add_names(loaded_pack_names, "ロード済みpack")
 
+    # Search is only expanded for a trusted command capability.  Ordinary
+    # "search/調べて" wording must not narrow the CLI catalog.
     if looks_like_search_request(request):
         search_names = [
             tool.name
@@ -112,17 +126,29 @@ def select_cli_context_tools(
         ]
         add_names(search_names, "検索")
 
-    if looks_like_filesystem_request(request):
+    # A server-verified attachment or explicit workspace capability opts into
+    # the managed-operation tree/place/link tool set.  Ordinary standalone
+    # file or Docs words remain un-routed below.
+    if looks_like_managed_workspace_request(request):
         filesystem_names = [
             tool.name
             for tool in all_tools
-            if tool.owner == "filesystem"
-            or tool.name in FILESYSTEM_TOOL_NAMES
-            or tool.name in DIRECT_FILESYSTEM_TOOL_HINT_NAMES
+            if tool.owner == "filesystem" or tool.name in FILESYSTEM_TOOL_NAMES
+        ]
+        docs_names = [
+            tool.name
+            for tool in all_tools
+            if tool.owner == "docs"
+            and tool.name in (*DOCS_READ_TOOL_NAMES, *DOCS_MUTATION_TOOL_NAMES)
         ]
         add_names(filesystem_names, "ファイル")
+        add_names(docs_names, "Docs")
 
-    if force_project_tools or looks_like_project_management_request(request):
+    # Project/Docs/Files are intentionally not re-routed by natural keywords.
+    # ``force_project_tools`` is a trusted internal/UI signal; command context
+    # headers are the other explicit signal available to this CLI selector.
+    capabilities = command_capabilities_from_text(request)
+    if force_project_tools or capabilities & PROJECT_COMMAND_CAPABILITIES:
         project_names = [
             *PROJECT_BASE_TOOL_NAMES,
             *DIRECT_PROJECT_TOOL_HINT_NAMES,
@@ -148,11 +174,13 @@ def build_cli_tool_context(
     user_input: str | None,
     registry: ToolRegistry,
     force_project_tools: bool = False,
+    loaded_pack_ids: Iterable[str] = (),
 ) -> str:
     selection = select_cli_context_tools(
         user_input=user_input,
         registry=registry,
         force_project_tools=force_project_tools,
+        loaded_pack_ids=loaded_pack_ids,
     )
     if not selection.tools:
         return ""

@@ -3,15 +3,11 @@
 import { useState, useEffect } from "react";
 import { useExplorer } from "@/contexts/explorer-context";
 import {
-  explorerRename,
   type ExplorerDirectory,
   type ExplorerFile,
 } from "@/lib/explorer-api";
-import {
-  isRecordTableFile,
-  RECORD_TABLE_EXTENSION,
-  updateProjectRecordTable,
-} from "@/lib/record-tables-api";
+import { useFilerOperations } from "@/hooks/use-filer-operations";
+import { isRecordTableFile } from "@/lib/record-tables-api";
 import {
   Dialog,
   DialogContent,
@@ -29,7 +25,8 @@ interface RenameDialogProps {
 }
 
 export function RenameDialog({ item, open, onOpenChange }: RenameDialogProps) {
-  const { refresh } = useExplorer();
+  const { refresh, capabilities, selectItem } = useExplorer();
+  const { rename } = useFilerOperations({ capabilities, refresh });
   const [newName, setNewName] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -41,26 +38,29 @@ export function RenameDialog({ item, open, onOpenChange }: RenameDialogProps) {
     if (!item || !newName.trim() || newName === item.name) return;
     setLoading(true);
     try {
+      // 実行・Undo登録は filer-operations 側へ集約
+      let recordTable: { projectId: string; tableId: string } | null = null;
       if ("type" in item && isRecordTableFile(item)) {
-        const tableName = newName.trim().endsWith(RECORD_TABLE_EXTENSION)
-          ? newName.trim().slice(0, -RECORD_TABLE_EXTENSION.length)
-          : newName.trim();
-        if (item.project_id && item.record_table_id && tableName) {
-          await updateProjectRecordTable(
-            item.project_id,
-            item.record_table_id,
-            {
-              name: tableName,
-            },
-          );
+        if (!item.project_id || !item.record_table_id) {
+          onOpenChange(false);
+          return;
         }
-      } else {
-        await explorerRename(item.path, newName.trim());
+        recordTable = {
+          projectId: item.project_id,
+          tableId: item.record_table_id,
+        };
       }
-      refresh();
-      onOpenChange(false);
-    } catch {
-      // rename error
+      const ok = await rename({
+        path: item.path,
+        currentName: item.name,
+        newName,
+        recordTable,
+        // fetchDirectory intentionally clears selection for ordinary refresh
+        // and navigation.  A successful rename is the one operation that
+        // restores the server-confirmed path after that refresh.
+        onRenamed: ({ newPath }) => selectItem(newPath),
+      });
+      if (ok) onOpenChange(false);
     } finally {
       setLoading(false);
     }
@@ -68,7 +68,7 @@ export function RenameDialog({ item, open, onOpenChange }: RenameDialogProps) {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-sm">
+      <DialogContent>
         <DialogHeader>
           <DialogTitle>名前の変更</DialogTitle>
         </DialogHeader>

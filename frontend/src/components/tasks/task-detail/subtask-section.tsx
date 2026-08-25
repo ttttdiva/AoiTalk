@@ -20,6 +20,7 @@ export function SubtaskSection({
   onSubtaskUpdated,
   onSubtaskDeleted,
   onUpdated,
+  readOnly = false,
 }: {
   task: Task;
   onEnsureTask?: () => Promise<Task | null | undefined>;
@@ -28,6 +29,7 @@ export function SubtaskSection({
   onSubtaskUpdated?: (subtask: Task) => void;
   onSubtaskDeleted?: (subtaskId: string) => void;
   onUpdated: () => void;
+  readOnly?: boolean;
 }) {
   const [addTitle, setAddTitle] = useState("");
   const [adding, setAdding] = useState(false);
@@ -38,14 +40,14 @@ export function SubtaskSection({
   const subtasks = task.subtasks || [];
 
   useEffect(() => {
-    if (!openInputSignal) return;
+    if (!openInputSignal || readOnly) return;
     setShowInput(true);
     setTimeout(() => inputRef.current?.focus(), 0);
-  }, [openInputSignal]);
+  }, [openInputSignal, readOnly]);
 
   const handleAdd = useCallback(async () => {
     const title = addTitle.trim();
-    if (!title || adding) return;
+    if (!title || adding || readOnly) return;
     setAdding(true);
     try {
       const parentTask = (await onEnsureTask?.()) ?? task;
@@ -74,7 +76,7 @@ export function SubtaskSection({
     } finally {
       setAdding(false);
     }
-  }, [addTitle, adding, onEnsureTask, onSubtaskAdded, onUpdated, task]);
+  }, [addTitle, adding, onEnsureTask, onSubtaskAdded, onUpdated, readOnly, task]);
 
   return (
     <div className="space-y-2">
@@ -98,7 +100,9 @@ export function SubtaskSection({
               <CornerDownRight className="size-3 text-muted-foreground shrink-0" />
               <Checkbox
                 checked={sub.status === "closed"}
+                disabled={readOnly}
                 onCheckedChange={async (checked) => {
+                  if (readOnly) return;
                   try {
                     const updated = await taskApi.updateTask(sub.id, {
                       status: checked ? "closed" : "open",
@@ -120,28 +124,31 @@ export function SubtaskSection({
               >
                 {sub.title}
               </span>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                className="opacity-0 group-hover:opacity-100 shrink-0 text-muted-foreground hover:text-red-500"
-                onClick={async () => {
-                  try {
-                    await taskApi.deleteTask(sub.id);
-                    onSubtaskDeleted?.(sub.id);
-                    onUpdated();
-                  } catch (err) {
-                    console.error("サブタスク削除失敗:", err);
-                  }
-                }}
-              >
-                <Trash2 className="size-3" />
-              </Button>
+              {!readOnly && (
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  className="opacity-0 group-hover:opacity-100 shrink-0 text-muted-foreground hover:text-red-500"
+                  onClick={async () => {
+                    if (readOnly) return;
+                    try {
+                      await taskApi.deleteTask(sub.id);
+                      onSubtaskDeleted?.(sub.id);
+                      onUpdated();
+                    } catch (err) {
+                      console.error("サブタスク削除失敗:", err);
+                    }
+                  }}
+                >
+                  <Trash2 className="size-3" />
+                </Button>
+              )}
             </div>
           ))}
         </div>
       )}
 
-      {showInput ? (
+      {!readOnly && (showInput ? (
         <div className="flex items-center gap-2 px-2">
           <Plus className="size-3 text-muted-foreground shrink-0" />
           <input
@@ -180,7 +187,7 @@ export function SubtaskSection({
           <Plus className="size-3" />
           サブタスクを追加
         </button>
-      )}
+      ))}
     </div>
   );
 }

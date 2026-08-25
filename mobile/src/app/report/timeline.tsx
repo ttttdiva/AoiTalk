@@ -20,6 +20,7 @@ import { useAuth } from "../../contexts/AuthContext";
 import { useProject } from "../../contexts/ProjectContext";
 import { taskApi } from "../../lib/task-api";
 import { TaskQuickViewDialog } from "../../components/task-quick-view-dialog";
+import { ScopeSwitcher } from "../../components/scope-switcher";
 import type { Task, TimeEntry } from "../../types/api";
 
 function formatDuration(seconds: number): string {
@@ -224,6 +225,7 @@ export default function ReportTimelineScreen() {
               {selectedSpace?.name || selectedProject?.name || "All projects"}
             </Text>
           </View>
+          <ScopeSwitcher accessibilityLabel="タイムラインの範囲を変更" />
         </View>
         <View style={styles.rangeRow}>
           {[7, 30].map((value) => (

@@ -10,11 +10,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from os import PathLike
 from typing import Any, Callable, Literal, Optional
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
+from ....services.task_management._shared import (
+    MAX_RECURRENCE_END_COUNT,
+    MAX_RECURRENCE_HORIZON_DAYS,
+    MAX_RECURRENCE_RRULE_LENGTH,
+)
 from ....task_time import DEFAULT_TASK_TIMEZONE
 from ...uuid_http import parse_uuid_or_400
 
@@ -29,6 +35,7 @@ class CreateTaskPayload(BaseModel):
     start_at: Optional[str] = None
     end_at: Optional[str] = None
     all_day: bool = False
+    auto_close_on_due: bool = False
     reminder_offsets: Optional[list[int]] = None
     notifications_enabled: Optional[bool] = None
     estimated_hours: Optional[float] = None
@@ -36,7 +43,9 @@ class CreateTaskPayload(BaseModel):
     source: str = "local"
     assignee_ids: list[str] = Field(default_factory=list)
     tag_ids: list[str] = Field(default_factory=list)
-    recurrence_rrule: Optional[str] = None
+    recurrence_rrule: Optional[str] = Field(
+        default=None, max_length=MAX_RECURRENCE_RRULE_LENGTH
+    )
     recurrence_timezone: str = DEFAULT_TASK_TIMEZONE
     task_metadata: Optional[dict[str, Any]] = None
 
@@ -51,15 +60,19 @@ class UpdateTaskPayload(BaseModel):
     start_at: Optional[str] = None
     end_at: Optional[str] = None
     all_day: Optional[bool] = None
+    auto_close_on_due: Optional[bool] = None
     reminder_offsets: Optional[list[int]] = None
     notifications_enabled: Optional[bool] = None
     estimated_hours: Optional[float] = None
     parent_task_id: Optional[str] = None
     assignee_ids: Optional[list[str]] = None
     tag_ids: Optional[list[str]] = None
-    recurrence_rrule: Optional[str] = None
+    recurrence_rrule: Optional[str] = Field(
+        default=None, max_length=MAX_RECURRENCE_RRULE_LENGTH
+    )
     recurrence_timezone: Optional[str] = None
     task_metadata: Optional[dict[str, Any]] = None
+    close_incomplete_subtasks: Optional[bool] = None
 
 
 class CreateTagPayload(BaseModel):
@@ -80,6 +93,7 @@ class TaskReferencePayload(BaseModel):
         "conversation_session",
         "conversation_message",
         "docs_node",
+        "task",
         "workspace_file",
         "url",
     ]
@@ -99,17 +113,25 @@ class OccurrenceUpdatePayload(BaseModel):
 
 
 class TaskRecurrencePayload(BaseModel):
-    rrule: Optional[str] = None
+    rrule: Optional[str] = Field(
+        default=None, max_length=MAX_RECURRENCE_RRULE_LENGTH
+    )
     timezone: Optional[str] = None
-    horizon_days: Optional[int] = None
+    horizon_days: Optional[int] = Field(
+        default=None, ge=1, le=MAX_RECURRENCE_HORIZON_DAYS
+    )
     trigger_status: Optional[str] = None
     create_new: Optional[bool] = None
     recur_forever: Optional[bool] = None
     reset_status_to: Optional[str] = None
-    end_count: Optional[int] = None
+    end_count: Optional[int] = Field(
+        default=None, ge=1, le=MAX_RECURRENCE_END_COUNT
+    )
     end_date: Optional[str] = None
     skip_weekend: Optional[bool] = None
     skip_holiday: Optional[bool] = None
+    # 土日・祝日に当たった回の扱い: shift_forward / omit
+    skip_mode: Optional[str] = None
 
 
 class TimerStartPayload(BaseModel):
@@ -151,6 +173,20 @@ class UserNotificationPreferencesPayload(BaseModel):
     task_notifications_default_enabled: Optional[bool] = None
 
 
+class WebPushSubscriptionPayload(BaseModel):
+    """Browser PushSubscription JSON sent by the authenticated web client."""
+
+    endpoint: str
+    expiration_time: Optional[float | int | str] = None
+    p256dh: str
+    auth: str
+    content_encoding: Optional[str] = "aes128gcm"
+
+
+class WebPushSubscriptionDeletePayload(BaseModel):
+    endpoint: str
+
+
 class CreateSpacePayload(BaseModel):
     name: str
     description: Optional[str] = None
@@ -172,6 +208,7 @@ class LegacyEventPayload(BaseModel):
     event_type: str
     trigger_source: str = "manual"
     payload: Optional[dict[str, Any]] = None
+    close_incomplete_subtasks: Optional[bool] = None
 
 
 def _parse_datetime(value: Optional[str], field_name: str) -> Optional[datetime]:
@@ -243,6 +280,8 @@ def _build_update_task_updates(payload: UpdateTaskPayload) -> dict[str, Any]:
         )
     if "all_day" in fields_set:
         updates["all_day"] = payload.all_day
+    if "auto_close_on_due" in fields_set:
+        updates["auto_close_on_due"] = payload.auto_close_on_due
     if "reminder_offsets" in fields_set:
         updates["reminder_offsets"] = payload.reminder_offsets
     if "notifications_enabled" in fields_set:
@@ -303,20 +342,20 @@ class TaskRouterContext:
     require_auth_dependency: Any
     service: Any
     google_calendar: Any
-    blocked_attachment_extensions: set
-
     # クロージャ helper 群
     get_current_user: Callable
     space_slug: Callable
     sanitize_file_name: Callable
     validate_project_relative_path: Callable
     unique_target_path: Callable
+    write_unique_target_file: Callable
     attachment_kind: Callable
     serialize_attachment: Callable
     serialize_task_reference: Callable
     load_task_for_attachment: Callable
     project_storage_root: Callable
     resolve_attachment_file: Callable
+    is_safe_workspace_path: Callable
     with_pending_agent_triage: Callable
     triage_task: Callable
     translate_google_calendar_error: Callable
@@ -331,3 +370,11 @@ class TaskRouterContext:
     delete_google_calendar_warning_only: Callable
     load_tag: Callable
     translate_service_error: Callable
+
+    # App/Project workspace の実効 root。
+    # Space 削除は配下 Project の workspace とロックを両方触るため、ロックを取る
+    # root と実ファイルを消す root がずれると排他が静かに壊れる。server 側で 1 度
+    # だけ解決した値をここへ載せ、各 register 関数から同じ値を配る。
+    # ``None`` は ``AOITALK_WORKSPACES_DIR`` 由来の既定 root へ委ねる意味で、
+    # 既存の呼び出し（テスト・外部利用）を壊さないための keyword-only 既定値。
+    workspace_root: "str | PathLike[str] | None" = field(default=None, kw_only=True)

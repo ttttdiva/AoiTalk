@@ -11,7 +11,8 @@
     "lint": "eslint src --ext .ts,.tsx",
     "typecheck": "tsc --noEmit",
     "test": "jest --runInBand",
-    "db:generate": "drizzle-kit generate"
+    "db:generate": "drizzle-kit generate",
+    "api:typegen": "node scripts/generate-api-types.mjs"
   },
   "dependencies": {
     "@expo/metro-runtime": "~6.1.2",
@@ -36,6 +37,7 @@
     "expo-router": "~6.0.13",
     "expo-screen-orientation": "~9.0.9",
     "expo-secure-store": "~15.0.7",
+    "expo-sharing": "~14.0.8",
     "expo-sqlite": "~16.0.8",
     "expo-status-bar": "~3.0.8",
     "expo-system-ui": "~6.0.8",

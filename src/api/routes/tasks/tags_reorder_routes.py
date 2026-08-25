@@ -286,16 +286,19 @@ def register_tag_reorder_routes(router: APIRouter, ctx: TaskRouterContext) -> No
                 )
                 return {"task": task, "time_entry": time_entry}
             if payload.event_type == "completed":
-                try:
-                    time_entry = await service.stop_timer(session, user_id=user_id)
-                except TaskManagementError:
-                    time_entry = None
                 task = await service.update_task(
                     session,
                     user_id=user_id,
                     task_id=task_uuid,
                     updates={"status": "closed"},
+                    close_incomplete_subtasks=(
+                        payload.close_incomplete_subtasks is True
+                    ),
                 )
+                try:
+                    time_entry = await service.stop_timer(session, user_id=user_id)
+                except TaskManagementError:
+                    time_entry = None
                 return {"task": task, "time_entry": time_entry}
             if payload.event_type == "blocked":
                 task = await service.update_task(
@@ -309,6 +312,8 @@ def register_tag_reorder_routes(router: APIRouter, ctx: TaskRouterContext) -> No
                 status_code=400, detail=f"Invalid event_type: {payload.event_type}"
             )
         except TaskManagementError as exc:
+            if exc.status_code == 409 and exc.detail is not None:
+                raise HTTPException(status_code=409, detail=exc.detail)
             raise _translate_service_error(exc)
         finally:
             await session.close()

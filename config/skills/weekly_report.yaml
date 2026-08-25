@@ -103,9 +103,8 @@ aliases:
   - weekly
 bound_tools:
   - get_project_context
-  - find_workspace_items
-  - read_workspace_file
-  - view_file
+  - search_files
+  - read_file
   - execute_command
 examples:
   - "/weekly_report"

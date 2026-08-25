@@ -5,6 +5,12 @@ import { taskApi } from "../lib/task-api";
 import { useNetworkStore } from "../stores/network";
 import type { TimeEntry, TimeReport, TimeReportBucket } from "../types/api";
 import { enqueueOutbox, randomId } from "./outbox";
+import { compareTaskTimestamps, isTaskTombstoned } from "./tasks";
+import {
+  compareTombstoneTimestamps,
+  loadTombstoneLedger,
+  persistTombstoneLedger,
+} from "./tombstone-ledger";
 
 type JoinedTimeEntryRow = {
   entry: typeof schema.timeEntries.$inferSelect;
@@ -157,7 +163,45 @@ export async function applyRemoteTimeEntries(list: TimeEntry[]): Promise<void> {
   if (!list.length) return;
   const db = getDb();
   const now = new Date().toISOString();
+  const ledger = await loadTombstoneLedger("time-entries:tombstones");
+  let ledgerChanged = false;
   for (const entry of list) {
+    if (await isTaskTombstoned(entry.task_id)) continue;
+    const existing = await db
+      .select({ deletedAt: schema.timeEntries.deletedAt, updatedAt: schema.timeEntries.updatedAt })
+      .from(schema.timeEntries)
+      .where(eq(schema.timeEntries.id, entry.id));
+    const current = existing[0];
+    const incomingUpdatedAt = entry.updated_at ?? now;
+    const hasIncomingVersion =
+      typeof entry.updated_at === "string" && entry.updated_at.trim().length > 0;
+    const explicitActive =
+      Object.prototype.hasOwnProperty.call(entry, "deleted_at") &&
+      entry.deleted_at == null;
+    const ledgerDeletedAt = ledger.entries.get(entry.id) ?? null;
+    if (
+      ledgerDeletedAt != null &&
+      !(
+        explicitActive &&
+        hasIncomingVersion &&
+        compareTombstoneTimestamps(incomingUpdatedAt, ledgerDeletedAt) > 0
+      )
+    ) {
+      continue;
+    }
+    if (ledgerDeletedAt != null && ledger.entries.delete(entry.id)) {
+      ledgerChanged = true;
+    }
+    if (
+      current?.deletedAt != null &&
+      !(
+        explicitActive &&
+        hasIncomingVersion &&
+        compareTaskTimestamps(incomingUpdatedAt, current.deletedAt) > 0
+      )
+    ) {
+      continue;
+    }
     await db
       .insert(schema.timeEntries)
       .values({
@@ -190,6 +234,7 @@ export async function applyRemoteTimeEntries(list: TimeEntry[]): Promise<void> {
         },
       });
   }
+  if (ledgerChanged) await persistTombstoneLedger(ledger);
 }
 
 export async function applyTimeEntryTombstones(
@@ -197,13 +242,22 @@ export async function applyTimeEntryTombstones(
 ): Promise<void> {
   if (!tombstones.length) return;
   const db = getDb();
+  const ledger = await loadTombstoneLedger("time-entries:tombstones");
+  let ledgerChanged = false;
   for (const item of tombstones) {
     const deletedAt = item.deleted_at ?? new Date().toISOString();
+    const previous = ledger.entries.get(item.id);
+    if (previous && compareTombstoneTimestamps(deletedAt, previous) < 0) {
+      continue;
+    }
+    ledger.entries.set(item.id, deletedAt);
+    ledgerChanged = true;
     await db
       .update(schema.timeEntries)
       .set({ deletedAt, updatedAt: deletedAt })
       .where(eq(schema.timeEntries.id, item.id));
   }
+  if (ledgerChanged) await persistTombstoneLedger(ledger);
 }
 
 export function buildTimeReportFromEntries(
@@ -416,6 +470,72 @@ export const timeEntriesRepo = {
       });
     }
     return (await this.getActiveLocal(taskId)) ?? local;
+  },
+
+  /**
+   * Create a finished manual entry while retaining the same local-first and
+   * outbox guarantees as the timer controls.
+   */
+  async logManual(
+    taskId: string,
+    startedAt: string,
+    endedAt: string,
+    note?: string | null,
+    occurrenceId?: string | null,
+  ): Promise<TimeEntry> {
+    const hasToken = Boolean(await getToken());
+    if (await canUseServer()) {
+      try {
+        const entry = await taskApi.logTime({
+          task_id: taskId,
+          occurrence_id: occurrenceId ?? null,
+          started_at: startedAt,
+          ended_at: endedAt,
+          note: note ?? null,
+          source: "manual",
+        });
+        await applyRemoteTimeEntries([entry]);
+        return entry;
+      } catch {
+        // Transport failures fall through to the durable local outbox.
+      }
+    }
+
+    const now = new Date().toISOString();
+    const local: TimeEntry = {
+      id: randomId(),
+      task_id: taskId,
+      occurrence_id: occurrenceId ?? null,
+      user_id: (await currentUserId()) ?? "",
+      started_at: startedAt,
+      ended_at: endedAt,
+      duration_seconds: calculateTimeEntryDuration({
+        started_at: startedAt,
+        ended_at: endedAt,
+      }),
+      source: "manual",
+      note: note ?? null,
+      metadata: {},
+      updated_at: now,
+      deleted_at: null,
+    };
+    await applyRemoteTimeEntries([local]);
+    if (hasToken) {
+      await enqueueOutbox({
+        table: "time_entries",
+        action: "create",
+        entityId: local.id,
+        payload: {
+          task_id: taskId,
+          occurrence_id: occurrenceId ?? null,
+          started_at: startedAt,
+          ended_at: endedAt,
+          source: "manual",
+          note: note ?? null,
+        },
+      });
+    }
+    return local;
   },
 
   async stopTimer(entryId?: string): Promise<TimeEntry> {

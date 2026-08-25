@@ -1,0 +1,628 @@
+{
+  "catalog_version": "2026-08-01.1",
+  "schema_version": 1,
+  "generated_at": "2026-08-01T00:00:00Z",
+  "free_incentive_groups": {
+    "1m": [
+      "gpt-5.6-sol",
+      "gpt-5.5-2026-04-23",
+      "gpt-5.4-2026-03-05",
+      "gpt-5.2-2025-12-11",
+      "gpt-5.1-2025-11-13",
+      "gpt-5.1-codex",
+      "gpt-5-codex",
+      "gpt-5-2025-08-07",
+      "gpt-5-chat-latest",
+      "gpt-4.5-preview-2025-02-27",
+      "gpt-4.1-2025-04-14",
+      "gpt-4o-2024-05-13",
+      "gpt-4o-2024-08-06",
+      "gpt-4o-2024-11-20",
+      "o3-2025-04-16",
+      "o1-preview-2024-09-12",
+      "o1-2024-12-17"
+    ],
+    "10m": [
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
+      "gpt-5.4-mini-2026-03-17",
+      "gpt-5.4-nano-2026-03-17",
+      "gpt-5.1-codex-mini",
+      "gpt-5-mini-2025-08-07",
+      "gpt-5-nano-2025-08-07",
+      "gpt-4.1-mini-2025-04-14",
+      "gpt-4.1-nano-2025-04-14",
+      "gpt-4o-mini-2024-07-18",
+      "o4-mini-2025-04-16",
+      "o1-mini-2024-09-12",
+      "codex-mini-latest"
+    ]
+  },
+  "rules": [
+    {
+      "rule_id": "openai:gpt-5.6-sol:2026-01-01",
+      "provider": "openai",
+      "canonical_model": "gpt-5.6-sol",
+      "aliases": ["gpt-5.6"],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "5.00",
+        "cached_input": "0.50",
+        "output": "30.00",
+        "cache_write": "6.25"
+      },
+      "long_context": {
+        "threshold_tokens": 272000,
+        "input_multiplier": "2",
+        "output_multiplier": "1.5"
+      },
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://openai.com/api/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "openai:gpt-5.6-terra:2026-01-01",
+      "provider": "openai",
+      "canonical_model": "gpt-5.6-terra",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "2.50",
+        "cached_input": "0.25",
+        "output": "15.00",
+        "cache_write": "3.125"
+      },
+      "long_context": {
+        "threshold_tokens": 272000,
+        "input_multiplier": "2",
+        "output_multiplier": "1.5"
+      },
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://openai.com/api/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "openai:gpt-5.6-luna:2026-01-01",
+      "provider": "openai",
+      "canonical_model": "gpt-5.6-luna",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "1.00",
+        "cached_input": "0.10",
+        "output": "6.00",
+        "cache_write": "1.25"
+      },
+      "long_context": {
+        "threshold_tokens": 272000,
+        "input_multiplier": "2",
+        "output_multiplier": "1.5"
+      },
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://openai.com/api/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "openai:gpt-5.5:2026-01-01",
+      "provider": "openai",
+      "canonical_model": "gpt-5.5",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "5.00",
+        "cached_input": "0.50",
+        "output": "30.00"
+      },
+      "long_context": {
+        "threshold_tokens": 272000,
+        "input_multiplier": "2",
+        "output_multiplier": "1.5"
+      },
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://openai.com/api/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "openai:gpt-5.5-pro:2026-01-01",
+      "provider": "openai",
+      "canonical_model": "gpt-5.5-pro",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "30.00",
+        "cached_input": "30.00",
+        "output": "180.00"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://openai.com/api/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "openai:gpt-5.4:2026-01-01",
+      "provider": "openai",
+      "canonical_model": "gpt-5.4",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "2.50",
+        "cached_input": "0.25",
+        "output": "15.00"
+      },
+      "long_context": {
+        "threshold_tokens": 272000,
+        "input_multiplier": "2",
+        "output_multiplier": "1.5"
+      },
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://openai.com/api/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "openai:gpt-5.4-mini:2026-01-01",
+      "provider": "openai",
+      "canonical_model": "gpt-5.4-mini",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "0.75",
+        "cached_input": "0.075",
+        "output": "4.50"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://openai.com/api/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "openai:gpt-5.4-nano:2026-01-01",
+      "provider": "openai",
+      "canonical_model": "gpt-5.4-nano",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "0.20",
+        "cached_input": "0.02",
+        "output": "1.25"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://openai.com/api/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "openai:gpt-5-mini:2026-01-01",
+      "provider": "openai",
+      "canonical_model": "gpt-5-mini",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "0.25",
+        "cached_input": "0.025",
+        "output": "2.00"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://openai.com/api/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "openai:gpt-4.1:2026-01-01",
+      "provider": "openai",
+      "canonical_model": "gpt-4.1",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "2.00",
+        "cached_input": "0.50",
+        "output": "8.00"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://openai.com/api/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "openai:gpt-4o:2026-01-01",
+      "provider": "openai",
+      "canonical_model": "gpt-4o",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "2.50",
+        "cached_input": "1.25",
+        "output": "10.00"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://openai.com/api/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "openai:gpt-4o-mini:2026-01-01",
+      "provider": "openai",
+      "canonical_model": "gpt-4o-mini",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "0.15",
+        "cached_input": "0.075",
+        "output": "0.60"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://openai.com/api/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "openai:o4-mini:2026-01-01",
+      "provider": "openai",
+      "canonical_model": "o4-mini",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "1.10",
+        "cached_input": "0.275",
+        "output": "4.40"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://openai.com/api/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+
+    {
+      "rule_id": "gemini:gemini-3.1-pro-preview:2026-01-01",
+      "provider": "gemini",
+      "canonical_model": "gemini-3.1-pro-preview",
+      "aliases": [],
+      "pricing_kind": "tiered_token",
+      "tiers": [
+        {
+          "max_input_tokens": 200000,
+          "rates": {"input": "2.00", "cached_input": "0.20", "output": "12.00"}
+        },
+        {
+          "max_input_tokens": null,
+          "rates": {"input": "4.00", "cached_input": "0.40", "output": "18.00"}
+        }
+      ],
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://ai.google.dev/gemini-api/docs/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "gemini:gemini-3-flash-preview:2026-01-01",
+      "provider": "gemini",
+      "canonical_model": "gemini-3-flash-preview",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "0.50",
+        "cached_input": "0.05",
+        "output": "3.00"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://ai.google.dev/gemini-api/docs/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "gemini:gemini-3.1-flash-lite:2026-01-01",
+      "provider": "gemini",
+      "canonical_model": "gemini-3.1-flash-lite",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "0.25",
+        "cached_input": "0.025",
+        "output": "1.50"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://ai.google.dev/gemini-api/docs/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "gemini:gemini-2.5-pro:2026-01-01",
+      "provider": "gemini",
+      "canonical_model": "gemini-2.5-pro",
+      "aliases": [],
+      "pricing_kind": "tiered_token",
+      "tiers": [
+        {
+          "max_input_tokens": 200000,
+          "rates": {"input": "1.25", "cached_input": "0.125", "output": "10.00"}
+        },
+        {
+          "max_input_tokens": null,
+          "rates": {"input": "2.50", "cached_input": "0.25", "output": "15.00"}
+        }
+      ],
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://ai.google.dev/gemini-api/docs/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "gemini:gemini-2.5-flash:2026-01-01",
+      "provider": "gemini",
+      "canonical_model": "gemini-2.5-flash",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "0.30",
+        "cached_input": "0.03",
+        "output": "2.50"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://ai.google.dev/gemini-api/docs/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "gemini:gemini-2.5-flash-lite:2026-01-01",
+      "provider": "gemini",
+      "canonical_model": "gemini-2.5-flash-lite",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "0.10",
+        "cached_input": "0.01",
+        "output": "0.40"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://ai.google.dev/gemini-api/docs/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+
+    {
+      "rule_id": "deepseek:deepseek-v4-flash:2026-08-01",
+      "provider": "deepseek",
+      "canonical_model": "deepseek-v4-flash",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "0.14",
+        "cached_input": "0.0028",
+        "output": "0.28"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-08-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://api-docs.deepseek.com/quick_start/pricing",
+      "catalog_version": "2026-08-01.1"
+    },
+
+    {
+      "rule_id": "deepseek:deepseek-v4-pro:2026-08-01",
+      "provider": "deepseek",
+      "canonical_model": "deepseek-v4-pro",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "0.435",
+        "cached_input": "0.003625",
+        "output": "0.87"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-08-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://api-docs.deepseek.com/quick_start/pricing",
+      "catalog_version": "2026-08-01.1"
+    },
+
+    {
+      "rule_id": "deepinfra:deepseek-ai/DeepSeek-V4-Flash:2026-08-01",
+      "provider": "deepinfra",
+      "canonical_model": "deepseek-ai/DeepSeek-V4-Flash",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "0.09",
+        "cached_input": "0.018",
+        "output": "0.18"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-08-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://deepinfra.com/pricing",
+      "catalog_version": "2026-08-01.2"
+    },
+
+    {
+      "rule_id": "deepinfra:deepseek-ai/DeepSeek-V4-Pro:2026-08-01",
+      "provider": "deepinfra",
+      "canonical_model": "deepseek-ai/DeepSeek-V4-Pro",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "1.30",
+        "cached_input": "0.10",
+        "output": "2.60"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-08-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://deepinfra.com/pricing",
+      "catalog_version": "2026-08-01.2"
+    },
+
+    {
+      "rule_id": "kimi:kimi-k3:2026-01-01",
+      "provider": "kimi",
+      "canonical_model": "kimi-k3",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "3.00",
+        "cached_input": "0.30",
+        "output": "15.00"
+      },
+      "long_context": null,
+      "tool_rates": {"web_search": "0.004"},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://platform.moonshot.ai/docs/pricing",
+      "catalog_version": "2026-07-29.1"
+    },
+
+    {
+      "rule_id": "openrouter:*:2026-01-01",
+      "provider": "openrouter",
+      "canonical_model": "*",
+      "aliases": [],
+      "pricing_kind": "provider_reported",
+      "rates": {},
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "https://openrouter.ai/api/v1/models",
+      "catalog_version": "2026-07-29.1"
+    },
+
+    {
+      "rule_id": "codex-cli:*:2026-01-01",
+      "provider": "codex-cli",
+      "canonical_model": "*",
+      "aliases": [],
+      "pricing_kind": "subscription",
+      "rates": {},
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "subscription",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "claude-cli:*:2026-01-01",
+      "provider": "claude-cli",
+      "canonical_model": "*",
+      "aliases": [],
+      "pricing_kind": "subscription",
+      "rates": {},
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "subscription",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "antigravity-cli:*:2026-01-01",
+      "provider": "antigravity-cli",
+      "canonical_model": "*",
+      "aliases": [],
+      "pricing_kind": "subscription",
+      "rates": {},
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "subscription",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "grok-cli:*:2026-01-01",
+      "provider": "grok-cli",
+      "canonical_model": "*",
+      "aliases": [],
+      "pricing_kind": "subscription",
+      "rates": {},
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "subscription",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "ollama:*:2026-01-01",
+      "provider": "ollama",
+      "canonical_model": "*",
+      "aliases": [],
+      "pricing_kind": "local",
+      "rates": {},
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "local",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "sglang:*:2026-01-01",
+      "provider": "sglang",
+      "canonical_model": "*",
+      "aliases": [],
+      "pricing_kind": "local",
+      "rates": {},
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "local",
+      "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "openai_compatible_local:*:2026-01-01",
+      "provider": "openai_compatible_local",
+      "canonical_model": "*",
+      "aliases": [],
+      "pricing_kind": "local",
+      "rates": {},
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_to": null,
+      "source": "local",
+      "catalog_version": "2026-07-29.1"
+    }
+  ]
+}

@@ -10,8 +10,6 @@ from typing import Any, Optional
 from ..llm.native_runtime import AgentDefinition as Agent, NativeModelSettings as ModelSettings
 
 from .base import BaseAgent
-from ..tools.core import ensure_tool_definitions
-from ..tools.scenario_tools import get_coc_creation_reference_context
 
 
 # ────────────────────────────────────────────
@@ -89,18 +87,14 @@ class StoryCreatorAgent(BaseAgent):
 
     def _create_agent(self) -> Agent:
         """ストーリークリエイターエージェントインスタンスを作成する。"""
-        tools = ensure_tool_definitions([get_coc_creation_reference_context])
         return Agent(
             name="story_creator",
             instructions=(
                 _STORY_CREATOR_SYSTEM_PROMPT
-                + "\n\nCoC6/CoC7シナリオ作成時は、必要に応じて "
-                + "`get_coc_creation_reference_context` で構造化DBから関連ルール/神話生物だけを参照してください。"
-                + "ルールブック全文やサプリ全文は要求・引用せず、取得した短い参照項目を設計判断の根拠にします。"
             ),
             model=self.model,
             model_settings=ModelSettings(tool_choice="auto"),
-            tools=tools,
+            tools=[],
         )
 
     def get_tool_name(self) -> str:

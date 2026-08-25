@@ -8,12 +8,15 @@
 禁止し 403 を返す。
 """
 
+import inspect
+import json
 import logging
+from urllib.parse import parse_qs
 from typing import TYPE_CHECKING, Any, Dict, Optional
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..router_helpers import cookie_auth_dependency
@@ -41,6 +44,10 @@ if TYPE_CHECKING:
     from ..server import WebChatServer
 
 logger = logging.getLogger(__name__)
+
+_MAX_SELECTED_DOWNLOAD_PAYLOAD_BYTES = 256 * 1024
+_MAX_SELECTED_DOWNLOAD_PATHS = 100
+_MAX_SELECTED_DOWNLOAD_PATH_LENGTH = 4096
 
 
 class RemoteTaskPatchPayload(BaseModel):
@@ -130,6 +137,209 @@ def register_remote_proxy_routes(app: FastAPI, server: "WebChatServer") -> None:
         except RemoteConnectorError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
         return JSONResponse({"success": True, "data": data})
+
+    async def _close_raw_stream(handle: Any) -> None:
+        """Close a connector stream and any legacy response/client handles."""
+
+        close = getattr(handle, "aclose", None)
+        if callable(close):
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.debug("remote download stream close failed", exc_info=True)
+
+        # Keep compatibility with early connector test doubles that expose the
+        # response and HTTP client separately.  The current connector keeps
+        # these resources private and closes them from handle.aclose(); calling
+        # an exposed close method again is safe for httpx and protects older
+        # test doubles that do not compose their lifecycle methods.
+        for resource in (
+            getattr(handle, "response", None),
+            getattr(handle, "client", None),
+        ):
+            if resource is None or resource is handle:
+                continue
+            close = getattr(resource, "aclose", None) or getattr(resource, "close", None)
+            if not callable(close):
+                continue
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.debug("remote download resource close failed", exc_info=True)
+
+    def _stream_headers(raw_headers: Any) -> dict[str, str]:
+        """Forward safe file headers while dropping hop-by-hop metadata."""
+
+        allowed = {
+            "content-type",
+            "content-disposition",
+            "content-length",
+            "accept-ranges",
+            "content-range",
+            "etag",
+            "last-modified",
+            "cache-control",
+            "expires",
+            "x-content-type-options",
+        }
+        headers: dict[str, str] = {}
+        for key, value in (raw_headers or {}).items():
+            lowered = str(key).lower()
+            if lowered in allowed:
+                headers[lowered] = str(value)
+
+        # A decoded response must not advertise byte ranges or an encoded
+        # content length.  The connector normally strips these; keep the
+        # proxy boundary defensive for test doubles and older connectors.
+        content_encoding = ""
+        for key, value in (raw_headers or {}).items():
+            if str(key).lower() == "content-encoding":
+                content_encoding = str(value)
+                break
+        if content_encoding.strip():
+            headers.pop("content-length", None)
+            headers.pop("accept-ranges", None)
+            headers.pop("content-range", None)
+        return headers
+
+    async def _open_remote_download(
+        user_id: UUID,
+        profile_id: str,
+        method: str,
+        project_id: str,
+        params: Dict[str, Any],
+        *,
+        json_body: Optional[Dict[str, Any]] = None,
+        request_headers: Optional[Dict[str, str]] = None,
+    ):
+        connector = await _connector_for(user_id, profile_id)
+        try:
+            open_stream = getattr(connector, "open_raw_stream")
+            return await open_stream(
+                method,
+                f"/api/projects/{project_id}/files/download",
+                params=params or None,
+                json_body=json_body,
+                request_headers=request_headers,
+            )
+        except RemoteConnectorError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except AttributeError as exc:
+            raise HTTPException(status_code=503, detail="Connector streaming is not available") from exc
+
+    async def _stream_download_response(handle: Any, *, head_only: bool = False):
+        status_code = int(getattr(handle, "status_code", 502) or 502)
+        if status_code >= 400:
+            await _close_raw_stream(handle)
+            detail = "Remote download failed"
+            # Preserve upstream client errors so callers can distinguish an
+            # inaccessible project/file from a connector failure.
+            if 400 <= status_code < 600:
+                raise HTTPException(status_code=status_code, detail=detail)
+            raise HTTPException(status_code=502, detail=detail)
+
+        headers = _stream_headers(getattr(handle, "headers", None))
+
+        async def body():
+            try:
+                if head_only:
+                    return
+                iterator = getattr(handle, "aiter_bytes", None)
+                if iterator is None:
+                    iterator = getattr(handle, "iter_bytes", None)
+                if not callable(iterator):
+                    raise RemoteConnectorError("remote stream iterator is not available")
+                async for chunk in iterator():
+                    if chunk:
+                        yield chunk
+            finally:
+                await _close_raw_stream(handle)
+
+        return StreamingResponse(
+            body(),
+            status_code=status_code,
+            headers=headers,
+            media_type=None,
+        )
+
+    async def _bounded_request_body(
+        request: Request, *, max_bytes: int
+    ) -> bytes:
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > max_bytes:
+                raise HTTPException(status_code=413, detail="Download payload is too large")
+            if chunk:
+                chunks.append(chunk)
+        return b"".join(chunks)
+
+    async def _selected_download_paths(request: Request) -> list[str]:
+        """Read the selected-path contract from JSON or URL-encoded forms."""
+
+        content_length = request.headers.get("content-length")
+        try:
+            if content_length is not None and int(content_length) > _MAX_SELECTED_DOWNLOAD_PAYLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="Download payload is too large")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid content length") from exc
+
+        content_type = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+        payload: Any
+        if content_type == "application/x-www-form-urlencoded":
+            raw_body = await _bounded_request_body(
+                request, max_bytes=_MAX_SELECTED_DOWNLOAD_PAYLOAD_BYTES
+            )
+            try:
+                decoded_body = raw_body.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                raise HTTPException(status_code=400, detail="Invalid download payload") from exc
+            fields = parse_qs(decoded_body, keep_blank_values=True)
+            values = fields.get("paths", [])
+            if len(values) == 1:
+                value = values[0]
+                try:
+                    payload = {"paths": json.loads(value)} if value.lstrip().startswith("[") else {"paths": values}
+                except json.JSONDecodeError:
+                    payload = {"paths": values}
+            else:
+                payload = {"paths": values}
+        else:
+            try:
+                raw_body = await _bounded_request_body(
+                    request, max_bytes=_MAX_SELECTED_DOWNLOAD_PAYLOAD_BYTES
+                )
+                payload = json.loads(raw_body.decode("utf-8", errors="strict"))
+            except HTTPException:
+                raise
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="Invalid download payload") from exc
+
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="paths must be an array")
+        paths = payload.get("paths")
+        if isinstance(paths, str):
+            try:
+                decoded = json.loads(paths)
+            except json.JSONDecodeError:
+                decoded = [paths]
+            paths = decoded
+        if (
+            not isinstance(paths, list)
+            or not paths
+            or len(paths) > _MAX_SELECTED_DOWNLOAD_PATHS
+            or any(not isinstance(path, str) for path in paths)
+        ):
+            raise HTTPException(status_code=400, detail="paths must be a non-empty array")
+        cleaned = [path.strip() for path in paths]
+        if any(not path or len(path) > _MAX_SELECTED_DOWNLOAD_PATH_LENGTH for path in cleaned):
+            raise HTTPException(status_code=400, detail="paths must be a non-empty array")
+        return cleaned
 
     @app.get("/api/remote-servers/{profile_id}/tasks")
     async def proxy_list_tasks(
@@ -313,19 +523,66 @@ def register_remote_proxy_routes(app: FastAPI, server: "WebChatServer") -> None:
         project_id, params = _project_scope(request)
         if not str(params.get("path") or "").strip():
             raise HTTPException(status_code=400, detail="path is required")
-        connector = await _connector_for(user_id, profile_id)
-        try:
-            raw = await connector.request_raw(
-                "GET", f"/api/projects/{project_id}/files/download", params=params
-            )
-        except RemoteConnectorError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        headers = {
-            key: value
-            for key, value in raw.headers.items()
-            if key in {"content-type", "content-disposition", "content-length", "accept-ranges", "content-range"}
-        }
-        return Response(content=raw.content, status_code=raw.status_code, headers=headers)
+        handle = await _open_remote_download(
+            user_id,
+            profile_id,
+            request.method,
+            project_id,
+            params,
+            request_headers={
+                key: value
+                for key in ("range", "if-range", "if-none-match", "if-modified-since")
+                if (value := request.headers.get(key))
+            },
+        )
+        return await _stream_download_response(
+            handle,
+            head_only=False,
+        )
+
+    @app.head(
+        "/api/remote-servers/{profile_id}/workspace/download",
+        include_in_schema=False,
+    )
+    async def proxy_workspace_download_head(
+        profile_id: str, request: Request, _: None = Depends(require_auth)
+    ):
+        _ensure_ready()
+        user_id = await _require_user_id(request)
+        project_id, params = _project_scope(request)
+        if not str(params.get("path") or "").strip():
+            raise HTTPException(status_code=400, detail="path is required")
+        handle = await _open_remote_download(
+            user_id,
+            profile_id,
+            "HEAD",
+            project_id,
+            params,
+            request_headers={
+                key: value
+                for key in ("range", "if-range", "if-none-match", "if-modified-since")
+                if (value := request.headers.get(key))
+            },
+        )
+        return await _stream_download_response(handle, head_only=True)
+
+    @app.post("/api/remote-servers/{profile_id}/workspace/download")
+    async def proxy_workspace_download_selected(
+        profile_id: str, request: Request, _: None = Depends(require_auth)
+    ):
+        _ensure_ready()
+        user_id = await _require_user_id(request)
+        project_id, params = _project_scope(request)
+        paths = await _selected_download_paths(request)
+        handle = await _open_remote_download(
+            user_id,
+            profile_id,
+            "POST",
+            project_id,
+            params,
+            json_body={"paths": paths},
+        )
+        return await _stream_download_response(handle)
 
     @app.get("/api/remote-servers/{profile_id}/docs/tree")
     async def proxy_docs_tree(

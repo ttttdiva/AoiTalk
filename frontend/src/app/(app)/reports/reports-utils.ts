@@ -16,8 +16,10 @@ export function formatHours(seconds: number): string {
 
 export type PeriodPreset = "this_week" | "this_month" | "custom";
 export type ScopeMode = "project" | "space" | "all";
+export type ReportsViewMode = "summary" | "timeline";
 
 export type ReportsViewSettings = {
+  active_view?: ReportsViewMode;
   scope?: ScopeMode;
   period?: PeriodPreset;
   custom_from?: string;

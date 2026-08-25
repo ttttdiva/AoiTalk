@@ -2,6 +2,7 @@ export interface Snippet {
   prefix: string;
   body: string;
   description?: string;
+  quickAccess?: boolean;
 }
 
 export async function getSnippets(): Promise<Snippet[]> {
@@ -18,10 +19,13 @@ export async function getSnippets(): Promise<Snippet[]> {
 }
 
 export async function saveSnippets(snippets: Snippet[]): Promise<void> {
-  await fetch("/api/users/me/settings", {
+  const res = await fetch("/api/users/me/settings", {
     method: "PATCH",
     credentials: "include",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ snippets }),
   });
+  if (!res.ok) {
+    throw new Error(`スニペットの保存に失敗しました (${res.status})`);
+  }
 }

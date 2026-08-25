@@ -9,6 +9,7 @@ import {
   CardDescription,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { LongTextEditor } from "@/components/editor/long-text-editor";
 import { ChevronDown, ChevronUp, Pencil, Plus, Trash2, Code2 } from "lucide-react";
@@ -25,6 +26,7 @@ export function SnippetsSection() {
     description: "",
   });
   const [saving, setSaving] = useState(false);
+  const [feedback, setFeedback] = useState<string | null>(null);
 
   const resetForm = () => {
     setForm({ prefix: "", body: "", description: "" });
@@ -32,11 +34,16 @@ export function SnippetsSection() {
   };
 
   const handleSave = async () => {
-    if (!form.prefix.trim() || !form.body.trim()) return;
+    if (!form.prefix.trim() || !form.body.trim()) {
+      setFeedback("prefix と本文を入力してください。");
+      return;
+    }
     setSaving(true);
+    setFeedback(null);
     try {
       const newSnippets = [...snippets];
       const entry: Snippet = {
+        ...form,
         prefix: form.prefix.trim(),
         body: form.body,
         description: form.description?.trim() || undefined,
@@ -48,6 +55,9 @@ export function SnippetsSection() {
       }
       await save(newSnippets);
       resetForm();
+      setFeedback("スニペットを保存しました。");
+    } catch (error) {
+      setFeedback(error instanceof Error ? error.message : "保存に失敗しました。");
     } finally {
       setSaving(false);
     }
@@ -55,10 +65,14 @@ export function SnippetsSection() {
 
   const handleDelete = async (index: number) => {
     setSaving(true);
+    setFeedback(null);
     try {
       const newSnippets = snippets.filter((_, i) => i !== index);
       await save(newSnippets);
       if (editIndex === index) resetForm();
+      setFeedback("スニペットを削除しました。");
+    } catch (error) {
+      setFeedback(error instanceof Error ? error.message : "削除に失敗しました。");
     } finally {
       setSaving(false);
     }
@@ -70,10 +84,20 @@ export function SnippetsSection() {
   };
 
   return (
-    <Card size="sm">
+    <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0">
       <CardHeader
         className="cursor-pointer select-none"
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        aria-controls="snippets-content"
         onClick={() => setExpanded((v) => !v)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            setExpanded((v) => !v);
+          }
+        }}
       >
         <CardTitle className="flex items-center justify-between text-sm">
           <span className="flex items-center gap-2">
@@ -98,7 +122,8 @@ export function SnippetsSection() {
         )}
       </CardHeader>
       {expanded && (
-      <CardContent className="space-y-4">
+      <CardContent id="snippets-content" className="space-y-4">
+        {feedback && <p role="status" className="text-xs text-muted-foreground">{feedback}</p>}
         {/* 一覧 */}
         {snippets.length > 0 && (
           <div className="space-y-2">
@@ -112,6 +137,15 @@ export function SnippetsSection() {
                     <code className="rounded bg-muted px-1.5 py-0.5 text-xs font-semibold">
                       {s.prefix}
                     </code>
+                    {s.quickAccess === true && (
+                      <Badge
+                        data-testid="snippet-quick-access-badge"
+                        variant="outline"
+                        className="text-[10px]"
+                      >
+                        クイックアクセス
+                      </Badge>
+                    )}
                     {s.description && (
                       <span className="truncate text-xs text-muted-foreground">
                         {s.description}

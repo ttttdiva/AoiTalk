@@ -8,18 +8,35 @@ from typing import Any, Optional
 
 from ..conversation_context import PromptMessages, build_prompt_messages
 from ..multimodal import openai_content_parts
-from ..tool_policy import looks_like_bare_search_followup_request
 from ...services.context_builder import ContextBuilder, ContextBundle
 from ...services.project_context import (
     ProjectContextResolver,
     format_project_context_for_chat_prompt,
     get_runtime_project_context,
 )
-from ...services.scenario_chat_context import build_scenario_chat_context
+from ...services.story_chat_context import (
+    build_story_chat_context,
+    resolve_story_chat_context_for_chat,
+    run_story_chat_context_sync,
+)
+from ...services.turn_context import get_turn_context
 
 
 class ContextBuildingMixin:
     """モデル入力メッセージ・会話コンテキスト・プロジェクトコンテキストの構築。"""
+
+    def _project_context_enabled_for_turn(self) -> bool:
+        """Prefer the immutable turn-local Project Context flag.
+
+        Provider clients retain ``current_include_project_context`` for legacy
+        and direct CLI/voice callers, but a request-scoped ContextVar must win
+        whenever the Web/REST boundary supplied an explicit ON/OFF value.
+        """
+
+        turn = get_turn_context()
+        if turn.include_project_context is not None:
+            return bool(turn.include_project_context)
+        return bool(getattr(self, "current_include_project_context", True))
 
     def _build_model_prompt_messages(
         self,
@@ -30,6 +47,8 @@ class ContextBuildingMixin:
         project_context: Optional[dict[str, Any]] = None,
     ) -> PromptMessages:
         """Build canonical role messages and append turn-local context."""
+        self._current_memory_recall_context = str(memory_recall or "")
+        self._current_tool_hint_context = str(tool_hint_context or "")
         history = self.history_manager.get_model_messages()
         state_mode_before = self._provider_state_mode
         if (
@@ -39,17 +58,15 @@ class ContextBuildingMixin:
         ):
             history = history[:-1]
 
+        include_project_context = self._project_context_enabled_for_turn()
         dynamic: list[tuple[str, str]] = []
-        if self._current_context_bundle and not self._get_scenario_chat_context_sync():
-            bundle = self._current_context_bundle
+        if self._current_context_bundle and not self._get_story_chat_context_sync():
+            bundle = self._context_bundle_for_turn(include_project_context)
             if self.history_manager.summary and getattr(bundle, "session_context_block", ""):
                 bundle = dataclasses.replace(bundle, session_context_block="")
             dynamic.append(
                 ("Current ContextBundle", bundle.render_for_prompt())
             )
-        include_project_context = bool(
-            getattr(self, "current_include_project_context", True)
-        )
         if include_project_context and project_context and not self._current_context_bundle:
             dynamic.append(
                 (
@@ -61,6 +78,7 @@ class ContextBuildingMixin:
             dynamic.append(("Current memory search results", memory_recall))
         if tool_hint_context:
             dynamic.append(("Current tool hints", tool_hint_context))
+        self._current_prompt_dynamic_context = list(dynamic)
         return build_prompt_messages(
             history,
             summary=self.history_manager.summary,
@@ -85,18 +103,17 @@ class ContextBuildingMixin:
     def _build_conversation_context(self) -> str:
         """Build conversation context from history"""
         history = self.history_manager.get_all()
-        scenario_chat_context = self._get_scenario_chat_context_sync()
+        story_chat_context = self._get_story_chat_context_sync()
+        include_project_context = self._project_context_enabled_for_turn()
+        current_bundle = self._context_bundle_for_turn(include_project_context)
         context_builder_block = (
-            self._current_context_bundle.render_for_prompt()
-            if not scenario_chat_context and self._current_context_bundle
+            current_bundle.render_for_prompt()
+            if not story_chat_context and current_bundle
             else ""
-        )
-        include_project_context = bool(
-            getattr(self, "current_include_project_context", True)
         )
         project_context = (
             None
-            if scenario_chat_context or not include_project_context
+            if story_chat_context or not include_project_context
             else get_runtime_project_context()
         )
         project_block = (
@@ -105,39 +122,14 @@ class ContextBuildingMixin:
             else ""
         )
 
-        # Scenario workflow sessions use scenario_chat_context.prompt as agent
-        # instructions, not as ordinary conversation context.
-        scenario_block = ""
-        if self.current_session_id:
-            try:
-                from ...services.scenario_service import (
-                    get_play_session_by_conversation_id,
-                )
-
-                if not scenario_chat_context:
-                    play_session = self._run_sync(
-                        get_play_session_by_conversation_id(self.current_session_id)
-                    )
-                else:
-                    play_session = None
-                if play_session:
-                    import json
-
-                    scenario_data = {
-                        "scenario_title": play_session.get("scenario", {}).get("title"),
-                        "current_scene": play_session.get("current_scene", {}).get(
-                            "title"
-                        ),
-                        "player_state": play_session.get("player_state", {}),
-                        "status": play_session.get("status"),
-                    }
-                    scenario_block = f"## Active TRPG Scenario State:\n{json.dumps(scenario_data, ensure_ascii=False, indent=2)}\n"
-            except Exception as e:
-                print(f"[AgentLLMClient] Failed to get scenario state: {e}")
+        # Story workflow sessions use story_chat_context.prompt as agent
+        # instructions, not as ordinary conversation context. TRPG play state
+        # is intentionally no longer loaded here (§11.8).
+        story_block = ""
 
         # ワールドブック情報の取得
         worldbook_block = ""
-        if self.character_name and not scenario_chat_context:
+        if self.character_name and not story_chat_context:
             try:
                 from ...services.worldbook_service import get_matching_entries
 
@@ -166,7 +158,7 @@ class ContextBuildingMixin:
                 for p in [
                     context_builder_block,
                     project_block,
-                    scenario_block,
+                    story_block,
                     worldbook_block,
                 ]
                 if p
@@ -181,7 +173,7 @@ class ContextBuildingMixin:
                 for p in [
                     context_builder_block,
                     project_block,
-                    scenario_block,
+                    story_block,
                     worldbook_block,
                     current_input,
                 ]
@@ -216,13 +208,32 @@ class ContextBuildingMixin:
             for p in [
                 context_builder_block,
                 project_block,
-                scenario_block,
+                story_block,
                 worldbook_block,
                 context,
             ]
             if p
         ]
         return "\n\n".join(parts)
+
+    def _context_bundle_for_turn(self, include_project_context: bool) -> ContextBundle:
+        """Strip selected-Project layers when Project Context is explicitly OFF."""
+
+        bundle = self._current_context_bundle
+        if bundle is None or include_project_context:
+            return bundle or ContextBundle()
+        # Keep user/session-scoped context, but never leak a retained selected
+        # Project's identity, Docs, pack, tasks, or Agent Memory into this
+        # turn through a stale/direct-client ContextBundle fallback.
+        return dataclasses.replace(
+            bundle,
+            project_context_block="",
+            project_knowledge_index=None,
+            project_information_block="",
+            agent_memory_block="",
+            project_pack_block="",
+            task_context_block="",
+        )
 
     def _run_sync(self, coro):
         """async コルーチンを同期的に実行するヘルパー。"""
@@ -238,28 +249,26 @@ class ContextBuildingMixin:
             future = pool.submit(asyncio.run, coro)
             return future.result()
 
-    def _get_scenario_chat_context_sync(self):
+    def _get_story_chat_context_sync(self):
         if not self.current_session_id:
             return None
-        try:
-            return self._run_sync(build_scenario_chat_context(self.current_session_id))
-        except Exception as e:
-            print(f"[AgentLLMClient] Failed to resolve scenario chat context: {e}")
-            return None
+        return run_story_chat_context_sync(self._run_sync, self.current_session_id)
 
     async def _build_context_bundle_for_prompt(
         self, user_input: str, project_context: Optional[dict[str, Any]]
     ) -> Optional[ContextBundle]:
-        if self._get_scenario_chat_context_sync():
+        if self._get_story_chat_context_sync():
             return None
-        include_project_context = bool(
-            getattr(self, "current_include_project_context", True)
-        ) and not looks_like_bare_search_followup_request(user_input)
+        # Project Context is controlled by the immutable turn flag (or the
+        # provider compatibility flag), not by natural-language search words.
+        include_project_context = self._project_context_enabled_for_turn()
+        turn_task_id = get_turn_context().task_id
         try:
             return await ContextBuilder().build_context(
                 user_id=self._get_session_user_id(),
                 message=user_input,
                 project_id=self.current_project_id if include_project_context else None,
+                task_id=turn_task_id,
                 session_id=self.current_session_id,
                 project_context=project_context if include_project_context else None,
                 include_project_context=include_project_context,
@@ -274,17 +283,26 @@ class ContextBuildingMixin:
 
         if self.current_session_id:
             try:
-                if await build_scenario_chat_context(self.current_session_id):
+                resolution = await resolve_story_chat_context_for_chat(
+                    self.current_session_id
+                )
+                if resolution.has_writing_session:
                     return None
             except Exception as e:
                 print(f"[AgentLLMClient] Failed to resolve scenario chat context: {e}")
 
         resolver = ProjectContextResolver()
         try:
-            return await resolver.resolve_context(
+            context = await resolver.resolve_context(
                 project_id=self.current_project_id,
                 session_id=self.current_session_id,
+                user_id=self._get_session_user_id(),
             )
+            if context is not None:
+                # Tool/service authorization uses this server-resolved identity;
+                # it is not exposed by sanitize_project_context_for_chat().
+                context["user_id"] = self._get_session_user_id()
+            return context
         except Exception as e:
             print(f"[AgentLLMClient] Failed to resolve project context: {e}")
             return None

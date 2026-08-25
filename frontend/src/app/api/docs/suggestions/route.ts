@@ -40,7 +40,7 @@ export async function POST(request: NextRequest) {
   const [row] = await db
     .insert(knowledgeAiSuggestions)
     .values({
-      workspaceId: workspace.id,
+      docsLibraryId: workspace.id,
       nodeId,
       suggestionType,
       payloadJson: normalizeJsonObject(body.payload_json),

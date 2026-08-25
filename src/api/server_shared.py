@@ -30,17 +30,26 @@ from fastapi.middleware.cors import CORSMiddleware
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 from .router_helpers import cookie_auth_dependency
+from ..features import Features
 from .connection_manager import ConnectionManager
 from .routes.api_token_routes import register_api_token_routes
 from .routes.auth_routes import register_auth_routes
 from .routes.agent_run_routes import register_agent_run_routes
+from .routes.live_voice_routes import register_live_voice_routes
+from .routes.voice_session_routes import register_voice_session_routes
+from .routes.voice_session_routes import register_voice_session_routes
 from .routes.capabilities_routes import register_capabilities_routes
+from .routes.chatgpt_web_routes import register_chatgpt_web_routes
 from .routes.config_routes import register_config_routes
 from .routes.yomi_linter_routes import register_yomi_linter_routes
 from .routes.conversation_dispatch_routes import register_conversation_dispatch_routes
 from .routes.crawler_routes import register_crawler_routes
-from .routes.remote_server_routes import register_remote_server_routes
-from .routes.remote_proxy_routes import register_remote_proxy_routes
+if Features.is_enterprise():
+    register_remote_server_routes = None
+    register_remote_proxy_routes = None
+else:
+    from .routes.remote_server_routes import register_remote_server_routes
+    from .routes.remote_proxy_routes import register_remote_proxy_routes
 from .routes.document_storage_routes import register_document_storage_routes
 from .routes.feedback_routes import register_feedback_routes
 from .routes.file_explorer_routes import register_file_explorer_routes
@@ -143,9 +152,11 @@ except ImportError:
     set_permission_manager = None
 
 from ..llm.generation_policy import resolve_generation_profile
+from ..llm.planning_policy import resolve_planning_policy
 from ..llm.tool_policy import (
     build_command_capability_context,
     command_capabilities_for_current_turn_text,
+    filter_review_command_capabilities,
     protect_untrusted_command_context,
     sanitize_command_capabilities,
 )
@@ -177,6 +188,28 @@ except ImportError:
     PROJECT_ROUTES_AVAILABLE = False
     create_project_router = None
 
+# Import Project Docs candidate review routes.  Keep this boundary separate
+# from the generic memory decision router so approval always goes through the
+# canonical Project Information Docs writer.
+try:
+    from .project_docs_candidate_routes import create_project_docs_candidate_router
+
+    PROJECT_DOCS_CANDIDATE_ROUTES_AVAILABLE = True
+except ImportError:
+    PROJECT_DOCS_CANDIDATE_ROUTES_AVAILABLE = False
+    create_project_docs_candidate_router = None
+
+# Import ProjectContextPack status/rebuild routes.  This boundary remains
+# separate from the generic Project and Docs candidate routers so projection
+# jobs cannot mutate canonical content directly.
+try:
+    from .project_context_pack_routes import create_project_context_pack_router
+
+    PROJECT_CONTEXT_PACK_ROUTES_AVAILABLE = True
+except ImportError:
+    PROJECT_CONTEXT_PACK_ROUTES_AVAILABLE = False
+    create_project_context_pack_router = None
+
 # Import Knowledge routes
 try:
     from .knowledge_routes import create_knowledge_router
@@ -194,15 +227,6 @@ try:
 except ImportError:
     DEEP_RESEARCH_ROUTES_AVAILABLE = False
     create_deep_research_router = None
-
-# Import git routes
-try:
-    from .git_routes import create_git_router
-
-    GIT_ROUTES_AVAILABLE = True
-except ImportError:
-    GIT_ROUTES_AVAILABLE = False
-    create_git_router = None
 
 # Import conversation routes
 try:
@@ -231,6 +255,15 @@ except ImportError:
     SKILL_ROUTES_AVAILABLE = False
     create_skill_router = None
 
+# Import skill recording routes
+try:
+    from .skill_recording_routes import create_skill_recording_router
+
+    SKILL_RECORDING_ROUTES_AVAILABLE = True
+except ImportError:
+    SKILL_RECORDING_ROUTES_AVAILABLE = False
+    create_skill_recording_router = None
+
 # Import task event routes
 try:
     from .task_event_routes import create_task_router
@@ -239,6 +272,15 @@ try:
 except ImportError:
     TASK_ROUTES_AVAILABLE = False
     create_task_router = None
+
+# Import Webex routes
+try:
+    from .webex_routes import create_webex_router
+
+    WEBEX_ROUTES_AVAILABLE = True
+except ImportError:
+    WEBEX_ROUTES_AVAILABLE = False
+    create_webex_router = None
 
 # Import mobile sync routes
 try:
@@ -257,6 +299,15 @@ try:
 except ImportError:
     DOCS_ROUTES_AVAILABLE = False
     create_docs_router = None
+
+# Import authenticated per-user X Cookie routes
+try:
+    from .x_cookie_routes import create_x_cookie_router
+
+    X_COOKIE_ROUTES_AVAILABLE = True
+except ImportError:
+    X_COOKIE_ROUTES_AVAILABLE = False
+    create_x_cookie_router = None
 
 # Import task reminder worker
 try:
@@ -285,24 +336,35 @@ except ImportError:
     AGENT_HARNESS_ROUTES_AVAILABLE = False
     create_agent_harness_router = None
 
-# Import app factory artifact routes
+# Import persistent Apps routes
 try:
-    from .app_factory_routes import create_app_factory_router
+    from .apps_routes import create_apps_router
 
-    APP_FACTORY_ROUTES_AVAILABLE = True
+    APPS_ROUTES_AVAILABLE = True
 except ImportError:
-    APP_FACTORY_ROUTES_AVAILABLE = False
-    create_app_factory_router = None
+    APPS_ROUTES_AVAILABLE = False
+    create_apps_router = None
 
-# Import hydrus browser routes
-try:
-    from ..tools.hydrus_browser import create_hydrus_compat_router, create_hydrus_router
-
-    HYDRUS_ROUTES_AVAILABLE = True
-except ImportError:
+# Hydrus compatibility is a desktop/local integration and is deliberately not
+# part of the Enterprise HTTP surface.  Keep this boundary at import time so a
+# source-tree Enterprise build cannot register the legacy unauthenticated
+# compatibility routes before the publisher's file exclusion runs.
+if Features.is_enterprise():
     HYDRUS_ROUTES_AVAILABLE = False
     create_hydrus_compat_router = None
     create_hydrus_router = None
+else:
+    try:
+        from ..tools.hydrus_browser import (
+            create_hydrus_compat_router,
+            create_hydrus_router,
+        )
+
+        HYDRUS_ROUTES_AVAILABLE = True
+    except ImportError:
+        HYDRUS_ROUTES_AVAILABLE = False
+        create_hydrus_compat_router = None
+        create_hydrus_router = None
 
 # Import ECC feature routes
 try:
@@ -313,32 +375,86 @@ except ImportError:
     ECC_ROUTES_AVAILABLE = False
     create_ecc_router = None
 
-# Import scenario routes
-try:
-    from .scenario_routes import create_scenario_router
-
-    SCENARIO_ROUTES_AVAILABLE = True
-except ImportError:
-    SCENARIO_ROUTES_AVAILABLE = False
-    create_scenario_router = None
-
-# Import TRPG play (multiplayer) routes
-try:
-    from .trpg_play_routes import create_trpg_play_router
-
-    TRPG_PLAY_ROUTES_AVAILABLE = True
-except ImportError:
+# Import Scenario Studio canonical routes and its read-only legacy projection.
+# Enterprise keeps the shared sync/model modules, but does not import or
+# register the route modules at all.  This makes the product boundary
+# fail-closed even if an optional route dependency is broken at import time.
+if Features.is_enterprise():
+    STORY_ROUTES_AVAILABLE = False
+    create_story_router = None
+    STORY_ASSIST_ROUTES_AVAILABLE = False
+    create_story_assist_router = None
+    STORY_LEGACY_COMPAT_AVAILABLE = False
+    create_story_legacy_compat_router = None
+    TRPG_REFERENCE_ROUTES_AVAILABLE = False
+    create_trpg_reference_router = None
     TRPG_PLAY_ROUTES_AVAILABLE = False
     create_trpg_play_router = None
+    TRPG_PLAY_WEBSOCKET_ROUTES_AVAILABLE = False
+    register_trpg_play_websocket_routes = None
+else:
+    try:
+        from .story_routes import create_story_router
 
-# Import comfyui routes
-try:
-    from .comfyui_routes import create_comfyui_router
+        STORY_ROUTES_AVAILABLE = True
+    except ImportError:
+        STORY_ROUTES_AVAILABLE = False
+        create_story_router = None
 
-    COMFYUI_ROUTES_AVAILABLE = True
-except ImportError:
+    try:
+        from .story_assist_routes import create_story_assist_router
+
+        STORY_ASSIST_ROUTES_AVAILABLE = True
+    except ImportError:
+        STORY_ASSIST_ROUTES_AVAILABLE = False
+        create_story_assist_router = None
+
+    try:
+        from .story_legacy_compat import create_story_legacy_compat_router
+
+        STORY_LEGACY_COMPAT_AVAILABLE = True
+    except ImportError:
+        STORY_LEGACY_COMPAT_AVAILABLE = False
+        create_story_legacy_compat_router = None
+
+    try:
+        from .trpg_reference_routes import create_trpg_reference_router
+
+        TRPG_REFERENCE_ROUTES_AVAILABLE = True
+    except ImportError:
+        TRPG_REFERENCE_ROUTES_AVAILABLE = False
+        create_trpg_reference_router = None
+
+    try:
+        from .trpg_play_routes import create_trpg_play_router
+
+        TRPG_PLAY_ROUTES_AVAILABLE = True
+    except ImportError:
+        TRPG_PLAY_ROUTES_AVAILABLE = False
+        create_trpg_play_router = None
+
+    try:
+        from .routes.trpg_play_websocket_routes import register_trpg_play_websocket_routes
+
+        TRPG_PLAY_WEBSOCKET_ROUTES_AVAILABLE = True
+    except ImportError:
+        TRPG_PLAY_WEBSOCKET_ROUTES_AVAILABLE = False
+        register_trpg_play_websocket_routes = None
+
+# ComfyUI can target arbitrary local HTTP endpoints and is disabled by the
+# Enterprise product boundary.  Do not register its management API in a
+# source-tree Enterprise build; publisher exclusions remain defense in depth.
+if Features.is_enterprise():
     COMFYUI_ROUTES_AVAILABLE = False
     create_comfyui_router = None
+else:
+    try:
+        from .comfyui_routes import create_comfyui_router
+
+        COMFYUI_ROUTES_AVAILABLE = True
+    except ImportError:
+        COMFYUI_ROUTES_AVAILABLE = False
+        create_comfyui_router = None
 
 # Logging configuration
 logging.basicConfig(level=logging.INFO)

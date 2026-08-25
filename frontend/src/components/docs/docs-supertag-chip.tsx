@@ -11,11 +11,13 @@ export function DocsSupertagChip({
   onRemove,
   onNavigate,
   onOpen,
+  disabled = false,
 }: {
   tag: DocsSupertag;
   onRemove: () => void;
   onNavigate: (direction: SupertagChipDirection) => void;
   onOpen?: () => void;
+  disabled?: boolean;
 }) {
   const handleKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
     if (event.key === "ArrowLeft") {
@@ -33,7 +35,7 @@ export function DocsSupertagChip({
       onNavigate("text");
       return;
     }
-    if (event.key === "Backspace" || event.key === "Delete") {
+    if (!disabled && (event.key === "Backspace" || event.key === "Delete")) {
       event.preventDefault();
       onRemove();
       return;
@@ -53,6 +55,7 @@ export function DocsSupertagChip({
       className="shrink-0 rounded border px-1.5 py-0.5 text-[11px] font-medium leading-4 outline-none focus-visible:ring-2 focus-visible:ring-ring"
       style={tagColorStyle(tag.color)}
       title="矢印で移動、Backspace/Deleteで解除、Enterで定義を開く"
+      disabled={disabled}
       onDoubleClick={onOpen}
       onKeyDown={handleKeyDown}
     >

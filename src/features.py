@@ -58,11 +58,14 @@ class Features:
         profile fallback so an Enterprise build cannot accidentally advertise or
         enable the personal outbound-connection UI.
         """
-        return (
-            os.getenv("AOITALK_PROFILE")
-            or os.getenv("AIVTUBER_ENV")
-            or "personal"
-        ).strip().lower()
+        profile = (os.getenv("AOITALK_PROFILE") or "").strip().lower()
+        environment = (os.getenv("AIVTUBER_ENV") or "").strip().lower()
+        # Enterprise is the fail-closed security profile.  If either legacy
+        # selector requests it, never let a stale/contradictory personal
+        # selector downgrade the runtime.
+        if profile == "enterprise" or environment == "enterprise":
+            return "enterprise"
+        return profile or environment or "personal"
 
     @classmethod
     def is_enterprise(cls) -> bool:
@@ -124,10 +127,18 @@ class Features:
         Returns:
             True if the feature is enabled
         """
-        # Enterprise is deliberately allowed to receive inbound server-to-server
-        # traffic, but it must never gain the outbound remote-server UI through an
-        # environment override.
-        if feature == "remote_server_view" and cls.is_enterprise():
+        # These capabilities are outside the Enterprise contract.  Keep the
+        # restriction fail-closed even when a stale .env tries to override a
+        # profile value; Enterprise must not expose unauthenticated audio,
+        # Discord, crawler, or entertainment integrations by accident.
+        if cls.is_enterprise() and feature in {
+            "voice_input",
+            "tts_output",
+            "discord_bot",
+            "crawler_status",
+            "entertainment",
+            "remote_server_view",
+        }:
             return False
 
         # 1. Check environment variable first (highest priority)

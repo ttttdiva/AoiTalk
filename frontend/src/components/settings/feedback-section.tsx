@@ -128,7 +128,7 @@ export function FeedbackSection() {
   });
 
   return (
-    <Card size="sm">
+    <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0">
       <CardHeader
         className="cursor-pointer select-none"
         onClick={handleToggle}
@@ -259,7 +259,7 @@ export function FeedbackSection() {
         </CardContent>
       )}
       <Dialog open={!!selected} onOpenChange={(open) => !open && setSelected(null)}>
-        <DialogContent className="sm:max-w-2xl">
+        <DialogContent size="2xl">
           <DialogHeader>
             <DialogTitle>フィードバック詳細</DialogTitle>
           </DialogHeader>

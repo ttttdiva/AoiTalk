@@ -24,12 +24,24 @@ from ..memory.models import (
     TaskReference,
 )
 from .docs_graph_service import DocsGraphService
+from .mail_thread_parser import split_mail_thread
 from .project_information_docs import ensure_project_information_doc
 
 
 MAIL_MANAGEMENT_TITLE = "メール管理"
 MAIL_SUPERTAG_SYSTEM_KEY = "email"
+MAIL_MESSAGE_SUPERTAG_SYSTEM_KEY = "email_message"
 _MESSAGE_ID_RE = re.compile(r"<([^<>]+)>")
+
+
+@dataclass(frozen=True)
+class ArchivedMailMessage:
+    node_id: UUID
+    source_key: str
+    title: str
+    date: str
+    sender: str
+    body: str
 
 
 @dataclass(frozen=True)
@@ -38,6 +50,7 @@ class ArchivedMail:
     title: str
     created: bool
     dedupe_key: str
+    messages: tuple[ArchivedMailMessage, ...] = ()
 
 
 def normalize_message_id(value: Any) -> str:
@@ -94,29 +107,6 @@ def _list_text(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _title_chunks(
-    value: Any, *, max_length: int = 450, max_chunks: int = 4
-) -> list[str]:
-    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
-    chunks: list[str] = []
-    truncated = False
-    for line in text.split("\n"):
-        line_chunks = ["（空行）"] if not line else [
-            line[index : index + max_length]
-            for index in range(0, len(line), max_length)
-        ]
-        for chunk in line_chunks:
-            if len(chunks) >= max_chunks:
-                truncated = True
-                break
-            chunks.append(chunk)
-        if truncated:
-            break
-    if truncated:
-        chunks[-1] = "（続きはノードのフィールドに全文保存されています）"
-    return chunks or ["（空）"]
-
-
 class MailDocsService:
     def __init__(self, session: AsyncSession):
         self.session = session
@@ -129,6 +119,7 @@ class MailDocsService:
         project_id: UUID,
         task_id: UUID | None = None,
         mails: list[dict[str, Any]],
+        commit: bool = True,
     ) -> list[ArchivedMail]:
         if not mails:
             return []
@@ -149,14 +140,20 @@ class MailDocsService:
             )
             if task_exists is None:
                 raise ValueError("メール参照を追加する対象タスクが見つかりません。")
-        workspace = await self.docs.ensure_workspace(user_id)
+        # Project mail is part of the shared canonical Project Docs graph.  Do
+        # not place the management tree in the actor's Personal Docs library:
+        # that would leave a canonical project-information parent pointing at a
+        # private library and could expose archived mail through owner-only
+        # queries.  The helper performs the project read check and the graph
+        # mutations re-check write permission transactionally.
+        library = await self.docs.ensure_project_information_library(project_id, user_id)
         project_information = await ensure_project_information_doc(
             self.session,
             project=project,
             user_id=user_id,
         )
         management = await self._ensure_management_node(
-            workspace_id=workspace.id,
+            docs_library_id=library.id,
             project_id=project_id,
             user_id=user_id,
             parent=project_information,
@@ -164,7 +161,7 @@ class MailDocsService:
         archived: list[ArchivedMail] = []
         for mail in mails:
             result = await self._archive_one(
-                workspace_id=workspace.id,
+                docs_library_id=library.id,
                 management=management,
                 project_id=project_id,
                 user_id=user_id,
@@ -178,15 +175,18 @@ class MailDocsService:
                     archived=result,
                 )
             archived.append(result)
-        await self.session.commit()
+        if commit:
+            await self.session.commit()
+        else:
+            await self.session.flush()
         return archived
 
     async def _find_system_node(
-        self, *, workspace_id: UUID, project_id: UUID, system_key: str
+        self, *, docs_library_id: UUID, project_id: UUID, system_key: str
     ) -> KnowledgeNode | None:
         result = await self.session.execute(
             select(KnowledgeNode).where(
-                KnowledgeNode.workspace_id == workspace_id,
+                KnowledgeNode.docs_library_id == docs_library_id,
                 KnowledgeNode.project_id == project_id,
                 KnowledgeNode.system_key == system_key,
             )
@@ -195,7 +195,7 @@ class MailDocsService:
 
     async def _create_unique_node(self, **kwargs: Any) -> tuple[KnowledgeNode, bool]:
         existing = await self._find_system_node(
-            workspace_id=kwargs["workspace_id"],
+            docs_library_id=kwargs["docs_library_id"],
             project_id=kwargs["project_id"],
             system_key=kwargs["system_key"],
         )
@@ -234,7 +234,7 @@ class MailDocsService:
             return node, True
         except IntegrityError:
             existing = await self._find_system_node(
-                workspace_id=kwargs["workspace_id"],
+                docs_library_id=kwargs["docs_library_id"],
                 project_id=kwargs["project_id"],
                 system_key=kwargs["system_key"],
             )
@@ -245,13 +245,13 @@ class MailDocsService:
     async def _ensure_management_node(
         self,
         *,
-        workspace_id: UUID,
+        docs_library_id: UUID,
         project_id: UUID,
         user_id: UUID,
         parent: KnowledgeNode,
     ) -> KnowledgeNode:
         node, _ = await self._create_unique_node(
-            workspace_id=workspace_id,
+            docs_library_id=docs_library_id,
             user_id=user_id,
             title=MAIL_MANAGEMENT_TITLE,
             parent=parent,
@@ -259,12 +259,18 @@ class MailDocsService:
             system_key=_system_key("project_mail_management", project_id),
             body_json={"format": "mail_management", "project_id": str(project_id)},
         )
+        display_props = dict(node.display_props or {})
+        if display_props.get("hidden_from_sidebar") is not True:
+            display_props["hidden_from_sidebar"] = True
+            node.display_props = display_props
+            node.updated_by = user_id
+            await self.session.flush()
         return node
 
     async def _archive_one(
         self,
         *,
-        workspace_id: UUID,
+        docs_library_id: UUID,
         management: KnowledgeNode,
         project_id: UUID,
         user_id: UUID,
@@ -275,7 +281,7 @@ class MailDocsService:
             str(mail.get("subject") or "（件名なし）").strip()[:500] or "（件名なし）"
         )
         node, created = await self._create_unique_node(
-            workspace_id=workspace_id,
+            docs_library_id=docs_library_id,
             user_id=user_id,
             title=title,
             parent=management,
@@ -286,83 +292,128 @@ class MailDocsService:
                 {"type": "workspace_file", "path": str(mail.get("source_path") or "")}
             ],
         )
-        archived = ArchivedMail(node.id, node.title, created, dedupe_key)
-        if not created:
-            return archived
+        if created:
+            tag = await self.docs.resolve_supertag(
+                docs_library_id=docs_library_id,
+                tag=MAIL_SUPERTAG_SYSTEM_KEY,
+                create=False,
+            )
+            await self.docs.add_tag(node=node, tag=tag, user_id=user_id)
+            fields = {
+                "email_subject": str(mail.get("subject") or ""),
+                "email_date": str(mail.get("date") or ""),
+                "email_from": str(mail.get("sender") or ""),
+                "email_to": _list_text(mail.get("to")),
+                "email_cc": _list_text(mail.get("cc")),
+                "email_bcc": _list_text(mail.get("bcc")),
+                "email_message_id": str(mail.get("message_id") or ""),
+                "email_in_reply_to": str(mail.get("in_reply_to") or ""),
+                "email_references": _list_text(mail.get("references")),
+                "email_body": str(mail.get("body") or ""),
+                "email_source_filename": str(mail.get("name") or ""),
+                "email_source_path": str(mail.get("source_path") or ""),
+                "email_dedupe_key": dedupe_key,
+            }
+            await self.docs.set_fields(
+                node=node,
+                values={
+                    key: value for key, value in fields.items() if value not in ("", None)
+                },
+                user_id=user_id,
+            )
+            await self.docs.upsert_search_index(node)
+            search_index = await self.session.get(KnowledgeSearchIndex, node.id)
+            if search_index is not None:
+                search_index.body_text_plain = str(mail.get("body") or "")
+            await self._link_thread(
+                node=node, user_id=user_id, project_id=project_id, mail=mail
+            )
+        messages = await self._ensure_message_sources(
+            raw_node=node,
+            project_id=project_id,
+            user_id=user_id,
+            mail=mail,
+        )
+        return ArchivedMail(node.id, node.title, created, dedupe_key, tuple(messages))
 
+    async def _ensure_message_sources(
+        self,
+        *,
+        raw_node: KnowledgeNode,
+        project_id: UUID,
+        user_id: UUID,
+        mail: dict[str, Any],
+    ) -> list[ArchivedMailMessage]:
         tag = await self.docs.resolve_supertag(
-            workspace_id=workspace_id,
-            tag=MAIL_SUPERTAG_SYSTEM_KEY,
+            docs_library_id=raw_node.docs_library_id,
+            tag=MAIL_MESSAGE_SUPERTAG_SYSTEM_KEY,
             create=False,
         )
-        await self.docs.add_tag(node=node, tag=tag, user_id=user_id)
-        fields = {
-            "email_subject": str(mail.get("subject") or ""),
-            "email_date": str(mail.get("date") or ""),
-            "email_from": str(mail.get("sender") or ""),
-            "email_to": _list_text(mail.get("to")),
-            "email_cc": _list_text(mail.get("cc")),
-            "email_bcc": _list_text(mail.get("bcc")),
-            "email_message_id": str(mail.get("message_id") or ""),
-            "email_in_reply_to": str(mail.get("in_reply_to") or ""),
-            "email_references": _list_text(mail.get("references")),
-            "email_body": str(mail.get("body") or ""),
-            "email_source_filename": str(mail.get("name") or ""),
-            "email_source_path": str(mail.get("source_path") or ""),
-            "email_dedupe_key": dedupe_key,
-        }
-        await self.docs.set_fields(
-            node=node,
-            values={
-                key: value for key, value in fields.items() if value not in ("", None)
-            },
-            user_id=user_id,
-        )
-        await self.docs.upsert_search_index(node)
-        search_index = await self.session.get(KnowledgeSearchIndex, node.id)
-        if search_index is not None:
-            search_index.body_text_plain = str(mail.get("body") or "")
-        await self._create_mail_outline(node=node, user_id=user_id, mail=mail)
-        await self._link_thread(
-            node=node, user_id=user_id, project_id=project_id, mail=mail
-        )
-        return archived
-
-    async def _create_mail_outline(
-        self, *, node: KnowledgeNode, user_id: UUID, mail: dict[str, Any]
-    ) -> None:
-        attributes = [
-            ("件名", mail.get("subject")),
-            ("メール日時", mail.get("date")),
-            ("From", mail.get("sender")),
-            ("To", _list_text(mail.get("to"))),
-            ("CC", _list_text(mail.get("cc"))),
-            ("BCC", _list_text(mail.get("bcc"))),
-            ("Message-ID", mail.get("message_id")),
-            ("In-Reply-To", mail.get("in_reply_to")),
-            ("References", _list_text(mail.get("references"))),
-            ("元ファイル名", mail.get("name")),
-            ("元ファイルのプロジェクト内パス", mail.get("source_path")),
-            ("本文", mail.get("body")),
-        ]
-        for label, value in attributes:
-            label_node = await self.docs.create_node(
-                workspace_id=node.workspace_id,
+        archived: list[ArchivedMailMessage] = []
+        for index, message in enumerate(split_mail_thread(mail)):
+            label_parts = [part for part in [message.date, message.sender] if part]
+            label = " | ".join(label_parts) or f"メッセージ {index + 1}"
+            title = f"{label} | {message.subject}"[:500]
+            source_node, created = await self._create_unique_node(
+                docs_library_id=raw_node.docs_library_id,
                 user_id=user_id,
-                title=label,
-                parent=node,
-                project_id=node.project_id,
+                title=title,
+                parent=raw_node,
+                project_id=project_id,
+                system_key=_system_key(
+                    "project_mail_message",
+                    project_id,
+                    f"{raw_node.id}:{message.source_key}",
+                ),
+                body_json={
+                    "format": "email_message",
+                    "source_mail_node_id": str(raw_node.id),
+                    "source_key": message.source_key,
+                    "sequence": index,
+                },
+                source_refs=[{"type": "docs_node", "id": str(raw_node.id)}],
             )
-            for chunk in _title_chunks(
-                value, max_chunks=32 if label == "本文" else 4
-            ):
-                await self.docs.create_node(
-                    workspace_id=node.workspace_id,
+            await self.docs.add_tag(node=source_node, tag=tag, user_id=user_id)
+            if created:
+                values = {
+                    "email_message_subject": message.subject,
+                    "email_message_date": message.date,
+                    "email_message_from": message.sender,
+                    "email_message_to": message.to,
+                    "email_message_cc": message.cc,
+                    "email_message_body": message.body,
+                    "email_message_source_key": message.source_key,
+                }
+                await self.docs.set_fields(
+                    node=source_node,
+                    values={
+                        key: value
+                        for key, value in values.items()
+                        if value not in ("", None)
+                    },
                     user_id=user_id,
-                    title=chunk,
-                    parent=label_node,
-                    project_id=node.project_id,
                 )
+                await self.docs.upsert_search_index(source_node)
+                search_index = await self.session.get(KnowledgeSearchIndex, source_node.id)
+                if search_index is not None:
+                    search_index.body_text_plain = message.body
+            await self._ensure_edge(
+                source=source_node,
+                target=raw_node,
+                relation_type="derived_from_email",
+                user_id=user_id,
+            )
+            archived.append(
+                ArchivedMailMessage(
+                    node_id=source_node.id,
+                    source_key=message.source_key,
+                    title=source_node.title,
+                    date=message.date,
+                    sender=message.sender,
+                    body=message.body,
+                )
+            )
+        return archived
 
     async def _nodes_by_message_ids(
         self, *, project_id: UUID, message_ids: list[str]

@@ -62,7 +62,7 @@ Task type: {task_type}
 {available_tools_with_descriptions}
 
 Selection rules:
-- 情報検索には `search_memory` またはWeb検索を使う。
+- 情報検索には `search_past_chats` またはWeb検索を使う。
 - タスク/TODO、案件情報Docs、内部 WBS.dbtable、
   follow-up planning には `list_project_information`、`list_record_tables`、
   `get_upcoming_wbs_tasks`、`create_record_table`、`append_record_rows`、
@@ -71,11 +71,9 @@ Selection rules:
 - 案件情報Docsを書く前に `list_project_information` で正本を読み、既存見出しを尊重して
   `patch_project_information_doc` の section_heading / operation / change_summary /
   source_refs_json を使う。根拠のない断定は本文ではなく要確認またはQ&A candidateに回す。
-- Spotify操作には `spotify_assistant` を使う。
-- ローカルファイル作業には `find_workspace_items`、
-  `inspect_workspace_tree`、`read_workspace_file`、`view_file`、
-  `search_files` などの直filesystem toolを使う。
-- 時刻、天気、計算には `utility_assistant` を使う。
+- ローカルファイル作業には `search_files`、`list_directory`、
+  `read_file` などの直filesystem toolを使う。
+- 時刻、天気、計算には `get_current_time`、`get_weather_info`、`calculate` を使う。
 - 画像生成やYouTube/NicoNico再生には `media_assistant` を使う。
 - インストール済みskillが適切な場合だけ `invoke_skill` を使う。
 

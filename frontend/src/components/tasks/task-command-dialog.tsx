@@ -61,7 +61,7 @@ export function TaskCommandDialog({
         if (!nextOpen) onClose();
       }}
     >
-      <DialogContent className="sm:max-w-md">
+      <DialogContent size="md">
         <DialogHeader>
           <DialogTitle>タスクコマンド</DialogTitle>
           <DialogDescription>

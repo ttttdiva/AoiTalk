@@ -14,6 +14,14 @@ export interface SnippetAutocompleteState {
   position: { top: number; left: number };
 }
 
+export type SnippetAutocompleteOptions = {
+  /**
+   * 候補表示・確定キーを処理してよい入力かを判定する。
+   * 省略時は従来どおり常に処理する。
+   */
+  shouldHandle?: (element: HTMLTextAreaElement) => boolean;
+};
+
 const INITIAL_STATE: SnippetAutocompleteState = {
   visible: false,
   matches: [],
@@ -29,7 +37,9 @@ const INITIAL_STATE: SnippetAutocompleteState = {
 export function useSnippetAutocomplete(
   ref: RefObject<HTMLTextAreaElement | null>,
   snippets: Snippet[],
+  options?: SnippetAutocompleteOptions,
 ) {
+  const shouldHandle = options?.shouldHandle;
   const [state, setState] = useState<SnippetAutocompleteState>(INITIAL_STATE);
   const stateRef = useRef(state);
   useEffect(() => {
@@ -64,6 +74,11 @@ export function useSnippetAutocomplete(
   }, [ref]);
 
   const updateMatches = useCallback(() => {
+    const el = ref.current;
+    if (shouldHandle && (!el || !shouldHandle(el))) {
+      setState(INITIAL_STATE);
+      return;
+    }
     if (snippets.length === 0) {
       setState(INITIAL_STATE);
       return;
@@ -84,33 +99,50 @@ export function useSnippetAutocomplete(
       selectedIndex: 0,
       position: calcPosition(),
     });
-  }, [snippets, getCurrentWord, calcPosition]);
+  }, [snippets, getCurrentWord, calcPosition, ref, shouldHandle]);
 
   // input イベントで候補更新
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const handler = () => updateMatches();
+    const handler = (event: Event) => {
+      if (shouldHandle && !shouldHandle(el)) {
+        setState(INITIAL_STATE);
+        return;
+      }
+      if ((event as InputEvent).isComposing) return;
+      updateMatches();
+    };
     el.addEventListener("input", handler);
     return () => el.removeEventListener("input", handler);
-  }, [ref, updateMatches]);
+  }, [ref, updateMatches, shouldHandle]);
 
   // キー操作
   useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
+    const element = ref.current;
+    if (!element) return;
+    const textarea = element as HTMLTextAreaElement;
 
     function handleKeyDown(e: KeyboardEvent) {
+      // コードブロック等では候補の表示状態も含めて破棄するが、Tab/
+      // Enter/Arrow を横取りせず、通常の textarea 操作へ委譲する。
+      if (shouldHandle && !shouldHandle(textarea)) {
+        setState(INITIAL_STATE);
+        return;
+      }
+
+      if (e.isComposing || e.keyCode === 229) return;
+
       const s = stateRef.current;
       if (!s.visible) return;
 
       if (e.key === "Tab" || (e.key === "Enter" && s.visible)) {
         e.preventDefault();
         const snippet = s.matches[s.selectedIndex];
-        if (!snippet || !el) return;
+        if (!snippet) return;
 
         const { from } = getCurrentWord();
-        const { selectionStart, value } = el;
+        const { selectionStart, value } = textarea;
         const newValue =
           value.slice(0, from) + snippet.body + value.slice(selectionStart);
 
@@ -118,11 +150,11 @@ export function useSnippetAutocomplete(
           HTMLTextAreaElement.prototype,
           "value",
         )!.set!;
-        nativeSet.call(el, newValue);
-        el.dispatchEvent(new Event("input", { bubbles: true }));
+        nativeSet.call(textarea, newValue);
+        textarea.dispatchEvent(new Event("input", { bubbles: true }));
 
         const newPos = from + snippet.body.length;
-        el.setSelectionRange(newPos, newPos);
+        textarea.setSelectionRange(newPos, newPos);
         setState(INITIAL_STATE);
         return;
       }
@@ -154,9 +186,32 @@ export function useSnippetAutocomplete(
       }
     }
 
-    el.addEventListener("keydown", handleKeyDown);
-    return () => el.removeEventListener("keydown", handleKeyDown);
-  }, [ref, getCurrentWord]);
+    textarea.addEventListener("keydown", handleKeyDown);
+    return () => textarea.removeEventListener("keydown", handleKeyDown);
+  }, [ref, getCurrentWord, shouldHandle]);
+
+  // カーソル／選択範囲の移動でコード本文へ入った場合にも、入力イベントを
+  // 待たず既存の候補ポップアップを閉じる。通常テキストでは候補を再計算せず、
+  // 既存の表示状態を維持する。
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+
+    const closeIfNotHandled = () => {
+      if (shouldHandle && !shouldHandle(el)) setState(INITIAL_STATE);
+    };
+    el.addEventListener("select", closeIfNotHandled);
+    el.addEventListener("keyup", closeIfNotHandled);
+    el.addEventListener("mouseup", closeIfNotHandled);
+    el.addEventListener("focus", closeIfNotHandled);
+    closeIfNotHandled();
+    return () => {
+      el.removeEventListener("select", closeIfNotHandled);
+      el.removeEventListener("keyup", closeIfNotHandled);
+      el.removeEventListener("mouseup", closeIfNotHandled);
+      el.removeEventListener("focus", closeIfNotHandled);
+    };
+  }, [ref, shouldHandle]);
 
   // blur で閉じる
   useEffect(() => {

@@ -9,8 +9,7 @@
 
 import React, { useEffect } from "react";
 import type { Project, Space } from "../types/api";
-import { useProjectStore } from "../stores/project";
-import { runSync } from "../sync/engine";
+import { useProjectStore, type RefreshProjectsOptions } from "../stores/project";
 import { useAuth } from "./AuthContext";
 
 interface ProjectContextValue {
@@ -22,7 +21,7 @@ interface ProjectContextValue {
   selectedProject: Project | null;
   setSelectedSpaceId: (id: string) => void;
   setSelectedProjectId: (id: string | null) => void;
-  refreshProjects: () => Promise<void>;
+  refreshProjects: (options?: RefreshProjectsOptions) => Promise<void>;
 }
 
 export function ProjectProvider({ children }: { children: React.ReactNode }) {
@@ -40,10 +39,10 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
 
     const loadProjects = async () => {
       resetProjects();
-      await runSync();
-      if (!cancelled) {
-        await refreshProjects();
-      }
+      // The project shell is local-first. Remote sync is owned by the root
+      // scheduler so it cannot become a mount/auth-scope completion gate.
+      await refreshProjects({ localOnly: true });
+      if (cancelled) return;
     };
 
     if (canUseApp) {

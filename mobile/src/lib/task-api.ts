@@ -2,7 +2,9 @@
  * Task-related mobile API client.
  */
 
-import { fetchApi, getBaseUrl } from "./api-client";
+import { Alert } from "react-native";
+
+import { fetchApi, getBaseUrl, isApiHttpError } from "./api-client";
 import { getToken } from "./auth";
 import { normalizeTaskStatus } from "./task-status";
 import type {
@@ -13,6 +15,11 @@ import type {
   Task,
   TaskAttachment,
   TaskOccurrence,
+  TaskRecurrence,
+  TaskRecurrencePayload,
+  TaskReference,
+  TaskReferencePayload,
+  TaskRestoreResponse,
   TimeEntry,
   TimeReport,
   UserSettings,
@@ -21,6 +28,105 @@ import type {
 } from "../types/api";
 
 export type Scope = { project_id?: string; space_id?: string };
+
+type IncompleteSubtaskSummary = {
+  id: string;
+  title: string;
+  status: string;
+};
+
+export class TaskCompletionCancelledError extends Error {
+  constructor() {
+    super("タスクの完了をキャンセルしました");
+    this.name = "TaskCompletionCancelledError";
+  }
+}
+
+const pendingCompletionConfirmationByTaskId = new Map<
+  string,
+  Promise<boolean>
+>();
+let completionConfirmationQueue = Promise.resolve();
+
+function parseIncompleteSubtasks(
+  error: unknown,
+): IncompleteSubtaskSummary[] | null {
+  if (!isApiHttpError(error) || error.status !== 409) return null;
+  let body: unknown;
+  try {
+    body = JSON.parse(error.responseBody);
+  } catch {
+    return null;
+  }
+  if (typeof body !== "object" || body === null) return null;
+  const outer = body as { detail?: unknown };
+  const payload =
+    typeof outer.detail === "object" && outer.detail !== null
+      ? outer.detail
+      : body;
+  const typed = payload as {
+    code?: unknown;
+    incomplete_subtasks?: unknown;
+  };
+  if (
+    typed.code !== "incomplete_subtasks_confirmation_required" ||
+    !Array.isArray(typed.incomplete_subtasks)
+  ) {
+    return null;
+  }
+  return typed.incomplete_subtasks.filter(
+    (item): item is IncompleteSubtaskSummary =>
+      typeof item === "object" &&
+      item !== null &&
+      typeof (item as IncompleteSubtaskSummary).id === "string" &&
+      typeof (item as IncompleteSubtaskSummary).title === "string" &&
+      typeof (item as IncompleteSubtaskSummary).status === "string",
+  );
+}
+
+function showCompletionConfirmation(
+  incompleteSubtasks: IncompleteSubtaskSummary[],
+): Promise<boolean> {
+  const titles = incompleteSubtasks
+    .slice(0, 3)
+    .map((subtask) => `「${subtask.title}」`)
+    .join("、");
+  const remaining = incompleteSubtasks.length - 3;
+  const summary = remaining > 0 ? `${titles} ほか${remaining}件` : titles;
+  return new Promise((resolve) => {
+    Alert.alert(
+      "サブタスクも完了しますか？",
+      `未完了の直下サブタスク${incompleteSubtasks.length}件も同時に完了します。${summary}`,
+      [
+        { text: "キャンセル", style: "cancel", onPress: () => resolve(false) },
+        { text: "すべて完了", onPress: () => resolve(true) },
+      ],
+      { cancelable: true, onDismiss: () => resolve(false) },
+    );
+  });
+}
+
+function requestCompletionConfirmation(
+  taskId: string,
+  incompleteSubtasks: IncompleteSubtaskSummary[],
+): Promise<boolean> {
+  const existing = pendingCompletionConfirmationByTaskId.get(taskId);
+  if (existing) return existing;
+  let pending: Promise<boolean>;
+  pending = completionConfirmationQueue
+    .then(() => showCompletionConfirmation(incompleteSubtasks))
+    .finally(() => {
+      if (pendingCompletionConfirmationByTaskId.get(taskId) === pending) {
+        pendingCompletionConfirmationByTaskId.delete(taskId);
+      }
+    });
+  pendingCompletionConfirmationByTaskId.set(taskId, pending);
+  completionConfirmationQueue = pending.then(
+    () => undefined,
+    () => undefined,
+  );
+  return pending;
+}
 
 function buildScopeQuery(scope: Scope | string): URLSearchParams {
   const params = new URLSearchParams();
@@ -37,7 +143,9 @@ function normalizeTask<T extends { status: string }>(task: T): T {
   return {
     ...task,
     status: normalizeTaskStatus(task.status),
-  };
+    auto_close_on_due:
+      (task as unknown as Task).auto_close_on_due === true,
+  } as T;
 }
 
 function normalizeOccurrence<T extends { status: string }>(occurrence: T): T {
@@ -111,14 +219,46 @@ export const taskApi = {
     taskId: string,
     data: Record<string, unknown>,
   ): Promise<Task> {
-    return fetchApi<Task>(`/api/tasks/${taskId}`, {
-      method: "PATCH",
-      body: JSON.stringify(normalizePayload(data)),
-    }).then(normalizeTask);
+    const normalized = normalizePayload(data);
+    try {
+      return await fetchApi<Task>(`/api/tasks/${taskId}`, {
+        method: "PATCH",
+        body: JSON.stringify(normalized),
+      }).then(normalizeTask);
+    } catch (error) {
+      const incompleteSubtasks = parseIncompleteSubtasks(error);
+      if (!incompleteSubtasks) throw error;
+      const confirmed = await requestCompletionConfirmation(
+        taskId,
+        incompleteSubtasks,
+      );
+      if (!confirmed) throw new TaskCompletionCancelledError();
+      return fetchApi<Task>(`/api/tasks/${taskId}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          ...normalized,
+          close_incomplete_subtasks: true,
+        }),
+      }).then(normalizeTask);
+    }
   },
 
   async deleteTask(taskId: string): Promise<void> {
     await fetchApi(`/api/tasks/${taskId}`, { method: "DELETE" });
+  },
+
+  /** Restore the current deletion batch within the server retention window. */
+  async restoreTask(
+    taskId: string,
+    deletionBatchId?: string | null,
+  ): Promise<TaskRestoreResponse> {
+    const payload = deletionBatchId
+      ? { deletion_batch_id: deletionBatchId }
+      : {};
+    return fetchApi<TaskRestoreResponse>(`/api/tasks/${taskId}/restore`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
   },
 
   async reorderTasks(projectId: string, taskIds: string[]): Promise<void> {
@@ -163,6 +303,29 @@ export const taskApi = {
     });
   },
 
+  /** Update a canonical project/space tag. */
+  async updateTag(
+    tagId: string,
+    data: { name?: string; color?: string | null },
+  ): Promise<Tag> {
+    return fetchApi<Tag>(`/api/tags/${tagId}`, {
+      method: "PATCH",
+      body: JSON.stringify(data),
+    });
+  },
+
+  /** Copy a tag into another Space, preserving the server-side ACL check. */
+  async copyTagToSpace(tagId: string, spaceId: string): Promise<Tag> {
+    return fetchApi<Tag>(`/api/tags/${tagId}/copy`, {
+      method: "POST",
+      body: JSON.stringify({ space_id: spaceId }),
+    });
+  },
+
+  async deleteTag(tagId: string): Promise<void> {
+    await fetchApi(`/api/tags/${tagId}`, { method: "DELETE" });
+  },
+
   async addComment(taskId: string, content: string): Promise<unknown> {
     return fetchApi<unknown>(`/api/tasks/${taskId}/comments`, {
       method: "POST",
@@ -205,6 +368,53 @@ export const taskApi = {
     });
   },
 
+  async getTaskRecurrence(taskId: string): Promise<TaskRecurrence | null> {
+    return fetchApi<TaskRecurrence | null>(
+      `/api/tasks/${taskId}/recurrence`,
+    );
+  },
+
+  async upsertTaskRecurrence(
+    taskId: string,
+    data: TaskRecurrencePayload,
+  ): Promise<TaskRecurrence> {
+    return fetchApi<TaskRecurrence>(`/api/tasks/${taskId}/recurrence`, {
+      method: "PUT",
+      body: JSON.stringify(data),
+    });
+  },
+
+  async deleteTaskRecurrence(taskId: string): Promise<void> {
+    await fetchApi(`/api/tasks/${taskId}/recurrence`, { method: "DELETE" });
+  },
+
+  async listTaskReferences(taskId: string): Promise<TaskReference[]> {
+    return fetchApi<TaskReference[]>(`/api/tasks/${taskId}/references`);
+  },
+
+  async createTaskReference(
+    taskId: string,
+    data: TaskReferencePayload,
+  ): Promise<TaskReference> {
+    return fetchApi<TaskReference>(`/api/tasks/${taskId}/references`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+  },
+
+  async deleteTaskReference(
+    taskId: string,
+    referenceId: string,
+    options?: { confirmSource?: boolean },
+  ): Promise<void> {
+    const query =
+      options?.confirmSource === true ? "?confirm_source=true" : "";
+    await fetchApi(
+      `/api/tasks/${taskId}/references/${encodeURIComponent(referenceId)}${query}`,
+      { method: "DELETE" },
+    );
+  },
+
   async listOccurrences(
     scopeOrProjectId?: Scope | string,
     startFrom?: string,
@@ -217,6 +427,33 @@ export const taskApi = {
     return fetchApi<TaskOccurrence[]>(`/api/task-occurrences${suffix}`).then(
       (occurrences) => occurrences.map(normalizeOccurrence),
     );
+  },
+
+  async updateOccurrence(
+    occurrenceId: string,
+    data: {
+      status?: string;
+      start_at?: string | null;
+      end_at?: string | null;
+      reminder_offsets?: number[];
+    },
+  ): Promise<TaskOccurrence> {
+    return fetchApi<TaskOccurrence>(
+      `/api/task-occurrences/${occurrenceId}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(normalizePayload(data)),
+      },
+    ).then(normalizeOccurrence);
+  },
+
+  /**
+   * There is no destructive occurrence endpoint in the canonical API.  The
+   * supported delete semantic is a cancelled occurrence, which keeps the
+   * row/tombstone available for sync and undo-safe local caches.
+   */
+  async deleteOccurrence(occurrenceId: string): Promise<TaskOccurrence> {
+    return this.updateOccurrence(occurrenceId, { status: "cancelled" });
   },
 
   async startTimer(
@@ -272,6 +509,20 @@ export const taskApi = {
     if (dateFrom) params.set("date_from", dateFrom);
     if (dateTo) params.set("date_to", dateTo);
     return fetchApi<TimeReport>(`/api/reports/time?${params.toString()}`);
+  },
+
+  async logTime(data: {
+    task_id: string;
+    occurrence_id?: string | null;
+    started_at: string;
+    ended_at: string;
+    note?: string | null;
+    source?: string;
+  }): Promise<TimeEntry> {
+    return fetchApi<TimeEntry>("/api/time-entries/log", {
+      method: "POST",
+      body: JSON.stringify({ source: "manual", ...data }),
+    });
   },
 
   async updateTimeEntry(

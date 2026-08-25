@@ -65,7 +65,17 @@ export async function GET(
       .select({ value: knowledgeFieldValues, field: knowledgeFields })
       .from(knowledgeFieldValues)
       .innerJoin(knowledgeFields, eq(knowledgeFieldValues.fieldId, knowledgeFields.id))
-      .where(eq(knowledgeFieldValues.targetNodeId, access.node.id))
+      .innerJoin(knowledgeNodes, eq(knowledgeFieldValues.nodeId, knowledgeNodes.id))
+      .where(
+        and(
+          eq(knowledgeFieldValues.targetNodeId, access.node.id),
+          // A malformed value must not turn a field from another library into
+          // a reference to this node.  Source and target share the same docs
+          // library boundary before ACL checks below are applied.
+          eq(knowledgeFields.docsLibraryId, access.workspace.id),
+          eq(knowledgeNodes.docsLibraryId, access.workspace.id),
+        ),
+      )
       .limit(500),
   ]);
 
@@ -74,11 +84,16 @@ export async function GET(
     ...placements.map((placement) => placement.parentNodeId),
     ...fieldRefs.map((row) => row.value.nodeId),
   ].filter((nodeId) => nodeId !== access.node.id)));
-  const nodes = referenceNodeIds.length
+  const visibleReferenceIds = (
+    await Promise.all(referenceNodeIds.map((nodeId) => requireDocsNode(nodeId, user, "read")))
+  )
+    .filter((item): item is NonNullable<typeof item> => Boolean(item))
+    .map((item) => item.node.id);
+  const nodes = visibleReferenceIds.length
     ? await db
         .select()
         .from(knowledgeNodes)
-        .where(inArray(knowledgeNodes.id, referenceNodeIds))
+        .where(inArray(knowledgeNodes.id, visibleReferenceIds))
         .limit(1000)
     : [];
   const nodesById = new Map(nodes.map((node) => [node.id, node]));

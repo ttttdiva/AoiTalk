@@ -20,13 +20,8 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
-  Command,
-  CommandDialog,
-  CommandEmpty,
   CommandGroup,
-  CommandInput,
   CommandItem,
-  CommandList,
   CommandSeparator,
 } from "@/components/ui/command";
 import {
@@ -37,7 +32,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import type { DocsField, DocsNode, DocsSupertag } from "./types";
+import type { DocsNode } from "./types";
 import {
   docsFieldType,
   fieldOptions,
@@ -45,12 +40,11 @@ import {
 } from "./docs-utils";
 import {
   nodeText,
-  type DocsAiCommand,
   type DocsAiPreview,
   type DocsCommandMode,
-  type DocsSupertagTool,
   type SearchView,
 } from "./docs-workspace-shared";
+import type { DocsCommandRegistration } from "./hooks/use-docs-command-palette";
 
 export function AliasEditorDialog({
   node,
@@ -76,7 +70,7 @@ export function AliasEditorDialog({
 
   return (
     <Dialog open={Boolean(node)} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-md">
+      <DialogContent size="md">
         <DialogHeader>
           <DialogTitle>エイリアス編集</DialogTitle>
           <DialogDescription>Ctrl+Pのページ検索で使う別名を1行ずつ入力します。</DialogDescription>
@@ -112,34 +106,34 @@ export function DocsAiPreviewDialog({
   const lines = Array.isArray(result?.lines) ? result.lines.map(String) : [];
   return (
     <Dialog open={Boolean(preview)} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-2xl">
+      <DialogContent size="2xl">
         <DialogHeader>
           <DialogTitle>AI候補の確認</DialogTitle>
           <DialogDescription>
-            反映前に内容を確認します。破棄すると保存済み候補は rejected として記録されます。
+            反映前に内容を確認します。破棄すると保存済み候補は「却下」として記録されます。
           </DialogDescription>
         </DialogHeader>
         {preview ? (
           <div className="space-y-3">
             <div className="rounded border bg-muted/20 p-3">
-              <div className="mb-1 text-[11px] font-medium uppercase text-muted-foreground">Target</div>
+              <div className="mb-1 text-[11px] font-medium text-muted-foreground">対象ノード</div>
               <div className="text-sm font-medium">{nodeText(preview.node)}</div>
             </div>
             {result?.mode === "replace_title" && typeof result.replacement === "string" ? (
               <div className="grid gap-2 md:grid-cols-2">
                 <div className="rounded border p-3">
-                  <div className="mb-1 text-[11px] font-medium uppercase text-muted-foreground">Current</div>
+                  <div className="mb-1 text-[11px] font-medium text-muted-foreground">現在のタイトル</div>
                   <div className="text-sm">{nodeText(preview.node)}</div>
                 </div>
                 <div className="rounded border border-primary/40 bg-primary/5 p-3">
-                  <div className="mb-1 text-[11px] font-medium uppercase text-muted-foreground">Proposed</div>
+                  <div className="mb-1 text-[11px] font-medium text-muted-foreground">提案タイトル</div>
                   <div className="text-sm">{result.replacement}</div>
                 </div>
               </div>
             ) : null}
             {result?.mode === "insert_children" ? (
               <div className="rounded border border-primary/40 bg-primary/5 p-3">
-                <div className="mb-2 text-[11px] font-medium uppercase text-muted-foreground">Child nodes to insert</div>
+                <div className="mb-2 text-[11px] font-medium text-muted-foreground">追加する子ノード</div>
                 <div className="max-h-72 overflow-auto font-mono text-xs leading-6">
                   {lines.map((line, index) => (
                     <div key={`${line}-${index}`} className="whitespace-pre-wrap border-b border-border/60 py-1 last:border-0">
@@ -160,54 +154,40 @@ export function DocsAiPreviewDialog({
   );
 }
 
-export function DocsCommandPalette({
-  open,
-  onOpenChange,
+export function DocsCommandItems({
+  context,
   mode,
   setMode,
-  selectedNode,
-  selectionCount,
-  tags,
-  fields,
-  moveTargets,
-  onAddChild,
-  onOpenSplit,
-  onToggleCheckbox,
-  onApplyTag,
-  onMove,
-  onSetView,
-  onSetField,
-  onRunAi,
-  onGoBack,
-  nodeTools,
+  onClose,
 }: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
+  context: DocsCommandRegistration;
   mode: DocsCommandMode;
   setMode: (mode: DocsCommandMode) => void;
-  selectedNode: DocsNode | null;
-  selectionCount: number;
-  tags: DocsSupertag[];
-  fields: DocsField[];
-  moveTargets: DocsNode[];
-  nodeTools: DocsSupertagTool[];
-  onAddChild: (node: DocsNode) => void;
-  onOpenSplit: (node: DocsNode) => void;
-  onToggleCheckbox: (node: DocsNode) => void;
-  onApplyTag: (node: DocsNode, tag: DocsSupertag) => void;
-  onMove: (node: DocsNode, target: DocsNode, leaveReference: boolean) => void;
-  onSetView: (node: DocsNode, view: SearchView) => void;
-  onSetField: (node: DocsNode, field: DocsField, value: string) => void;
-  onRunAi: (node: DocsNode, command: DocsAiCommand) => void;
-  onGoBack: (node: DocsNode) => void;
+  onClose: () => void;
 }) {
-  const close = () => onOpenChange(false);
+  const {
+    selectedNode,
+    selectionCount,
+    tags,
+    fields,
+    moveTargets,
+    nodeTools,
+    onAddChild,
+    onOpenSplit,
+    onToggleCheckbox,
+    onApplyTag,
+    onMove,
+    onSetView,
+    onSetField,
+    onRunAi,
+    onGoBack,
+  } = context;
   const viewItems: Array<{ view: SearchView; label: string; icon: LucideIcon }> = [
-    { view: "list", label: "View as list", icon: ListFilter },
-    { view: "table", label: "View as table", icon: Table2 },
-    { view: "board", label: "View as board", icon: KanbanSquare },
-    { view: "calendar", label: "View as calendar", icon: CalendarDays },
-    { view: "cards", label: "View as cards", icon: Columns2 },
+    { view: "list", label: "リスト", icon: ListFilter },
+    { view: "table", label: "テーブル", icon: Table2 },
+    { view: "board", label: "ボード", icon: KanbanSquare },
+    { view: "calendar", label: "カレンダー", icon: CalendarDays },
+    { view: "cards", label: "カード", icon: Columns2 },
   ];
 
   const fieldValueItems = selectedNode && mode.kind === "field"
@@ -215,170 +195,148 @@ export function DocsCommandPalette({
         const field = fields.find((item) => item.id === mode.fieldId);
         if (!field) return [];
         const type = docsFieldType(field);
-        if (type === "checkbox") return ["true", "false"].map((value) => ({ label: value, value, field }));
+        if (type === "checkbox") return ["true", "false"].map((value) => ({
+          label: value === "true" ? "オン" : "オフ",
+          value,
+          field,
+        }));
         const options = fieldOptions(field);
         if (options.length > 0) return options.map((value) => ({ label: value, value, field }));
-        return [{ label: `Clear ${field.name}`, value: "", field }];
+        return [{ label: `${field.name}をクリア`, value: "", field }];
       })()
     : [];
 
   return (
-    <CommandDialog
-      open={open}
-      onOpenChange={onOpenChange}
-      title="Docs command palette"
-      description="Docs node commands"
-      className="max-w-xl"
-    >
-      <Command>
-        <CommandInput
-          placeholder={
-            mode.kind === "move"
-              ? mode.leaveReference ? "Move and leave reference to..." : "Move to..."
-              : mode.kind === "tag"
-                ? "Add tag..."
-                : mode.kind === "view"
-                  ? "View as..."
-                  : mode.kind === "field"
-                    ? "Set field..."
-                    : "Enter command..."
-          }
-        />
-        <CommandList className="max-h-80">
-          <CommandEmpty>見つかりません</CommandEmpty>
-          {!selectedNode ? (
-            <CommandGroup heading="Docs">
-              <CommandItem disabled>ノードを選択してください</CommandItem>
-            </CommandGroup>
-          ) : mode.kind === "root" ? (
-            <>
-              {selectionCount > 1 ? (
-                <CommandGroup heading="Selection">
-                  <CommandItem disabled value={`${selectionCount} nodes selected`}>
-                    <CheckSquare className="size-4" />
-                    {selectionCount} nodes selected
-                  </CommandItem>
-                </CommandGroup>
-              ) : null}
-              {selectionCount > 1 ? <CommandSeparator /> : null}
-              <CommandGroup heading="Command">
-                <CommandItem onSelect={() => { onOpenSplit(selectedNode); close(); }} value="open in right panel">
-                  <Columns2 className="size-4" />
-                  Open in right panel
-                </CommandItem>
-                <CommandItem onSelect={() => { onAddChild(selectedNode); close(); }} value="add child node">
-                  <Plus className="size-4" />
-                  Add child node
-                </CommandItem>
-                <CommandItem onSelect={() => { onToggleCheckbox(selectedNode); close(); }} value="add checkbox toggle checkbox">
-                  <CheckSquare className="size-4" />
-                  {selectedNode.display_props?.show_checkbox === true ? "Toggle checkbox" : "Add checkbox"}
-                </CommandItem>
-                <CommandItem onSelect={() => { onRunAi(selectedNode, "continue"); close(); }} value="ai continue generate children">
-                  <Sparkles className="size-4" />
-                  AI: continue as child nodes
-                </CommandItem>
-                <CommandItem onSelect={() => { onRunAi(selectedNode, "rewrite"); close(); }} value="ai rewrite title">
-                  <Sparkles className="size-4" />
-                  AI: rewrite title
-                </CommandItem>
-                <CommandItem onSelect={() => { onRunAi(selectedNode, "extract_tasks"); close(); }} value="ai extract tasks">
-                  <Sparkles className="size-4" />
-                  AI: extract tasks
-                </CommandItem>
-                <CommandItem onSelect={() => { onRunAi(selectedNode, "generate_minutes"); close(); }} value="ai generate minutes 議事録生成">
-                  <Sparkles className="size-4" />
-                  AI: 議事録生成
-                </CommandItem>
-                {nodeTools.map((tool) => (
-                  <CommandItem
-                    key={tool.command}
-                    onSelect={() => { onRunAi(selectedNode, tool.command); close(); }}
-                    value={`${tool.command} ${tool.label}`}
-                  >
-                    <Sparkles className="size-4" />
-                    {tool.label}
-                  </CommandItem>
-                ))}
-                <CommandItem onSelect={() => setMode({ kind: "move", leaveReference: false })} value="move to">
-                  <ExternalLink className="size-4" />
-                  Move to
-                </CommandItem>
-                <CommandItem onSelect={() => setMode({ kind: "move", leaveReference: true })} value="move and leave reference">
-                  <Link2 className="size-4" />
-                  Move and leave reference to
-                </CommandItem>
-                <CommandItem onSelect={() => setMode({ kind: "view" })} value="view as">
-                  <Table2 className="size-4" />
-                  View as
-                </CommandItem>
-                <CommandItem onSelect={() => { onGoBack(selectedNode); close(); }} value="go back parent">
-                  <ChevronRight className="size-4 rotate-180" />
-                  Go back
-                </CommandItem>
-              </CommandGroup>
-              <CommandSeparator />
-              {fields.length > 0 ? (
-                <CommandGroup heading="Fields">
-                  {fields.map((field) => (
-                    <CommandItem key={field.id} value={`set ${field.name}`} onSelect={() => setMode({ kind: "field", fieldId: field.id })}>
-                      <SlidersHorizontal className="size-4" />
-                      Set {field.name}
-                    </CommandItem>
-                  ))}
-                </CommandGroup>
-              ) : null}
-              <CommandGroup heading="Tags">
-                {tags.map((tag) => (
-                  <CommandItem key={tag.id} value={`tag ${tag.name}`} keywords={[tag.description ?? ""]} onSelect={() => { onApplyTag(selectedNode, tag); close(); }}>
-                    <Hash className="size-4" style={tagColorStyle(tag.color)} />
-                    Add tag #{tag.name}
-                  </CommandItem>
-                ))}
-              </CommandGroup>
-            </>
-          ) : mode.kind === "move" ? (
-            <CommandGroup heading={mode.leaveReference ? "Move and leave reference to" : "Move to"}>
-              {moveTargets.map((target) => (
-                <CommandItem key={target.id} value={`${nodeText(target)} ${target.id}`} onSelect={() => { onMove(selectedNode, target, mode.leaveReference); close(); }}>
-                  <ExternalLink className="size-4" />
-                  <span className="truncate">{nodeText(target)}</span>
-                </CommandItem>
-              ))}
-            </CommandGroup>
-          ) : mode.kind === "view" ? (
-            <CommandGroup heading="View as">
-              {viewItems.map((item) => {
-                const Icon = item.icon;
-                return (
-                  <CommandItem key={item.view} value={item.label} onSelect={() => { onSetView(selectedNode, item.view); close(); }}>
-                    <Icon className="size-4" />
-                    {item.label}
-                  </CommandItem>
-                );
-              })}
-            </CommandGroup>
-          ) : mode.kind === "field" ? (
-            <CommandGroup heading="Set field">
-              {fieldValueItems.map((item) => (
-                <CommandItem key={`${item.field.id}:${item.value}`} value={`${item.field.name} ${item.label}`} onSelect={() => { onSetField(selectedNode, item.field, item.value); close(); }}>
-                  <Type className="size-4" />
-                  {item.field.name}: {item.label || "empty"}
-                </CommandItem>
-              ))}
-            </CommandGroup>
-          ) : (
-            <CommandGroup heading="Tags">
-              {tags.map((tag) => (
-                <CommandItem key={tag.id} value={`tag ${tag.name}`} onSelect={() => { onApplyTag(selectedNode, tag); close(); }}>
-                  <Hash className="size-4" style={tagColorStyle(tag.color)} />
-                  Add tag #{tag.name}
-                </CommandItem>
-              ))}
-            </CommandGroup>
-          )}
-        </CommandList>
-      </Command>
-    </CommandDialog>
+    !selectedNode ? (
+      <CommandGroup heading="Docsノード操作">
+        <CommandItem disabled>ノードを選択してください</CommandItem>
+      </CommandGroup>
+    ) : mode.kind === "root" ? (
+      <>
+        {selectionCount > 1 ? (
+          <CommandGroup heading="選択中">
+            <CommandItem disabled value={`${selectionCount}件選択中`}>
+              <CheckSquare className="size-4" />
+              {selectionCount}件選択中
+            </CommandItem>
+          </CommandGroup>
+        ) : null}
+        {selectionCount > 1 ? <CommandSeparator /> : null}
+        <CommandGroup heading="Docsノード操作">
+          <CommandItem onSelect={() => { onOpenSplit(selectedNode); onClose(); }} value="右パネルで開く open in right panel">
+            <Columns2 className="size-4" />
+            右パネルで開く
+          </CommandItem>
+          <CommandItem onSelect={() => { onAddChild(selectedNode); onClose(); }} value="子ノードを追加 add child node">
+            <Plus className="size-4" />
+            子ノードを追加
+          </CommandItem>
+          <CommandItem onSelect={() => { onToggleCheckbox(selectedNode); onClose(); }} value="チェックボックス checkbox toggle">
+            <CheckSquare className="size-4" />
+            {selectedNode.display_props?.show_checkbox === true ? "チェックボックスを切り替え" : "チェックボックスを追加"}
+          </CommandItem>
+          <CommandItem onSelect={() => { onRunAi(selectedNode, "continue"); onClose(); }} value="AI 子ノードとして続ける continue generate children">
+            <Sparkles className="size-4" />
+            AI: 子ノードとして続ける
+          </CommandItem>
+          <CommandItem onSelect={() => { onRunAi(selectedNode, "rewrite"); onClose(); }} value="AI タイトルを書き換える rewrite title">
+            <Sparkles className="size-4" />
+            AI: タイトルを書き換える
+          </CommandItem>
+          <CommandItem onSelect={() => { onRunAi(selectedNode, "extract_tasks"); onClose(); }} value="AI タスクを抽出 extract tasks">
+            <Sparkles className="size-4" />
+            AI: タスクを抽出
+          </CommandItem>
+          <CommandItem onSelect={() => { onRunAi(selectedNode, "generate_minutes"); onClose(); }} value="AI 議事録を生成 generate minutes">
+            <Sparkles className="size-4" />
+            AI: 議事録を生成
+          </CommandItem>
+          {nodeTools.map((tool) => (
+            <CommandItem
+              key={tool.command}
+              onSelect={() => { onRunAi(selectedNode, tool.command); onClose(); }}
+              value={`${tool.command} ${tool.label}`}
+            >
+              <Sparkles className="size-4" />
+              {tool.label}
+            </CommandItem>
+          ))}
+          <CommandItem onSelect={() => setMode({ kind: "move", leaveReference: false })} value="移動する move to">
+            <ExternalLink className="size-4" />
+            移動する
+          </CommandItem>
+          <CommandItem onSelect={() => setMode({ kind: "move", leaveReference: true })} value="参照を残して移動する move and leave reference">
+            <Link2 className="size-4" />
+            参照を残して移動する
+          </CommandItem>
+          <CommandItem onSelect={() => setMode({ kind: "view" })} value="表示形式を変更 view as">
+            <Table2 className="size-4" />
+            表示形式を変更
+          </CommandItem>
+          <CommandItem onSelect={() => { onGoBack(selectedNode); onClose(); }} value="親ノードへ戻る go back parent">
+            <ChevronRight className="size-4 rotate-180" />
+            親ノードへ戻る
+          </CommandItem>
+        </CommandGroup>
+        <CommandSeparator />
+        {fields.length > 0 ? (
+          <CommandGroup heading="フィールド">
+            {fields.map((field) => (
+              <CommandItem key={field.id} value={`${field.name}を設定 set ${field.name}`} onSelect={() => setMode({ kind: "field", fieldId: field.id })}>
+                <SlidersHorizontal className="size-4" />
+                {field.name}を設定
+              </CommandItem>
+            ))}
+          </CommandGroup>
+        ) : null}
+        <CommandGroup heading="タグ">
+          {tags.map((tag) => (
+            <CommandItem key={tag.id} value={`#${tag.name}を追加 tag ${tag.name}`} keywords={[tag.description ?? ""]} onSelect={() => { onApplyTag(selectedNode, tag); onClose(); }}>
+              <Hash className="size-4" style={tagColorStyle(tag.color)} />
+              #{tag.name}を追加
+            </CommandItem>
+          ))}
+        </CommandGroup>
+      </>
+    ) : mode.kind === "move" ? (
+      <CommandGroup heading={mode.leaveReference ? "参照を残して移動" : "移動先"}>
+        {moveTargets.map((target) => (
+          <CommandItem key={target.id} value={`${nodeText(target)} ${target.id}`} onSelect={() => { onMove(selectedNode, target, mode.leaveReference); onClose(); }}>
+            <ExternalLink className="size-4" />
+            <span className="truncate">{nodeText(target)}</span>
+          </CommandItem>
+        ))}
+      </CommandGroup>
+    ) : mode.kind === "view" ? (
+      <CommandGroup heading="表示形式">
+        {viewItems.map((item) => {
+          const Icon = item.icon;
+          return (
+            <CommandItem key={item.view} value={item.label} onSelect={() => { onSetView(selectedNode, item.view); onClose(); }}>
+              <Icon className="size-4" />
+              {item.label}
+            </CommandItem>
+          );
+        })}
+      </CommandGroup>
+    ) : mode.kind === "field" ? (
+      <CommandGroup heading="フィールド値を設定">
+        {fieldValueItems.map((item) => (
+          <CommandItem key={`${item.field.id}:${item.value}`} value={`${item.field.name} ${item.label}`} onSelect={() => { onSetField(selectedNode, item.field, item.value); onClose(); }}>
+            <Type className="size-4" />
+            {item.field.name}: {item.label || "空"}
+          </CommandItem>
+        ))}
+      </CommandGroup>
+    ) : (
+      <CommandGroup heading="タグ">
+        {tags.map((tag) => (
+          <CommandItem key={tag.id} value={`#${tag.name}を追加 tag ${tag.name}`} onSelect={() => { onApplyTag(selectedNode, tag); onClose(); }}>
+            <Hash className="size-4" style={tagColorStyle(tag.color)} />
+            #{tag.name}を追加
+          </CommandItem>
+        ))}
+      </CommandGroup>
+    )
   );
 }

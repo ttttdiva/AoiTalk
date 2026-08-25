@@ -24,6 +24,34 @@ const DEFAULT_VALUES: Record<string, number> = {
   emotion: 50,
 };
 
+function clampPercent(value: number): number {
+  return Math.min(100, Math.max(0, value));
+}
+
+function toDisplaySettings(
+  settings: Record<string, number> | undefined,
+): Record<string, number> {
+  if (!settings) return {};
+
+  return Object.fromEntries(
+    Object.entries(settings).flatMap(([key, value]) => {
+      if (typeof value !== "number" || !Number.isFinite(value)) return [];
+      return [[key, clampPercent(value * 100)]];
+    }),
+  );
+}
+
+function toApiSettings(
+  settings: Record<string, number>,
+): Record<string, number> {
+  return Object.fromEntries(
+    Object.entries(settings).flatMap(([key, value]) => {
+      if (typeof value !== "number" || !Number.isFinite(value)) return [];
+      return [[key, clampPercent(value) / 100]];
+    }),
+  );
+}
+
 export function SteeringPanel({ sessionId, isVisible }: SteeringPanelProps) {
   const [expanded, setExpanded] = useState(false);
   const [values, setValues] = useState<Record<string, number>>({
@@ -38,7 +66,10 @@ export function SteeringPanel({ sessionId, isVisible }: SteeringPanelProps) {
       .getRpSettings(sessionId)
       .then((data) => {
         if (data.rp_settings && Object.keys(data.rp_settings).length > 0) {
-          setValues({ ...DEFAULT_VALUES, ...data.rp_settings });
+          setValues({
+            ...DEFAULT_VALUES,
+            ...toDisplaySettings(data.rp_settings),
+          });
         } else {
           setValues({ ...DEFAULT_VALUES });
         }
@@ -54,7 +85,9 @@ export function SteeringPanel({ sessionId, isVisible }: SteeringPanelProps) {
         // デバウンスでAPIに保存
         if (debounceRef.current) clearTimeout(debounceRef.current);
         debounceRef.current = setTimeout(() => {
-          chatApi.updateRpSettings(sessionId, updated).catch(() => {});
+          chatApi
+            .updateRpSettings(sessionId, toApiSettings(updated))
+            .catch(() => {});
         }, 500);
 
         return updated;
@@ -66,9 +99,9 @@ export function SteeringPanel({ sessionId, isVisible }: SteeringPanelProps) {
   if (!isVisible) return null;
 
   return (
-    <div className="border-t bg-muted/30">
+    <div className="border-t border-border-subtle bg-surface-container-low">
       <button
-        className="flex w-full items-center justify-between px-4 py-2 text-xs text-muted-foreground hover:bg-muted/50 transition-colors"
+        className="flex w-full items-center justify-between px-4 py-2.5 text-[11px] uppercase tracking-[0.08em] text-text-secondary transition-colors hover:bg-surface-slate hover:text-on-surface"
         onClick={() => setExpanded((v) => !v)}
       >
         <span className="flex items-center gap-1.5">
@@ -83,12 +116,12 @@ export function SteeringPanel({ sessionId, isVisible }: SteeringPanelProps) {
       </button>
 
       {expanded && (
-        <div className="space-y-3 px-4 pb-3">
+        <div className="space-y-3 border-t border-border-subtle px-4 pb-4 pt-3">
           {SLIDER_DEFS.map((def) => (
             <div key={def.key} className="space-y-1">
               <div className="flex items-center justify-between">
                 <Label className="text-xs">{def.label}</Label>
-                <span className="text-[10px] text-muted-foreground tabular-nums">
+                <span className="text-[10px] text-primary tabular-nums">
                   {values[def.key] ?? 50}
                 </span>
               </div>
@@ -98,9 +131,9 @@ export function SteeringPanel({ sessionId, isVisible }: SteeringPanelProps) {
                 max={100}
                 value={values[def.key] ?? 50}
                 onChange={(e) => handleChange(def.key, Number(e.target.value))}
-                className="w-full h-1 rounded-full appearance-none bg-muted accent-primary cursor-pointer"
+                className="h-1 w-full cursor-pointer appearance-none rounded-full bg-surface-container-highest accent-primary"
               />
-              <p className="text-[10px] text-muted-foreground">{def.desc}</p>
+              <p className="text-[10px] text-text-secondary">{def.desc}</p>
             </div>
           ))}
         </div>

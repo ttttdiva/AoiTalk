@@ -4,9 +4,12 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
+from ...features import Features
+from ...services.feedback_store import FeedbackEntry
 from ..router_helpers import cookie_auth_dependency
 
 if TYPE_CHECKING:
@@ -15,9 +18,37 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class FeedbackSubmitResponse(BaseModel):
+    success: bool
+    feedback_id: str
+    message: str
+
+
+class FeedbackListResponse(BaseModel):
+    feedback: list[FeedbackEntry]
+    count: int
+
+
+class FeedbackResolveResponse(BaseModel):
+    success: bool
+    message: str
+
+
 def register_feedback_routes(app: FastAPI, server: "WebChatServer") -> None:
     """フィードバック関連ルートを登録する (JSONL→DB 移行タスクの登録を含む)"""
     require_auth = cookie_auth_dependency(server._enforce_cookie_auth)
+    server._feedback_migration_status = "pending"
+
+    async def require_admin(request: Request) -> dict:
+        """Require an authenticated administrator for review operations."""
+        if not server.auth_enabled:
+            return {"id": "default_user", "username": "default_user", "role": "admin"}
+        user_info = await server._get_user_info_from_request(request)
+        if not user_info:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        if str(user_info.get("role", "")).lower() != "admin":
+            raise HTTPException(status_code=403, detail="Administrator privileges required")
+        return user_info
 
     # ── Feedback API Endpoints ──────────────────────────────────────────
     # Import feedback module (async version for DB support)
@@ -45,6 +76,7 @@ def register_feedback_routes(app: FastAPI, server: "WebChatServer") -> None:
                         logger.info(
                             f"Migrated {migrated} feedback entries from JSONL to database"
                         )
+                    server._feedback_migration_status = "ready"
                     return
                 except Exception as e:
                     if attempt < max_retries - 1:
@@ -56,6 +88,7 @@ def register_feedback_routes(app: FastAPI, server: "WebChatServer") -> None:
                         logger.warning(
                             f"Failed to migrate feedback after {max_retries} attempts: {e}"
                         )
+                        server._feedback_migration_status = "failed"
 
         server._startup_background_tasks.append(_migrate_feedback)
     except ImportError as e:
@@ -65,8 +98,9 @@ def register_feedback_routes(app: FastAPI, server: "WebChatServer") -> None:
         save_feedback_async = None
         load_feedback_async = None
         mark_feedback_resolved_async = None
+        server._feedback_migration_status = "failed"
 
-    @app.post("/api/feedback")
+    @app.post("/api/feedback", response_model=FeedbackSubmitResponse)
     async def submit_feedback(request: Request, _: None = Depends(require_auth)):
         """Submit feedback on an agent response"""
         if not FEEDBACK_AVAILABLE:
@@ -92,13 +126,15 @@ def register_feedback_routes(app: FastAPI, server: "WebChatServer") -> None:
                 status_code=500, detail=f"Failed to save feedback: {e}"
             )
 
-    @app.get("/api/feedback")
+    @app.get("/api/feedback", response_model=FeedbackListResponse)
     async def get_feedback_list(
+        request: Request,
         include_resolved: bool = False,
-        limit: int = 100,
+        limit: int = Query(100, ge=1, le=500),
         _: None = Depends(require_auth),
     ):
         """Get list of feedback entries (for admin review)"""
+        admin_info = await require_admin(request)
         if not FEEDBACK_AVAILABLE:
             raise HTTPException(
                 status_code=503, detail="Feedback system is not available"
@@ -120,16 +156,26 @@ def register_feedback_routes(app: FastAPI, server: "WebChatServer") -> None:
                 status_code=500, detail=f"Failed to load feedback: {e}"
             )
 
-    @app.post("/api/feedback/{feedback_id}/resolve")
-    async def resolve_feedback(feedback_id: str, _: None = Depends(require_auth)):
+    @app.post(
+        "/api/feedback/{feedback_id}/resolve",
+        response_model=FeedbackResolveResponse,
+    )
+    async def resolve_feedback(
+        feedback_id: str,
+        request: Request,
+        _: None = Depends(require_auth),
+    ):
         """Mark a feedback entry as resolved"""
+        admin_info = await require_admin(request)
         if not FEEDBACK_AVAILABLE:
             raise HTTPException(
                 status_code=503, detail="Feedback system is not available"
             )
 
         try:
-            success = await mark_feedback_resolved_async(feedback_id)
+            success = await mark_feedback_resolved_async(
+                feedback_id, resolved_by=admin_info.get("username")
+            )
             if success:
                 return JSONResponse(
                     {

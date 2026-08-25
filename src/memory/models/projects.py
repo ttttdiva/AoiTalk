@@ -16,11 +16,12 @@ from sqlalchemy import (
     Boolean,
     UniqueConstraint,
     Index,
+    CheckConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
-from .base import Base, _encrypted_text_property
+from .base import Base, _encrypted_json_property, _encrypted_text_property
 
 
 class Space(Base):
@@ -84,6 +85,10 @@ class Project(Base):
 
     # 設定
     allow_join_requests = Column(Boolean, default=True)  # 参加申請を受け付けるか
+    # 完了済みプロジェクトは正本レコードの状態。
+    # モバイルのスペース階層・完了分離で利用するため、
+    # DB に存在する is_completed を ORM/同期ペイロードから落とさない。
+    is_completed = Column(Boolean, default=False, server_default="false", nullable=False)
 
     # ストレージ設定
     storage_quota_mb = Column(Integer, default=1000)  # 容量制限（MB）
@@ -108,6 +113,12 @@ class Project(Base):
     )
     tasks = relationship(
         "Task",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    schedule_phases = relationship(
+        "ProjectSchedulePhase",
         back_populates="project",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -144,6 +155,11 @@ class Project(Base):
         passive_deletes=True,
         uselist=False,
     )
+    context_pack_rebuild_jobs = relationship(
+        "ProjectContextPackRebuildJob",
+        back_populates="project",
+        passive_deletes=True,
+    )
     context_memories = relationship(
         "ContextMemory",
         back_populates="project",
@@ -152,6 +168,12 @@ class Project(Base):
     )
     qa_entries = relationship(
         "ProjectQaEntry",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    knowledge_refs = relationship(
+        "ProjectKnowledgeRef",
         back_populates="project",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -172,6 +194,7 @@ class Project(Base):
                 str(self.knowledge_node_id) if self.knowledge_node_id else None
             ),
             "allow_join_requests": self.allow_join_requests,
+            "is_completed": bool(self.is_completed),
             "storage_quota_mb": self.storage_quota_mb,
             "storage_used_mb": self.storage_used_mb,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -179,6 +202,46 @@ class Project(Base):
             "deleted_at": self.deleted_at.isoformat() if self.deleted_at else None,
             "metadata": normalize_project_metadata(self.project_metadata),
         }
+
+
+class ProjectKnowledgeRef(Base):
+    """A Project's explicit reference to a shared KnowledgeNode."""
+
+    __tablename__ = "project_knowledge_refs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    knowledge_node_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    relation_type = Column(String(32), nullable=False, default="related", server_default="related")
+    priority = Column(Integer, nullable=False, default=100, server_default="100")
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    project = relationship("Project", back_populates="knowledge_refs")
+    knowledge_node = relationship("KnowledgeNode", back_populates="project_references")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "knowledge_node_id",
+            name="uq_project_knowledge_refs_project_node",
+        ),
+        Index(
+            "ix_project_knowledge_refs_project_priority",
+            "project_id",
+            "priority",
+        ),
+        Index("ix_project_knowledge_refs_node", "knowledge_node_id"),
+    )
 
 
 class ProjectContextPack(Base):
@@ -203,9 +266,35 @@ class ProjectContextPack(Base):
     open_questions = Column(JSON, default=list, nullable=False)
     manual_notes = Column(Text, default="", nullable=False)
     generated_from = Column(JSON, default=dict, nullable=False)
+    # Projection metadata.  The pack body remains the last known projection;
+    # ``status`` tells readers whether the canonical sources changed after it
+    # was generated.  Keep this as a plain String so service-level validation
+    # remains portable across PostgreSQL/SQLite test databases.
+    source_digest = Column(String(64), nullable=True)
+    generated_at = Column(DateTime, nullable=True)
+    generation_version = Column(
+        Integer,
+        default=1,
+        server_default="1",
+        nullable=False,
+    )
+    status = Column(
+        String(16),
+        default="fresh",
+        server_default="fresh",
+        nullable=False,
+    )
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_project_context_packs_project_status",
+            "project_id",
+            "status",
+        ),
     )
 
     project = relationship("Project", back_populates="context_pack")
@@ -223,7 +312,116 @@ class ProjectContextPack(Base):
             "open_questions": self.open_questions or [],
             "manual_notes": self.manual_notes or "",
             "generated_from": self.generated_from or {},
+            "source_digest": self.source_digest,
+            "generated_at": self.generated_at.isoformat() if self.generated_at else None,
+            "generation_version": int(self.generation_version or 1),
+            "status": self.status or "fresh",
             "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class ProjectContextPackRevision(Base):
+    """Recoverable generation captured before replacing a context pack."""
+
+    __tablename__ = "project_context_pack_revisions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    context_pack_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("project_context_packs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    revision_number = Column(Integer, nullable=False)
+    snapshot = Column(JSON, default=dict, nullable=False)
+    change_reason = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_project_context_pack_revisions_pack_revision",
+            "context_pack_id",
+            "revision_number",
+            unique=True,
+        ),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": str(self.id),
+            "project_id": str(self.project_id),
+            "context_pack_id": str(self.context_pack_id),
+            "revision_number": self.revision_number,
+            "snapshot": self.snapshot or {},
+            "change_reason": self.change_reason,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class ProjectContextPackRebuildJob(Base):
+    """Durable metadata-only ProjectContextPack rebuild request."""
+
+    __tablename__ = "project_context_pack_rebuild_jobs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    requested_by = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    status = Column(
+        String(16),
+        default="pending",
+        server_default="pending",
+        nullable=False,
+    )
+    reason = Column(String(128), nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    updated_at = Column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'running', 'completed', 'failed')",
+            name="ck_project_context_pack_rebuild_jobs_status",
+        ),
+        Index(
+            "ix_project_context_pack_rebuild_jobs_project_status",
+            "project_id",
+            "status",
+        ),
+    )
+
+    project = relationship("Project", back_populates="context_pack_rebuild_jobs")
+    requester = relationship("User", foreign_keys=[requested_by])
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": str(self.id),
+            "project_id": str(self.project_id),
+            "requested_by": str(self.requested_by),
+            "status": self.status,
+            "reason": self.reason,
+            "error_message": self.error_message,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
 
@@ -259,11 +457,39 @@ class ContextMemory(Base):
     title = Column(String(200), nullable=True)
     _content = Column("content", Text, nullable=False)
     content = _encrypted_text_property("_content", "context_memories.content")
-    structured_data = Column(JSON, default=dict, nullable=False)
+    _structured_data = Column("structured_data", JSON, default=dict, nullable=False)
+    structured_data = _encrypted_json_property(
+        "_structured_data", "context_memories.structured_data"
+    )
     source_type = Column(String(32), default="manual", nullable=False)
     source_ref = Column(Text, nullable=True)
     confidence = Column(Float, default=1.0, nullable=False)
     importance = Column(Integer, default=5, nullable=False)
+    trust_level = Column(String(32), default="inferred", nullable=False)
+    sensitivity = Column(String(32), default="normal", nullable=False)
+    _evidence_refs = Column("evidence_refs", JSON, default=list, nullable=False)
+    evidence_refs = _encrypted_json_property(
+        "_evidence_refs", "context_memories.evidence_refs"
+    )
+    _evidence_span = Column("evidence_span", JSON, default=dict, nullable=False)
+    evidence_span = _encrypted_json_property(
+        "_evidence_span", "context_memories.evidence_span"
+    )
+    dedupe_key = Column(String(128), nullable=True, index=True)
+    supersedes_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("context_memories.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    version = Column(Integer, default=1, nullable=False)
+    created_by_actor = Column(String(120), nullable=True)
+    rejection_reason = Column(Text, nullable=True)
+    _projection_metadata = Column("projection_metadata", JSON, default=dict, nullable=False)
+    projection_metadata = _encrypted_json_property(
+        "_projection_metadata", "context_memories.projection_metadata"
+    )
+    migration_id = Column(String(120), nullable=True, index=True)
     status = Column(String(32), default="active", nullable=False, index=True)
     is_pinned = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -274,6 +500,12 @@ class ContextMemory(Base):
     expires_at = Column(DateTime, nullable=True)
 
     project = relationship("Project", back_populates="context_memories")
+    supersedes = relationship(
+        "ContextMemory",
+        remote_side=[id],
+        foreign_keys=[supersedes_id],
+        uselist=False,
+    )
 
     __table_args__ = (
         Index("ix_context_memories_user_status", "user_id", "status"),
@@ -282,6 +514,15 @@ class ContextMemory(Base):
         Index("ix_context_memories_session_status", "session_id", "status"),
         Index("ix_context_memories_scope", "scope_type", "scope_id"),
         Index("ix_context_memories_pinned_importance", "is_pinned", "importance"),
+        Index(
+            "uq_context_memories_active_scope_dedupe",
+            "user_id",
+            "scope_type",
+            "scope_id",
+            "dedupe_key",
+            unique=True,
+            postgresql_where=(status == "active"),
+        ),
     )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -301,6 +542,17 @@ class ContextMemory(Base):
             "source_ref": self.source_ref,
             "confidence": self.confidence,
             "importance": self.importance,
+            "trust_level": self.trust_level,
+            "sensitivity": self.sensitivity,
+            "evidence_refs": self.evidence_refs or [],
+            "evidence_span": self.evidence_span or {},
+            "dedupe_key": self.dedupe_key,
+            "supersedes_id": str(self.supersedes_id) if self.supersedes_id else None,
+            "version": self.version,
+            "created_by_actor": self.created_by_actor,
+            "rejection_reason": self.rejection_reason,
+            "projection_metadata": self.projection_metadata or {},
+            "migration_id": self.migration_id,
             "status": self.status,
             "is_pinned": self.is_pinned,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -308,6 +560,87 @@ class ContextMemory(Base):
             "last_used_at": self.last_used_at.isoformat() if self.last_used_at else None,
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
         }
+
+
+class ContextMemoryAudit(Base):
+    """Append-only, content-minimized audit trail for Scoped Memory mutations."""
+
+    __tablename__ = "context_memory_audits"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    memory_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("context_memories.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    user_id = Column(String(100), nullable=True, index=True)
+    operation = Column(String(48), nullable=False, index=True)
+    actor = Column(String(120), nullable=False)
+    turn_context = Column(JSON, default=dict, nullable=False)
+    before_snapshot = Column(JSON, default=dict, nullable=False)
+    after_snapshot = Column(JSON, default=dict, nullable=False)
+    reason = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+
+class ScopedMemoryJob(Base):
+    """Durable and idempotent background extraction job."""
+
+    __tablename__ = "scoped_memory_jobs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(String(100), nullable=False, index=True)
+    session_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("conversation_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    project_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    message_key = Column(String(128), nullable=False)
+    # Discord message IDs are globally stable for one external principal even
+    # when ``/clear`` rotates the durable ConversationSession.  Web/UUID
+    # callers leave this nullable and retain the legacy session-scoped key.
+    source_message_id = Column(String(255), nullable=True, index=True)
+    _payload = Column("payload", JSON, default=dict, nullable=False)
+    payload = _encrypted_json_property("_payload", "scoped_memory_jobs.payload")
+    status = Column(String(32), default="pending", nullable=False, index=True)
+    attempts = Column(Integer, default=0, nullable=False)
+    error = Column(Text, nullable=True)
+    next_retry_at = Column(DateTime, nullable=True, index=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "session_id",
+            "message_key",
+            name="uq_scoped_memory_jobs_turn",
+        ),
+        Index(
+            "uq_scoped_memory_jobs_external_message",
+            "user_id",
+            "source_message_id",
+            unique=True,
+            postgresql_where=(
+                (user_id.like("discord:%"))
+                & source_message_id.isnot(None)
+            ),
+            sqlite_where=(
+                (user_id.like("discord:%"))
+                & source_message_id.isnot(None)
+            ),
+        ),
+    )
 
 
 class ProjectQaEntry(Base):
@@ -418,9 +751,10 @@ class ProjectMember(Base):
         JSON,
         default=lambda: {
             "read": True,
-            "write": True,
+            "write": False,
             "delete": False,
             "manage_members": False,
+            "manage_settings": False,
         },
     )
 

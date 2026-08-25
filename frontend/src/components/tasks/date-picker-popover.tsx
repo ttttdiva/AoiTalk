@@ -6,6 +6,10 @@ import { Input } from "@/components/ui/input";
 import { CalendarIcon, X, Clock } from "lucide-react";
 import { parseLocalDateTime } from "@/lib/date-time";
 import { formatTaskDateLabel } from "@/lib/task-date-label";
+import {
+  getTaskDatePresets,
+  type TaskDatePreset,
+} from "@/components/tasks/task-date-presets";
 
 function pad(n: number) {
   return n.toString().padStart(2, "0");
@@ -153,87 +157,6 @@ function parseFlexibleDate(raw: string): string | null {
   return null;
 }
 
-interface Preset {
-  label: string;
-  subLabel: string;
-  getDate: () => Date;
-}
-
-function getPresets(): Preset[] {
-  const now = new Date();
-  const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-
-  const today = new Date(now);
-  today.setHours(0, 0, 0, 0);
-
-  const tomorrow = new Date(now);
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  tomorrow.setHours(0, 0, 0, 0);
-
-  const thisWeekend = new Date(now);
-  const daysUntilSat = (6 - now.getDay() + 7) % 7 || 7;
-  thisWeekend.setDate(thisWeekend.getDate() + daysUntilSat);
-  thisWeekend.setHours(0, 0, 0, 0);
-
-  const nextMonday = new Date(now);
-  const daysUntilMon = now.getDay() === 0 ? 1 : 8 - now.getDay();
-  nextMonday.setDate(nextMonday.getDate() + daysUntilMon);
-  nextMonday.setHours(0, 0, 0, 0);
-
-  const nextWeekend = new Date(now);
-  const daysUntilNextSat = daysUntilSat < 7 ? daysUntilSat + 7 : daysUntilSat;
-  nextWeekend.setDate(nextWeekend.getDate() + daysUntilNextSat);
-  nextWeekend.setHours(0, 0, 0, 0);
-
-  const twoWeeks = new Date(now);
-  twoWeeks.setDate(twoWeeks.getDate() + 14);
-  twoWeeks.setHours(0, 0, 0, 0);
-
-  const fourWeeks = new Date(now);
-  fourWeeks.setDate(fourWeeks.getDate() + 28);
-  fourWeeks.setHours(0, 0, 0, 0);
-
-  const fmtShort = (d: Date) => `${d.getMonth() + 1}/${d.getDate()}`;
-
-  return [
-    {
-      label: "Today",
-      subLabel: dayNames[today.getDay()],
-      getDate: () => new Date(today),
-    },
-    {
-      label: "Tomorrow",
-      subLabel: dayNames[tomorrow.getDay()],
-      getDate: () => new Date(tomorrow),
-    },
-    {
-      label: "This weekend",
-      subLabel: dayNames[thisWeekend.getDay()],
-      getDate: () => new Date(thisWeekend),
-    },
-    {
-      label: "Next week",
-      subLabel: `${fmtShort(nextMonday)}`,
-      getDate: () => new Date(nextMonday),
-    },
-    {
-      label: "Next weekend",
-      subLabel: `${fmtShort(nextWeekend)}`,
-      getDate: () => new Date(nextWeekend),
-    },
-    {
-      label: "In 2 weeks",
-      subLabel: `${fmtShort(twoWeeks)}`,
-      getDate: () => new Date(twoWeeks),
-    },
-    {
-      label: "In 4 weeks",
-      subLabel: `${fmtShort(fourWeeks)}`,
-      getDate: () => new Date(fourWeeks),
-    },
-  ];
-}
-
 interface DatePickerPopoverProps {
   value: string | null;
   onChange?: (value: string | null) => void;
@@ -249,6 +172,8 @@ interface DatePickerPopoverProps {
   allDay?: boolean;
 }
 
+type TextCommitResult = "unchanged" | "committed" | "invalid";
+
 export function DatePickerPopover({
   value,
   onChange,
@@ -262,9 +187,39 @@ export function DatePickerPopover({
   const [open, setOpen] = useState(false);
   const [textInput, setTextInput] = useState("");
   const [isEditing, setIsEditing] = useState(false);
+  const textInputRef = useRef("");
+  const textDirtyRef = useRef(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  const updateTextInput = useCallback((nextValue: string) => {
+    textInputRef.current = nextValue;
+    setTextInput(nextValue);
+  }, []);
+
+  const commitTextInput = useCallback((): TextCommitResult => {
+    if (!textDirtyRef.current) return "unchanged";
+
+    textDirtyRef.current = false;
+    const trimmed = textInputRef.current.trim();
+    const parsed = trimmed ? parseFlexibleDate(trimmed) : null;
+    if (!parsed) return "invalid";
+
+    onChange?.(parsed);
+    onCommit?.(parsed);
+    updateTextInput(formatDisplayDate(parsed, Boolean(allDay)));
+    return "committed";
+  }, [allDay, onChange, onCommit, updateTextInput]);
+
+  const finalizeTextInput = useCallback(() => {
+    const result = commitTextInput();
+    setIsEditing(false);
+    if (result === "invalid") {
+      updateTextInput(formatDisplayDate(value, Boolean(allDay)));
+    }
+    return result;
+  }, [allDay, commitTextInput, updateTextInput, value]);
 
   // テキスト入力を値と同期（編集中でない時のみ）
   useEffect(() => {
@@ -281,9 +236,8 @@ export function DatePickerPopover({
         containerRef.current &&
         !containerRef.current.contains(e.target as Node)
       ) {
+        finalizeTextInput();
         setOpen(false);
-        setIsEditing(false);
-        setTextInput(formatDisplayDate(value, Boolean(allDay)));
       }
     };
     // 遅延して追加（開いた直後のクリックで閉じないように）
@@ -294,7 +248,7 @@ export function DatePickerPopover({
       clearTimeout(timer);
       document.removeEventListener("mousedown", handleClickOutside);
     };
-  }, [allDay, open, value]);
+  }, [finalizeTextInput, open]);
 
   const selectedDate = useMemo(() => {
     return parseDateValue(value) ?? undefined;
@@ -306,7 +260,7 @@ export function DatePickerPopover({
     return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
   }, [value]);
 
-  const presets = useMemo(() => getPresets(), []);
+  const presets = useMemo(() => getTaskDatePresets(), []);
 
   const handleSelectDate = useCallback(
     (date: Date | undefined) => {
@@ -318,6 +272,7 @@ export function DatePickerPopover({
       const v = formatDateTimeLocal(date);
       onChange?.(v);
       onCommit?.(v);
+      textDirtyRef.current = false;
       setOpen(false);
       setIsEditing(false);
     },
@@ -325,7 +280,7 @@ export function DatePickerPopover({
   );
 
   const handlePreset = useCallback(
-    (preset: Preset) => {
+    (preset: TaskDatePreset) => {
       const d = preset.getDate();
       if (value) {
         const existing = parseDateValue(value);
@@ -336,6 +291,7 @@ export function DatePickerPopover({
       const v = formatDateTimeLocal(d);
       onChange?.(v);
       onCommit?.(v);
+      textDirtyRef.current = false;
       setIsEditing(false);
       setOpen(false);
     },
@@ -362,23 +318,17 @@ export function DatePickerPopover({
     (e: React.KeyboardEvent<HTMLInputElement>) => {
       if (e.key === "Enter") {
         e.preventDefault();
-        const trimmed = textInput.trim();
-        const parsed = trimmed ? parseFlexibleDate(trimmed) : null;
-        if (parsed) {
-          onChange?.(parsed);
-          onCommit?.(parsed);
-          setTextInput(formatDisplayDate(parsed, Boolean(allDay)));
-        }
-        setIsEditing(false);
+        finalizeTextInput();
         setOpen(false);
       }
       if (e.key === "Escape") {
+        textDirtyRef.current = false;
         setIsEditing(false);
-        setTextInput(formatDisplayDate(value, Boolean(allDay)));
+        updateTextInput(formatDisplayDate(value, Boolean(allDay)));
         setOpen(false);
       }
     },
-    [allDay, textInput, value, onChange, onCommit],
+    [allDay, finalizeTextInput, updateTextInput, value],
   );
 
   const handleClear = useCallback(
@@ -387,30 +337,42 @@ export function DatePickerPopover({
       e.preventDefault();
       onChange?.(null);
       onCommit?.(null);
-      setTextInput("");
+      textDirtyRef.current = false;
+      updateTextInput("");
       setIsEditing(false);
     },
-    [onChange, onCommit],
+    [onChange, onCommit, updateTextInput],
   );
 
   const handleInputFocus = useCallback(() => {
-    setTextInput(formatDisplayDate(value, Boolean(allDay)));
+    textDirtyRef.current = false;
+    updateTextInput(formatDisplayDate(value, Boolean(allDay)));
     setIsEditing(true);
     setOpen(true);
-  }, [allDay, value]);
+  }, [allDay, updateTextInput, value]);
 
   const handleInputChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
+      textDirtyRef.current = true;
       setIsEditing(true);
-      setTextInput(e.target.value);
+      updateTextInput(e.target.value);
     },
-    [],
+    [updateTextInput],
   );
 
   const isButtonMode = buttonClassName !== undefined;
 
   return (
-    <div ref={containerRef} className="relative w-full">
+    <div
+      ref={containerRef}
+      className="relative w-full"
+      onBlurCapture={(e) => {
+        const nextTarget = e.relatedTarget as Node | null;
+        if (nextTarget && e.currentTarget.contains(nextTarget)) return;
+        finalizeTextInput();
+        setOpen(false);
+      }}
+    >
       {/* トリガー */}
       {isButtonMode ? (
         <button

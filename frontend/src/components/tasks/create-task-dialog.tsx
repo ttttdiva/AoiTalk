@@ -273,6 +273,7 @@ export function CreateTaskDialog({
   const [startAt, setStartAt] = useState("");
   const [endAt, setEndAt] = useState("");
   const [allDay, setAllDay] = useState(false);
+  const [autoCloseOnDue, setAutoCloseOnDue] = useState(false);
   const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
   const [localTags, setLocalTags] = useState<Tag[]>(tags);
   const [targetProjectId, setTargetProjectId] = useState<string | null>(null);
@@ -426,6 +427,7 @@ export function CreateTaskDialog({
     setStartAt("");
     setEndAt("");
     setAllDay(false);
+    setAutoCloseOnDue(false);
     setSelectedTagIds([]);
     selectedTagIdsRef.current = [];
     pendingTagResolutionRef.current = null;
@@ -556,6 +558,7 @@ export function CreateTaskDialog({
           start_at: payloadStartAt || undefined,
           end_at: payloadEndAt || undefined,
           all_day: submitAllDay,
+          auto_close_on_due: autoCloseOnDue,
           tag_ids: submitTagIds,
         };
         if (payloadStartAt || payloadEndAt) {
@@ -588,6 +591,7 @@ export function CreateTaskDialog({
       startAt,
       endAt,
       allDay,
+      autoCloseOnDue,
       title,
       projectId,
       targetProjectId,
@@ -613,7 +617,7 @@ export function CreateTaskDialog({
           }
         />
       )}
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent size="lg">
         <DialogHeader>
           <DialogTitle>新規タスク作成</DialogTitle>
           <DialogDescription>
@@ -736,6 +740,25 @@ export function CreateTaskDialog({
             <Label htmlFor="task-allday" className="cursor-pointer">
               終日
             </Label>
+          </div>
+
+          <div className="flex items-start gap-2">
+            <Checkbox
+              id="task-auto-close-on-due"
+              checked={autoCloseOnDue}
+              onCheckedChange={(checked) => setAutoCloseOnDue(!!checked)}
+            />
+            <div className="grid gap-0.5">
+              <Label
+                htmlFor="task-auto-close-on-due"
+                className="cursor-pointer"
+              >
+                期日で自動完了
+              </Label>
+              <p className="text-[11px] text-muted-foreground">
+                期日になると自動的に完了にします。終日は23:59までです。
+              </p>
+            </div>
           </div>
 
           <div className="grid gap-2">

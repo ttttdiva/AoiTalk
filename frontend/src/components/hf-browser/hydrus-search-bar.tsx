@@ -47,6 +47,7 @@ import {
   writeSearchTags,
 } from "@/lib/hydrus/tag-store";
 import { getOrCreatePagePromise } from "@/lib/hydrus/page-cache";
+import { Pagination } from "@/components/explorer/pagination";
 
 /**
  * Hydrus Client API の file_sort_type。2 = import time。
@@ -111,7 +112,8 @@ const EMPTY_RESULT: ExplorerListResponse = {
 };
 
 export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
-  const { viewMode, setViewMode, isHydrusMode, currentPath } = useExplorer();
+  const { viewMode, setViewMode, isHydrusMode, currentPath, userId } = useExplorer();
+  const [stateUserId, setStateUserId] = useState<string | null>(userId);
   const [tagInput, setTagInput] = useState("");
   const [tags, setTags] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
@@ -127,6 +129,14 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
   const activeAbortRef = useRef<AbortController | null>(null);
   const pagingAbortRef = useRef(new AbortController());
   const pageCacheRef = useRef(new Map<string, Promise<HydrusPageResult>>());
+  const principalReady = stateUserId === userId;
+  const visibleTags = principalReady ? tags : [];
+  const visibleBookmarks = principalReady ? bookmarks : [];
+  const visibleHistory = principalReady ? history : [];
+  const visibleLoading = principalReady && loading;
+  const visibleTotal = principalReady ? total : 0;
+  const visiblePage = principalReady ? page : 1;
+  const visibleTotalPages = principalReady ? totalPages : 1;
 
   const queryKey = useCallback(
     (targetTags: string[]) => JSON.stringify({ tags: targetTags, perPage }),
@@ -192,11 +202,11 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
       setPage(result.page);
       setTotalPages(result.totalPages);
       setTotal(result.total);
-      setHistory(pushTagHistory(targetTags));
+      setHistory(pushTagHistory(targetTags, userId));
       onResults(result.data);
       return true;
     },
-    [onResults, queryKey],
+    [onResults, queryKey, userId],
   );
 
   const runSearch = useCallback(
@@ -210,10 +220,15 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
       if (targetTags.length === 0) {
         activeAbortRef.current?.abort();
         generationRef.current += 1;
+        activeAbortRef.current = null;
         onResults(EMPTY_RESULT);
         setTotal(0);
         setTotalPages(1);
         setPage(1);
+        // Clearing an in-flight query must also clear its spinner.  The
+        // previous request's finally block is generation-gated and therefore
+        // cannot do this after the generation bump.
+        setLoading(false);
         return;
       }
       activeAbortRef.current?.abort();
@@ -256,14 +271,18 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
   );
 
   useEffect(() => {
-    onPagingChange?.({
-      page,
-      totalPages,
-      loadPage: (targetPage) => loadPage(targetPage, true),
-      prefetchPage: (targetPage) => loadPage(targetPage, false),
-    });
+    onPagingChange?.(
+      principalReady
+        ? {
+            page,
+            totalPages,
+            loadPage: (targetPage) => loadPage(targetPage, true),
+            prefetchPage: (targetPage) => loadPage(targetPage, false),
+          }
+        : null,
+    );
     return () => onPagingChange?.(null);
-  }, [loadPage, onPagingChange, page, totalPages]);
+  }, [loadPage, onPagingChange, page, principalReady, totalPages]);
 
   useEffect(() => {
     const pageCache = pageCacheRef.current;
@@ -279,6 +298,25 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
     };
   }, []);
 
+  // Principal changes invalidate the previous search/results namespace.
+  useEffect(() => {
+    setStateUserId(userId);
+    initializedRef.current = false;
+    generationRef.current += 1;
+    activeAbortRef.current?.abort();
+    pagingAbortRef.current.abort();
+    pagingAbortRef.current = new AbortController();
+    tagsRef.current = [];
+    pageCacheRef.current.clear();
+    setTags([]);
+    setHistory([]);
+    setBookmarks([]);
+    setPage(1);
+    setTotal(0);
+    setTotalPages(1);
+    setLoading(false);
+  }, [userId]);
+
   // 初回のみ: 保存済みの検索条件があれば復元し、
   // 無ければ初期条件（直近3日のインポート）で自動検索する。
   //
@@ -287,25 +325,26 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
   // currentPath が "Hydrus" になる（＝リセット完了）まで待ってから検索する。
   useEffect(() => {
     if (initializedRef.current) return;
+    if (!userId) return;
     if (!isHydrusMode || currentPath !== "Hydrus") return;
     initializedRef.current = true;
-    setHistory(readTagHistory());
-    setBookmarks(readTagBookmarks());
-    const saved = readSearchTags();
+    setHistory(readTagHistory(userId));
+    setBookmarks(readTagBookmarks(userId));
+    const saved = readSearchTags(userId);
     const initial = saved ?? HYDRUS_DEFAULT_SEARCH_TAGS;
     setTags(initial);
-    if (saved === null) writeSearchTags(initial);
+    if (saved === null) writeSearchTags(initial, userId);
     void runSearch(initial, 1);
-  }, [isHydrusMode, currentPath, runSearch]);
+  }, [isHydrusMode, currentPath, runSearch, userId]);
 
   const applyTags = useCallback(
     (next: string[]) => {
       setTags(next);
-      writeSearchTags(next);
+      writeSearchTags(next, userId);
       setPage(1);
       void runSearch(next, 1);
     },
-    [runSearch],
+    [runSearch, userId],
   );
 
   const handleAddTag = () => {
@@ -321,21 +360,43 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
   };
 
   /** 履歴/ブックマークからの1クリック追加。既存タグは重複追加しない。 */
-  const handleUseTag = (tag: string) => {
+  const handleUseTag = useCallback((tag: string) => {
     if (tags.includes(tag)) return;
     applyTags([...tags, tag]);
-  };
+  }, [applyTags, tags]);
+
+  // The Files workspace sidebar is a second entry point for the same Hydrus
+  // tag bookmarks. Keep the search bar and sidebar in sync without introducing
+  // a second persistence mechanism.
+  useEffect(() => {
+    const onBookmarksChanged = (event: Event) => {
+      const detail = (event as CustomEvent<{ userId?: string | null }>).detail;
+      if ((detail?.userId ?? null) !== (userId ?? null)) return;
+      setBookmarks(readTagBookmarks(userId));
+    };
+    const onUseBookmark = (event: Event) => {
+      const detail = (event as CustomEvent<{ tag?: unknown; userId?: string | null }>).detail;
+      if (typeof detail?.tag !== "string" || (detail.userId ?? null) !== (userId ?? null)) return;
+      handleUseTag(detail.tag);
+    };
+    window.addEventListener("hydrus-tag-bookmarks-changed", onBookmarksChanged);
+    window.addEventListener("hydrus-tag-bookmark-use", onUseBookmark);
+    return () => {
+      window.removeEventListener("hydrus-tag-bookmarks-changed", onBookmarksChanged);
+      window.removeEventListener("hydrus-tag-bookmark-use", onUseBookmark);
+    };
+  }, [handleUseTag, userId]);
 
   const handleToggleBookmark = (tag: string) => {
-    setBookmarks(toggleTagBookmark(tag));
+    setBookmarks(toggleTagBookmark(tag, userId));
   };
 
   const handleRemoveHistory = (tag: string) => {
-    setHistory(removeTagHistory(tag));
+    setHistory(removeTagHistory(tag, userId));
   };
 
   const handleClearHistory = () => {
-    setHistory(clearTagHistory());
+    setHistory(clearTagHistory(userId));
   };
 
   const handleKey = (e: React.KeyboardEvent) => {
@@ -351,7 +412,7 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
   };
 
   return (
-    <div className="flex flex-col gap-2 rounded-md border bg-muted/20 p-2">
+    <div className="mx-6 flex flex-col gap-2 rounded-md border border-border bg-card/40 p-3">
       <div className="flex items-center gap-2">
         <Search className="size-4 text-muted-foreground" />
         <Input
@@ -359,9 +420,9 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
           onChange={(e) => setTagInput(e.target.value)}
           onKeyDown={handleKey}
           placeholder="タグ追加（例: rating:like/1, system:filetype:image, width>1000）Enterで追加"
-          className="h-8"
+          className="h-8 border-border bg-background text-[13px]"
         />
-        <Button size="sm" onClick={handleAddTag} disabled={!tagInput.trim()}>
+          <Button size="sm" className="h-8 bg-primary-container text-primary-foreground hover:bg-primary" onClick={handleAddTag} disabled={!tagInput.trim()}>
           追加
         </Button>
         <div className="flex items-center rounded-md border">
@@ -389,9 +450,9 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
       </div>
 
       {/* 現在の検索条件 */}
-      {tags.length > 0 && (
+      {visibleTags.length > 0 && (
         <div className="flex flex-wrap gap-1">
-          {tags.map((t, i) => (
+          {visibleTags.map((t, i) => (
             <span
               key={`${t}-${i}`}
               className="inline-flex items-center gap-1 rounded bg-primary/10 px-2 py-0.5 text-xs"
@@ -400,12 +461,12 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
                 className="hover:text-amber-500"
                 onClick={() => handleToggleBookmark(t)}
                 title={
-                  bookmarks.includes(t)
+                  visibleBookmarks.includes(t)
                     ? "ブックマーク解除"
                     : "ブックマークに追加"
                 }
                 aria-label={
-                  bookmarks.includes(t)
+                  visibleBookmarks.includes(t)
                     ? "ブックマーク解除"
                     : "ブックマークに追加"
                 }
@@ -413,7 +474,7 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
                 <Star
                   className={cn(
                     "size-3",
-                    bookmarks.includes(t) && "fill-amber-400 text-amber-400",
+                    visibleBookmarks.includes(t) && "fill-amber-400 text-amber-400",
                   )}
                 />
               </button>
@@ -432,13 +493,13 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
       )}
 
       {/* ブックマーク */}
-      {bookmarks.length > 0 && (
+      {visibleBookmarks.length > 0 && (
         <div className="flex flex-wrap items-center gap-1">
           <span className="inline-flex items-center gap-1 text-[10px] text-muted-foreground">
             <Star className="size-3" />
             ブックマーク
           </span>
-          {bookmarks.map((t) => (
+          {visibleBookmarks.map((t) => (
             <span
               key={`bm-${t}`}
               className="inline-flex items-center gap-1 rounded bg-amber-500/10 px-2 py-0.5 text-xs"
@@ -446,9 +507,9 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
               <button
                 className="hover:underline disabled:opacity-50 disabled:no-underline"
                 onClick={() => handleUseTag(t)}
-                disabled={tags.includes(t)}
+                disabled={visibleTags.includes(t)}
                 title={
-                  tags.includes(t) ? "既に検索条件にあります" : "検索条件へ追加"
+                  visibleTags.includes(t) ? "既に検索条件にあります" : "検索条件へ追加"
                 }
               >
                 {t}
@@ -467,13 +528,13 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
       )}
 
       {/* 使用履歴 */}
-      {history.length > 0 && (
+      {visibleHistory.length > 0 && (
         <div className="flex flex-wrap items-center gap-1">
           <span className="inline-flex items-center gap-1 text-[10px] text-muted-foreground">
             <History className="size-3" />
             使用履歴
           </span>
-          {history.map((t) => (
+          {visibleHistory.map((t) => (
             <span
               key={`hist-${t}`}
               className="inline-flex items-center gap-1 rounded bg-muted px-2 py-0.5 text-xs"
@@ -482,12 +543,12 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
                 className="hover:text-amber-500"
                 onClick={() => handleToggleBookmark(t)}
                 title={
-                  bookmarks.includes(t)
+                  visibleBookmarks.includes(t)
                     ? "ブックマーク解除"
                     : "ブックマークに追加"
                 }
                 aria-label={
-                  bookmarks.includes(t)
+                  visibleBookmarks.includes(t)
                     ? "ブックマーク解除"
                     : "ブックマークに追加"
                 }
@@ -495,16 +556,16 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
                 <Star
                   className={cn(
                     "size-3",
-                    bookmarks.includes(t) && "fill-amber-400 text-amber-400",
+                    visibleBookmarks.includes(t) && "fill-amber-400 text-amber-400",
                   )}
                 />
               </button>
               <button
                 className="hover:underline disabled:opacity-50 disabled:no-underline"
                 onClick={() => handleUseTag(t)}
-                disabled={tags.includes(t)}
+                disabled={visibleTags.includes(t)}
                 title={
-                  tags.includes(t) ? "既に検索条件にあります" : "検索条件へ追加"
+                  visibleTags.includes(t) ? "既に検索条件にあります" : "検索条件へ追加"
                 }
               >
                 {t}
@@ -531,31 +592,21 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
         </div>
       )}
 
-      {(loading || total > 0) && (
+      {(visibleLoading || visibleTotal > 0) && (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          {loading ? (
+          {visibleLoading ? (
             <span>検索中...</span>
           ) : (
             <>
               <span>
-                {total}件 / {page}/{totalPages}ページ（インポート日時の新しい順）
+                {visibleTotal}件 / {visiblePage}/{visibleTotalPages}ページ（インポート日時の新しい順）
               </span>
-              <Button
-                size="xs"
-                variant="ghost"
-                onClick={() => goPage(page - 1)}
-                disabled={page <= 1}
-              >
-                前
-              </Button>
-              <Button
-                size="xs"
-                variant="ghost"
-                onClick={() => goPage(page + 1)}
-                disabled={page >= totalPages}
-              >
-                次
-              </Button>
+              <Pagination
+                page={visiblePage}
+                totalPages={visibleTotalPages}
+                onPageChange={goPage}
+                label="Hydrusページ"
+              />
             </>
           )}
         </div>

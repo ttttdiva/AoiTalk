@@ -11,6 +11,7 @@ import yaml
 
 from .models import HeartbeatDefinition
 from .registry import get_heartbeat_registry, register_heartbeat
+from .security import HeartbeatSecurityError, resolve_heartbeat_yaml_path, validate_heartbeat_name
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,12 @@ def save_heartbeat_to_yaml(heartbeat: HeartbeatDefinition, heartbeats_dir: Optio
     """HeartbeatをYAMLファイルに保存"""
     directory = heartbeats_dir or HEARTBEATS_DIR
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{heartbeat.name}.yaml"
+    try:
+        validate_heartbeat_name(heartbeat.name)
+        path = resolve_heartbeat_yaml_path(heartbeat.name, directory)
+    except HeartbeatSecurityError:
+        logger.error("[HeartbeatLoader] 無効な Heartbeat 名: %s", heartbeat.name)
+        return False
 
     data = {
         "name": heartbeat.name,
@@ -89,7 +95,11 @@ def save_heartbeat_to_yaml(heartbeat: HeartbeatDefinition, heartbeats_dir: Optio
 def delete_heartbeat_yaml(name: str, heartbeats_dir: Optional[Path] = None) -> bool:
     """Heartbeat YAMLファイルを削除"""
     directory = heartbeats_dir or HEARTBEATS_DIR
-    path = directory / f"{name}.yaml"
+    try:
+        path = resolve_heartbeat_yaml_path(name, directory)
+    except HeartbeatSecurityError:
+        logger.error("[HeartbeatLoader] 無効な Heartbeat 名: %s", name)
+        return False
     if path.exists():
         path.unlink()
         return True

@@ -30,7 +30,7 @@ export async function PATCH(
     .where(
       and(
         eq(knowledgeAiSuggestions.id, id),
-        eq(knowledgeAiSuggestions.workspaceId, workspace.id),
+        eq(knowledgeAiSuggestions.docsLibraryId, workspace.id),
       ),
     )
     .returning();

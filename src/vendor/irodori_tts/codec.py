@@ -5,8 +5,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-import torchaudio
 from huggingface_hub import hf_hub_download
+
+try:
+    import torchaudio
+except Exception:  # pragma: no cover - optional import for metadata-only users
+    torchaudio = None
 
 _CODEC_DEFAULT = object()
 
@@ -54,6 +58,7 @@ class DACVAECodec:
         deterministic_encode: bool = True,
         deterministic_decode: bool = True,
         normalize_db: float | None = -16.0,
+        cache_dir: str | None = None,
     ) -> DACVAECodec:
         # Prefer installed package; fallback to local clone at ../dacvae.
         try:
@@ -69,7 +74,11 @@ class DACVAECodec:
             location = location[len("hf://") :]
         if not Path(location).exists() and "/" in location and not location.endswith(".pth"):
             try:
-                location = hf_hub_download(repo_id=location, filename="weights.pth")
+                location = hf_hub_download(
+                    repo_id=location,
+                    filename="weights.pth",
+                    cache_dir=cache_dir,
+                )
                 print(f"[codec] dacvae: hf://{repo_id} -> {location}", flush=True)
             except Exception:
                 # Let DACVAE.load surface a clearer error if this is not a valid path/repo.
@@ -198,6 +207,11 @@ class DACVAECodec:
         if waveform.shape[1] != 1:
             waveform = waveform.mean(dim=1, keepdim=True)
         if sample_rate != self.sample_rate:
+            if torchaudio is None:
+                raise RuntimeError(
+                    "torchaudio is required to resample reference audio. "
+                    "Install the AoiTalk audio/Irodori dependencies."
+                )
             waveform = torchaudio.functional.resample(waveform, sample_rate, self.sample_rate)
 
         if normalize_db is _CODEC_DEFAULT:
@@ -267,9 +281,13 @@ class DACVAECodec:
         return self.model.decode(z)
 
     def encode_file(self, path: str | Path) -> torch.Tensor:
-        try:
-            wav, sr = torchaudio.load(str(path))
-        except RuntimeError:
+        wav = None
+        if torchaudio is not None:
+            try:
+                wav, sr = torchaudio.load(str(path))
+            except RuntimeError:
+                wav = None
+        if wav is None:
             import soundfile as sf
 
             data, sr = sf.read(str(path), dtype="float32")

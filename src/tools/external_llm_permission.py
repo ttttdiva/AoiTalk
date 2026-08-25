@@ -10,12 +10,39 @@ for the user's approve/deny response.
 import asyncio
 import contextvars
 import logging
+import os
+import re
+import shlex
 import uuid
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_PERMISSION_SESSION_KEY = "default"
+
+# 承認キャッシュを引くための会話セッション識別子。
+# 誰もセットしなければ全体で1つの既定キーになる（単一ユーザー運用では十分）。
+_current_permission_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "aoitalk_permission_session_key",
+    default=DEFAULT_PERMISSION_SESSION_KEY,
+)
+
+
+def set_permission_session_key(value: Optional[str]):
+    """承認キャッシュのスコープとなるセッションキーを設定する。"""
+    return _current_permission_session_key.set(
+        str(value or DEFAULT_PERMISSION_SESSION_KEY)
+    )
+
+
+def reset_permission_session_key(token) -> None:
+    _current_permission_session_key.reset(token)
+
+
+def get_permission_session_key() -> str:
+    return _current_permission_session_key.get()
 
 
 class PermissionStatus(Enum):
@@ -36,6 +63,35 @@ class PermissionRequest:
     status: PermissionStatus = PermissionStatus.PENDING
     future: Optional[asyncio.Future] = field(default=None, repr=False)
     loop: Optional[asyncio.AbstractEventLoop] = field(default=None, repr=False)
+    # セッション承認キャッシュ用のキー。None ならキャッシュ対象外。
+    cache_key: Optional[Tuple[str, str, str]] = field(default=None, repr=False)
+    scope: str = "once"
+    user_id: Optional[str] = field(default=None, repr=False)
+    session_id: Optional[str] = field(default=None, repr=False)
+
+
+def get_permission_request_scope() -> tuple[Optional[str], Optional[str]]:
+    """Return the user/session scope carried by the current generation task."""
+    value = get_permission_session_key()
+    if "|" not in value:
+        return None, None
+    user_id, session_id = value.split("|", 1)
+    return user_id or None, session_id or None
+
+
+def _enterprise_permission_scope_required() -> bool:
+    """Require an owner scope for permission prompts in Enterprise."""
+    try:
+        from ..features import Features
+
+        return Features.is_enterprise()
+    except Exception:
+        # If the central profile resolver is unavailable, either selector
+        # requesting Enterprise must still fail closed.
+        return any(
+            str(os.getenv(name) or "").strip().lower() == "enterprise"
+            for name in ("AOITALK_PROFILE", "AIVTUBER_ENV")
+        )
 
 
 FILE_WRITE_TOOLS = {
@@ -47,6 +103,8 @@ FILE_WRITE_TOOLS = {
     "create_workspace_directory",
     "upload_workspace_file",
     "move_workspace_item",
+    "copy_workspace_item",
+    "docs_place_workspace_file",
     "upload_user_file",
 }
 
@@ -85,9 +143,12 @@ PROJECT_MANAGEMENT_MUTATION_TOOLS = {
 }
 
 DOCS_MUTATION_TOOLS = {
+    "docs_attach_workspace_file",
+    "docs_place_workspace_file",
     "docs_ensure_inbox",
     "docs_create_nodes",
     "docs_update_node",
+    "inbox_update_item",
     "docs_move_node",
     "docs_archive_node",
 }
@@ -100,6 +161,117 @@ DEFAULT_PERMISSION_TOOLS = sorted(
     | PROJECT_MANAGEMENT_MUTATION_TOOLS
     | DOCS_MUTATION_TOOLS
 )
+
+MUTATION_TOOLS = (
+    FILE_WRITE_TOOLS
+    | FILE_DELETE_TOOLS
+    | COMMAND_TOOLS
+    | PROJECT_MANAGEMENT_MUTATION_TOOLS
+    | DOCS_MUTATION_TOOLS
+)
+
+# 取り返しのつかないコマンドを拾うためのパターン。
+# CommandExecutor.DANGEROUS_PATTERNS とは別物で、こちらは「確認ダイアログを出すか」
+# だけを決める。判定できないものは False（＝確認しない）に倒し、既定を自由側に保つ。
+_DESTRUCTIVE_COMMAND_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # 削除系
+    re.compile(r"(?:^|[;&|]\s*)\s*(?:sudo\s+)?rm\b", re.IGNORECASE),
+    re.compile(r"(?:^|[;&|]\s*)\s*(?:sudo\s+)?rmdir\b", re.IGNORECASE),
+    re.compile(r"(?:^|[;&|]\s*)\s*(?:sudo\s+)?unlink\b", re.IGNORECASE),
+    re.compile(r"(?:^|[;&|]\s*)\s*(?:sudo\s+)?shred\b", re.IGNORECASE),
+    re.compile(r"\bdel\s+/[a-z]", re.IGNORECASE),
+    re.compile(r"(?:^|[;&|]\s*)\s*(?:del|erase)\b", re.IGNORECASE),
+    re.compile(r"\brd\s+/s\b", re.IGNORECASE),
+    re.compile(r"\bRemove-Item\b", re.IGNORECASE),
+    re.compile(r"\bClear-Content\b", re.IGNORECASE),
+    # フォーマット・ディスク操作
+    re.compile(r"(?:^|[;&|]\s*)\s*(?:sudo\s+)?mkfs(?:\.\w+)?\b", re.IGNORECASE),
+    re.compile(r"(?:^|[;&|]\s*)\s*format\s+[a-z]:", re.IGNORECASE),
+    re.compile(r"\bdiskpart\b", re.IGNORECASE),
+    re.compile(r"\bFormat-Volume\b", re.IGNORECASE),
+    re.compile(r"\bdd\s+[^|]*\bof=", re.IGNORECASE),
+    # 上書きリダイレクト。>> の追記、`2>&1` のような fd 複製、
+    # /dev/null・$null・NUL への破棄はファイルを壊さないので対象外。
+    re.compile(
+        r"(?<!>)>(?!>)(?!&)\s*(?!(?:/dev/null|\$null|nul\b))\S",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bOut-File\b(?![^|]*-Append)", re.IGNORECASE),
+    re.compile(r"\bSet-Content\b", re.IGNORECASE),
+    # 破壊的な git 操作
+    re.compile(r"\bgit\b[^|;&]*\breset\b[^|;&]*--hard\b", re.IGNORECASE),
+    re.compile(r"\bgit\b[^|;&]*\bclean\b[^|;&]*-[a-z]*f", re.IGNORECASE),
+    re.compile(r"\bgit\b[^|;&]*\bpush\b[^|;&]*(?:--force\b|-f\b)", re.IGNORECASE),
+    re.compile(r"\bgit\b[^|;&]*\bcheckout\b[^|;&]*\s--\s", re.IGNORECASE),
+    re.compile(r"\bgit\b[^|;&]*\bbranch\b[^|;&]*\s-D\b"),
+    re.compile(r"\bgit\b[^|;&]*\bfilter-branch\b", re.IGNORECASE),
+    # 権限・システム設定
+    re.compile(r"(?:^|[;&|]\s*)\s*(?:sudo\s+)?chmod\b[^|;&]*-R\b", re.IGNORECASE),
+    re.compile(r"(?:^|[;&|]\s*)\s*(?:sudo\s+)?chown\b[^|;&]*-R\b", re.IGNORECASE),
+    re.compile(r"\breg\s+delete\b", re.IGNORECASE),
+    # 破壊的なパッケージ/DB操作
+    re.compile(r"\bdrop\s+(?:database|table|schema)\b", re.IGNORECASE),
+    re.compile(r"\btruncate\s+table\b", re.IGNORECASE),
+    re.compile(r"\bdocker\b[^|;&]*\b(?:rm|rmi|prune)\b", re.IGNORECASE),
+)
+
+
+def _command_looks_destructive(command: str) -> bool:
+    """コマンド文字列が取り返しのつかない操作かどうかを判定する。
+
+    確認ダイアログを出すかどうかだけを決める緩い判定で、判定できない場合は
+    ``False``（確認しない）を返す。既定は自由側に倒す方針のため。
+    """
+    text = str(command or "").strip()
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in _DESTRUCTIVE_COMMAND_PATTERNS)
+
+
+def _command_program_name(command: str) -> str:
+    """コマンド文字列から実行プログラム名だけを取り出す。"""
+    text = str(command or "").strip()
+    if not text:
+        return ""
+    try:
+        tokens = shlex.split(text, posix=False)
+    except ValueError:
+        tokens = text.split()
+    for token in tokens:
+        cleaned = token.strip("\"'")
+        if not cleaned or "=" in cleaned.split("/")[0].split("\\")[0]:
+            # 環境変数の前置き（VAR=value cmd）は読み飛ばす
+            continue
+        return cleaned.casefold()
+    return ""
+
+
+_PATH_ARG_KEYS = (
+    "path",
+    "file_path",
+    "filename",
+    "src",
+    "node_id",
+    "name",
+)
+
+
+def build_approval_signature(tool_name: str, tool_args: Optional[Dict[str, Any]]) -> str:
+    """承認キャッシュのキーに使う「同種の操作」を表す署名を作る。
+
+    JSON の完全一致ではなく、``execute_command`` は実行プログラム名、
+    ファイル系ツールは対象パスまでを見る粒度にする。
+    """
+    args = tool_args or {}
+    if tool_name in COMMAND_TOOLS:
+        return f"program:{_command_program_name(args.get('command', ''))}"
+    if tool_name in (FILE_WRITE_TOOLS | FILE_DELETE_TOOLS):
+        for key in _PATH_ARG_KEYS:
+            value = args.get(key)
+            if value:
+                return f"path:{str(value)}"
+        return "path:"
+    return ""
 
 
 class ExternalLLMPermissionManager:
@@ -123,31 +295,68 @@ class ExternalLLMPermissionManager:
         self._pending_requests: Dict[str, PermissionRequest] = {}
         self._broadcast_callback: Optional[Callable] = None
         self._timeout_seconds = 300  # 5 minutes timeout
-        
+        # (session_key, tool_name, signature) -> セッション中は許可
+        self._session_approvals: set[Tuple[str, str, str]] = set()
+
         # Load config
         self._load_config()
-    
+
     def _load_config(self):
         """Load configuration settings"""
         self.auto_approve = True  # Default to current behavior outside agent modes
         self.enabled_tools = DEFAULT_PERMISSION_TOOLS.copy()
-        
+        # プロファイル名 -> PermissionPolicy。設定で既定より厳しくするための上書き。
+        self.permission_policy_overrides: Dict[str, Any] = {}
+        self.session_approval_cache_enabled = True
+
         if self.config is None:
             return
-        
+
         # Get external_llm config
         external_llm_config = None
         if hasattr(self.config, 'get'):
             external_llm_config = self.config.get('external_llm', {})
         elif isinstance(self.config, dict):
             external_llm_config = self.config.get('external_llm', {})
-        
+
         if external_llm_config:
             self.auto_approve = external_llm_config.get('auto_approve', True)
             self.enabled_tools = external_llm_config.get('tools', self.enabled_tools)
-        
-        logger.info(f"[ExternalLLMPermission] auto_approve={self.auto_approve}, tools={self.enabled_tools}")
-    
+            self.session_approval_cache_enabled = bool(
+                external_llm_config.get('session_approval_cache', True)
+            )
+            self.permission_policy_overrides = self._parse_policy_overrides(
+                external_llm_config.get('permission_policy_overrides')
+            )
+
+        logger.info(
+            "[ExternalLLMPermission] auto_approve=%s, tools=%s, "
+            "policy_overrides=%s, session_approval_cache=%s",
+            self.auto_approve,
+            self.enabled_tools,
+            {k: v.value for k, v in self.permission_policy_overrides.items()},
+            self.session_approval_cache_enabled,
+        )
+
+    @staticmethod
+    def _parse_policy_overrides(raw: Any) -> Dict[str, Any]:
+        """``permission_policy_overrides`` を安全に解釈する。
+
+        空文字・None・未知の文字列は黙って無視する。設定ミスで動かなくなるより、
+        既定のポリシーで動くほうを優先するため。
+        """
+        from ..llm.generation_policy import resolve_permission_policy
+
+        if not isinstance(raw, dict):
+            return {}
+        resolved: Dict[str, Any] = {}
+        for profile_name, value in raw.items():
+            policy = resolve_permission_policy(value)
+            if policy is None:
+                continue
+            resolved[str(profile_name)] = policy
+        return resolved
+
     def set_broadcast_callback(self, callback: Callable):
         """
         Set the callback for broadcasting permission requests to WebUI.
@@ -157,41 +366,91 @@ class ExternalLLMPermissionManager:
         """
         self._broadcast_callback = callback
     
-    def is_permission_required(self, tool_name: str) -> bool:
-        """
-        Check if permission is required for the given tool.
-        
-        Args:
-            tool_name: Name of the tool
-            
-        Returns:
-            True if permission is required (auto_approve=False and tool is in list)
+    def effective_permission_policy(self):
+        """現在のプロファイルに適用される PermissionPolicy を返す。
+
+        設定の ``permission_policy_overrides`` があればプロファイル既定より優先する。
         """
         # Import lazily because src.llm package initialization imports src.tools.
         # An eager import here creates a cycle before this module exposes its helpers.
-        from ..llm.generation_policy import (
-            PermissionPolicy,
-            get_current_generation_policy,
-        )
+        from ..llm.generation_policy import get_current_generation_policy
 
-        permission_policy = get_current_generation_policy().permission_policy
+        policy = get_current_generation_policy()
+        profile_name = getattr(policy.profile, "value", str(policy.profile))
+        override = self.permission_policy_overrides.get(profile_name)
+        if override is not None:
+            return override
+        return policy.permission_policy
+
+    def is_permission_required(
+        self,
+        tool_name: str,
+        tool_args: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Check if permission is required for the given tool.
+
+        Args:
+            tool_name: Name of the tool
+            tool_args: Arguments passed to the tool（破壊性の判定に使う。省略可）
+
+        Returns:
+            True if permission is required
+        """
+        from ..llm.generation_policy import PermissionPolicy
+
+        permission_policy = self.effective_permission_policy()
         if permission_policy == PermissionPolicy.AUTO_APPROVE:
             return False
+        if permission_policy == PermissionPolicy.CONFIRM_DESTRUCTIVE:
+            # 取り返しのつかない操作だけ確認する。
+            # 作成・編集・追記・Docs更新・プロジェクト管理・検索・読み取りは確認しない。
+            if tool_name in FILE_DELETE_TOOLS:
+                return True
+            if tool_name in COMMAND_TOOLS:
+                command = str((tool_args or {}).get("command") or "")
+                return _command_looks_destructive(command)
+            return False
         if permission_policy == PermissionPolicy.CONFIRM_MUTATIONS:
-            return tool_name in (
-                FILE_WRITE_TOOLS
-                | FILE_DELETE_TOOLS
-                | COMMAND_TOOLS
-                | PROJECT_MANAGEMENT_MUTATION_TOOLS
-                | DOCS_MUTATION_TOOLS
-            )
+            return tool_name in MUTATION_TOOLS
         if permission_policy == PermissionPolicy.CONFIRM_ALL_TOOLS:
             return tool_name in self.enabled_tools
 
         if self.auto_approve:
             return False
         return tool_name in self.enabled_tools
-    
+
+    def _approval_cache_key(
+        self,
+        tool_name: str,
+        tool_args: Optional[Dict[str, Any]],
+    ) -> Optional[Tuple[str, str, str]]:
+        if not self.session_approval_cache_enabled:
+            return None
+        return (
+            get_permission_session_key(),
+            tool_name,
+            build_approval_signature(tool_name, tool_args),
+        )
+
+    def is_approved_for_session(
+        self,
+        tool_name: str,
+        tool_args: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """同じ署名の操作がこのセッションで既に許可済みかどうか。"""
+        cache_key = self._approval_cache_key(tool_name, tool_args)
+        return bool(cache_key and cache_key in self._session_approvals)
+
+    def clear_session_approvals(self, session_key: Optional[str] = None) -> None:
+        """セッション承認キャッシュを破棄する。"""
+        if session_key is None:
+            self._session_approvals.clear()
+            return
+        self._session_approvals = {
+            key for key in self._session_approvals if key[0] != session_key
+        }
+
     async def request_permission(
         self,
         tool_name: str,
@@ -210,19 +469,37 @@ class ExternalLLMPermissionManager:
             True if approved, False if denied or timeout
         """
         # Auto-approve if configured/current mode allows it.
-        if not self.is_permission_required(tool_name):
+        if not self.is_permission_required(tool_name, tool_args):
             return True
-        
+
+        # このセッションで同種の操作を既に許可済みなら、聞き直さない。
+        cache_key = self._approval_cache_key(tool_name, tool_args)
+        if cache_key and cache_key in self._session_approvals:
+            logger.info(
+                "[ExternalLLMPermission] セッション承認キャッシュにより自動許可: %s",
+                cache_key,
+            )
+            return True
+
         # Require broadcast callback
         if self._broadcast_callback is None:
             logger.warning("[ExternalLLMPermission] No broadcast callback set, denying")
             return False
-        
+
+        permission_user_id, permission_session_id = get_permission_request_scope()
+        if _enterprise_permission_scope_required() and not (
+            permission_user_id and permission_session_id
+        ):
+            logger.error(
+                "[ExternalLLMPermission] Enterprise permission request has no user/session scope; denying"
+            )
+            return False
+
         # Create request
         request_id = str(uuid.uuid4())
         loop = asyncio.get_event_loop()
         future = loop.create_future()
-        
+
         request = PermissionRequest(
             request_id=request_id,
             tool_name=tool_name,
@@ -230,10 +507,13 @@ class ExternalLLMPermissionManager:
             description=description or self._generate_description(tool_name, tool_args),
             future=future,
             loop=loop,
+            cache_key=cache_key,
+            user_id=permission_user_id,
+            session_id=permission_session_id,
         )
-        
+
         self._pending_requests[request_id] = request
-        
+
         # Broadcast permission request to WebUI
         try:
             await self._broadcast_callback({
@@ -242,10 +522,15 @@ class ExternalLLMPermissionManager:
                     "request_id": request_id,
                     "tool_name": tool_name,
                     "tool_args": tool_args,
-                    "description": request.description
+                    "description": request.description,
+                    # WebUI に「1回だけ許可 / このセッション中は許可 / 拒否」を出させる
+                    "scope_options": (
+                        ["once", "session"] if cache_key else ["once"]
+                    ),
+                    "signature": cache_key[2] if cache_key else "",
                 }
             })
-            
+
             logger.info(f"[ExternalLLMPermission] Sent permission request: {request_id} for {tool_name}")
             
             # Wait for response with timeout
@@ -276,6 +561,10 @@ class ExternalLLMPermissionManager:
         confirm: bool = True,
         notify: bool = True,
         request_kind: str = "external_model_prompt",
+        source_kind: str = "",
+        risk_level: str = "",
+        semantic_status: str = "",
+        warning: str = "",
     ) -> Optional[str]:
         """Ask the WebUI to approve or edit a prompt before an external model call."""
         outbound_prompt = (redacted_prompt or "").strip() or prompt
@@ -284,6 +573,15 @@ class ExternalLLMPermissionManager:
 
         if self._broadcast_callback is None:
             logger.warning("[ExternalLLMPermission] No broadcast callback set, denying external model prompt")
+            return None
+
+        permission_user_id, permission_session_id = get_permission_request_scope()
+        if _enterprise_permission_scope_required() and not (
+            permission_user_id and permission_session_id
+        ):
+            logger.error(
+                "[ExternalLLMPermission] Enterprise external-model prompt has no user/session scope; denying"
+            )
             return None
 
         request_id = str(uuid.uuid4())
@@ -303,6 +601,8 @@ class ExternalLLMPermissionManager:
             or f"分担先モデル {provider}/{model} へ送信するプロンプトを確認してください",
             future=future,
             loop=loop,
+            user_id=permission_user_id,
+            session_id=permission_session_id,
         )
         self._pending_requests[request_id] = request
 
@@ -320,6 +620,10 @@ class ExternalLLMPermissionManager:
                         "redaction_findings": redaction_findings or [],
                         "description": request.description,
                         "notify": notify,
+                        "source_kind": source_kind,
+                        "risk_level": risk_level,
+                        "semantic_status": semantic_status,
+                        "warning": warning,
                     },
                 }
             )
@@ -338,39 +642,96 @@ class ExternalLLMPermissionManager:
         finally:
             self._pending_requests.pop(request_id, None)
     
-    def handle_permission_response(self, request_id: str, approved: bool):
+    def handle_permission_response(
+        self,
+        request_id: str,
+        approved: bool,
+        scope: str = "once",
+        *,
+        requester_user_id: Optional[str] = None,
+        requester_session_id: Optional[str] = None,
+    ):
         """
         Handle user response to permission request.
-        
+
         Args:
             request_id: The request ID
             approved: True if user approved, False if denied
+            scope: ``"once"`` なら今回だけ、``"session"`` ならセッション中は許可を記憶する
         """
         request = self._pending_requests.get(request_id)
         if not request:
             logger.warning(f"[ExternalLLMPermission] Unknown request ID: {request_id}")
             return
-        
+        if (
+            request.user_id
+            and request.user_id != str(requester_user_id or "")
+        ) or (
+            request.session_id
+            and request.session_id != str(requester_session_id or "")
+        ):
+            logger.warning(
+                "[ExternalLLMPermission] Permission response scope mismatch: %s",
+                request_id,
+            )
+            return
+
+        normalized_scope = str(scope or "once").strip().casefold()
+        if normalized_scope not in ("once", "session"):
+            normalized_scope = "once"
+        request.scope = normalized_scope
         request.status = PermissionStatus.APPROVED if approved else PermissionStatus.DENIED
-        
+
+        if (
+            approved
+            and normalized_scope == "session"
+            and self.session_approval_cache_enabled
+            and request.cache_key
+        ):
+            self._session_approvals.add(request.cache_key)
+            logger.info(
+                "[ExternalLLMPermission] セッション承認をキャッシュしました: %s",
+                request.cache_key,
+            )
+
         if request.future and not request.future.done():
             if request.loop and request.loop.is_running():
                 request.loop.call_soon_threadsafe(request.future.set_result, approved)
             else:
                 request.future.set_result(approved)
-        
-        logger.info(f"[ExternalLLMPermission] Permission response: {request_id} -> {'approved' if approved else 'denied'}")
+
+        logger.info(
+            "[ExternalLLMPermission] Permission response: %s -> %s (scope=%s)",
+            request_id,
+            "approved" if approved else "denied",
+            normalized_scope,
+        )
 
     def handle_external_model_prompt_response(
         self,
         request_id: str,
         approved: bool,
         prompt: str = "",
+        *,
+        requester_user_id: Optional[str] = None,
+        requester_session_id: Optional[str] = None,
     ):
         """Handle user response for an external model prompt request."""
         request = self._pending_requests.get(request_id)
         if not request:
             logger.warning("[ExternalLLMPermission] Unknown external model prompt request ID: %s", request_id)
+            return
+        if (
+            request.user_id
+            and request.user_id != str(requester_user_id or "")
+        ) or (
+            request.session_id
+            and request.session_id != str(requester_session_id or "")
+        ):
+            logger.warning(
+                "[ExternalLLMPermission] External prompt scope mismatch: %s",
+                request_id,
+            )
             return
 
         request.status = PermissionStatus.APPROVED if approved else PermissionStatus.DENIED
@@ -410,14 +771,27 @@ class ExternalLLMPermissionManager:
             "move_workspace_item": lambda args: (
                 f"ワークスペース項目移動: {args.get('src', '')} -> {args.get('dest', '')}"
             ),
+            "copy_workspace_item": lambda args: (
+                f"ワークスペース項目コピー: {args.get('src', '')} -> {args.get('dest', '')}"
+            ),
             "upload_user_file": lambda args: f"ユーザーファイル保存: {args.get('filename', '')}",
             "delete_user_file": lambda args: f"ユーザーファイル削除: {args.get('filename', '')}",
             "docs_create_nodes": lambda args: (
                 f"Docsノード作成: 親「{args.get('parent', 'today')}」配下"
             ),
+            "docs_attach_workspace_file": lambda args: (
+                f"Docsへworkspaceファイル参照を追加: {args.get('file_path', '')}"
+            ),
+            "docs_place_workspace_file": lambda args: (
+                f"workspaceファイル配置とDocs参照追加: "
+                f"{args.get('src', '')} -> {args.get('dest', '')}"
+            ),
             "docs_ensure_inbox": lambda args: "Docs Inboxを作成または確認",
             "docs_update_node": lambda args: (
                 f"Docsノード更新: {args.get('title') or args.get('node_id', '')}"
+            ),
+            "inbox_update_item": lambda args: (
+                f"Inbox項目更新: {args.get('node_id', '')}"
             ),
             "docs_move_node": lambda args: (
                 f"Docsノード移動: {args.get('node_id', '')} -> {args.get('new_parent', '')}"
@@ -457,6 +831,10 @@ async def request_external_model_prompt(
     confirm: bool = True,
     notify: bool = True,
     request_kind: str = "external_model_prompt",
+    source_kind: str = "",
+    risk_level: str = "",
+    semantic_status: str = "",
+    warning: str = "",
 ) -> Optional[str]:
     manager = get_permission_manager()
     if manager is None:
@@ -473,6 +851,10 @@ async def request_external_model_prompt(
         confirm=confirm,
         notify=notify,
         request_kind=request_kind,
+        source_kind=source_kind,
+        risk_level=risk_level,
+        semantic_status=semantic_status,
+        warning=warning,
     )
 
 

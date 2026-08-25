@@ -10,7 +10,7 @@ from ..base import LLMKeywordDetector, KeywordDetectionResult, KeywordAction
 class SpotifyLLMKeywordDetector(LLMKeywordDetector):
     """LLMを使用するSpotify自動キュー検出器"""
     
-    def __init__(self, enabled: bool = True, llm_client=None):
+    def __init__(self, enabled: bool = True, llm_client=None, config=None):
         """
         初期化
         
@@ -19,6 +19,8 @@ class SpotifyLLMKeywordDetector(LLMKeywordDetector):
             llm_client: LLMクライアント
         """
         super().__init__("spotify", enabled, llm_client)
+        self.config = config
+        self.integration_enabled = self._read_integration_enabled(config) if config is not None else True
         
         # 検出対象キーワード
         self.keywords = [
@@ -74,7 +76,7 @@ class SpotifyLLMKeywordDetector(LLMKeywordDetector):
         Returns:
             検出結果
         """
-        if not self.enabled:
+        if not self.enabled or not self.integration_enabled:
             return KeywordDetectionResult()
         
         text_lower = text.lower()
@@ -130,7 +132,7 @@ class SpotifyLLMKeywordDetector(LLMKeywordDetector):
         Returns:
             処理結果メッセージ
         """
-        if not result.detected:
+        if not result.detected or not self.integration_enabled:
             return None
         
         try:
@@ -308,3 +310,23 @@ class SpotifyLLMKeywordDetector(LLMKeywordDetector):
                         )
         
         return None
+
+    @staticmethod
+    def _read_integration_enabled(config) -> bool:
+        """Read integrations.spotify.enabled and fail closed on missing state."""
+
+        if isinstance(config, dict):
+            value = config
+            for part in ("integrations", "spotify", "enabled"):
+                if not isinstance(value, dict) or part not in value:
+                    return False
+                value = value[part]
+            return bool(value)
+        getter = getattr(config, "get", None)
+        if callable(getter):
+            try:
+                value = getter("integrations.spotify.enabled", None)
+                return bool(value) if value is not None else False
+            except Exception:
+                return False
+        return False

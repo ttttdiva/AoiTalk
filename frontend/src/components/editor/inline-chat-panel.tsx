@@ -5,6 +5,9 @@ import { Send, X, Quote } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { useChatSessions } from "@/contexts/chat-session-context";
+import { chatApi } from "@/lib/chat-api";
+import { buildWebSocketUrl } from "@/lib/websocket-url";
 
 interface ChatMessage {
   id: string;
@@ -31,67 +34,316 @@ export function InlineChatPanel({
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamContent, setStreamContent] = useState("");
   const [isConnected, setIsConnected] = useState(false);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const streamBufferRef = useRef("");
+  const isStreamingRef = useRef(false);
+  const { addSession } = useChatSessions();
 
   const fileName = filePath.split("/").pop() || filePath;
 
-  // WebSocket接続
+  // EnterpriseではWebSocketの書き込みに所有者付き会話セッションが必要。
+  // ファイラーはチャットページのactiveSessionIdを共有しないため、このパネル
+  // 専用のセッションを作成してから同一オリジンのWSへ接続する。キャラクターは
+  // "aoi" に固定せず、Enterprise設定を含む現在のキャラクター解決APIに従う。
   useEffect(() => {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${protocol}//127.0.0.1:3000/ws`);
+    let cancelled = false;
 
-    ws.onopen = () => setIsConnected(true);
-    ws.onclose = () => setIsConnected(false);
-
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === "stream_start") {
-          setIsStreaming(true);
-          streamBufferRef.current = "";
-          setStreamContent("");
-        } else if (msg.type === "stream_token") {
-          streamBufferRef.current += msg.data?.token || "";
-          setStreamContent(streamBufferRef.current);
-        } else if (msg.type === "stream_end" || msg.type === "response") {
-          const finalContent = streamBufferRef.current || msg.data?.message || msg.data?.content || "";
-          if (finalContent) {
-            setMessages((prev) => [
-              ...prev,
-              {
-                id: `assistant-${Date.now()}`,
-                role: "assistant",
-                content: finalContent,
-                timestamp: new Date().toLocaleTimeString(),
-              },
-            ]);
-          }
-          setIsStreaming(false);
-          setStreamContent("");
-          streamBufferRef.current = "";
-        } else if (msg.type === "new_message" && msg.data?.type === "assistant") {
-          const content = msg.data.message || "";
-          if (content && !isStreaming) {
-            setMessages((prev) => [
-              ...prev,
-              {
-                id: `assistant-${Date.now()}`,
-                role: "assistant",
-                content,
-                timestamp: new Date().toLocaleTimeString(),
-              },
-            ]);
-          }
+    void chatApi
+      .getCurrentCharacterName()
+      .then((characterName) => chatApi.createSession(characterName))
+      .then(({ session }) => {
+        if (cancelled) return;
+        addSession(session);
+        setSessionId(session.id);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setConnectionError("チャットセッションを作成できませんでした");
         }
-      } catch { /* ignore parse errors */ }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [addSession]);
+
+  // WebSocket接続。window.location.hostを使い、localhost内側の3000番へ
+  // 直結せず、CaddyのTLS・Cookie認証境界を必ず通す。
+  useEffect(() => {
+    if (!sessionId) return;
+
+    const wsUrl = buildWebSocketUrl(sessionId);
+    let cancelled = false;
+    let reconnectAttempt = 0;
+    let reconnectTimer: number | null = null;
+    let generationPollTimer: number | null = null;
+    let pollGenerationUntilIdle: (() => void) | null = null;
+
+    const clearReconnectTimer = () => {
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
     };
 
-    wsRef.current = ws;
-    return () => ws.close();
-  }, [isStreaming]);
+    const clearGenerationPollTimer = () => {
+      if (generationPollTimer !== null) {
+        window.clearTimeout(generationPollTimer);
+        generationPollTimer = null;
+      }
+    };
+
+    const applyPersistedMessages = (
+      persisted: Awaited<ReturnType<typeof chatApi.getMessages>>["messages"],
+    ) => {
+      const durable = (persisted || [])
+        .filter(
+          (message) =>
+            message.role === "user" || message.role === "assistant",
+        )
+        .map((message) => ({
+          id: message.id,
+          role: message.role as "user" | "assistant",
+          content: message.content,
+          timestamp: message.created_at
+            ? new Date(message.created_at).toLocaleTimeString()
+            : "",
+        }));
+      const durableIds = new Set(durable.map((message) => message.id));
+      const durableContentCounts = new Map<string, number>();
+      for (const message of durable) {
+        const key = `${message.role}\u0000${message.content}`;
+        durableContentCounts.set(key, (durableContentCounts.get(key) || 0) + 1);
+      }
+      setMessages((current) => {
+        const pending = current.filter((message) => {
+          if (durableIds.has(message.id)) return false;
+          if (!message.id.startsWith("user-") && !message.id.startsWith("assistant-")) {
+            return true;
+          }
+          const key = `${message.role}\u0000${message.content}`;
+          const count = durableContentCounts.get(key) || 0;
+          if (count > 0) {
+            durableContentCounts.set(key, count - 1);
+            return false;
+          }
+          return true;
+        });
+        return [...durable, ...pending];
+      });
+    };
+
+    const connect = () => {
+      if (cancelled) return;
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      const scheduleGenerationPoll = () => {
+        clearGenerationPollTimer();
+        if (cancelled) return;
+        generationPollTimer = window.setTimeout(async () => {
+          generationPollTimer = null;
+          if (cancelled || wsRef.current !== ws) return;
+          try {
+            const status = await chatApi.getGenerationStatus(sessionId);
+            if (cancelled || wsRef.current !== ws) return;
+            if (status.running) {
+              isStreamingRef.current = true;
+              setIsStreaming(true);
+              scheduleGenerationPoll();
+              return;
+            }
+            isStreamingRef.current = false;
+            setIsStreaming(false);
+            setStreamContent("");
+            streamBufferRef.current = "";
+            const { messages: persisted } = await chatApi.getMessages(sessionId);
+            if (!cancelled && wsRef.current === ws) {
+              applyPersistedMessages(persisted);
+            }
+          } catch {
+            scheduleGenerationPoll();
+          }
+        }, 1000);
+      };
+      pollGenerationUntilIdle = scheduleGenerationPoll;
+
+      const reconcileAfterConnect = async () => {
+        const [historyResult, statusResult] = await Promise.allSettled([
+          chatApi.getMessages(sessionId),
+          chatApi.getGenerationStatus(sessionId),
+        ]);
+        if (cancelled || wsRef.current !== ws) return;
+        if (historyResult.status === "fulfilled") {
+          applyPersistedMessages(historyResult.value.messages);
+        }
+        if (statusResult.status === "fulfilled") {
+          if (statusResult.value.running) {
+            isStreamingRef.current = true;
+            setIsStreaming(true);
+            scheduleGenerationPoll();
+          } else {
+            isStreamingRef.current = false;
+            setIsStreaming(false);
+            setStreamContent("");
+            streamBufferRef.current = "";
+          }
+        } else {
+          // A reconnect can race the backend status endpoint. Reuse the
+          // bounded generation poller so a transient 5xx cannot leave the
+          // panel permanently stale.
+          scheduleGenerationPoll();
+        }
+      };
+
+      ws.onopen = () => {
+        if (cancelled || wsRef.current !== ws) return;
+        reconnectAttempt = 0;
+        setConnectionError(null);
+        setIsConnected(true);
+        // Reconcile both durable history and generation state after every
+        // reconnect. A turn can finish while the socket is down, so a single
+        // history read is insufficient when persistence is still in flight.
+        void reconcileAfterConnect();
+      };
+      ws.onclose = () => {
+        if (cancelled || wsRef.current !== ws) return;
+        isStreamingRef.current = false;
+        setIsConnected(false);
+        setIsStreaming(false);
+        clearGenerationPollTimer();
+        streamBufferRef.current = "";
+        setStreamContent("");
+        if (!cancelled) {
+          setConnectionError("WebSocket接続が切断されました。再接続しています");
+          const delay = Math.min(1000 * 2 ** reconnectAttempt, 5000);
+          reconnectAttempt += 1;
+          clearReconnectTimer();
+          reconnectTimer = window.setTimeout(connect, delay);
+        }
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          if (cancelled || wsRef.current !== ws) return;
+          const msg = JSON.parse(event.data);
+          const eventSessionId = msg.session_id ?? msg.data?.session_id;
+          // Every inline event must be scoped to this panel's durable session.
+          // Unscoped broadcasts are intentionally ignored rather than risking
+          // cross-session display in a shared Enterprise WebSocket.
+          if (!eventSessionId || String(eventSessionId) !== sessionId) return;
+          if (msg.type === "stream_start") {
+            setConnectionError(null);
+            isStreamingRef.current = true;
+            setIsStreaming(true);
+            streamBufferRef.current = "";
+            setStreamContent("");
+          } else if (msg.type === "stream_token") {
+            const token = msg.content || msg.data?.content || msg.data?.token || "";
+            streamBufferRef.current += token;
+            setStreamContent(streamBufferRef.current);
+          } else if (msg.type === "stream_end" || msg.type === "response") {
+            const finalContent =
+              msg.content || msg.data?.content || streamBufferRef.current || "";
+            if (finalContent) {
+              setMessages((prev) => [
+                ...prev,
+                {
+                  id: `assistant-${Date.now()}`,
+                  role: "assistant",
+                  content: finalContent,
+                  timestamp: new Date().toLocaleTimeString(),
+                },
+              ]);
+            }
+            isStreamingRef.current = false;
+            setIsStreaming(false);
+            clearGenerationPollTimer();
+            setStreamContent("");
+            streamBufferRef.current = "";
+          } else if (msg.type === "stream_cancelled") {
+            const cancellationStatus =
+              typeof msg.status === "string"
+                ? msg.status
+                : typeof msg.data?.status === "string"
+                  ? msg.data.status
+                  : "cancelled";
+            if (cancellationStatus === "cancellation_pending") {
+              isStreamingRef.current = true;
+              setIsStreaming(true);
+              setConnectionError(
+                typeof msg.message === "string"
+                  ? msg.message
+                  : "停止処理を継続しています",
+              );
+              pollGenerationUntilIdle?.();
+              return;
+            }
+            const finalContent =
+              msg.content || msg.data?.content || msg.data?.message || streamBufferRef.current || "";
+            if (finalContent) {
+              setMessages((prev) => [
+                ...prev,
+                {
+                  id: msg.message_id || msg.data?.message_id || `assistant-${Date.now()}`,
+                  role: "assistant",
+                  content: finalContent,
+                  timestamp: new Date().toLocaleTimeString(),
+                },
+              ]);
+            }
+            isStreamingRef.current = false;
+            setIsStreaming(false);
+            clearGenerationPollTimer();
+            if (cancellationStatus === "cancellation_failed") {
+              setConnectionError(
+                typeof msg.message === "string"
+                  ? msg.message
+                  : "応答生成を完全に停止できませんでした",
+              );
+            }
+            setStreamContent("");
+            streamBufferRef.current = "";
+          } else if (msg.type === "new_message" && msg.data?.type === "assistant") {
+            const content = msg.data.message || "";
+            if (content && !isStreamingRef.current) {
+              setMessages((prev) => [
+                ...prev,
+                {
+                  id: `assistant-${Date.now()}`,
+                  role: "assistant",
+                  content,
+                  timestamp: new Date().toLocaleTimeString(),
+                },
+              ]);
+            }
+          }
+        } catch { /* ignore parse errors */ }
+      };
+
+      ws.onerror = () => {
+        if (!cancelled && wsRef.current === ws) {
+          setIsConnected(false);
+        }
+      };
+    };
+
+    connect();
+
+    return () => {
+      cancelled = true;
+      clearReconnectTimer();
+      clearGenerationPollTimer();
+      pollGenerationUntilIdle = null;
+      wsRef.current?.close();
+      wsRef.current = null;
+      isStreamingRef.current = false;
+    };
+  }, [sessionId]);
 
   // 自動スクロール
   useEffect(() => {
@@ -100,7 +352,7 @@ export function InlineChatPanel({
 
   const sendMessage = useCallback(
     (content: string) => {
-      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+      if (!sessionId || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
       if (!content.trim()) return;
 
       // ファイルコンテキストを自動追加
@@ -115,6 +367,7 @@ export function InlineChatPanel({
         JSON.stringify({
           type: "user_message",
           data: {
+            session_id: sessionId,
             message: contextMsg,
             mentions: [{ type: "file", id: filePath, name: fileName }],
           },
@@ -123,7 +376,7 @@ export function InlineChatPanel({
 
       setInput("");
     },
-    [filePath, fileName]
+    [filePath, fileName, sessionId]
   );
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -145,12 +398,21 @@ export function InlineChatPanel({
       <div className="flex items-center justify-between border-b px-3 py-2">
         <div className="flex items-center gap-1.5">
           <span className="text-sm font-medium">AI チャット</span>
-          <span className={`size-1.5 rounded-full ${isConnected ? "bg-green-500" : "bg-red-500"}`} />
+          <span
+            className={`size-1.5 rounded-full ${isConnected ? "bg-green-500" : "bg-red-500"}`}
+            title={connectionError || (isConnected ? "接続済み" : "接続中...")}
+          />
         </div>
         <Button variant="ghost" size="icon" onClick={onClose} className="size-6">
           <X className="size-3.5" />
         </Button>
       </div>
+
+      {connectionError && (
+        <div className="border-b px-3 py-1.5 text-[11px] text-destructive">
+          {connectionError}
+        </div>
+      )}
 
       {/* 選択テキスト引用ボタン */}
       {selectedText && (

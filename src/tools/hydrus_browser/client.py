@@ -1,5 +1,7 @@
-"""
-Hydrus Client API への非同期HTTPクライアント（読み取り専用）
+"""Hydrus Client APIへの非同期HTTPクライアント。
+
+クライアントは認証主体ごとに生成する。以前のmodule-global singletonは
+ユーザー間で接続先・session keyを共有してしまうため廃止した。
 """
 import os
 import json
@@ -23,16 +25,15 @@ class HydrusBrowserClient:
         api_url: Optional[str] = None,
         access_key: Optional[str] = None,
     ):
-        self._api_url = (
-            api_url
-            or os.environ.get("HYDRUS_API_URL", DEFAULT_API_URL)
-        ).rstrip("/")
-        self._access_key = access_key or os.environ.get("HYDRUS_ACCESS_KEY", "")
+        # Do not silently fall back to process-global HYDRUS_* credentials.  The
+        # caller has already resolved the authenticated user's integration.
+        self._api_url = (api_url or "").rstrip("/")
+        self._access_key = access_key or ""
         self._session_key: Optional[str] = None
         self._client: Optional[httpx.AsyncClient] = None
 
         if not self._access_key:
-            logger.warning("HYDRUS_ACCESS_KEY が未設定です")
+            logger.warning("Hydrus access key が未設定です")
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         """httpx クライアントの遅延初期化"""
@@ -269,6 +270,27 @@ class HydrusBrowserClient:
         )
         resp.raise_for_status()
 
+    async def delete_files(
+        self, file_ids: List[int], reason: Optional[str] = None
+    ) -> None:
+        """ファイルをゴミ箱へ送る（Hydrus の delete_files）"""
+        payload: Dict[str, Any] = {"file_ids": file_ids}
+        if reason:
+            payload["reason"] = reason
+        resp = await self._post_request(
+            "/add_files/delete_files",
+            json_data=payload,
+        )
+        resp.raise_for_status()
+
+    async def undelete_files(self, file_ids: List[int]) -> None:
+        """削除したファイルを元に戻す（Hydrus の undelete_files）"""
+        resp = await self._post_request(
+            "/add_files/undelete_files",
+            json_data={"file_ids": file_ids},
+        )
+        resp.raise_for_status()
+
     async def set_rating(
         self,
         file_id: int,
@@ -298,12 +320,16 @@ class HydrusBrowserClient:
             self._session_key = None
 
 
-# モジュールレベルのシングルトン
-_hydrus_client: Optional[HydrusBrowserClient] = None
+def get_hydrus_client(
+    *,
+    api_url: Optional[str] = None,
+    access_key: Optional[str] = None,
+) -> HydrusBrowserClient:
+    """Create an isolated client for one resolved integration.
 
+    ``api_url`` and ``access_key`` are intentionally required by callers in
+    production; omitting either yields a client that fails closed instead of
+    reading global environment credentials.
+    """
 
-def get_hydrus_client() -> HydrusBrowserClient:
-    global _hydrus_client
-    if _hydrus_client is None:
-        _hydrus_client = HydrusBrowserClient()
-    return _hydrus_client
+    return HydrusBrowserClient(api_url=api_url, access_key=access_key)

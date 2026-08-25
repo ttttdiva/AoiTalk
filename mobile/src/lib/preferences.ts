@@ -1,10 +1,19 @@
 import * as SecureStore from 'expo-secure-store';
 import { STORAGE_KEYS } from '../constants/config';
 
-export async function getDefaultCharacterName(): Promise<string> {
-  return (await SecureStore.getItemAsync(STORAGE_KEYS.DEFAULT_CHARACTER_NAME)) || 'default';
+export async function getCurrentCharacterSlug(): Promise<string | null> {
+  const value = await SecureStore.getItemAsync(STORAGE_KEYS.CURRENT_CHARACTER_SLUG);
+  const normalized = value?.trim();
+  return normalized || null;
 }
 
-export async function saveDefaultCharacterName(value: string): Promise<void> {
-  await SecureStore.setItemAsync(STORAGE_KEYS.DEFAULT_CHARACTER_NAME, value.trim() || 'default');
+export async function saveCurrentCharacterSlug(value: string): Promise<void> {
+  const normalized = value.trim();
+  if (!normalized) {
+    throw new Error("現在のキャラクターを選択してください。");
+  }
+  await SecureStore.setItemAsync(
+    STORAGE_KEYS.CURRENT_CHARACTER_SLUG,
+    normalized,
+  );
 }

@@ -1,4 +1,4 @@
-﻿export const DOCS_NAV_LABEL = "Docs";
+export const DOCS_NAV_LABEL = "Docs";
 export const DOCS_ROUTE = "/docs";
 
 export const DOCS_NODE_TYPES = ["node", "search", "day", "system"] as const;
@@ -22,7 +22,9 @@ export const DOCS_BASE_TYPES = [
   "project",
   "project_information",
   "day",
+  "record",
 ] as const;
+
 export type DocsBaseType = (typeof DOCS_BASE_TYPES)[number];
 
 export const DOCS_FIELD_TYPES = [
@@ -141,6 +143,48 @@ export const DEFAULT_DOCS_SUPERTAGS: DefaultDocsSupertag[] = [
     aiInstructions: "1メール=1ノード。同じプロジェクトの過去メールに関する質問では、ヘッダーと本文を根拠として使う。",
   },
   {
+    name: "メールメッセージ",
+    systemKey: "email_message",
+    baseType: "email",
+    description: "メール原本の引用チェーンから復元した、個別に参照できる1通",
+    icon: "mail-open",
+    color: "#0ea5e9",
+    pinnedFieldKeys: ["送信日時", "From"],
+    fields: [
+      { name: "件名", systemKey: "email_message_subject", fieldType: "text" },
+      { name: "送信日時", systemKey: "email_message_date", fieldType: "text" },
+      { name: "From", systemKey: "email_message_from", fieldType: "text" },
+      { name: "To", systemKey: "email_message_to", fieldType: "long_text" },
+      { name: "CC", systemKey: "email_message_cc", fieldType: "long_text" },
+      { name: "本文", systemKey: "email_message_body", fieldType: "long_text" },
+      { name: "原本", systemKey: "email_message_source", fieldType: "reference" },
+      { name: "復元キー", systemKey: "email_message_source_key", fieldType: "text" },
+    ],
+    templateJson: scaffold([]),
+    aiInstructions: "メールの経緯を裏付ける個別メッセージ。要約の事実は該当メッセージへ直接リンクする。",
+  },
+  {
+    name: "Inbox項目",
+    systemKey: "work_intake",
+    baseType: "record",
+    description: "/inboxで受け付けた問い合わせ・依頼・情報共有の管理単位",
+    icon: "inbox",
+    color: "#6366f1",
+    pinnedFieldKeys: ["Inbox ID", "対応状態", "受付日時"],
+    fields: [
+      { name: "Inbox ID", systemKey: "inbox_item_id", fieldType: "text" },
+      { name: "分類", systemKey: "inbox_classification", fieldType: "options", options: { values: ["質問", "依頼", "情報共有"] } },
+      { name: "対応状態", systemKey: "inbox_status", fieldType: "options", options: { values: ["受付", "対応中", "確認待ち", "レビュー待ち", "完了", "保存のみ"] }, defaultValue: "受付" },
+      { name: "受付元", systemKey: "inbox_source_type", fieldType: "options", options: { values: ["チャット", "メール", "複合"] } },
+      { name: "受付日時", systemKey: "inbox_received_at", fieldType: "date" },
+      { name: "最終更新", systemKey: "inbox_last_updated_at", fieldType: "date" },
+      { name: "受付内容", systemKey: "inbox_instruction", fieldType: "long_text" },
+      { name: "取りまとめ", systemKey: "inbox_summary", fieldType: "long_text" },
+    ],
+    templateJson: scaffold([]),
+    aiInstructions: "1回の/inbox受付を1つのInbox項目として扱う。概要を最優先し、内容に必要な章だけを作る。複数回の応酬は経緯を意味的に要約し、各事実の直下へ根拠をリンクする。確認事項・次の対応・参考資料・更新履歴を固定で作らない。追加情報は同じUUIDの文書全体へ統合し、新しい項目を推測で作らない。",
+  },
+  {
     name: "Day",
     systemKey: "day",
     baseType: "day",
@@ -245,7 +289,7 @@ export function normalizeDocsNodeType(value: unknown): DocsNodeType {
 }
 
 export function normalizeDocsBaseType(value: unknown): DocsBaseType {
-  return DOCS_BASE_TYPES.includes(value as DocsBaseType)
+  return DOCS_BASE_TYPES.includes(value as (typeof DOCS_BASE_TYPES)[number])
     ? (value as DocsBaseType)
     : "note";
 }

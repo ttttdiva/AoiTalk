@@ -14,6 +14,8 @@ import { MODEL_LIST_TIMEOUT, STORAGE_KEYS } from "../constants/config";
 export type DirectMobileLlmProvider =
   | "openai"
   | "gemini"
+  | "deepseek"
+  | "deepinfra"
   | "kimi"
   | "openrouter"
   | "anthropic"
@@ -57,6 +59,8 @@ export const GEMINI_DEFAULT_BASE_URL =
   "https://generativelanguage.googleapis.com/v1beta";
 export const OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1";
 export const KIMI_DEFAULT_BASE_URL = "https://api.moonshot.ai/v1";
+export const DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com";
+export const DEEPINFRA_DEFAULT_BASE_URL = "https://api.deepinfra.com/v1/openai";
 export const OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
 export const ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com";
 
@@ -95,6 +99,33 @@ export const CLOUD_PROVIDER_DEFINITIONS: Record<
     ],
     defaultModel: "gemini-3-flash-preview",
     hint: "自分のGoogle AI Studio APIキーが必要です。",
+  },
+  deepseek: {
+    id: "deepseek",
+    label: "DeepSeek",
+    adapter: "openai_chat",
+    defaultBaseUrl: DEEPSEEK_DEFAULT_BASE_URL,
+    baseUrlEditable: true,
+    baseUrlRequired: false,
+    advanced: false,
+    models: [{ id: "deepseek-v4-flash" }, { id: "deepseek-v4-pro" }],
+    defaultModel: "deepseek-v4-flash",
+    hint: "自分のDeepSeek APIキーが必要です。公式APIのBase URLは /v1 不要です。",
+  },
+  deepinfra: {
+    id: "deepinfra",
+    label: "DeepInfra",
+    adapter: "openai_chat",
+    defaultBaseUrl: DEEPINFRA_DEFAULT_BASE_URL,
+    baseUrlEditable: true,
+    baseUrlRequired: false,
+    advanced: false,
+    models: [
+      { id: "deepseek-ai/DeepSeek-V4-Flash" },
+      { id: "deepseek-ai/DeepSeek-V4-Pro" },
+    ],
+    defaultModel: "deepseek-ai/DeepSeek-V4-Flash",
+    hint: "自分のDeepInfra API tokenが必要です。Chat URLは /v1/openai、モデル一覧は公式 /v1/models から取得します。",
   },
   kimi: {
     id: "kimi",
@@ -159,6 +190,8 @@ export const CLOUD_PROVIDER_DEFINITIONS: Record<
 export const DIRECT_PROVIDER_ORDER: DirectMobileLlmProvider[] = [
   "openai",
   "gemini",
+  "deepseek",
+  "deepinfra",
   "kimi",
   "openrouter",
   "anthropic",
@@ -171,6 +204,8 @@ export function isDirectMobileLlmProvider(
   return (
     value === "openai" ||
     value === "gemini" ||
+    value === "deepseek" ||
+    value === "deepinfra" ||
     value === "kimi" ||
     value === "openrouter" ||
     value === "anthropic" ||
@@ -295,6 +330,59 @@ async function fetchOpenAiModels(
   return extractOpenAiCompatibleIds(data).filter(isLikelyChatModel);
 }
 
+function resolveDeepInfraModelsUrl(baseUrl?: string): string {
+  const normalized = resolveBaseUrl("deepinfra", baseUrl);
+  if (normalized.endsWith("/openai")) {
+    return `${normalized.slice(0, -"/openai".length)}/models`;
+  }
+  return "";
+}
+
+async function fetchDeepInfraModels(
+  options: FetchCloudModelsOptions,
+): Promise<string[]> {
+  const apiKey = (options.apiKey ?? "").trim();
+  const modelsUrl = resolveDeepInfraModelsUrl(options.baseUrl);
+  if (!apiKey || !modelsUrl) return [];
+  const data = await fetchJsonWithTimeout(modelsUrl, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+  const record = data as
+    | {
+        data?: Array<{
+          id?: unknown;
+          model?: unknown;
+          name?: unknown;
+          reported_type?: unknown;
+          task?: unknown;
+          type?: unknown;
+          deprecated?: unknown;
+        }>;
+        models?: Array<Record<string, unknown>>;
+      }
+    | null;
+  const items = Array.isArray(record?.data)
+    ? record.data
+    : Array.isArray(record?.models)
+      ? record.models
+      : [];
+  const nonText = /(embedding|image|audio|speech|whisper|moderation|rerank|transcrib)/i;
+  const ids: string[] = [];
+  for (const item of items) {
+    if (item?.deprecated === true) continue;
+    const id = [item?.id, item?.model, item?.name].find(
+      (value): value is string => typeof value === "string" && value.trim().length > 0,
+    );
+    if (!id) continue;
+    const declared = [item?.reported_type, item?.task, item?.type]
+      .find((value): value is string => typeof value === "string" && value.trim().length > 0)
+      ?.toLowerCase();
+    if (declared && (nonText.test(declared) || !/(text|chat|generation|causal)/i.test(declared))) continue;
+    ids.push(id);
+  }
+  return ids;
+}
+
 async function fetchOpenRouterModels(
   options: FetchCloudModelsOptions,
 ): Promise<string[]> {
@@ -368,6 +456,10 @@ export async function fetchCloudModels(
       return fetchOpenAiModels("openai", options);
     case "kimi":
       return fetchOpenAiModels("kimi", options);
+    case "deepseek":
+      return fetchOpenAiModels("deepseek", options);
+    case "deepinfra":
+      return fetchDeepInfraModels(options);
     case "openrouter":
       return fetchOpenRouterModels(options);
     case "gemini":

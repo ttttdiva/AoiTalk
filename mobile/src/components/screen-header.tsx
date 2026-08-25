@@ -25,6 +25,8 @@ export type ScreenHeaderProps = {
   onSettings?: () => void;
   /** 指定時は左端に戻る矢印を表示（Stack の戻る用）。 */
   onBack?: () => void;
+  /** Settings root itself can hide the self-referential settings action. */
+  showSettings?: boolean;
 };
 
 export function ScreenHeader({
@@ -33,6 +35,7 @@ export function ScreenHeader({
   right,
   onSettings,
   onBack,
+  showSettings = true,
 }: ScreenHeaderProps) {
   const router = useRouter();
   const insets = useSafeAreaInsets();
@@ -47,7 +50,15 @@ export function ScreenHeader({
 
   return (
     <Surface
-      style={[styles.header, { paddingTop: insets.top + 12 }]}
+      testID="screen-header"
+      style={[
+        styles.header,
+        {
+          paddingTop: insets.top + 12,
+          paddingLeft: insets.left + 12,
+          paddingRight: insets.right + 12,
+        },
+      ]}
       elevation={1}
     >
       <View style={styles.row}>
@@ -73,14 +84,16 @@ export function ScreenHeader({
         </View>
         <View style={styles.actions}>
           {right}
-          <IconButton
-            icon="cog-outline"
-            size={22}
-            iconColor={MUTED}
-            style={styles.settingsButton}
-            onPress={handleSettings}
-            accessibilityLabel="設定"
-          />
+          {showSettings ? (
+            <IconButton
+              icon="cog-outline"
+              size={22}
+              iconColor={MUTED}
+              style={styles.settingsButton}
+              onPress={handleSettings}
+              accessibilityLabel="設定"
+            />
+          ) : null}
         </View>
       </View>
     </Surface>
@@ -89,7 +102,8 @@ export function ScreenHeader({
 
 const styles = StyleSheet.create({
   header: {
-    paddingHorizontal: 12,
+    paddingLeft: 12,
+    paddingRight: 12,
     paddingBottom: 12,
     backgroundColor: SURFACE,
   },

@@ -2,7 +2,7 @@
 Authentication service with JWT token management
 """
 
-import os
+import secrets
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
@@ -10,6 +10,7 @@ from uuid import UUID
 
 import jwt
 from pydantic import BaseModel
+from src.security_secret import auth_secret_required, resolve_auth_secret_env
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,8 @@ class TokenPayload(BaseModel):
     user_id: str
     username: str
     role: str
+    is_password_reset_required: bool = False
+    session_version: int = 1
     exp: datetime
     iat: datetime
     
@@ -52,24 +55,30 @@ class AuthService:
             algorithm: JWT algorithm
             access_token_expire_minutes: Token expiry in minutes
         """
-        # Check for environment variable first
-        env_secret = os.getenv("AOITALK_JWT_SECRET") or os.getenv("AUTH_SECRET")
-        
-        if secret_key:
-            self.secret_key = secret_key
-        elif env_secret:
-            self.secret_key = env_secret
+        provided_secret = secret_key
+
+        if secret_key is not None and not secret_key.strip():
+            raise ValueError("JWT signing secret must not be blank")
+        if provided_secret is not None:
+            self.secret_key = provided_secret
         else:
-            # Use default but warn strongly
-            self.secret_key = "aoitalk-default-secret-change-in-production"
-            logger.warning(
-                "⚠️ 【セキュリティ警告】デフォルトのJWTシークレットを使用しています。"
-                "本番環境では環境変数 AOITALK_JWT_SECRET を設定してください！"
+            env_secret = resolve_auth_secret_env(
+                ("AOITALK_JWT_SECRET", "AUTH_SECRET"),
+                error_type=ValueError,
             )
-            logger.warning(
-                "⚠️ [SECURITY WARNING] Using default JWT secret. "
-                "Set AOITALK_JWT_SECRET environment variable for production!"
-            )
+            if env_secret is not None:
+                self.secret_key = env_secret
+            elif auth_secret_required():
+                raise ValueError(
+                    "AOITALK_JWT_SECRET (or AUTH_SECRET) is required for Enterprise authentication"
+                )
+            else:
+                # Development/test compatibility only. Enterprise never reaches
+                # this fallback because it requires an explicit secret.
+                self.secret_key = secrets.token_urlsafe(32)
+                logger.warning(
+                    "開発用の既定JWTシークレットを使用しています。本番では AOITALK_JWT_SECRET を設定してください。"
+                )
         
         self.algorithm = algorithm
         self.access_token_expire_minutes = access_token_expire_minutes
@@ -79,7 +88,9 @@ class AuthService:
         user_id: str,
         username: str,
         role: str,
-        expires_delta: Optional[timedelta] = None
+        expires_delta: Optional[timedelta] = None,
+        is_password_reset_required: bool = False,
+        session_version: int = 1,
     ) -> str:
         """Create JWT access token
         
@@ -103,7 +114,9 @@ class AuthService:
             "role": role,
             "exp": expire,
             "iat": datetime.utcnow(),
-            "type": "access"
+            "type": "access",
+            "password_reset_required": bool(is_password_reset_required),
+            "session_version": max(1, int(session_version or 1)),
         }
         
         return jwt.encode(payload, self.secret_key, algorithm=self.algorithm)
@@ -123,11 +136,17 @@ class AuthService:
                 self.secret_key,
                 algorithms=[self.algorithm]
             )
+            if payload.get("type") != "access":
+                raise jwt.InvalidTokenError("Only access tokens can be verified")
             
             return TokenPayload(
                 user_id=payload["user_id"],
                 username=payload["username"],
                 role=payload["role"],
+                is_password_reset_required=bool(
+                    payload.get("password_reset_required", False)
+                ),
+                session_version=max(1, int(payload.get("session_version", 1))),
                 exp=datetime.fromtimestamp(payload["exp"]),
                 iat=datetime.fromtimestamp(payload["iat"])
             )
@@ -146,7 +165,8 @@ class AuthService:
         user_id: str,
         username: str,
         role: str,
-        is_password_reset_required: bool = False
+        is_password_reset_required: bool = False,
+        session_version: int = 1,
     ) -> AuthResult:
         """Create successful auth result with token
         
@@ -159,7 +179,13 @@ class AuthService:
         Returns:
             AuthResult: Success result with token
         """
-        token = self.create_access_token(user_id, username, role)
+        token = self.create_access_token(
+            user_id,
+            username,
+            role,
+            is_password_reset_required=is_password_reset_required,
+            session_version=session_version,
+        )
         
         return AuthResult(
             success=True,
@@ -187,7 +213,7 @@ class AuthService:
         )
     
     def refresh_token(self, token: str) -> Optional[str]:
-        """Refresh an existing token if still valid
+        """Refresh a signed access token within its bounded refresh window.
         
         Args:
             token: Current JWT token
@@ -204,24 +230,44 @@ class AuthService:
                     algorithms=[self.algorithm],
                     options={"verify_exp": False},
                 )
-                issued_at = datetime.fromtimestamp(raw_payload["iat"])
-                if datetime.utcnow() - issued_at > timedelta(days=30):
+                if raw_payload.get("type") != "access":
+                    return None
+                issued_at = datetime.utcfromtimestamp(raw_payload["iat"])
+                expires_at = datetime.utcfromtimestamp(raw_payload["exp"])
+                now = datetime.utcnow()
+                # Access-token expiry is not the refresh-window boundary. A
+                # mobile client can be offline while its short-lived access
+                # token expires, so allow a signed token to refresh until it
+                # reaches the 30-day maximum age. The route additionally
+                # rechecks the user's active/session state in the database.
+                if (
+                    issued_at > now + timedelta(seconds=60)
+                    or now - issued_at > timedelta(days=30)
+                ):
                     return None
                 payload = TokenPayload(
                     user_id=raw_payload["user_id"],
                     username=raw_payload["username"],
                     role=raw_payload["role"],
-                    exp=datetime.fromtimestamp(raw_payload["exp"]),
+                    is_password_reset_required=bool(
+                        raw_payload.get("password_reset_required", False)
+                    ),
+                    session_version=max(1, int(raw_payload.get("session_version", 1))),
+                    exp=expires_at,
                     iat=issued_at,
                 )
             except Exception as exc:
                 logger.warning(f"Token refresh decode failed: {exc}")
                 return None
         
+        if payload.is_password_reset_required:
+            return None
+
         return self.create_access_token(
             user_id=payload.user_id,
             username=payload.username,
-            role=payload.role
+            role=payload.role,
+            session_version=payload.session_version,
         )
     
     def extract_token_from_header(self, authorization: Optional[str]) -> Optional[str]:

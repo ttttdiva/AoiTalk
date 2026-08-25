@@ -37,10 +37,10 @@ export async function GET(request: NextRequest) {
     .where(
       sourceType
         ? and(
-            eq(knowledgeImportJobs.workspaceId, workspace.id),
+            eq(knowledgeImportJobs.docsLibraryId, workspace.id),
             eq(knowledgeImportJobs.sourceType, sourceType),
           )
-        : eq(knowledgeImportJobs.workspaceId, workspace.id),
+        : eq(knowledgeImportJobs.docsLibraryId, workspace.id),
     )
     .orderBy(desc(knowledgeImportJobs.createdAt))
     .limit(100);
@@ -77,7 +77,7 @@ export async function POST(request: NextRequest) {
     const [job] = await tx
       .insert(knowledgeImportJobs)
       .values({
-        workspaceId: workspace.id,
+        docsLibraryId: workspace.id,
         projectId,
         sourceType,
         sourceName,

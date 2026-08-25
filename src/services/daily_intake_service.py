@@ -38,8 +38,16 @@ from .project_information_docs import (
     ensure_project_information_doc,
     update_project_information_doc,
 )
-from .project_information_organizer import _parse_json_object
-from .project_qa_candidate_service import _normalized_question_hash
+from .project_information_organizer import (
+    LLMUsageContext,
+    _apply_llm_usage_context,
+    _parse_json_object,
+)
+from .project_qa_candidate_service import (
+    _normalized_question_hash,
+    find_existing_project_qa_entry,
+    is_project_qa_entry_closed,
+)
 from .task_management_service import TaskManagementService
 
 logger = logging.getLogger(__name__)
@@ -246,6 +254,7 @@ async def _generate_draft_with_llm(
     raw_input: str,
     clarification_answers: str,
     intake_date: str,
+    usage_context: LLMUsageContext | Any = None,
 ) -> DailyIntakeDraft | None:
     prompt = _build_prompt(project_name, raw_input, clarification_answers, intake_date)
 
@@ -253,6 +262,7 @@ async def _generate_draft_with_llm(
         from ..llm.manager import create_llm_client
 
         client = create_llm_client(config)
+        _apply_llm_usage_context(client, usage_context)
         return client.generate_response(prompt, stream=False)
 
     try:
@@ -397,16 +407,12 @@ async def apply_daily_intake(
     inquiries_created = 0
     for question in draft.inquiries:
         question_hash = _normalized_question_hash(question)
-        existing_result = await session.execute(
-            select(ProjectQaEntry)
-            .where(
-                ProjectQaEntry.project_id == project_id,
-                ProjectQaEntry.deleted_at.is_(None),
-                ProjectQaEntry.normalized_question_hash == question_hash,
-            )
-            .limit(1)
+        entry = await find_existing_project_qa_entry(
+            session,
+            project_id=project_id,
+            question=question,
+            question_hash=question_hash,
         )
-        entry = existing_result.scalar_one_or_none()
         if entry is None:
             session.add(
                 ProjectQaEntry(
@@ -426,6 +432,8 @@ async def apply_daily_intake(
                 )
             )
             inquiries_created += 1
+        elif is_project_qa_entry_closed(entry):
+            continue
         else:
             entry.asked_count = int(entry.asked_count or 0) + 1
             entry.last_asked_at = now
@@ -435,9 +443,10 @@ async def apply_daily_intake(
     # タスク候補 → TaskManagementService.create_task
     task_service = TaskManagementService()
     tasks_created = 0
+    task_payloads: list[dict[str, Any]] = []
     for task in draft.task_candidates:
         start_at, end_at, all_day = _normalize_task_schedule_inputs(due_date=task.due_date)
-        await task_service.create_task(
+        task_payload = await task_service.create_task(
             session,
             user_id=user_id,
             project_id=project_id,
@@ -448,7 +457,9 @@ async def apply_daily_intake(
             end_at=end_at,
             all_day=all_day,
             source="daily_intake",
+            commit=False,
         )
+        task_payloads.append(task_payload)
         tasks_created += 1
 
     # 実施事項 → record table「作業記録」へ行追記
@@ -477,6 +488,21 @@ async def apply_daily_intake(
             record_rows_created += 1
 
     await session.commit()
+    # Daily intake mutates the canonical Project Information Docs in the
+    # transaction above.  Rebuild scheduling happens only after that commit;
+    # a queue outage must not turn a successful intake into an API failure.
+    from .project_context_pack_job_service import enqueue_project_context_pack_rebuild
+
+    try:
+        await enqueue_project_context_pack_rebuild(
+            project_id,
+            user_id,
+            "daily_intake_applied",
+        )
+    except Exception:
+        logger.exception("Failed to enqueue ProjectContextPack rebuild after daily intake")
+    for task_payload in task_payloads:
+        await task_service._broadcast("task_created", task_payload)
 
     return {
         "decisions": len(draft.decisions),
@@ -503,6 +529,7 @@ async def run_daily_intake(  # noqa: PLR0913
     use_llm: bool = True,
     config: Any = None,
     draft_override: dict[str, Any] | None = None,
+    usage_context: LLMUsageContext | Any = None,
 ) -> dict[str, Any]:
     """日次インテークの制御フロー(preview / clarify / apply)。"""
 
@@ -522,6 +549,7 @@ async def run_daily_intake(  # noqa: PLR0913
                 raw_input=raw_input,
                 clarification_answers=clarification_answers,
                 intake_date=intake_date,
+                usage_context=usage_context,
             )
         if draft is None:
             draft = DailyIntakeDraft(intake_date=intake_date, raw_input=raw_input)

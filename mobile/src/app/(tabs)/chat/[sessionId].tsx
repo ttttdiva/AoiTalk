@@ -6,26 +6,20 @@ import React, {
   useState,
 } from "react";
 import {
+  Alert,
+  Animated,
   FlatList,
   Keyboard,
-  Pressable,
   ScrollView,
   StyleSheet,
   View,
 } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import { useLocalSearchParams, useNavigation, useRouter } from "expo-router";
-import { KeyboardStickyView } from "react-native-keyboard-controller";
-import Markdown from "react-native-markdown-display";
 import {
-  ActivityIndicator,
   Button,
-  Chip,
   Dialog,
-  Divider,
   IconButton,
-  Portal,
-  ProgressBar,
   Surface,
   Text,
   TextInput,
@@ -34,10 +28,26 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useAuth } from "../../../contexts/AuthContext";
 import { useProject } from "../../../contexts/ProjectContext";
 import { useConversationController } from "../../../features/conversation/useConversationController";
-import { groupMessageKey } from "../../../features/conversation/timeline";
+import { buildDurableTimeline } from "../../../features/conversation/timeline";
 import type { TimelineItem } from "../../../features/conversation/models";
+import { ChatHeaderStatus } from "../../../features/conversation/components/ChatHeaderStatus";
+import { ChatTimeline } from "../../../features/conversation/components/ChatTimeline";
+import {
+  ChatComposer,
+  type ChatComposerSubmission,
+} from "../../../features/conversation/components/ChatComposer";
+import { ChatDialogHost } from "../../../features/conversation/components/ChatDialogHost";
+import { ChatScreenShell } from "../../../features/conversation/components/ChatScreenShell";
+import { useReducedMotion } from "../../../features/ui/use-reduced-motion";
 import type { ConversationMessage } from "../../../types/api";
-import type { ChatResponseModelSelection } from "../../../types/api";
+import { chatApi, type ChatAppContext, type ContextRequestSnapshot } from "../../../lib/chat-api";
+import { characterApi } from "../../../lib/character-api";
+import { appsRepo } from "../../../repositories/apps";
+import type { ProjectAppBinding } from "../../../lib/apps-api";
+import { conversationsRepo } from "../../../repositories";
+import {
+  applyRemoteConversationSessions,
+} from "../../../repositories/conversations";
 import {
   getFallbackConfig,
   getMainSlot,
@@ -55,29 +65,43 @@ import {
   type DirectMobileLlmProvider,
 } from "../../../lib/cloud-model-catalog";
 import {
-  filterSlashCommands,
-  MOBILE_CHAT_COMMANDS,
-  resolveMobileCommandSubmission,
-  type MobileChatCommand,
-  type SkillSlashCommand,
-} from "../../../features/conversation/chat-commands";
-
-function compactLabel(value: string): string {
-  return value.length > 18 ? `${value.slice(0, 17)}...` : value;
-}
+  buildModelPickerGroups,
+  type ModelPickerEntry,
+} from "../../../features/conversation/model-picker";
+import { ChatTextInput } from "../../../features/conversation/chat-input-theme";
 
 type DirectModelOption = DirectMobileLlmSelection & { label: string };
 
 export default function ChatScreen() {
-  const { sessionId } = useLocalSearchParams<{ sessionId: string }>();
+  const { sessionId, appId: rawAppId, appTargetId: rawAppTargetId, projectId: rawProjectId, taskId: rawTaskId } =
+    useLocalSearchParams<{
+      sessionId: string;
+      appId?: string;
+      appTargetId?: string;
+      projectId?: string;
+      taskId?: string;
+    }>();
+  const routeAppId = Array.isArray(rawAppId) ? rawAppId[0] : rawAppId;
+  const routeAppTargetId = Array.isArray(rawAppTargetId)
+    ? rawAppTargetId[0]
+    : rawAppTargetId;
+  const routeProjectId = Array.isArray(rawProjectId) ? rawProjectId[0] : rawProjectId;
+  const routeTaskId = Array.isArray(rawTaskId) ? rawTaskId[0] : rawTaskId;
   const navigation = useNavigation();
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const { user, isAuthenticated } = useAuth();
-  const { selectedProjectId } = useProject();
+  const {
+    projects,
+    selectedProjectId,
+    setSelectedProjectId,
+    refreshProjects,
+  } = useProject();
   const flatListRef = useRef<FlatList<TimelineItem>>(null);
-  const [input, setInput] = useState("");
-  const includeProjectContext = Boolean(selectedProjectId);
+  const scrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const promotedSessionTargetRef = useRef<string | null>(null);
+  const reduceMotion = useReducedMotion();
+  const screenOpacity = useRef(new Animated.Value(0)).current;
   const [editTarget, setEditTarget] = useState<ConversationMessage | null>(
     null,
   );
@@ -85,77 +109,339 @@ export default function ChatScreen() {
   const [modelTarget, setModelTarget] = useState<ConversationMessage | null>(
     null,
   );
-  const [deepResearchVisible, setDeepResearchVisible] = useState(false);
-  const [deepResearchQuery, setDeepResearchQuery] = useState("");
-  const [commandSheetVisible, setCommandSheetVisible] = useState(false);
   const [llmModeVisible, setLlmModeVisible] = useState(false);
-  const [llmModeSaving, setLlmModeSaving] = useState(false);
   const [responseModelVisible, setResponseModelVisible] = useState(false);
-  const [responseModel, setResponseModel] =
-    useState<ChatResponseModelSelection | null>(null);
-  const [directResponse, setDirectResponse] =
-    useState<DirectMobileLlmSelection | null>(null);
   const [directModelOptions, setDirectModelOptions] = useState<DirectModelOption[]>([]);
-  const [activeCommand, setActiveCommand] = useState<MobileChatCommand | null>(null);
-  const [composerError, setComposerError] = useState<string | null>(null);
+  // モデル選択ダイアログの 1段目(プロバイダー)→2段目(モデル) 遷移用。null=1段目。
+  const [modelPickerProvider, setModelPickerProvider] = useState<string | null>(
+    null,
+  );
+  const [modelPickerFilter, setModelPickerFilter] = useState("");
+  const [rerunPickerProvider, setRerunPickerProvider] = useState<string | null>(
+    null,
+  );
   const [pendingQueueVisible, setPendingQueueVisible] = useState(false);
   const [keyboardVisible, setKeyboardVisible] = useState(false);
   const [actionTarget, setActionTarget] = useState<ConversationMessage | null>(
     null,
   );
+  const [titleDialogVisible, setTitleDialogVisible] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
+  const [titleSaving, setTitleSaving] = useState(false);
+  const [titleError, setTitleError] = useState<string | null>(null);
+  const [contextVisible, setContextVisible] = useState(false);
+  const [contextLoading, setContextLoading] = useState(false);
+  const [contextMain, setContextMain] = useState<ContextRequestSnapshot | null>(null);
+  const [contextError, setContextError] = useState<string | null>(null);
+  const [appPickerVisible, setAppPickerVisible] = useState(false);
+  const [appPickerLoading, setAppPickerLoading] = useState(false);
+  const [appPickerError, setAppPickerError] = useState<string | null>(null);
+  const [appPickerApps, setAppPickerApps] = useState<ProjectAppBinding[]>([]);
+  const [appPickerTargetId, setAppPickerTargetId] = useState<string | null>(null);
+  const [groupPickerVisible, setGroupPickerVisible] = useState(false);
+  const [groupPickerLoading, setGroupPickerLoading] = useState(false);
+  const [groupPickerError, setGroupPickerError] = useState<string | null>(null);
+  const [groupCharacters, setGroupCharacters] = useState<string[]>([]);
+  const [groupSelectedCharacters, setGroupSelectedCharacters] = useState<string[]>([]);
+  const [groupCreating, setGroupCreating] = useState(false);
+  const groupCreatingRef = useRef(false);
 
   const handleSessionPromoted = useCallback(
     (remoteSessionId: string) => {
+      promotedSessionTargetRef.current = remoteSessionId;
       router.replace({
         pathname: "/(tabs)/chat/[sessionId]",
-        params: { sessionId: remoteSessionId },
+        params: {
+          sessionId: remoteSessionId,
+          ...(routeAppId ? { appId: routeAppId } : {}),
+          ...(routeAppTargetId ? { appTargetId: routeAppTargetId } : {}),
+          ...(routeProjectId ? { projectId: routeProjectId } : {}),
+          ...(routeTaskId ? { taskId: routeTaskId } : {}),
+        },
       });
     },
-    [router],
+    [routeAppId, routeAppTargetId, routeProjectId, routeTaskId, router],
   );
 
   const controller = useConversationController({
     sessionId,
     isAuthenticated,
+    userId: user?.user_id,
     userRole: user?.role,
     selectedProjectId,
     onSessionPromoted: handleSessionPromoted,
+    initialAppContext: routeAppId
+      ? ({
+          appId: routeAppId,
+          appTargetId: routeAppTargetId ?? null,
+          projectId: routeProjectId ?? null,
+        } satisfies ChatAppContext)
+      : null,
   });
+  const responseModel =
+    controller.responseTarget.kind === "server"
+      ? controller.responseTarget.responseModel ?? null
+      : null;
+  const directResponse =
+    controller.responseTarget.kind === "direct"
+      ? controller.responseTarget.selection
+      : null;
+  const contentBelongsToRoute =
+    controller.session?.id === sessionId ||
+    controller.messages.some((message) => message.session_id === sessionId);
+  const promotionInProgress = promotedSessionTargetRef.current === sessionId;
+  const hasConversationContent = contentBelongsToRoute || promotionInProgress;
+  useEffect(() => {
+    if (
+      promotedSessionTargetRef.current === sessionId &&
+      controller.session?.id === sessionId
+    ) {
+      promotedSessionTargetRef.current = null;
+    }
+  }, [controller.session?.id, sessionId]);
+  const currentProjectId = controller.session
+    ? controller.session.project_id
+    : routeProjectId ?? selectedProjectId;
+  const includeProjectContext = Boolean(currentProjectId);
+  const appContextSelected = Boolean(controller.session?.app_id || routeAppId);
 
-  const messageGroups = useMemo(() => {
-    const groups: Record<string, ConversationMessage[]> = {};
-    for (const message of controller.messages) {
-      const key = groupMessageKey(message);
-      if (!groups[key]) groups[key] = [];
-      groups[key].push(message);
+  const openContextSnapshot = useCallback(() => {
+    setContextVisible(true);
+    setContextLoading(true);
+    setContextError(null);
+    void controller
+      .getContextSnapshot()
+      .then((result) => setContextMain(result.main))
+      .catch((error) =>
+        setContextError(error instanceof Error ? error.message : "コンテキスト取得に失敗しました。"),
+      )
+      .finally(() => setContextLoading(false));
+  }, [controller.getContextSnapshot]);
+
+  const openAppPicker = useCallback(() => {
+    setAppPickerVisible(true);
+    setAppPickerLoading(true);
+    setAppPickerError(null);
+    const request = currentProjectId
+      ? appsRepo.listProjectApps(currentProjectId)
+      : appsRepo.list().then((apps) =>
+          apps.map((app) => ({
+            project_id: "",
+            app_id: app.id,
+            binding_mode: "development" as const,
+            enabled: true,
+            pinned: false,
+            app,
+            targets: app.targets ?? [],
+          })),
+        );
+    void request
+      .then((bindings) => {
+        const enabled = bindings.filter((binding) => binding.enabled);
+        setAppPickerApps(enabled);
+        const current = enabled.find(
+          (binding) => binding.app_id === controller.session?.app_id,
+        );
+        setAppPickerTargetId(
+          current?.targets?.[0]?.id ?? current?.app.targets?.[0]?.id ?? null,
+        );
+      })
+      .catch((error) =>
+        setAppPickerError(
+          error instanceof Error ? error.message : "App一覧を取得できませんでした。",
+        ),
+      )
+      .finally(() => setAppPickerLoading(false));
+  }, [controller.session?.app_id, currentProjectId]);
+
+  const applyAppContext = useCallback(
+    async (binding: ProjectAppBinding | null, targetId = appPickerTargetId) => {
+      try {
+        await controller.bindAppContext(
+          binding
+            ? {
+                appId: binding.app_id,
+                appTargetId: targetId,
+                projectId: currentProjectId,
+              }
+            : null,
+        );
+        setAppPickerVisible(false);
+      } catch (error) {
+        setAppPickerError(
+          error instanceof Error ? error.message : "App contextの変更に失敗しました。",
+        );
+      }
+    }, [appPickerTargetId, controller.bindAppContext, currentProjectId],
+  );
+
+  const openGroupPicker = useCallback(() => {
+    setGroupPickerVisible(true);
+    setGroupPickerLoading(true);
+    setGroupPickerError(null);
+    void characterApi
+      .list()
+      .catch(() => characterApi.getOfflineList(false))
+      .then((characters) => {
+        const slugs = characters
+          .filter((character) => character.is_enabled !== false)
+          .map((character) => character.slug)
+          .filter((slug): slug is string => Boolean(slug));
+        setGroupCharacters(slugs);
+        setGroupSelectedCharacters(slugs.slice(0, 2));
+      })
+      .catch((error) =>
+        setGroupPickerError(
+          error instanceof Error
+            ? error.message
+            : "キャラクター一覧を取得できませんでした。",
+        ),
+      )
+      .finally(() => setGroupPickerLoading(false));
+  }, []);
+
+  const createGroupChat = useCallback(async () => {
+    if (groupCreatingRef.current) return;
+    if (controller.session?.is_group_chat) return;
+    const selectedCharacters = Array.from(
+      new Set(groupSelectedCharacters.map((character) => character.trim()).filter(Boolean)),
+    );
+    if (!isAuthenticated) {
+      setGroupPickerError("グループチャットにはログインが必要です。");
+      return;
     }
-    for (const group of Object.values(groups)) {
-      group.sort((a, b) => (a.branch_index ?? 0) - (b.branch_index ?? 0));
+    if (selectedCharacters.length < 2) {
+      setGroupPickerError("グループチャットには2人以上のキャラクターを選択してください。");
+      return;
     }
-    return groups;
-  }, [controller.messages]);
+
+    groupCreatingRef.current = true;
+    setGroupCreating(true);
+    setGroupPickerError(null);
+    const shouldCleanupRegularSession =
+      !controller.session?.is_group_chat && controller.messages.length === 0;
+    try {
+      const result = await chatApi.createGroupSession(
+        selectedCharacters,
+        currentProjectId ?? null,
+      );
+      await applyRemoteConversationSessions([result.session]);
+      setGroupPickerVisible(false);
+      router.replace({
+        pathname: "/(tabs)/chat/[sessionId]",
+        params: {
+          sessionId: result.session.id,
+          ...(currentProjectId ? { projectId: currentProjectId } : {}),
+        },
+      });
+      if (shouldCleanupRegularSession) {
+        try {
+          await conversationsRepo.deleteSession(sessionId);
+        } catch (cleanupError) {
+          console.warn("[chat] unused regular session cleanup failed", cleanupError);
+        }
+      }
+    } catch (error) {
+      setGroupPickerError(
+        error instanceof Error ? error.message : "グループチャットの作成に失敗しました。",
+      );
+    } finally {
+      groupCreatingRef.current = false;
+      setGroupCreating(false);
+    }
+  }, [
+    controller.messages.length,
+    controller.session?.is_group_chat,
+    currentProjectId,
+    groupSelectedCharacters,
+    isAuthenticated,
+    router,
+    sessionId,
+  ]);
+
+  useEffect(() => {
+    if (controller.loading) return;
+    if (reduceMotion) {
+      screenOpacity.setValue(1);
+      return;
+    }
+    screenOpacity.setValue(0);
+    const animation = Animated.timing(screenOpacity, {
+      toValue: 1,
+      duration: 180,
+      useNativeDriver: true,
+    });
+    animation.start();
+    return () => animation.stop();
+  }, [controller.loading, reduceMotion, screenOpacity]);
+
+  const durableTimeline = useMemo(
+    () =>
+      buildDurableTimeline({
+        messages: controller.visibleMessages,
+        permissions: controller.pendingPermissions,
+        jobs: controller.jobs,
+        activeTool: controller.diagnostics.activeTool,
+        activityMessage: controller.diagnostics.activityMessage,
+      }),
+    [
+      controller.diagnostics.activeTool,
+      controller.diagnostics.activityMessage,
+      controller.jobs,
+      controller.pendingPermissions,
+      controller.visibleMessages,
+    ],
+  );
 
   const sendEnabled = controller.commands.find(
     (command) => command.id === "send-message",
   )?.enabled;
   const pendingMessages = useMemo(
     () =>
-      controller.messages.filter((message) =>
-        Boolean(message.metadata?.pending),
+      controller.messages.filter(
+        (message) =>
+          message.role === "user" &&
+          Boolean(message.metadata?.local_only) &&
+          Boolean(message.metadata?.pending),
       ),
     [controller.messages],
   );
   const directEffortOptions = directResponse
     ? getDirectReasoningEffortOptions(directResponse.provider, directResponse.model)
     : [];
-  const currentLlmModeLabel = directResponse
+  const effectiveDirect =
+    controller.effectiveGeneration?.kind === "direct"
+      ? controller.effectiveGeneration
+      : null;
+  const effectiveDirectEffortOptions = effectiveDirect
+    ? getDirectReasoningEffortOptions(
+        effectiveDirect.provider as DirectMobileLlmProvider,
+        effectiveDirect.model,
+      )
+    : [];
+  const currentLlmModeLabel = effectiveDirect?.reasoningEffort
+    ? effectiveDirect.reasoningEffort
+    : directResponse
     ? directResponse.reasoningEffort || directEffortOptions[0] || "標準"
     : controller.llmMode
       ? controller.llmModeLabels[controller.llmMode] ?? controller.llmMode
-      : "LLM";
+      : "サーバー既定";
+  const llmSyncLabel =
+    controller.llmModeSyncStatus === "pending"
+      ? "Effortをバックグラウンド同期予定"
+      : controller.llmModeSyncStatus === "syncing"
+        ? "Effortをバックグラウンド同期中"
+        : null;
   const currentResponseModelLabel = useMemo(() => {
+    const effective = controller.effectiveGeneration;
+    if (effective?.kind === "direct") {
+      return `${getProviderLabel(effective.provider as DirectMobileLlmProvider)} / ${effective.model}`;
+    }
+    if (effective?.kind === "server" && effective.model) {
+      return `${effective.provider ? `${effective.provider} / ` : ""}${effective.model}`;
+    }
     if (directResponse) {
-      return `Direct · ${getProviderLabel(directResponse.provider)} / ${directResponse.model}`;
+      return `${getProviderLabel(directResponse.provider)} / ${directResponse.model}`;
     }
     const option = responseModel
       ? controller.responseModelOptions.find(
@@ -164,13 +450,106 @@ export default function ChatScreen() {
             item.model === responseModel.model,
         )
       : controller.responseModelOptions.find((item) => item.isCurrent);
-    return option?.modelLabel ?? responseModel?.model ?? "自動";
-  }, [controller.responseModelOptions, directResponse, responseModel]);
+    return option?.modelLabel ?? responseModel?.model ?? "サーバー既定";
+  }, [controller.effectiveGeneration, controller.responseModelOptions, directResponse, responseModel]);
+
+  // 「次の応答モデル」: Direct + Server をプロバイダー単位で 2段階化する。
+  const visibleDirectModelOptions = directModelOptions;
+  const responseModelGroups = useMemo(
+    () =>
+      buildModelPickerGroups(
+        visibleDirectModelOptions.map((option) => ({
+          ...option,
+          isCurrent:
+            directResponse?.provider === option.provider &&
+            directResponse?.model === option.model,
+        })),
+        controller.responseModelOptions,
+      ),
+    [controller.responseModelOptions, directResponse, visibleDirectModelOptions],
+  );
+  const activeResponseGroup = useMemo(
+    () =>
+      responseModelGroups.find((group) => group.key === modelPickerProvider) ??
+      null,
+    [responseModelGroups, modelPickerProvider],
+  );
+  const activeResponseModels = useMemo(() => {
+    if (!activeResponseGroup) return [];
+    const query = modelPickerFilter.trim().toLowerCase();
+    if (!query) return activeResponseGroup.models;
+    return activeResponseGroup.models.filter((entry) =>
+      `${entry.model} ${entry.label} ${entry.routeLabel ?? ""}`
+        .toLowerCase()
+        .includes(query),
+    );
+  }, [activeResponseGroup, modelPickerFilter]);
+  // 「別モデルでこの回答を再生成」: Server カタログのみを 2段階化する。
+  const rerunModelGroups = useMemo(
+    () => buildModelPickerGroups([], controller.responseModelOptions),
+    [controller.responseModelOptions],
+  );
+  const activeRerunGroup = useMemo(
+    () =>
+      rerunModelGroups.find((group) => group.key === rerunPickerProvider) ?? null,
+    [rerunModelGroups, rerunPickerProvider],
+  );
+
+  const closeResponseModelDialog = useCallback(() => {
+    setResponseModelVisible(false);
+    setModelPickerProvider(null);
+    setModelPickerFilter("");
+  }, []);
+
+  const closeModelTargetDialog = useCallback(() => {
+    setModelTarget(null);
+    setRerunPickerProvider(null);
+  }, []);
+
+  const selectResponseModelEntry = useCallback((entry: ModelPickerEntry) => {
+    if (appContextSelected && entry.kind === "direct") return;
+    if (entry.kind === "direct") {
+      const efforts = getDirectReasoningEffortOptions(
+        entry.provider as DirectMobileLlmProvider,
+        entry.model,
+      );
+      const previousEffort = directResponse?.reasoningEffort;
+      controller.changeResponseTarget({
+        kind: "direct",
+        selection: {
+          provider: entry.provider as DirectMobileLlmProvider,
+          model: entry.model,
+            reasoningEffort: efforts.includes(previousEffort ?? "")
+              ? previousEffort
+              : efforts.includes("medium")
+                ? "medium"
+                : efforts[0],
+        },
+      });
+    } else {
+      controller.changeResponseTarget({
+        kind: "server",
+        responseModel: { provider: entry.provider, model: entry.model },
+      });
+    }
+    setResponseModelVisible(false);
+    setModelPickerProvider(null);
+    setModelPickerFilter("");
+  }, [appContextSelected, controller.changeResponseTarget, directResponse]);
+
+  useEffect(() => {
+    if (appContextSelected && directResponse) {
+      controller.changeResponseTarget({ kind: "server" });
+    }
+  }, [appContextSelected, controller.changeResponseTarget, directResponse]);
 
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const [main, fallback] = await Promise.all([getMainSlot(), getFallbackConfig()]);
+      const [main, fallback] = await Promise.all([
+        getMainSlot(),
+        getFallbackConfig(),
+      ]);
       const preferredModels = new Map<DirectMobileLlmProvider, string[]>();
       if (isDirectProvider(main.provider)) {
         preferredModels.set(main.provider, main.model ? [main.model] : []);
@@ -198,11 +577,11 @@ export default function ChatScreen() {
       if (cancelled) return;
       setDirectModelOptions(
         Array.from(providerModels.entries()).flatMap(([provider, models]) =>
-          models.slice(0, 30).map((model) => ({
-            provider,
-            model,
-            label: `Direct · ${getProviderLabel(provider)} / ${model}`,
-          })),
+            models.map((model) => ({
+              provider,
+              model,
+              label: model,
+            })),
         ),
       );
     })().catch(() => {
@@ -212,34 +591,69 @@ export default function ChatScreen() {
       cancelled = true;
     };
   }, []);
-  const slashQuery = /^\/[^\s\n]*$/.test(input) ? input : null;
-  const slashSuggestions = useMemo(() => {
-    if (!slashQuery) return [];
-    const builtIns = filterSlashCommands(MOBILE_CHAT_COMMANDS, slashQuery).map((command) => ({
-      kind: "command" as const,
-      command,
-    }));
-    const skills = filterSlashCommands(controller.skillCommands, slashQuery).map((command) => ({
-      kind: "skill" as const,
-      command,
-    }));
-    return [...builtIns, ...skills].slice(0, 6);
-  }, [controller.skillCommands, slashQuery]);
-
   useEffect(() => {
     navigation.setOptions({
       title: controller.session?.title || "チャット",
+      headerRight: () => (
+        <IconButton
+          icon="pencil-outline"
+          iconColor="#cdd6f4"
+          size={21}
+          accessibilityLabel="セッションタイトルを変更"
+          onPress={() => {
+            setTitleDraft(controller.session?.title || "");
+            setTitleError(null);
+            setTitleDialogVisible(true);
+          }}
+        />
+      ),
     });
   }, [controller.session?.title, navigation]);
 
+  const saveSessionTitle = useCallback(async () => {
+    const normalized = titleDraft.trim();
+    if (!normalized) {
+      setTitleError("タイトルを入力してください。");
+      return;
+    }
+    setTitleSaving(true);
+    setTitleError(null);
+    try {
+      await controller.updateSessionTitle(normalized);
+      setTitleDialogVisible(false);
+    } catch (error) {
+      setTitleError(
+        error instanceof Error ? error.message : "タイトルの更新に失敗しました。",
+      );
+    } finally {
+      setTitleSaving(false);
+    }
+  }, [controller, titleDraft]);
+
+  const changeChatProject = useCallback(
+    async (projectId: string | null) => {
+      await controller.changeProject(projectId);
+      await setSelectedProjectId(projectId);
+    },
+    [controller.changeProject, setSelectedProjectId],
+  );
+
+  const scheduleScrollToEnd = useCallback((delay = 48) => {
+    if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
+    scrollTimerRef.current = setTimeout(() => {
+      scrollTimerRef.current = null;
+      flatListRef.current?.scrollToEnd({ animated: true });
+    }, delay);
+  }, []);
+
   useEffect(() => {
-    setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 80);
-  }, [controller.timeline.length]);
+    scheduleScrollToEnd();
+  }, [durableTimeline.length, Boolean(controller.streamContent), scheduleScrollToEnd]);
 
   useEffect(() => {
     const showSubscription = Keyboard.addListener("keyboardDidShow", () => {
       setKeyboardVisible(true);
-      setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 80);
+      scheduleScrollToEnd(64);
     });
     const hideSubscription = Keyboard.addListener("keyboardDidHide", () => {
       setKeyboardVisible(false);
@@ -247,61 +661,37 @@ export default function ChatScreen() {
     return () => {
       showSubscription.remove();
       hideSubscription.remove();
+      if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
     };
-  }, []);
+  }, [scheduleScrollToEnd]);
 
-  const selectBuiltInCommand = useCallback((command: MobileChatCommand) => {
-    setActiveCommand(command);
-    setComposerError(null);
-    setInput((value) => (/^\/[^\s\n]*$/.test(value) ? "" : value));
-    setCommandSheetVisible(false);
-  }, []);
-
-  const selectSkillCommand = useCallback((command: SkillSlashCommand) => {
-    setActiveCommand(null);
-    setComposerError(null);
-    setInput(`${command.command} `);
-    setCommandSheetVisible(false);
-  }, []);
-
-  const handleSend = useCallback(() => {
-    const submission = resolveMobileCommandSubmission(input, activeCommand);
-    if (submission.error) {
-      setComposerError(submission.error);
-      return;
-    }
-    const text = submission.content;
-    if (!text || !sendEnabled) return;
-    if (
-      directResponse &&
-      (Boolean(submission.capabilities?.length) || text.startsWith("/"))
-    ) {
-      setComposerError("組み込みコマンドとSkillsはServerモデルで実行してください。");
-      return;
-    }
-    setInput("");
-    setActiveCommand(null);
-    setComposerError(null);
-    void controller.sendConversationCommand({
-      message: text,
-      projectId: selectedProjectId,
+  const sendComposerMessage = useCallback(
+    (submission: ChatComposerSubmission) => {
+      if (controller.session?.is_group_chat) {
+        return controller.groupRespond(submission.content);
+      }
+      return controller.sendConversationCommand({
+          message: submission.content,
+          projectId: currentProjectId,
+          appId: controller.session?.app_id ?? routeAppId ?? null,
+          appTargetId: controller.session?.app_target_id ?? routeAppTargetId ?? null,
+          includeProjectContext,
+          agentMode: "confirm",
+          target: controller.responseTarget,
+          commandCapabilities: submission.capabilities,
+        });
+    },
+    [
+      controller.groupRespond,
+      controller.session?.is_group_chat,
+      controller.responseTarget,
+      controller.sendConversationCommand,
+      currentProjectId,
       includeProjectContext,
-      agentMode: "confirm",
-      target: directResponse
-        ? { kind: "direct", selection: directResponse }
-        : { kind: "server", responseModel: responseModel ?? undefined },
-      commandCapabilities: submission.capabilities,
-    });
-  }, [
-    activeCommand,
-    controller,
-    includeProjectContext,
-    input,
-    selectedProjectId,
-    sendEnabled,
-    responseModel,
-    directResponse,
-  ]);
+      routeAppId,
+      routeAppTargetId,
+    ],
+  );
 
   const openEdit = useCallback((message: ConversationMessage) => {
     setEditTarget(message);
@@ -319,341 +709,336 @@ export default function ChatScreen() {
     await Clipboard.setStringAsync(message.content);
   }, []);
 
-  const submitDeepResearch = useCallback(() => {
-    const query = deepResearchQuery.trim() || input.trim();
-    if (!query) return;
-    setDeepResearchVisible(false);
-    setDeepResearchQuery("");
-    void controller.startDeepResearch(query);
-  }, [controller, deepResearchQuery, input]);
-
   const changeLlmMode = useCallback(
-    async (mode: string) => {
-      setLlmModeSaving(true);
-      setComposerError(null);
-      try {
-        await controller.changeLlmMode(mode);
-        setLlmModeVisible(false);
-      } catch (error) {
-        setComposerError(
-          error instanceof Error ? error.message : "Effortの変更に失敗しました。",
-        );
-      } finally {
-        setLlmModeSaving(false);
-      }
+    (mode: string) => {
+      controller.changeLlmMode(mode);
+      setLlmModeVisible(false);
     },
-    [controller],
+    [controller.changeLlmMode],
   );
 
-  const renderMessage = (message: ConversationMessage) => {
-    const key = groupMessageKey(message);
-    const siblings = messageGroups[key] || [];
-    const hasBranch = key !== "__root__" && siblings.length > 1;
-    const currentBranchIdx = hasBranch
-      ? siblings.findIndex((entry) => entry.id === message.id)
-      : -1;
-    return (
-      <View style={styles.messageWrap}>
-        <Pressable
-          onLongPress={() => setActionTarget(message)}
-          delayLongPress={280}
-        >
-          <Surface
-            style={[
-              styles.messageBubble,
-              message.role === "user"
-                ? styles.userBubble
-                : styles.assistantBubble,
-            ]}
-            elevation={0}
-          >
-            {message.role === "user" ? (
-              <Text style={styles.userText}>{message.content}</Text>
-            ) : (
-              <Markdown style={markdownStyles}>{message.content}</Markdown>
-            )}
-          </Surface>
-        </Pressable>
-        {hasBranch ? (
-          <View style={styles.branchRow}>
-            <IconButton
-              icon="chevron-left"
-              iconColor={currentBranchIdx > 0 ? "#cdd6f4" : "#585b70"}
-              size={18}
-              onPress={() =>
-                void controller.switchBranch(message, currentBranchIdx - 1)
-              }
-              disabled={currentBranchIdx <= 0}
-            />
-            <Text style={styles.branchText}>
-              {currentBranchIdx + 1}/{siblings.length}
-            </Text>
-            <IconButton
-              icon="chevron-right"
-              iconColor={
-                currentBranchIdx < siblings.length - 1 ? "#cdd6f4" : "#585b70"
-              }
-              size={18}
-              onPress={() =>
-                void controller.switchBranch(message, currentBranchIdx + 1)
-              }
-              disabled={currentBranchIdx >= siblings.length - 1}
-            />
-          </View>
-        ) : null}
-      </View>
-    );
-  };
-
-  const renderEvent = (item: TimelineItem) => {
-    if (item.type === "message") return renderMessage(item.message);
-    if (item.type === "stream") {
-      return (
-        <Surface
-          style={[styles.messageBubble, styles.assistantBubble]}
-          elevation={0}
-        >
-          <Markdown style={markdownStyles}>{item.content}</Markdown>
-        </Surface>
-      );
-    }
-    const event = item.event;
-    const danger = event.severity === "danger";
-    return (
-      <Surface style={styles.eventCard} elevation={0}>
-        <View style={styles.eventHeader}>
-          <Text style={[styles.eventTitle, danger ? styles.dangerText : null]}>
-            {event.title}
-          </Text>
-          <Chip
-            compact
-            style={styles.eventChip}
-            textStyle={styles.eventChipText}
-          >
-            {event.kind}
-          </Chip>
-        </View>
-        <Text style={styles.eventDescription}>{event.description}</Text>
-        {event.kind === "permission" ? (
-          <>
-            <Text style={styles.eventMeta} numberOfLines={5}>
-              {JSON.stringify(event.request.toolArgs, null, 2)}
-            </Text>
-            <View style={styles.eventActions}>
-              <Button
-                mode="outlined"
-                compact
-                textColor="#f38ba8"
-                onPress={() =>
-                  controller.respondPermission(event.request.requestId, false)
-                }
-              >
-                Deny
-              </Button>
-              <Button
-                mode="contained"
-                compact
-                buttonColor="#7c3aed"
-                onPress={() =>
-                  controller.respondPermission(event.request.requestId, true)
-                }
-              >
-                Allow
-              </Button>
-            </View>
-          </>
-        ) : null}
-        {event.kind === "job" ? (
-          <>
-            <ProgressBar
-              progress={Math.max(0, Math.min(1, event.job.progress / 100))}
-              color={danger ? "#f38ba8" : "#7c3aed"}
-              style={styles.progress}
-            />
-            {event.job.resultText ? (
-              <Text style={styles.eventMeta} numberOfLines={8}>
-                {event.job.resultText}
-              </Text>
-            ) : null}
-          </>
-        ) : null}
-      </Surface>
-    );
-  };
-
-  if (controller.loading) {
-    return (
-      <View style={styles.loadingContainer}>
-        <ActivityIndicator size="large" color="#7c3aed" />
-      </View>
-    );
-  }
+  const openMessageActions = useCallback((message: ConversationMessage) => {
+    setActionTarget(message);
+  }, []);
+  const switchMessageBranch = useCallback(
+    (message: ConversationMessage, nextIndex: number) => {
+      void controller.switchBranch(message, nextIndex);
+    },
+    [controller.switchBranch],
+  );
+  const openPendingQueue = useCallback(() => setPendingQueueVisible(true), []);
+  const openResponseModel = useCallback(() => {
+    setModelPickerFilter("");
+    setResponseModelVisible(true);
+  }, []);
+  const openLlmMode = useCallback(() => setLlmModeVisible(true), []);
 
   return (
-    <View style={styles.container}>
-      {controller.error ? (
-        <Surface style={styles.errorBanner} elevation={0}>
-          <Text style={styles.errorText}>{controller.error}</Text>
-          <Button
-            compact
-            textColor="#89b4fa"
-            onPress={() => void controller.load()}
-          >
-            再読み込み
-          </Button>
-        </Surface>
-      ) : null}
-
-      <FlatList
-        ref={flatListRef}
-        data={controller.timeline}
-        keyExtractor={(item) => item.id}
-        renderItem={({ item }) => renderEvent(item)}
-        keyboardShouldPersistTaps="handled"
-        contentContainerStyle={styles.messageList}
-        ListEmptyComponent={
-          <View style={styles.empty}>
-            <Text style={styles.emptyText}>
-              メッセージを送信して会話を開始します。
-            </Text>
-          </View>
-        }
+    <ChatScreenShell
+      loading={controller.loading && !hasConversationContent}
+      error={controller.error}
+      opacity={screenOpacity}
+      onReload={() => void controller.load()}
+    >
+      <ChatHeaderStatus
+        diagnostics={controller.diagnostics}
+        session={controller.session}
+        projects={projects}
+        currentProjectId={currentProjectId ?? null}
+        pendingCount={pendingMessages.length}
+        onRefreshProjects={refreshProjects}
+        onChangeProject={changeChatProject}
+        onChangeCharacter={controller.changeCharacter}
+        onOpenPendingQueue={openPendingQueue}
+      />
+      <ChatTimeline
+        listRef={flatListRef}
+        items={durableTimeline}
+        allMessages={controller.messages}
+        streamContent={controller.streamContent}
+        reduceMotion={reduceMotion}
+        agentRuns={controller.agentRuns}
+        agentRunErrors={controller.agentRunErrors}
+        onLongPressMessage={openMessageActions}
+        onSwitchBranch={switchMessageBranch}
+        onRetryAgentRun={controller.retryAgentRun}
+        onRespondPermission={controller.respondPermission}
       />
 
-      <KeyboardStickyView offset={{ closed: 0, opened: 0 }}>
-        <View
-          style={[
-            styles.inputBar,
-            {
-              paddingBottom: keyboardVisible ? 4 : Math.max(4, insets.bottom),
-            },
-          ]}
-        >
-        {slashSuggestions.length > 0 ? (
-          <Surface style={styles.slashSuggestions} elevation={3}>
-            {slashSuggestions.map((item) => (
-              <Pressable
-                key={`${item.kind}-${item.command.command}`}
-                style={styles.slashSuggestionRow}
-                onPress={() =>
-                  item.kind === "command"
-                    ? selectBuiltInCommand(item.command)
-                    : selectSkillCommand(item.command)
-                }
-              >
-                <Text style={styles.slashCommand}>{item.command.command}</Text>
-                <Text style={styles.slashDescription} numberOfLines={1}>
-                  {item.command.description}
-                </Text>
-              </Pressable>
-            ))}
-          </Surface>
-        ) : null}
-        {activeCommand ? (
-          <View style={styles.composerStatus}>
-            <Text style={styles.composerStatusText} numberOfLines={1}>
-              {activeCommand.command} · {activeCommand.label}
-            </Text>
-            <IconButton
-              icon="close"
-              size={16}
-              iconColor="#a6adc8"
-              style={styles.clearCommandButton}
-              onPress={() => setActiveCommand(null)}
-              accessibilityLabel="選択中のコマンドを解除"
-            />
-          </View>
-        ) : null}
-        {composerError ? <Text style={styles.composerError}>{composerError}</Text> : null}
-        <Surface style={styles.composerCard} elevation={1}>
-          <TextInput
-            value={input}
-            onChangeText={setInput}
-            placeholder="メッセージを入力..."
-            placeholderTextColor="#585b70"
-            style={styles.textInput}
-            mode="flat"
-            underlineColor="transparent"
-            activeUnderlineColor="transparent"
-            multiline
-            maxLength={4000}
-            disabled={!sendEnabled}
-            onSubmitEditing={handleSend}
-            blurOnSubmit={false}
-          />
-          <View style={styles.composerActions}>
-            <IconButton
-              icon="plus"
-              iconColor="#cdd6f4"
-              size={24}
-              style={styles.composerIconButton}
-              onPress={() => {
-                Keyboard.dismiss();
-                setCommandSheetVisible(true);
-              }}
-              accessibilityLabel="ツールとコマンドを開く"
-            />
-            <Pressable
-              style={styles.composerSelector}
-              onPress={() => {
-                Keyboard.dismiss();
-                setResponseModelVisible(true);
-              }}
-              accessibilityRole="button"
-              accessibilityLabel={`モデルを選択。現在は${currentResponseModelLabel}`}
-            >
-              <Text style={styles.composerSelectorText} numberOfLines={1}>
-                {compactLabel(currentResponseModelLabel)}
-              </Text>
-              <Text style={styles.composerSelectorChevron}>⌄</Text>
-            </Pressable>
-            <Pressable
-              style={styles.composerSelector}
-              disabled={
-                directResponse
-                  ? directEffortOptions.length === 0
-                  : controller.llmModeOptions.length === 0
-              }
-              onPress={() => {
-                Keyboard.dismiss();
-                setLlmModeVisible(true);
-              }}
-              accessibilityRole="button"
-              accessibilityLabel={`Effortを選択。現在は${currentLlmModeLabel}`}
-            >
-              <Text
-                style={[
-                  styles.composerSelectorText,
-                  (directResponse
-                    ? directEffortOptions.length === 0
-                    : controller.llmModeOptions.length === 0)
-                    ? styles.composerSelectorDisabled
-                    : null,
-                ]}
-                numberOfLines={1}
-              >
-                {compactLabel(currentLlmModeLabel)}
-              </Text>
-              <Text style={styles.composerSelectorChevron}>⌄</Text>
-            </Pressable>
-            <IconButton
-              icon="arrow-up"
-              iconColor={input.trim() && sendEnabled ? "#11111b" : "#6c7086"}
-              containerColor={
-                input.trim() && sendEnabled ? "#89b4fa" : "#313244"
-              }
-              size={22}
-              style={styles.sendButton}
-              onPress={handleSend}
-              disabled={!input.trim() || !sendEnabled}
-              accessibilityLabel="送信"
-            />
-          </View>
-        </Surface>
+      <Surface style={styles.appContextRail} elevation={0}>
+        <View style={styles.appContextRailText}>
+          <Text style={styles.appContextTitle} numberOfLines={1}>
+            App context: {controller.session?.app_id ?? routeAppId ?? "なし"}
+          </Text>
+          <Text style={styles.appContextMeta} numberOfLines={1}>
+            Project {currentProjectId ?? "全体"} · Task {routeTaskId ?? "—"} · Target {controller.session?.app_target_id ?? routeAppTargetId ?? "default"} · {controller.session?.development_status ?? (appContextSelected ? "working" : "通常Chat")}
+          </Text>
         </View>
-      </KeyboardStickyView>
+        <Button compact mode="text" textColor="#89b4fa" onPress={openContextSnapshot}>
+          Context
+        </Button>
+        <Button compact mode="text" textColor="#89b4fa" onPress={openAppPicker} disabled={!isAuthenticated}>
+          App
+        </Button>
+        <Button
+          compact
+          mode="text"
+          textColor="#89b4fa"
+          onPress={openGroupPicker}
+          disabled={!isAuthenticated || Boolean(controller.session?.is_group_chat)}
+        >
+          Group
+        </Button>
+      </Surface>
 
-      <Portal>
+      <ChatComposer
+        bottomInset={insets.bottom}
+        keyboardVisible={keyboardVisible}
+        sendEnabled={Boolean(sendEnabled)}
+        serverGenerationActive={controller.serverGenerationActive}
+        directResponseActive={Boolean(directResponse)}
+        currentResponseModelLabel={currentResponseModelLabel}
+        currentLlmModeLabel={currentLlmModeLabel}
+        effortEnabled={
+          directResponse || effectiveDirect
+            ? (directResponse ? directEffortOptions : effectiveDirectEffortOptions).length > 0
+            : controller.llmModeOptions.length > 0
+        }
+        llmSelectionMessage={controller.llmSelectionMessage}
+        llmSyncLabel={llmSyncLabel}
+        skillCommands={controller.skillCommands}
+        isAuthenticated={isAuthenticated}
+        pendingCount={pendingMessages.length}
+        onSend={sendComposerMessage}
+        onStopGeneration={controller.stopGeneration}
+        onOpenResponseModel={openResponseModel}
+        onOpenLlmMode={openLlmMode}
+        onOpenPendingQueue={openPendingQueue}
+        onStartDeepResearch={controller.startDeepResearch}
+        onSteerGeneration={controller.steerGeneration}
+      />
+
+      <ChatDialogHost>
+        <Dialog
+          visible={groupPickerVisible}
+          onDismiss={() => {
+            if (!groupPickerLoading && !groupCreating) setGroupPickerVisible(false);
+          }}
+          style={styles.dialog}
+        >
+          <Dialog.Title style={styles.dialogTitle}>Group Chat</Dialog.Title>
+          <Dialog.ScrollArea style={styles.dialogScrollArea}>
+            <ScrollView contentContainerStyle={styles.dialogScrollContent}>
+              <Text style={styles.diagnosticsText}>
+                参加するキャラクターを2人以上選択してください。
+              </Text>
+              {groupPickerLoading ? (
+                <Text style={styles.diagnosticsText}>読み込み中…</Text>
+              ) : null}
+              {groupPickerError ? (
+                <Text style={styles.dialogError}>{groupPickerError}</Text>
+              ) : null}
+              {!groupPickerLoading && groupCharacters.length === 0 ? (
+                <Text style={styles.diagnosticsText}>
+                  利用可能なキャラクターがありません。
+                </Text>
+              ) : null}
+              {!groupPickerLoading
+                ? groupCharacters.map((slug) => {
+                    const selected = groupSelectedCharacters.includes(slug);
+                    return (
+                      <Button
+                        key={slug}
+                        mode={selected ? "contained" : "outlined"}
+                        buttonColor={selected ? "#7c3aed" : undefined}
+                        textColor="#cdd6f4"
+                        style={styles.modeButton}
+                        onPress={() =>
+                          setGroupSelectedCharacters((current) =>
+                            selected
+                              ? current.filter((item) => item !== slug)
+                              : [...current, slug],
+                          )
+                        }
+                        disabled={groupCreating}
+                      >
+                        {slug}
+                      </Button>
+                    );
+                  })
+                : null}
+            </ScrollView>
+          </Dialog.ScrollArea>
+          <Dialog.Actions>
+            <Button
+              textColor="#a6adc8"
+              onPress={() => setGroupPickerVisible(false)}
+              disabled={groupPickerLoading || groupCreating}
+            >
+              閉じる
+            </Button>
+            <Button
+              textColor="#7c3aed"
+              onPress={() => void createGroupChat()}
+              loading={groupCreating}
+              disabled={
+                groupPickerLoading ||
+                groupCreating ||
+                groupSelectedCharacters.length < 2
+              }
+            >
+              作成
+            </Button>
+          </Dialog.Actions>
+        </Dialog>
+        <Dialog
+          visible={appPickerVisible}
+          onDismiss={() => {
+            if (!appPickerLoading) setAppPickerVisible(false);
+          }}
+          style={styles.dialog}
+        >
+          <Dialog.Title style={styles.dialogTitle}>App context</Dialog.Title>
+          <Dialog.ScrollArea style={styles.dialogScrollArea}>
+            <ScrollView contentContainerStyle={styles.dialogScrollContent}>
+              {appPickerLoading ? <Text style={styles.diagnosticsText}>読み込み中…</Text> : null}
+              {appPickerError ? <Text style={styles.dialogError}>{appPickerError}</Text> : null}
+              {!appPickerLoading ? (
+                <>
+                  <Button
+                    mode={!controller.session?.app_id ? "contained" : "outlined"}
+                    buttonColor={!controller.session?.app_id ? "#7c3aed" : undefined}
+                    textColor="#cdd6f4"
+                    style={styles.modeButton}
+                    onPress={() => void applyAppContext(null)}
+                  >
+                    App contextを解除
+                  </Button>
+                  {appPickerApps.map((binding) => {
+                    const selected = binding.app_id === controller.session?.app_id;
+                    const targets = binding.targets ?? binding.app.targets ?? [];
+                    return (
+                      <View key={binding.app_id}>
+                        <Button
+                          mode={selected ? "contained" : "outlined"}
+                          buttonColor={selected ? "#7c3aed" : undefined}
+                          textColor="#cdd6f4"
+                          style={styles.modeButton}
+                          onPress={() => {
+                            const targetId = targets[0]?.id ?? null;
+                            setAppPickerTargetId(targetId);
+                            void applyAppContext(binding, targetId);
+                          }}
+                        >
+                          {binding.display_alias || binding.app.name}
+                        </Button>
+                        {selected
+                          ? targets.map((target) => (
+                              <Button
+                                key={target.id}
+                                compact
+                                mode={target.id === controller.session?.app_target_id ? "contained" : "outlined"}
+                                textColor="#89b4fa"
+                                style={styles.targetButton}
+                                onPress={() => {
+                                  setAppPickerTargetId(target.id);
+                                  void applyAppContext(binding, target.id);
+                                }}
+                              >
+                                Target: {target.display_name || target.target_key}
+                              </Button>
+                            ))
+                          : null}
+                      </View>
+                    );
+                  })}
+                  {appPickerApps.length === 0 ? (
+                    <Text style={styles.diagnosticsText}>このProjectで利用可能なAppはありません。</Text>
+                  ) : null}
+                </>
+              ) : null}
+            </ScrollView>
+          </Dialog.ScrollArea>
+          <Dialog.Actions>
+            <Button textColor="#a6adc8" onPress={() => setAppPickerVisible(false)} disabled={appPickerLoading}>閉じる</Button>
+          </Dialog.Actions>
+        </Dialog>
+        <Dialog
+          visible={contextVisible}
+          onDismiss={() => setContextVisible(false)}
+          style={styles.dialog}
+        >
+          <Dialog.Title style={styles.dialogTitle}>Context snapshot</Dialog.Title>
+          <Dialog.Content>
+            {contextLoading ? <Text style={styles.diagnosticsText}>読み込み中…</Text> : null}
+            {contextError ? <Text style={styles.dialogError}>{contextError}</Text> : null}
+            {!contextLoading && !contextError && contextMain ? (
+              <>
+                <Text style={styles.contextMetric}>
+                  {contextMain.provider ?? "server"} / {contextMain.model ?? "default"}
+                </Text>
+                <Text style={styles.contextMetric}>
+                  Tokens {contextMain.input_tokens ?? "?"} / {contextMain.context_window_tokens ?? "?"}
+                </Text>
+                <Text style={styles.contextMetric}>
+                  Remaining {contextMain.remaining_tokens ?? "?"} · {contextMain.measurement ?? "estimated"}
+                </Text>
+                {(contextMain.categories ?? contextMain.components ?? []).map((item, index) => (
+                  <Text key={`${item.id ?? item.category ?? "category"}-${index}`} style={styles.contextCategory}>
+                    {item.label ?? item.category ?? item.id ?? "context"}: {item.tokens ?? item.input_tokens ?? item.chars ?? "?"}
+                  </Text>
+                ))}
+              </>
+            ) : null}
+            {!contextLoading && !contextError && !contextMain ? (
+              <Text style={styles.diagnosticsText}>利用可能なスナップショットはありません。</Text>
+            ) : null}
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button textColor="#a6adc8" onPress={() => setContextVisible(false)}>閉じる</Button>
+          </Dialog.Actions>
+        </Dialog>
+        <Dialog
+          visible={titleDialogVisible}
+          onDismiss={() => {
+            if (!titleSaving) setTitleDialogVisible(false);
+          }}
+          style={styles.dialog}
+        >
+          <Dialog.Title style={styles.dialogTitle}>
+            セッションタイトルを変更
+          </Dialog.Title>
+          <Dialog.Content>
+            <ChatTextInput
+              value={titleDraft}
+              onChangeText={setTitleDraft}
+              mode="outlined"
+              label="タイトル"
+              maxLength={200}
+              autoFocus
+              disabled={titleSaving}
+              onSubmitEditing={() => void saveSessionTitle()}
+            />
+            {titleError ? (
+              <Text style={styles.dialogError}>{titleError}</Text>
+            ) : null}
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button
+              onPress={() => setTitleDialogVisible(false)}
+              disabled={titleSaving}
+            >
+              キャンセル
+            </Button>
+            <Button
+              onPress={() => void saveSessionTitle()}
+              loading={titleSaving}
+              disabled={titleSaving || !titleDraft.trim()}
+            >
+              保存
+            </Button>
+          </Dialog.Actions>
+        </Dialog>
         <Dialog
           visible={pendingQueueVisible}
           onDismiss={() => setPendingQueueVisible(false)}
@@ -680,12 +1065,15 @@ export default function ChatScreen() {
                     compact
                     icon="refresh"
                     textColor="#89b4fa"
+                    disabled={controller.retryingMessageIds.includes(message.id)}
                     onPress={() => {
                       setPendingQueueVisible(false);
                       void controller.retryPendingMessage(message);
                     }}
                   >
-                    Retry
+                    {controller.retryingMessageIds.includes(message.id)
+                      ? "Retrying…"
+                      : "Retry"}
                   </Button>
                 </Surface>
               ))}
@@ -708,89 +1096,123 @@ export default function ChatScreen() {
 
         <Dialog
           visible={responseModelVisible}
-          onDismiss={() => setResponseModelVisible(false)}
+          onDismiss={closeResponseModelDialog}
           style={styles.dialog}
         >
-          <Dialog.Title style={styles.dialogTitle}>次の応答モデル</Dialog.Title>
+          <Dialog.Title style={styles.dialogTitle}>
+            {activeResponseGroup ? activeResponseGroup.label : "次の応答モデル"}
+          </Dialog.Title>
           <Dialog.ScrollArea style={styles.dialogScrollArea}>
             <ScrollView contentContainerStyle={styles.dialogScrollContent}>
-              <Button
-                mode={!responseModel ? "contained" : "outlined"}
-                buttonColor={!responseModel ? "#7c3aed" : undefined}
-                textColor={!responseModel ? "#f5e9ff" : "#89b4fa"}
-                style={styles.modeButton}
-                onPress={() => {
-                  setResponseModel(null);
-                  setDirectResponse(null);
-                  setResponseModelVisible(false);
-                }}
-              >
-                サーバー既定（自動）
-              </Button>
-              {directModelOptions.length > 0 ? (
+              {activeResponseGroup ? (
                 <>
-                  <Divider style={styles.innerDivider} />
-                  <Text style={styles.commandSectionTitle}>Direct</Text>
-                  {directModelOptions.map((option) => {
+                  <Button
+                    icon="chevron-left"
+                    textColor="#a6adc8"
+                    style={styles.modeButton}
+                    onPress={() => setModelPickerProvider(null)}
+                  >
+                    プロバイダー一覧へ戻る
+                  </Button>
+                  {activeResponseGroup.models.length > 8 ? (
+                    <TextInput
+                      label="モデルを検索"
+                      value={modelPickerFilter}
+                      onChangeText={setModelPickerFilter}
+                      mode="outlined"
+                      dense
+                      style={styles.modelPickerSearch}
+                      autoCapitalize="none"
+                    />
+                  ) : null}
+                  {activeResponseModels.map((entry) => {
                     const selected =
-                      directResponse?.provider === option.provider &&
-                      directResponse?.model === option.model;
+                      entry.kind === "direct"
+                        ? directResponse?.provider === entry.provider &&
+                          directResponse?.model === entry.model
+                        : responseModel?.provider === entry.provider &&
+                          responseModel?.model === entry.model;
                     return (
                       <Button
-                        key={`direct:${option.provider}:${option.model}`}
+                        key={`${entry.kind}:${entry.provider}:${entry.model}`}
                         mode={selected ? "contained" : "outlined"}
                         buttonColor={selected ? "#7c3aed" : undefined}
                         textColor={selected ? "#f5e9ff" : "#89b4fa"}
                         style={styles.modeButton}
-                        onPress={() => {
-                          const efforts = getDirectReasoningEffortOptions(
-                            option.provider,
-                            option.model,
-                          );
-                          setDirectResponse({
-                            provider: option.provider,
-                            model: option.model,
-                            reasoningEffort: efforts.includes("medium")
-                              ? "medium"
-                              : efforts[0],
-                          });
-                          setResponseModel(null);
-                          setResponseModelVisible(false);
-                        }}
+                        disabled={appContextSelected && entry.kind === "direct"}
+                        onPress={() => selectResponseModelEntry(entry)}
                       >
-                        {option.label}
+                        {entry.routeLabel
+                          ? `${entry.label} · ${entry.routeLabel}`
+                          : entry.label}
                       </Button>
                     );
                   })}
-                  <Divider style={styles.innerDivider} />
-                  <Text style={styles.commandSectionTitle}>Server</Text>
                 </>
-              ) : null}
-              {controller.responseModelOptions.map((option) => {
-                const selected =
-                  responseModel?.provider === option.provider &&
-                  responseModel?.model === option.model;
-                return (
+              ) : (
+                <>
                   <Button
-                    key={`${option.provider}:${option.model}`}
-                    mode={selected ? "contained" : "outlined"}
-                    buttonColor={selected ? "#7c3aed" : undefined}
-                    textColor={selected ? "#f5e9ff" : "#89b4fa"}
+                    mode={
+                      !responseModel && !directResponse ? "contained" : "outlined"
+                    }
+                    buttonColor={
+                      !responseModel && !directResponse ? "#7c3aed" : undefined
+                    }
+                    textColor={
+                      !responseModel && !directResponse ? "#f5e9ff" : "#89b4fa"
+                    }
                     style={styles.modeButton}
                     onPress={() => {
-                      setResponseModel({ provider: option.provider, model: option.model });
-                      setDirectResponse(null);
-                      setResponseModelVisible(false);
+                      controller.changeResponseTarget({ kind: "server" });
+                      closeResponseModelDialog();
                     }}
                   >
-                    {option.label}
+                    サーバー既定（自動）
                   </Button>
-                );
-              })}
+                  {responseModelGroups.map((group) => {
+                    const selected =
+                      (Boolean(directResponse) &&
+                        group.models.some(
+                          (entry) =>
+                            entry.kind === "direct" &&
+                            directResponse?.provider === entry.provider &&
+                            directResponse?.model === entry.model,
+                        )) ||
+                      (Boolean(responseModel) &&
+                        group.models.some(
+                          (entry) =>
+                            entry.kind === "server" &&
+                            responseModel?.provider === entry.provider &&
+                            responseModel?.model === entry.model,
+                        ));
+                    return (
+                      <Button
+                        key={group.key}
+                        mode="outlined"
+                        textColor={selected ? "#c084fc" : "#89b4fa"}
+                        style={styles.modeButton}
+                        contentStyle={styles.providerButtonContent}
+                        icon="chevron-right"
+                        onPress={() => {
+                          setModelPickerFilter("");
+                          setModelPickerProvider(group.key);
+                        }}
+                      >
+                        {group.label}
+                      </Button>
+                    );
+                  })}
+                  {responseModelGroups.length === 0 ? (
+                    <Text style={styles.diagnosticsText}>
+                      利用可能なモデルがありません。
+                    </Text>
+                  ) : null}
+                </>
+              )}
             </ScrollView>
           </Dialog.ScrollArea>
           <Dialog.Actions>
-            <Button textColor="#a6adc8" onPress={() => setResponseModelVisible(false)}>
+            <Button textColor="#a6adc8" onPress={closeResponseModelDialog}>
               Cancel
             </Button>
           </Dialog.Actions>
@@ -819,11 +1241,13 @@ export default function ChatScreen() {
                   compact
                   buttonColor={selected ? "#7c3aed" : undefined}
                   textColor={selected ? "#f5e9ff" : "#89b4fa"}
-                  disabled={!directResponse && llmModeSaving}
                   style={styles.modeButton}
                   onPress={() => {
                     if (directResponse) {
-                      setDirectResponse({ ...directResponse, reasoningEffort: mode });
+                      controller.changeResponseTarget({
+                        kind: "direct",
+                        selection: { ...directResponse, reasoningEffort: mode },
+                      });
                       setLlmModeVisible(false);
                     } else {
                       void changeLlmMode(mode);
@@ -884,13 +1308,18 @@ export default function ChatScreen() {
                     <Button
                       icon="refresh"
                       textColor="#89b4fa"
+                      disabled={controller.retryingMessageIds.includes(
+                        actionTarget.id,
+                      )}
                       onPress={() => {
                         const target = actionTarget;
                         setActionTarget(null);
                         if (target) void controller.retryPendingMessage(target);
                       }}
                     >
-                      リトライ
+                      {controller.retryingMessageIds.includes(actionTarget.id)
+                        ? "リトライ中…"
+                        : "リトライ"}
                     </Button>
                   ) : null}
                   {canEdit ? (
@@ -945,6 +1374,33 @@ export default function ChatScreen() {
                       >
                         分岐を読み込み
                       </Button>
+                      <Button
+                        icon="source-fork"
+                        textColor="#89b4fa"
+                        onPress={() => {
+                          const target = actionTarget;
+                          setActionTarget(null);
+                          if (!target) return;
+                          void controller
+                            .forkConversation(target.id)
+                            .then((forkedId) =>
+                              router.replace({
+                                pathname: "/(tabs)/chat/[sessionId]",
+                                params: { sessionId: forkedId },
+                              }),
+                            )
+                            .catch((error) =>
+                              Alert.alert(
+                                "Chat",
+                                error instanceof Error
+                                  ? error.message
+                                  : "会話のフォークに失敗しました。",
+                              ),
+                            );
+                        }}
+                      >
+                        ここからフォーク
+                      </Button>
                     </>
                   ) : null}
                 </>
@@ -965,7 +1421,7 @@ export default function ChatScreen() {
         >
           <Dialog.Title style={styles.dialogTitle}>Edit Message</Dialog.Title>
           <Dialog.Content>
-            <TextInput
+            <ChatTextInput
               value={editContent}
               onChangeText={setEditContent}
               mode="outlined"
@@ -989,11 +1445,13 @@ export default function ChatScreen() {
 
         <Dialog
           visible={Boolean(modelTarget)}
-          onDismiss={() => setModelTarget(null)}
+          onDismiss={closeModelTargetDialog}
           style={styles.dialog}
         >
           <Dialog.Title style={styles.dialogTitle}>
-            別モデルでこの回答を再生成
+            {activeRerunGroup
+              ? activeRerunGroup.label
+              : "別モデルでこの回答を再生成"}
           </Dialog.Title>
           <Dialog.ScrollArea style={styles.dialogScrollArea}>
             <ScrollView contentContainerStyle={styles.dialogScrollContent}>
@@ -1003,152 +1461,89 @@ export default function ChatScreen() {
                 </Text>
               ) : null}
               {!controller.responseModelOptionsLoading &&
-              controller.responseModelOptions.length === 0 ? (
+              rerunModelGroups.length === 0 ? (
                 <Text style={styles.diagnosticsText}>
                   再生成モデルがありません。
                 </Text>
               ) : null}
-              {!controller.responseModelOptionsLoading
-                ? controller.responseModelOptions.map((option) => (
+              {!controller.responseModelOptionsLoading && activeRerunGroup ? (
+                <>
+                  <Button
+                    icon="chevron-left"
+                    textColor="#a6adc8"
+                    style={styles.modeButton}
+                    onPress={() => setRerunPickerProvider(null)}
+                  >
+                    プロバイダー一覧へ戻る
+                  </Button>
+                  {activeRerunGroup.models.map((entry) => (
                     <Button
-                      key={`${option.provider}:${option.model}`}
+                      key={`${entry.provider}:${entry.model}`}
                       textColor="#89b4fa"
+                      style={styles.modeButton}
                       onPress={() => {
                         const target = modelTarget;
-                        setModelTarget(null);
-                        if (target) void controller.rerunMessage(target, option);
+                        closeModelTargetDialog();
+                        if (target)
+                          void controller.rerunMessage(target, {
+                            provider: entry.provider,
+                            model: entry.model,
+                          });
                       }}
                     >
-                      {option.label}
+                      {entry.routeLabel
+                        ? `${entry.label} · ${entry.routeLabel}`
+                        : entry.label}
+                    </Button>
+                  ))}
+                </>
+              ) : null}
+              {!controller.responseModelOptionsLoading && !activeRerunGroup
+                ? rerunModelGroups.map((group) => (
+                    <Button
+                      key={group.key}
+                      mode="outlined"
+                      textColor="#89b4fa"
+                      style={styles.modeButton}
+                      contentStyle={styles.providerButtonContent}
+                      icon="chevron-right"
+                      onPress={() => setRerunPickerProvider(group.key)}
+                    >
+                      {group.label}
                     </Button>
                   ))
                 : null}
             </ScrollView>
           </Dialog.ScrollArea>
           <Dialog.Actions>
-            <Button textColor="#a6adc8" onPress={() => setModelTarget(null)}>
+            <Button textColor="#a6adc8" onPress={closeModelTargetDialog}>
               Cancel
             </Button>
           </Dialog.Actions>
         </Dialog>
 
-        <Dialog
-          visible={deepResearchVisible}
-          onDismiss={() => setDeepResearchVisible(false)}
-          style={styles.dialog}
-        >
-          <Dialog.Title style={styles.dialogTitle}>Deep Research</Dialog.Title>
-          <Dialog.Content>
-            <Text style={styles.dialogHelp}>
-              長時間ジョブとして開始し、進捗はタイムラインに表示します。
-            </Text>
-            <TextInput
-              value={deepResearchQuery}
-              onChangeText={setDeepResearchQuery}
-              mode="outlined"
-              multiline
-              placeholder={input.trim() || "調査したい内容"}
-              style={styles.editInput}
-            />
-          </Dialog.Content>
-          <Dialog.Actions>
-            <Button
-              textColor="#a6adc8"
-              onPress={() => setDeepResearchVisible(false)}
-            >
-              Cancel
-            </Button>
-            <Button textColor="#7c3aed" onPress={submitDeepResearch}>
-              Start
-            </Button>
-          </Dialog.Actions>
-        </Dialog>
-
-        <Dialog
-          visible={commandSheetVisible}
-          onDismiss={() => setCommandSheetVisible(false)}
-          style={styles.dialog}
-        >
-          <Dialog.Title style={styles.dialogTitle}>追加と設定</Dialog.Title>
-          <Dialog.ScrollArea style={styles.dialogScrollArea}>
-            <ScrollView contentContainerStyle={styles.dialogScrollContent}>
-              <Text style={styles.commandSectionTitle}>ツール</Text>
-              <Button
-                icon="magnify"
-                textColor="#cdd6f4"
-                contentStyle={styles.quickActionContent}
-                disabled={!isAuthenticated}
-                onPress={() => {
-                  setCommandSheetVisible(false);
-                  setDeepResearchVisible(true);
-                }}
-              >
-                Deep Research
-              </Button>
-              {pendingMessages.length > 0 ? (
-                <Button
-                  icon="cloud-upload-outline"
-                  textColor="#f9e2af"
-                  contentStyle={styles.quickActionContent}
-                  onPress={() => {
-                    setCommandSheetVisible(false);
-                    setPendingQueueVisible(true);
-                  }}
-                >
-                  未送信メッセージ {pendingMessages.length}件
-                </Button>
-              ) : null}
-              <Divider style={styles.innerDivider} />
-              <Text style={styles.commandSectionTitle}>組み込みコマンド</Text>
-              {MOBILE_CHAT_COMMANDS.map((command) => (
-                <Pressable
-                  key={command.command}
-                  style={styles.commandRow}
-                  onPress={() => selectBuiltInCommand(command)}
-                >
-                  <View style={styles.commandText}>
-                    <Text style={styles.commandTitle}>{command.command} · {command.label}</Text>
-                    <Text style={styles.commandDescription}>
-                      {command.description}
-                    </Text>
-                  </View>
-                </Pressable>
-              ))}
-              <Divider style={styles.innerDivider} />
-              <Text style={styles.commandSectionTitle}>Skills</Text>
-              {controller.skillCommands.map((command) => (
-                <Pressable
-                  key={command.command}
-                  style={styles.commandRow}
-                  onPress={() => selectSkillCommand(command)}
-                >
-                  <View style={styles.commandText}>
-                    <Text style={styles.commandTitle}>{command.command}</Text>
-                    <Text style={styles.commandDescription}>{command.description}</Text>
-                  </View>
-                </Pressable>
-              ))}
-              {controller.skillCommands.length === 0 ? (
-                <Text style={styles.diagnosticsText}>利用可能な手動Skillはありません。</Text>
-              ) : null}
-            </ScrollView>
-          </Dialog.ScrollArea>
-          <Dialog.Actions>
-            <Button
-              textColor="#a6adc8"
-              onPress={() => setCommandSheetVisible(false)}
-            >
-              Close
-            </Button>
-          </Dialog.Actions>
-        </Dialog>
-      </Portal>
-    </View>
+      </ChatDialogHost>
+    </ChatScreenShell>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b" },
+  appContextRail: {
+    minHeight: 48,
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    backgroundColor: "#202033",
+    borderBottomColor: "#45475a",
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  appContextRailText: { flex: 1, minWidth: 0 },
+  appContextTitle: { color: "#cdd6f4", fontSize: 12, fontWeight: "700" },
+  appContextMeta: { color: "#a6adc8", fontSize: 11, marginTop: 2 },
+  contextMetric: { color: "#cdd6f4", fontSize: 13, marginTop: 8 },
+  contextCategory: { color: "#a6adc8", fontSize: 12, marginTop: 4 },
   loadingContainer: {
     flex: 1,
     justifyContent: "center",
@@ -1157,6 +1552,46 @@ const styles = StyleSheet.create({
   },
   statusChip: { backgroundColor: "#313244", marginRight: 6 },
   statusChipText: { color: "#cdd6f4", fontSize: 11 },
+  connectionBar: {
+    minHeight: 30,
+    flexDirection: "row",
+    flexWrap: "nowrap",
+    alignItems: "center",
+    paddingHorizontal: 14,
+    paddingVertical: 4,
+    gap: 7,
+    backgroundColor: "#181825",
+    borderBottomColor: "#313244",
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  connectionDot: { width: 8, height: 8, borderRadius: 4, flexGrow: 0, flexShrink: 0 },
+  connectionLabel: {
+    minWidth: 0,
+    flexShrink: 1,
+    color: "#cdd6f4",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  projectChip: {
+    maxWidth: 132,
+    backgroundColor: "#313244",
+    height: 28,
+  },
+  projectChipText: { color: "#cdd6f4", fontSize: 11 },
+  projectError: {
+    color: "#f38ba8",
+    backgroundColor: "#2d1822",
+    fontSize: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+  },
+  pendingBadge: {
+    backgroundColor: "#453a2b",
+    borderRadius: 10,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
+  pendingBadgeText: { color: "#f9e2af", fontSize: 11, fontWeight: "700" },
   commandChip: { backgroundColor: "#181825", marginRight: 6 },
   commandChipText: { color: "#cdd6f4", fontSize: 11 },
   pendingRow: {
@@ -1197,6 +1632,40 @@ const styles = StyleSheet.create({
     paddingHorizontal: 2,
   },
   userText: { color: "#cdd6f4", fontSize: 15 },
+  cancelledLabel: {
+    color: "#f9a8d4",
+    fontSize: 12,
+    fontWeight: "600",
+    marginBottom: 6,
+  },
+  cancelledLogCard: {
+    backgroundColor: "#181825",
+    borderColor: "#45475a",
+    borderWidth: 1,
+    borderRadius: 12,
+    marginBottom: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  cancelledLogTitle: {
+    color: "#cba6f7",
+    fontSize: 12,
+    fontWeight: "700",
+    marginBottom: 7,
+  },
+  cancelledLogRow: {
+    borderLeftColor: "#585b70",
+    borderLeftWidth: 2,
+    marginBottom: 8,
+    paddingLeft: 9,
+  },
+  cancelledLogAction: { color: "#cdd6f4", fontSize: 12 },
+  cancelledLogDetail: {
+    color: "#a6adc8",
+    fontFamily: "monospace",
+    fontSize: 11,
+    marginTop: 3,
+  },
   branchRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -1258,6 +1727,18 @@ const styles = StyleSheet.create({
   composerStatusText: { flex: 1, color: "#a6adc8", fontSize: 11 },
   clearCommandButton: { margin: 0 },
   composerError: { color: "#f38ba8", fontSize: 12, paddingHorizontal: 6, paddingTop: 4 },
+  composerSyncStatus: {
+    color: "#a6adc8",
+    fontSize: 11,
+    paddingHorizontal: 6,
+    paddingTop: 3,
+  },
+  composerSyncWarning: {
+    color: "#f9e2af",
+    fontSize: 11,
+    paddingHorizontal: 6,
+    paddingTop: 3,
+  },
   slashSuggestions: {
     backgroundColor: "#181825",
     borderColor: "#45475a",
@@ -1320,11 +1801,16 @@ const styles = StyleSheet.create({
   sendButton: { margin: 2, marginLeft: "auto" },
   dialog: { backgroundColor: "#1e1e2e" },
   dialogTitle: { color: "#cdd6f4" },
+  dialogError: { color: "#f38ba8", fontSize: 12, marginTop: 8 },
+  menuContent: { backgroundColor: "#1e1e2e" },
   dialogHelp: { color: "#a6adc8", fontSize: 13, marginBottom: 8 },
   modeButton: { marginTop: 8 },
+  providerButtonContent: { flexDirection: "row-reverse", justifyContent: "space-between" },
+  targetButton: { marginTop: 4, marginLeft: 16 },
   editInput: { backgroundColor: "#313244", marginTop: 8 },
   dialogScrollArea: { maxHeight: 460, borderColor: "#313244" },
   dialogScrollContent: { paddingVertical: 4 },
+  modelPickerSearch: { marginBottom: 8 },
   commandRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -1346,31 +1832,3 @@ const styles = StyleSheet.create({
   diagnosticsText: { color: "#a6adc8", fontSize: 12, lineHeight: 18 },
   innerDivider: { backgroundColor: "#313244", marginVertical: 8 },
 });
-
-const markdownStyles = {
-  body: { color: "#cdd6f4", fontSize: 15 },
-  heading1: { color: "#cdd6f4", fontWeight: "bold" as const },
-  heading2: { color: "#cdd6f4", fontWeight: "bold" as const },
-  heading3: { color: "#cdd6f4", fontWeight: "bold" as const },
-  code_inline: { backgroundColor: "#313244", color: "#a6e3a1", padding: 2 },
-  code_block: {
-    backgroundColor: "#313244",
-    color: "#a6e3a1",
-    padding: 8,
-    borderRadius: 6,
-  },
-  fence: {
-    backgroundColor: "#313244",
-    color: "#a6e3a1",
-    padding: 8,
-    borderRadius: 6,
-  },
-  link: { color: "#89b4fa" },
-  blockquote: {
-    borderLeftColor: "#7c3aed",
-    borderLeftWidth: 3,
-    paddingLeft: 8,
-  },
-  bullet_list_icon: { color: "#7c3aed" },
-  ordered_list_icon: { color: "#7c3aed" },
-};

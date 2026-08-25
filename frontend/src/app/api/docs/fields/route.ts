@@ -53,7 +53,7 @@ export async function POST(request: NextRequest) {
       .select()
       .from(knowledgeFields)
       .where(and(
-        eq(knowledgeFields.workspaceId, workspace.id),
+        eq(knowledgeFields.docsLibraryId, workspace.id),
         sql`lower(${knowledgeFields.name}) = lower(${name})`,
         eq(knowledgeFields.fieldType, fieldType),
       ))
@@ -92,7 +92,7 @@ export async function POST(request: NextRequest) {
     const [created] = await tx
       .insert(knowledgeFields)
       .values({
-        workspaceId: workspace.id,
+        docsLibraryId: workspace.id,
         supertagId: supertag.id,
         name,
         fieldType,

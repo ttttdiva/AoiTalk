@@ -1,5 +1,7 @@
 "use client";
 
+import { AppSelect } from "@/components/ui/app-select";
+
 import { useEffect, useMemo, useState, useCallback } from "react";
 import useSWR from "swr";
 import { useRouter } from "next/navigation";
@@ -32,6 +34,7 @@ import {
 import { Checkbox } from "@/components/ui/checkbox";
 import { useConfirm } from "@/hooks/use-confirm";
 import { getLlmModelCatalog } from "@/lib/chat-api";
+import { IrodoriVoiceSettings } from "@/components/settings/irodori-voice-settings";
 import type {
   LlmCatalogModelOption,
   LlmCatalogProvider,
@@ -51,7 +54,9 @@ interface Character {
   voice_name: string;
   voice_id: string;
   speaker_id: number | null;
-  voice_parameters: Record<string, number>;
+  // TTS parameters are JSON values. Irodori stores caption and reference asset
+  // metadata here while the existing engines continue to use numeric values.
+  voice_parameters: Record<string, unknown>;
   // 性格
   greeting: string;
   invalid_content_reply: string;
@@ -135,7 +140,7 @@ const TYPE_OPTIONS = [
 
 const TOOL_OPTIONS = [
   { value: "web_search", label: "Web検索" },
-  { value: "read_workspace_file", label: "ファイル読込" },
+  { value: "read_file", label: "ファイル読込" },
   { value: "search_files", label: "ファイル検索" },
   { value: "execute_command", label: "コマンド実行" },
   { value: "list_project_information", label: "案件情報参照" },
@@ -143,8 +148,40 @@ const TOOL_OPTIONS = [
   { value: "create_task", label: "タスク作成" },
   { value: "media_assistant", label: "メディア" },
   { value: "utility_assistant", label: "ユーティリティ" },
-  { value: "spotify_assistant", label: "Spotify" },
+  // Spotify is a shared integration capability.  It is not a delegated
+  // Spotify agent, so keep the persisted logical value independent of the
+  // retired ``spotify_assistant`` runner.
+  { value: "spotify", label: "Spotify" },
 ];
+
+const LEGACY_SPOTIFY_TOOL = "spotify_assistant";
+
+/**
+ * Normalize character tool permissions at the UI boundary.
+ *
+ * Character runtime remains independent from Agent Team runtime, but old
+ * character records may still contain the former Spotify specialist name.
+ * Mapping it on read and on write makes the migration safe without exposing
+ * the legacy value in the editor or writing it back to the API.
+ */
+function normalizeAllowedTools(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const normalized = value
+    .filter((tool): tool is string => typeof tool === "string")
+    .map((tool) => (tool === LEGACY_SPOTIFY_TOOL ? "spotify" : tool));
+  return [...new Set(normalized)];
+}
+
+function normalizeCharacter(character: Character): Character {
+  return {
+    ...character,
+    allowed_tools: normalizeAllowedTools(character.allowed_tools),
+    voice_parameters:
+      character.voice_parameters && typeof character.voice_parameters === "object"
+        ? character.voice_parameters
+        : {},
+  };
+}
 
 const VOICE_ENGINE_OPTIONS = [
   { value: "", label: "なし" },
@@ -155,6 +192,7 @@ const VOICE_ENGINE_OPTIONS = [
   { value: "aivisspeech", label: "AivisSpeech" },
   { value: "nijivoice", label: "NijiVoice" },
   { value: "miotts", label: "MioTTS" },
+  { value: "irodori_tts", label: "Irodori-TTS" },
 ];
 
 const DEFAULT_VOICE_PARAMETER_FIELDS = [
@@ -182,17 +220,26 @@ const getVoiceParameterFields = (engine: string) =>
 const IMAGE_GEN_OPTIONS = [
   { value: "", label: "なし" },
   { value: "comfyui", label: "ComfyUI" },
-  { value: "gemini", label: "Gemini" },
 ];
 
 async function pyFetch<T = unknown>(
   path: string,
   init?: RequestInit,
 ): Promise<T> {
+  const headers = new Headers(init?.headers);
+  // The browser must set the multipart boundary for FormData. Explicitly
+  // adding application/json here breaks voice asset uploads.
+  if (
+    init?.body !== undefined &&
+    !(init.body instanceof FormData) &&
+    !headers.has("Content-Type")
+  ) {
+    headers.set("Content-Type", "application/json");
+  }
   const res = await fetch(`/api/python-proxy${path}`, {
-    credentials: "include",
-    headers: { "Content-Type": "application/json", ...init?.headers },
     ...init,
+    credentials: "include",
+    headers,
   });
   if (!res.ok) throw new Error(`API Error: ${res.status}`);
   return res.json();
@@ -245,11 +292,11 @@ export function CharactersSection() {
     "settings/characters",
     async () => {
       try {
-        return (
-          await pyFetch<{ success: boolean; characters: Character[] }>(
-            "/characters/manage",
-          )
-        ).characters || [];
+        const payload = await pyFetch<{
+          success: boolean;
+          characters: Character[];
+        }>("/characters/manage");
+        return (payload.characters || []).map(normalizeCharacter);
       } catch {
         return [];
       }
@@ -317,6 +364,16 @@ export function CharactersSection() {
     }
   }, [mutateCharacters]);
 
+  useEffect(() => {
+    const handleTargetOpen = (event: Event) => {
+      if ((event as CustomEvent<string>).detail !== "characters") return;
+      setExpanded(true);
+      if (characters.length === 0) void fetchCharacters();
+    };
+    window.addEventListener("settings:open-target", handleTargetOpen);
+    return () => window.removeEventListener("settings:open-target", handleTargetOpen);
+  }, [characters.length, fetchCharacters]);
+
   const handleToggle = useCallback(() => {
     if (!expanded && characters.length === 0) fetchCharacters();
     setExpanded((v) => !v);
@@ -325,7 +382,7 @@ export function CharactersSection() {
   const openEditor = useCallback((char: Character | null) => {
     if (char) {
       setIsNew(false);
-      setForm({ ...char });
+      setForm(normalizeCharacter(char));
     } else {
       setIsNew(true);
       setForm({ ...EMPTY_CHAR });
@@ -346,7 +403,12 @@ export function CharactersSection() {
     if (!form.name.trim() || !form.slug.trim()) return;
     setSaving(true);
     try {
-      const body = { ...form };
+      const body = {
+        ...form,
+        // Persist the shared Spotify capability name, not the retired
+        // spotify_assistant specialist value.
+        allowed_tools: normalizeAllowedTools(form.allowed_tools),
+      };
       if (isNew) {
         await pyFetch("/characters/manage", {
           method: "POST",
@@ -438,9 +500,9 @@ export function CharactersSection() {
   const toggleTool = useCallback((tool: string) => {
     setForm((prev) => ({
       ...prev,
-      allowed_tools: prev.allowed_tools.includes(tool)
-        ? prev.allowed_tools.filter((t) => t !== tool)
-        : [...prev.allowed_tools, tool],
+      allowed_tools: normalizeAllowedTools(prev.allowed_tools).includes(tool)
+        ? normalizeAllowedTools(prev.allowed_tools).filter((t) => t !== tool)
+        : [...normalizeAllowedTools(prev.allowed_tools), tool],
     }));
   }, []);
 
@@ -552,10 +614,25 @@ export function CharactersSection() {
 
   return (
     <>
-      <Card size="sm">
+      <Card
+        size="sm"
+        data-settings-disclosure="true"
+        data-settings-target="characters"
+        className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0"
+      >
         <CardHeader
           className="cursor-pointer select-none"
+          role="button"
+          tabIndex={0}
+          aria-expanded={expanded}
+          aria-controls="characters-content"
           onClick={handleToggle}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              handleToggle();
+            }
+          }}
         >
           <CardTitle className="flex items-center justify-between text-sm">
             <span className="flex items-center gap-2">
@@ -575,7 +652,7 @@ export function CharactersSection() {
           </CardTitle>
         </CardHeader>
         {expanded && (
-          <CardContent className="space-y-3">
+          <CardContent id="characters-content" className="space-y-3">
             <div className="flex items-center justify-between">
               <div className="flex gap-1.5">
                 <Button variant="outline" size="sm" onClick={fetchCharacters}>
@@ -718,7 +795,7 @@ export function CharactersSection() {
 
       {/* インポートダイアログ */}
       <Dialog open={importDialogOpen} onOpenChange={setImportDialogOpen}>
-        <DialogContent className="sm:max-w-md">
+        <DialogContent size="md">
           <DialogHeader>
             <DialogTitle>キャラクターをインポート</DialogTitle>
           </DialogHeader>
@@ -798,7 +875,7 @@ export function CharactersSection() {
 
       {/* 編集ダイアログ */}
       <Dialog open={!!editChar} onOpenChange={(v) => !v && setEditChar(null)}>
-        <DialogContent className="sm:max-w-2xl max-h-[85vh] overflow-auto">
+        <DialogContent size="2xl" className="max-h-[85vh] overflow-auto">
           <DialogHeader>
             <DialogTitle>
               {isNew ? "キャラクター作成" : `キャラクター編集: ${form.name}`}
@@ -837,7 +914,7 @@ export function CharactersSection() {
               <div className="grid grid-cols-2 gap-3">
                 <div className="space-y-1">
                   <Label className="text-xs">タイプ</Label>
-                  <select
+                  <AppSelect
                     value={form.character_type}
                     onChange={(e) =>
                       updateForm("character_type", e.target.value)
@@ -849,11 +926,11 @@ export function CharactersSection() {
                         {opt.label}
                       </option>
                     ))}
-                  </select>
+                  </AppSelect>
                 </div>
                 <div className="space-y-1">
                   <Label className="text-xs">モデル</Label>
-                  <select
+                  <AppSelect
                     value={form.model}
                     onChange={(e) => updateForm("model", e.target.value)}
                     className={selectClass}
@@ -863,7 +940,7 @@ export function CharactersSection() {
                         {opt.label}
                       </option>
                     ))}
-                  </select>
+                  </AppSelect>
                 </div>
               </div>
               <div className="space-y-1">
@@ -1006,9 +1083,13 @@ export function CharactersSection() {
                 <div className="flex items-center gap-2">
                   <Checkbox
                     checked={form.auto_image_gen}
-                    onCheckedChange={(checked) =>
-                      updateForm("auto_image_gen", !!checked)
-                    }
+                    onCheckedChange={(checked) => {
+                      const enabled = !!checked;
+                      updateForm("auto_image_gen", enabled);
+                      if (enabled && !form.image_gen_engine) {
+                        updateForm("image_gen_engine", "comfyui");
+                      }
+                    }}
                   />
                   <Label className="text-xs cursor-pointer">
                     RP中に画像を自動生成する
@@ -1020,7 +1101,7 @@ export function CharactersSection() {
                       <Label className="text-[10px] text-muted-foreground">
                         トリガー
                       </Label>
-                      <select
+                      <AppSelect
                         value={form.image_gen_trigger}
                         onChange={(e) =>
                           updateForm("image_gen_trigger", e.target.value)
@@ -1030,7 +1111,7 @@ export function CharactersSection() {
                         <option value="scene_change">シーン変更時</option>
                         <option value="every_n">N回ごと</option>
                         <option value="emotion_change">感情変化時</option>
-                      </select>
+                      </AppSelect>
                     </div>
                     {form.image_gen_trigger === "every_n" && (
                       <div className="space-y-1">
@@ -1062,7 +1143,7 @@ export function CharactersSection() {
               <div className="grid grid-cols-2 gap-3">
                 <div className="space-y-1">
                   <Label className="text-xs">音声エンジン</Label>
-                  <select
+                  <AppSelect
                     value={form.voice_engine}
                     onChange={(e) => updateForm("voice_engine", e.target.value)}
                     className={selectClass}
@@ -1072,7 +1153,7 @@ export function CharactersSection() {
                         {opt.label}
                       </option>
                     ))}
-                  </select>
+                  </AppSelect>
                 </div>
                 <div className="space-y-1">
                   <Label className="text-xs">ボイス名</Label>
@@ -1111,46 +1192,59 @@ export function CharactersSection() {
                   />
                 </div>
               </div>
-              <div className="space-y-1">
-                <Label className="text-xs">音声パラメータ</Label>
-                <div className="grid grid-cols-2 gap-3">
-                  {getVoiceParameterFields(form.voice_engine).map(
-                    (param) => (
-                      <div key={param} className="space-y-1">
-                        <Label className="text-[10px] text-muted-foreground">
-                          {param}
-                        </Label>
-                        <Input
-                          type="number"
-                          step={
-                            param === "max_tokens" || param === "best_of_n_n"
-                              ? "1"
-                              : "0.1"
-                          }
-                          value={form.voice_parameters[param] ?? ""}
-                          onChange={(e) => {
-                            const newParams = { ...form.voice_parameters };
-                            if (e.target.value) {
-                              newParams[param] = Number(e.target.value);
-                            } else {
-                              delete newParams[param];
+              {form.voice_engine === "irodori_tts" ? (
+                <IrodoriVoiceSettings
+                  characterId={isNew ? "" : form.id}
+                  voiceParameters={form.voice_parameters}
+                  onChange={(value) => updateForm("voice_parameters", value)}
+                />
+              ) : (
+                <div className="space-y-1">
+                  <Label className="text-xs">音声パラメータ</Label>
+                  <div className="grid grid-cols-2 gap-3">
+                    {getVoiceParameterFields(form.voice_engine).map(
+                      (param) => (
+                        <div key={param} className="space-y-1">
+                          <Label className="text-[10px] text-muted-foreground">
+                            {param}
+                          </Label>
+                          <Input
+                            type="number"
+                            step={
+                              param === "max_tokens" || param === "best_of_n_n"
+                                ? "1"
+                                : "0.1"
                             }
-                            updateForm("voice_parameters", newParams);
-                          }}
-                          placeholder="1.0"
-                        />
-                      </div>
-                    ),
-                  )}
+                            value={
+                              typeof form.voice_parameters[param] === "number" ||
+                              typeof form.voice_parameters[param] === "string"
+                                ? String(form.voice_parameters[param])
+                                : ""
+                            }
+                            onChange={(e) => {
+                              const newParams = { ...form.voice_parameters };
+                              if (e.target.value) {
+                                newParams[param] = Number(e.target.value);
+                              } else {
+                                delete newParams[param];
+                              }
+                              updateForm("voice_parameters", newParams);
+                            }}
+                            placeholder="1.0"
+                          />
+                        </div>
+                      ),
+                    )}
+                  </div>
                 </div>
-              </div>
+              )}
             </TabsContent>
 
             {/* ── 外見 ── */}
             <TabsContent value="appearance" className="space-y-3 mt-3">
               <div className="space-y-1">
                 <Label className="text-xs">画像生成エンジン</Label>
-                <select
+                <AppSelect
                   value={form.image_gen_engine}
                   onChange={(e) =>
                     updateForm("image_gen_engine", e.target.value)
@@ -1162,7 +1256,7 @@ export function CharactersSection() {
                       {opt.label}
                     </option>
                   ))}
-                </select>
+                </AppSelect>
               </div>
               <div className="space-y-1">
                 <Label className="text-xs">外見タグ（Danbooruタグ形式）</Label>

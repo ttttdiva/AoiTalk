@@ -27,7 +27,7 @@ const SHORTCUT_SECTIONS: ShortcutSection[] = [
   },
   {
     title: "ページ移動",
-    items: APP_VIEW_TABS.map((tab) => ({
+    items: APP_VIEW_TABS.filter((tab) => Boolean(tab.shortcut)).map((tab) => ({
       keys: ["Alt", tab.shortcut],
       description: tab.title,
     })),
@@ -39,6 +39,12 @@ const SHORTCUT_SECTIONS: ShortcutSection[] = [
         keys: ["Alt", "Shift", "1~9"],
         description: "スペースを番号で切り替え",
       },
+    ],
+  },
+  {
+    title: "Docs",
+    items: [
+      { keys: ["Ctrl", "Alt", "I"], description: "クリップ取り込みを開く" },
     ],
   },
   {
@@ -76,23 +82,57 @@ const SHORTCUT_SECTIONS: ShortcutSection[] = [
       { keys: ["T"], description: "タスク作成（入力欄以外）" },
       { keys: ["L"], description: "タスク一覧へ移動（入力欄以外）" },
       { keys: ["C"], description: "カレンダーへ移動（入力欄以外）" },
-      { keys: ["P"], description: "メモ帳を開く（入力欄以外）" },
+      { keys: ["P"], description: "メモ帳を開閉（入力欄以外）" },
+      { keys: ["Alt", "P"], description: "メモ帳を開閉" },
       { keys: ["S"], description: "タイマー停止（入力欄以外）" },
     ],
   },
   {
-    title: "ファイラー",
+    title: "Files",
     items: [
+      { keys: ["Ctrl", "D"], description: "現在のフォルダをブックマークへ登録" },
+      { keys: ["Ctrl", "Shift", "D"], description: "フォーカス中のファイルをランチャーへ登録" },
+      { keys: ["Alt", "Q"], description: "ブックマークへ切り替えて一覧にフォーカス" },
+      { keys: ["Alt", "E"], description: "ランチャーへ切り替えて一覧にフォーカス" },
+      { keys: ["Alt", "J"], description: "ランチャー項目の親フォルダへ移動" },
+      { keys: ["↑", "↓"], description: "ブックマーク／ランチャー項目を移動・並び替え" },
+      { keys: ["Enter"], description: "フォーカス項目を開く／フォルダへ移動" },
+      { keys: ["Esc"], description: "Files本体へフォーカスを戻す" },
+      { keys: ["Delete"], description: "フォーカス項目を削除" },
       { keys: ["Alt", "←"], description: "戻る" },
       { keys: ["Backspace"], description: "戻る" },
       { keys: ["Alt", "Backspace"], description: "戻る" },
       { keys: ["Alt", "→"], description: "進む" },
       { keys: ["Alt", "↑"], description: "上の階層へ移動" },
+      { keys: ["Ctrl", "H"], description: "現在のタブのホームへ移動" },
+      {
+        keys: ["Ctrl", "←/→"],
+        description:
+          "Filesタブ（Project Files / User Files / HF / Hydrus）を切り替え",
+      },
       { keys: [":"], description: "サムネイル表示" },
       { keys: [";"], description: "リスト表示" },
       { keys: ["F8"], description: "名前順" },
       { keys: ["F9"], description: "更新日時順" },
+      { keys: ["Ctrl", "S"], description: "ファイル名の即席フィルターを開閉" },
+      {
+        keys: ["Ctrl", "F"],
+        description:
+          "ファイル名・フォルダ名の検索（F3も可・正規表現・置換対応）",
+      },
+      { keys: ["Ctrl", "N"], description: "新規フォルダ作成" },
+      { keys: ["Ctrl", "Shift", "N"], description: "新規テキストファイル作成" },
+      { keys: ["F7"], description: "新規フォルダ作成" },
+      { keys: ["Shift", "F7"], description: "新規テキストファイル作成" },
       { keys: ["Delete"], description: "削除" },
+      {
+        keys: ["Ctrl", "Z"],
+        description: "直前の削除・リネーム・置換・移動を元に戻す（最大3操作）",
+      },
+      {
+        keys: ["Ctrl", "Y"],
+        description: "元に戻した操作をやり直す（Ctrl+Shift+Z も同じ）",
+      },
       { keys: ["Ctrl", "I"], description: "選択中の項目をZIP圧縮" },
       { keys: ["Ctrl", "U"], description: "選択中の圧縮ファイルを展開" },
       {
@@ -143,7 +183,7 @@ export function ShortcutsHelpDialog() {
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogContent className="max-w-lg max-h-[80vh] overflow-y-auto">
+      <DialogContent size="lg" className="max-h-[80vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>キーボードショートカット</DialogTitle>
         </DialogHeader>

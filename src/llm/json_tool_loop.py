@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import json
+import inspect
 import re
 from dataclasses import dataclass, field
+from collections.abc import Mapping
 from typing import Any, Callable, Optional
 
 from ..tools.core import ToolDefinition
 from ..tools.registry import ToolRegistry
+from ..services.agent_team_service import (
+    ToolFailureCircuitBreaker,
+    parse_structured_tool_failure,
+    tool_failure_family,
+)
 from .unified_turn_runtime import RegistryToolRouter, UnifiedToolCall
 
 
@@ -75,6 +82,8 @@ def run_json_tool_loop(
     required_tool_reason: str | None = None,
     require_all_required_tools: bool = False,
     return_result: bool = False,
+    restore_tool_arguments: Callable[..., Mapping[str, Any] | None] | None = None,
+    failure_breaker: ToolFailureCircuitBreaker | None = None,
 ) -> str | JsonToolLoopResult:
     """Run a text JSON tool loop and return the final user-facing response."""
     messages = list(initial_messages)
@@ -176,13 +185,46 @@ def run_json_tool_loop(
                 arguments = {}
         if not isinstance(arguments, dict):
             arguments = {}
+        if restore_tool_arguments is not None:
+            arguments = _restore_tool_call_arguments(
+                restore_tool_arguments,
+                arguments,
+                tool_name=tool_name,
+            )
 
-        tool_result = execute_json_tool_call(
-            registry,
-            tool_name,
-            arguments,
-            fallback_request=original_request,
-        )
+        family = tool_failure_family(tool_name)
+        if failure_breaker is not None and failure_breaker.is_open(family):
+            tool_result = json.dumps(
+                {
+                    "success": False,
+                    "error_code": "circuit_open",
+                    "retryable": False,
+                    "error": f"Tool failure circuit is open for {family}; retry suppressed",
+                },
+                ensure_ascii=False,
+            )
+        else:
+            tool_result = execute_json_tool_call(
+                registry,
+                tool_name,
+                arguments,
+                fallback_request=original_request,
+            )
+            if failure_breaker is not None:
+                failure = parse_structured_tool_failure(tool_result)
+                if failure is not None:
+                    decision = failure_breaker.check(family, failure)
+                    if not decision.allowed:
+                        tool_result = json.dumps(
+                            {
+                                "success": False,
+                                "error_code": "circuit_open",
+                                "retryable": False,
+                                "error": "同じ内部Tool障害を繰り返したため再試行を停止しました",
+                                "retry_suppressed": True,
+                            },
+                            ensure_ascii=False,
+                        )
         tool_calls.append(
             JsonToolCallRecord(
                 tool=tool_name,
@@ -224,6 +266,77 @@ def parse_json_tool_action(content: str) -> Optional[dict[str, Any]]:
     except Exception:
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _restore_tool_call_arguments(
+    callback: Callable[..., Mapping[str, Any] | None],
+    arguments: dict[str, Any],
+    *,
+    tool_name: str,
+) -> dict[str, Any]:
+    """Restore tool arguments without losing the original on a no-op callback.
+
+    Privacy gateways need the tool name to avoid restoring aliases for
+    external-egress tools.  Older embedders supplied a one-argument callback,
+    so preserve that compatibility while preferring the explicit, named
+    ``tool_name`` form.  A callback may return ``None`` to indicate that no
+    restoration was needed; in that case the original arguments remain intact.
+    """
+
+    original = dict(arguments)
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        signature = None
+
+    if signature is None:
+        # Some extension callables and mocks do not expose a useful signature;
+        # retain the historical one-argument fallback for those adapters.
+        try:
+            restored = callback(dict(original), tool_name=tool_name)
+        except TypeError:
+            restored = callback(dict(original))
+    else:
+        parameters = tuple(signature.parameters.values())
+        named_tool_name = signature.parameters.get("tool_name")
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        positional = tuple(
+            parameter
+            for parameter in parameters
+            if parameter.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        )
+        if (
+            accepts_kwargs
+            or (
+                named_tool_name is not None
+                and named_tool_name.kind
+                in (
+                    inspect.Parameter.KEYWORD_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+            )
+        ):
+            restored = callback(dict(original), tool_name=tool_name)
+        elif len(positional) >= 2 or any(
+            parameter.kind == inspect.Parameter.VAR_POSITIONAL
+            for parameter in parameters
+        ):
+            restored = callback(dict(original), tool_name)
+        else:
+            restored = callback(dict(original))
+
+    if restored is None:
+        return original
+    if isinstance(restored, Mapping):
+        return dict(restored)
+    return original
 
 
 def execute_json_tool_call(
@@ -315,8 +428,8 @@ def _build_repair_prompt(original_request: str) -> str:
             "",
             "Return one JSON object only.",
             (
-                "If a relevant tool is available and the request explicitly asks for web search "
-                "or uses Japanese terms such as 調べて or 調査して, call that tool."
+                "Choose a relevant available tool only when the request requires external, "
+                "current, or otherwise tool-backed information; do not infer a tool from a single keyword."
             ),
             (
                 "If you cannot translate the request, call the relevant `*_assistant` tool with the exact "

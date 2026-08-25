@@ -4,19 +4,83 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime
 from typing import List, Optional, TYPE_CHECKING
 
 import requests
 
+from ...x_search_mcp.api_client import (
+    normalize_usage,
+    normalize_xai_response_usage,
+    persist_xai_usage_sync as _persist_xai_usage_sync,
+)
+from .....services.outbound_privacy_service import (
+    OutboundPrivacyGateway,
+    get_privacy_policy_context,
+)
+from .....services.turn_context import get_turn_context
+
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
+
+
+def persist_usage_sync(*args, **kwargs):
+    """Lazy seam for tests and the shared TokenUsage persistence path."""
+
+    from .....llm.conversation_context import persist_usage_sync as _persist
+
+    return bool(_persist(*args, **kwargs))
+
+
+def persist_xai_usage_sync(usage, *, requested_model, latency_ms=0):
+    """Persist xAI usage through this module's patchable sync seam."""
+
+    return _persist_xai_usage_sync(
+        usage,
+        requested_model=requested_model,
+        latency_ms=latency_ms,
+        persistence_fn=persist_usage_sync,
+    )
 
 XAI_SYSTEM_PROMPT = (
     "あなたは速報性の高いニュースリサーチャーです。"
     "GrokのX検索ツールで取得した投稿の要点を2〜4個の箇条書きでまとめ、"
     "最終行に投稿へのURLまたはハンドルを提示してください。"
 )
+
+_RECORDED_USAGE_RESPONSES: list[object] = []
+
+
+def _grok_privacy_gateway() -> OutboundPrivacyGateway:
+    try:
+        from .....config import Config
+
+        config = Config()
+    except Exception as exc:
+        raise RuntimeError("Grok検索のプライバシー設定を解決できません") from exc
+    try:
+        turn = get_turn_context()
+    except Exception:
+        turn = None
+    inherited = get_privacy_policy_context()
+    return OutboundPrivacyGateway(
+        config,
+        user_id=str(getattr(turn, "user_id", None) or ""),
+        session_id=str(getattr(turn, "session_id", None) or ""),
+        session_context=inherited.session_context,
+        project_metadata=inherited.project_metadata,
+    )
+
+
+def _mark_usage_recorded(payload: object) -> bool:
+    """Prevent accidental duplicate dashboard rows for one HTTP response."""
+
+    if any(item is payload for item in _RECORDED_USAGE_RESPONSES):
+        return True
+    _RECORDED_USAGE_RESPONSES.append(payload)
+    del _RECORDED_USAGE_RESPONSES[:-8]
+    return False
 
 
 def _parse_handles(raw_value: str) -> List[str]:
@@ -190,12 +254,32 @@ def register(mcp: FastMCP):
             'max_output_tokens': max_output_tokens,
         }
 
+        # Inherit the effective request policy and let the shared review
+        # bridge decide protected/high-risk requests; never auto-approve an
+        # external X query here.
+        try:
+            gateway = _grok_privacy_gateway()
+        except Exception as exc:
+            return f"Grok検索はプライバシー設定を解決できないため停止しました: {exc}"
+        try:
+            protected = await gateway.protect(
+                payload,
+                provider="grok",
+                base_url=xai_api_base,
+                source_kind="grok_x_search_mcp",
+                model=xai_model,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return f"Grok検索はプライバシーポリシーにより停止しました: {exc}"
+        payload = protected.payload
+
         url = f"{xai_api_base.rstrip('/')}/responses"
         headers = {
             'Authorization': f"Bearer {api_key}",
             'Content-Type': 'application/json'
         }
 
+        started_at = time.monotonic()
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=timeout_seconds)
         except requests.RequestException as exc:
@@ -220,7 +304,23 @@ def register(mcp: FastMCP):
         except ValueError:
             return f"Grok APIの応答を解析できませんでした: {response.text}"
 
+        usage = normalize_xai_response_usage(
+            response_payload,
+            normalizer=normalize_usage,
+        )
+        if usage and not _mark_usage_recorded(response_payload):
+            try:
+                persist_xai_usage_sync(
+                    usage,
+                    requested_model=xai_model,
+                    latency_ms=max(0, int((time.monotonic() - started_at) * 1000)),
+                )
+            except Exception:
+                # Search results remain usable if dashboard persistence is down.
+                pass
+
         text = _extract_text_from_response(response_payload)
+        text = str(gateway.restore_aliases(text))
         if not text:
             text = json.dumps(response_payload, ensure_ascii=False)
 

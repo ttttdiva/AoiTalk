@@ -3,33 +3,54 @@
 import {
   useCallback,
   useEffect,
+  useRef,
   type Dispatch,
   type RefObject,
   type SetStateAction,
 } from "react";
 import type { useRouter } from "next/navigation";
 import { chatApi } from "@/lib/chat-api";
+import { storyApi } from "@/lib/story/api";
 import type {
-  ConversationGenerationStatus,
   ConversationMessage,
   ConversationSession,
 } from "@/lib/chat-api";
+import type { ChatGenerationEvent } from "@/lib/chat-generation-state";
 import type { chatTimelineReducer } from "@/lib/chat-state";
+import { isTransientChatMessage } from "@/lib/chat-state";
+import {
+  deriveServerTime,
+  getLastServerTime,
+  mergePersistedById,
+  readCachedMessages,
+  setLastServerTime,
+  writeCachedMessages,
+} from "@/lib/chat-message-cache";
 import type { SubmittedSteeringInstruction } from "@/components/chat/chat-composer";
+import {
+  safeLocalStorageGetItem,
+  safeLocalStorageRemoveItem,
+  safeLocalStorageSetItem,
+} from "@/lib/safe-storage";
 
 const LAST_SESSION_KEY = "aoitalk_last_session_id";
 
 type ChatTimelineAction = Parameters<typeof chatTimelineReducer>[1];
 
-function isScenarioWorkflowSession(session: ConversationSession) {
+export type RefreshPersistedMessagesOptions = {
+  /**
+   * 差分取得ではなく、現在のサーバー側 active path 全体を再取得する。
+   * ブランチ切替など、直前の server_time より前の履歴も置き換える必要が
+   * ある操作で利用する。
+   */
+  forceFull?: boolean;
+};
+
+function isStoryWorkflowSession(session: ConversationSession) {
   const characterName = session.character_name || "";
   return (
-    /^scenario_roleplay:[^:]+:[^:]+$/.test(characterName) ||
-    characterName.startsWith("scenario_") ||
-    characterName.startsWith("trpg_room_") ||
-    session.title?.startsWith("[シナリオ]") ||
-    session.title?.startsWith("[執筆]") ||
-    session.title?.startsWith("[TRPG]")
+    characterName.startsWith("story_") ||
+    session.title?.startsWith("[執筆]")
   );
 }
 
@@ -68,39 +89,19 @@ type UseChatPersistenceArgs = {
   responsePollGenerationRef: RefObject<number>;
   updateSidebarTitle: (sessionId: string, title: string) => void;
   dispatchChatTimeline: Dispatch<ChatTimelineAction>;
-  markWaitingResponse: (sessionId: string | null) => void;
-  clearWaitingResponse: (sessionId: string | null) => void;
-  resetDisplayedGenerationState: () => void;
-  setRestoredGenerationStatus: Dispatch<
-    SetStateAction<ConversationGenerationStatus | null>
-  >;
-  setPendingAgentRunId: Dispatch<SetStateAction<string | null>>;
-  setCurrentSession: Dispatch<SetStateAction<ConversationSession | null>>;
+  dispatchGeneration: Dispatch<ChatGenerationEvent>;
+  upsertSession: (session: ConversationSession) => void;
+  /** Bump the sidebar only after an assistant message is durably persisted. */
+  bumpSession: (sessionId: string) => void;
   setSteeringInstructions: Dispatch<
     SetStateAction<SubmittedSteeringInstruction[]>
   >;
   setIsLoadingMessages: Dispatch<SetStateAction<boolean>>;
   setSessionLoadError: Dispatch<SetStateAction<string | null>>;
-  setScenarioSession: Dispatch<
-    SetStateAction<
-      Awaited<ReturnType<typeof chatApi.getScenarioPlaySessionByConversation>>
-    >
-  >;
   setWritingSession: Dispatch<
     SetStateAction<
-      Awaited<ReturnType<typeof chatApi.getWritingSessionByConversation>>
+      Awaited<ReturnType<typeof storyApi.getWritingSessionByConversation>>
     >
-  >;
-  setRoleplaySession: Dispatch<
-    SetStateAction<{
-      scenario: { id: string; title: string };
-      character: {
-        id: string;
-        name: string;
-        role?: string;
-        description?: string;
-      };
-    } | null>
   >;
 };
 
@@ -120,23 +121,44 @@ export function useChatPersistence({
   responsePollGenerationRef,
   updateSidebarTitle,
   dispatchChatTimeline,
-  markWaitingResponse,
-  clearWaitingResponse,
-  resetDisplayedGenerationState,
-  setRestoredGenerationStatus,
-  setPendingAgentRunId,
-  setCurrentSession,
+  dispatchGeneration,
+  upsertSession,
+  bumpSession,
   setSteeringInstructions,
   setIsLoadingMessages,
   setSessionLoadError,
-  setScenarioSession,
   setWritingSession,
-  setRoleplaySession,
 }: UseChatPersistenceArgs) {
+  const statusRequestGenerationRef = useRef(0);
+  // The first passive effect can run after a user submits from a freshly
+  // mounted /chat route.  Do not clear the optimistic provisional row that
+  // was appended before that effect; later null-session transitions still
+  // clear the previous session normally.
+  const previousActiveSessionIdRef = useRef<string | null | undefined>(
+    undefined,
+  );
+  // A response can be observed through both the websocket event and the
+  // fallback REST poll. Keep one activity bump per durable assistant message
+  // so duplicate notifications do not continually rewrite last_activity.
+  const assistantActivityKeysRef = useRef<Set<string>>(new Set());
+  const bumpSessionForAssistant = useCallback(
+    (sessionId: string, messageId: string) => {
+      const key = `${sessionId}:${messageId}`;
+      const keys = assistantActivityKeysRef.current;
+      if (keys.has(key)) return;
+      keys.add(key);
+      if (keys.size > 512) {
+        const oldest = keys.values().next().value;
+        if (oldest) keys.delete(oldest);
+      }
+      bumpSession(sessionId);
+    },
+    [bumpSession],
+  );
   const maybeGenerateLoadedSessionTitle = useCallback(
     async (session: ConversationSession, messages: ConversationMessage[]) => {
       if (
-        isScenarioWorkflowSession(session) ||
+        isStoryWorkflowSession(session) ||
         !shouldRequestSessionTitleGeneration(session, messages)
       ) {
         return;
@@ -148,11 +170,6 @@ export function useChatPersistence({
           return;
         }
         updateSidebarTitle(session.id, titleResult.title);
-        setCurrentSession((prev) =>
-          prev && prev.id === session.id
-            ? { ...prev, title: titleResult.title }
-            : prev,
-        );
       } catch (err) {
         console.warn("セッションタイトル生成に失敗:", err);
       }
@@ -161,23 +178,52 @@ export function useChatPersistence({
     [updateSidebarTitle],
   );
 
-  const refreshPersistedMessages = useCallback(async (sessionId: string) => {
-    try {
-      const data = await chatApi.getMessages(sessionId);
-      const currentSessionId = activeSessionIdRef.current;
-      if (currentSessionId && currentSessionId !== sessionId) return null;
-      dispatchChatTimeline({
-        type: "hydrate_persisted",
-        sessionId,
-        messages: data.messages,
-      });
-      return data.messages;
-    } catch (err) {
-      console.warn("保存済みメッセージの再取得に失敗:", err);
-      return null;
-    }
+  const refreshPersistedMessages = useCallback(
+    async (
+      sessionId: string,
+      options?: RefreshPersistedMessagesOptions,
+    ) => {
+      try {
+        // 通常は前回の server_time を since に渡し、差分のみ取得する。
+        // ブランチ切替後は inactive になった旧 active path を確実に除去し、
+        // 新しい active path 全体を表示するため、full GET を行う。
+        const since = options?.forceFull ? null : getLastServerTime(sessionId);
+        const data = await chatApi.getMessages(sessionId, since ?? undefined);
+        const currentSessionId = activeSessionIdRef.current;
+        if (currentSessionId !== sessionId) return null;
+
+        // since 指定時は既存の永続メッセージへ差分をマージ（id で重複排除）。
+        // since なし（初回）は取得結果をそのまま採用する。
+        const prevPersisted = since
+          ? messagesRef.current.filter(
+              (message) =>
+                !isTransientChatMessage(message) &&
+                message.session_id === sessionId,
+            )
+          : [];
+        const mergedPersisted = since
+          ? mergePersistedById(prevPersisted, data.messages)
+          : data.messages;
+
+        dispatchChatTimeline({
+          type: "hydrate_persisted",
+          sessionId,
+          messages: mergedPersisted,
+        });
+
+        const nextServerTime =
+          data.server_time ?? deriveServerTime(mergedPersisted);
+        setLastServerTime(sessionId, nextServerTime);
+        void writeCachedMessages(sessionId, mergedPersisted, nextServerTime);
+        return mergedPersisted;
+      } catch (err) {
+        console.warn("保存済みメッセージの再取得に失敗:", err);
+        return null;
+      }
+    },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    [],
+  );
 
   const waitForPersistedAssistantResponse = useCallback(
     async (
@@ -188,26 +234,49 @@ export function useChatPersistence({
       const generation = ++responsePollGenerationRef.current;
       const timeoutAt = Date.now() + 300_000;
 
-      const hasNewAssistantMessage = (
-        persistedMessages: ConversationMessage[],
-      ) =>
-        persistedMessages.some(
-          (message) =>
-            message.role === "assistant" && !knownAssistantIds.has(message.id),
-        );
-
       while (Date.now() < timeoutAt) {
         await new Promise((resolve) => window.setTimeout(resolve, 1000));
         if (responsePollGenerationRef.current !== generation) return;
         const currentSessionId = activeSessionIdRef.current;
-        if (currentSessionId && currentSessionId !== sessionId) return;
+        if (currentSessionId !== sessionId) return;
 
         const persistedMessages = await refreshPersistedMessages(sessionId);
         if (!persistedMessages) continue;
 
-        if (hasNewAssistantMessage(persistedMessages)) {
-          clearWaitingResponse(sessionId);
-          setRestoredGenerationStatus(null);
+        const newAssistantMessage = persistedMessages.find(
+          (message) =>
+            message.role === "assistant" && !knownAssistantIds.has(message.id),
+        );
+        if (newAssistantMessage) {
+          bumpSessionForAssistant(sessionId, newAssistantMessage.id);
+          const agentRunId =
+            typeof newAssistantMessage.metadata?.agent_run_id === "string"
+              ? newAssistantMessage.metadata.agent_run_id
+              : null;
+          dispatchGeneration({
+            type: "assistant_persisted",
+            sessionId,
+            agentRunId,
+            assistantMessageId: newAssistantMessage.id,
+            eventId: `poll:message:${sessionId}:${newAssistantMessage.id}`,
+          });
+          try {
+            const status = await chatApi.getGenerationStatus(sessionId);
+            if (
+              responsePollGenerationRef.current === generation &&
+              activeSessionIdRef.current === sessionId &&
+              (!status.session_id || status.session_id === sessionId)
+            ) {
+              dispatchGeneration({
+                type: "status_restored",
+                sessionId,
+                status,
+                eventId: `poll:terminal:${sessionId}:${status.updated_at ?? status.status}`,
+              });
+            }
+          } catch {
+            // 永続メッセージは表示済み。lifecycleは次のauthoritative statusまで維持する。
+          }
           if (titleSession) {
             void maybeGenerateLoadedSessionTitle(
               titleSession,
@@ -219,19 +288,34 @@ export function useChatPersistence({
       }
 
       const finalMessages = await refreshPersistedMessages(sessionId);
-      if (finalMessages && hasNewAssistantMessage(finalMessages)) {
+      const finalAssistantMessage = finalMessages?.find(
+        (message) =>
+          message.role === "assistant" && !knownAssistantIds.has(message.id),
+      );
+      if (finalMessages && finalAssistantMessage) {
+        bumpSessionForAssistant(sessionId, finalAssistantMessage.id);
+        const agentRunId =
+          typeof finalAssistantMessage.metadata?.agent_run_id === "string"
+            ? finalAssistantMessage.metadata.agent_run_id
+            : null;
+        dispatchGeneration({
+          type: "assistant_persisted",
+          sessionId,
+          agentRunId,
+          assistantMessageId: finalAssistantMessage.id,
+          eventId: `poll:message:${sessionId}:${finalAssistantMessage.id}`,
+        });
         if (titleSession) {
           void maybeGenerateLoadedSessionTitle(titleSession, finalMessages);
         }
       }
-      clearWaitingResponse(sessionId);
-      setRestoredGenerationStatus(null);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
-      clearWaitingResponse,
+      dispatchGeneration,
       maybeGenerateLoadedSessionTitle,
       refreshPersistedMessages,
+      bumpSessionForAssistant,
     ],
   );
 
@@ -241,18 +325,32 @@ export function useChatPersistence({
       knownMessages: ConversationMessage[],
       titleSession?: ConversationSession | null,
     ) => {
+      const statusGeneration = ++statusRequestGenerationRef.current;
+      const isCurrentStatusRequest = (
+        status?: { session_id?: string | null } | null,
+      ) =>
+        statusRequestGenerationRef.current === statusGeneration &&
+        activeSessionIdRef.current === sessionId &&
+        (status?.session_id == null || status.session_id === sessionId);
       try {
         const status = await chatApi.getGenerationStatus(sessionId);
+        // Check the request/session identity before interpreting the response.
+        // In particular, a malformed response from a session that was already
+        // left must never synthesize an idle state for the newly active one.
+        if (!isCurrentStatusRequest(status)) return;
         if (
-          activeSessionIdRef.current &&
-          activeSessionIdRef.current !== sessionId
+          typeof status?.running !== "boolean" ||
+          typeof status?.status !== "string"
         ) {
-          return;
+          throw new Error("生成状態レスポンスが不正です");
         }
+        dispatchGeneration({
+          type: "status_restored",
+          sessionId,
+          status,
+          eventId: `poll:status:${sessionId}:${status.updated_at ?? statusGeneration}`,
+        });
         if (status.running) {
-          setRestoredGenerationStatus(status);
-          markWaitingResponse(sessionId);
-          setPendingAgentRunId(status.agent_run_id ?? null);
           const knownAssistantIds = new Set(
             knownMessages
               .filter((message) => message.role === "assistant")
@@ -264,41 +362,48 @@ export function useChatPersistence({
             titleSession,
           );
         } else {
-          setRestoredGenerationStatus(null);
           if (status.status !== "idle") {
-            clearWaitingResponse(sessionId);
-            setPendingAgentRunId(null);
+            void refreshPersistedMessages(sessionId);
           }
         }
       } catch (err) {
         console.warn("生成状態の復元に失敗しました", err);
+        if (
+          statusRequestGenerationRef.current === statusGeneration &&
+          activeSessionIdRef.current === sessionId
+        ) {
+          dispatchGeneration({ type: "hydration_failed", sessionId });
+        }
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
-      clearWaitingResponse,
-      markWaitingResponse,
+      dispatchGeneration,
+      refreshPersistedMessages,
       waitForPersistedAssistantResponse,
     ],
   );
 
   // ─── セッション選択時にメッセージを取得 ───
   useEffect(() => {
+    // A→B→Aのような再選択でも、最初のA向け遅延responseを失効させる。
+    statusRequestGenerationRef.current += 1;
+    const previousActiveSessionId = previousActiveSessionIdRef.current;
+    previousActiveSessionIdRef.current = activeSessionId;
     if (!activeSessionId) {
-      dispatchChatTimeline({ type: "clear" });
-      resetDisplayedGenerationState();
+      if (previousActiveSessionId !== undefined) {
+        dispatchChatTimeline({ type: "clear" });
+      }
+      dispatchGeneration({ type: "reset", sessionId: null });
       setIsLoadingMessages(false);
       setSessionLoadError(null);
-      setScenarioSession(null);
       setWritingSession(null);
-      setRoleplaySession(null);
-      setCurrentSession(null);
       setSteeringInstructions([]);
       return;
     }
 
     let cancelled = false;
-    resetDisplayedGenerationState();
+    dispatchGeneration({ type: "reset", sessionId: activeSessionId });
     setIsLoadingMessages(true);
     setSessionLoadError(null);
     // 現在のセッションのtempメッセージのみ保持（別セッションのものはクリア）
@@ -307,91 +412,111 @@ export function useChatPersistence({
       sessionId: activeSessionId,
     });
     setSteeringInstructions([]);
-    setScenarioSession(null);
     setWritingSession(null);
-    setRoleplaySession(null);
 
     (async () => {
-      const loadScenarioContext = async (session: ConversationSession) => {
-        const characterName = session.character_name || "";
-        const roleplayMatch = characterName.match(
-          /^scenario_roleplay:([^:]+):([^:]+)$/,
-        );
-
-        if (roleplayMatch) {
-          const [, scenarioId, characterId] = roleplayMatch;
-          try {
-            const scenario = await chatApi.getScenario(scenarioId);
-            const character = scenario.characters?.find(
-              (item) => item.id === characterId,
-            );
-            if (!cancelled && character) {
-              setRoleplaySession({
-                scenario: { id: scenario.id, title: scenario.title },
-                character,
-              });
-            }
-          } catch (err) {
-            console.warn("シナリオロールプレイ情報取得失敗:", err);
-          }
+      const loadStoryContext = async (session: ConversationSession) => {
+        if (!isStoryWorkflowSession(session)) {
           return;
         }
 
-        if (!isScenarioWorkflowSession(session)) {
-          return;
-        }
-
-        const [playResult, writingResult] = await Promise.allSettled([
-          chatApi.getScenarioPlaySessionByConversation(activeSessionId),
-          chatApi.getWritingSessionByConversation(activeSessionId),
+        const writingResult = await Promise.allSettled([
+          storyApi.getWritingSessionByConversation(activeSessionId),
         ]);
 
         if (cancelled) return;
 
-        setScenarioSession(
-          playResult.status === "fulfilled" ? playResult.value : null,
-        );
         setWritingSession(
-          writingResult.status === "fulfilled" ? writingResult.value : null,
+          writingResult[0].status === "fulfilled" ? writingResult[0].value : null,
         );
       };
 
+      // キャッシュ済みメッセージがあれば即描画（低帯域配慮）。
+      // resume は履歴本文を含めず、続く messages GET で差分だけを取得する。
+      let cachedMessages:
+        | Awaited<ReturnType<typeof readCachedMessages>>
+        | undefined;
       try {
-        const data = await chatApi.resumeSession(activeSessionId);
+        cachedMessages = await readCachedMessages(activeSessionId);
+        if (
+          !cancelled &&
+          cachedMessages &&
+          cachedMessages.messages.length > 0
+        ) {
+          dispatchChatTimeline({
+            type: "hydrate_persisted",
+            sessionId: activeSessionId,
+            messages: cachedMessages.messages,
+          });
+          setLastServerTime(activeSessionId, cachedMessages.serverTime);
+          setIsLoadingMessages(false);
+        }
+      } catch {
+        // キャッシュ読み出し失敗は無視して通常ロードへ。
+      }
+
+      try {
+        const data = await chatApi.resumeSession(activeSessionId, false);
+        let messagesForDisplay = cachedMessages?.messages ?? [];
+        let nextServerTime = cachedMessages?.serverTime ?? null;
+        try {
+          const delta = await chatApi.getMessages(
+            activeSessionId,
+            cachedMessages?.serverTime ?? undefined,
+          );
+          messagesForDisplay = cachedMessages
+            ? mergePersistedById(cachedMessages.messages, delta.messages)
+            : delta.messages;
+          nextServerTime =
+            delta.server_time ?? deriveServerTime(messagesForDisplay);
+        } catch (messageError) {
+          // キャッシュがあればオフラインでも表示を継続する。初回だけは履歴取得失敗を通知する。
+          if (!cachedMessages) throw messageError;
+          console.warn(
+            "メッセージ差分の取得に失敗したためキャッシュを表示します:",
+            messageError,
+          );
+        }
         if (!cancelled) {
-          setCurrentSession(data.session);
-          if (isScenarioWorkflowSession(data.session)) {
-            if (localStorage.getItem(LAST_SESSION_KEY) === activeSessionId) {
-              localStorage.removeItem(LAST_SESSION_KEY);
+          upsertSession(data.session);
+          if (isStoryWorkflowSession(data.session)) {
+            if (safeLocalStorageGetItem(LAST_SESSION_KEY) === activeSessionId) {
+              safeLocalStorageRemoveItem(LAST_SESSION_KEY);
             }
           } else {
-            localStorage.setItem(LAST_SESSION_KEY, activeSessionId);
+            safeLocalStorageSetItem(LAST_SESSION_KEY, activeSessionId);
           }
           // API結果で置き換え。temp-メッセージはAPIに未反映のもののみ残す
           dispatchChatTimeline({
             type: "hydrate_persisted",
             sessionId: activeSessionId,
-            messages: data.messages,
+            messages: messagesForDisplay,
           });
+          setLastServerTime(activeSessionId, nextServerTime);
+          void writeCachedMessages(
+            activeSessionId,
+            messagesForDisplay,
+            nextServerTime,
+          );
           void refreshGenerationStatus(
             activeSessionId,
-            data.messages,
+            messagesForDisplay,
             data.session,
           );
-          void maybeGenerateLoadedSessionTitle(data.session, data.messages);
-          await loadScenarioContext(data.session);
+          void maybeGenerateLoadedSessionTitle(
+            data.session,
+            messagesForDisplay,
+          );
+          await loadStoryContext(data.session);
         }
       } catch (err) {
         console.error("セッション再開失敗:", err);
         if (!cancelled) {
-          if (localStorage.getItem(LAST_SESSION_KEY) === activeSessionId) {
-            localStorage.removeItem(LAST_SESSION_KEY);
+          if (safeLocalStorageGetItem(LAST_SESSION_KEY) === activeSessionId) {
+            safeLocalStorageRemoveItem(LAST_SESSION_KEY);
           }
           dispatchChatTimeline({ type: "clear" });
-          setCurrentSession(null);
-          setScenarioSession(null);
           setWritingSession(null);
-          setRoleplaySession(null);
           setSessionLoadError(
             "会話セッションを表示できませんでした。履歴データは残っている可能性があるため、再読み込みしてください。",
           );
@@ -405,30 +530,42 @@ export function useChatPersistence({
 
     return () => {
       cancelled = true;
+      statusRequestGenerationRef.current += 1;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
-    activeSessionId,
-    maybeGenerateLoadedSessionTitle,
-    refreshGenerationStatus,
-    resetDisplayedGenerationState,
-    router,
-    sessionLoadAttempt,
+      activeSessionId,
+      maybeGenerateLoadedSessionTitle,
+      refreshGenerationStatus,
+      dispatchGeneration,
+      router,
+      sessionLoadAttempt,
+      upsertSession,
   ]);
 
   useEffect(() => {
     if (!activeSessionId || !isConnected) return;
-    void refreshGenerationStatus(
-      activeSessionId,
-      messagesRef.current,
-      currentSession,
-    );
+    void (async () => {
+      const refreshed = await refreshPersistedMessages(activeSessionId);
+      await refreshGenerationStatus(
+        activeSessionId,
+        refreshed ?? messagesRef.current,
+        currentSession,
+      );
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSessionId, currentSession, isConnected, refreshGenerationStatus]);
+  }, [
+    activeSessionId,
+    currentSession,
+    isConnected,
+    refreshGenerationStatus,
+    refreshPersistedMessages,
+  ]);
 
   return {
     maybeGenerateLoadedSessionTitle,
     refreshPersistedMessages,
     waitForPersistedAssistantResponse,
+    bumpSessionForAssistant,
   };
 }

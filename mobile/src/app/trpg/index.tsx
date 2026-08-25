@@ -12,26 +12,39 @@ import {
   Text,
   TextInput,
 } from 'react-native-paper';
-import { scenarioApi } from '../../lib/scenario-api';
+import { storyApi } from '../../lib/story-api';
+import storyRepo from '../../repositories/story';
 import { trpgApi } from '../../lib/trpg-api';
-import type { Scenario, TrpgRoom } from '../../types/api';
+import type { StoryWork, TrpgRoom } from '../../types/api';
 
 export default function TrpgRoomsScreen() {
   const router = useRouter();
   const [rooms, setRooms] = useState<TrpgRoom[]>([]);
-  const [scenarios, setScenarios] = useState<Scenario[]>([]);
+  const [works, setWorks] = useState<StoryWork[]>([]);
   const [joinCode, setJoinCode] = useState('');
+  const [joinSessionId, setJoinSessionId] = useState('');
   const [dialogVisible, setDialogVisible] = useState(false);
-  const [scenarioId, setScenarioId] = useState('');
+  const [workId, setWorkId] = useState('');
   const [roomTitle, setRoomTitle] = useState('');
 
   const load = useCallback(async () => {
-    const [nextRooms, nextScenarios] = await Promise.all([
+    const loadWorks = async (): Promise<StoryWork[]> => {
+      try {
+        return await storyApi.listWorks();
+      } catch {
+        // Keep the selector usable offline after the last successful Story
+        // list has been cached locally.
+        return storyRepo.listWorks();
+      }
+    };
+    const [nextRooms, nextWorks] = await Promise.all([
       trpgApi.listRooms(),
-      scenarioApi.list(),
+      loadWorks(),
     ]);
     setRooms(nextRooms);
-    setScenarios(nextScenarios);
+    const trpgWorks = nextWorks.filter((work) => work.kind === 'trpg');
+    setWorks(trpgWorks);
+    setWorkId((current) => (current && trpgWorks.some((work) => work.id === current) ? current : ''));
   }, []);
 
   useFocusEffect(
@@ -41,12 +54,13 @@ export default function TrpgRoomsScreen() {
   );
 
   const handleCreate = async () => {
-    if (!scenarioId) return;
+    if (!workId) return;
     try {
       const room = await trpgApi.createRoom({
-        scenario_id: scenarioId,
+        // trpgApi serializes this selected Story Work ID as the canonical
+        // `work_id` field required by POST /api/trpg/sessions.
+        work_id: workId,
         room_title: roomTitle,
-        is_public: true,
         gm_mode: 'ai',
       });
       setDialogVisible(false);
@@ -57,13 +71,13 @@ export default function TrpgRoomsScreen() {
   };
 
   const handleJoinByCode = async () => {
-    if (!joinCode.trim()) return;
+    const sessionId = joinSessionId.trim();
+    const code = joinCode.trim().toUpperCase();
+    if (!sessionId || !code) return;
     try {
-      const code = joinCode.trim().toUpperCase();
-      const room = await trpgApi.getRoom(code, code);
       router.push({
         pathname: '/trpg/[roomId]',
-        params: { roomId: room.id, invite_code: code },
+        params: { roomId: sessionId, invite_code: code },
       });
     } catch (error) {
       Alert.alert('TRPG', error instanceof Error ? error.message : 'Room not found');
@@ -85,10 +99,19 @@ export default function TrpgRoomsScreen() {
         <View style={styles.joinRow}>
           <TextInput
             mode="outlined"
+            value={joinSessionId}
+            onChangeText={setJoinSessionId}
+            placeholder="Session ID"
+            style={styles.joinInput}
+            autoCapitalize="none"
+          />
+          <TextInput
+            mode="outlined"
             value={joinCode}
             onChangeText={setJoinCode}
-            placeholder="Room code"
+            placeholder="Invite code"
             style={styles.joinInput}
+            autoCapitalize="characters"
           />
           <Button mode="text" textColor="#89b4fa" onPress={() => router.push('/trpg/host')}>
             Host
@@ -102,11 +125,14 @@ export default function TrpgRoomsScreen() {
       <ScrollView contentContainerStyle={styles.content}>
         {rooms.map((room) => (
           <Surface key={room.id} style={styles.card} elevation={0}>
-            <Text style={styles.cardTitle}>{room.room_title}</Text>
+            <Text style={styles.cardTitle}>{room.title || room.room_title || 'TRPG Room'}</Text>
             <Text style={styles.cardMeta}>
-              {room.room_code} · {room.player_count}/{room.max_players} · {room.gm_mode.toUpperCase()}
+              {room.invite_code || room.room_code || 'No invite code'} ·{' '}
+              {room.participants?.length ?? 0} participants · {room.gm_mode.toUpperCase()}
             </Text>
-            <Text style={styles.cardDesc}>{room.scenario?.title || 'No scenario linked'}</Text>
+            <Text style={styles.cardDesc}>
+              {room.status} · Work {room.work_id || 'not linked'}
+            </Text>
             <View style={styles.actions}>
               <Button compact textColor="#89b4fa" onPress={() => router.push(`/trpg/${room.id}`)}>
                 Open
@@ -123,18 +149,18 @@ export default function TrpgRoomsScreen() {
           <Dialog.Title style={styles.dialogTitle}>Create TRPG Room</Dialog.Title>
           <Dialog.Content>
             <TextInput label="Room Title" value={roomTitle} onChangeText={setRoomTitle} mode="outlined" style={styles.input} />
-            <Text style={styles.selectLabel}>Scenario</Text>
+            <Text style={styles.selectLabel}>Story Work (TRPG)</Text>
             <ScrollView style={styles.selectList}>
-              {scenarios.map((scenario) => (
+              {works.map((work) => (
                 <Button
-                  key={scenario.id}
-                  mode={scenarioId === scenario.id ? 'contained' : 'outlined'}
-                  buttonColor={scenarioId === scenario.id ? '#7c3aed' : undefined}
+                  key={work.id}
+                  mode={workId === work.id ? 'contained' : 'outlined'}
+                  buttonColor={workId === work.id ? '#7c3aed' : undefined}
                   textColor="#cdd6f4"
                   style={styles.selectButton}
-                  onPress={() => setScenarioId(scenario.id)}
+                  onPress={() => setWorkId(work.id)}
                 >
-                  {scenario.title}
+                  {work.title}
                 </Button>
               ))}
             </ScrollView>
@@ -143,7 +169,7 @@ export default function TrpgRoomsScreen() {
             <Button textColor="#a6adc8" onPress={() => setDialogVisible(false)}>
               Cancel
             </Button>
-            <Button textColor="#7c3aed" onPress={handleCreate} disabled={!scenarioId}>
+            <Button textColor="#7c3aed" onPress={handleCreate} disabled={!workId}>
               Create
             </Button>
           </Dialog.Actions>

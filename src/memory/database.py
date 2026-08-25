@@ -6,12 +6,12 @@ import os
 import asyncio
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote_plus
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import NullPool
-from .models import Base
 from .migrations import run_migrations
 from .config import MemoryConfig
 from ..utils.windows_optimization import get_windows_optimizer
@@ -37,8 +37,8 @@ class DatabaseManager:
             postgres_host = "127.0.0.1"
             
         self.database_url = (
-            f"postgresql+asyncpg://{self.config.postgres_user}:"
-            f"{self.config.postgres_password}@{postgres_host}:"
+            f"postgresql+asyncpg://{quote_plus(str(self.config.postgres_user))}:"
+            f"{quote_plus(str(self.config.postgres_password))}@{postgres_host}:"
             f"{self.config.postgres_port}/{self.config.postgres_db}"
         )
         
@@ -90,8 +90,8 @@ class DatabaseManager:
         
         # Create sync engine and session factory for synchronous operations
         self.sync_database_url = (
-            f"postgresql://{self.config.postgres_user}:"
-            f"{self.config.postgres_password}@{postgres_host}:"
+            f"postgresql://{quote_plus(str(self.config.postgres_user))}:"
+            f"{quote_plus(str(self.config.postgres_password))}@{postgres_host}:"
             f"{self.config.postgres_port}/{self.config.postgres_db}"
         )
         
@@ -121,12 +121,31 @@ class DatabaseManager:
         )
         
         self._initialized = False
-    
+        self._initialize_lock = asyncio.Lock()
+
     async def initialize(self, force: bool = False, max_retries: int = 10, retry_delay: float = 2.0) -> bool:
+        """Initialize the database once, serializing concurrent callers."""
+        if self._initialized and not force:
+            return True
+        async with self._initialize_lock:
+            if self._initialized and not force:
+                return True
+            return await self._initialize_unlocked(
+                force=force,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+            )
+
+    async def _initialize_unlocked(
+        self,
+        force: bool = False,
+        max_retries: int = 10,
+        retry_delay: float = 2.0,
+    ) -> bool:
         """Initialize database tables
-        
+
         Args:
-            force: If True, run create_all even if already initialized
+            force: If True, run Alembic verification even if already initialized
             max_retries: Maximum number of connection retry attempts (for Docker)
             retry_delay: Delay between retries in seconds
         
@@ -135,6 +154,9 @@ class DatabaseManager:
         """
         import platform
         
+        if self._initialized and not force:
+            return True
+
         # Docker environment detection
         is_docker = os.path.exists('/.dockerenv') or os.environ.get('AOITALK_DOCKER', '').lower() == 'true'
         
@@ -143,13 +165,12 @@ class DatabaseManager:
             print("[DatabaseManager] Docker environment detected, using connection retry logic")
             for attempt in range(max_retries):
                 try:
-                    try:
-                        await asyncio.to_thread(run_migrations, self.sync_database_url)
-                    except Exception as migration_error:
-                        print(f"[DatabaseManager] Alembic upgrade skipped: {migration_error}")
-                    async with self.engine.begin() as conn:
-                        await conn.run_sync(Base.metadata.create_all)
-                    
+                    migrated = await asyncio.to_thread(
+                        run_migrations, self.sync_database_url
+                    )
+                    if not migrated:
+                        raise RuntimeError("Alembic migration runner returned false")
+
                     self._initialized = True
                     print(f"[DatabaseManager] PostgreSQL database initialized (attempt {attempt + 1}/{max_retries})")
                     return True
@@ -177,14 +198,9 @@ class DatabaseManager:
         
         # Non-Docker environment - original logic
         try:
-            try:
-                await asyncio.to_thread(run_migrations, self.sync_database_url)
-            except Exception as migration_error:
-                print(f"[DatabaseManager] Alembic upgrade skipped: {migration_error}")
-            # PostgreSQL initialization - no Windows-specific timeout wrapper
-            # asyncpg already has its own timeout settings from connect_args
-            async with self.engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
+            migrated = await asyncio.to_thread(run_migrations, self.sync_database_url)
+            if not migrated:
+                raise RuntimeError("Alembic migration runner returned false")
             
             self._initialized = True
             if not self._initialized or force:
@@ -223,7 +239,9 @@ class DatabaseManager:
             AsyncSession: Database session
         """
         if not self._initialized:
-            await self.initialize()
+            initialized = await self.initialize()
+            if not initialized:
+                raise RuntimeError("Database is not initialized; refusing to open a session")
         
         return self.SessionLocal()
     
@@ -233,6 +251,8 @@ class DatabaseManager:
         Returns:
             Session: Synchronous database session
         """
+        if not self._initialized:
+            raise RuntimeError("Database is not initialized; refusing to open a sync session")
         return self.SyncSessionLocal()
     
     async def close(self):

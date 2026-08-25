@@ -25,7 +25,8 @@ def _update_recurrence_status_if_column_exists(
             IF EXISTS (
                 SELECT 1
                 FROM information_schema.columns
-                WHERE table_name = 'task_recurrence_rules'
+                WHERE table_schema = current_schema()
+                  AND table_name = 'task_recurrence_rules'
                   AND column_name = '{column_name}'
             ) THEN
                 UPDATE task_recurrence_rules

@@ -50,7 +50,7 @@ export function LoginHistorySection({ isAdmin }: { isAdmin: boolean }) {
   // ログイン履歴（サーバー状態）は SWR で管理。取得タイミングは従来どおり
   // 呼び出し側（トグル/更新）で駆動するため自動 revalidation は無効化する。
   const { data = EMPTY_LOGIN_HISTORY, mutate: mutateLogs } = useSWR<LoginHistoryData>(
-    "settings/login-history",
+    isAdmin ? "settings/login-history" : null,
     async () => {
       try {
         return await pyFetch<LoginHistoryData>("/auth/login-history?limit=50");
@@ -120,8 +120,10 @@ export function LoginHistorySection({ isAdmin }: { isAdmin: boolean }) {
     }
   };
 
+  if (!isAdmin) return null;
+
   return (
-    <Card size="sm">
+    <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0">
       <CardHeader
         className="cursor-pointer select-none"
         onClick={handleToggle}

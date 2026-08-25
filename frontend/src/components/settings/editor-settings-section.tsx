@@ -31,28 +31,43 @@ export function EditorSettingsSection() {
   const { editorLinkDefaultDisplayMode, patch } = useUserSettings();
   const [expanded, setExpanded] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [feedback, setFeedback] = useState<string | null>(null);
 
   const handleModeChange = async (value: string | null) => {
     const next = normalizeEditorLinkDefaultDisplayMode(value);
     if (next === editorLinkDefaultDisplayMode) return;
 
     setSaving(true);
+    setFeedback(null);
     try {
       await patch({
         editor: {
           link_default_display_mode: next,
         },
       });
+      setFeedback("エディタ設定を保存しました。");
+    } catch (error) {
+      setFeedback(error instanceof Error ? error.message : "保存に失敗しました。");
     } finally {
       setSaving(false);
     }
   };
 
   return (
-    <Card size="sm">
+    <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0">
       <CardHeader
         className="cursor-pointer select-none"
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        aria-controls="editor-settings-content"
         onClick={() => setExpanded((v) => !v)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            setExpanded((v) => !v);
+          }
+        }}
       >
         <CardTitle className="flex items-center justify-between text-sm">
           <span className="flex items-center gap-2">
@@ -75,7 +90,8 @@ export function EditorSettingsSection() {
         )}
       </CardHeader>
       {expanded && (
-        <CardContent className="space-y-3">
+        <CardContent id="editor-settings-content" className="space-y-3">
+          {feedback && <p role="status" className="text-xs text-muted-foreground">{feedback}</p>}
           <div className="space-y-2">
             <Label className="text-xs">URL の既定表示</Label>
             <Select

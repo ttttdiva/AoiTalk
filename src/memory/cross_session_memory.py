@@ -7,15 +7,82 @@ sessions to provide more contextual and informed responses.
 
 import re
 import logging
+import asyncio
+import threading
+import uuid
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+# Qdrant equality filters cannot express SQL-style NULL safely. Messages that
+# are not associated with a project therefore use an explicit scope value.
+NO_PROJECT_SCOPE = "__aoitalk_no_project__"
+PROJECT_MANAGER_SLUG = "project_manager"
+LEGACY_PROJECT_MANAGER_SLUG = "project_management_assistant"
+
+
+def _canonical_character_slug(character_name: Optional[str]) -> str:
+    value = str(character_name or "unknown")
+    if value == LEGACY_PROJECT_MANAGER_SLUG:
+        return PROJECT_MANAGER_SLUG
+    return value
+
+
+def _character_slug_candidates(character_name: Optional[str]) -> tuple[str, ...]:
+    canonical = _canonical_character_slug(character_name)
+    if canonical == PROJECT_MANAGER_SLUG:
+        return (PROJECT_MANAGER_SLUG, LEGACY_PROJECT_MANAGER_SLUG)
+    return (canonical,)
+
+
+def _character_slugs_match(left: Optional[str], right: Optional[str]) -> bool:
+    return _canonical_character_slug(left) == _canonical_character_slug(right)
+
+
+async def _legacy_message_matches_scope(
+    metadata: Dict[str, Any],
+    *,
+    user_id: str,
+    character_name: str,
+    project_id: Optional[str],
+) -> bool:
+    """Validate pre-project-metadata Qdrant points against the SQL canonical row."""
+    session_id = metadata.get("session_id")
+    if not session_id:
+        return False
+    try:
+        from .database import get_db_session
+        from .models import ConversationSession
+
+        async with await get_db_session() as database:
+            conversation = await database.get(
+                ConversationSession,
+                uuid.UUID(str(session_id)),
+            )
+        if conversation is None:
+            return False
+        expected_project = str(project_id) if project_id else None
+        actual_project = (
+            str(conversation.project_id) if conversation.project_id else None
+        )
+        return (
+            str(conversation.user_id) == str(user_id)
+            and _character_slugs_match(conversation.character_name, character_name)
+            and actual_project == expected_project
+        )
+    except Exception:
+        logger.warning(
+            "[CrossSessionMemory] legacy scope validation failed",
+            exc_info=True,
+        )
+        return False
+
 # Keywords that trigger past conversation lookup
 TRIGGER_KEYWORDS_JA = [
     "前に", "以前", "また", "覚えて", "話した", "言った", "教えた", 
-    "約束", "頼んだ", "お願いした", "聞いた", "質問した"
+    "約束", "頼んだ", "お願いした", "聞いた", "質問した", "前回",
+    "続き", "だっけ",
 ]
 TRIGGER_KEYWORDS_EN = [
     "before", "previously", "again", "remember", "told you", "said",
@@ -29,12 +96,21 @@ PRONOUN_PATTERNS = [
 ]
 
 
+class _InitializationAttempt:
+    """Thread-safe completion gate shared by callers of one init attempt."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.result: Optional[bool] = None
+
+
 class CrossSessionMemoryService:
     """Service for retrieving relevant past conversations across sessions."""
     
     # Class-level cache for shared components
     _shared_embedding = None
     _shared_qdrant = None
+    _initialization_lock = threading.Lock()
     
     COLLECTION_NAME = "aoitalk_conversation_memory"
     
@@ -48,6 +124,7 @@ class CrossSessionMemoryService:
         self._initialized = False
         self.embedding = None
         self.qdrant = None
+        self._initialization_attempt: Optional[_InitializationAttempt] = None
         
         # Configuration
         self.min_relevance_score = self.config.get('min_relevance_score', 0.3)
@@ -56,53 +133,154 @@ class CrossSessionMemoryService:
     
     async def initialize(self) -> bool:
         """Initialize the service components.
-        
+
         Returns:
             True if initialization successful
         """
-        if self._initialized:
-            return True
-        
+        lock = CrossSessionMemoryService._initialization_lock
+        with lock:
+            if (
+                self._initialized
+                and self.embedding is not None
+                and self.qdrant is not None
+            ):
+                return True
+
+            attempt = self._initialization_attempt
+            is_owner = attempt is None
+            if is_owner:
+                attempt = _InitializationAttempt()
+                self._initialization_attempt = attempt
+
+        if not is_owner:
+            # ``Event.wait`` is blocking, so keep it off the event loop. This
+            # also allows callers from different asyncio loops to share a gate.
+            await asyncio.to_thread(attempt.done.wait)
+            return bool(attempt.result)
+
+        candidate_embedding = None
+        candidate_qdrant = None
+        initialized = False
         try:
-            # Use shared RAG infrastructure
+            # Use shared RAG infrastructure. Component references remain local
+            # until both initializers have succeeded.
             from ..rag.embedding import BgeM3Embedding
             from ..rag.qdrant_client import QdrantManager
             from ..rag.config import QdrantConfig, get_rag_config
-            
-            # Get RAG config
+
             rag_config = get_rag_config()
-            
-            # Use shared embedding model if available
-            if CrossSessionMemoryService._shared_embedding is None:
-                from ..rag.manager import _shared_embedding
-                if _shared_embedding is not None:
-                    CrossSessionMemoryService._shared_embedding = _shared_embedding
-                else:
-                    # Create new embedding model
-                    CrossSessionMemoryService._shared_embedding = BgeM3Embedding(rag_config.embedding)
-                    await CrossSessionMemoryService._shared_embedding.initialize()
-            
-            self.embedding = CrossSessionMemoryService._shared_embedding
-            
-            # Create Qdrant manager for conversation memory collection
+
+            # A failed shared object is discarded rather than becoming a
+            # sticky cache entry; successful BGE instances may be reused.
+            from ..rag import manager as rag_manager
+
+            def _discard_failed_embedding() -> None:
+                with lock:
+                    if (
+                        CrossSessionMemoryService._shared_embedding
+                        is shared_embedding
+                    ):
+                        CrossSessionMemoryService._shared_embedding = None
+                    if rag_manager._shared_embedding is shared_embedding:
+                        rag_manager._shared_embedding = None
+
+            with lock:
+                shared_embedding = CrossSessionMemoryService._shared_embedding
+                if shared_embedding is not None and not getattr(
+                    shared_embedding, "_initialized", False
+                ):
+                    CrossSessionMemoryService._shared_embedding = None
+                    shared_embedding = None
+
+                if shared_embedding is None:
+                    if rag_manager._shared_embedding is not None:
+                        shared_embedding = rag_manager._shared_embedding
+                    else:
+                        shared_embedding = BgeM3Embedding(rag_config.embedding)
+
+            # RagManager's cache may contain an object that failed previously.
+            # Its existence alone is not success; always inspect initialize().
+            initialize_embedding = getattr(shared_embedding, "initialize", None)
+            if initialize_embedding is None:
+                _discard_failed_embedding()
+                logger.error("[CrossSessionMemory] Embedding initialization failed")
+                return False
+            try:
+                embedding_initialized = await initialize_embedding()
+            except asyncio.CancelledError:
+                _discard_failed_embedding()
+                raise
+            except Exception:
+                _discard_failed_embedding()
+                raise
+            if not embedding_initialized:
+                _discard_failed_embedding()
+                logger.error("[CrossSessionMemory] Embedding initialization failed")
+                return False
+            candidate_embedding = shared_embedding
+
+            with lock:
+                CrossSessionMemoryService._shared_embedding = candidate_embedding
+
             qdrant_config = QdrantConfig(
                 host=rag_config.qdrant.host,
                 port=rag_config.qdrant.port,
                 collection_name=self.COLLECTION_NAME,
-                local_path=rag_config.qdrant.local_path
+                local_path=rag_config.qdrant.local_path,
             )
-            
-            self.qdrant = QdrantManager(qdrant_config, vector_size=1024)  # BGE-M3 uses 1024 dim
-            await self.qdrant.initialize()
-            
-            self._initialized = True
-            logger.info(f"[CrossSessionMemory] Initialized with collection: {self.COLLECTION_NAME}")
+            candidate_qdrant = QdrantManager(
+                qdrant_config, vector_size=1024
+            )  # BGE-M3 uses 1024 dim
+            try:
+                qdrant_initialized = await candidate_qdrant.initialize()
+            except Exception as e:
+                logger.error(
+                    "[CrossSessionMemory] Qdrant initialization raised an exception: %s",
+                    e,
+                )
+                return False
+            if not qdrant_initialized:
+                logger.error(
+                    "[CrossSessionMemory] Qdrant initialization returned false"
+                )
+                return False
+
+            initialized = True
+            logger.info(
+                "[CrossSessionMemory] Initialized with collection: %s",
+                self.COLLECTION_NAME,
+            )
             return True
-            
+
+        except asyncio.CancelledError:
+            # Release the completion gate in finally before propagating
+            # cancellation. Waiters receive the same False result.
+            raise
         except Exception as e:
             logger.error(f"[CrossSessionMemory] Initialization failed: {e}")
             return False
-    
+        finally:
+            with lock:
+                if (
+                    initialized
+                    and candidate_embedding is not None
+                    and candidate_qdrant is not None
+                ):
+                    self.embedding = candidate_embedding
+                    self.qdrant = candidate_qdrant
+                    self._initialized = True
+                    attempt.result = True
+                else:
+                    self.embedding = None
+                    self.qdrant = None
+                    self._initialized = False
+                    attempt.result = False
+                if self._initialization_attempt is attempt:
+                    self._initialization_attempt = None
+                # Set while holding the short lock so callers cannot observe a
+                # cleared attempt before its waiters are released.
+                attempt.done.set()
+
     def should_search_past_conversations(self, user_input: str) -> bool:
         """Check if the user input suggests referencing past conversations.
         
@@ -142,7 +320,9 @@ class CrossSessionMemoryService:
         user_id: str, 
         query: str, 
         current_session_id: Optional[str] = None,
-        limit: Optional[int] = None
+        limit: Optional[int] = None,
+        character_name: Optional[str] = None,
+        project_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Search for relevant past conversations.
         
@@ -151,6 +331,8 @@ class CrossSessionMemoryService:
             query: Search query (usually user's current input)
             current_session_id: Current session ID to exclude from results
             limit: Maximum number of results
+            character_name: Current character scope. Missing values use "unknown".
+            project_id: Current project scope. None means non-project conversations.
             
         Returns:
             List of relevant conversation snippets with metadata
@@ -169,17 +351,62 @@ class CrossSessionMemoryService:
                 return []
             
             # Search in Qdrant
-            filter_conditions = {"user_id": user_id}
-            
-            results = await self.qdrant.search(
+            scoped_results = []
+            for scoped_character in _character_slug_candidates(character_name):
+                filter_conditions = {
+                    "user_id": user_id,
+                    "character_name": scoped_character,
+                    "project_id": str(project_id) if project_id else NO_PROJECT_SCOPE,
+                }
+                scoped_results.extend(
+                    await self.qdrant.search(
+                        query_embedding=query_embedding,
+                        top_k=limit * 2,  # Get more to filter
+                        filter_conditions=filter_conditions,
+                    )
+                )
+            result_sources = [(result, False) for result in scoped_results]
+            # Older points predate project_id metadata.  Always fetch a bounded
+            # broad supplement because scoped hits may later be discarded as
+            # current-session, below-threshold, or duplicate.  Every broad hit
+            # is still scope-validated below; missing metadata is never guessed.
+            legacy_results = await self.qdrant.search(
                 query_embedding=query_embedding,
-                top_k=limit * 2,  # Get more to filter
-                filter_conditions=filter_conditions
+                top_k=limit * 10,
+                filter_conditions={"user_id": user_id},
+            )
+            result_sources.extend(
+                (result, True) for result in legacy_results
             )
             
             # Filter and format results
-            formatted_results = []
-            for result in results:
+            deduped_results: dict[tuple[str, str], Dict[str, Any]] = {}
+            for result, legacy_fallback in result_sources:
+                if legacy_fallback:
+                    metadata = result.metadata or {}
+                    stored_project = metadata.get("project_id")
+                    stored_character = metadata.get("character_name")
+                    if stored_project is not None:
+                        if (
+                            stored_project
+                            != (
+                                str(project_id)
+                                if project_id
+                                else NO_PROJECT_SCOPE
+                            )
+                            or not _character_slugs_match(
+                                stored_character,
+                                character_name,
+                            )
+                        ):
+                            continue
+                    elif not await _legacy_message_matches_scope(
+                        metadata,
+                        user_id=user_id,
+                        character_name=character_name or "unknown",
+                        project_id=project_id,
+                    ):
+                        continue
                 # Skip current session messages
                 if current_session_id and result.metadata.get("session_id") == current_session_id:
                     continue
@@ -187,18 +414,38 @@ class CrossSessionMemoryService:
                 # Check relevance threshold
                 if result.score < self.min_relevance_score:
                     continue
-                
-                formatted_results.append({
+                dedupe_key = (
+                    str(result.metadata.get("session_id") or ""),
+                    str(result.text or ""),
+                )
+                candidate = {
                     "content": result.text,
                     "role": result.metadata.get("role", "unknown"),
                     "session_id": result.metadata.get("session_id"),
                     "timestamp": result.metadata.get("timestamp"),
                     "relevance_score": result.score,
-                    "character_name": result.metadata.get("character_name")
-                })
-                
-                if len(formatted_results) >= limit:
-                    break
+                    "character_name": _canonical_character_slug(
+                        result.metadata.get("character_name")
+                    ),
+                    "project_id": (
+                        None
+                        if result.metadata.get("project_id") == NO_PROJECT_SCOPE
+                        else result.metadata.get("project_id")
+                    ),
+                }
+                existing = deduped_results.get(dedupe_key)
+                if (
+                    existing is None
+                    or candidate["relevance_score"]
+                    > existing["relevance_score"]
+                ):
+                    deduped_results[dedupe_key] = candidate
+
+            formatted_results = sorted(
+                deduped_results.values(),
+                key=lambda item: item["relevance_score"],
+                reverse=True,
+            )[:limit]
             
             logger.info(f"[CrossSessionMemory] Found {len(formatted_results)} relevant messages for user {user_id}")
             return formatted_results
@@ -254,6 +501,7 @@ class CrossSessionMemoryService:
         role: str,
         content: str,
         character_name: Optional[str] = None,
+        project_id: Optional[str] = None,
         timestamp: Optional[datetime] = None
     ) -> bool:
         """Index a conversation message for future retrieval.
@@ -265,6 +513,7 @@ class CrossSessionMemoryService:
             role: Message role (user/assistant)
             content: Message content
             character_name: Optional character name
+            project_id: Optional project identifier. None is stored explicitly.
             timestamp: Optional timestamp
             
         Returns:
@@ -299,7 +548,8 @@ class CrossSessionMemoryService:
                 "session_id": session_id,
                 "user_id": user_id,
                 "role": role,
-                "character_name": character_name or "unknown",
+                "character_name": _canonical_character_slug(character_name),
+                "project_id": str(project_id) if project_id else NO_PROJECT_SCOPE,
                 "timestamp": timestamp.isoformat() if timestamp else datetime.now().isoformat()
             }
             
@@ -338,6 +588,7 @@ class CrossSessionMemoryService:
 
 # Global service instance
 _cross_session_memory: Optional[CrossSessionMemoryService] = None
+_cross_session_memory_factory_lock = threading.Lock()
 
 
 def get_cross_session_memory(
@@ -352,8 +603,9 @@ def get_cross_session_memory(
         CrossSessionMemoryService instance
     """
     global _cross_session_memory
-    
-    if _cross_session_memory is None:
-        _cross_session_memory = CrossSessionMemoryService(config)
-    
-    return _cross_session_memory
+
+    with _cross_session_memory_factory_lock:
+        if _cross_session_memory is None:
+            _cross_session_memory = CrossSessionMemoryService(config)
+
+        return _cross_session_memory

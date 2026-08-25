@@ -3,21 +3,112 @@ Configuration management for Voice Assistant
 """
 import os
 import copy
+import ipaddress
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Union
+from urllib.parse import urlsplit
 import yaml
 from dotenv import load_dotenv
 import logging
 from .config_validator import ConfigValidator
+from .config_defaults import load_default_config
+from .features import Features
 from .app_config_store import (
     load_app_config_sync,
     save_app_config_sync,
     update_app_config_key_sync,
 )
 from .security.field_crypto import redact_secret_value
+from .security.secret_env import load_secret_environment
 from .tts.irodori_config import normalize_irodori_settings
+from .config_errors import (
+    CharacterLookupError,
+    CharacterNotFoundError,
+    build_character_lookup_error,
+)
+
+_HF_STANDARD_CACHE_ENV_KEYS = (
+    "HF_HOME",
+    "HF_HUB_CACHE",
+    "HUGGINGFACE_HUB_CACHE",
+    "TRANSFORMERS_CACHE",
+)
 
 logger = logging.getLogger(__name__)
+
+# Direct API/CLI startup paths may provide Docker-style *_FILE settings
+# without the Enterprise container entrypoint.  Resolve them before modules
+# such as memory.config snapshot environment-backed dataclass defaults.
+load_secret_environment()
+
+
+def _is_loopback_url(url: str) -> bool:
+    """Return whether an HTTP URL points back to the current container/host."""
+    try:
+        hostname = urlsplit(url).hostname
+    except ValueError:
+        return False
+    if not hostname:
+        return False
+    normalized = hostname.rstrip(".").lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_enterprise_docker_sglang_contract(config: Dict[str, Any]) -> None:
+    """Reject a persisted SGLang target that differs from Compose's server."""
+    docker_mode = os.getenv("AOITALK_DOCKER", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if (
+        not Features.is_enterprise()
+        or not docker_mode
+        or str(config.get("llm_provider") or "").strip().lower() != "sglang"
+    ):
+        return
+
+    from .llm.sglang_url import resolve_sglang_base_url, resolve_sglang_model
+
+    mismatches: list[str] = []
+    expected_model = os.getenv("SGLANG_MODEL", "").strip()
+    effective_model = resolve_sglang_model(config).strip()
+    if expected_model and effective_model != expected_model:
+        mismatches.append(
+            f"model: database={effective_model!r}, compose={expected_model!r}"
+        )
+
+    expected_base_url = os.getenv("SGLANG_BASE_URL", "").strip().rstrip("/")
+    effective_base_url = resolve_sglang_base_url(config).strip().rstrip("/")
+    if expected_base_url and _is_loopback_url(expected_base_url):
+        mismatches.append(
+            "base_url: Compose SGLang URL must use the sglang service name, "
+            f"not loopback {expected_base_url!r}"
+        )
+    if effective_base_url and _is_loopback_url(effective_base_url):
+        mismatches.append(
+            "base_url: persisted SGLang URL must use the sglang service name, "
+            f"not loopback {effective_base_url!r}"
+        )
+    if expected_base_url and effective_base_url != expected_base_url:
+        mismatches.append(
+            "base_url: "
+            f"database={effective_base_url!r}, compose={expected_base_url!r}"
+        )
+
+    if mismatches:
+        raise RuntimeError(
+            "Enterprise SGLang configuration differs from the Compose service ("
+            + "; ".join(mismatches)
+            + "). Align the persisted LLM settings with SGLANG_MODEL and "
+            "SGLANG_BASE_URL before starting AoiTalk."
+        )
 
 DEFAULT_MOBILE_UI_CONFIG: Dict[str, Any] = {
     'enabled': True,
@@ -80,6 +171,10 @@ class Config:
         'openrouter_app_name': 'OPENROUTER_APP_NAME',
         'kimi_api_key': 'MOONSHOT_API_KEY',
         'kimi_base_url': 'MOONSHOT_BASE_URL',
+        'deepseek_api_key': 'DEEPSEEK_API_KEY',
+        'deepseek_base_url': 'DEEPSEEK_BASE_URL',
+        'deepinfra_api_key': 'DEEPINFRA_TOKEN',
+        'deepinfra_base_url': 'DEEPINFRA_BASE_URL',
         'discord_bot_token': 'DISCORD_BOT_TOKEN',
         'gemini_api_key': 'GEMINI_API_KEY',
         'ollama_api_key': 'OLLAMA_API_KEY',
@@ -112,10 +207,34 @@ class Config:
             config_path: Path to config.yaml file. If None, uses default location.
         """
         self.root_dir = Path(__file__).parent.parent
-        self.config_path = Path(config_path) if config_path else self.root_dir / "config" / "config.yaml"
+        if config_path:
+            self.config_path = Path(config_path)
+        else:
+            docker_config = self.root_dir / "config" / "config.docker.yaml"
+            use_docker_config = os.getenv("AOITALK_DOCKER", "").lower() in {
+                "1", "true", "yes", "on"
+            }
+            self.config_path = (
+                docker_config
+                if use_docker_config and docker_config.exists()
+                else self.root_dir / "config" / "config.yaml"
+            )
         
         # Load environment variables
-        load_dotenv(self.root_dir / ".env")
+        # Personal/local launches use the repository .env as the canonical
+        # provider credential source.  Override stale Windows environment
+        # variables here, then let an explicit deployment secret file win.
+        preexisting_hf_cache_env = {
+            key: os.environ[key]
+            for key in _HF_STANDARD_CACHE_ENV_KEYS
+            if key in os.environ
+        }
+        load_dotenv(self.root_dir / ".env", override=True)
+        for key, value in preexisting_hf_cache_env.items():
+            os.environ[key] = value
+        # dotenv must not override a deployment secret file.  Re-read after
+        # dotenv because a native launcher may load .env before Config.
+        load_secret_environment()
         
         # Load configuration
         self.config = self._load_config()
@@ -125,17 +244,68 @@ class Config:
         
     def _load_config(self) -> Dict[str, Any]:
         """Load configuration from the database, seeding from legacy YAML if present."""
-        config = load_app_config_sync(self.config_path)
-            
-        # 環境別設定をマージ
-        environment = os.environ.get("AIVTUBER_ENV")
+        seed_override = None
+        environment = os.environ.get("AIVTUBER_ENV") or os.environ.get(
+            "AOITALK_PROFILE"
+        )
         if environment:
             env_config_path = self.config_path.parent / f"{environment}.yaml"
+            if not env_config_path.exists() and Features.is_enterprise():
+                raise FileNotFoundError(
+                    f"Enterprise configuration overlay is missing: {env_config_path}"
+                )
             if env_config_path.exists():
-                with open(env_config_path, 'r', encoding='utf-8') as f:
+                with open(env_config_path, "r", encoding="utf-8") as f:
                     env_config = yaml.safe_load(f) or {}
-                    config = self._merge_configs(config, env_config)
-            
+                if self.config_path.exists():
+                    with open(self.config_path, "r", encoding="utf-8") as f:
+                        base_seed = yaml.safe_load(f) or {}
+                else:
+                    base_seed = load_default_config()
+                seed_override = self._merge_configs(base_seed, env_config)
+
+                # The Enterprise overlay is shared by native Linux and
+                # Compose.  A Docker container must seed its first DB row with
+                # the Compose service name; 127.0.0.1 would point back to the
+                # AoiTalk container itself.  This is a first-seed deployment
+                # default; an existing DB remains authoritative.
+                if os.getenv("AOITALK_DOCKER", "").lower() in {
+                    "1", "true", "yes", "on"
+                }:
+                    docker_sglang_url = os.getenv(
+                        "SGLANG_BASE_URL", "http://sglang:30000/v1"
+                    ).strip().rstrip("/")
+                    seed_override["sglang_base_url"] = docker_sglang_url
+                    sglang_seed = seed_override.setdefault("sglang", {})
+                    if isinstance(sglang_seed, dict):
+                        sglang_seed["base_url"] = docker_sglang_url
+                        sglang_seed["host"] = "sglang"
+
+                # Compose passes SGLANG_MODEL even when the default Gemma
+                # value is used.  Keep the first DB seed and the SGLang
+                # container's served name identical; otherwise a deliberate
+                # model override would start SGLang with one name while
+                # AoiTalk still asks the database-seeded model for another.
+                sglang_model = os.getenv("SGLANG_MODEL", "").strip()
+                if sglang_model:
+                    seed_override["llm_model"] = sglang_model
+                    sglang_seed = seed_override.setdefault("sglang", {})
+                    if isinstance(sglang_seed, dict):
+                        sglang_seed["model"] = sglang_model
+
+        # Enterprise overlayは初回DB seedへだけ適用し、既存DBの正本を
+        # 毎回上書きしない。環境変数は下記でdeployment overrideとして適用する。
+        config = load_app_config_sync(
+            self.config_path,
+            seed_override=seed_override,
+        )
+
+        # Existing DB values remain authoritative, but in Enterprise Compose
+        # they must identify the model that the paired SGLang container serves.
+        # Fail before frontend/Caddy/client startup instead of accepting a
+        # healthy server that every chat request addresses incorrectly.
+        validate_enterprise_docker_sglang_contract(config)
+
         # 環境変数をマージ
         self._merge_env_variables(config)
         
@@ -192,8 +362,8 @@ class Config:
         """環境変数をconfig辞書にマージ"""
         for config_key, env_var in self.ENV_MAPPINGS.items():
             value = os.getenv(env_var, '')
-            # Web設定へ保存したKimi接続情報は、空の.env項目で消さない。
-            if config_key.startswith('kimi_') and not value:
+            # Web設定へ保存した接続情報は、空の.env項目で消さない。
+            if config_key.startswith(('kimi_', 'deepseek_', 'deepinfra_')) and not value:
                 continue
             if value and config_key.endswith('_path'):
                 value = self._expand_path_vars(value)
@@ -251,7 +421,6 @@ class Config:
             'codec_model_id': 'AOITALK_MIOTTS_CODEC_MODEL_ID',
             'refs_dir': 'AOITALK_MIOTTS_REFS_DIR',
             'presets_dir': 'AOITALK_MIOTTS_PRESETS_DIR',
-            'cache_dir': 'AOITALK_MIOTTS_CACHE_DIR',
             'device': 'AOITALK_MIOTTS_DEVICE',
             'dtype': 'AOITALK_MIOTTS_DTYPE',
         }
@@ -298,8 +467,11 @@ class Config:
             except Exception as exc:
                 logger.warning(f"モバイルUI設定の読み込みに失敗しました: {exc}")
 
+        if Features.is_enterprise():
+            mobile_config['enabled'] = False
+
         config['mobile_ui'] = mobile_config
-        
+
     def _validate_environment(self) -> None:
         """必須環境変数の検証"""
         missing_vars = []
@@ -337,6 +509,10 @@ class Config:
             issues['warnings'].append('OpenRouter APIキーが設定されていません')
         if provider == 'kimi' and not self.config.get('kimi_api_key'):
             issues['warnings'].append('Kimi APIキーが設定されていません')
+        if provider == 'deepseek' and not self.config.get('deepseek_api_key'):
+            issues['warnings'].append('DeepSeek APIキーが設定されていません')
+        if provider == 'deepinfra' and not self.config.get('deepinfra_api_key'):
+            issues['warnings'].append('DeepInfra API tokenが設定されていません')
 
         return issues
         
@@ -393,11 +569,25 @@ class Config:
             True if save was successful, False otherwise
         """
         try:
-            # First update in-memory config
-            self.set(key, value)
-            
             if not update_app_config_key_sync(key, value):
                 return False
+            # DBが正本なので、永続化に成功してからメモリ上の値を更新する。
+            # 先にsetするとDB障害時だけプロセス内と次回起動の値が乖離する。
+            if key == "agent_team" or key.startswith("agent_team."):
+                # Agent Team schema-v3 is a single canonical envelope.  A
+                # dotted legacy write (for example ``agent_team.members``)
+                # is accepted only as migration input by the store; copying
+                # that value back into the live Config would reintroduce v2
+                # keys after a successful save.  Read the persisted envelope
+                # and replace only this managed branch in memory.
+                persisted = load_app_config_sync()
+                self.config["agent_team"] = copy.deepcopy(
+                    persisted.get("agent_team", {})
+                    if isinstance(persisted, dict)
+                    else {}
+                )
+            else:
+                self.set(key, value)
             logger.info("Config saved: %s = %s", key, redact_secret_value(key, value))
             return True
         except Exception as e:
@@ -405,7 +595,13 @@ class Config:
             return False
         
         
-    def get_character_config(self, character_name: str) -> Dict[str, Any]:
+    def get_character_config(
+        self,
+        character_name: str,
+        *,
+        request_id: object | None = None,
+        trace_id: object | None = None,
+    ) -> Dict[str, Any]:
         """Load character configuration from DB.
 
         Args:
@@ -414,22 +610,92 @@ class Config:
         Returns:
             Character configuration dictionary (YAML互換形式)
         """
-        db_config = self._get_character_from_db(character_name)
+        db_config = self._get_character_from_db(
+            character_name,
+            request_id=request_id,
+            trace_id=trace_id,
+        )
         if db_config is not None:
             return db_config
 
-        raise FileNotFoundError(f"Character configuration not found: {character_name}")
+        # Keep the historical FileNotFoundError contract so API routes expose
+        # a 404 for a genuine missing row.  Database failures are raised from
+        # _get_character_from_db as CharacterLookupError and never reach here.
+        raise CharacterNotFoundError(character_name)
 
-    def _get_character_from_db(self, character_name: str) -> Optional[Dict[str, Any]]:
-        """DBからキャラクターを取得し、YAML互換形式に変換する。"""
+    def _get_character_from_db(
+        self,
+        character_name: str,
+        *,
+        request_id: object | None = None,
+        trace_id: object | None = None,
+    ) -> Optional[Dict[str, Any]]:
+        """DBからキャラクターを取得し、YAML互換形式に変換する。
+
+        ``None`` は有効なキャラクター行が存在しない場合だけ返す。
+        PostgreSQL/SQLAlchemy/asyncpg の障害を ``None`` へ変換すると、
+        呼び出し元が「設定なし」と誤認してしまうため、秘密値を含まない
+        ``CharacterLookupError`` として分類・再送出する。
+        """
+        # Keep the service's domain exception identity when available.  The
+        # sentinel avoids an unbound-local failure if importing the service
+        # itself fails during database bootstrap.
+        service_not_found_error_type = None
         try:
-            from .services.character_service import get_character_for_prompt, _run_sync
+            from .services.character_service import (
+                CharacterNotFoundError as _service_not_found_error_type,
+                _run_sync,
+                get_character_for_prompt,
+            )
+
+            service_not_found_error_type = _service_not_found_error_type
+
             char = _run_sync(get_character_for_prompt(character_name))
             if char is None:
                 return None
             return self._db_char_to_yaml_format(char)
-        except Exception:
-            return None
+        except Exception as exc:
+            # ``get_character_for_prompt`` currently returns None for a miss,
+            # but retain compatibility with older service implementations that
+            # raised their domain 404 exception instead.
+            if (
+                isinstance(exc, CharacterNotFoundError)
+                or (
+                    service_not_found_error_type is not None
+                    and isinstance(exc, service_not_found_error_type)
+                )
+            ):
+                return None
+            # Some older character-service releases exposed a generic domain
+            # exception with a 404 status.  Restrict this compatibility path
+            # to that explicit class name; a database error carrying an
+            # incidental ``status_code`` must still propagate as a DB failure.
+            if (
+                type(exc).__name__ == "CharacterNotFoundError"
+                and getattr(exc, "status_code", None) == 404
+            ):
+                return None
+
+            lookup_error = build_character_lookup_error(
+                exc,
+                trace_id=trace_id,
+                request_id=request_id,
+            )
+            logger.error(
+                "Character database lookup failed: category=%s trace_id=%s "
+                "request_id=%s exception_type=%s detail=%s",
+                lookup_error.category,
+                lookup_error.trace_id,
+                lookup_error.request_id or "-",
+                lookup_error.original_type or type(exc).__name__,
+                lookup_error.detail or "-",
+            )
+            # Do not chain the raw DBAPI exception.  SQLAlchemy/asyncpg
+            # exception strings can contain a DSN credential; the typed error
+            # is already recorded with a bounded redacted detail above.
+            if isinstance(lookup_error, CharacterLookupError):
+                raise lookup_error from None
+            raise
 
     @staticmethod
     def _db_char_to_yaml_format(char: Dict[str, Any]) -> Dict[str, Any]:
@@ -455,15 +721,67 @@ class Config:
             "_db_character": char,
         }
     
-    def get_available_characters(self) -> list[str]:
-        """Get list of available character names from DB."""
+    def get_available_character_options(self) -> list[dict[str, str]]:
+        """Get stable character identities and display names from DB."""
         try:
             from .services.character_service import list_characters, _run_sync
             db_chars = _run_sync(list_characters(enabled_only=True))
-            return sorted(c["name"] for c in db_chars)
-        except Exception:
-            default_character = self.get("default_character")
-            return [default_character] if default_character else []
+            # An initialized database with no enabled rows is a legitimate
+            # empty-catalog state.  Keep the legacy default-character fallback
+            # only for that explicit result; connection/auth/schema failures
+            # are handled below and must not become a plausible default list.
+            if not db_chars:
+                return self._default_character_options()
+            options = [
+                {"slug": str(c["slug"]), "name": str(c["name"])}
+                for c in db_chars
+                if c.get("slug") and c.get("name")
+            ]
+            has_canonical_project_manager = any(
+                option["slug"] == "project_manager" for option in options
+            )
+            if has_canonical_project_manager:
+                options = [
+                    option
+                    for option in options
+                    if option["slug"] != "project_management_assistant"
+                ]
+            return sorted(options, key=lambda item: (item["name"], item["slug"]))
+        except (ImportError, ModuleNotFoundError):
+            # Character persistence is optional for lightweight/local installs
+            # where the service module is intentionally unavailable.  Do not
+            # use this fallback for runtime database failures from list query.
+            return self._default_character_options()
+        except CharacterLookupError:
+            raise
+        except Exception as exc:
+            lookup_error = build_character_lookup_error(exc)
+            logger.error(
+                "Character list database lookup failed: category=%s trace_id=%s "
+                "request_id=%s exception_type=%s detail=%s",
+                lookup_error.category,
+                lookup_error.trace_id,
+                lookup_error.request_id or "-",
+                lookup_error.original_type or type(exc).__name__,
+                lookup_error.detail or "-",
+            )
+            raise lookup_error from None
+
+    def _default_character_options(self) -> list[dict[str, str]]:
+        """Return the local default only when the catalog is absent/optional."""
+
+        default_character = self.get("default_character")
+        return (
+            [{"slug": default_character, "name": default_character}]
+            if default_character
+            else []
+        )
+
+    def get_available_characters(self) -> list[str]:
+        """Get unique display names for legacy clients."""
+        return sorted(
+            {option["name"] for option in self.get_available_character_options()}
+        )
             
     @property
     def llm_model(self) -> str:

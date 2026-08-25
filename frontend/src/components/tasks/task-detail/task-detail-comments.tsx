@@ -3,6 +3,7 @@
 import { Send } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { MarkdownContent } from "@/components/ui/markdown-content";
 import { Textarea } from "@/components/ui/textarea";
 import { formatDateTime } from "@/components/tasks/task-detail/task-detail-utils";
 
@@ -20,12 +21,14 @@ export function TaskDetailComments({
   setCommentText,
   sendingComment,
   onSendComment,
+  readOnly = false,
 }: {
   comments: CommentItem[];
   commentText: string;
   setCommentText: (value: string) => void;
   sendingComment: boolean;
   onSendComment: () => void;
+  readOnly?: boolean;
 }) {
   return (
     <div className="space-y-4">
@@ -41,7 +44,10 @@ export function TaskDetailComments({
               key={c.id}
               className="rounded-lg border p-3 text-sm space-y-1"
             >
-              <p>{c.content}</p>
+              {/* 改行とMarkdown書式をそのまま反映する。 */}
+              <div className="min-w-0 [overflow-wrap:anywhere]">
+                <MarkdownContent content={c.content} breaks />
+              </div>
               <p className="text-xs text-muted-foreground">
                 {formatDateTime(c.created_at)}
               </p>
@@ -49,7 +55,7 @@ export function TaskDetailComments({
           ))}
         </div>
       )}
-      <div className="flex gap-2">
+      {!readOnly && <div className="flex gap-2">
         <Textarea
           value={commentText}
           onChange={(e) => setCommentText(e.target.value)}
@@ -70,7 +76,7 @@ export function TaskDetailComments({
         >
           <Send className="size-4" />
         </Button>
-      </div>
+      </div>}
     </div>
   );
 }

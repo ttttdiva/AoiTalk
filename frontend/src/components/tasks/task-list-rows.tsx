@@ -6,10 +6,19 @@ import type React from "react";
 import { CornerDownRight, Plus, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { TaskRowDatePicker } from "@/components/tasks/task-row-date-picker";
+import {
+  TaskStatusMenuItems,
+  type TaskStatusOption,
+} from "@/components/tasks/task-status-menu-items";
 import { taskApi, type Task } from "@/lib/task-api";
 import { toLocalDateTimeInputValue } from "@/lib/date-time";
+import { formatTaskDateLabel } from "@/lib/task-date-label";
 import {
   getTaskDisplayAllDay,
   getTaskDisplayEndAt,
@@ -18,11 +27,12 @@ import {
 import { cn } from "@/lib/utils";
 import {
   dateButtonColor,
+  formatDuration,
+  getTaskDisplayStatus,
   STATUS_DOT_COLORS,
   STATUS_LABELS,
 } from "@/lib/tasks-page-utils";
 import type { DropMode } from "@/lib/task-reorder";
-import type { FetchDataOptions } from "@/components/tasks/hooks/use-tasks-data";
 import type { UndoEntry } from "@/components/tasks/hooks/use-task-undo";
 
 /**
@@ -44,11 +54,23 @@ export function SubtaskRow({
   openTask,
   onContextMenu,
   pushUndo,
-  fetchData,
   handleTaskDateChange,
   applyTaskPatchLocally,
+  removeTaskLocally,
   requestRecurringDelete,
   readOnly = false,
+  showProjectColumn = projectTab === "all",
+  showStartColumn = true,
+  showDueColumn = true,
+  showPriorityColumn = false,
+  showAssigneeColumn = false,
+  showTimeColumn = true,
+  onStatusChange,
+  rowRef,
+  tabIndex = -1,
+  onFocus,
+  focusRow,
+  focused = false,
 }: {
   sub: Task;
   parentTask: Task;
@@ -65,19 +87,35 @@ export function SubtaskRow({
   openTask: (task: Task) => void;
   onContextMenu: (e: React.MouseEvent, task: Task) => void;
   pushUndo: (entry: UndoEntry) => void;
-  fetchData: (options?: FetchDataOptions) => Promise<void>;
   handleTaskDateChange: (
     task: Task,
     changes: { start_at?: string | null; end_at?: string | null },
   ) => Promise<void>;
   applyTaskPatchLocally: (taskId: string, patch: Partial<Task>) => void;
+  removeTaskLocally: (taskId: string) => void;
   requestRecurringDelete?: (task: Task) => boolean;
   readOnly?: boolean;
+  showProjectColumn?: boolean;
+  showStartColumn?: boolean;
+  showDueColumn?: boolean;
+  showPriorityColumn?: boolean;
+  showAssigneeColumn?: boolean;
+  showTimeColumn?: boolean;
+  onStatusChange?: (task: Task, status: TaskStatusOption) => Promise<void>;
+  rowRef?: React.Ref<HTMLTableRowElement>;
+  tabIndex?: number;
+  onFocus?: () => void;
+  focusRow?: () => void;
+  focused?: boolean;
 }) {
+  const status = getTaskDisplayStatus(sub);
+
   return (
     <tr
       key={sub.id}
+      ref={rowRef}
       data-testid={`task-row-${sub.id}`}
+      tabIndex={tabIndex}
       draggable={!readOnly}
       onDragStart={(e) => onDragStart(e, sub.id)}
       onDragOver={(e) => onDragOver(e, sub.id)}
@@ -85,24 +123,27 @@ export function SubtaskRow({
       onDrop={(e) => onDrop(e, sub.id)}
       onDragEnd={onDragEnd}
       onMouseEnter={() => setHoveredGroupId(parentTask.id)}
+      onFocus={onFocus}
       onClick={() => {
+        focusRow?.();
         openTask(sub);
       }}
       onContextMenu={(e) => {
         if (!readOnly) onContextMenu(e, sub);
       }}
       className={cn(
-        "group relative border-b border-border/30 cursor-pointer transition-colors hover:bg-accent/60 hover:shadow-sm bg-muted/10",
+        "group relative h-11 cursor-pointer border-b border-border/40 bg-muted/10 transition-colors hover:bg-card/60",
         draggingIds.includes(sub.id) && "opacity-40",
+        focused &&
+          "is-focused bg-primary/10 outline outline-1 -outline-offset-1 outline-primary/60",
       )}
     >
-      <td className="py-1.5 pl-2 w-8">
+      <td className="h-11 py-0 pl-6">
         {dropTargetId === sub.id && !draggingIds.includes(sub.id) && (
           <div
             className={cn(
               "pointer-events-none absolute inset-x-0 z-20 h-[3px] rounded-full bg-blue-500 shadow-[0_0_6px_rgba(59,130,246,0.6)]",
-              (dropMode === "reorder-before" ||
-                dropMode === "subtask-before") &&
+              (dropMode === "reorder-before" || dropMode === "subtask-before") &&
                 "-top-[2px]",
               (dropMode === "reorder-after" || dropMode === "subtask-after") &&
                 "-bottom-[2px]",
@@ -110,123 +151,252 @@ export function SubtaskRow({
           />
         )}
       </td>
-      <td className="py-1.5 pl-0">
-        <div className="flex items-center gap-0.5 pl-4">
-          <CornerDownRight className="size-3 text-muted-foreground shrink-0" />
-          <Checkbox
-            disabled={readOnly}
-            checked={sub.status === "closed"}
-            onCheckedChange={async (checked) => {
-              try {
-                pushUndo({
-                  type: "update",
-                  taskId: sub.id,
-                  previous: { status: sub.status },
-                });
-                await taskApi.updateTask(sub.id, {
-                  status: checked ? "closed" : "open",
-                });
-                await fetchData();
-              } catch (err) {
-                console.error("ステータス更新失敗:", err);
-              }
-            }}
-            onClick={(e) => e.stopPropagation()}
-            className={cn(
-              "size-3.5",
-              sub.status === "in_progress" && STATUS_DOT_COLORS.in_progress,
-            )}
-            title={STATUS_LABELS[sub.status]}
-          />
+      <td className="h-11 py-0 text-center">
+        <CornerDownRight className="mx-auto size-3 text-muted-foreground" />
+      </td>
+      <td className="h-11 py-0 text-center" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-center gap-1">
+          {readOnly || !onStatusChange ? (
+            <span
+              className={cn(
+                "size-4 shrink-0 rounded-full border-2",
+                STATUS_DOT_COLORS[status] || STATUS_DOT_COLORS.open,
+              )}
+              title={STATUS_LABELS[status]}
+            />
+          ) : (
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                className={cn(
+                  "size-4 shrink-0 rounded-full border-2 transition-colors hover:ring-2 hover:ring-primary/30",
+                  STATUS_DOT_COLORS[status] || STATUS_DOT_COLORS.open,
+                )}
+                title={STATUS_LABELS[status]}
+                aria-label={`${sub.title}のステータスを変更`}
+              />
+              <DropdownMenuContent align="start" className="min-w-36">
+                <TaskStatusMenuItems
+                  currentStatus={status}
+                  onSelect={(nextStatus, event) => {
+                    event.stopPropagation();
+                    void onStatusChange(sub, nextStatus);
+                  }}
+                />
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
         </div>
       </td>
-      <td className="py-1.5 pl-2" colSpan={projectTab === "all" ? 2 : 1}>
-        <span
-          className={cn(
-            "text-sm",
-            sub.status === "closed" && "line-through text-muted-foreground",
-          )}
-        >
-          {sub.title}
-        </span>
-      </td>
-      {/* サブタスク日程 — 開始日と期限を同じポップオーバーで編集 */}
-      <td
-        className="py-1.5 px-2 text-xs whitespace-nowrap"
-        colSpan={2}
-        onClick={(e) => e.stopPropagation()}
-      >
-        {readOnly ? (
-          <span className="text-muted-foreground">
-            {getTaskDisplayStartAt(sub) || getTaskDisplayEndAt(sub)
-              ? `${getTaskDisplayStartAt(sub) ?? "-"} / ${getTaskDisplayEndAt(sub) ?? "-"}`
-              : "-"}
+      <td className="h-11 overflow-hidden py-0 pl-0 pr-4">
+        <div className="flex min-w-0 items-center gap-2 pl-4">
+          <span
+            className={cn(
+              "truncate text-sm font-medium leading-5",
+              status === "closed" && "text-muted-foreground line-through",
+            )}
+            title={sub.title}
+          >
+            {sub.title}
           </span>
-        ) : (
-          <TaskRowDatePicker
-            taskId={sub.id}
-            startAt={toLocalDateTimeInputValue(getTaskDisplayStartAt(sub), {
-              allDay: getTaskDisplayAllDay(sub),
-            })}
-            endAt={toLocalDateTimeInputValue(getTaskDisplayEndAt(sub), {
-              allDay: getTaskDisplayAllDay(sub),
-            })}
-            onRangeChange={({ startAt, endAt }) =>
-              handleTaskDateChange(sub, {
-                start_at: startAt,
-                end_at: endAt,
-              })
-            }
-            onRecurrenceChange={(hasRecurrence) =>
-              applyTaskPatchLocally(sub.id, {
-                has_recurrence: hasRecurrence,
-              })
-            }
-            allDay={getTaskDisplayAllDay(sub)}
-            startPlaceholder="Start Date"
-            endPlaceholder="Due Date"
-            startButtonClassName={dateButtonColor(
-              getTaskDisplayStartAt(sub),
-              sub,
-              "start",
-            )}
-            endButtonClassName={dateButtonColor(
-              getTaskDisplayEndAt(sub),
-              sub,
-              "end",
-            )}
-          />
-        )}
+          {sub.has_recurrence && (
+            <span
+              className="text-[10px] text-muted-foreground"
+              aria-label="繰り返しタスク"
+              title="繰り返しタスク"
+            >
+              ↻
+            </span>
+          )}
+          {(sub.tags?.length ?? 0) > 0 && (
+            <span className="flex min-w-0 max-w-[38%] items-center gap-1 overflow-hidden">
+              {sub.tags.slice(0, 3).map((tag) => (
+                <span
+                  key={tag.id}
+                  className="max-w-24 truncate rounded px-1.5 py-0.5 text-[10px] font-medium text-white"
+                  style={{ backgroundColor: tag.color || "#6B7280" }}
+                >
+                  {tag.name}
+                </span>
+              ))}
+              {sub.tags.length > 3 && (
+                <span className="shrink-0 text-[10px] text-muted-foreground">
+                  +{sub.tags.length - 3}
+                </span>
+              )}
+            </span>
+          )}
+          {!readOnly && (
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              onClick={(event) => {
+                event.stopPropagation();
+                if (requestRecurringDelete?.(sub)) return;
+                pushUndo({
+                  type: "recreate",
+                  tasks: [sub],
+                });
+                void taskApi.deleteTask(sub.id).then(() => {
+                  removeTaskLocally(sub.id);
+                });
+              }}
+              className="ml-auto shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-red-500 group-hover:opacity-100"
+              aria-label="サブタスクを削除"
+            >
+              <Trash2 className="size-3" />
+            </Button>
+          )}
+        </div>
       </td>
-      {/* 記録時間（サブタスクでは空） */}
-      <td className="py-1.5 px-2"></td>
-      <td className="py-1.5 pr-2">
-        <Button
-          variant="ghost"
-          size="icon-xs"
-          onClick={(e) => {
-            e.stopPropagation();
-            if (readOnly) return;
-            if (requestRecurringDelete?.(sub)) return;
-            pushUndo({
-              type: "recreate",
-              tasks: [sub],
-            });
-            taskApi.deleteTask(sub.id).then(() => fetchData());
-          }}
-          className="shrink-0 text-muted-foreground hover:text-red-500"
-          disabled={readOnly}
+      {showProjectColumn && (
+        <td className="h-11 truncate px-2 py-0 text-[13px] leading-5 text-muted-foreground">
+          {sub.project_name || "-"}
+        </td>
+      )}
+      {showStartColumn && (
+        <td
+          className="h-11 whitespace-nowrap px-2 py-1 text-[13px] leading-5"
+          onClick={(e) => e.stopPropagation()}
         >
-          <Trash2 className="size-3" />
-        </Button>
-      </td>
+          {readOnly ? (
+            <span
+              className="block min-w-0 flex-1 whitespace-nowrap text-[13px] leading-5 text-muted-foreground"
+              title={
+                formatTaskDateLabel(getTaskDisplayStartAt(sub), {
+                  allDay: getTaskDisplayAllDay(sub),
+                }) || "-"
+              }
+            >
+              {formatTaskDateLabel(getTaskDisplayStartAt(sub), {
+                allDay: getTaskDisplayAllDay(sub),
+              }) || "-"}
+            </span>
+          ) : (
+            <div className="min-w-0 flex-1">
+              <TaskRowDatePicker
+                taskId={sub.id}
+                startAt={toLocalDateTimeInputValue(getTaskDisplayStartAt(sub), {
+                  allDay: getTaskDisplayAllDay(sub),
+                })}
+                endAt={toLocalDateTimeInputValue(getTaskDisplayEndAt(sub), {
+                  allDay: getTaskDisplayAllDay(sub),
+                })}
+                onRangeChange={({ startAt, endAt }) =>
+                  handleTaskDateChange(sub, {
+                    start_at: startAt,
+                    end_at: endAt,
+                  })
+                }
+                onRecurrenceChange={(hasRecurrence) =>
+                  applyTaskPatchLocally(sub.id, { has_recurrence: hasRecurrence })
+                }
+                allDay={getTaskDisplayAllDay(sub)}
+                startPlaceholder="Start Date"
+                endPlaceholder="Due Date"
+                startButtonClassName={cn(
+                  "ao-task-date-button h-8 w-full min-w-0 px-1.5 text-[13px] leading-5",
+                  dateButtonColor(getTaskDisplayStartAt(sub), sub, "start"),
+                )}
+                endButtonClassName={cn(
+                  "ao-task-date-button h-8 w-full min-w-0 px-1.5 text-[13px] leading-5",
+                  dateButtonColor(getTaskDisplayEndAt(sub), sub, "end"),
+                )}
+                showStartDate
+                showEndDate={false}
+              />
+            </div>
+          )}
+        </td>
+      )}
+      {showDueColumn && (
+        <td
+          className="h-11 whitespace-nowrap px-2 py-1 text-[13px] leading-5"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="flex min-w-0 items-center gap-1">
+            {sub.has_recurrence && !showStartColumn && (
+              <span
+                className="text-[10px] text-muted-foreground"
+                aria-label="繰り返しタスク"
+                title="繰り返しタスク"
+              >
+                ↻
+              </span>
+            )}
+            {readOnly ? (
+              <span
+                className="block min-w-0 flex-1 whitespace-nowrap text-[13px] leading-5 text-muted-foreground"
+                title={
+                  formatTaskDateLabel(getTaskDisplayEndAt(sub), {
+                    allDay: getTaskDisplayAllDay(sub),
+                  }) || "-"
+                }
+              >
+                {formatTaskDateLabel(getTaskDisplayEndAt(sub), {
+                  allDay: getTaskDisplayAllDay(sub),
+                }) || "-"}
+              </span>
+            ) : (
+              <div className="min-w-0 flex-1">
+                <TaskRowDatePicker
+                  taskId={sub.id}
+                  startAt={toLocalDateTimeInputValue(getTaskDisplayStartAt(sub), {
+                    allDay: getTaskDisplayAllDay(sub),
+                  })}
+                  endAt={toLocalDateTimeInputValue(getTaskDisplayEndAt(sub), {
+                    allDay: getTaskDisplayAllDay(sub),
+                  })}
+                  onRangeChange={({ startAt, endAt }) =>
+                    handleTaskDateChange(sub, {
+                      start_at: startAt,
+                      end_at: endAt,
+                    })
+                  }
+                  onRecurrenceChange={(hasRecurrence) =>
+                    applyTaskPatchLocally(sub.id, { has_recurrence: hasRecurrence })
+                  }
+                  allDay={getTaskDisplayAllDay(sub)}
+                  startPlaceholder="Start Date"
+                  endPlaceholder="Due Date"
+                  startButtonClassName={cn(
+                    "ao-task-date-button h-8 w-full min-w-0 px-1.5 text-[13px] leading-5",
+                    dateButtonColor(getTaskDisplayStartAt(sub), sub, "start"),
+                  )}
+                  endButtonClassName={cn(
+                    "ao-task-date-button h-8 w-full min-w-0 px-1.5 text-[13px] leading-5",
+                    dateButtonColor(getTaskDisplayEndAt(sub), sub, "end"),
+                  )}
+                  showStartDate={false}
+                  showEndDate
+                />
+              </div>
+            )}
+          </div>
+        </td>
+      )}
+      {showPriorityColumn && (
+        <td className="h-11 truncate px-2 py-0 text-[13px] leading-5 text-muted-foreground">
+          {sub.priority !== "none" ? sub.priority : "-"}
+        </td>
+      )}
+      {showAssigneeColumn && (
+        <td className="h-11 truncate px-2 py-0 text-[13px] leading-5 text-muted-foreground">
+          {sub.assignees?.length
+            ? sub.assignees
+                .map((assignee) => assignee.display_name || assignee.username || assignee.user_id)
+                .join(", ")
+            : "-"}
+        </td>
+      )}
+      {showTimeColumn && (
+        <td className="h-11 px-2 py-0 text-right font-mono text-[13px] leading-5 text-muted-foreground">
+          {(sub.total_time_seconds ?? 0) > 0 ? formatDuration(sub.total_time_seconds ?? 0) : "--:--:--"}
+        </td>
+      )}
     </tr>
   );
 }
 
-/**
- * サブタスク追加行 — 既にサブタスクがあり、かつグループに hover 中 or 入力中のみ表示。
- */
 export function SubtaskAddRow({
   task,
   colSpan,
@@ -309,13 +479,11 @@ export function QuickAddRow({
   projectTab,
   selectedProjectId,
   upsertTaskLocally,
-  fetchData,
 }: {
   colSpan: number;
   projectTab: string;
   selectedProjectId: string | null;
   upsertTaskLocally: (task: Task) => void;
-  fetchData: (options?: FetchDataOptions) => Promise<void>;
 }) {
   const [quickAddActive, setQuickAddActive] = useState(false);
   const [quickAddTitle, setQuickAddTitle] = useState("");
@@ -332,14 +500,12 @@ export function QuickAddRow({
       });
       upsertTaskLocally(created);
       setQuickAddTitle("");
-      void fetchData();
     } catch (err) {
       console.error("タスク作成失敗:", err);
     } finally {
       setQuickAddCreating(false);
     }
   }, [
-    fetchData,
     projectTab,
     quickAddTitle,
     selectedProjectId,

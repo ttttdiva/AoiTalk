@@ -2,14 +2,15 @@ import { NextRequest, NextResponse } from "next/server";
 import { and, desc, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "@/db";
 import {
-  conversationParticipants,
-  conversationSessions,
   projects,
   taskReferences,
   tasks,
 } from "@/db/schema";
 import { getSession } from "@/lib/auth";
-import { getProjectMembership } from "@/lib/server/task-route-utils";
+import {
+  canReadProjectId,
+} from "@/lib/server/task-route-utils";
+import { getLiveConversationSession } from "@/lib/server/conversation-route-utils";
 
 export async function GET(
   _request: NextRequest,
@@ -18,25 +19,7 @@ export async function GET(
   const user = await getSession();
   if (!user) return NextResponse.json({ detail: "認証が必要です" }, { status: 401 });
   const { id } = await params;
-  const [participant] = await db
-    .select({ sessionId: conversationParticipants.sessionId })
-    .from(conversationParticipants)
-    .where(and(
-      eq(conversationParticipants.sessionId, id),
-      eq(conversationParticipants.participantType, "user"),
-      eq(conversationParticipants.participantId, user.id),
-      eq(conversationParticipants.status, "joined"),
-    ))
-    .limit(1);
-  const [session] = await db
-    .select({ id: conversationSessions.id })
-    .from(conversationSessions)
-    .where(and(
-      eq(conversationSessions.id, id),
-      isNull(conversationSessions.deletedAt),
-      participant ? eq(conversationSessions.id, participant.sessionId) : eq(conversationSessions.userId, user.id),
-    ))
-    .limit(1);
+  const session = await getLiveConversationSession(id, user.id);
   if (!session) return NextResponse.json({ detail: "会話が見つかりません" }, { status: 404 });
 
   const refs = await db.select({ taskId: taskReferences.taskId })
@@ -54,7 +37,7 @@ export async function GET(
     .orderBy(desc(tasks.updatedAt));
   const readable = [];
   for (const row of rows) {
-    if (user.role !== "admin" && !(await getProjectMembership(user.id, row.task.projectId))) continue;
+    if (!(await canReadProjectId(user, row.task.projectId))) continue;
     readable.push({
       id: row.task.id,
       title: row.task.title,

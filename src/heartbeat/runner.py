@@ -11,6 +11,10 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
+from ..services.ephemeral_llm import (
+    generate_ephemeral_text_with_llm_client,
+    supports_ephemeral_text,
+)
 from .models import HeartbeatDefinition
 from .registry import get_heartbeat_registry
 
@@ -34,6 +38,7 @@ class HeartbeatRunner:
         self._running = False
         self._llm_client = None
         self._broadcast_fn: Optional[Callable[[Dict[str, Any]], Coroutine]] = None
+        self._admin_notify_fn: Optional[Callable[[Dict[str, Any]], Coroutine]] = None
         self._last_run: Dict[str, float] = {}
         self._last_results: Dict[str, Dict[str, Any]] = {}
         self._check_interval = 60  # メインループのチェック間隔（秒）
@@ -48,6 +53,10 @@ class HeartbeatRunner:
     def set_broadcast_fn(self, fn: Callable[[Dict[str, Any]], Coroutine]) -> None:
         """WebSocketブロードキャスト関数を設定"""
         self._broadcast_fn = fn
+
+    def set_admin_notify_fn(self, fn: Callable[[Dict[str, Any]], Coroutine]) -> None:
+        """管理者向け通知ブロードキャスト関数を設定"""
+        self._admin_notify_fn = fn
 
     async def start(self) -> None:
         """バックグラウンドタスクを開始"""
@@ -213,7 +222,7 @@ class HeartbeatRunner:
         return result
 
     async def _get_project_contexts(self) -> List[Tuple[str, Dict[str, Any]]]:
-        """DBから案件ファイラーを持つ全プロジェクトのコンテキストを取得"""
+        """システムスケジューラ実行時に、管理者権限契約で参照可能な Project のみ列挙する。"""
         try:
             from sqlalchemy import select
             from ..memory.database import get_database_manager
@@ -230,6 +239,8 @@ class HeartbeatRunner:
 
             contexts = []
             for p in projects:
+                if getattr(p, "deleted_at", None) is not None:
+                    continue
                 ctx = build_project_context(p)
                 if ctx and (ctx.get("project_storage_path") or ctx.get("workspace_root")):
                     contexts.append((getattr(p, "name", "unknown"), ctx))
@@ -256,6 +267,13 @@ class HeartbeatRunner:
             return result
 
         if not force and not await self._is_llm_ready_for_heartbeat():
+            return self._llm_unavailable_result(heartbeat)
+
+        if not supports_ephemeral_text(self._llm_client):
+            logger.warning(
+                "[HeartbeatRunner] 履歴非保存LLM APIがないためHeartbeatをスキップします: %s",
+                type(self._llm_client).__name__,
+            )
             return self._llm_unavailable_result(heartbeat)
 
         if not force and not self._is_in_active_hours(heartbeat):
@@ -288,7 +306,16 @@ class HeartbeatRunner:
                     prompt = HEARTBEAT_PROMPT_TEMPLATE.format(checklist=heartbeat.checklist)
                     full_prompt = f"{context_block}\n\n{prompt}"
 
-                    response = await self._llm_client.generate_response_async(full_prompt)
+                    response = await generate_ephemeral_text_with_llm_client(
+                        self._llm_client,
+                        full_prompt,
+                        timeout_seconds=None,
+                    )
+                    if response is None:
+                        logger.warning(
+                            "[HeartbeatRunner] 履歴非保存LLM呼び出しに失敗したためHeartbeatをスキップします"
+                        )
+                        return self._llm_unavailable_result(heartbeat)
                     is_ok = self._is_heartbeat_ok(response)
 
                     if not is_ok:
@@ -332,7 +359,16 @@ class HeartbeatRunner:
         prompt = HEARTBEAT_PROMPT_TEMPLATE.format(checklist=heartbeat.checklist)
 
         try:
-            response = await self._llm_client.generate_response_async(prompt)
+            response = await generate_ephemeral_text_with_llm_client(
+                self._llm_client,
+                prompt,
+                timeout_seconds=None,
+            )
+            if response is None:
+                logger.warning(
+                    "[HeartbeatRunner] 履歴非保存LLM呼び出しに失敗したためHeartbeatをスキップします"
+                )
+                return self._llm_unavailable_result(heartbeat)
             self._last_run[heartbeat.name] = now.timestamp()
 
             is_ok = self._is_heartbeat_ok(response)
@@ -485,7 +521,7 @@ class HeartbeatRunner:
     async def _action_webhook(
         self, config: Dict[str, Any], result: Dict[str, Any]
     ) -> Dict[str, Any]:
-        import httpx
+        from .safe_webhook import safe_webhook_request
 
         url = str(config.get("url") or "")
         if not url:
@@ -498,9 +534,13 @@ class HeartbeatRunner:
                 "status": result.get("status"),
                 "response": result.get("response"),
             }
-        async with httpx.AsyncClient(timeout=float(config.get("timeout_seconds") or 30)) as client:
-            response = await client.request(method, url, json=payload)
-            response.raise_for_status()
+        response = await safe_webhook_request(
+            method,
+            url,
+            json_payload=payload,
+            timeout_seconds=float(config.get("timeout_seconds") or 30),
+        )
+        response.raise_for_status()
         return {"status_code": response.status_code}
 
     async def _action_create_task(
@@ -565,8 +605,12 @@ class HeartbeatRunner:
         return start_str <= current_time < end_str
 
     async def _notify(self, heartbeat: HeartbeatDefinition, message: str, timestamp: datetime) -> None:
-        """WebSocketでアラートを通知"""
-        if not self._broadcast_fn:
+        """管理者接続のみへ WebSocket アラートを通知する。"""
+        notify_fn = self._admin_notify_fn
+        if not notify_fn:
+            logger.error(
+                "[HeartbeatRunner] admin notify callback is not configured; alert dropped"
+            )
             return
 
         payload = {
@@ -579,7 +623,7 @@ class HeartbeatRunner:
         }
 
         try:
-            await self._broadcast_fn(payload)
+            await notify_fn(payload)
         except Exception as e:
             logger.error(f"[HeartbeatRunner] 通知エラー: {e}")
 

@@ -13,6 +13,7 @@ import {
   Chip,
   Dialog,
   Divider,
+  Icon,
   IconButton,
   Menu,
   Portal,
@@ -30,25 +31,39 @@ import {
   timeEntriesRepo,
   conversationsRepo,
 } from "../../../repositories";
+import {
+  readAttachmentsSnapshot,
+  writeAttachmentsSnapshot,
+} from "../../../repositories/tasks";
 import { useAuth } from "../../../contexts/AuthContext";
 import { useNetworkStore } from "../../../stores/network";
 import { useProject } from "../../../contexts/ProjectContext";
 import { chatApi } from "../../../lib/chat-api";
 import { taskApi } from "../../../lib/task-api";
-import { getDefaultCharacterName } from "../../../lib/preferences";
+import { projectApi } from "../../../lib/project-api";
+import { createCurrentCharacterSession } from "../../../features/characters/current-character";
 import {
-  buildTaskAgentPrompt,
+  buildTaskAgentDispatchPayload,
   buildTaskAgentSessionTitle,
 } from "../../../lib/task-agent";
 import {
   isTaskDateOnlyInput,
   toTaskWallClockIso,
 } from "../../../lib/task-datetime";
+import { TaskDateField } from "../../../components/task-date-field";
+import {
+  getTaskStatusOption,
+  TASK_STATUS_OPTIONS,
+  TASK_STATUS_SHORTCUT_KEYS,
+} from "../../../features/tasks/task-list-state";
 import type {
   Tag,
   Task,
   TaskAttachment,
   TaskComment,
+  TaskAssigneeCandidate,
+  TaskRecurrence,
+  TaskReference,
   TimeEntry,
 } from "../../../types/api";
 import {
@@ -57,19 +72,9 @@ import {
   isTaskCompletionTransition,
   useTaskCompletionUndoStore,
 } from "../../../stores/task-completion-undo";
-
-const STATUS_OPTIONS = [
-  { value: "open", label: "未着手", color: "#89b4fa" },
-  { value: "in_progress", label: "進行中", color: "#f38ba8" },
-  { value: "closed", label: "完了", color: "#a6e3a1" },
-  { value: "cancelled", label: "キャンセル", color: "#a6adc8" },
-];
-
-const STATUS_SHORTCUT_KEYS: Record<string, string> = {
-  c: "closed",
-  s: "in_progress",
-  x: "open",
-};
+import { createAsyncSerialQueue } from "../../../lib/async-serial-queue";
+import { appsRepo } from "../../../repositories/apps";
+import type { AppSummary, TaskAppLink } from "../../../lib/apps-api";
 
 const REMINDER_PRESETS = [
   { value: 5, label: "5分前" },
@@ -141,6 +146,7 @@ function buildTaskSavedDraft(task: Task): Record<string, unknown> {
     notifications_enabled: task.notifications_enabled ?? true,
     reminder_offsets: task.reminder_offsets ?? [],
     tag_ids: (task.tags ?? []).map((tag) => tag.id),
+    assignee_ids: (task.assignees ?? []).map((assignee) => assignee.user_id),
   };
 }
 
@@ -159,6 +165,7 @@ export default function TaskDetailScreen() {
   const [statusMenuVisible, setStatusMenuVisible] = useState(false);
   const [projectMenuVisible, setProjectMenuVisible] = useState(false);
   const [tagMenuVisible, setTagMenuVisible] = useState(false);
+  const [assigneeMenuVisible, setAssigneeMenuVisible] = useState(false);
   const [timerElapsed, setTimerElapsed] = useState(0);
 
   const [title, setTitle] = useState("");
@@ -171,6 +178,10 @@ export default function TaskDetailScreen() {
   const [reminderOffsets, setReminderOffsets] = useState<number[]>([]);
   const [availableTags, setAvailableTags] = useState<Tag[]>([]);
   const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
+  const [availableMembers, setAvailableMembers] = useState<
+    TaskAssigneeCandidate[]
+  >([]);
+  const [selectedAssigneeIds, setSelectedAssigneeIds] = useState<string[]>([]);
   const [newTagDraft, setNewTagDraft] = useState("");
   const [tagBusy, setTagBusy] = useState(false);
   const [subtaskDraft, setSubtaskDraft] = useState("");
@@ -179,6 +190,17 @@ export default function TaskDetailScreen() {
   const [commentSaving, setCommentSaving] = useState(false);
   const [attachments, setAttachments] = useState<TaskAttachment[]>([]);
   const [attachmentSaving, setAttachmentSaving] = useState(false);
+  const [attachmentsStale, setAttachmentsStale] = useState(false);
+  const [attachmentsCachedAt, setAttachmentsCachedAt] = useState<string | null>(
+    null,
+  );
+  const [appLinks, setAppLinks] = useState<TaskAppLink[]>([]);
+  const [availableApps, setAvailableApps] = useState<AppSummary[]>([]);
+  const [appLinkDialogVisible, setAppLinkDialogVisible] = useState(false);
+  const [selectedAppLinkId, setSelectedAppLinkId] = useState<string | null>(
+    null,
+  );
+  const [appLinkBusy, setAppLinkBusy] = useState(false);
   const [titleError, setTitleError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [activeInfoTab, setActiveInfoTab] = useState<
@@ -187,11 +209,26 @@ export default function TaskDetailScreen() {
   const [showHistoryDialog, setShowHistoryDialog] = useState(false);
   const [launchingAgent, setLaunchingAgent] = useState(false);
   const [triagingAgent, setTriagingAgent] = useState(false);
+  const [recurrenceRule, setRecurrenceRule] = useState<TaskRecurrence | null>(
+    null,
+  );
+  const [references, setReferences] = useState<TaskReference[]>([]);
+  const [recurrenceDialogVisible, setRecurrenceDialogVisible] = useState(false);
+  const [referenceDialogVisible, setReferenceDialogVisible] = useState(false);
+  const [recurrenceFrequency, setRecurrenceFrequency] = useState<
+    "DAILY" | "WEEKLY" | "MONTHLY"
+  >("DAILY");
+  const [recurrenceInterval, setRecurrenceInterval] = useState("1");
+  const [referenceUrlDraft, setReferenceUrlDraft] = useState("");
+  const [referenceNameDraft, setReferenceNameDraft] = useState("");
+  const [advancedSaving, setAdvancedSaving] = useState(false);
   const completionRefreshToken = useTaskCompletionUndoStore(
     (state) => state.refreshToken,
   );
   const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const saveTaskDraftRef = useRef<(() => Promise<Task | null>) | null>(null);
+  const saveTaskQueueRef = useRef(createAsyncSerialQueue());
+  const saveTaskGenerationRef = useRef(0);
   const shouldFlushAutosaveRef = useRef(false);
   const isMountedRef = useRef(true);
   const userEditedDuringRefreshRef = useRef(false);
@@ -201,6 +238,7 @@ export default function TaskDetailScreen() {
     return () => {
       isMountedRef.current = false;
       loadTaskRequestRef.current += 1;
+      saveTaskGenerationRef.current += 1;
     };
   }, []);
 
@@ -215,6 +253,9 @@ export default function TaskDetailScreen() {
     setAllDay(Boolean(nextTask.all_day));
     setReminderOffsets(nextTask.reminder_offsets ?? []);
     setSelectedTagIds((nextTask.tags ?? []).map((tag) => tag.id));
+    setSelectedAssigneeIds(
+      (nextTask.assignees ?? []).map((assignee) => assignee.user_id),
+    );
     setNotificationsEnabled(nextTask.notifications_enabled ?? true);
     setTitleError(null);
     setSaveError(null);
@@ -251,23 +292,64 @@ export default function TaskDetailScreen() {
         .catch(() => {
           if (isCurrentRequest()) setActiveEntry(null);
         });
+      const applyCachedAttachments = () => {
+        if (!isCurrentRequest()) return;
+        const snapshot = readAttachmentsSnapshot(taskId);
+        if (snapshot) {
+          setAttachments(snapshot.attachments);
+          setAttachmentsStale(true);
+          setAttachmentsCachedAt(snapshot.cachedAt || null);
+        } else {
+          setAttachments([]);
+          setAttachmentsStale(false);
+          setAttachmentsCachedAt(null);
+        }
+      };
       const attachmentPromise =
         isAuthenticated && online
           ? taskApi
               .listAttachments(taskId)
               .then((nextAttachments) => {
-                if (isCurrentRequest()) setAttachments(nextAttachments);
+                // 成功時は最新一覧を表示し、スナップショットを更新する。
+                writeAttachmentsSnapshot(taskId, nextAttachments);
+                if (isCurrentRequest()) {
+                  setAttachments(nextAttachments);
+                  setAttachmentsStale(false);
+                  setAttachmentsCachedAt(null);
+                }
+              })
+              // 失敗時はスナップショットがあれば最終同期時点の内容を表示する。
+              .catch(applyCachedAttachments)
+          : // オフライン・未ログイン時はスナップショットを表示（閲覧のみ）。
+            Promise.resolve().then(applyCachedAttachments);
+      const recurrencePromise =
+        isAuthenticated && online
+          ? taskApi
+              .getTaskRecurrence(taskId)
+              .then((rule) => {
+                if (isCurrentRequest()) setRecurrenceRule(rule);
               })
               .catch(() => {
-                if (isCurrentRequest()) setAttachments([]);
+                if (isCurrentRequest()) setRecurrenceRule(null);
               })
-          : Promise.resolve().then(() => {
-              if (isCurrentRequest()) setAttachments([]);
-            });
+          : Promise.resolve();
+      const referencesPromise =
+        isAuthenticated && online
+          ? taskApi
+              .listTaskReferences(taskId)
+              .then((items) => {
+                if (isCurrentRequest()) setReferences(items);
+              })
+              .catch(() => {
+                if (isCurrentRequest()) setReferences([]);
+              })
+          : Promise.resolve();
       await Promise.allSettled([
         remoteTaskPromise,
         timerPromise,
         attachmentPromise,
+        recurrencePromise,
+        referencesPromise,
       ]);
     } finally {
       if (isCurrentRequest()) setLoading(false);
@@ -285,11 +367,48 @@ export default function TaskDetailScreen() {
   );
 
   useEffect(() => {
+    if (!taskId) {
+      setAppLinks([]);
+      setAvailableApps([]);
+      return;
+    }
+    let cancelled = false;
+    void appsRepo
+      .listTaskApps(taskId)
+      .then((links) => {
+        if (!cancelled) setAppLinks(links);
+      })
+      .catch(() => {
+        if (!cancelled) setAppLinks([]);
+      });
+    if (task?.project_id) {
+      void appsRepo
+        .list({ projectId: task.project_id })
+        .then((apps) => {
+          if (!cancelled) setAvailableApps(apps);
+        })
+        .catch(() => {
+          if (!cancelled) setAvailableApps([]);
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [online, task?.project_id, taskId]);
+
+  // task.tags はロード毎に新しい配列になり、ローカル→リモート差し替えで
+  // listTags が1表示で多重発火していた。タグidの安定キーへ依存を切り替える。
+  const taskTagSignature = useMemo(
+    () => (task?.tags ?? []).map((tag) => tag.id).join(","),
+    [task?.tags],
+  );
+  useEffect(() => {
     if (!task?.project_id) {
       setAvailableTags([]);
       return;
     }
     let cancelled = false;
+    const fallbackTags = task.tags ?? [];
     taskApi
       .listTags(task.project_id)
       .then((tags) => {
@@ -300,12 +419,31 @@ export default function TaskDetailScreen() {
         );
       })
       .catch(() => {
-        if (!cancelled) setAvailableTags(task.tags ?? []);
+        if (!cancelled) setAvailableTags(fallbackTags);
       });
     return () => {
       cancelled = true;
     };
-  }, [task?.project_id, task?.tags]);
+  }, [task?.project_id, taskTagSignature]);
+
+  useEffect(() => {
+    if (!task?.project_id) {
+      setAvailableMembers([]);
+      return;
+    }
+    let cancelled = false;
+    projectApi
+      .listAssigneeCandidates(task.project_id)
+      .then((members) => {
+        if (!cancelled) setAvailableMembers(members);
+      })
+      .catch(() => {
+        if (!cancelled) setAvailableMembers([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [task?.project_id]);
 
   useEffect(() => {
     if (!activeEntry?.started_at) {
@@ -333,6 +471,7 @@ export default function TaskDetailScreen() {
       notifications_enabled: notificationsEnabled,
       reminder_offsets: reminderOffsets,
       tag_ids: selectedTagIds,
+      assignee_ids: selectedAssigneeIds,
     };
   }, [
     allDay,
@@ -340,6 +479,7 @@ export default function TaskDetailScreen() {
     endAt,
     notificationsEnabled,
     reminderOffsets,
+    selectedAssigneeIds,
     selectedTagIds,
     startAt,
     status,
@@ -351,6 +491,8 @@ export default function TaskDetailScreen() {
     () => (draftPayload ? serializeTaskDraft(draftPayload) : ""),
     [draftPayload],
   );
+  const draftSignatureRef = useRef(draftSignature);
+  draftSignatureRef.current = draftSignature;
   const savedSignature = useMemo(
     () => (task ? serializeTaskDraft(buildTaskSavedDraft(task)) : ""),
     [task],
@@ -365,7 +507,7 @@ export default function TaskDetailScreen() {
     Boolean(title.trim()) && !DISALLOWED_PLACEHOLDER_TITLES.has(title.trim());
 
   const statusOption = useMemo(
-    () => STATUS_OPTIONS.find((item) => item.value === status),
+    () => getTaskStatusOption(status),
     [status],
   );
   useEffect(() => {
@@ -374,7 +516,7 @@ export default function TaskDetailScreen() {
       if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) {
         return;
       }
-      const nextStatus = STATUS_SHORTCUT_KEYS[event.key.toLowerCase()];
+      const nextStatus = TASK_STATUS_SHORTCUT_KEYS[event.key.toLowerCase()];
       if (!nextStatus) return;
       event.preventDefault();
       event.stopPropagation();
@@ -406,29 +548,61 @@ export default function TaskDetailScreen() {
         return task;
       }
 
+      const saveGeneration = saveTaskGenerationRef.current + 1;
+      saveTaskGenerationRef.current = saveGeneration;
       if (isMountedRef.current) {
         setAutosaving(true);
         setSaveError(null);
       }
       try {
         const previousTask = task;
-        const updated = await tasksRepo.update(taskId, draftPayload);
-        if (isMountedRef.current) {
-          setTask(updated);
+        const updated = await saveTaskQueueRef.current.enqueue(() =>
+          tasksRepo.update(taskId, draftPayload),
+        );
+        const isLatestSave =
+          isMountedRef.current &&
+          saveTaskGenerationRef.current === saveGeneration;
+        const selectedAssignees = availableMembers
+          .filter((member) => selectedAssigneeIds.includes(member.user_id))
+          .map((member, index) => ({
+            id: `draft-${member.user_id}`,
+            task_id: taskId,
+            user_id: member.user_id,
+            is_primary: index === 0,
+            display_name: member.display_name,
+            username: member.username,
+          }));
+        const displayedTask = {
+          ...updated,
+          assignees:
+            selectedAssigneeIds.length > 0 && updated.assignees.length === 0
+              ? selectedAssignees
+              : updated.assignees,
+        };
+        if (isLatestSave) {
+          setTask(displayedTask);
           setTitleError(null);
+          if (draftSignatureRef.current === draftSignature) {
+            shouldFlushAutosaveRef.current = false;
+          }
         }
-        shouldFlushAutosaveRef.current = false;
-        if (isTaskCompletionTransition(previousTask.status, status)) {
+        if (
+          isLatestSave &&
+          isTaskCompletionTransition(previousTask.status, status)
+        ) {
           enqueueTaskCompletionUndoBatch({
             entries: [createTaskCompletionUndoEntry(previousTask)],
           });
         }
-        if (options?.navigateAfter) {
+        if (isLatestSave && options?.navigateAfter) {
           goBackOrReplace(router, "/(tabs)/tasks");
         }
-        return updated;
+        return displayedTask;
       } catch (error) {
-        if (isMountedRef.current) {
+        if (
+          isMountedRef.current &&
+          saveTaskGenerationRef.current === saveGeneration
+        ) {
           if (showErrors) {
             setSaveError(
               error instanceof Error ? error.message : "保存に失敗しました",
@@ -441,7 +615,10 @@ export default function TaskDetailScreen() {
         }
         return null;
       } finally {
-        if (isMountedRef.current) {
+        if (
+          isMountedRef.current &&
+          saveTaskGenerationRef.current === saveGeneration
+        ) {
           setAutosaving(false);
         }
       }
@@ -449,9 +626,10 @@ export default function TaskDetailScreen() {
     [
       draftPayload,
       draftSignature,
-
+      availableMembers,
       router,
       savedSignature,
+      selectedAssigneeIds,
       status,
       task,
       taskId,
@@ -560,6 +738,86 @@ export default function TaskDetailScreen() {
     }
   }, [availableTags, newTagDraft, tagBusy, task?.project_id, toggleTag]);
 
+  const saveRecurrence = useCallback(async () => {
+    if (!taskId || advancedSaving) return;
+    setAdvancedSaving(true);
+    try {
+      const interval = Math.max(1, Number.parseInt(recurrenceInterval, 10) || 1);
+      const next = await taskApi.upsertTaskRecurrence(taskId, {
+        rrule: `FREQ=${recurrenceFrequency};INTERVAL=${interval}`,
+        timezone: "Asia/Tokyo",
+      });
+      setRecurrenceRule(next);
+      setRecurrenceDialogVisible(false);
+      setTask((current) =>
+        current ? { ...current, has_recurrence: true, recurrence_rule: next } : current,
+      );
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : "繰り返し設定に失敗しました");
+    } finally {
+      setAdvancedSaving(false);
+    }
+  }, [advancedSaving, recurrenceFrequency, recurrenceInterval, taskId]);
+
+  const clearRecurrence = useCallback(async () => {
+    if (!taskId || advancedSaving) return;
+    setAdvancedSaving(true);
+    try {
+      await taskApi.deleteTaskRecurrence(taskId);
+      setRecurrenceRule(null);
+      setTask((current) =>
+        current ? { ...current, has_recurrence: false, recurrence_rule: null } : current,
+      );
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : "繰り返し解除に失敗しました");
+    } finally {
+      setAdvancedSaving(false);
+    }
+  }, [advancedSaving, taskId]);
+
+  const addTaskReference = useCallback(async () => {
+    if (!taskId || advancedSaving || !referenceUrlDraft.trim()) return;
+    setAdvancedSaving(true);
+    try {
+      const created = await taskApi.createTaskReference(taskId, {
+        reference_type: "url",
+        relation_type: "related",
+        target_url: referenceUrlDraft.trim(),
+        display_name: referenceNameDraft.trim() || referenceUrlDraft.trim(),
+      });
+      setReferences((current) => [...current, created]);
+      setReferenceUrlDraft("");
+      setReferenceNameDraft("");
+      setReferenceDialogVisible(false);
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : "参照先の追加に失敗しました");
+    } finally {
+      setAdvancedSaving(false);
+    }
+  }, [advancedSaving, referenceNameDraft, referenceUrlDraft, taskId]);
+
+  const removeTaskReference = useCallback(
+    (reference: TaskReference) => {
+      if (!taskId || advancedSaving) return;
+      Alert.alert("参照先を削除しますか？", reference.display_name || "この参照先", [
+        { text: "キャンセル", style: "cancel" },
+        {
+          text: "削除",
+          style: "destructive",
+          onPress: () => {
+            void taskApi
+              .deleteTaskReference(taskId, reference.id, { confirmSource: true })
+              .then(() => setReferences((current) => current.filter((item) => item.id !== reference.id)))
+              .catch((error) =>
+                setSaveError(error instanceof Error ? error.message : "参照先の削除に失敗しました"),
+              );
+          },
+        },
+      ]);
+    },
+    [advancedSaving, taskId],
+  );
+
   const handleMoveProject = useCallback(
     async (projectId: string) => {
       if (!taskId || !task || task.project_id === projectId) return;
@@ -570,6 +828,7 @@ export default function TaskDetailScreen() {
         });
         setTask(updated);
         setSelectedTagIds([]);
+        setSelectedAssigneeIds([]);
         await loadTask();
       } catch (error) {
         setSaveError(
@@ -592,7 +851,6 @@ export default function TaskDetailScreen() {
         parent_task_id: task.id,
         title: titleValue,
         status: "open",
-        priority: "normal",
         notifications_enabled: task.notifications_enabled,
       });
       setSubtaskDraft("");
@@ -646,7 +904,13 @@ export default function TaskDetailScreen() {
           }),
         );
       }
-      setAttachments((prev) => [...uploaded, ...prev]);
+      setAttachments((prev) => {
+        const next = [...uploaded, ...prev];
+        writeAttachmentsSnapshot(taskId, next);
+        return next;
+      });
+      setAttachmentsStale(false);
+      setAttachmentsCachedAt(null);
     } catch (error) {
       setSaveError(
         error instanceof Error
@@ -673,6 +937,61 @@ export default function TaskDetailScreen() {
       }
     },
     [taskId],
+  );
+
+  const openAppLinkDialog = useCallback(() => {
+    if (!online) {
+      setSaveError("オフラインでは Task と App の関係を変更できません");
+      return;
+    }
+    setSelectedAppLinkId(null);
+    setAppLinkDialogVisible(true);
+  }, [online]);
+
+  const handleLinkApp = useCallback(async () => {
+    if (!taskId || !selectedAppLinkId || !online) return;
+    const selected = availableApps.find((app) => app.id === selectedAppLinkId);
+    setAppLinkBusy(true);
+    try {
+      const link = await appsRepo.linkTaskApp(
+        taskId,
+        { app_id: selectedAppLinkId, relation_type: "related" },
+        selected?.permission,
+      );
+      setAppLinks((previous) => [
+        ...previous.filter(
+          (item) =>
+            !(
+              item.app_id === link.app_id &&
+              item.target_id === link.target_id &&
+              item.relation_type === link.relation_type
+            ),
+        ),
+        link,
+      ]);
+      setAppLinkDialogVisible(false);
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : "App連携に失敗しました");
+    } finally {
+      setAppLinkBusy(false);
+    }
+  }, [availableApps, online, selectedAppLinkId, taskId]);
+
+  const handleUnlinkApp = useCallback(
+    async (link: TaskAppLink) => {
+      if (!taskId || !online) return;
+      try {
+        await appsRepo.unlinkTaskApp(taskId, link.app_id, {
+          targetId: link.target_id,
+          relationType: link.relation_type,
+          permission: link.app?.permission,
+        });
+        setAppLinks((previous) => previous.filter((item) => item.id !== link.id));
+      } catch (error) {
+        setSaveError(error instanceof Error ? error.message : "App連携の解除に失敗しました");
+      }
+    },
+    [online, taskId],
   );
 
   const handleRunWithAgent = useCallback(async () => {
@@ -707,6 +1026,22 @@ export default function TaskDetailScreen() {
       notifications_enabled: notificationsEnabled,
       reminder_offsets: reminderOffsets,
       tags: availableTags.filter((tag) => selectedTagIds.includes(tag.id)),
+      assignees: selectedAssigneeIds.map((userId, index) => {
+        const member = availableMembers.find(
+          (candidate) => candidate.user_id === userId,
+        );
+        const existing = task.assignees.find(
+          (candidate) => candidate.user_id === userId,
+        );
+        return {
+          id: existing?.id ?? `draft-${userId}`,
+          task_id: task.id,
+          user_id: userId,
+          is_primary: index === 0,
+          display_name: member?.display_name ?? existing?.display_name,
+          username: member?.username ?? existing?.username,
+        };
+      }),
     };
 
     setLaunchingAgent(true);
@@ -734,21 +1069,17 @@ export default function TaskDetailScreen() {
         }
       }
 
-      const characterName = await getDefaultCharacterName();
-      const session = await conversationsRepo.createSession(
-        characterName,
+      const session = await createCurrentCharacterSession(
         launchTask.project_id || undefined,
       );
       await conversationsRepo.updateTitle(
         session.id,
         buildTaskAgentSessionTitle(normalizedTitle),
       );
-      await chatApi.dispatchMessage(session.id, {
-        message: buildTaskAgentPrompt(launchTask),
-        project_id: launchTask.project_id || undefined,
-        agent_mode: "confirm",
-        include_project_context: true,
-      });
+      await chatApi.dispatchMessage(
+        session.id,
+        buildTaskAgentDispatchPayload(launchTask),
+      );
       router.push(`/(tabs)/chat/${session.id}`);
     } catch (error) {
       Alert.alert(
@@ -761,12 +1092,18 @@ export default function TaskDetailScreen() {
       setLaunchingAgent(false);
     }
   }, [
+    allDay,
+    availableMembers,
+    availableTags,
     description,
     endAt,
     isAuthenticated,
     notificationsEnabled,
     online,
+    reminderOffsets,
     router,
+    selectedAssigneeIds,
+    selectedTagIds,
     startAt,
     status,
     task,
@@ -819,12 +1156,16 @@ export default function TaskDetailScreen() {
       selectedTagIds.includes(tag.id) &&
       all.findIndex((candidate) => candidate.id === tag.id) === index,
   );
-  const assigneeLabel = task?.assignees?.length
-    ? task.assignees
-        .map((item) => item.display_name || item.username || "")
+  const selectedAssignees = availableMembers.filter((member) =>
+    selectedAssigneeIds.includes(member.user_id),
+  );
+  const assigneeLabel =
+    selectedAssignees.length || task?.assignees?.length
+      ? (selectedAssignees.length ? selectedAssignees : task?.assignees ?? [])
+        .map((item) => item.display_name || item.username || item.user_id)
         .filter(Boolean)
         .join(", ")
-    : "未設定";
+      : "未設定";
   const completedSubtasks = (task?.subtasks ?? []).filter(
     (item) => item.status === "closed",
   ).length;
@@ -871,13 +1212,6 @@ export default function TaskDetailScreen() {
       keyboardShouldPersistTaps="handled"
     >
       <View style={styles.redesignTitleRow}>
-        <IconButton
-          icon={status === "closed" ? "check-circle" : "circle-outline"}
-          iconColor={status === "closed" ? "#a6e3a1" : "#89b4fa"}
-          size={32}
-          onPress={() => setStatus(status === "closed" ? "open" : "closed")}
-          style={styles.redesignCompleteButton}
-        />
         <TextInput
           value={title}
           onChangeText={(value) => {
@@ -962,6 +1296,18 @@ export default function TaskDetailScreen() {
             />
           ))}
         </Menu>
+        <IconButton
+          icon="check-circle"
+          iconColor={status === "closed" ? "#f5f5f7" : "#a6adc8"}
+          containerColor={status === "closed" ? "#40a85a" : "#181825"}
+          size={19}
+          mode="contained"
+          onPress={() => setStatus(status === "closed" ? "open" : "closed")}
+          style={styles.redesignCompleteButton}
+          accessibilityLabel={
+            status === "closed" ? "未着手に戻す" : "完了にする"
+          }
+        />
         <Menu
           visible={statusMenuVisible}
           onDismiss={() => setStatusMenuVisible(false)}
@@ -980,7 +1326,7 @@ export default function TaskDetailScreen() {
           }
           contentStyle={styles.menuContent}
         >
-          {STATUS_OPTIONS.map((item) => (
+          {TASK_STATUS_OPTIONS.map((item) => (
             <Menu.Item
               key={item.value}
               title={item.label}
@@ -992,35 +1338,72 @@ export default function TaskDetailScreen() {
             />
           ))}
         </Menu>
-        <Chip
-          compact
-          icon="account-outline"
-          style={styles.redesignAttributeChip}
+        <Menu
+          visible={assigneeMenuVisible}
+          onDismiss={() => setAssigneeMenuVisible(false)}
+          anchor={
+            <Chip
+              compact
+              icon="account-outline"
+              onPress={() => setAssigneeMenuVisible(true)}
+              style={styles.redesignAttributeChip}
+              textStyle={styles.redesignAssigneeText}
+              accessibilityLabel={`担当者: ${assigneeLabel}`}
+            >
+              {assigneeLabel}
+            </Chip>
+          }
+          contentStyle={styles.menuContent}
         >
-          {assigneeLabel}
-        </Chip>
+          <Menu.Item
+            title="未設定"
+            leadingIcon={
+              selectedAssigneeIds.length === 0 ? "check-circle" : "circle-outline"
+            }
+            onPress={() => {
+              setSelectedAssigneeIds([]);
+              setAssigneeMenuVisible(false);
+            }}
+          />
+          {availableMembers.map((member) => {
+            const selected = selectedAssigneeIds.includes(member.user_id);
+            return (
+              <Menu.Item
+                key={member.user_id}
+                title={
+                  member.display_name || member.username || member.user_id
+                }
+                leadingIcon={selected ? "check-circle" : "circle-outline"}
+                onPress={() =>
+                  setSelectedAssigneeIds((previous) =>
+                    selected
+                      ? previous.filter((id) => id !== member.user_id)
+                      : [...previous, member.user_id],
+                  )
+                }
+              />
+            );
+          })}
+          {availableMembers.length === 0 ? (
+            <Menu.Item title="担当者候補を取得できません" disabled />
+          ) : null}
+        </Menu>
       </View>
 
       <View style={styles.redesignDateRow}>
-        <TextInput
+        <TaskDateField
           label="Start Date"
           value={startAt}
-          onChangeText={setStartAt}
-          mode="outlined"
-          dense
+          onChange={setStartAt}
+          allDay={allDay}
           style={styles.redesignDateInput}
-          placeholder="yyyy-MM-ddTHH:mm"
-          right={startAt ? <TextInput.Icon icon="close" onPress={() => setStartAt("")} /> : undefined}
         />
-        <TextInput
+        <TaskDateField
           label="Due Date"
           value={endAt}
-          onChangeText={setEndAt}
-          mode="outlined"
-          dense
+          onChange={setEndAt}
+          allDay={allDay}
           style={styles.redesignDateInput}
-          placeholder="yyyy-MM-ddTHH:mm"
-          right={endAt ? <TextInput.Icon icon="close" onPress={() => setEndAt("")} /> : undefined}
         />
       </View>
 
@@ -1071,8 +1454,94 @@ export default function TaskDetailScreen() {
               />
             ))
           )}
+          <Divider />
+          <View style={styles.compactTagCreateRow}>
+            <TextInput
+              value={newTagDraft}
+              onChangeText={setNewTagDraft}
+              mode="outlined"
+              dense
+              placeholder="新規タグ"
+              style={styles.compactTagCreateInput}
+            />
+            <IconButton
+              icon="plus"
+              iconColor="#89b4fa"
+              size={20}
+              onPress={() => void handleCreateTag()}
+              disabled={!newTagDraft.trim() || tagBusy}
+              loading={tagBusy}
+              accessibilityLabel="タグを追加"
+            />
+          </View>
         </Menu>
       </View>
+
+      <Surface style={styles.redesignSectionCard} elevation={0}>
+        <View style={styles.sectionHeaderRow}>
+          <Text style={styles.redesignSectionTitle}>繰り返し・参照</Text>
+          <View style={styles.advancedActions}>
+            <Button
+              mode="text"
+              compact
+              icon="calendar-sync"
+              onPress={() => setRecurrenceDialogVisible(true)}
+              disabled={!online}
+            >
+              {recurrenceRule ? "変更" : "設定"}
+            </Button>
+            <Button
+              mode="text"
+              compact
+              icon="link-plus"
+              onPress={() => setReferenceDialogVisible(true)}
+              disabled={!online}
+            >
+              参照
+            </Button>
+          </View>
+        </View>
+        <Text style={styles.advancedMeta}>
+          {recurrenceRule
+            ? `${recurrenceRule.rrule}${recurrenceRule.timezone ? ` (${recurrenceRule.timezone})` : ""}`
+            : "繰り返しなし"}
+        </Text>
+        {recurrenceRule ? (
+          <Button
+            mode="text"
+            compact
+            textColor="#f38ba8"
+            icon="calendar-remove"
+            onPress={() => void clearRecurrence()}
+            disabled={!online || advancedSaving}
+          >
+            繰り返しを解除
+          </Button>
+        ) : null}
+        {references.length === 0 ? (
+          <Text style={styles.redesignEmptyText}>関連付けられた参照先はありません</Text>
+        ) : (
+          references.map((reference) => (
+            <View key={reference.id} style={styles.referenceRow}>
+              <Icon source="link-variant" size={18} color="#89b4fa" />
+              <View style={styles.referenceCopy}>
+                <Text style={styles.referenceTitle} numberOfLines={1}>
+                  {reference.display_name || reference.target_url || reference.id}
+                </Text>
+                <Text style={styles.referenceMeta}>{reference.reference_type}</Text>
+              </View>
+              <IconButton
+                icon="link-off"
+                iconColor="#f38ba8"
+                size={18}
+                onPress={() => removeTaskReference(reference)}
+                disabled={!online || advancedSaving}
+                accessibilityLabel="タスク参照を削除"
+              />
+            </View>
+          ))
+        )}
+      </Surface>
 
       <Surface style={styles.redesignSectionCard} elevation={0}>
         <Text style={styles.redesignSectionTitle}>説明</Text>
@@ -1147,6 +1616,76 @@ export default function TaskDetailScreen() {
         </View>
       </Surface>
 
+      <Surface style={styles.redesignSectionCard} elevation={0}>
+        <View style={styles.sectionHeaderRow}>
+          <Text style={styles.redesignSectionTitle}>関連 Apps</Text>
+          <Button
+            mode="text"
+            compact
+            icon="link-plus"
+            onPress={openAppLinkDialog}
+            disabled={!online || availableApps.length === 0}
+          >
+            追加
+          </Button>
+        </View>
+        {appLinks.length === 0 ? (
+          <Text style={styles.redesignEmptyText}>
+            関連付けられた App はありません
+          </Text>
+        ) : (
+          appLinks.map((link) => (
+            <View key={link.id} style={styles.appLinkRow}>
+              <Icon source="application-brackets-outline" size={20} color="#89b4fa" />
+              <View style={styles.appLinkCopy}>
+                <Text style={styles.appLinkTitle} numberOfLines={1}>
+                  {link.app?.name || link.app_id}
+                </Text>
+                <Text style={styles.appLinkMeta}>{link.relation_type}</Text>
+              </View>
+              <IconButton
+                icon="link-off"
+                iconColor="#f38ba8"
+                size={18}
+                onPress={() => void handleUnlinkApp(link)}
+                disabled={!online}
+                accessibilityLabel="App連携を解除"
+              />
+            </View>
+          ))
+        )}
+        {!online ? <Text style={styles.attachmentStaleNote}>オフラインでは連携を変更できません</Text> : null}
+      </Surface>
+
+      <Portal>
+        <Dialog
+          visible={appLinkDialogVisible}
+          onDismiss={() => !appLinkBusy && setAppLinkDialogVisible(false)}
+        >
+          <Dialog.Title>TaskにAppを追加</Dialog.Title>
+          <Dialog.Content>
+            {availableApps.length === 0 ? (
+              <Text style={styles.redesignEmptyText}>このProjectで利用できる App がありません</Text>
+            ) : (
+              availableApps.map((app) => (
+                <Chip
+                  key={app.id}
+                  selected={selectedAppLinkId === app.id}
+                  onPress={() => setSelectedAppLinkId(app.id)}
+                  style={styles.appLinkChoice}
+                >
+                  {app.name} ({app.permission || "viewer"})
+                </Chip>
+              ))
+            )}
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button onPress={() => setAppLinkDialogVisible(false)} disabled={appLinkBusy}>キャンセル</Button>
+            <Button onPress={() => void handleLinkApp()} loading={appLinkBusy} disabled={!selectedAppLinkId || appLinkBusy}>追加</Button>
+          </Dialog.Actions>
+        </Dialog>
+      </Portal>
+
       <View style={styles.redesignTabRow}>
         <Chip
           compact
@@ -1220,6 +1759,14 @@ export default function TaskDetailScreen() {
                 追加
               </Button>
             </View>
+            {attachmentsStale ? (
+              <Text style={styles.attachmentStaleNote}>
+                オフライン表示: 最終同期時点の内容です
+                {attachmentsCachedAt
+                  ? `（${format(new Date(attachmentsCachedAt), "MM/dd HH:mm")}時点）`
+                  : ""}
+              </Text>
+            ) : null}
             {attachments.length === 0 ? (
               <Text style={styles.redesignEmptyText}>
                 添付ファイルはまだありません
@@ -1251,50 +1798,10 @@ export default function TaskDetailScreen() {
 
       <Surface style={styles.redesignDetailsCard} elevation={0}>
         <View style={styles.redesignDetailsContent}>
-            <Text style={styles.redesignSectionTitle}>タグ・通知</Text>
+            <Text style={styles.redesignSectionTitle}>通知</Text>
             <View style={styles.redesignSettingRow}>
               <Text style={styles.redesignSettingLabel}>終日</Text>
               <Switch value={allDay} onValueChange={setAllDay} />
-            </View>
-            <Divider style={styles.redesignDetailsDivider} />
-            <Text style={styles.redesignSettingHeading}>タグ</Text>
-            <View style={styles.tagRow}>
-              {availableTags.map((tag) => (
-                <Chip
-                  key={tag.id}
-                  compact
-                  selected={selectedTagIds.includes(tag.id)}
-                  onPress={() => toggleTag(tag.id)}
-                  style={[
-                    styles.tagChip,
-                    selectedTagIds.includes(tag.id)
-                      ? { backgroundColor: tag.color || "#45475a" }
-                      : { borderColor: tag.color || "#45475a" },
-                  ]}
-                  textStyle={styles.tagText}
-                >
-                  {tag.name}
-                </Chip>
-              ))}
-            </View>
-            <View style={styles.inlineFormRow}>
-              <TextInput
-                value={newTagDraft}
-                onChangeText={setNewTagDraft}
-                mode="outlined"
-                dense
-                placeholder="新規タグ"
-                style={styles.inlineFormInput}
-              />
-              <Button
-                mode="outlined"
-                compact
-                onPress={() => void handleCreateTag()}
-                disabled={!newTagDraft.trim() || tagBusy}
-                loading={tagBusy}
-              >
-                追加
-              </Button>
             </View>
             <Divider style={styles.redesignDetailsDivider} />
             <View style={styles.redesignSettingRow}>
@@ -1407,6 +1914,80 @@ export default function TaskDetailScreen() {
           </Dialog.Content>
           <Dialog.Actions>
             <Button onPress={() => setShowHistoryDialog(false)}>閉じる</Button>
+          </Dialog.Actions>
+        </Dialog>
+        <Dialog
+          visible={recurrenceDialogVisible}
+          onDismiss={() => !advancedSaving && setRecurrenceDialogVisible(false)}
+          style={styles.dialog}
+        >
+          <Dialog.Title style={styles.dialogTitle}>繰り返しを設定</Dialog.Title>
+          <Dialog.Content>
+            <Text style={styles.dialogText}>このタスクの予定を自動生成します。</Text>
+            <View style={styles.dialogChipRow}>
+              {(["DAILY", "WEEKLY", "MONTHLY"] as const).map((value) => (
+                <Chip
+                  key={value}
+                  selected={recurrenceFrequency === value}
+                  onPress={() => setRecurrenceFrequency(value)}
+                >
+                  {value === "DAILY" ? "毎日" : value === "WEEKLY" ? "毎週" : "毎月"}
+                </Chip>
+              ))}
+            </View>
+            <TextInput
+              label="間隔（回）"
+              value={recurrenceInterval}
+              onChangeText={(value) => setRecurrenceInterval(value.replace(/[^0-9]/g, ""))}
+              keyboardType="number-pad"
+              mode="outlined"
+              style={styles.dialogInput}
+            />
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button onPress={() => setRecurrenceDialogVisible(false)} disabled={advancedSaving}>
+              キャンセル
+            </Button>
+            <Button onPress={() => void saveRecurrence()} loading={advancedSaving}>
+              保存
+            </Button>
+          </Dialog.Actions>
+        </Dialog>
+        <Dialog
+          visible={referenceDialogVisible}
+          onDismiss={() => !advancedSaving && setReferenceDialogVisible(false)}
+          style={styles.dialog}
+        >
+          <Dialog.Title style={styles.dialogTitle}>参照先を追加</Dialog.Title>
+          <Dialog.Content>
+            <TextInput
+              label="URL"
+              value={referenceUrlDraft}
+              onChangeText={setReferenceUrlDraft}
+              mode="outlined"
+              autoCapitalize="none"
+              keyboardType="url"
+              style={styles.dialogInput}
+            />
+            <TextInput
+              label="表示名（任意）"
+              value={referenceNameDraft}
+              onChangeText={setReferenceNameDraft}
+              mode="outlined"
+              style={styles.dialogInput}
+            />
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button onPress={() => setReferenceDialogVisible(false)} disabled={advancedSaving}>
+              キャンセル
+            </Button>
+            <Button
+              onPress={() => void addTaskReference()}
+              loading={advancedSaving}
+              disabled={!referenceUrlDraft.trim() || advancedSaving}
+            >
+              追加
+            </Button>
           </Dialog.Actions>
         </Dialog>
         <Snackbar
@@ -1528,6 +2109,20 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     marginBottom: 8,
   },
+  advancedActions: { flexDirection: "row", alignItems: "center" },
+  advancedMeta: { color: "#a6adc8", fontSize: 12, marginBottom: 6 },
+  referenceRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: "#313244",
+    paddingVertical: 5,
+  },
+  referenceCopy: { flex: 1, marginLeft: 8 },
+  referenceTitle: { color: "#cdd6f4", fontSize: 13 },
+  referenceMeta: { color: "#9399b2", fontSize: 11, marginTop: 2 },
+  dialogChipRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginVertical: 10 },
+  dialogInput: { marginBottom: 10, backgroundColor: "#181825" },
   inlineFormRow: {
     flexDirection: "row",
     gap: 8,
@@ -1548,6 +2143,18 @@ const styles = StyleSheet.create({
   attachmentInfo: { flex: 1, minWidth: 0 },
   attachmentName: { color: "#cdd6f4", fontSize: 14, fontWeight: "600" },
   attachmentMeta: { color: "#9399b2", fontSize: 11, marginTop: 4 },
+  attachmentStaleNote: { color: "#9399b2", fontSize: 11, marginBottom: 8 },
+  appLinkRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: "#313244",
+    paddingVertical: 6,
+  },
+  appLinkCopy: { flex: 1, marginLeft: 8 },
+  appLinkTitle: { color: "#cdd6f4", fontSize: 14, fontWeight: "600" },
+  appLinkMeta: { color: "#9399b2", fontSize: 11, marginTop: 2 },
+  appLinkChoice: { marginBottom: 8 },
   commentCard: {
     backgroundColor: "#1e1e2e",
     borderRadius: 10,
@@ -1607,7 +2214,13 @@ const styles = StyleSheet.create({
     alignItems: "center",
     marginBottom: 6,
   },
-  redesignCompleteButton: { margin: 0, marginRight: 2 },
+  redesignCompleteButton: {
+    width: 32,
+    height: 32,
+    margin: 0,
+    borderWidth: 1,
+    borderColor: "#313244",
+  },
   redesignTitleInput: {
     flex: 1,
     backgroundColor: "transparent",
@@ -1640,6 +2253,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#313244",
   },
+  redesignAssigneeText: { maxWidth: 132 },
   redesignImportantTags: {
     flexDirection: "row",
     flexWrap: "wrap",
@@ -1655,6 +2269,18 @@ const styles = StyleSheet.create({
     borderColor: "#585b70",
   },
   redesignAddTagText: { color: "#a6adc8", fontSize: 12 },
+  compactTagCreateRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    minWidth: 240,
+  },
+  compactTagCreateInput: {
+    flex: 1,
+    height: 40,
+    backgroundColor: "#181825",
+  },
   redesignSectionCard: {
     backgroundColor: "#1e1e2e",
     borderRadius: 14,

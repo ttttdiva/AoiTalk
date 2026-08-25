@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Alert,
   Animated,
   FlatList,
   PanResponder,
@@ -25,9 +26,18 @@ import {
 import { format } from "date-fns";
 import { useAuth } from "../contexts/AuthContext";
 import { useProject } from "../contexts/ProjectContext";
-import { conversationsRepo } from "../repositories/conversations";
+import {
+  conversationsRepo,
+  subscribeToConversationChanges,
+} from "../repositories/conversations";
 import { tasksRepo } from "../repositories/tasks";
-import { getDefaultCharacterName } from "../lib/preferences";
+import { scheduleSyncAfterInteractions } from "../lib/background-sync";
+import { createCurrentCharacterSession } from "../features/characters/current-character";
+import {
+  animateNextListChange,
+  areConversationListsEqual,
+} from "../features/ui/list-transitions";
+import { useReducedMotion } from "../features/ui/use-reduced-motion";
 import { filesApi, type FilesEntry, type FilesSource } from "../lib/files-api";
 import { COMPLETED_TASK_STATUSES, isFutureTask } from "../lib/task-visibility";
 import type { ConversationSession, Task } from "../types/api";
@@ -195,35 +205,78 @@ function ContextSwitcher() {
   );
 }
 
-function ChatSidebar({ close }: { close: () => void }) {
+function ChatSidebar({
+  close,
+  replaceCurrentChat,
+}: {
+  close: () => void;
+  replaceCurrentChat: boolean;
+}) {
   const router = useRouter();
   const { selectedProjectId } = useProject();
+  const reduceMotion = useReducedMotion();
+  const reduceMotionRef = useRef(reduceMotion);
+  reduceMotionRef.current = reduceMotion;
   const [sessions, setSessions] = useState<ConversationSession[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const loadRequestRef = useRef(0);
+  const syncTaskRef = useRef<(() => void) | null>(null);
 
   const loadSessions = useCallback(async () => {
-    setLoading(true);
+    const requestId = ++loadRequestRef.current;
+
+    const applyList = (list: ConversationSession[]) => {
+      if (requestId !== loadRequestRef.current) return;
+      setSessions((previous) => {
+        if (areConversationListsEqual(previous, list)) return previous;
+        animateNextListChange(reduceMotionRef.current);
+        return list;
+      });
+    };
+
     try {
-      setSessions(await conversationsRepo.listSessions());
+      applyList(await conversationsRepo.listSessionsLocal());
     } catch {
-      // Keep the current list visible if a refresh fails.
+      // A sync can still repair a failed/stale local read.
     } finally {
-      setLoading(false);
+      if (requestId === loadRequestRef.current) {
+        setLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
-    void loadSessions();
+    let mounted = true;
+    void loadSessions().then(() => {
+      if (!mounted) return;
+      syncTaskRef.current = scheduleSyncAfterInteractions(loadSessions);
+    });
+    return () => {
+      mounted = false;
+      loadRequestRef.current += 1;
+      syncTaskRef.current?.();
+      syncTaskRef.current = null;
+    };
   }, [loadSessions]);
 
+  useEffect(
+    () => subscribeToConversationChanges(() => void loadSessions()),
+    [loadSessions],
+  );
+
   const createSession = async () => {
-    const characterName = await getDefaultCharacterName();
-    const session = await conversationsRepo.createSession(
-      characterName,
-      selectedProjectId,
-    );
-    close();
-    router.push(`/(tabs)/chat/${session.id}`);
+    try {
+      const session = await createCurrentCharacterSession(selectedProjectId, {
+        localFirst: true,
+      });
+      close();
+      router.push(`/(tabs)/chat/${session.id}`);
+    } catch (error) {
+      Alert.alert(
+        "Chat",
+        error instanceof Error ? error.message : "チャット開始に失敗しました。",
+      );
+    }
   };
 
   return (
@@ -253,24 +306,45 @@ function ChatSidebar({ close }: { close: () => void }) {
               title={item.title || "無題の会話"}
               description={
                 item.last_activity
-                  ? `${item.character_name || "default"} ・ ${formatRelativeTime(
+                  ? `${item.character_name || "キャラクター未設定"} ・ ${formatRelativeTime(
                       item.last_activity,
                     )}`
-                  : item.character_name || "default"
+                  : item.character_name || "キャラクター未設定"
               }
               titleNumberOfLines={1}
               descriptionNumberOfLines={1}
               titleStyle={styles.listTitle}
               descriptionStyle={styles.listDescription}
               left={(props) => (
-                <List.Icon {...props} icon="message-outline" color="#7c3aed" />
+                item.development_status === "working" && item.message_count > 0 ? (
+                  <View style={styles.sessionIconSlot}>
+                    <ActivityIndicator
+                      accessibilityLabel="エージェントが作業中"
+                      size={18}
+                      color="#89b4fa"
+                    />
+                  </View>
+                ) : (
+                  <List.Icon {...props} icon="message-outline" color="#7c3aed" />
+                )
               )}
               right={() => (
-                <Text style={styles.itemCount}>{item.message_count}</Text>
+                <View style={styles.sessionMeta}>
+                  {item.is_unread && item.development_status !== "working" ? (
+                    <View accessibilityLabel="未読" style={styles.unreadDot} />
+                  ) : null}
+                  <Text style={styles.itemCount}>{item.message_count}</Text>
+                </View>
               )}
               onPress={() => {
+                void conversationsRepo.markSessionRead?.(item.id);
                 close();
-                router.push(`/(tabs)/chat/${item.id}`);
+                const href = `/(tabs)/chat/${item.id}` as const;
+                if (replaceCurrentChat) {
+                  router.replace(href);
+                } else {
+                  router.push(href);
+                }
               }}
               style={styles.listItem}
             />
@@ -452,7 +526,7 @@ function FilesSidebar({ close }: { close: () => void }) {
   return (
     <View style={styles.panel}>
       <View style={styles.groupHeader}>
-        <Text style={styles.groupLabel}>ファイラー</Text>
+        <Text style={styles.groupLabel}>ファイル</Text>
         <IconButton
           icon="open-in-new"
           size={18}
@@ -530,6 +604,7 @@ function AppSidebarContent({ close }: { close: () => void }) {
   const router = useRouter();
   const pathname = usePathname();
   const [tab, setTab] = useState<SidebarTab>("chat");
+  const isChatDetail = /^\/(?:\(tabs\)\/)?chat\/[^/]+$/.test(pathname);
 
   const navigate = (href: string) => {
     close();
@@ -607,6 +682,12 @@ function AppSidebarContent({ close }: { close: () => void }) {
           onPress={() => navigate("/trpg")}
         />
         <NavigationRow
+          icon="application-brackets-outline"
+          label="Apps"
+          active={pathname.includes("/apps")}
+          onPress={() => navigate("/(tabs)/apps")}
+        />
+        <NavigationRow
           icon="cog-outline"
           label="設定"
           active={pathname.includes("/settings")}
@@ -626,7 +707,9 @@ function AppSidebarContent({ close }: { close: () => void }) {
         ]}
       />
 
-      {tab === "chat" && <ChatSidebar close={close} />}
+      {tab === "chat" && (
+        <ChatSidebar close={close} replaceCurrentChat={isChatDetail} />
+      )}
       {tab === "tasks" && <TaskSidebar close={close} />}
       {tab === "files" && <FilesSidebar close={close} />}
     </View>
@@ -645,15 +728,16 @@ export function AppSidebar({
   const { width } = useWindowDimensions();
   const drawerWidth = Math.min(MAX_DRAWER_WIDTH, Math.round(width * 0.86));
   const [open, setOpen] = useState(initialOpen);
+  const reduceMotion = useReducedMotion();
   const translateX = useRef(new Animated.Value(-drawerWidth)).current;
 
   useEffect(() => {
     Animated.timing(translateX, {
       toValue: open ? 0 : -drawerWidth,
-      duration: 180,
-      useNativeDriver: false,
+      duration: reduceMotion ? 0 : 180,
+      useNativeDriver: true,
     }).start();
-  }, [drawerWidth, open, translateX]);
+  }, [drawerWidth, open, reduceMotion, translateX]);
 
   const close = useCallback(() => setOpen(false), []);
   const openSidebar = useCallback(() => setOpen(true), []);
@@ -880,6 +964,24 @@ const styles = StyleSheet.create({
     color: MUTED,
     fontSize: 11,
     paddingRight: 8,
+  },
+  sessionIconSlot: {
+    width: 40,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  sessionMeta: {
+    minWidth: 28,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "flex-end",
+    gap: 8,
+  },
+  unreadDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: "#89dceb",
   },
   statusDot: {
     width: 14,

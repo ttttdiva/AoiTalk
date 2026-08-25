@@ -3,15 +3,42 @@ Repository for WebUI login log management
 """
 
 from datetime import datetime
-from typing import List, Optional, Dict, Any
-from sqlalchemy import select, delete, and_, or_
+from ipaddress import ip_address as parse_ip_address
+from typing import List, Optional, Dict, Any, Sequence
+from sqlalchemy import select, delete, and_, or_, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import WebUILoginLog
 
 
+def resolve_login_client_ip(
+    peer: Optional[str], forwarded_values: Sequence[str]
+) -> str:
+    """Return one canonical audit/limiter IP across trusted proxy boundaries."""
+    normalized_peer = str(peer or "").strip()
+    try:
+        peer_address = parse_ip_address(normalized_peer)
+    except ValueError:
+        return normalized_peer or "unknown"
+    normalized_peer = str(peer_address)
+    if not peer_address.is_loopback or len(forwarded_values) != 1:
+        return normalized_peer
+
+    forwarded_parts = [
+        part.strip() for part in forwarded_values[0].split(",") if part.strip()
+    ]
+    if len(forwarded_parts) != 1:
+        return normalized_peer
+    try:
+        return str(parse_ip_address(forwarded_parts[0]))
+    except ValueError:
+        return normalized_peer
+
+
 class LoginLogRepository:
     """Repository for managing login/logout logs"""
+
+    resolve_login_client_ip = staticmethod(resolve_login_client_ip)
     
     @staticmethod
     async def create_log_entry(
@@ -23,7 +50,9 @@ class LoginLogRepository:
         success: bool = True,
         failure_reason: Optional[str] = None,
         session_duration_seconds: Optional[int] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        *,
+        commit: bool = True,
     ) -> WebUILoginLog:
         """Create a new login log entry
         
@@ -53,7 +82,10 @@ class LoginLogRepository:
         )
         
         session.add(log_entry)
-        await session.commit()
+        if commit:
+            await session.commit()
+        else:
+            await session.flush()
         await session.refresh(log_entry)
         
         return log_entry
@@ -200,3 +232,68 @@ class LoginLogRepository:
         
         result = await session.execute(query)
         return result.scalars().all()
+
+    @staticmethod
+    async def get_recent_login_attempts_for_throttling(
+        session: AsyncSession,
+        normalized_username: str,
+        ip_address: str,
+        since: datetime,
+        limit: int = 32,
+    ) -> List[WebUILoginLog]:
+        """Return recent login outcomes for one normalized user/IP pair.
+
+        Successful outcomes are intentionally included so callers can reset
+        temporary backoff without maintaining process-global limiter state.
+        """
+        query = (
+            select(WebUILoginLog)
+            .where(
+                and_(
+                    WebUILoginLog.action == "login",
+                    func.lower(func.trim(WebUILoginLog.username))
+                    == normalized_username,
+                    WebUILoginLog.ip_address == ip_address,
+                    WebUILoginLog.created_at >= since,
+                    # Throttled requests remain in the audit trail but must
+                    # not consume this bounded result set; otherwise a burst
+                    # of 429 retries could evict the credential failures that
+                    # caused the backoff and immediately bypass it.
+                    or_(
+                        WebUILoginLog.success.is_(True),
+                        WebUILoginLog.failure_reason.is_(None),
+                        WebUILoginLog.failure_reason != "rate_limited",
+                    ),
+                )
+            )
+            .order_by(WebUILoginLog.created_at.desc())
+            .limit(limit)
+        )
+        result = await session.execute(query)
+        return result.scalars().all()
+
+    @staticmethod
+    async def acquire_login_throttle_lock(
+        session: AsyncSession,
+        normalized_username: str,
+        ip_address: str,
+    ) -> Optional[bool]:
+        """Serialize one PostgreSQL login-attempt key for this transaction.
+
+        SQLite and lightweight test sessions deliberately fall back to the
+        persistent history check without a process-global mutable lock.
+        """
+        try:
+            bind = session.get_bind()
+            dialect_name = str(bind.dialect.name).lower()
+        except (AttributeError, TypeError):
+            return None
+        if dialect_name != "postgresql":
+            return None
+
+        lock_key = f"aoitalk-login:{ip_address}:{normalized_username}"
+        result = await session.execute(
+            text("SELECT pg_try_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {"lock_key": lock_key},
+        )
+        return bool(result.scalar_one())

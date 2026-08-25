@@ -14,23 +14,27 @@ import {
   groupChatSessionsByProject,
   sortChatSessions,
 } from "@/lib/chat-session-view";
+import {
+  safeLocalStorageGetItem,
+  safeLocalStorageRemoveItem,
+} from "@/lib/safe-storage";
 
 const LAST_SESSION_KEY = "aoitalk_last_session_id";
 
-function isScenarioWorkflowSession(session: ConversationSession) {
+function isStoryWorkflowSession(session: ConversationSession) {
   const characterName = session.character_name || "";
   return (
-    /^scenario_roleplay:[^:]+:[^:]+$/.test(characterName) ||
-    characterName.startsWith("scenario_") ||
-    characterName.startsWith("trpg_room_") ||
-    session.title?.startsWith("[シナリオ]") ||
-    session.title?.startsWith("[執筆]") ||
-    session.title?.startsWith("[TRPG]")
+    characterName.startsWith("story_") ||
+    session.title?.startsWith("[執筆]")
   );
 }
 
 type UseActiveChatSessionArgs = {
   searchParamSessionId: string | null;
+  /** A route-created session requested by the shared ChatSessionProvider. */
+  requestedSessionId?: string | null;
+  onRequestedSessionConsumed?: () => void;
+  suppressLastSessionRestore?: boolean;
   router: ReturnType<typeof useRouter>;
   allProjects: Array<{ id: string; name: string }>;
   sessions: ConversationSession[];
@@ -43,6 +47,9 @@ type UseActiveChatSessionArgs = {
  */
 export function useActiveChatSession({
   searchParamSessionId,
+  requestedSessionId = null,
+  onRequestedSessionConsumed,
+  suppressLastSessionRestore = false,
   router,
   allProjects,
   sessions,
@@ -64,7 +71,7 @@ export function useActiveChatSession({
       );
       if (blocked) return;
 
-      const savedView = localStorage.getItem("aoitalk-chat-history-view");
+      const savedView = safeLocalStorageGetItem("aoitalk-chat-history-view");
       const view = savedView === "project" ? "project" : "timeline";
       const projectNameById = new Map(allProjects.map((project) => [project.id, project.name]));
       const ordered = view === "project"
@@ -86,6 +93,15 @@ export function useActiveChatSession({
   useEffect(() => {
     setActiveSessionId(searchParamSessionId);
   }, [searchParamSessionId]);
+
+  useEffect(() => {
+    if (!requestedSessionId) return;
+    if (activeSessionId !== requestedSessionId) {
+      activeSessionIdRef.current = requestedSessionId;
+      setActiveSessionId(requestedSessionId);
+    }
+    onRequestedSessionConsumed?.();
+  }, [activeSessionId, onRequestedSessionConsumed, requestedSessionId]);
 
   useEffect(() => {
     const syncActiveSessionId = () => {
@@ -112,29 +128,30 @@ export function useActiveChatSession({
     setActiveSessionId(sessionId);
   }, []);
 
-  // 最後の通常チャットセッションIDを復元（シナリオ系は専用導線からのみ復元）
+  // 最後の通常チャットセッションIDを復元（Story系は専用導線からのみ復元）
   useEffect(() => {
-    if (activeSessionId) return;
+    if (activeSessionId || suppressLastSessionRestore) return;
 
-    const lastId = localStorage.getItem(LAST_SESSION_KEY);
+    const lastId = safeLocalStorageGetItem(LAST_SESSION_KEY);
     if (!lastId) return;
 
     let cancelled = false;
 
     (async () => {
       try {
-        const data = await chatApi.resumeSession(lastId);
+        // ここでは存在確認と再開だけでよく、履歴本文は chat persistence が取得する。
+        const data = await chatApi.resumeSession(lastId, false);
         if (cancelled) return;
 
-        if (isScenarioWorkflowSession(data.session)) {
-          localStorage.removeItem(LAST_SESSION_KEY);
+        if (isStoryWorkflowSession(data.session)) {
+          safeLocalStorageRemoveItem(LAST_SESSION_KEY);
           return;
         }
 
         router.replace(`/chat?s=${lastId}`);
       } catch {
         if (!cancelled) {
-          localStorage.removeItem(LAST_SESSION_KEY);
+          safeLocalStorageRemoveItem(LAST_SESSION_KEY);
         }
       }
     })();
@@ -142,7 +159,7 @@ export function useActiveChatSession({
     return () => {
       cancelled = true;
     };
-  }, [activeSessionId, router]);
+  }, [activeSessionId, router, suppressLastSessionRestore]);
 
   return {
     activeSessionId,

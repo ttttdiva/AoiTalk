@@ -7,9 +7,14 @@ import concurrent.futures
 import json
 import logging
 import re
+import time
 from typing import Any, Awaitable, Callable, Dict, Generator, List, Optional, Union
 
 from ..native_runtime import responses_output_text
+from ..openrouter_provider_routing import merge_provider_options_into_extra_body
+from ..conversation_context import normalize_usage, persist_usage_sync
+from ...services.outbound_privacy_service import OutboundPrivacyGateway
+from ...services.turn_context import get_turn_context
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +27,125 @@ _SEARCH_URL_LIMIT = 20
 
 
 class GenerationApiMixin:
+    def _privacy_gateway_for_generation(self) -> OutboundPrivacyGateway:
+        """Return a gateway scoped to the active user/session identity."""
+
+        turn = get_turn_context()
+        user_id = str(
+            getattr(self, "session_user_id", None)
+            or getattr(turn, "user_id", None)
+            or "default_user"
+        ).strip()
+        session_id = str(
+            getattr(self, "current_session_id", None)
+            or getattr(turn, "session_id", None)
+            or ""
+        ).strip()
+        runner = getattr(self, "_turn_runner", None)
+        gateway = getattr(runner, "privacy_gateway", None)
+        if not isinstance(gateway, OutboundPrivacyGateway) or (
+            gateway.user_id != user_id or gateway.session_id != session_id
+        ):
+            gateway = OutboundPrivacyGateway(
+                getattr(self, "config", None),
+                user_id=user_id,
+                session_id=session_id,
+                session_context=(getattr(self, "_privacy_session_context", None) or None),
+                project_metadata=(getattr(self, "_privacy_project_metadata", None) or None),
+            )
+            if runner is not None:
+                runner.privacy_gateway = gateway
+        else:
+            session_context = getattr(self, "_privacy_session_context", None)
+            project_metadata = getattr(self, "_privacy_project_metadata", None)
+            if session_context or project_metadata:
+                gateway.update_policy_context(
+                    session_context=session_context,
+                    project_metadata=project_metadata,
+                )
+            else:
+                gateway.update_policy_context()
+        return gateway
+
     """chat/generate_* 系の公開エントリポイント、ストリーム抽出、シーン画像生成。"""
+
+    def _record_generation_usage(
+        self,
+        response: Any,
+        *,
+        request_type: str,
+        started_at: float | None = None,
+        is_streaming: bool = False,
+    ) -> dict[str, Any]:
+        """Persist one successful ephemeral/provider API response immediately.
+
+        Native chat turns are recorded by ``TurnExecutionMixin``.  This helper
+        is intentionally limited to the direct Responses/Chat Completions
+        calls in this mixin so those calls are accounted for exactly once.
+        Providers may return the served model on the response envelope; pass it
+        through ``normalize_usage`` so requested and resolved models remain
+        distinguishable in ``TokenUsage``.
+        """
+
+        raw_usage = getattr(response, "usage", None)
+        resolved_model = getattr(response, "model", None)
+        if isinstance(response, dict):
+            if raw_usage is None:
+                raw_usage = response.get("usage")
+            if resolved_model is None:
+                resolved_model = response.get("model")
+        usage = normalize_usage(
+            raw_usage,
+            provider=str(getattr(self, "provider_label", "") or ""),
+            resolved_model=(str(resolved_model) if resolved_model else None),
+        )
+        # ``normalize_usage({})`` intentionally returns a shape containing
+        # ``None`` fields for callers that compare key sets.  Do not turn that
+        # shape into a fabricated zero-token TokenUsage row.
+        if not usage or all(
+            usage.get(key) is None for key in ("input_tokens", "output_tokens")
+        ):
+            return {}
+        latency_ms = 0
+        if started_at is not None:
+            try:
+                latency_ms = max(0, int((time.monotonic() - started_at) * 1000))
+            except Exception:
+                latency_ms = 0
+        try:
+            persist_usage_sync(
+                self,
+                provider=str(getattr(self, "provider_label", "openai") or "openai"),
+                model=str(getattr(self, "model_name", "") or ""),
+                usage=usage,
+                request_type=request_type,
+                latency_ms=latency_ms,
+                is_streaming=bool(is_streaming),
+            )
+        except Exception:
+            # Usage persistence must never turn a successful internal request
+            # into a failed title/memory/plain-text operation.
+            logger.debug("generation usage persistence failed", exc_info=True)
+        return usage
+
+    def _merge_openrouter_usage_extra_body(
+        self,
+        extra_body: Any,
+    ) -> dict[str, Any]:
+        """Ensure OpenRouter returns usage/cost metadata for direct calls."""
+
+        merged = dict(extra_body) if isinstance(extra_body, dict) else {}
+        usage_option = merged.get("usage")
+        usage_option = dict(usage_option) if isinstance(usage_option, dict) else {}
+        # ``usage.include`` is required for OpenRouter to include accounting
+        # details (including provider-reported cost) on plain completions.
+        usage_option["include"] = True
+        merged["usage"] = usage_option
+        return merge_provider_options_into_extra_body(
+            merged,
+            getattr(self, "config", None),
+            str(getattr(self, "model_name", "") or ""),
+        )
 
     def chat(
         self,
@@ -244,24 +367,46 @@ class GenerationApiMixin:
         return re.sub(r"\n?\[SCENE_DESCRIPTION:\s*.+?\]\s*", "", response, flags=re.DOTALL).strip()
 
     async def _generate_scene_image_async(
-        self, scene_description: str
+        self,
+        scene_description: str,
+        *,
+        message_id: str,
     ) -> Optional[Dict[str, Any]]:
-        """シーン画像を生成し、表示用タグと配信データを返す。"""
+        """Roleplay シーン画像を生成し、永続 media と表示用タグを返す。"""
         try:
-            # キャラクターの外見タグを取得
+            from ...services.character_service import get_character_for_prompt
+            from ...services.generated_media_service import (
+                generate_roleplay_scene_media,
+                should_attempt_roleplay_generation,
+            )
+
+            char_data = await get_character_for_prompt(self.character_name)
+            session_id = str(getattr(self, "current_session_id", "") or "")
+            owner_user_id = str(
+                getattr(self, "session_user_id", None)
+                or self._get_session_user_id()
+                or ""
+            )
+            if not session_id or not message_id:
+                return None
+
+            if not await should_attempt_roleplay_generation(
+                character_data=char_data,
+                scene_description=scene_description,
+                session_id=session_id,
+                config=getattr(self, "config", None),
+            ):
+                return None
+
             appearance_tags = ""
             negative_tags = ""
             comfyui_overrides: Dict[str, Any] = {}
-            try:
-                from ...services.character_service import get_character_for_prompt
-
-                char_data = await get_character_for_prompt(self.character_name)
-                if char_data:
-                    appearance_tags = char_data.get("appearance_tags", "")
-                    negative_tags = char_data.get("negative_tags", "")
-                    comfyui_overrides = char_data.get("comfyui_config", {}) or {}
-            except Exception as e:
-                logger.warning(f"外見タグ取得エラー: {e}")
+            character_type = ""
+            if char_data:
+                appearance_tags = char_data.get("appearance_tags", "")
+                negative_tags = char_data.get("negative_tags", "")
+                comfyui_overrides = char_data.get("comfyui_config", {}) or {}
+                character_type = str(char_data.get("character_type") or "")
 
             from ...services.image_prompt_builder import build_image_prompt
 
@@ -269,44 +414,30 @@ class GenerationApiMixin:
                 self.history_manager.get_all(),
                 appearance_tags,
                 scene_description,
+                usage_context=self,
+                roleplay_pov=character_type == "roleplay",
             )
             negative_parts = [p for p in [negative_tags, default_negative] if p]
             combined_negative = ", ".join(negative_parts)
 
             logger.info(
-                f"[AgentLLMClient] シーン画像生成開始: {prompt[:80]}..."
+                "[AgentLLMClient] シーン画像生成開始: %s...",
+                prompt[:80],
             )
 
-            # 画像生成エンジンに委譲
-            try:
-                from ...services.comfyui_service import generate_image
-
-                result = await generate_image(
-                    prompt=prompt,
-                    negative_prompt=combined_negative,
-                    overrides=comfyui_overrides,
-                )
-                if result and result.get("success"):
-                    image_path = result.get("image_path")
-                    tag = f"[GENERATED_IMAGE:{image_path}]"
-                    logger.info(f"[AgentLLMClient] シーン画像生成完了: {image_path}")
-                    return {
-                        "content": tag,
-                        "tag": tag,
-                        "image_path": image_path,
-                        "image_url": result.get("image_url"),
-                        "filename": result.get("filename"),
-                    }
-            except ImportError:
-                logger.info(
-                    "[AgentLLMClient] ComfyUI サービスが利用できません。画像生成スキップ。"
-                )
-            except Exception as e:
-                logger.warning(f"画像生成エラー: {e}")
-            return None
-
+            return await generate_roleplay_scene_media(
+                owner_user_id=owner_user_id,
+                session_id=session_id,
+                message_id=message_id,
+                scene_description=scene_description,
+                positive_prompt=prompt,
+                negative_prompt=combined_negative,
+                comfyui_overrides=comfyui_overrides,
+                engine="comfyui",
+                config=getattr(self, "config", None),
+            )
         except Exception as e:
-            logger.error(f"[AgentLLMClient] シーン画像生成タスクエラー: {e}")
+            logger.error("[AgentLLMClient] シーン画像生成タスクエラー: %s", e)
             return None
 
     async def generate_memory_extraction_async(
@@ -322,16 +453,32 @@ class GenerationApiMixin:
                 # temperature は reasoning 系モデルが拒否するため指定しない。
                 # max_output_tokens は reasoning トークンも消費するため、
                 # 小さい値で JSON が途中打ち切りになるのを避けて未指定とする。
+                started_at = time.monotonic()
+                request_kwargs = {
+                    "model": self.model_name,
+                    "instructions": system_prompt or "",
+                    "input": prompt or "",
+                    "store": False,
+                }
+                gateway = self._privacy_gateway_for_generation()
+                protected = await gateway.protect(
+                    request_kwargs,
+                    provider=str(getattr(self, "provider_label", "openai") or "openai"),
+                    base_url=str(getattr(self._openai_client, "base_url", "") or ""),
+                    source_kind="memory_extraction",
+                )
                 response = await self._openai_client.responses.create(
-                    model=self.model_name,
-                    instructions=system_prompt or "",
-                    input=prompt or "",
-                    store=False,
+                    **protected.payload
                 )
             except Exception as first_error:
                 print(f"[AgentLLMClient] Dreamingメモリ抽出に失敗: {first_error}")
                 raise first_error
-            return responses_output_text(response)
+            self._record_generation_usage(
+                response,
+                request_type="memory_extraction",
+                started_at=started_at,
+            )
+            return gateway.restore(responses_output_text(response))
 
         messages = [
             {"role": "system", "content": system_prompt or ""},
@@ -341,33 +488,101 @@ class GenerationApiMixin:
             "model": self.model_name,
             "messages": messages,
         }
-        if getattr(self, "provider_label", "") == "kimi" and self.model_name == "kimi-k3":
+        if getattr(self, "provider_label", "") == "deepseek":
+            effort = str(
+                self.config.get("deepseek.reasoning_effort", "high")
+                if self.config is not None and hasattr(self.config, "get")
+                else "high"
+            ).strip().lower()
+            if effort not in {"none", "high", "max"}:
+                effort = "high"
+            kwargs["extra_body"] = {
+                "thinking": {
+                    "type": "disabled" if effort == "none" else "enabled"
+                }
+            }
+            if effort != "none":
+                kwargs["reasoning_effort"] = effort
+            kwargs["max_tokens"] = 1200
+        elif getattr(self, "provider_label", "") == "deepinfra":
+            effort = str(
+                self.config.get("deepinfra.reasoning_effort", "high")
+                if self.config is not None and hasattr(self.config, "get")
+                else "high"
+            ).strip().lower()
+            if effort not in {"none", "low", "medium", "high"}:
+                effort = "high"
+            kwargs["extra_body"] = {"reasoning_effort": effort}
+            kwargs["max_tokens"] = 1200
+        elif getattr(self, "provider_label", "") == "kimi" and self.model_name == "kimi-k3":
             kwargs["reasoning_effort"] = "max"
             kwargs["max_completion_tokens"] = 1200
         else:
             kwargs["temperature"] = 0.0
             kwargs["max_tokens"] = 1200
+        if getattr(self, "provider_label", "") == "openrouter":
+            merged_extra_body = self._merge_openrouter_usage_extra_body(
+                kwargs.get("extra_body")
+            )
+            if merged_extra_body:
+                kwargs["extra_body"] = merged_extra_body
         try:
-            response = await self._openai_client.chat.completions.create(**kwargs)
+            started_at = time.monotonic()
+            gateway = self._privacy_gateway_for_generation()
+            protected = await gateway.protect(
+                kwargs,
+                provider=str(getattr(self, "provider_label", "openai") or "openai"),
+                base_url=str(getattr(self._openai_client, "base_url", "") or ""),
+                source_kind="memory_extraction",
+            )
+            response = await self._openai_client.chat.completions.create(
+                **protected.payload
+            )
         except Exception as first_error:
+            if getattr(self, "provider_label", "") in {"deepseek", "deepinfra", "openrouter"}:
+                print(f"[AgentLLMClient] Dreamingメモリ抽出に失敗: {first_error}")
+                raise
             # Some OpenAI-compatible providers reject optional sampling params.
             try:
+                retry_started_at = time.monotonic()
+                retry_kwargs = {"model": self.model_name, "messages": messages}
+                retry_protected = await gateway.protect(
+                    retry_kwargs,
+                    provider=str(getattr(self, "provider_label", "openai") or "openai"),
+                    base_url=str(getattr(self._openai_client, "base_url", "") or ""),
+                    source_kind="memory_extraction",
+                )
                 response = await self._openai_client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
+                    **retry_protected.payload
                 )
             except Exception:
                 print(f"[AgentLLMClient] Dreamingメモリ抽出に失敗: {first_error}")
                 raise first_error
+            self._record_generation_usage(
+                response,
+                # Compatibility fallback is still part of the same memory
+                # extraction operation.  Keep the dashboard category stable
+                # so the fallback response does not split totals into a
+                # separate generic retry bucket.
+                request_type="memory_extraction",
+                started_at=retry_started_at,
+            )
+        else:
+            self._record_generation_usage(
+                response,
+                request_type="memory_extraction",
+                started_at=started_at,
+            )
         choice = response.choices[0]
         message = choice.message
-        return str(getattr(message, "content", "") or "")
+        return gateway.restore(str(getattr(message, "content", "") or ""))
 
     async def generate_plain_text_async(
         self,
         prompt: str,
         *,
         system_prompt: Optional[str] = None,
+        request_type: str = "plain",
     ) -> str:
         """ツールなしのプレーンテキスト応答を生成する。
 
@@ -379,13 +594,29 @@ class GenerationApiMixin:
             "the requested format."
         )
         if getattr(self, "provider_label", "openai") == "openai":
-            response = await self._openai_client.responses.create(
-                model=self.model_name,
-                instructions=system,
-                input=prompt or "",
-                store=False,
+            started_at = time.monotonic()
+            gateway = self._privacy_gateway_for_generation()
+            request_kwargs = {
+                "model": self.model_name,
+                "instructions": system,
+                "input": prompt or "",
+                "store": False,
+            }
+            protected = await gateway.protect(
+                request_kwargs,
+                provider=str(getattr(self, "provider_label", "openai") or "openai"),
+                base_url=str(getattr(self._openai_client, "base_url", "") or ""),
+                source_kind=request_type,
             )
-            return responses_output_text(response)
+            response = await self._openai_client.responses.create(
+                **protected.payload
+            )
+            self._record_generation_usage(
+                response,
+                request_type=request_type,
+                started_at=started_at,
+            )
+            return gateway.restore(responses_output_text(response))
 
         kwargs: Dict[str, Any] = dict(
             model=self.model_name,
@@ -394,10 +625,63 @@ class GenerationApiMixin:
                 {"role": "user", "content": prompt or ""},
             ],
         )
-        if getattr(self, "provider_label", "") == "kimi" and self.model_name == "kimi-k3":
+        if getattr(self, "provider_label", "") == "deepseek":
+            effort = str(
+                self.config.get("deepseek.reasoning_effort", "high")
+                if self.config is not None and hasattr(self.config, "get")
+                else "high"
+            ).strip().lower()
+            if effort not in {"none", "high", "max"}:
+                effort = "high"
+            kwargs["extra_body"] = {
+                "thinking": {
+                    "type": "disabled" if effort == "none" else "enabled"
+                }
+            }
+            if effort != "none":
+                kwargs["reasoning_effort"] = effort
+        elif getattr(self, "provider_label", "") == "deepinfra":
+            effort = str(
+                self.config.get("deepinfra.reasoning_effort", "high")
+                if self.config is not None and hasattr(self.config, "get")
+                else "high"
+            ).strip().lower()
+            if effort not in {"none", "low", "medium", "high"}:
+                effort = "high"
+            kwargs["extra_body"] = {"reasoning_effort": effort}
+        elif getattr(self, "provider_label", "") == "kimi" and self.model_name == "kimi-k3":
             kwargs["reasoning_effort"] = "max"
-        response = await self._openai_client.chat.completions.create(**kwargs)
-        return str(response.choices[0].message.content or "")
+        if getattr(self, "provider_label", "") == "openrouter":
+            merged_extra_body = self._merge_openrouter_usage_extra_body(
+                kwargs.get("extra_body")
+            )
+            if merged_extra_body:
+                kwargs["extra_body"] = merged_extra_body
+        started_at = time.monotonic()
+        gateway = self._privacy_gateway_for_generation()
+        protected = await gateway.protect(
+            kwargs,
+            provider=str(getattr(self, "provider_label", "openai") or "openai"),
+            base_url=str(getattr(self._openai_client, "base_url", "") or ""),
+            source_kind=request_type,
+        )
+        response = await self._openai_client.chat.completions.create(
+            **protected.payload
+        )
+        self._record_generation_usage(
+            response,
+            request_type=request_type,
+            started_at=started_at,
+        )
+        return gateway.restore(str(response.choices[0].message.content or ""))
+
+    async def generate_title_async(self, prompt: str) -> str:
+        """Generate a title through the side-effect-free API and meter it as title."""
+
+        return await self.generate_plain_text_async(
+            prompt,
+            request_type="title",
+        )
 
     async def generate_response_async(
         self,
@@ -409,7 +693,11 @@ class GenerationApiMixin:
         steering_callback: Optional[SteeringCallback] = None,
     ) -> str:
         """Async version of generate_response"""
-        return await self._generate_async(
+        from ...services.session_llm_generation import run_session_aware_generation
+
+        return await run_session_aware_generation(
+            self,
+            self.config,
             user_input,
             stream_callback=stream_callback,
             steering_callback=steering_callback,

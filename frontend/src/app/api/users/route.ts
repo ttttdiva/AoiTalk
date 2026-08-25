@@ -1,154 +1,199 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/db";
-import { users } from "@/db/schema";
 import { getSession } from "@/lib/auth";
-import { eq } from "drizzle-orm";
-import bcrypt from "bcryptjs";
+import { proxyRequestToPythonApi } from "@/lib/server/python-api-proxy";
 
-type UserSettings = Record<string, unknown>;
+export const dynamic = "force-dynamic";
+export const fetchCache = "force-no-store";
 
-function getSettings(value: unknown): UserSettings {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as UserSettings)
-    : {};
+type UserRecord = Record<string, unknown>;
+
+function isRecord(value: unknown): value is UserRecord {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function lifecycleState(value: unknown): string {
-  const settings = getSettings(value);
-  const lifecycle = settings.account_lifecycle;
-  if (lifecycle && typeof lifecycle === "object" && !Array.isArray(lifecycle)) {
-    const state = (lifecycle as UserSettings).state;
-    if (typeof state === "string") return state;
-  }
-  return "active";
+function getSettings(value: unknown): UserRecord {
+  return isRecord(value) ? value : {};
 }
 
-function lifecycleDate(value: unknown, key: string): string | null {
-  const settings = getSettings(value);
-  const lifecycle = settings.account_lifecycle;
-  if (lifecycle && typeof lifecycle === "object" && !Array.isArray(lifecycle)) {
-    const date = (lifecycle as UserSettings)[key];
-    if (typeof date === "string") return date;
-  }
-  return null;
-}
-
-function serializeUser(u: typeof users.$inferSelect) {
-  const lifecycle = lifecycleState(u.userSettings);
+function normalizeUser(value: unknown): UserRecord {
+  const user = isRecord(value) ? value : {};
+  const settings = getSettings(user.settings ?? user.user_settings);
+  const lifecycle = getSettings(settings.account_lifecycle);
+  const active = user.is_active ?? user.isActive;
   const status =
-    lifecycle === "deleted" ? "deleted" : u.isActive ? "active" : "inactive";
-
+    lifecycle.state === "deleted"
+      ? "deleted"
+      : active === true
+        ? "active"
+        : "inactive";
   return {
-    id: u.id,
-    username: u.username,
-    email: u.email,
-    display_name: u.displayName,
-    role: u.role,
-    is_active: u.isActive,
+    ...user,
+    id: user.id == null ? "" : String(user.id),
+    display_name: user.display_name ?? user.displayName ?? null,
+    avatar_url: user.avatar_url ?? user.avatarUrl ?? null,
+    role: user.role ?? "user",
+    is_active: active === true,
     status,
     is_deleted: status === "deleted",
-    password_reset_required: u.isPasswordResetRequired,
-    created_at: u.createdAt,
-    last_login: u.lastLogin,
-    deleted_at: status === "deleted" ? lifecycleDate(u.userSettings, "deleted_at") : null,
+    password_reset_required:
+      user.password_reset_required ?? user.is_password_reset_required ?? null,
+    deleted_at: status === "deleted" && typeof lifecycle.deleted_at === "string"
+      ? lifecycle.deleted_at
+      : null,
   };
 }
 
-export async function GET() {
+function parseCreateBody(value: unknown): UserRecord | null {
+  if (!isRecord(value)) return null;
+  const allowed = new Set([
+    "username",
+    "password",
+    "role",
+    "email",
+    "display_name",
+    "require_password_change",
+  ]);
+  if (Object.keys(value).some((key) => !allowed.has(key))) return null;
+  if (
+    typeof value.username !== "string" ||
+    !value.username.trim() ||
+    value.username.trim().length > 100
+  ) {
+    return null;
+  }
+  if (typeof value.password !== "string" || value.password.length < 6 || value.password.length > 1024) {
+    return null;
+  }
+  if (value.role !== undefined && value.role !== "admin" && value.role !== "user") {
+    return null;
+  }
+  if (
+    value.email !== undefined &&
+    value.email !== null &&
+    (typeof value.email !== "string" || value.email.length > 255)
+  ) {
+    return null;
+  }
+  if (
+    value.display_name !== undefined &&
+    value.display_name !== null &&
+    (typeof value.display_name !== "string" || value.display_name.length > 100)
+  ) {
+    return null;
+  }
+  if (
+    value.require_password_change !== undefined &&
+    typeof value.require_password_change !== "boolean"
+  ) {
+    return null;
+  }
+  return {
+    ...value,
+    username: value.username.trim(),
+    email: typeof value.email === "string" && value.email.trim() ? value.email.trim() : null,
+    display_name:
+      typeof value.display_name === "string" && value.display_name.trim()
+        ? value.display_name.trim()
+        : null,
+    role: value.role ?? "user",
+    require_password_change: value.require_password_change ?? true,
+  };
+}
+
+async function requireAdmin() {
   const user = await getSession();
   if (!user) {
-    return NextResponse.json({ detail: "認証が必要です" }, { status: 401 });
+    return {
+      error: NextResponse.json({ detail: "認証が必要です" }, { status: 401 }),
+      user: null,
+    };
   }
-
   if (user.role !== "admin") {
-    return NextResponse.json({ detail: "管理者権限が必要です" }, { status: 403 });
+    return {
+      error: NextResponse.json({ detail: "管理者権限が必要です" }, { status: 403 }),
+      user: null,
+    };
   }
+  return { error: null, user };
+}
 
-  const rows = await db.select().from(users);
+async function readProxyJson(response: NextResponse): Promise<unknown> {
+  return response.json().catch(() => null);
+}
 
-  const result = rows
-    .map(serializeUser)
-    .sort((a, b) => {
-      const stateOrder: Record<string, number> = {
-        active: 0,
-        inactive: 1,
-        deleted: 2,
-      };
-      const byState = stateOrder[a.status] - stateOrder[b.status];
-      if (byState !== 0) return byState;
-      return a.username.localeCompare(b.username);
-    });
+function proxyResponse(body: unknown, status: number): NextResponse {
+  return NextResponse.json(body, {
+    status,
+    headers: { "cache-control": "no-store, no-cache, must-revalidate" },
+  });
+}
 
-  return NextResponse.json(result);
+export async function GET(request: NextRequest) {
+  const guard = await requireAdmin();
+  if (guard.error) return guard.error;
+
+  // The management console includes inactive/deleted accounts.  Keep this
+  // adapter concern here while the FastAPI list endpoint remains reusable for
+  // callers that intentionally request active users only.
+  const url = new URL(request.url);
+  if (!url.searchParams.has("include_inactive")) {
+    url.searchParams.set("include_inactive", "true");
+  }
+  if (!url.searchParams.has("limit")) {
+    url.searchParams.set("limit", "500");
+  }
+  const proxyRequest = new NextRequest(url, {
+    method: "GET",
+    headers: request.headers,
+  });
+  const response = await proxyRequestToPythonApi(proxyRequest, {
+    path: ["users"],
+    user: guard.user,
+  });
+  const body = await readProxyJson(response);
+  if (!response.ok) return proxyResponse(body, response.status);
+  const users = isRecord(body) && Array.isArray(body.users) ? body.users : body;
+  const normalizedUsers = Array.isArray(users) ? users.map(normalizeUser) : [];
+  const stateOrder: Record<string, number> = {
+    active: 0,
+    inactive: 1,
+    deleted: 2,
+  };
+  normalizedUsers.sort((left, right) => {
+    const byState =
+      (stateOrder[String(left.status)] ?? 99) -
+      (stateOrder[String(right.status)] ?? 99);
+    if (byState !== 0) return byState;
+    return String(left.username ?? "").localeCompare(String(right.username ?? ""));
+  });
+  return proxyResponse(
+    normalizedUsers,
+    response.status,
+  );
 }
 
 export async function POST(request: NextRequest) {
-  const user = await getSession();
-  if (!user) {
-    return NextResponse.json({ detail: "認証が必要です" }, { status: 401 });
+  const guard = await requireAdmin();
+  if (guard.error) return guard.error;
+
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ detail: "不正なJSONです" }, { status: 400 });
+  }
+  const payload = parseCreateBody(body);
+  if (!payload) {
+    return NextResponse.json({ detail: "リクエスト形式が不正です" }, { status: 400 });
   }
 
-  if (user.role !== "admin") {
-    return NextResponse.json({ detail: "管理者権限が必要です" }, { status: 403 });
-  }
-
-  const body = await request.json();
-  const {
-    username,
-    password,
-    role,
-    email,
-    display_name,
-    require_password_change,
-  } = body;
-
-  if (!username || !password) {
-    return NextResponse.json(
-      { detail: "usernameとpasswordは必須です" },
-      { status: 400 }
-    );
-  }
-
-  if (password.length < 6) {
-    return NextResponse.json(
-      { detail: "パスワードは6文字以上必要です" },
-      { status: 400 }
-    );
-  }
-
-  const [existing] = await db
-    .select({ id: users.id })
-    .from(users)
-    .where(eq(users.username, username))
-    .limit(1);
-  if (existing) {
-    return NextResponse.json(
-      { detail: "このユーザー名は既に使われています" },
-      { status: 409 },
-    );
-  }
-
-  const hash = await bcrypt.hash(password, 12);
-
-  const [newUser] = await db
-    .insert(users)
-    .values({
-      username,
-      email: email || null,
-      displayName: display_name || null,
-      passwordHash: hash,
-      role: role || "member",
-      isActive: true,
-      isPasswordResetRequired: require_password_change !== false,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-      userSettings: {
-        account_lifecycle: {
-          state: "active",
-        },
-      },
-    })
-    .returning();
-
-  return NextResponse.json(serializeUser(newUser));
+  const response = await proxyRequestToPythonApi(request, {
+    path: ["users"],
+    user: guard.user,
+    body: JSON.stringify(payload),
+  });
+  const result = await readProxyJson(response);
+  if (!response.ok) return proxyResponse(result, response.status);
+  const user = isRecord(result) ? result.user : result;
+  return proxyResponse(normalizeUser(user), response.status);
 }

@@ -9,6 +9,11 @@ import {
   parseRrule,
   recurrenceEndDateInputValue,
 } from "@/components/tasks/task-date-picker";
+import { supportsSkipWeekend } from "@/lib/recurrence-rrule";
+import {
+  normalizeSkipMode,
+  type RecurrenceSkipMode,
+} from "@/lib/recurrence-preview";
 
 interface TaskRowDatePickerProps {
   taskId: string;
@@ -24,6 +29,8 @@ interface TaskRowDatePickerProps {
   endPlaceholder?: string;
   startButtonClassName?: string;
   endButtonClassName?: string;
+  showStartDate?: boolean;
+  showEndDate?: boolean;
 }
 
 export function TaskRowDatePicker({
@@ -37,6 +44,8 @@ export function TaskRowDatePicker({
   endPlaceholder,
   startButtonClassName,
   endButtonClassName,
+  showStartDate = true,
+  showEndDate = true,
 }: TaskRowDatePickerProps) {
   const [recurrenceRule, setRecurrenceRule] = useState<RecurrenceRule | null>(
     null,
@@ -52,6 +61,8 @@ export function TaskRowDatePicker({
   const [recEndDate, setRecEndDate] = useState<string | null>(null);
   const [recSkipWeekend, setRecSkipWeekend] = useState(false);
   const [recSkipHoliday, setRecSkipHoliday] = useState(false);
+  const [recSkipMode, setRecSkipMode] =
+    useState<RecurrenceSkipMode>("shift_forward");
   const [recurrenceSaving, setRecurrenceSaving] = useState(false);
   const loadedRef = useRef(false);
 
@@ -68,6 +79,7 @@ export function TaskRowDatePicker({
     setRecEndDate(null);
     setRecSkipWeekend(false);
     setRecSkipHoliday(false);
+    setRecSkipMode("shift_forward");
   }, []);
 
   const applyRule = useCallback((rule: RecurrenceRule | null) => {
@@ -91,6 +103,7 @@ export function TaskRowDatePicker({
       setRecResetStatusTo(rule.reset_status_to || "open");
       setRecSkipWeekend(rule.skip_weekend ?? false);
       setRecSkipHoliday(rule.skip_holiday ?? false);
+      setRecSkipMode(normalizeSkipMode(rule.skip_mode));
     }
   }, []);
 
@@ -145,8 +158,11 @@ export function TaskRowDatePicker({
         reset_status_to: recResetStatusTo,
         end_count: recRecurForever ? null : recEndCount,
         end_date: recRecurForever ? null : recEndDate,
-        skip_weekend: recFreq === "DAILY" ? recSkipWeekend : false,
+        skip_weekend: supportsSkipWeekend(recFreq, recByDay)
+          ? recSkipWeekend
+          : false,
         skip_holiday: recSkipHoliday,
+        skip_mode: recSkipMode,
       });
       setRecurrenceRule(rule);
       onRecurrenceChange?.(true);
@@ -168,6 +184,7 @@ export function TaskRowDatePicker({
     recEndDate,
     recSkipWeekend,
     recSkipHoliday,
+    recSkipMode,
     onRecurrenceChange,
   ]);
 
@@ -197,6 +214,8 @@ export function TaskRowDatePicker({
       endPlaceholder={endPlaceholder}
       startButtonClassName={startButtonClassName}
       endButtonClassName={endButtonClassName}
+      showStartDate={showStartDate}
+      showEndDate={showEndDate}
       onOpenChange={handleOpenChange}
       recurrence={{
         recurrenceRule,
@@ -211,6 +230,7 @@ export function TaskRowDatePicker({
         endDate: recEndDate,
         skipWeekend: recSkipWeekend,
         skipHoliday: recSkipHoliday,
+        skipMode: recSkipMode,
         saving: recurrenceSaving,
         onFreqChange: handleFreqChange,
         onIntervalChange: setRecInterval,
@@ -223,6 +243,7 @@ export function TaskRowDatePicker({
         onEndDateChange: setRecEndDate,
         onSkipWeekendChange: setRecSkipWeekend,
         onSkipHolidayChange: setRecSkipHoliday,
+        onSkipModeChange: setRecSkipMode,
         onSave: handleSaveRecurrence,
         onDelete: handleDeleteRecurrence,
       }}

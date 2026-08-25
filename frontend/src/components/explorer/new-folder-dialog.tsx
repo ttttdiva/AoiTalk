@@ -11,7 +11,7 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import { NewItemNameInput } from "@/components/explorer/new-item-name-input";
 
 interface NewFolderDialogProps {
   open: boolean;
@@ -43,17 +43,15 @@ export function NewFolderDialog({ open, onOpenChange }: NewFolderDialogProps) {
       open={open}
       onOpenChange={onOpenChange}
     >
-      <DialogContent className="sm:max-w-sm">
+      <DialogContent>
         <DialogHeader>
           <DialogTitle>新規フォルダ</DialogTitle>
         </DialogHeader>
-        <Input
+        <NewItemNameInput
           placeholder="フォルダ名"
           value={name}
-          onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") handleCreate();
-          }}
+          onValueChange={setName}
+          onSubmit={handleCreate}
           autoFocus
         />
         <DialogFooter>

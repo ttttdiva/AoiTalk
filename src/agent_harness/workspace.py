@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import HarnessHookSettings
+from ..utils.subprocess_env import build_aoitalk_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +35,10 @@ def sanitize_identifier(identifier: str | None) -> str:
 
 
 def assert_path_within_root(path: Path, root: Path) -> Path:
-    root.mkdir(parents=True, exist_ok=True)
+    if root.exists() and root.is_symlink():
+        raise WorkspaceSafetyError(f"workspace root may not be a symlink: {root}")
     canonical_root = root.resolve()
+    canonical_root.mkdir(parents=True, exist_ok=True)
     candidate = path
     if not candidate.is_absolute():
         candidate = canonical_root / candidate
@@ -197,6 +200,7 @@ def run_hook(hook: str, command: str, cwd: Path, *, timeout_ms: int) -> HookResu
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            env=build_aoitalk_subprocess_env(extra_env={"NO_COLOR": "1"}),
             timeout=max(0.001, timeout_ms / 1000),
             check=False,
         )

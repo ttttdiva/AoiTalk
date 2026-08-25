@@ -6,7 +6,7 @@ function pushLine(lines: string[], label: string, value: unknown) {
   lines.push(`- ${label}: ${String(value)}`);
 }
 
-export function buildTaskAgentPrompt(task: Task): string {
+export function buildTaskChatDraft(task: Task): string {
   const lines: string[] = [
     "Take over the following task.",
     "First inspect the task context and any relevant project/repository context available to you.",
@@ -86,7 +86,7 @@ export function buildTaskAgentPrompt(task: Task): string {
   return lines.join("\n");
 }
 
-export function buildTaskAgentSessionTitle(title: string): string {
+export function buildTaskChatSessionTitle(title: string): string {
   const normalized = title.trim() || "Task";
   const clipped =
     normalized.length > 60

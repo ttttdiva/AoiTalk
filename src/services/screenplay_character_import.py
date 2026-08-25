@@ -2,7 +2,7 @@
 
 The legacy F01 screenplay source keeps the canonical character voice data in
 ``03_キャラ/キャラ倉庫.md``.  This module converts that warehouse document into
-``scenario_characters`` payloads without treating per-character detail notes as
+StoryCharacter payloads without treating per-character detail notes as
 standalone characters.
 """
 
@@ -31,7 +31,7 @@ class ScreenplayCharacter:
     fields: Dict[str, str]
     sort_order: int
 
-    def to_scenario_payload(self) -> Dict[str, Any]:
+    def to_story_payload(self) -> Dict[str, Any]:
         personality = self.fields.get("性格", "")
         remarks = self.fields.get("備考", "")
         relationships_text = self.fields.get("人間関係", "")
@@ -108,9 +108,9 @@ def parse_character_warehouse(markdown: str) -> List[ScreenplayCharacter]:
 
 
 def build_character_payloads(markdown: str) -> List[Dict[str, Any]]:
-    """Return scenario-character payload dictionaries for a warehouse file."""
+    """Return StoryCharacter payload dictionaries for a warehouse file."""
 
-    return [character.to_scenario_payload() for character in parse_character_warehouse(markdown)]
+    return [character.to_story_payload() for character in parse_character_warehouse(markdown)]
 
 
 def _strip_front_matter(markdown: str) -> str:

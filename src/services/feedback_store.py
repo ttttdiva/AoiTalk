@@ -10,6 +10,7 @@ api 層を import する層逆流（services→api）を解消するため servi
 """
 
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -17,6 +18,26 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+try:
+    from ..features import Features
+except ImportError:
+    Features = None
+
+
+def _enterprise_mode() -> bool:
+    if Features is not None:
+        return Features.is_enterprise()
+    return any(
+        str(os.getenv(name) or "").strip().lower() == "enterprise"
+        for name in ("AOITALK_PROFILE", "AIVTUBER_ENV")
+    )
+
+
+def _database_required_error(operation: str) -> RuntimeError:
+    return RuntimeError(
+        f"Enterprise feedback {operation} requires PostgreSQL; JSONL fallback is disabled"
+    )
 
 # Check if database is available
 try:
@@ -54,6 +75,8 @@ class FeedbackEntry(BaseModel):
     category: str
     comment: Optional[str] = None
     resolved: bool = False
+    resolved_by: Optional[str] = None
+    resolved_at: Optional[str] = None
 
 
 async def save_feedback_async(request: FeedbackRequest) -> FeedbackEntry:
@@ -67,6 +90,8 @@ async def save_feedback_async(request: FeedbackRequest) -> FeedbackEntry:
         The complete feedback entry that was saved.
     """
     if not DATABASE_AVAILABLE:
+        if _enterprise_mode():
+            raise _database_required_error("storage")
         logger.warning("Database not available, using fallback JSONL storage")
         return _save_feedback_jsonl_fallback(request)
 
@@ -100,13 +125,21 @@ async def save_feedback_async(request: FeedbackRequest) -> FeedbackEntry:
                 user_input=feedback.user_input,
                 category=feedback.category,
                 comment=feedback.comment,
-                resolved=feedback.resolved
+                resolved=feedback.resolved,
+                resolved_by=feedback.resolved_by,
+                resolved_at=(
+                    feedback.resolved_at.isoformat()
+                    if feedback.resolved_at
+                    else None
+                ),
             )
         finally:
             await session.close()
 
     except Exception as e:
         logger.error(f"Failed to save feedback to database: {e}")
+        if _enterprise_mode():
+            raise _database_required_error("storage") from e
         # Fallback to JSONL
         return _save_feedback_jsonl_fallback(request)
 
@@ -149,6 +182,8 @@ async def load_feedback_async(
         List of feedback entries, newest first.
     """
     if not DATABASE_AVAILABLE:
+        if _enterprise_mode():
+            raise _database_required_error("reading")
         logger.warning("Database not available, using fallback JSONL storage")
         return _load_feedback_jsonl_fallback(include_resolved, limit)
 
@@ -175,7 +210,9 @@ async def load_feedback_async(
                     user_input=f.user_input,
                     category=f.category,
                     comment=f.comment,
-                    resolved=f.resolved
+                    resolved=f.resolved,
+                    resolved_by=f.resolved_by,
+                    resolved_at=f.resolved_at.isoformat() if f.resolved_at else None,
                 )
                 for f in feedback_list
             ]
@@ -184,6 +221,8 @@ async def load_feedback_async(
 
     except Exception as e:
         logger.error(f"Failed to load feedback from database: {e}")
+        if _enterprise_mode():
+            raise _database_required_error("reading") from e
         return _load_feedback_jsonl_fallback(include_resolved, limit)
 
 
@@ -209,7 +248,9 @@ def load_feedback(
         return asyncio.run(load_feedback_async(include_resolved, limit))
 
 
-async def mark_feedback_resolved_async(feedback_id: str) -> bool:
+async def mark_feedback_resolved_async(
+    feedback_id: str, resolved_by: Optional[str] = None
+) -> bool:
     """
     Mark a feedback entry as resolved (async version).
 
@@ -220,6 +261,8 @@ async def mark_feedback_resolved_async(feedback_id: str) -> bool:
         True if successful, False otherwise.
     """
     if not DATABASE_AVAILABLE:
+        if _enterprise_mode():
+            raise _database_required_error("resolution")
         logger.warning("Database not available, using fallback JSONL storage")
         return _mark_feedback_resolved_jsonl_fallback(feedback_id)
 
@@ -230,16 +273,22 @@ async def mark_feedback_resolved_async(feedback_id: str) -> bool:
         session = await db_manager.get_session()
 
         try:
-            return await FeedbackRepository.mark_resolved(session, feedback_id)
+            return await FeedbackRepository.mark_resolved(
+                session, feedback_id, resolved_by=resolved_by
+            )
         finally:
             await session.close()
 
     except Exception as e:
         logger.error(f"Failed to mark feedback as resolved: {e}")
+        if _enterprise_mode():
+            raise _database_required_error("resolution") from e
         return False
 
 
-def mark_feedback_resolved(feedback_id: str) -> bool:
+def mark_feedback_resolved(
+    feedback_id: str, resolved_by: Optional[str] = None
+) -> bool:
     """
     Mark a feedback entry as resolved (sync wrapper).
     """
@@ -251,11 +300,13 @@ def mark_feedback_resolved(feedback_id: str) -> bool:
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future = executor.submit(
                 asyncio.run,
-                mark_feedback_resolved_async(feedback_id)
+                mark_feedback_resolved_async(feedback_id, resolved_by=resolved_by)
             )
             return future.result()
     except RuntimeError:
-        return asyncio.run(mark_feedback_resolved_async(feedback_id))
+        return asyncio.run(
+            mark_feedback_resolved_async(feedback_id, resolved_by=resolved_by)
+        )
 
 
 async def migrate_jsonl_to_database() -> int:
@@ -266,6 +317,8 @@ async def migrate_jsonl_to_database() -> int:
         Number of entries migrated.
     """
     if not DATABASE_AVAILABLE:
+        if _enterprise_mode():
+            raise _database_required_error("migration")
         logger.warning("Database not available, cannot migrate")
         return 0
 
@@ -282,6 +335,8 @@ async def migrate_jsonl_to_database() -> int:
 
     except Exception as e:
         logger.error(f"Failed to migrate feedback: {e}")
+        if _enterprise_mode():
+            raise _database_required_error("migration") from e
         return 0
 
 

@@ -42,6 +42,7 @@ def build_record_table_tools() -> list:
                     session,
                     project=project,
                     project_id=project_id,
+                    permission="read",
                 )
                 result = await session.execute(
                     select(
@@ -98,6 +99,7 @@ def build_record_table_tools() -> list:
                     session,
                     project=project,
                     project_id=project_id,
+                    permission="write",
                 )
                 if resolved_project_id is None:
                     raise ValueError("No project could be resolved for the record table.")
@@ -211,6 +213,7 @@ def build_record_table_tools() -> list:
                     session,
                     project=project,
                     project_id=project_id,
+                    permission="write",
                 )
                 if resolved_project_id is None:
                     raise ValueError("No project could be resolved for the record table.")
@@ -328,6 +331,7 @@ def build_record_table_tools() -> list:
                 await _resolve_actor_and_project(
                     session,
                     project_id=str(row.project_id),
+                    permission="write",
                 )
                 fields_result = await session.execute(
                     select(RecordField)
@@ -403,6 +407,7 @@ def build_record_table_tools() -> list:
                     await _resolve_actor_and_project(
                         session,
                         project_id=str(project_id_value),
+                        permission="write",
                     )
                 now = datetime.utcnow()
                 for row in rows:
@@ -443,6 +448,7 @@ def build_record_table_tools() -> list:
                     session,
                     project=project,
                     project_id=project_id,
+                    permission="write",
                 )
                 if resolved_project_id is None:
                     raise ValueError("No project could be resolved for the record table.")

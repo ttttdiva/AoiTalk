@@ -8,6 +8,8 @@ from contextlib import AsyncExitStack
 import json
 import os
 
+from ...utils.subprocess_env import build_aoitalk_subprocess_env
+
 from ..core import ToolDefinition, ToolParam
 
 try:
@@ -117,14 +119,21 @@ class MCPClient:
             
         if args is None:
             args = []
-        if env is None:
-            env = {}
-            
+        # The MCP SDK merges ``env`` with its own small platform allowlist,
+        # but this client must not pass the AoiTalk parent environment through
+        # as a default.  Only values supplied by the MCP server configuration
+        # are explicit child overrides.
+        explicit_env = env or {}
+        child_env = build_aoitalk_subprocess_env(
+            extra_env=explicit_env,
+            sensitive_env_keys=explicit_env,
+        )
+
         try:
             server_params = StdioServerParameters(
                 command=command,
                 args=args,
-                env=env
+                env=child_env,
             )
             
             # Add timeout to prevent hanging during server startup
@@ -145,7 +154,7 @@ class MCPClient:
             self.servers[name] = {
                 'command': command,
                 'args': args,
-                'env': env
+                'env': child_env,
             }
             
             logger.info(f"MCP server '{name}' connected successfully")
@@ -354,11 +363,12 @@ class MCPPlugin:
                     else:
                         actual_config = dict(server_config)
 
-                    # Start with current process environment (PATH, etc.)
-                    # then overlay config-specified env vars
+                    # Resolve only environment values explicitly present in
+                    # the server configuration.  The parent environment is
+                    # never copied wholesale; ``MCPClient.add_server`` adds
+                    # the fixed runtime allowlist and nothing else.
                     env = {**shared_env, **actual_config.get('env', {})}
-                    expanded_env = dict(os.environ)
-                    expanded_env['PYTHONIOENCODING'] = 'utf-8'
+                    expanded_env = {}
                     for key, value in env.items():
                         if isinstance(value, str) and value.startswith('${') and value.endswith('}'):
                             # Extract env var name and expand it
@@ -388,7 +398,15 @@ class MCPPlugin:
         if not self._initialized:
             logger.error("MCP plugin not initialized")
             return False
-        return await self.client.add_server(name, command, args, env)
+        # Keep this boundary explicit as well as the MCPClient boundary so
+        # callers that replace/instrument the client cannot accidentally pass
+        # the parent process environment to a server.
+        explicit_env = env or {}
+        child_env = build_aoitalk_subprocess_env(
+            extra_env=explicit_env,
+            sensitive_env_keys=explicit_env,
+        )
+        return await self.client.add_server(name, command, args, child_env)
     
     def is_initialized(self) -> bool:
         """Check if plugin is initialized"""

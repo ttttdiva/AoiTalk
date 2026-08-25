@@ -6,8 +6,9 @@ import { ExplorerUploadError, explorerUpload } from "@/lib/explorer-api";
 import { getDroppedExplorerFiles } from "@/lib/file-drop";
 import { Upload } from "lucide-react";
 import { toast } from "sonner";
-import { hfUploadFiles } from "@/lib/hf-api";
+import { HfUploadError, hfUploadFiles } from "@/lib/hf-api";
 import { parseHfPath } from "@/lib/hf/virtual-path";
+import { uploadFailureToastOptions } from "@/lib/upload-failure";
 
 interface UploadZoneProps {
   children: React.ReactNode;
@@ -15,25 +16,31 @@ interface UploadZoneProps {
 }
 
 export function UploadZone({ children, onContextMenu }: UploadZoneProps) {
-  const { currentPath, refresh, isHfMode, isHydrusMode } = useExplorer();
+  const { currentPath, refresh, isHfMode, isHydrusMode, capabilities } =
+    useExplorer();
   const [isDragging, setIsDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
   const dragCounterRef = useRef(0);
   const hfPath = isHfMode ? parseHfPath(currentPath) : null;
   const uploadEnabled =
     !isHydrusMode &&
-    (!isHfMode || Boolean(hfPath?.kind === "repo" && hfPath.accountId));
+    (isHfMode
+      ? Boolean(hfPath?.kind === "repo" && hfPath.accountId)
+      : capabilities.canCreate);
 
-  const handleDragEnter = useCallback((e: React.DragEvent) => {
-    // 内部D&D（ファイル移動）の場合はアップロードUIを出さない
-    if (e.dataTransfer.types.includes("application/x-explorer-paths")) return;
-    e.preventDefault();
-    e.stopPropagation();
-    dragCounterRef.current++;
-    if (dragCounterRef.current === 1) {
-      setIsDragging(uploadEnabled);
-    }
-  }, [uploadEnabled]);
+  const handleDragEnter = useCallback(
+    (e: React.DragEvent) => {
+      // 内部D&D（ファイル移動）の場合はアップロードUIを出さない
+      if (e.dataTransfer.types.includes("application/x-explorer-paths")) return;
+      e.preventDefault();
+      e.stopPropagation();
+      dragCounterRef.current++;
+      if (dragCounterRef.current === 1) {
+        setIsDragging(uploadEnabled);
+      }
+    },
+    [uploadEnabled],
+  );
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     // 内部D&D（ファイル移動）の場合はアップロードUIを出さない
@@ -78,7 +85,10 @@ export function UploadZone({ children, onContextMenu }: UploadZoneProps) {
           ? await hfUploadFiles(currentPath, files)
           : await explorerUpload(currentPath, files);
         if (result.failureCount > 0) {
-          toast.warning(`${result.successCount}件成功、${result.failureCount}件失敗しました`);
+          toast.warning(
+            `${result.successCount}件成功、${result.failureCount}件失敗しました`,
+            uploadFailureToastOptions(result.failures),
+          );
         } else {
           toast.success(`${result.successCount}件アップロードしました`);
         }
@@ -91,10 +101,22 @@ export function UploadZone({ children, onContextMenu }: UploadZoneProps) {
             successCount > 0
               ? `${successCount}件アップロード、${failureCount}件失敗しました`
               : error.message,
+            uploadFailureToastOptions(error.batchResult.failures),
+          );
+        } else if (error instanceof HfUploadError) {
+          const { successCount, failureCount } = error.batchResult;
+          if (successCount > 0) await refresh();
+          toast.error(
+            successCount > 0
+              ? `${successCount}件アップロード、${failureCount}件失敗しました`
+              : error.message,
+            uploadFailureToastOptions(error.batchResult.failures),
           );
         } else {
           toast.error(
-            error instanceof Error ? error.message : "アップロードに失敗しました",
+            error instanceof Error
+              ? error.message
+              : "アップロードに失敗しました",
           );
         }
       } finally {

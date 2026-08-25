@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 class AntigravityCLIBackend(CLIBackendBase):
     """Antigravity CLI backend implementation."""
 
+    scoped_execution_delegate = True
+
     prompt_stdin_supported = False
     direct_prompt_max_length = 24000
     _ssh_session_env_names = ("SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY")
@@ -51,7 +53,12 @@ class AntigravityCLIBackend(CLIBackendBase):
         if model and model.lower() != "default":
             cmd.extend(["--model", model])
 
-        log_file = os.getenv("AGY_LOG_FILE")
+        # A host log path would be unreachable (and potentially outside the
+        # repository) inside the scoped WSL namespace.  Keep it only for the
+        # ordinary unscoped desktop path.
+        log_file = (
+            None if self._active_run_scope() is not None else os.getenv("AGY_LOG_FILE")
+        )
         if log_file:
             cmd.extend(["--log-file", str(log_file)])
 
@@ -68,12 +75,12 @@ class AntigravityCLIBackend(CLIBackendBase):
     def get_provider_name(self) -> str:
         return "Antigravity CLI"
 
-    def get_subprocess_env(self) -> Optional[Dict[str, str]]:
+    def get_subprocess_env(self) -> Dict[str, str]:
         """Use normal desktop auth even when AoiTalk was launched over SSH."""
+        env = super().get_subprocess_env()
         if self._truthy_env("AGY_PRESERVE_SSH_ENV", default=False):
-            return None
+            return env
 
-        env = os.environ.copy()
         removed = [name for name in self._ssh_session_env_names if name in env]
         for name in removed:
             env.pop(name, None)
@@ -106,6 +113,34 @@ class AntigravityCLIBackend(CLIBackendBase):
         """
         combined_prompt = self._combine_prompt(prompt, system_context)
         prompt_cleanup: Optional[Callable[[], None]] = None
+
+        scoped = self._active_run_scope()
+        if scoped is not None:
+            # Never create the historical profile/temp workspace for a trusted
+            # repository worker: those paths are outside the WSL mount and
+            # would make the provider's ``--add-dir`` escape ambiguous.
+            try:
+                scoped_cwd = scoped.assert_command_cwd_allowed(
+                    scoped.canonical_root if cwd is None else cwd
+                )
+            except Exception as exc:
+                return False, f"Antigravity CLI scoped execution denied: {exc}"
+            self._active_print_timeout = os.getenv("AGY_PRINT_TIMEOUT") or (
+                f"{max(int(timeout) - 2, 1)}s" if timeout is not None else None
+            )
+            self._active_add_dirs = []
+            try:
+                return super().execute_prompt(
+                    combined_prompt,
+                    cwd=scoped_cwd,
+                    timeout=timeout,
+                    extra_args=extra_args,
+                    system_context=None,
+                    event_callback=event_callback,
+                )
+            finally:
+                self._active_print_timeout = None
+                self._active_add_dirs = []
 
         if len(combined_prompt) > self.direct_prompt_max_length:
             combined_prompt, prompt_cleanup = self._prompt_file_instruction(

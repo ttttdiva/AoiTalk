@@ -4,7 +4,8 @@
 # ============================================================================
 #
 # 使用方法:
-#   基本起動:      docker compose up -d
+#   fail-closed確認: docker compose up -d --build --wait
+#   正式起動:      docker compose -f docker-compose.yml -f docker-compose.sglang.yml --profile sglang up -d --build --wait
 #   VOICEVOX付き:  docker compose --profile voicevox up -d
 #   全サービス:    docker compose --profile voicevox --profile aivisspeech up -d
 #   停止:          docker compose down
@@ -20,16 +21,50 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: aoitalk
-    ports:
-      - "3000:3000"
+      secrets:
+        - nextauth_secret
+    secrets:
+      - postgres_password
+      - nextauth_secret
+      - web_auth_secret
+      - jwt_secret
+      - app_bridge_secret
+      - internal_api_key
+      - caddy_gate_key
+      - bootstrap_admin_password
+      - openai_api_key
+      - openrouter_api_key
+      - moonshot_api_key
+      - gemini_api_key
+      - xai_api_key
+      - nijivoice_api_key
+      - openweather_api_key
+      - webex_client_secret
+      - webex_state_secret
+      - field_crypto_key_b64
+      - sglang_api_key
     environment:
+      # Enterprise/Dockerの責任境界。外部公開はcaddyサービスだけが担当する。
+      - AIVTUBER_ENV=enterprise
+      - AOITALK_PROFILE=enterprise
+      - AOITALK_DOCKER=true
+      - AOITALK_REQUIRE_DATABASE=true
+      - AOITALK_REQUIRE_AUTH_SECRET=true
+      - AOITALK_SKIP_CADDY=true
+      # 3002 is not host-published; only the Caddy service on aoitalk-network
+      # may supply canonical client forwarding headers.
+      - AOITALK_LOGIN_TRUST_PROXY=true
+      - AOITALK_FASTAPI_SESSION_COOKIE=${AOITALK_FASTAPI_SESSION_COOKIE:-aoitalk_fastapi_session}
+      - AOITALK_WEB_HOST=0.0.0.0
+      - AOITALK_NEXT_HOST=0.0.0.0
+      - AOITALK_FRONTEND_HOST=0.0.0.0
+      - AOITALK_WEB_AUTO_OPEN=false
       # PostgreSQL接続
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_DB=aoitalk_memory
       - POSTGRES_USER=aoitalk
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-aoitalk_password}
+      - POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password
       - USE_POSTGRESQL=true
       # Qdrant接続
       - QDRANT_HOST=qdrant
@@ -40,23 +75,44 @@ services:
       - AIVISSPEECH_HOST=aivisspeech
       - AIVISSPEECH_PORT=10101
       # API Keys (ホストの.envから引き継ぎ)
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENAI_API_KEY_FILE=/run/secrets/openai_api_key
+      - OPENROUTER_API_KEY_FILE=/run/secrets/openrouter_api_key
       - OPENROUTER_SITE_URL=${OPENROUTER_SITE_URL:-}
-      - MOONSHOT_API_KEY=${MOONSHOT_API_KEY:-}
+      - MOONSHOT_API_KEY_FILE=/run/secrets/moonshot_api_key
       - MOONSHOT_BASE_URL=${MOONSHOT_BASE_URL:-}
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - XAI_API_KEY=${XAI_API_KEY:-}
-      - NIJIVOICE_API_KEY=${NIJIVOICE_API_KEY:-}
-      - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY:-}
+      - GEMINI_API_KEY_FILE=/run/secrets/gemini_api_key
+      - XAI_API_KEY_FILE=/run/secrets/xai_api_key
+      - NIJIVOICE_API_KEY_FILE=/run/secrets/nijivoice_api_key
+      - OPENWEATHER_API_KEY_FILE=/run/secrets/openweather_api_key
+      # Webex Messaging OAuth
+      - WEBEX_CLIENT_ID=${WEBEX_CLIENT_ID:-}
+      - WEBEX_CLIENT_SECRET_FILE=/run/secrets/webex_client_secret
+      - WEBEX_REDIRECT_URI=${WEBEX_REDIRECT_URI:-}
+      - WEBEX_STATE_SECRET_FILE=/run/secrets/webex_state_secret
       # WebUI/API認証 (アカウントはDB管理)
-      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:-}
-      - AOITALK_WEB_AUTH_SECRET=${AOITALK_WEB_AUTH_SECRET:-}
-      - AOITALK_JWT_SECRET=${AOITALK_JWT_SECRET:-}
-      - INTERNAL_API_KEY=${INTERNAL_API_KEY:-}
-      # Docker固有設定
+      - NEXTAUTH_SECRET_FILE=/run/secrets/nextauth_secret
+      - AOITALK_WEB_AUTH_SECRET_FILE=/run/secrets/web_auth_secret
+      - AOITALK_JWT_SECRET_FILE=/run/secrets/jwt_secret
+      - AOITALK_APP_BRIDGE_SECRET_FILE=/run/secrets/app_bridge_secret
+      - INTERNAL_API_KEY_FILE=/run/secrets/internal_api_key
+      - AOITALK_CADDY_GATE_KEY_FILE=/run/secrets/caddy_gate_key
+      - AOITALK_BOOTSTRAP_ADMIN_USERNAME=${AOITALK_BOOTSTRAP_ADMIN_USERNAME:-admin}
+      - AOITALK_BOOTSTRAP_ADMIN_PASSWORD_FILE=/run/secrets/bootstrap_admin_password
+      # Field encryption is used by both FastAPI and Next.js. Production Linux
+      # deployments should provide a keyring/KMS command; the local file is a
+      # deliberately opt-in fallback for isolated verification only.
+      - AOITALK_FIELD_CRYPTO_KEY_COMMAND=${AOITALK_FIELD_CRYPTO_KEY_COMMAND:-}
+      - AOITALK_FIELD_CRYPTO_KEY_B64_FILE=/run/secrets/field_crypto_key_b64
+      - AOITALK_FIELD_CRYPTO_ALLOW_ENV_KEY=${AOITALK_FIELD_CRYPTO_ALLOW_ENV_KEY:-false}
+      - AOITALK_FIELD_CRYPTO_ALLOW_LOCAL_KEY_FILE=${AOITALK_FIELD_CRYPTO_ALLOW_LOCAL_KEY_FILE:-false}
+      - AOITALK_FIELD_CRYPTO_LOCAL_KEY_FILE=${AOITALK_FIELD_CRYPTO_LOCAL_KEY_FILE:-/app/cache/field-crypto.key}
+      # SGLangは同一ネットワーク上の任意サービス。初回はGemma 4 E4B BF16。
+      - SGLANG_BASE_URL=${SGLANG_BASE_URL:-http://sglang:30000/v1}
+      - SGLANG_MODEL=${SGLANG_MODEL:-google/gemma-4-E4B-it}
+      - SGLANG_REASONING_PARSER=${SGLANG_REASONING_PARSER:-gemma4}
+      - SGLANG_TOOL_CALL_PARSER=${SGLANG_TOOL_CALL_PARSER:-gemma4}
+      - SGLANG_API_KEY_FILE=/run/secrets/sglang_api_key
       - AOITALK_HEADLESS=true
-      - AOITALK_WEB_AUTO_OPEN=false
     volumes:
       # 設定ファイル (読み取り専用)
       - ./config:/app/config:ro
@@ -67,27 +123,254 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      qdrant:
-        condition: service_started
+      qdrant-ready:
+        condition: service_healthy
+      aoitalk-storage-init:
+        condition: service_completed_successfully
+      sglang:
+        condition: service_healthy
+        required: false
+    healthcheck:
+      # Enterprise is configured for SGLang/Gemma 4 E4B.  Keep the base
+      # profile fail-closed: without --profile sglang, AoiTalk must not report
+      # healthy while chat would fail on the missing service DNS name.
+      test:
+        - CMD-SHELL
+        - >-
+          curl -fsS http://127.0.0.1:3000/health >/dev/null &&
+          curl -fsS http://127.0.0.1:3002/login >/dev/null &&
+          curl -fsS http://sglang:30000/health >/dev/null || {
+          echo 'SGLang is not healthy; start with --profile sglang and docker-compose.sglang.yml' >&2;
+          exit 1;
+          }
+      interval: 10s
+      timeout: 10s
+      retries: ${AOITALK_HEALTHCHECK_RETRIES:-180}
+      start_period: ${AOITALK_HEALTHCHECK_START_PERIOD:-600s}
     networks:
       - aoitalk-network
     restart: unless-stopped
+
+  # Bind mounts created by Compose are root-owned on a fresh Linux checkout.
+  # Prepare them before the non-root application container starts.
+  aoitalk-storage-init:
+    image: busybox:1.36
+    user: "0:0"
+    network_mode: none
+    command:
+      - sh
+      - -ec
+      - >-
+        mkdir -p /logs /cache /workspaces /logs/web &&
+        chown -R 1000:1000 /logs /cache /workspaces
+    volumes:
+      - ./workspaces:/workspaces
+      - ./cache:/cache
+      - ./logs:/logs
+    restart: "no"
+
+  # ========================================================================
+  # Caddy: 外部公開/TLSの単一境界。aoitalkの3000/3002はホストへ公開しない。
+  # 会社運用では AOITALK_CADDY_SITE_ADDRESS と証明書運用を明示する。
+  # ========================================================================
+  caddy:
+    image: caddy:2.11.2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
+    environment:
+      - AOITALK_CADDY_SITE_ADDRESS=${AOITALK_CADDY_SITE_ADDRESS:-localhost}
+      - AOITALK_CADDY_PORT=${AOITALK_CADDY_PORT:-443}
+      - AOITALK_CADDY_TLS_DIRECTIVE=${AOITALK_CADDY_TLS_DIRECTIVE:-}
+      - AOITALK_BOOTSTRAP_CADDY_PORT=${AOITALK_BOOTSTRAP_CADDY_PORT:-8443}
+      - AOITALK_BOOTSTRAP_HTTPS_PORT=${AOITALK_BOOTSTRAP_HTTPS_PORT:-8443}
+      # The host publish below is loopback-only; the container listener must
+      # bind its bridge interface so Docker can forward that host port.
+      - AOITALK_BOOTSTRAP_BIND_ADDRESS=0.0.0.0
+      - AOITALK_CADDY_HEALTH_HOST=${AOITALK_CADDY_HEALTH_HOST:-127.0.0.1}
+      - AOITALK_CADDY_HEALTH_PORT=${AOITALK_CADDY_HEALTH_PORT:-8080}
+      - AOITALK_FASTAPI_SESSION_COOKIE=${AOITALK_FASTAPI_SESSION_COOKIE:-aoitalk_fastapi_session}
+      - AOITALK_CADDY_FASTAPI_UPSTREAM=aoitalk:3000
+      - AOITALK_CADDY_NEXT_UPSTREAM=aoitalk:3002
+      - AOITALK_CADDY_ACCESS_LOG=/logs/web/caddy-access.log
+      - AOITALK_CADDY_RUNTIME_LOG=/logs/web/caddy-runtime.log
+      - AOITALK_CADDY_GATE_KEY_FILE=/run/secrets/caddy_gate_key
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        test -s "$${AOITALK_CADDY_GATE_KEY_FILE}" || {
+        echo "Caddy gate secret is missing" >&2; exit 1; };
+        export AOITALK_CADDY_GATE_KEY="$$(cat "$${AOITALK_CADDY_GATE_KEY_FILE}")";
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+    secrets:
+      - caddy_gate_key
+    ports:
+      # Public listeners exist from first start, but Caddy denies every request
+      # until the bootstrap administrator has changed the initial password.
+      - "${AOITALK_PUBLIC_BIND_ADDRESS:-0.0.0.0}:${AOITALK_HTTP_PORT:-80}:80"
+      - "${AOITALK_PUBLIC_BIND_ADDRESS:-0.0.0.0}:${AOITALK_HTTPS_PORT:-443}:${AOITALK_CADDY_PORT:-443}"
+      # Only a user on the server can reach the initial setup listener.
+      - "127.0.0.1:${AOITALK_BOOTSTRAP_HTTPS_PORT:-8443}:${AOITALK_BOOTSTRAP_CADDY_PORT:-8443}"
+    volumes:
+      # Compose is the Linux Enterprise boundary; do not allow an arbitrary
+      # host path to replace the bootstrap/LAN gate.
+      - ./caddy/Caddyfile.enterprise:/etc/caddy/Caddyfile:ro
+      # Optional company-CA certificate/key directory for deployment-specific
+      # Caddyfile entries such as: tls /etc/caddy/certs/server.crt /etc/caddy/certs/server.key
+      - ${AOITALK_CADDY_CERTS_DIR:-./caddy/certs}:/etc/caddy/certs:ro
+      - ./logs:/logs
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      caddy-port-contract:
+        condition: service_completed_successfully
+      aoitalk:
+        # Caddy must be able to expose the localhost-only bootstrap UI while
+        # the optional GPU/SGLang readiness gate is still pending.  The strict
+        # sglang overlay keeps AoiTalk itself from starting until SGLang is
+        # healthy; the base profile remains fail-closed for chat readiness.
+        condition: service_started
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          wget -q
+          -O /dev/null
+          "http://$${AOITALK_CADDY_HEALTH_HOST}:$${AOITALK_CADDY_HEALTH_PORT}/healthz"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    networks:
+      - aoitalk-network
+    restart: unless-stopped
+
+  # Caddy's listener port and the host's published HTTPS port must be the
+  # same value. Otherwise Caddy can be healthy internally while redirects
+  # and browser URLs point at a different external port.
+  caddy-port-contract:
+    image: busybox:1.36
+    environment:
+      - EXTERNAL_HTTPS_PORT=${AOITALK_HTTPS_PORT:-443}
+      - CADDY_HTTPS_PORT=${AOITALK_CADDY_PORT:-443}
+      - EXTERNAL_HTTP_PORT=${AOITALK_HTTP_PORT:-80}
+      - BOOTSTRAP_HTTPS_PORT=${AOITALK_BOOTSTRAP_HTTPS_PORT:-8443}
+      - BOOTSTRAP_CADDY_PORT=${AOITALK_BOOTSTRAP_CADDY_PORT:-8443}
+      - HEALTH_HTTP_PORT=${AOITALK_CADDY_HEALTH_PORT:-8080}
+    command:
+      - sh
+      - -ec
+      - >-
+        test "$$EXTERNAL_HTTPS_PORT" = "$$CADDY_HTTPS_PORT" || {
+        echo "AOITALK_HTTPS_PORT と AOITALK_CADDY_PORT は同値が必要です" >&2;
+        exit 1;
+        };
+        test "$$BOOTSTRAP_HTTPS_PORT" = "$$BOOTSTRAP_CADDY_PORT" || {
+        echo "AOITALK_BOOTSTRAP_HTTPS_PORT と AOITALK_BOOTSTRAP_CADDY_PORT は同値が必要です" >&2;
+        exit 1;
+        };
+        test "$$BOOTSTRAP_HTTPS_PORT" != "$$EXTERNAL_HTTPS_PORT" || {
+        echo "bootstrap HTTPS と public HTTPS は別ポートが必要です" >&2;
+        exit 1;
+        };
+        test "$$BOOTSTRAP_HTTPS_PORT" != "$$EXTERNAL_HTTP_PORT" || {
+        echo "bootstrap HTTPS と public HTTP は別ポートが必要です" >&2;
+        exit 1;
+        };
+        test "$$EXTERNAL_HTTP_PORT" != "$$EXTERNAL_HTTPS_PORT" || {
+        echo "public HTTP と public HTTPS は別ポートが必要です" >&2;
+        exit 1;
+        };
+        test "$$CADDY_HTTPS_PORT" != "80" || {
+        echo "public HTTPS はCaddyのHTTPポート80と衝突できません" >&2;
+        exit 1;
+        };
+        test "$$HEALTH_HTTP_PORT" != "80" || {
+        echo "loopback health HTTP と public HTTP は別ポートが必要です" >&2;
+        exit 1;
+        };
+        test "$$HEALTH_HTTP_PORT" != "$$CADDY_HTTPS_PORT" || {
+        echo "loopback health HTTP と public HTTPS は別ポートが必要です" >&2;
+        exit 1;
+        };
+        test "$$HEALTH_HTTP_PORT" != "$$BOOTSTRAP_CADDY_PORT" || {
+        echo "loopback health HTTP と bootstrap HTTPS は別ポートが必要です" >&2;
+        exit 1;
+        }
+    networks:
+      - aoitalk-network
+
+  # ========================================================================
+  # SGLang: GPU環境が整っている場合だけ --profile sglang で起動する。
+  # NVIDIA Container Toolkit/CDIがないホストでは、先に管理者側で整備する。
+  # ========================================================================
+  sglang:
+    # Pin the tested Gemma 4 runtime. Override SGLANG_IMAGE deliberately when
+    # the company has approved a newer digest.
+    image: ${SGLANG_IMAGE:-lmsysorg/sglang@sha256:7b6a35df9839fd593a94a1eaee82d7777f472225d9f3ad1f8a2e0cb2bd1785d0}
+    environment:
+      - SGLANG_MODEL=${SGLANG_MODEL:-google/gemma-4-E4B-it}
+      - SGLANG_REASONING_PARSER=${SGLANG_REASONING_PARSER:-gemma4}
+      - SGLANG_TOOL_CALL_PARSER=${SGLANG_TOOL_CALL_PARSER:-gemma4}
+      - HF_HOME
+      - HF_HUB_CACHE
+    secrets:
+      - hf_token
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        if test -s /run/secrets/hf_token; then
+        export HF_TOKEN="$$(cat /run/secrets/hf_token)";
+        export HUGGING_FACE_HUB_TOKEN="$$HF_TOKEN";
+        fi;
+        exec sglang serve
+        --model-path "$${SGLANG_MODEL:-google/gemma-4-E4B-it}"
+        --served-model-name "$${SGLANG_MODEL:-google/gemma-4-E4B-it}"
+        --dtype bfloat16
+        --reasoning-parser "$${SGLANG_REASONING_PARSER:-gemma4}"
+        --tool-call-parser "$${SGLANG_TOOL_CALL_PARSER:-gemma4}"
+        --mem-fraction-static 0.80
+        --host 0.0.0.0
+        --port 30000
+    expose:
+      - "30000"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import json, os, urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:30000/health', timeout=5);
+          data=json.load(urllib.request.urlopen('http://127.0.0.1:30000/v1/models', timeout=5));
+          names={item.get('id') for item in data.get('data', [])};
+          assert os.environ.get('SGLANG_MODEL') in names"
+      interval: 10s
+      timeout: 10s
+      # Gemma 4 cold-start includes weight download/load and can exceed 15
+      # minutes on a fresh host. Keep strict Enterprise startup from marking
+      # a healthy GPU service as failed while that one-time work is ongoing.
+      retries: ${SGLANG_HEALTHCHECK_RETRIES:-180}
+      start_period: ${SGLANG_HEALTHCHECK_START_PERIOD:-600s}
+    gpus: all
+    shm_size: "32gb"
+    networks:
+      - aoitalk-network
+    restart: unless-stopped
+    profiles:
+      - sglang
 
   # ==========================================================================
   # PostgreSQL + pgvector (会話履歴・ユーザー管理)
   # ==========================================================================
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: aoitalk-postgres
     environment:
       - POSTGRES_USER=aoitalk
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-aoitalk_password}
+      - POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password
       - POSTGRES_DB=aoitalk_memory
+    secrets:
+      - postgres_password
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${POSTGRES_PUBLISHED_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U aoitalk -d aoitalk_memory"]
       interval: 10s
@@ -102,13 +385,44 @@ services:
   # Qdrant (ベクトル検索・RAG)
   # ==========================================================================
   qdrant:
-    image: qdrant/qdrant:latest
-    container_name: aoitalk-qdrant
+    # Keep the vector-store image reproducible across the Enterprise rollout.
+    image: ${QDRANT_IMAGE:-qdrant/qdrant@sha256:94728574965d17c6485dd361aa3c0818b325b9016dac5ea6afec7b4b2700865f}
     volumes:
       - qdrant_data:/qdrant/storage
     ports:
-      - "127.0.0.1:6333:6333"
-      - "127.0.0.1:6334:6334"
+      - "127.0.0.1:${QDRANT_PUBLISHED_PORT:-6333}:6333"
+      - "127.0.0.1:${QDRANT_GRPC_PUBLISHED_PORT:-6334}:6334"
+    healthcheck:
+      # Official Qdrant images do not ship curl. This check only verifies that
+      # the process is alive; qdrant-ready below performs the HTTP readiness
+      # check using a dedicated curl image before AoiTalk starts.
+      test: ["CMD", "/qdrant/qdrant", "--version"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - aoitalk-network
+    restart: unless-stopped
+
+  qdrant-ready:
+    image: curlimages/curl:8.16.0
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        until curl -fsS http://qdrant:6333/readyz >/dev/null; do
+          sleep 2;
+        done;
+        tail -f /dev/null
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://qdrant:6333/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    depends_on:
+      qdrant:
+        condition: service_healthy
     networks:
       - aoitalk-network
     restart: unless-stopped
@@ -119,9 +433,10 @@ services:
   # ==========================================================================
   voicevox:
     image: voicevox/voicevox_engine:cpu-ubuntu20.04-latest
-    container_name: aoitalk-voicevox
+    # VOICEVOX is an unauthenticated internal engine.  Keep it loopback-only
+    # even when AOITALK_BIND_ADDRESS=0.0.0.0 is used for the Caddy boundary.
     ports:
-      - "50021:50021"
+      - "127.0.0.1:${VOICEVOX_PUBLISHED_PORT:-50021}:50021"
     networks:
       - aoitalk-network
     restart: unless-stopped
@@ -134,9 +449,9 @@ services:
   # ==========================================================================
   voicevox-gpu:
     image: voicevox/voicevox_engine:nvidia-ubuntu20.04-latest
-    container_name: aoitalk-voicevox-gpu
+    # Keep the optional unauthenticated engine off the LAN.
     ports:
-      - "50021:50021"
+      - "127.0.0.1:${VOICEVOX_PUBLISHED_PORT:-50021}:50021"
     networks:
       - aoitalk-network
     restart: unless-stopped
@@ -183,3 +498,51 @@ volumes:
     driver: local
   qdrant_data:
     driver: local
+  caddy_data:
+    driver: local
+  caddy_config:
+    driver: local
+
+# BuildKit reads this value only for the frontend build and does not persist it
+# in Dockerfile ARG/history layers.
+secrets:
+  nextauth_secret:
+    environment: NEXTAUTH_SECRET
+  postgres_password:
+    environment: POSTGRES_PASSWORD
+  web_auth_secret:
+    environment: AOITALK_WEB_AUTH_SECRET
+  jwt_secret:
+    environment: AOITALK_JWT_SECRET
+  app_bridge_secret:
+    environment: AOITALK_APP_BRIDGE_SECRET
+  internal_api_key:
+    environment: INTERNAL_API_KEY
+  caddy_gate_key:
+    environment: AOITALK_CADDY_GATE_KEY
+  bootstrap_admin_password:
+    environment: AOITALK_BOOTSTRAP_ADMIN_PASSWORD
+  openai_api_key:
+    environment: OPENAI_API_KEY
+  openrouter_api_key:
+    environment: OPENROUTER_API_KEY
+  moonshot_api_key:
+    environment: MOONSHOT_API_KEY
+  gemini_api_key:
+    environment: GEMINI_API_KEY
+  xai_api_key:
+    environment: XAI_API_KEY
+  nijivoice_api_key:
+    environment: NIJIVOICE_API_KEY
+  openweather_api_key:
+    environment: OPENWEATHER_API_KEY
+  webex_client_secret:
+    environment: WEBEX_CLIENT_SECRET
+  webex_state_secret:
+    environment: WEBEX_STATE_SECRET
+  field_crypto_key_b64:
+    environment: AOITALK_FIELD_CRYPTO_KEY_B64
+  sglang_api_key:
+    environment: SGLANG_API_KEY
+  hf_token:
+    environment: HF_TOKEN

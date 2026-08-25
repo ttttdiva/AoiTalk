@@ -18,12 +18,76 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from ..text_content import TextContentError, read_safe_text, read_safe_text_lines
+
 logger = logging.getLogger(__name__)
 
 
 class FileEditorError(Exception):
     """Exception raised by FileEditor operations."""
-    pass
+
+    def __init__(self, message: str, *, error_code: str = ""):
+        super().__init__(message)
+        self.error_code = error_code
+
+
+def _run_scoped_path(path: str, *, access: str, operation: str) -> Path:
+    """Resolve *path* through the active run contract when one is bound.
+
+    The editor is also used by ordinary user/app APIs, so an absent scope keeps
+    the historical path behaviour.  Agent runs bind ``AgentRunScope`` in their
+    task context; in that case every path is checked before any filesystem
+    operation (including a create with a missing final component).
+    """
+
+    try:
+        from ...security.agent_run_scope import (
+            RunScopeViolation,
+            get_current_run_scope,
+        )
+    except ImportError:  # pragma: no cover - defensive for stripped builds
+        return Path(path).resolve()
+
+    scope = get_current_run_scope()
+    if scope is None:
+        return Path(path).resolve()
+    try:
+        if access == "read":
+            return scope.assert_read_allowed(path)
+        if access == "delete":
+            return scope.assert_delete_allowed(path)
+        return scope.assert_mutation_allowed(path, operation)
+    except RunScopeViolation as exc:
+        raise FileEditorError(str(exc), error_code="run_scope_violation") from exc
+
+
+def allowed_absolute_paths() -> List[str]:
+    """AOITALK_ALLOWED_PATHS による許可ディレクトリ（未設定なら制限なし）。
+
+    ファイル系ツールの許可パス判定はここ1系統に統一する。呼び出しごとに
+    環境変数を読むので、起動後に設定を変えても判定が食い違わない。
+    """
+    raw = os.environ.get("AOITALK_ALLOWED_PATHS", "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def path_outside_allowed_error(
+    path: str,
+    allowed_paths: Optional[List[str]] = None,
+) -> Optional[str]:
+    """許可ディレクトリ外なら理由文字列、許可されていれば None を返す。"""
+    allowed = list(allowed_paths) if allowed_paths is not None else allowed_absolute_paths()
+    if not allowed:
+        return None
+
+    target = Path(path).resolve()
+    for item in allowed:
+        try:
+            target.relative_to(Path(item).resolve())
+            return None
+        except ValueError:
+            continue
+    return f"Path is outside allowed directories: {path}. Allowed: {allowed}"
 
 
 class FileEditor:
@@ -50,22 +114,38 @@ class FileEditor:
         
         Args:
             allowed_paths: List of paths where files can be edited.
-                          If None, loads from AOITALK_ALLOWED_PATHS env var.
+                          If None, AOITALK_ALLOWED_PATHS is read on every check
+                          （起動時スナップショットにしない）。
         """
-        # Load allowed paths from environment if not specified
-        if allowed_paths is None:
-            env_paths = os.environ.get("AOITALK_ALLOWED_PATHS", "")
-            if env_paths:
-                self.allowed_paths = [p.strip() for p in env_paths.split(",") if p.strip()]
-            else:
-                self.allowed_paths = []
-        else:
-            self.allowed_paths = allowed_paths
-            
+        # 明示指定が無い場合は環境変数を判定のたびに読む。シングルトン生成時に
+        # 固定すると、同じ read_file でも行範囲指定の有無で判定が食い違う。
+        self._explicit_allowed_paths: Optional[List[str]] = (
+            list(allowed_paths) if allowed_paths is not None else None
+        )
+
         # Per-file edit history for undo
         self._file_history: Dict[Path, List[str]] = defaultdict(list)
-        
-    def _validate_path(self, path: str, must_exist: bool = True, allow_create: bool = False) -> Path:
+
+    @property
+    def allowed_paths(self) -> List[str]:
+        if self._explicit_allowed_paths is not None:
+            return list(self._explicit_allowed_paths)
+        return allowed_absolute_paths()
+
+    @allowed_paths.setter
+    def allowed_paths(self, value: Optional[List[str]]) -> None:
+        self._explicit_allowed_paths = list(value) if value is not None else None
+
+    def _validate_path(
+        self,
+        path: str,
+        must_exist: bool = True,
+        allow_create: bool = False,
+        max_file_size: Optional[int] = None,
+        *,
+        access: str = "read",
+        operation: str = "read",
+    ) -> Path:
         """
         Validate and resolve a file path.
         
@@ -80,24 +160,15 @@ class FileEditor:
         Raises:
             FileEditorError: If path is invalid or outside allowed paths.
         """
-        file_path = Path(path).resolve()
-        
+        file_path = _run_scoped_path(path, access=access, operation=operation)
+
         # Check if path is within allowed paths (if restrictions are set)
-        if self.allowed_paths:
-            allowed = False
-            for allowed_path in self.allowed_paths:
-                try:
-                    file_path.relative_to(Path(allowed_path).resolve())
-                    allowed = True
-                    break
-                except ValueError:
-                    continue
-            if not allowed:
-                raise FileEditorError(
-                    f"Path is outside allowed directories: {path}. "
-                    f"Allowed: {self.allowed_paths}"
-                )
-                
+        # Check the canonical candidate.  In a run scope a relative input is
+        # resolved against the selected repository, not the process cwd.
+        denied = path_outside_allowed_error(str(file_path), self._explicit_allowed_paths)
+        if denied:
+            raise FileEditorError(denied)
+
         # Check existence
         if must_exist and not file_path.exists():
             raise FileEditorError(f"File does not exist: {path}")
@@ -106,11 +177,13 @@ class FileEditor:
             if file_path.is_dir():
                 raise FileEditorError(f"Path is a directory, not a file: {path}")
                 
-            # Check file size
-            if file_path.stat().st_size > self.MAX_FILE_SIZE:
+            # Read-only callers may provide a separate ceiling without
+            # changing the 10MB edit/write limit used by mutation methods.
+            size_limit = self.MAX_FILE_SIZE if max_file_size is None else max_file_size
+            if file_path.stat().st_size > size_limit:
                 raise FileEditorError(
                     f"File too large ({file_path.stat().st_size / 1024 / 1024:.1f}MB). "
-                    f"Maximum: {self.MAX_FILE_SIZE / 1024 / 1024:.0f}MB"
+                    f"Maximum: {size_limit / 1024 / 1024:.0f}MB"
                 )
                 
         return file_path
@@ -118,21 +191,30 @@ class FileEditor:
     def _read_file(self, path: Path) -> str:
         """Read file contents."""
         try:
-            return path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            # Try with other encodings
-            for encoding in ["utf-8-sig", "cp932", "shift_jis", "latin-1"]:
-                try:
-                    return path.read_text(encoding=encoding)
-                except UnicodeDecodeError:
-                    continue
-            raise FileEditorError(f"Could not decode file: {path}")
+            # Imported lazily to avoid coupling module import order while using
+            # the same extension hints as preview/full-content reads.
+            from ..file_explorer.file_explorer_service import TEXT_EXTENSIONS
+
+            content, _encoding = read_safe_text(
+                path,
+                known_text_extensions=TEXT_EXTENSIONS,
+            )
+            return content
+        except TextContentError as e:
+            raise FileEditorError(
+                "Binary files cannot be read as text",
+                error_code=getattr(e, "error_code", "binary_file"),
+            ) from e
         except Exception as e:
             raise FileEditorError(f"Failed to read file: {e}")
             
     def _write_file(self, path: Path, content: str) -> None:
         """Write content to file."""
         try:
+            # Re-check immediately before the write.  The public mutators do a
+            # preflight in ``_validate_path``; this second check also protects
+            # future/internal callers that invoke ``_write_file`` directly.
+            _run_scoped_path(str(path), access="mutation", operation="write")
             # Ensure parent directory exists
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
@@ -183,7 +265,9 @@ class FileEditor:
         self,
         path: str,
         start_line: Optional[int] = None,
-        end_line: Optional[int] = None
+        end_line: Optional[int] = None,
+        *,
+        max_file_size: Optional[int] = None,
     ) -> str:
         """
         View file contents with line numbers.
@@ -196,38 +280,59 @@ class FileEditor:
         Returns:
             Formatted file content with line numbers.
         """
-        file_path = self._validate_path(path, must_exist=True)
-        content = self._read_file(file_path)
-        lines = content.split("\n")
-        n_lines = len(lines)
-        
-        init_line = 1
-        
+        file_path = self._validate_path(
+            path,
+            must_exist=True,
+            max_file_size=max_file_size,
+            access="read",
+            operation="read",
+        )
+        size_limit = self.MAX_FILE_SIZE if max_file_size is None else max_file_size
+
         if start_line is not None or end_line is not None:
-            # Validate line range
             start = start_line if start_line is not None else 1
-            end = end_line if end_line is not None else n_lines
-            
+            end = end_line
             if start < 1:
                 raise FileEditorError(f"start_line must be >= 1, got {start}")
+            if end is not None and end != -1 and end < start:
+                raise FileEditorError(
+                    f"end_line ({end}) must be >= start_line ({start})"
+                )
+            if end == -1:
+                end = None
+
+            try:
+                from ..file_explorer.file_explorer_service import TEXT_EXTENSIONS
+
+                selected, n_lines, _encoding = read_safe_text_lines(
+                    file_path,
+                    start_line=start,
+                    end_line=end,
+                    max_selected_lines=101,
+                    max_bytes=size_limit,
+                    known_text_extensions=TEXT_EXTENSIONS,
+                )
+            except TextContentError as e:
+                raise FileEditorError(
+                    "Binary files cannot be read as text",
+                    error_code=getattr(e, "error_code", "binary_file"),
+                ) from e
+
             if start > n_lines:
                 raise FileEditorError(
                     f"start_line ({start}) exceeds file length ({n_lines} lines)"
                 )
-            if end != -1 and end < start:
-                raise FileEditorError(
-                    f"end_line ({end}) must be >= start_line ({start})"
-                )
-                
-            init_line = start
-            
-            if end == -1:
-                content = "\n".join(lines[start - 1:])
-            else:
-                content = "\n".join(lines[start - 1:end])
-                
+            return self._make_output(
+                "\n".join(selected),
+                str(file_path),
+                init_line=start,
+            )
+
+        content = self._read_file(file_path)
+        init_line = 1
+
         return self._make_output(content, str(file_path), init_line=init_line)
-        
+
     def create(self, path: str, content: str) -> str:
         """
         Create a new file with the given content.
@@ -242,7 +347,13 @@ class FileEditor:
         Raises:
             FileEditorError: If file already exists or path is invalid.
         """
-        file_path = self._validate_path(path, must_exist=False, allow_create=True)
+        file_path = self._validate_path(
+            path,
+            must_exist=False,
+            allow_create=True,
+            access="mutation",
+            operation="create",
+        )
         
         if file_path.exists():
             raise FileEditorError(
@@ -273,7 +384,12 @@ class FileEditor:
         Raises:
             FileEditorError: If old_str not found or appears multiple times.
         """
-        file_path = self._validate_path(path, must_exist=True)
+        file_path = self._validate_path(
+            path,
+            must_exist=True,
+            access="mutation",
+            operation="edit",
+        )
         content = self._read_file(file_path)
         
         # Normalize tabs for consistent matching
@@ -335,7 +451,12 @@ class FileEditor:
         Returns:
             Success message with snippet.
         """
-        file_path = self._validate_path(path, must_exist=True)
+        file_path = self._validate_path(
+            path,
+            must_exist=True,
+            access="mutation",
+            operation="insert",
+        )
         file_content = self._read_file(file_path)
         lines = file_content.split("\n")
         n_lines = len(lines)
@@ -378,7 +499,12 @@ class FileEditor:
         Returns:
             Success message with restored content snippet.
         """
-        file_path = self._validate_path(path, must_exist=True)
+        file_path = self._validate_path(
+            path,
+            must_exist=True,
+            access="mutation",
+            operation="undo",
+        )
         
         if not self._file_history[file_path]:
             raise FileEditorError(f"No edit history for: {path}")
@@ -396,7 +522,7 @@ class FileEditor:
         
     def get_history_count(self, path: str) -> int:
         """Get the number of undo steps available for a file."""
-        file_path = Path(path).resolve()
+        file_path = _run_scoped_path(path, access="read", operation="read")
         return len(self._file_history.get(file_path, []))
 
 

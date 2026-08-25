@@ -1,49 +1,80 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+import json
+from pathlib import Path
 
 import torch
 
 
-class ByteTokenizer:
-    """Simple byte-level tokenizer for text-to-speech."""
+_TOKENIZERS_BACKEND_CLASS = "TokenizersBackend"
 
-    def __init__(self, bos_token: int = 256) -> None:
-        if bos_token < 0:
-            raise ValueError(f"bos_token must be >= 0, got {bos_token}")
-        self.bos_token = int(bos_token)
 
-    @classmethod
-    def for_vocab_size(cls, text_vocab_size: int) -> "ByteTokenizer":
-        if text_vocab_size < 256:
-            raise ValueError(
-                f"text_vocab_size must be >= 256 for byte-level tokenization, got {text_vocab_size}"
-            )
-        # Reserve a dedicated BOS token outside UTF-8 byte range when possible.
-        if text_vocab_size == 256:
-            return cls(bos_token=0)
-        return cls(bos_token=text_vocab_size - 1)
+def _read_local_tokenizer_config(path: Path) -> dict[str, object] | None:
+    """Read a bundled tokenizer config without mutating the HF snapshot."""
+    config_path = path / "tokenizer_config.json"
+    if not config_path.is_file():
+        return None
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
-    def encode(self, text: str, add_bos: bool = True) -> torch.Tensor:
-        tokens = list(text.encode("utf-8"))
-        if add_bos:
-            tokens.insert(0, self.bos_token)
-        return torch.tensor(tokens, dtype=torch.long)
 
-    def batch_encode(
-        self,
-        texts: Iterable[str],
-        max_length: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        encoded = [self.encode(t) for t in texts]
-        if max_length is None:
-            max_length = max(x.numel() for x in encoded)
+def _load_bundled_tokenizers_backend(
+    path: Path,
+    config: Mapping[str, object],
+):
+    """Load v5 ``TokenizersBackend`` assets with transformers 4.x.
 
-        batch = torch.zeros((len(encoded), max_length), dtype=torch.long)
-        mask = torch.zeros((len(encoded), max_length), dtype=torch.bool)
-        for i, seq in enumerate(encoded):
-            n = min(max_length, seq.numel())
-            batch[i, :n] = seq[:n]
-            mask[i, :n] = True
-        return batch, mask
+    Irodori v4.1 bundles a plain ``tokenizer.json`` and advertises the
+    transformers 5-only ``TokenizersBackend`` class.  Transformers 4.57 can
+    consume the same tokenizers serialization through ``PreTrainedTokenizerFast``;
+    constructing it directly avoids editing the shared HF snapshot or relying
+    on a process-global tokenizer registry.
+    """
+    from transformers import PreTrainedTokenizerFast
+
+    tokenizer_file = path / "tokenizer.json"
+    if not tokenizer_file.is_file():
+        raise FileNotFoundError(
+            f"Bundled TokenizersBackend config has no tokenizer.json: {path}"
+        )
+
+    kwargs: dict[str, object] = {}
+    for token_name in (
+        "bos_token",
+        "eos_token",
+        "unk_token",
+        "sep_token",
+        "pad_token",
+        "cls_token",
+        "mask_token",
+    ):
+        token = config.get(token_name)
+        if isinstance(token, str) and token:
+            kwargs[token_name] = token
+    model_max_length = config.get("model_max_length")
+    if isinstance(model_max_length, (int, float)) and not isinstance(model_max_length, bool):
+        kwargs["model_max_length"] = int(model_max_length)
+    for field in ("padding_side", "truncation_side", "clean_up_tokenization_spaces"):
+        value = config.get(field)
+        if isinstance(value, (str, bool)):
+            kwargs[field] = value
+
+    try:
+        return PreTrainedTokenizerFast(tokenizer_file=str(tokenizer_file), **kwargs)
+    except TypeError:
+        # A future transformers release may reject a newer optional config
+        # field.  Retry with only the stable special-token arguments.
+        stable_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key.endswith("_token")
+        }
+        return PreTrainedTokenizerFast(
+            tokenizer_file=str(tokenizer_file),
+            **stable_kwargs,
+        )
 
 
 class PretrainedTextTokenizer:
@@ -77,6 +108,8 @@ class PretrainedTextTokenizer:
         repo_id: str,
         add_bos: bool = True,
         local_files_only: bool = False,
+        revision: str | None = None,
+        cache_dir: str | None = None,
     ) -> "PretrainedTextTokenizer":
         try:
             from transformers import AutoTokenizer
@@ -86,12 +119,32 @@ class PretrainedTextTokenizer:
                 "Install with `pip install transformers sentencepiece`."
             ) from exc
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            repo_id,
-            use_fast=True,
-            trust_remote_code=False,
-            local_files_only=local_files_only,
-        )
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                repo_id,
+                use_fast=True,
+                trust_remote_code=False,
+                local_files_only=local_files_only,
+                revision=revision,
+                cache_dir=cache_dir,
+            )
+        except ValueError as exc:
+            # v4.x does not register transformers 5's TokenizersBackend.  Only
+            # apply the direct tokenizer.json fallback to an explicitly local
+            # bundled asset with that exact config marker; remote/v3 tokenizers
+            # continue through AutoTokenizer unchanged.
+            local_path = Path(repo_id).expanduser()
+            config = (
+                _read_local_tokenizer_config(local_path)
+                if local_files_only and local_path.is_dir()
+                else None
+            )
+            if not config or config.get("tokenizer_class") != _TOKENIZERS_BACKEND_CLASS:
+                raise
+            try:
+                tokenizer = _load_bundled_tokenizers_backend(local_path, config)
+            except Exception as fallback_exc:
+                raise exc from fallback_exc
         return cls(tokenizer=tokenizer, add_bos=add_bos)
 
     @property
@@ -124,21 +177,54 @@ class PretrainedTextTokenizer:
         texts: Iterable[str],
         max_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        encoded = [self.encode(t) for t in texts]
+        texts = list(texts)
+        if not texts:
+            raise ValueError("texts must contain at least one item.")
         if max_length is None:
+            encoded = [self.encode(t) for t in texts]
             max_length = max(max(x.numel(), 1) for x in encoded)
         if max_length <= 0:
             raise ValueError(f"max_length must be > 0, got {max_length}")
 
+        if self.add_bos:
+            bos_id = self.bos_token_id
+            if bos_id is None:
+                raise ValueError("Tokenizer has no bos_token_id but BOS prepend was requested.")
+            if max_length == 1:
+                batch = torch.full(
+                    (len(texts), 1),
+                    fill_value=int(bos_id),
+                    dtype=torch.long,
+                )
+                mask = torch.ones((len(texts), 1), dtype=torch.bool)
+                return batch, mask
+            body_max_length = max_length - 1
+        else:
+            body_max_length = max_length
+
+        encoded_batch = self.tokenizer(
+            texts,
+            add_special_tokens=False,
+            padding="max_length",
+            truncation=True,
+            max_length=body_max_length,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+        body_ids = encoded_batch["input_ids"].to(dtype=torch.long)
+        body_mask = encoded_batch["attention_mask"].to(dtype=torch.bool)
+
+        if not self.add_bos:
+            return body_ids, body_mask
+
         batch = torch.full(
-            (len(encoded), max_length),
+            (len(texts), max_length),
             fill_value=self.pad_token_id,
             dtype=torch.long,
         )
-        mask = torch.zeros((len(encoded), max_length), dtype=torch.bool)
-        for i, seq in enumerate(encoded):
-            n = min(max_length, seq.numel())
-            if n > 0:
-                batch[i, :n] = seq[:n]
-                mask[i, :n] = True
+        mask = torch.zeros((len(texts), max_length), dtype=torch.bool)
+        batch[:, 0] = int(self.bos_token_id)
+        mask[:, 0] = True
+        batch[:, 1:] = body_ids
+        mask[:, 1:] = body_mask
         return batch, mask

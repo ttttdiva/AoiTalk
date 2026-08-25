@@ -7,7 +7,13 @@ from typing import Optional, List, Dict, Any
 import httpx
 import json
 import io
-from pydub import AudioSegment
+try:
+    from pydub import AudioSegment
+except ImportError:
+    # Audio conversion is optional for the core/Linux build.  The engine can
+    # still be imported and will report an explicit synthesis failure if the
+    # audio extra is selected without pydub/ffmpeg.
+    AudioSegment = None
 
 
 class NijivoiceEngine:

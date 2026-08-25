@@ -21,17 +21,15 @@ DEFAULT_ERROR_PROTECT_CHARS = 8000
 
 SEARCH_TOOLS = {
     "web_search",
+    "x_search",
     "grok_x_search",
     "knowledge_search",
-    "search_memory",
+    "search_past_chats",
 }
 FILE_PREVIEW_TOOLS = {
-    "read_workspace_file",
-    "view_file",
+    "read_file",
 }
 FILE_LISTING_TOOLS = {
-    "find_workspace_items",
-    "inspect_workspace_tree",
     "search_files",
     "list_directory",
 }

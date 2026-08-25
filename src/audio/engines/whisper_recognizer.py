@@ -18,6 +18,7 @@ try:
     import whisper
     WHISPER_AVAILABLE = True
 except ImportError:
+    whisper = None
     WHISPER_AVAILABLE = False
     print("[WhisperRecognizer] whisper not available")
 

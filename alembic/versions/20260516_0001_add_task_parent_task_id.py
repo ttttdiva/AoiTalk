@@ -32,7 +32,8 @@ def _column_exists(bind, table: str, column: str) -> bool:
     return (
         bind.exec_driver_sql(
             "SELECT 1 FROM information_schema.columns "
-            f"WHERE table_name = '{table}' AND column_name = '{column}'"
+            f"WHERE table_schema = current_schema() "
+            f"AND table_name = '{table}' AND column_name = '{column}'"
         ).first()
         is not None
     )
@@ -42,7 +43,8 @@ def _constraint_exists(bind, table: str, constraint: str) -> bool:
     return (
         bind.exec_driver_sql(
             "SELECT 1 FROM information_schema.table_constraints "
-            f"WHERE table_name = '{table}' AND constraint_name = '{constraint}'"
+            f"WHERE table_schema = current_schema() "
+            f"AND table_name = '{table}' AND constraint_name = '{constraint}'"
         ).first()
         is not None
     )

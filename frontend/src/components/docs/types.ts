@@ -4,7 +4,7 @@ import type { DocsFieldType } from "@/lib/docs-model";
 
 export type DocsNode = {
   id: string;
-  workspace_id: string;
+  docs_library_id: string;
   parent_id: string | null;
   root_page_id: string | null;
   project_id: string | null;
@@ -25,11 +25,27 @@ export type DocsNode = {
   created_at: string | null;
   updated_at: string | null;
   archived_at: string | null;
+  /** Effective ACL for the current actor (owner/read/write). */
+  permission?: "owner" | "read" | "write";
+};
+
+export type DocsLibrary = {
+  id: string;
+  docs_library_id: string;
+  name?: string | null;
+  description?: string | null;
+  /** Library discriminator; project identity belongs to node.project_id. */
+  library_type?: "personal" | string;
+  project_id?: string | null;
+  owner_user_id?: string | null;
+  settings?: Record<string, unknown>;
+  created_at?: string | null;
+  updated_at?: string | null;
 };
 
 export type DocsSupertag = {
   id: string;
-  workspace_id: string;
+  docs_library_id: string;
   parent_supertag_id: string | null;
   system_key: string | null;
   name: string;
@@ -46,7 +62,7 @@ export type DocsSupertag = {
 
 export type DocsField = {
   id: string;
-  workspace_id: string;
+  docs_library_id: string;
   supertag_id: string | null;
   system_key: string | null;
   name: string;
@@ -112,7 +128,7 @@ export type DocsProject = {
 
 export type DocsSavedView = {
   id: string;
-  workspace_id: string;
+  docs_library_id: string;
   supertag_id: string | null;
   name: string;
   layout: "table" | "board" | "calendar" | "list" | string;
@@ -125,7 +141,7 @@ export type DocsSavedView = {
 
 export type DocsAiSuggestion = {
   id: string;
-  workspace_id: string;
+  docs_library_id: string;
   node_id: string | null;
   suggestion_type: string;
   payload_json: Record<string, unknown>;
@@ -137,6 +153,13 @@ export type DocsAiSuggestion = {
 };
 
 export type DocsState = {
+  library?: DocsLibrary;
+  /**
+   * Legacy/bootstrap responses also expose the library id at the top level.
+   * Keep it in the client shape so a focused foreign-library tree can use the
+   * id as its authoritative scope before a full library DTO is available.
+   */
+  docs_library_id?: string;
   nodes: DocsNode[];
   /** APIが子の存在を確認済みのノードID。子本体は必要時に遅延取得する。 */
   has_children_ids?: string[];

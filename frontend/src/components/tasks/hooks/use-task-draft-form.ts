@@ -92,7 +92,8 @@ export function useTaskDraftForm({
       task.priority !== "medium" ||
       task.parent_task_id ||
       task.reminder_offsets.length > 0 ||
-      task.notifications_enabled === false,
+      task.notifications_enabled === false ||
+      task.auto_close_on_due === true,
     );
   }, [draftTagIds.length, editDescription, editTitle, effectiveTaskId, task]);
 

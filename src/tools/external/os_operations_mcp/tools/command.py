@@ -113,6 +113,23 @@ def register(mcp: FastMCP):
             command: 実行するコマンド（例：「dir」「ls -la」「python script.py」）
             working_directory: コマンドを実行するディレクトリ（省略時はカレントディレクトリ）
         """
+        try:
+            from src.security.agent_run_scope import RunScopeViolation, get_current_run_scope
+
+            scope = get_current_run_scope()
+            if scope is not None:
+                try:
+                    working_directory = str(
+                        scope.assert_command_cwd_allowed(working_directory)
+                    )
+                except RunScopeViolation as exc:
+                    return json.dumps(
+                        {"success": False, "error": str(exc)},
+                        ensure_ascii=False,
+                    )
+        except ImportError:  # pragma: no cover - defensive for stripped builds
+            pass
+
         protection_error = _check_command_protection(command, working_directory)
         if protection_error:
             return json.dumps(protection_error, ensure_ascii=False)

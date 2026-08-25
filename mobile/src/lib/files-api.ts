@@ -1,55 +1,58 @@
 import * as FileSystem from "expo-file-system/legacy";
-import { Directory } from "expo-file-system";
+import { Directory, Paths } from "expo-file-system";
 import { fetchApi, getBaseUrl } from "./api-client";
 import { getToken, getTokenAuthScope } from "./auth";
+import {
+  downloadFileToDevice,
+  type FilesDownloadResult,
+} from "./files-download";
+import type {
+  FilesBookmark,
+  FilesEntry,
+  FilesEntryMetadata,
+  FilesMediaKind,
+  FilesMediaSource,
+  FilesScope,
+  FilesSource,
+  FilesUploadInput,
+} from "./files-types";
 
-export type FilesSource = "local" | "server";
-export type FilesScope = "workspace" | "user";
+export type {
+  FilesBookmark,
+  FilesEntry,
+  FilesEntryMetadata,
+  FilesMediaKind,
+  FilesMediaSource,
+  FilesScope,
+  FilesSource,
+  FilesUploadInput,
+} from "./files-types";
 
-export type FilesEntry = {
-  name: string;
-  path: string;
-  type: "file" | "directory";
-  size?: number;
-  modifiedAt?: string | null;
-  mimeType?: string;
-  extension?: string;
-  source: FilesSource;
-};
+/**
+ * Identity of the bookmark collection used by the Files API.
+ *
+ * Bookmark collection ownership is no longer inferred from the authenticated
+ * user or the current project.  Callers must state whether they are reading
+ * the selected Space's shared collection or the authenticated user's personal
+ * collection for every operation.
+ */
+export type FilesBookmarkScope =
+  | { scope: "shared"; spaceId: string }
+  | { scope: "personal" };
 
-export type FilesUploadInput = {
-  uri: string;
-  name: string;
-  mimeType?: string | null;
-};
-
-export type FilesBookmark = {
-  id?: string;
-  name: string;
-  path: string;
-  icon?: string;
-  sort_order?: number;
-  created_at?: string;
-  updated_at?: string;
-};
-
-export type FilesEntryMetadata = {
-  size?: number;
-  modifiedAt?: string | null;
-};
-
-export type FilesMediaSource = {
-  uri: string;
-  headers?: Record<string, string>;
-};
-
-export type FilesMediaKind =
-  | "image"
-  | "video"
-  | "audio"
-  | "pdf"
-  | "text"
-  | "other";
+function bookmarkCollectionUrl(collection: FilesBookmarkScope): string {
+  if (collection.scope === "shared") {
+    if (!collection.spaceId) {
+      throw new Error("共有ブックマークにはSpaceを指定してください");
+    }
+    return `/api/spaces/${encodeURIComponent(
+      collection.spaceId,
+    )}/explorer/bookmarks`;
+  }
+  // Personal bookmarks intentionally retain the legacy endpoint so existing
+  // user-owned data remains compatible during the Space migration.
+  return "/api/explorer/bookmarks";
+}
 
 type ExplorerListPayload = {
   success: boolean;
@@ -79,11 +82,11 @@ type ExplorerContentPayload = {
   error?: string;
 };
 
-const LOCAL_SCOPE_DIRS: Record<FilesScope, string> = {
-  workspace: "workspace",
-  user: "user",
-};
+// ローカルは scope を問わず単一の user ディレクトリだけを使う。
+// （旧: workspace/user の2区分。workspace 区分は廃止し user へ集約した。）
+const LOCAL_ROOT_DIR = "user";
 const DEFAULT_MEMO_FILE = "memo.md";
+const DEFAULT_MEMO_CONTENT = "# memo\n\n- ここにメモを書けます。\n";
 const TEXT_EXTENSIONS = new Set([
   ".md",
   ".markdown",
@@ -146,12 +149,14 @@ export function filesThumbnailCacheKey(
   ]);
 }
 
-function getLocalRootUri(scope: FilesScope = "workspace"): string {
+// ローカルの root は scope を問わず常に user ディレクトリを指す。
+// 引数 scope は呼び出し側の互換のため残すが、解決先には影響しない。
+function getLocalRootUri(_scope: FilesScope = "user"): string {
   const baseDir = FileSystem.documentDirectory || FileSystem.cacheDirectory;
   if (!baseDir) {
     throw new Error("ローカルファイル用ディレクトリを取得できません");
   }
-  return `${baseDir}${LOCAL_SCOPE_DIRS[scope]}/`;
+  return `${baseDir}${LOCAL_ROOT_DIR}/`;
 }
 
 function joinLocalUri(
@@ -217,7 +222,78 @@ function toIsoString(timestampSeconds?: number | null): string | null {
   return new Date(timestampSeconds * 1000).toISOString();
 }
 
+// 旧ローカル workspace 区分（documentDirectory/workspace/）を一度だけ user へ集約する。
+// - 自動生成された既定 memo.md（内容が DEFAULT_MEMO_CONTENT と一致）は移行せず破棄する。
+// - それ以外のユーザーファイル・フォルダーは user 直下へ移動し、名前衝突時は " (n)" を付与する。
+// - workspace ディレクトリが無ければ何もしない（冪等）。
+let localWorkspaceMigration: Promise<void> | null = null;
+
+function ensureLocalWorkspaceMigration(): Promise<void> {
+  if (!localWorkspaceMigration) {
+    localWorkspaceMigration = migrateLocalWorkspaceToUser().catch(() => {
+      // 移行失敗はローカル閲覧を止めない。次回アクセス時に再試行できるよう解除する。
+      localWorkspaceMigration = null;
+    });
+  }
+  return localWorkspaceMigration;
+}
+
+async function uniqueLocalMoveTarget(
+  parentUri: string,
+  name: string,
+  isDirectory: boolean,
+): Promise<string> {
+  const dotIndex = isDirectory ? -1 : name.lastIndexOf(".");
+  const base = dotIndex > 0 ? name.slice(0, dotIndex) : name;
+  const extension = dotIndex > 0 ? name.slice(dotIndex) : "";
+  let candidate = joinLocalUri(parentUri, name, isDirectory);
+  let index = 1;
+  while ((await FileSystem.getInfoAsync(candidate)).exists) {
+    candidate = joinLocalUri(
+      parentUri,
+      `${base} (${index})${extension}`,
+      isDirectory,
+    );
+    index += 1;
+  }
+  return candidate;
+}
+
+// テスト容易性のため公開する。通常は ensureLocalWorkspaceMigration 経由で一度だけ実行される。
+export async function migrateLocalWorkspaceToUser(): Promise<void> {
+  const baseDir = FileSystem.documentDirectory || FileSystem.cacheDirectory;
+  if (!baseDir) return;
+  const workspaceUri = `${baseDir}workspace/`;
+  const workspaceInfo = await FileSystem.getInfoAsync(workspaceUri);
+  if (!workspaceInfo.exists || !workspaceInfo.isDirectory) return;
+
+  const userRoot = getLocalRootUri("user");
+  const userInfo = await FileSystem.getInfoAsync(userRoot);
+  if (!userInfo.exists) {
+    await FileSystem.makeDirectoryAsync(userRoot, { intermediates: true });
+  }
+
+  const names = await FileSystem.readDirectoryAsync(workspaceUri);
+  for (const name of names) {
+    const childUri = joinLocalUri(workspaceUri, name);
+    const childInfo = await FileSystem.getInfoAsync(childUri);
+    const isDirectory = Boolean(childInfo.isDirectory);
+    // 自動生成された既定 memo.md はユーザーデータではないため移行しない。
+    if (!isDirectory && name === DEFAULT_MEMO_FILE) {
+      const content = await FileSystem.readAsStringAsync(childUri).catch(
+        () => null,
+      );
+      if (content === DEFAULT_MEMO_CONTENT) continue;
+    }
+    const target = await uniqueLocalMoveTarget(userRoot, name, isDirectory);
+    await FileSystem.moveAsync({ from: childUri, to: target });
+  }
+
+  await FileSystem.deleteAsync(workspaceUri, { idempotent: true });
+}
+
 async function ensureLocalWorkspace(scope: FilesScope): Promise<string> {
+  await ensureLocalWorkspaceMigration();
   const rootUri = getLocalRootUri(scope);
   const rootInfo = await FileSystem.getInfoAsync(rootUri);
   if (!rootInfo.exists) {
@@ -228,7 +304,7 @@ async function ensureLocalWorkspace(scope: FilesScope): Promise<string> {
   if (entries.length === 0) {
     await FileSystem.writeAsStringAsync(
       joinLocalUri(rootUri, DEFAULT_MEMO_FILE),
-      "# memo\n\n- ここにメモを書けます。\n",
+      DEFAULT_MEMO_CONTENT,
     );
   }
 
@@ -461,10 +537,8 @@ function getLocalParentDirectory(path: string): string | null {
   const lastSlash = normalized.lastIndexOf("/");
   if (lastSlash < 0) return null;
   const parent = normalized.slice(0, lastSlash + 1);
-  const root = [getLocalRootUri("workspace"), getLocalRootUri("user")].find(
-    (candidate) => path.startsWith(candidate),
-  );
-  if (!root) return null;
+  const root = getLocalRootUri();
+  if (!path.startsWith(root)) return null;
   return parent.length >= root.length ? parent : null;
 }
 
@@ -478,6 +552,66 @@ function getLocalDirectoryPrefix(path: string): string {
   return path.endsWith("/") ? path : `${path}/`;
 }
 
+/**
+ * Validate and normalize a local file/folder name before it is joined to a URI.
+ *
+ * Names are deliberately treated as a single path segment.  A local rename
+ * must not accidentally turn `a/b` into a nested move, and an empty segment
+ * would otherwise resolve to the parent directory.  The remote endpoint keeps
+ * its existing validation/contract and does not use this helper.
+ */
+export function normalizeLocalEntryName(name: string): string {
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(name)) {
+    throw new Error("名前に制御文字を含めることはできません");
+  }
+  const normalized = name.trim();
+  if (!normalized) {
+    throw new Error("名前を入力してください");
+  }
+  if (normalized === "." || normalized === "..") {
+    throw new Error("この名前は使用できません");
+  }
+  if (/[\\/]/.test(normalized)) {
+    throw new Error("名前にフォルダー区切りを含めることはできません");
+  }
+  return normalized;
+}
+
+function decodeLocalEntryName(path: string): string {
+  const encodedName = getLocalEntryName(path);
+  try {
+    // Directory.list() returns a URI whose final segment is percent-encoded,
+    // while `entry.name` is decoded.  Decode only that segment; decoding the
+    // whole URI first could turn an encoded slash into a path separator.
+    return decodeURIComponent(encodedName);
+  } catch {
+    throw new Error("ローカルパスの名前を読み取れません");
+  }
+}
+
+function joinLocalEncodedUri(
+  parentUri: string,
+  name: string,
+  isDirectory = false,
+): string {
+  // Expo's Paths.join encodes URI path segments and keeps `#`, `?`, `%`,
+  // spaces, and non-ASCII names out of URL syntax.  Keep a small fallback for
+  // older Expo runtimes/test doubles that do not expose Paths at runtime.
+  let joined: string;
+  if (typeof Paths?.join === "function") {
+    joined = Paths.join(parentUri, name);
+  } else {
+    let encodedName: string;
+    try {
+      encodedName = encodeURIComponent(name);
+    } catch {
+      throw new Error("名前に不正な文字が含まれています");
+    }
+    joined = `${parentUri.replace(/\/+$/, "")}/${encodedName}`;
+  }
+  return isDirectory && !joined.endsWith("/") ? `${joined}/` : joined;
+}
+
 async function renameLocalEntry(
   path: string,
   newName: string,
@@ -486,8 +620,26 @@ async function renameLocalEntry(
   if (!parent) {
     throw new Error("ルートは名前変更できません");
   }
+  const normalizedName = normalizeLocalEntryName(newName);
   const targetInfo = await FileSystem.getInfoAsync(path);
-  const nextPath = joinLocalUri(parent, newName, targetInfo.isDirectory);
+  if (!targetInfo.exists) {
+    throw new Error("名前変更する項目が見つかりません");
+  }
+  const currentName = normalizeLocalEntryName(decodeLocalEntryName(path));
+  if (normalizedName === currentName) {
+    // Android の moveAsync は同一 URI を拒否する実装があるため、同名
+    // 保存は冪等な no-op とする。
+    return path;
+  }
+  const nextPath = joinLocalEncodedUri(
+    parent,
+    normalizedName,
+    Boolean(targetInfo.isDirectory),
+  );
+  const destinationInfo = await FileSystem.getInfoAsync(nextPath);
+  if (destinationInfo.exists) {
+    throw new Error("同じ名前の項目が既に存在します");
+  }
   await FileSystem.moveAsync({ from: path, to: nextPath });
   return nextPath;
 }
@@ -660,7 +812,9 @@ function cacheNameFor(entry: FilesEntry, authScope: string): string {
   return `filer-${hashPath(`${authScope}:${entry.source}:${entry.path}`)}${safeExt}`;
 }
 
-async function downloadServerMediaToCache(entry: FilesEntry): Promise<string> {
+async function downloadServerMediaToCache(
+  entry: FilesEntry,
+): Promise<string> {
   const cacheRoot = FileSystem.cacheDirectory;
   if (!cacheRoot) throw new Error("メディアキャッシュを利用できません");
   const token = await getToken();
@@ -670,8 +824,49 @@ async function downloadServerMediaToCache(entry: FilesEntry): Promise<string> {
 
   const url = await getServerMediaUrl(entry.path);
   const headers = token ? { Authorization: `Bearer ${token}` } : undefined;
-  const result = await FileSystem.downloadAsync(url, targetUri, headers ? { headers } : undefined);
-  return result.uri;
+  try {
+    const result = await FileSystem.downloadAsync(
+      url,
+      targetUri,
+      headers ? { headers } : undefined,
+    );
+    if (result.status < 200 || result.status >= 300) {
+      throw new Error(`サーバーがエラーを返しました (${result.status})`);
+    }
+    return result.uri;
+  } catch (error) {
+    await FileSystem.deleteAsync(targetUri, { idempotent: true }).catch(() => {});
+    throw error;
+  }
+}
+
+async function downloadServerFileForExport(entry: FilesEntry): Promise<string> {
+  const cacheRoot = FileSystem.cacheDirectory;
+  if (!cacheRoot) throw new Error("ファイル保存用キャッシュを利用できません");
+  const token = await getToken();
+  const baseName = cacheNameFor(entry, getTokenAuthScope(token));
+  const extension = getExtension(baseName);
+  const stem = extension ? baseName.slice(0, -extension.length) : baseName;
+  const targetUri = `${cacheRoot}${stem}-download-${Date.now()}-${Math.random()
+    .toString(16)
+    .slice(2)}${extension}`;
+  const url = await getServerMediaUrl(entry.path);
+  const headers = token ? { Authorization: `Bearer ${token}` } : undefined;
+
+  try {
+    const result = await FileSystem.downloadAsync(
+      url,
+      targetUri,
+      headers ? { headers } : undefined,
+    );
+    if (result.status < 200 || result.status >= 300) {
+      throw new Error(`サーバーがエラーを返しました (${result.status})`);
+    }
+    return result.uri;
+  } catch (error) {
+    await FileSystem.deleteAsync(targetUri, { idempotent: true }).catch(() => {});
+    throw error;
+  }
 }
 
 export function isTextEntry(entry: FilesEntry): boolean {
@@ -797,6 +992,29 @@ export const filesApi = {
     }
   },
 
+  async download(entry: FilesEntry): Promise<FilesDownloadResult> {
+    let temporaryUri: string | null = null;
+    try {
+      return await downloadFileToDevice(entry, async () => {
+        if (entry.source === "local") {
+          const info = await FileSystem.getInfoAsync(entry.path);
+          if (!info.exists || info.isDirectory) {
+            throw new Error("ローカルファイルが見つかりません");
+          }
+          return entry.path;
+        }
+        temporaryUri = await downloadServerFileForExport(entry);
+        return temporaryUri;
+      });
+    } finally {
+      if (temporaryUri) {
+        await FileSystem.deleteAsync(temporaryUri, { idempotent: true }).catch(
+          () => {},
+        );
+      }
+    }
+  },
+
   getMetadata(entry: FilesEntry): Promise<FilesEntryMetadata> {
     if (entry.source !== "local" || entry.type === "directory") {
       return Promise.resolve({ size: entry.size, modifiedAt: entry.modifiedAt });
@@ -866,13 +1084,20 @@ export const filesApi = {
     return downloadServerMediaToCache(entry);
   },
 
-  async listBookmarks(): Promise<{ success?: boolean; bookmarks: FilesBookmark[] }> {
-    return fetchApi("/api/explorer/bookmarks");
+  async listBookmarks(
+    collection: FilesBookmarkScope,
+  ): Promise<{ success?: boolean; bookmarks: FilesBookmark[] }> {
+    return fetchApi(bookmarkCollectionUrl(collection));
   },
 
-  async addBookmark(name: string, path: string, icon = "📁") {
+  async addBookmark(
+    name: string,
+    path: string,
+    icon = "📁",
+    collection: FilesBookmarkScope,
+  ) {
     return fetchApi<{ success?: boolean; bookmark?: FilesBookmark }>(
-      "/api/explorer/bookmarks",
+      bookmarkCollectionUrl(collection),
       {
         method: "POST",
         body: JSON.stringify({ name, path, icon }),
@@ -880,8 +1105,8 @@ export const filesApi = {
     );
   },
 
-  async removeBookmark(path: string) {
-    return fetchApi<{ success?: boolean }>("/api/explorer/bookmarks", {
+  async removeBookmark(path: string, collection: FilesBookmarkScope) {
+    return fetchApi<{ success?: boolean }>(bookmarkCollectionUrl(collection), {
       method: "DELETE",
       body: JSON.stringify({ path }),
     });

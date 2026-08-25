@@ -65,7 +65,7 @@ async def generate_comfyui_image(
         生成画像のパスを含む特殊タグ [GENERATED_IMAGE:<path>]
     """
     try:
-        from ..services.comfyui_service import get_comfyui_service, ComfyUIError, WORKFLOWS_DIR
+        from ..services.comfyui_service import get_comfyui_service, ComfyUIError
 
         service = get_comfyui_service()
 
@@ -78,7 +78,7 @@ async def generate_comfyui_image(
         if workflow_name:
             if not workflow_name.endswith(".json"):
                 workflow_name += ".json"
-            potential_path = WORKFLOWS_DIR / workflow_name
+            potential_path = service.workflows_dir / workflow_name
             if potential_path.exists():
                 workflow_path = str(potential_path.absolute())
             else:

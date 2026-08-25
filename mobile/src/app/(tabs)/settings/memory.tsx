@@ -10,18 +10,17 @@ import {
   IconButton,
   Portal,
   Surface,
-  Switch,
   Text,
   TextInput,
 } from "react-native-paper";
 import { format } from "date-fns";
 import { useAuth } from "../../../contexts/AuthContext";
 import { memoryApi } from "../../../lib/memory-api";
-import type { UserMemory } from "../../../types/api";
+import type { ScopedMemory } from "../../../types/api";
 
 type EditingState = {
   mode: "create" | "edit";
-  memory?: UserMemory;
+  memory?: ScopedMemory;
 };
 
 function formatMemoryDate(value?: string | null): string {
@@ -34,15 +33,15 @@ function formatMemoryDate(value?: string | null): string {
 export default function SettingsMemoryScreen() {
   const router = useRouter();
   const { isAuthenticated } = useAuth();
-  const [memories, setMemories] = useState<UserMemory[]>([]);
+  const [memories, setMemories] = useState<ScopedMemory[]>([]);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [editing, setEditing] = useState<EditingState | null>(null);
   const [draftContent, setDraftContent] = useState("");
-  const [draftCategory, setDraftCategory] = useState("general");
+  const [draftMemoryType, setDraftMemoryType] = useState("fact");
 
   const activeCount = useMemo(
-    () => memories.filter((memory) => memory.is_active).length,
+    () => memories.filter((memory) => memory.status === "active").length,
     [memories],
   );
 
@@ -74,13 +73,13 @@ export default function SettingsMemoryScreen() {
 
   const openCreateDialog = useCallback(() => {
     setDraftContent("");
-    setDraftCategory("general");
+    setDraftMemoryType("fact");
     setEditing({ mode: "create" });
   }, []);
 
-  const openEditDialog = useCallback((memory: UserMemory) => {
+  const openEditDialog = useCallback((memory: ScopedMemory) => {
     setDraftContent(memory.content);
-    setDraftCategory(memory.category || "general");
+    setDraftMemoryType(memory.memory_type || "fact");
     setEditing({ mode: "edit", memory });
   }, []);
 
@@ -91,7 +90,7 @@ export default function SettingsMemoryScreen() {
 
   const saveMemory = useCallback(async () => {
     const content = draftContent.trim();
-    const category = draftCategory.trim() || "general";
+    const memoryType = draftMemoryType.trim() || "fact";
     if (!content) {
       Alert.alert("User Memory", "メモリ内容を入力してください。");
       return;
@@ -101,12 +100,18 @@ export default function SettingsMemoryScreen() {
     setSaving(true);
     try {
       if (editing.mode === "create") {
-        const created = await memoryApi.create({ content, category });
+        const created = await memoryApi.create({
+          content,
+          scope: "user",
+          memoryType,
+          status: "active",
+        });
         setMemories((prev) => [created, ...prev]);
       } else if (editing.memory) {
         const updated = await memoryApi.update(editing.memory.id, {
+          version: editing.memory.version,
           content,
-          category,
+          memoryType,
         });
         setMemories((prev) =>
           prev.map((memory) =>
@@ -123,25 +128,9 @@ export default function SettingsMemoryScreen() {
     } finally {
       setSaving(false);
     }
-  }, [draftCategory, draftContent, editing]);
+  }, [draftMemoryType, draftContent, editing]);
 
-  const toggleMemory = useCallback(async (memory: UserMemory) => {
-    try {
-      const updated = await memoryApi.toggle(memory.id);
-      setMemories((prev) =>
-        prev.map((item) => (item.id === updated.id ? updated : item)),
-      );
-    } catch (error) {
-      Alert.alert(
-        "User Memory",
-        error instanceof Error
-          ? error.message
-          : "メモリ状態の切り替えに失敗しました。",
-      );
-    }
-  }, []);
-
-  const deleteMemory = useCallback((memory: UserMemory) => {
+  const deleteMemory = useCallback((memory: ScopedMemory) => {
     Alert.alert("User Memory", "このメモリを削除しますか？", [
       { text: "キャンセル", style: "cancel" },
       {
@@ -150,7 +139,7 @@ export default function SettingsMemoryScreen() {
         onPress: () => {
           void (async () => {
             try {
-              await memoryApi.delete(memory.id);
+              await memoryApi.delete(memory.id, memory.version);
               setMemories((prev) => prev.filter((item) => item.id !== memory.id));
             } catch (error) {
               Alert.alert(
@@ -264,19 +253,16 @@ export default function SettingsMemoryScreen() {
                       <Text style={styles.memoryText}>{memory.content}</Text>
                       <View style={styles.metaRow}>
                         <Chip compact style={styles.metaChip} textStyle={styles.metaChipText}>
-                          {memory.source === "manual" ? "manual" : "auto"}
+                          {memory.source_type || "manual"}
                         </Chip>
                         <Chip compact style={styles.metaChip} textStyle={styles.metaChipText}>
-                          {memory.category || "general"}
+                          {memory.memory_type || "fact"}
+                        </Chip>
+                        <Chip compact style={styles.metaChip} textStyle={styles.metaChipText}>
+                          {memory.status}
                         </Chip>
                       </View>
                     </View>
-                    <Switch
-                      value={memory.is_active}
-                      onValueChange={() => {
-                        void toggleMemory(memory);
-                      }}
-                    />
                   </View>
                   <Text style={styles.memoryDate}>
                     Updated {formatMemoryDate(memory.updated_at || memory.created_at)}
@@ -343,11 +329,11 @@ export default function SettingsMemoryScreen() {
               activeOutlineColor="#7c3aed"
               textColor="#cdd6f4"
             />
-            <Text style={styles.dialogLabel}>カテゴリ</Text>
+            <Text style={styles.dialogLabel}>種類</Text>
             <TextInput
               mode="outlined"
-              value={draftCategory}
-              onChangeText={setDraftCategory}
+              value={draftMemoryType}
+              onChangeText={setDraftMemoryType}
               autoCapitalize="none"
               style={styles.dialogInput}
               outlineColor="#585b70"

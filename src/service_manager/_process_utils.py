@@ -77,28 +77,80 @@ def _listening_pid_for_netstat_line(line: str, port: int) -> str | None:
 def _kill_existing_on_port(port: int) -> None:
     """Stop existing listener on the given port before starting services."""
     if _IS_WINDOWS:
-        try:
-            result = subprocess.run(
+        result = subprocess.run(
+            ["netstat", "-ano"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                f"ポート {port} の使用状況を確認できませんでした"
+                + (f": {detail}" if detail else "")
+            )
+
+        pids = {
+            pid
+            for line in result.stdout.splitlines()
+            if (pid := _listening_pid_for_netstat_line(line, port))
+        }
+        kill_errors: list[str] = []
+        for pid in sorted(pids, key=int):
+            kill_result = subprocess.run(
+                ["taskkill", "/PID", pid, "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if kill_result.returncode != 0:
+                detail = (kill_result.stderr or kill_result.stdout or "").strip()
+                kill_errors.append(f"PID {pid}: {detail or 'taskkill failed'}")
+
+        if kill_errors:
+            recheck = subprocess.run(
                 ["netstat", "-ano"],
                 capture_output=True,
                 text=True,
                 timeout=5,
             )
-            seen_pids = set()
-            for line in result.stdout.splitlines():
-                pid = _listening_pid_for_netstat_line(line, port)
-                if pid and pid not in seen_pids:
-                    seen_pids.add(pid)
-                    subprocess.run(
-                        ["taskkill", "/PID", pid, "/T", "/F"],
-                        capture_output=True,
-                        timeout=5,
-                    )
-                    print(f"Stopped existing process on port {port} (PID {pid})")
-        except Exception:
-            pass
+            if recheck.returncode != 0:
+                detail = (recheck.stderr or recheck.stdout or "").strip()
+                raise RuntimeError(
+                    f"ポート {port} の停止結果を確認できませんでした"
+                    + (f": {detail}" if detail else "")
+                )
+            remaining_pids = {
+                pid
+                for line in recheck.stdout.splitlines()
+                if (pid := _listening_pid_for_netstat_line(line, port))
+            }
+            failed_pids = {
+                error.split(":", 1)[0].removeprefix("PID ")
+                for error in kill_errors
+            }
+            if failed_pids & remaining_pids:
+                raise RuntimeError(
+                    f"ポート {port} を解放できませんでした"
+                    f" ({'; '.join(kill_errors)})"
+                )
+
+        if not _wait_for_port_closed(
+            "127.0.0.1",
+            port,
+            timeout_seconds=5,
+        ):
+            detail = "; ".join(kill_errors)
+            raise RuntimeError(
+                f"ポート {port} を解放できませんでした"
+                + (f" ({detail})" if detail else "")
+            )
+
+        for pid in sorted(pids, key=int):
+            print(f"Stopped existing process on port {port} (PID {pid})")
         return
 
+    kill_errors: list[str] = []
     try:
         result = subprocess.run(
             ["lsof", "-ti", f":{port}"],
@@ -109,25 +161,43 @@ def _kill_existing_on_port(port: int) -> None:
         pids = [p.strip() for p in result.stdout.splitlines() if p.strip().isdigit()]
         for pid in pids:
             try:
-                subprocess.run(["kill", "-9", pid], capture_output=True, timeout=5)
-                print(f"Stopped existing process on port {port} (PID {pid})")
-            except Exception:
-                pass
-        if pids:
-            return
+                kill_result = subprocess.run(
+                    ["kill", "-9", pid],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if kill_result.returncode != 0:
+                    detail = (kill_result.stderr or kill_result.stdout or "").strip()
+                    kill_errors.append(f"PID {pid}: {detail or 'kill failed'}")
+            except Exception as exc:
+                kill_errors.append(f"PID {pid}: {exc}")
     except FileNotFoundError:
         pass
-    except Exception:
-        pass
+    except Exception as exc:
+        kill_errors.append(f"lsof: {exc}")
 
     try:
-        subprocess.run(
+        fuser_result = subprocess.run(
             ["fuser", "-k", f"{port}/tcp"],
             capture_output=True,
+            text=True,
             timeout=5,
         )
-    except Exception:
+        if fuser_result.returncode not in (0, 1):
+            detail = (fuser_result.stderr or fuser_result.stdout or "").strip()
+            kill_errors.append(f"fuser: {detail or 'fuser failed'}")
+    except FileNotFoundError:
         pass
+    except Exception as exc:
+        kill_errors.append(f"fuser: {exc}")
+
+    if not _wait_for_port_closed("127.0.0.1", port, timeout_seconds=5):
+        detail = "; ".join(kill_errors)
+        raise RuntimeError(
+            f"ポート {port} を解放できませんでした"
+            + (f" ({detail})" if detail else "")
+        )
 
 
 def _read_log_tail(path: Path, max_chars: int = 3000) -> str:
@@ -140,10 +210,23 @@ def _read_log_tail(path: Path, max_chars: int = 3000) -> str:
     return text[-max_chars:]
 
 
-def _service_log_dir(project_root: Path) -> Path:
-    log_dir = project_root / "logs" / "services"
+def _web_log_dir(project_root: Path) -> Path:
+    """HTTP 境界ログ（frontend / Caddy）用ディレクトリ。"""
+    log_dir = project_root / "logs" / "web"
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
+
+
+def _models_log_dir(project_root: Path) -> Path:
+    """ローカル LLM サーバーログ用ディレクトリ。"""
+    log_dir = project_root / "logs" / "models"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir
+
+
+def _service_log_dir(project_root: Path) -> Path:
+    """後方互換: 旧 logs/services は web へ誘導する。"""
+    return _web_log_dir(project_root)
 
 
 def _is_port_open(host: str, port: int, timeout_seconds: float = 1.0) -> bool:
@@ -156,10 +239,55 @@ def _is_port_open(host: str, port: int, timeout_seconds: float = 1.0) -> bool:
 
 def _wait_for_port(host: str, port: int, timeout_seconds: float) -> bool:
     deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
+    if timeout_seconds <= 0:
+        return False
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
         try:
-            with socket.create_connection((host, port), timeout=1.0):
+            with socket.create_connection(
+                (host, port),
+                timeout=min(1.0, remaining),
+            ):
                 return True
         except OSError:
-            time.sleep(0.25)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.25, remaining))
+
+
+def _wait_for_port_closed(host: str, port: int, timeout_seconds: float) -> bool:
+    """Wait until no listener accepts connections on the target port."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not _is_port_open(host, port, timeout_seconds=0.25):
+            return True
+        time.sleep(0.1)
+    return not _is_port_open(host, port, timeout_seconds=0.25)
+
+
+def _wait_for_process_port(
+    proc: subprocess.Popen,
+    host: str,
+    port: int,
+    timeout_seconds: float,
+) -> bool:
+    """Wait for a stable listener while ensuring its launcher stays alive."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return False
+        if _is_port_open(host, port, timeout_seconds=0.25):
+            stable_until = min(deadline, time.monotonic() + 1.0)
+            while time.monotonic() < stable_until:
+                if proc.poll() is not None:
+                    return False
+                if not _is_port_open(host, port, timeout_seconds=0.25):
+                    break
+                time.sleep(0.1)
+            else:
+                return True
+        time.sleep(0.1)
     return False

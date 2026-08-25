@@ -9,8 +9,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from ..security.secret_env import load_secret_environment
+
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+load_secret_environment()
 
 
 @dataclass
@@ -44,7 +47,7 @@ class MemoryConfig:
     postgres_port: int = int(os.getenv("POSTGRES_PORT", "5432"))
     postgres_db: str = os.getenv("POSTGRES_DB", "aoitalk_memory")
     postgres_user: str = os.getenv("POSTGRES_USER", "aoitalk")
-    postgres_password: str = os.getenv("POSTGRES_PASSWORD", "aoitalk_password")
+    postgres_password: str = os.getenv("POSTGRES_PASSWORD", "")
     
     # Database compatibility - needed for legacy code
     database_path: Optional[str] = None  # Not used for PostgreSQL, but needed for compatibility

@@ -3,8 +3,8 @@
 """
 
 from typing import Optional, Any, Dict
+from ...features import Features
 from .manager import get_keyword_manager
-from .detectors.spotify_detector import SpotifyLLMKeywordDetector
 from .detectors.speech_rate_detector import SpeechRateDetector
 from .detectors.character_switch_detector import CharacterSwitchDetector
 
@@ -30,12 +30,22 @@ def initialize_keyword_detectors(llm_client: Optional[Any] = None, config: Optio
     # Spotify LLM検出器を登録
     try:
         spotify_config = keyword_config.get('spotify', {})
-        spotify_enabled = spotify_config.get('enabled', True)
+        # Keyword detection is a separate toggle from Integration
+        # availability.  Spotify detection is effective only when both are
+        # enabled; the Integration defaults to disabled and therefore avoids
+        # any Spotify-specific LLM call on fresh installs.
+        spotify_enabled = bool(
+            _spotify_integration_enabled(config)
+            and spotify_config.get('enabled', True)
+        )
         
-        if spotify_enabled:
+        if spotify_enabled and Features.entertainment():
+            from .detectors.spotify_detector import SpotifyLLMKeywordDetector
+
             spotify_detector = SpotifyLLMKeywordDetector(
                 enabled=spotify_enabled,
-                llm_client=llm_client
+                llm_client=llm_client,
+                config=config,
             )
             # 設定パラメータを検出器に渡す
             if hasattr(spotify_detector, 'use_llm_extraction'):
@@ -48,6 +58,10 @@ def initialize_keyword_detectors(llm_client: Optional[Any] = None, config: Optio
             manager.register_detector(spotify_detector)
             print(f"[キーワード初期化] Spotify検出器を登録しました (有効: {spotify_enabled})")
         else:
+            # A process may reinitialize after the Integration toggle changes;
+            # remove any previously registered detector so a stale instance
+            # cannot issue Spotify LLM/tool calls while disabled.
+            manager.unregister_detector("spotify")
             print("[キーワード初期化] Spotify検出器は無効に設定されています")
         
     except Exception as e:
@@ -119,9 +133,9 @@ def _get_keyword_config(config: Optional[Any]) -> Dict[str, Any]:
     """
     default_config = {
         'enabled': True,
-        'llm_model': 'gpt-4o-mini',
+        'llm_model': 'gpt-5.6-luna',
         'spotify': {
-            'enabled': True,
+            'enabled': False,
             'use_llm_extraction': True,
             'confidence_threshold': 0.7,
             'fallback_to_regex': True
@@ -158,11 +172,39 @@ def _get_keyword_config(config: Optional[Any]) -> Dict[str, Any]:
             result = default_config.copy()
             result.update(config['keyword_detection'])
             return result
+        elif hasattr(config, 'get'):
+            configured = config.get('keyword_detection', {})
+            if isinstance(configured, dict):
+                result = default_config.copy()
+                result.update(configured)
+                return result
     
     except Exception as e:
         print(f"[キーワード初期化] 設定読み込みエラー: {e}")
     
     return default_config
+
+
+def _spotify_integration_enabled(config: Optional[Any]) -> bool:
+    """Read canonical Shared Integration availability; fail closed."""
+
+    if config is None:
+        return False
+    try:
+        if isinstance(config, dict):
+            value = config
+            for part in ('integrations', 'spotify', 'enabled'):
+                if not isinstance(value, dict) or part not in value:
+                    return False
+                value = value[part]
+            return bool(value)
+        getter = getattr(config, 'get', None)
+        if callable(getter):
+            value = getter('integrations.spotify.enabled', None)
+            return bool(value) if value is not None else False
+    except Exception:
+        return False
+    return False
 
 
 def get_llm_client_for_keywords(config: Optional[Any] = None):
@@ -182,7 +224,7 @@ def get_llm_client_for_keywords(config: Optional[Any] = None):
         
         # 設定からキーワード検出設定を取得
         keyword_config = _get_keyword_config(config)
-        llm_model = keyword_config.get('llm_model', 'gpt-4o-mini')
+        llm_model = keyword_config.get('llm_model', 'gpt-5.6-luna')
         
         # 設定を読み込み（引数のconfigが無い場合のみ）
         if not config:

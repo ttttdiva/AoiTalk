@@ -7,12 +7,14 @@ import logging
 import io
 import time
 import wave
-from typing import Dict, Optional, Set
+import uuid
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Set
 from collections import defaultdict
 import numpy as np
 
 import discord
-from discord.ext import voice_recv
+from ..voice_recv_compat import voice_recv
 
 from ...runtime_features import runtime_feature_manager
 from .custom_sink import UserAudioSink
@@ -23,6 +25,25 @@ from ...audio.manager import SpeechRecognitionManager as AudioManager
 from ...tts.manager import TTSManager
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _DiscordVoiceUsageContext:
+    """Immutable identity for one Discord VC recognition request.
+
+    ``SpeechRecognitionManager`` is shared by all guild members.  Passing a
+    fresh context to each Gemini call avoids mutating manager/recognizer
+    defaults and keeps STT usage rows tied to the originating user/session.
+    """
+
+    user_id: Optional[str]
+    current_session_id: Optional[str]
+    current_project_id: Any = None
+    character_name: Optional[str] = None
+    guild_id: Optional[str] = None
+
+    def _get_session_user_id(self) -> Optional[str]:
+        return self.user_id
 
 
 # Note: We don't need a custom VoiceConnection class anymore
@@ -476,8 +497,36 @@ class VoiceHandler:
                         f.write(wav_buffer.getvalue())
                     logger.info(f"Debug: Saved audio to {debug_path} (length: {len(audio_array)/target_rate:.2f}s)")
                 
-                # Perform speech recognition
-                text = await self._recognize_speech(wav_buffer.read())
+                # Resolve the real SessionHandler UUID before ASR whenever the
+                # bot is available.  The manager is shared across guilds, so
+                # pass this request-local identity to Gemini instead of
+                # relying on mutable recognizer defaults.
+                session = None
+                # Voice usage telemetry uses the in-process runtime identity;
+                # the durable ConversationSession UUID is resolved only once
+                # the assistant exists and is passed separately below.
+                runtime_session_id = None
+                if self._bot_instance:
+                    try:
+                        session = await self._bot_instance.session_handler.get_or_create_session(
+                            guild_id=guild_id,
+                            user_id=user_id,
+                        )
+                        runtime_session_id = getattr(session, 'runtime_id', None) or getattr(
+                            session, 'id', None
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Failed to resolve Discord session before ASR",
+                            exc_info=True,
+                        )
+
+                text = await self._recognize_speech(
+                    wav_buffer.read(),
+                    user_id=user_id,
+                    guild_id=guild_id,
+                    session_id=runtime_session_id,
+                )
                 
                 if text:
                     logger.info(f"🗣️ User {user_id} said: '{text}'")
@@ -498,10 +547,11 @@ class VoiceHandler:
                     # Use stored bot instance
                     if self._bot_instance:
                         # Get session
-                        session = await self._bot_instance.session_handler.get_or_create_session(
-                            guild_id=guild_id,
-                            user_id=user_id
-                        )
+                        if session is None:
+                            session = await self._bot_instance.session_handler.get_or_create_session(
+                                guild_id=guild_id,
+                                user_id=user_id
+                            )
                         
                         # Ensure session is in voice mode and has assistant
                         if session.mode != 'voice':
@@ -525,7 +575,41 @@ class VoiceHandler:
             finally:
                 logger.info(f"🔓 Released processing lock for user {user_id}")
     
-    async def _recognize_speech(self, audio_data: bytes) -> Optional[str]:
+    @staticmethod
+    def _build_usage_context(
+        user_id: Optional[int],
+        guild_id: Optional[int],
+        session_id: Optional[str] = None,
+    ) -> _DiscordVoiceUsageContext:
+        resolved_session_id = session_id
+        if resolved_session_id is None and user_id is not None:
+            resolved_session_id = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"aoitalk:discord:{user_id}:{guild_id if guild_id is not None else 'dm'}",
+                )
+            )
+        memory_user_id = None
+        if user_id is not None:
+            memory_user_id = (
+                f"discord:{guild_id if guild_id is not None else 'dm'}:{user_id}"
+            )
+        return _DiscordVoiceUsageContext(
+            user_id=memory_user_id,
+            current_session_id=resolved_session_id,
+            guild_id=str(guild_id) if guild_id is not None else None,
+        )
+
+    async def _recognize_speech(
+        self,
+        audio_data: bytes,
+        *,
+        user_id: Optional[int] = None,
+        guild_id: Optional[int] = None,
+        session_id: Optional[str] = None,
+        usage_client: Any = None,
+        usage_context: Any = None,
+    ) -> Optional[str]:
         """Recognize speech from audio data
         
         Args:
@@ -546,13 +630,31 @@ class VoiceHandler:
             
             audio_manager = await self._ensure_audio_manager()
 
-            # Use existing speech recognition system
+            request_context = usage_context
+            if request_context is None and (user_id is not None or guild_id is not None):
+                request_context = self._build_usage_context(
+                    user_id,
+                    guild_id,
+                    session_id=session_id,
+                )
+
+            # Use existing speech recognition system.  Only add the optional
+            # usage kwargs when a request actually supplied identity, keeping
+            # compatibility with third-party AudioManager substitutes.
+            recognize_kwargs = {
+                "sample_rate": framerate,
+                "channels": channels,
+                "sample_width": sample_width,
+            }
+            if usage_client is not None or request_context is not None:
+                recognize_kwargs.update(
+                    usage_client=usage_client,
+                    usage_context=request_context,
+                )
             result = await asyncio.to_thread(
                 audio_manager.recognize,
                 frames,  # raw PCM data
-                sample_rate=framerate,
-                channels=channels,
-                sample_width=sample_width
+                **recognize_kwargs,
             )
             
             if result:
@@ -595,20 +697,88 @@ class VoiceHandler:
         try:
             # Generate response
             if session.assistant:
-                if not getattr(session, 'memory_prefilled', False):
+                # Resolve the durable DB conversation after the assistant has
+                # been initialized.  ``session.id``/``runtime_id`` is only a
+                # process-local turn identity and must never be sent as the
+                # LLM client's current_session_id.
+                resolver = getattr(getattr(bot, 'session_handler', None), 'ensure_conversation_session', None)
+                if callable(resolver):
                     try:
-                        await session.assistant.prefill_context_from_memory(
-                            user_id=user_id,
-                            guild_id=guild_id
+                        await resolver(session, session.assistant)
+                    except Exception:
+                        logger.debug(
+                            "Failed to resolve durable voice conversation",
+                            exc_info=True,
                         )
-                    finally:
-                        session.memory_prefilled = True
-
-                response = await session.assistant.process_text(
-                    text,
-                    user_id=user_id,
-                    guild_id=guild_id
+                conversation_id = getattr(session, 'conversation_id', None)
+                runtime_session_id = getattr(session, 'runtime_id', None) or getattr(
+                    session, 'id', None
                 )
+                if not getattr(session, 'memory_prefilled', False):
+                    should_prefill = True
+                    prefill_policy = getattr(
+                        session.assistant,
+                        "should_prefill_context_from_memory",
+                        None,
+                    )
+                    if callable(prefill_policy):
+                        try:
+                            should_prefill = bool(prefill_policy())
+                        except Exception:
+                            logger.debug(
+                                "Voice memory prefill capability check failed",
+                                exc_info=True,
+                            )
+
+                    # Native durable-session clients load history inside their
+                    # provider request; legacy assistants still use the
+                    # user-scoped prefill below.
+                    session.memory_prefilled = True
+                    if should_prefill:
+                        prefill_kwargs = {
+                            "user_id": user_id,
+                            "guild_id": guild_id,
+                            "session_id": conversation_id,
+                            "runtime_session_id": runtime_session_id,
+                        }
+                        try:
+                            await session.assistant.prefill_context_from_memory(
+                                **prefill_kwargs,
+                            )
+                        except TypeError as exc:
+                            message_text = str(exc)
+                            if not any(
+                                key in message_text
+                                for key in ("session_id", "runtime_session_id")
+                            ):
+                                raise
+                            await session.assistant.prefill_context_from_memory(
+                                user_id=user_id,
+                                guild_id=guild_id,
+                            )
+
+                process_kwargs = {
+                    "user_id": user_id,
+                    "guild_id": guild_id,
+                    "session_id": conversation_id,
+                    "runtime_session_id": runtime_session_id,
+                }
+                try:
+                    response = await session.assistant.process_text(
+                        text,
+                        **process_kwargs,
+                    )
+                except TypeError as exc:
+                    # Preserve compatibility with legacy voice assistants that
+                    # predate runtime_session_id while retaining durable ID
+                    # semantics whenever the new API is available.
+                    if "runtime_session_id" not in str(exc):
+                        raise
+                    process_kwargs.pop("runtime_session_id", None)
+                    response = await session.assistant.process_text(
+                        text,
+                        **process_kwargs,
+                    )
                 
                 if response:
                     # Send text response to the text channel
@@ -890,16 +1060,47 @@ class VoiceHandler:
     
     async def cleanup(self):
         """Cleanup all voice connections"""
-        # Cancel timeout check task
-        if self._timeout_check_task and not self._timeout_check_task.done():
-            self._timeout_check_task.cancel()
-            
-        # Cancel all processing tasks
+        current_task = asyncio.current_task()
+        tasks_to_cancel = set()
+
+        # Cancel timeout check task and await its terminal state.  The
+        # cleanup method can itself be called from that task in tests or
+        # embedded integrations, so avoid cancelling/awaiting the current
+        # task.
+        timeout_task = self._timeout_check_task
+        if (
+            timeout_task
+            and timeout_task is not current_task
+            and not timeout_task.done()
+        ):
+            timeout_task.cancel()
+            tasks_to_cancel.add(timeout_task)
+
+        # Cancel all processing tasks and collect them for one bounded gather
+        # below.  Clearing the dictionaries before awaiting would otherwise
+        # leave task exceptions unobserved during bot shutdown.
         for guild_tasks in self.processing_tasks.values():
             for task in guild_tasks.values():
-                if not task.done():
+                if task and task is not current_task and not task.done():
                     task.cancel()
-        
+                    tasks_to_cancel.add(task)
+
+        if tasks_to_cancel:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks_to_cancel, return_exceptions=True),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                # A third-party voice task may ignore cancellation.  Keep
+                # shutdown progressing; the task has still been cancelled and
+                # will be observed by the event loop if it eventually exits.
+                logger.warning(
+                    "Timed out waiting for Discord voice tasks during cleanup"
+                )
+
+        self._timeout_check_task = None
+
         for guild_id in list(self.voice_connections.keys()):
             await self.disconnect_voice_channel(guild_id)
         

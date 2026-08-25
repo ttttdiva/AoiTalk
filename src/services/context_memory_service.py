@@ -27,6 +27,23 @@ def _coerce_uuid(value: Optional[str]) -> Optional[uuid.UUID]:
 
 _ASCII_WORD_RE = re.compile(r"[A-Za-z0-9_\-]{3,}")
 _CJK_RUN_RE = re.compile(r"[ぁ-んァ-ン一-龥]{2,}")
+_ALWAYS_ON_MEMORY_TYPES = {"preference", "constraint", "instruction"}
+_CJK_STOP_BIGRAMS = {
+    "して",
+    "する",
+    "した",
+    "いる",
+    "ある",
+    "ます",
+    "です",
+    "こと",
+    "ため",
+    "よう",
+    "から",
+    "ので",
+    "これ",
+    "それ",
+}
 
 
 def _keywords(text: Optional[str]) -> set[str]:
@@ -41,10 +58,49 @@ def _keywords(text: Optional[str]) -> set[str]:
             if len(clipped) < size:
                 continue
             for index in range(0, len(clipped) - size + 1):
-                terms.add(clipped[index : index + size].casefold())
+                term = clipped[index : index + size].casefold()
+                if size == 2 and term in _CJK_STOP_BIGRAMS:
+                    continue
+                terms.add(term)
                 if len(terms) >= 120:
                     return terms
     return terms
+
+
+def _memory_selection(
+    item: Dict[str, Any],
+    *,
+    terms: set[str],
+    project_id: Optional[str],
+    task_id: Optional[str],
+    session_id: Optional[str],
+) -> tuple[bool, str, int]:
+    """Return whether a scoped memory is useful for this specific turn.
+
+    Broad scope eligibility and turn relevance are intentionally separate:
+    being owned by the user does not mean a detailed fact belongs in every
+    prompt.
+    """
+    haystack = f"{item.get('title') or ''}\n{item.get('content') or ''}".casefold()
+    keyword_score = sum(1 for term in terms if term in haystack)
+    if item.get("is_pinned"):
+        return True, "pinned", keyword_score
+    if keyword_score:
+        return True, "current_message_keyword_match", keyword_score
+
+    memory_type = str(item.get("memory_type") or "").casefold()
+    importance = int(item.get("importance") or 0)
+    if memory_type in _ALWAYS_ON_MEMORY_TYPES and importance >= 8:
+        return True, "high_importance_user_guidance", 0
+    if (
+        importance >= 7
+        and (
+            (session_id and item.get("session_id") == session_id)
+            or (task_id and item.get("task_id") == task_id)
+        )
+    ):
+        return True, "active_session_or_task_scope", 0
+    return False, "not_relevant_to_current_turn", 0
 
 
 class ContextMemoryService:
@@ -205,7 +261,13 @@ class ContextMemoryService:
 
         async with await get_db_session() as session:
             conditions = [
-                ContextMemory.scope_type == "global",
+                and_(
+                    ContextMemory.scope_type == "global",
+                    or_(
+                        ContextMemory.user_id.is_(None),
+                        ContextMemory.user_id == str(user_id),
+                    ),
+                ),
                 and_(
                     ContextMemory.scope_type == "user",
                     ContextMemory.user_id == str(user_id),
@@ -214,6 +276,7 @@ class ContextMemoryService:
             if project_uuid:
                 conditions.append(
                     and_(
+                        ContextMemory.scope_type == "project",
                         ContextMemory.project_id == project_uuid,
                         or_(
                             ContextMemory.user_id.is_(None),
@@ -222,12 +285,19 @@ class ContextMemoryService:
                     )
                 )
                 conditions.append(
-                    (ContextMemory.scope_type == "project")
-                    & (ContextMemory.scope_id == str(project_id))
+                    and_(
+                        ContextMemory.scope_type == "project",
+                        ContextMemory.scope_id == str(project_id),
+                        or_(
+                            ContextMemory.user_id.is_(None),
+                            ContextMemory.user_id == str(user_id),
+                        ),
+                    )
                 )
             if task_uuid:
                 conditions.append(
                     and_(
+                        ContextMemory.scope_type == "task",
                         ContextMemory.task_id == task_uuid,
                         or_(
                             ContextMemory.user_id.is_(None),
@@ -236,12 +306,19 @@ class ContextMemoryService:
                     )
                 )
                 conditions.append(
-                    (ContextMemory.scope_type == "task")
-                    & (ContextMemory.scope_id == str(task_id))
+                    and_(
+                        ContextMemory.scope_type == "task",
+                        ContextMemory.scope_id == str(task_id),
+                        or_(
+                            ContextMemory.user_id.is_(None),
+                            ContextMemory.user_id == str(user_id),
+                        ),
+                    )
                 )
             if session_uuid:
                 conditions.append(
                     and_(
+                        ContextMemory.scope_type == "session",
                         ContextMemory.session_id == session_uuid,
                         or_(
                             ContextMemory.user_id.is_(None),
@@ -250,8 +327,14 @@ class ContextMemoryService:
                     )
                 )
                 conditions.append(
-                    (ContextMemory.scope_type == "session")
-                    & (ContextMemory.scope_id == str(session_id))
+                    and_(
+                        ContextMemory.scope_type == "session",
+                        ContextMemory.scope_id == str(session_id),
+                        or_(
+                            ContextMemory.user_id.is_(None),
+                            ContextMemory.user_id == str(user_id),
+                        ),
+                    )
                 )
 
             stmt = (
@@ -269,14 +352,31 @@ class ContextMemoryService:
                     ContextMemory.importance.desc(),
                     ContextMemory.updated_at.desc(),
                 )
-                .limit(max(limit * 3, limit))
+                # Keep the always-on path bounded.  Older/detail memories remain
+                # available through the explicit search_past_chats semantic path.
+                .limit(max(limit * 25, 200))
             )
             result = await session.execute(stmt)
             rows = [item.to_dict() for item in result.scalars().all()]
 
+        selected: list[Dict[str, Any]] = []
+        for item in rows:
+            include, reason, keyword_score = _memory_selection(
+                item,
+                terms=terms,
+                project_id=project_id,
+                task_id=task_id,
+                session_id=session_id,
+            )
+            if not include:
+                continue
+            item = dict(item)
+            item["selection_reason"] = reason
+            item["_keyword_score"] = keyword_score
+            selected.append(item)
+
         def score(item: Dict[str, Any]) -> tuple[int, int, int]:
-            haystack = f"{item.get('title') or ''}\n{item.get('content') or ''}".casefold()
-            keyword_score = sum(1 for term in terms if term in haystack)
+            keyword_score = int(item.get("_keyword_score") or 0)
             scope_score = 0
             if item.get("session_id") == session_id:
                 scope_score += 3
@@ -290,8 +390,10 @@ class ContextMemoryService:
                 int(item.get("importance") or 0),
             )
 
-        rows.sort(key=score, reverse=True)
-        return rows[:limit]
+        selected.sort(key=score, reverse=True)
+        for item in selected:
+            item.pop("_keyword_score", None)
+        return selected[:limit]
 
     @staticmethod
     def render_memories_for_prompt(memories: List[Dict[str, Any]]) -> str:

@@ -1,4 +1,9 @@
-"""無料Teamの編集可能な初期テンプレート。"""
+"""無料Teamの routing/profile overlay 用の初期値。
+
+Free Team は Agent Team の topology を所有しない。ここで定義するのは、
+``routing_profiles.free-team`` が参照する候補プールと、canonical な
+``agent_team.llm_profiles`` に対応する pool target だけである。
+"""
 
 from __future__ import annotations
 
@@ -10,7 +15,6 @@ _PROFILE_TEMPLATE: dict[str, Any] = {
     "display_name": "無料Team",
     "enabled": True,
     "main_pool_id": "coordinator",
-    "agent_team_enabled": True,
     "max_fallbacks": 6,
     "credential_profiles": {
         "openai-complimentary": {
@@ -103,26 +107,54 @@ _PROFILE_TEMPLATE: dict[str, Any] = {
         "tool-executor": {"tool_mode": "required", "candidate_ids": ["gemini-free-flash", "openrouter-free-*", "gemini-promo-flash", "codex-spark", "antigravity", "grok-build"]},
         "vision": {"tool_mode": "required", "candidate_ids": ["gemini-free-flash", "gemini-promo-flash"]},
     },
-    "agent_team": {
-        "model_groups": {
-            "heavy": {"name": "高負荷", "target_type": "pool", "pool_id": "heavy", "effort_policy": "same"},
-            "light": {"name": "軽量", "target_type": "pool", "pool_id": "light", "effort_policy": "lower"},
-            "coding": {"name": "コーディング", "target_type": "pool", "pool_id": "coding", "effort_policy": "same"},
-            "tool-executor": {"name": "ツール実行", "target_type": "pool", "pool_id": "tool-executor", "effort_policy": "same"},
+    # These are routing overlays for the canonical Agent Team profiles.  The
+    # Team/Subagent graph remains in ``agent_team`` and is never copied here.
+    # Provider/model identify the Free Team routing profile; pool_id selects
+    # the candidate pool maintained below.
+    "llm_profiles": {
+        "heavy": {
+            "profile_id": "heavy",
+            "name": "高負荷",
+            "target_type": "pool",
+            "provider": "routing-profile",
+            "model": "free-team",
+            "effort_policy": "same",
+            "effort": "",
+            "pool_id": "heavy",
+            "routing_profile_id": "free-team",
         },
-        "members": {
-            "advanced_reasoning": {"enabled": True, "group_id": "heavy", "override": {}},
-            "architect": {"enabled": True, "group_id": "auto", "override": {}},
-            "explorer": {"enabled": True, "group_id": "light", "override": {}},
-            "implementer": {"enabled": True, "group_id": "coding", "override": {}},
-            "reviewer": {"enabled": True, "group_id": "heavy", "override": {}},
-            "utility": {"enabled": True, "group_id": "tool-executor", "override": {}},
-            "media": {"enabled": True, "group_id": "tool-executor", "override": {}},
-            "spotify": {"enabled": True, "group_id": "tool-executor", "override": {}},
-            "scenario": {"enabled": True, "group_id": "coordinator", "override": {}},
-            "writing": {"enabled": True, "group_id": "coordinator", "override": {}},
-            "import": {"enabled": True, "group_id": "light", "override": {}},
-            "agent_harness": {"enabled": True, "group_id": "", "override": {"provider": "codex-cli", "model": "gpt-5.3-codex-spark", "runner": "codex_exec"}},
+        "light": {
+            "profile_id": "light",
+            "name": "軽量",
+            "target_type": "pool",
+            "provider": "routing-profile",
+            "model": "free-team",
+            "effort_policy": "lower",
+            "effort": "",
+            "pool_id": "light",
+            "routing_profile_id": "free-team",
+        },
+        "coding": {
+            "profile_id": "coding",
+            "name": "コーディング",
+            "target_type": "pool",
+            "provider": "routing-profile",
+            "model": "free-team",
+            "effort_policy": "same",
+            "effort": "",
+            "pool_id": "coding",
+            "routing_profile_id": "free-team",
+        },
+        "tool-executor": {
+            "profile_id": "tool-executor",
+            "name": "ツール実行",
+            "target_type": "pool",
+            "provider": "routing-profile",
+            "model": "free-team",
+            "effort_policy": "same",
+            "effort": "",
+            "pool_id": "tool-executor",
+            "routing_profile_id": "free-team",
         },
     },
 }

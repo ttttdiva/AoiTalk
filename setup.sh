@@ -1,184 +1,255 @@
 #!/usr/bin/env bash
-# AoiTalk Linux (Debian/Ubuntu, WSL2 を含む) 用セットアップスクリプト
-# setup.bat の Linux 版。冪等に動作する想定。
+# AoiTalk Linux/WSL セットアップ
+#
+# 方針:
+# - Python/Node/PostgreSQL の「存在」ではなく、実際に利用可能かを検査する。
+# - DB スキーマは Alembic のみを正規ルートにする。
+# - 音声系の巨大な依存は Enterprise/Linux の初回セットアップでは入れない。
+#   必要な場合だけ AOITALK_INSTALL_AUDIO_DEPS=true を指定する。
+# - .env は生成するが、Git 管理下へ戻さない。
 
-set -euo pipefail
+set -Eeuo pipefail
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-echo "==================================="
-echo "AoiTalk セットアップ開始"
-echo "==================================="
+log() { printf '[AoiTalk] %s\n' "$*"; }
+die() { printf '[AoiTalk][ERROR] %s\n' "$*" >&2; exit 1; }
 
-# ---------------------------------------------------------------------------
-# [1/6] PostgreSQL 16 + pgvector インストール
-# ---------------------------------------------------------------------------
-echo
-echo "[1/6] PostgreSQL 16 + pgvector をインストール中..."
+is_true() {
+    case "${1:-}" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
-if ! command -v psql >/dev/null 2>&1; then
-    echo "  - apt で postgresql-16 をインストールします (sudo パスワードが必要な場合があります)"
-    sudo apt-get update
-    # postgresql-16 / pgvector が Debian 12 / Ubuntu 22.04 以降の公式 APT にあれば、それで入る。
-    # 見つからない場合は PostgreSQL 公式 APT リポジトリの追加や、pgvector をソースビルドする必要がある。
-    # 参考 (実行はしない):
-    #   git clone https://github.com/pgvector/pgvector.git
-    #   cd pgvector && make && sudo make install
-    sudo apt-get install -y postgresql-16 postgresql-client-16 postgresql-16-pgvector || {
-        echo "  [警告] postgresql-16 / postgresql-16-pgvector のインストールに失敗しました。"
-        echo "         PostgreSQL 公式 APT リポジトリの追加や pgvector のソースビルドが必要かもしれません。"
-        echo "         参考: https://www.postgresql.org/download/linux/  https://github.com/pgvector/pgvector"
-        exit 1
-    }
-else
-    echo "  - psql は既にインストールされています。スキップ。"
-fi
+random_secret() {
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex 32
+    else
+        od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+    fi
+}
 
-echo
-echo "  - PostgreSQL サービスを有効化/起動中..."
-if command -v systemctl >/dev/null 2>&1; then
-    sudo systemctl enable --now postgresql 2>/dev/null || {
-        echo "  [情報] systemctl による起動に失敗しました。service コマンドで再試行します。"
-        sudo service postgresql start || echo "  [警告] PostgreSQL の起動に失敗しました。手動で確認してください。"
-    }
-else
-    sudo service postgresql start || echo "  [警告] PostgreSQL の起動に失敗しました。手動で確認してください。"
-fi
+set_env_value() {
+    local key="$1"
+    local value="$2"
+    local escaped
+    escaped="${value//\\/\\\\}"
+    escaped="${escaped//&/\\&}"
+    if grep -Eq "^${key}=" .env; then
+        sed -E -i "s|^${key}=.*$|${key}=${escaped}|" .env
+    else
+        printf '%s=%s\n' "$key" "$value" >> .env
+    fi
+}
 
-# ---------------------------------------------------------------------------
-# [2/6] .env 生成 + DB/ユーザー作成 (冪等)
-# ---------------------------------------------------------------------------
-echo
-echo "[2/6] .env と PostgreSQL データベース/ユーザーを設定中..."
+load_env() {
+    # .env を shell source しない。値に ``$(...)`` やバッククォートが
+    # 含まれていても、セットアッププロセス内のコードとして実行しない。
+    local line key value
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            if [ "${#value}" -ge 2 ] && \
+                { [ "${value:0:1}" = '"' ] || [ "${value:0:1}" = "'" ]; } && \
+                [ "${value:0:1}" = "${value: -1}" ]; then
+                value="${value:1:${#value}-2}"
+            fi
+            export "$key=$value"
+        fi
+    done < .env
+}
 
-# .env が無ければ .env.sample から生成し、空の認証シークレットを自動生成する
-if [ ! -f ".env" ]; then
-    cp .env.sample .env
-    for key in NEXTAUTH_SECRET AOITALK_WEB_AUTH_SECRET AOITALK_JWT_SECRET INTERNAL_API_KEY; do
-        # CRLF 改行の .env.sample にも対応する
-        if grep -Eq "^${key}=[[:space:]]*\r?$" .env; then
-            secret="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-            sed -E -i "s|^${key}=[[:space:]]*(\r?)$|${key}=${secret}\1|" .env
-            echo "  - ${key} を自動生成しました。"
+ensure_env_file() {
+    if [ ! -f .env ]; then
+        cp .env.sample .env
+        log ".env を .env.sample から作成しました。"
+    fi
+    chmod 600 .env
+
+    local key
+    for key in NEXTAUTH_SECRET AOITALK_WEB_AUTH_SECRET AOITALK_JWT_SECRET INTERNAL_API_KEY AOITALK_CADDY_GATE_KEY; do
+        if ! grep -Eq "^${key}=[^[:space:]]+" .env; then
+            set_env_value "$key" "$(random_secret)"
+            log "${key} を生成しました。"
         fi
     done
-    echo "  - .env を .env.sample から作成しました。APIキー等は必要に応じて .env を編集してください。"
-else
-    echo "  - 既存の .env を使用します。"
-fi
 
-# peer 認証前提で sudo -u postgres psql を使う
-PSQL_SU="sudo -u postgres psql -v ON_ERROR_STOP=1"
-
-$PSQL_SU -tAc "SELECT 1 FROM pg_roles WHERE rolname='aoitalk'" | grep -q 1 || \
-    $PSQL_SU -c "CREATE USER aoitalk WITH PASSWORD 'aoitalk_password';"
-
-$PSQL_SU -tAc "SELECT 1 FROM pg_database WHERE datname='aoitalk_memory'" | grep -q 1 || \
-    $PSQL_SU -c "CREATE DATABASE aoitalk_memory OWNER aoitalk;"
-
-$PSQL_SU -c "GRANT ALL PRIVILEGES ON DATABASE aoitalk_memory TO aoitalk;"
-sudo -u postgres psql -v ON_ERROR_STOP=1 -d aoitalk_memory -c "CREATE EXTENSION IF NOT EXISTS vector;"
-sudo -u postgres psql -v ON_ERROR_STOP=1 -d aoitalk_memory -c "GRANT USAGE ON SCHEMA public TO aoitalk;"
-sudo -u postgres psql -v ON_ERROR_STOP=1 -d aoitalk_memory -c "GRANT CREATE ON SCHEMA public TO aoitalk;"
-
-echo "  - 完了しました。"
-
-# ---------------------------------------------------------------------------
-# [3/6] Node.js LTS の確認とインストール
-# ---------------------------------------------------------------------------
-echo
-echo "[3/6] Node.js の確認とインストール..."
-
-if command -v node >/dev/null 2>&1; then
-    echo "  - Node.js は既にインストールされています ($(node --version))。スキップ。"
-else
-    echo "  - Node.js LTS を nodesource 経由でインストールします..."
-    # NodeSource 公式手順 (LTS)
-    curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
-    sudo apt-get install -y nodejs
-fi
-
-# ---------------------------------------------------------------------------
-# [4/6] Python venv + Python 依存
-# ---------------------------------------------------------------------------
-echo
-echo "[4/6] Python 仮想環境とパッケージをインストール中..."
-
-PYTHON_CMD=""
-for candidate in "${PYTHON:-}" python3.12 python3; do
-    [ -n "$candidate" ] || continue
-    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' >/dev/null 2>&1; then
-        PYTHON_CMD="$candidate"
-        break
+    # 固定された初期DBパスワードをそのまま使わない。既存環境の値は尊重する。
+    if grep -Eq '^POSTGRES_PASSWORD=(|aoitalk_password)[[:space:]]*$' .env; then
+        set_env_value POSTGRES_PASSWORD "$(random_secret)"
+        log "POSTGRES_PASSWORD をランダム値へ置換しました。"
     fi
-done
+    if ! grep -Eq '^AOITALK_BOOTSTRAP_ADMIN_PASSWORD=[^[:space:]]+' .env; then
+        set_env_value AOITALK_BOOTSTRAP_ADMIN_PASSWORD "$(random_secret)"
+        log "初回管理者パスワードを生成しました。初回ログイン後に変更してください。"
+    fi
+}
 
-if [ -z "$PYTHON_CMD" ]; then
-    echo "  [エラー] Python 3.12以上が必要です。python3.12 をインストールしてから再実行してください。"
-    exit 1
-fi
-echo "  - Python: $($PYTHON_CMD --version)"
+ensure_node() {
+    if ! command -v node >/dev/null 2>&1; then
+        command -v sudo >/dev/null 2>&1 || die "Node.js がなく sudo もありません。Node.js 20以上を先に用意してください。"
+        log "Node.js LTS をインストールします。"
+        curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
+        sudo apt-get install -y nodejs
+    fi
+    node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 20 ? 0 : 1)' \
+        || die "Node.js 20以上が必要です: $(node --version)"
+    log "Node.js: $(node --version), npm: $(npm --version)"
+}
 
-# python3-venv が無いと venv 作成に失敗するので、可能なら入れておく
-if ! "$PYTHON_CMD" -m venv --help >/dev/null 2>&1; then
-    echo "  - Python venv パッケージをインストールします..."
-    sudo apt-get install -y python3.12-venv python3-pip || sudo apt-get install -y python3-venv python3-pip || true
-fi
+find_python() {
+    local candidate
+    for candidate in "${PYTHON:-}" python3.12 python3; do
+        [ -n "$candidate" ] || continue
+        if command -v "$candidate" >/dev/null 2>&1 && \
+            "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' >/dev/null 2>&1; then
+            command -v "$candidate"
+            return 0
+        fi
+    done
 
-if [ -d "venv" ]; then
-    if [ -x "venv/bin/python" ] && venv/bin/python -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' >/dev/null 2>&1; then
-        echo "  - venv は既にPython 3.12以上です。スキップ。"
-    else
-        echo "  - 既存venvがPython 3.12未満のため再作成します..."
+    # Debian/Ubuntu の標準リポジトリに 3.12 がない場合でも、uv の管理Pythonを使える。
+    if command -v uv >/dev/null 2>&1; then
+        log "Python 3.12 が見つからないため uv で取得します。" >&2
+        uv python install 3.12 >&2
+        uv python find 3.12
+        return 0
+    fi
+    return 1
+}
+
+ensure_python_venv() {
+    local python_cmd
+    python_cmd="$(find_python)" || die "Python 3.12以上が必要です。uv または python3.12 を用意してください。"
+    log "Python: $($python_cmd --version)"
+
+    if [ -d venv ] && { [ ! -x venv/bin/python ] || ! venv/bin/python -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' >/dev/null 2>&1; }; then
+        log "既存venvのPythonが古いため作り直します。"
         rm -rf venv
     fi
-fi
+    if [ ! -d venv ]; then
+        "$python_cmd" -m venv venv || {
+            command -v sudo >/dev/null 2>&1 && sudo apt-get install -y python3-venv python3-pip || true
+            "$python_cmd" -m venv venv || die "venv の作成に失敗しました。"
+        }
+    fi
 
-if [ ! -d "venv" ]; then
-    "$PYTHON_CMD" -m venv venv || {
-        echo "  [エラー] venv 作成に失敗しました。python3.12-venv をインストールしてから再実行してください。"
-        exit 1
-    }
-    echo "  - venv を作成しました。"
-fi
+    # shellcheck disable=SC1091
+    . venv/bin/activate
+    python -m pip install --upgrade pip wheel
+    if is_true "${AOITALK_INSTALL_AUDIO_DEPS:-false}"; then
+        python -m pip install -e '.[audio,test,irodori,yomi-linter]'
+        # DACVAE's descript-audiotools dependency pins protobuf<3.20, while
+        # AoiTalk (mem0ai) requires protobuf>=5.29.6. Keep the existing
+        # protobuf and install the codec plus its runtime imports explicitly,
+        # rather than allowing pip to downgrade the memory stack.
+        python -m pip install --no-deps \
+            'dacvae @ git+https://github.com/facebookresearch/dacvae@414c20785fc3a28373073ea8ef7a1316eeeaca6e'
+        python -m pip install --no-deps descript-audiotools==0.7.2
+        python -m pip install \
+            absl-py argbind einops ffmpy ipython julius librosa markdown2 matplotlib \
+            flatten-dict importlib-resources pyloudnorm pystoi randomname rich scipy \
+            soundfile tensorboard torch-stoi
+    else
+        python -m pip install -e '.[test]'
+    fi
+}
 
-# shellcheck disable=SC1091
-. venv/bin/activate
-pip install --upgrade pip
-# Linux では windows extras を除外
-pip install -e ".[audio,test,irodori,yomi-linter]"
-pip install --no-deps "dacvae @ git+https://github.com/facebookresearch/dacvae" \
-    descript-audiotools argbind julius pystoi torch-stoi flatten-dict \
-    markdown2 randomname importlib-resources
+ensure_postgres() {
+    if is_true "${AOITALK_SKIP_DB_SETUP:-false}"; then
+        log "AOITALK_SKIP_DB_SETUP=true のためDBセットアップをスキップします。"
+        return 0
+    fi
 
-# ---------------------------------------------------------------------------
-# [5/6] フロントエンド依存
-# ---------------------------------------------------------------------------
-echo
-echo "[5/6] フロントエンドの依存インストールとビルド中..."
+    local host="${POSTGRES_HOST:-127.0.0.1}"
+    local port="${POSTGRES_PORT:-5432}"
+    if ! command -v pg_isready >/dev/null 2>&1; then
+        if command -v sudo >/dev/null 2>&1; then
+            log "PostgreSQLクライアントがないためインストールします。"
+            sudo apt-get update
+            sudo apt-get install -y postgresql postgresql-client
+        else
+            die "pg_isready がありません。PostgreSQL または AOITALK_SKIP_DB_SETUP=true を用意してください。"
+        fi
+    fi
 
-if [ -f "frontend/package.json" ]; then
-    cp -f .env frontend/.env
-    (cd frontend && npm ci && npm run build)
-    echo "  - 完了しました。"
-else
-    echo "  - frontend/package.json が見つかりません。スキップしました。"
-fi
+    if ! pg_isready -h "$host" -p "$port" >/dev/null 2>&1; then
+        if [[ "$host" == "localhost" || "$host" == "127.0.0.1" || "$host" == "::1" ]] && command -v sudo >/dev/null 2>&1; then
+            log "ローカルPostgreSQLを起動します。"
+            sudo systemctl enable --now postgresql 2>/dev/null || sudo service postgresql start 2>/dev/null || true
+        fi
+    fi
+    pg_isready -h "$host" -p "$port" >/dev/null 2>&1 || \
+        die "PostgreSQL ${host}:${port} に接続できません。Docker Composeを使う場合は AOITALK_SKIP_DB_SETUP=true を指定してください。"
 
-# ---------------------------------------------------------------------------
-# [6/6] alembic マイグレーション
-# ---------------------------------------------------------------------------
-echo
-echo "[6/6] データベーススキーマ初期化/マイグレーション実行中..."
-# shellcheck disable=SC1091
-. venv/bin/activate
-python scripts/init_db_schema.py
+    if [[ "$host" != "localhost" && "$host" != "127.0.0.1" && "$host" != "::1" ]]; then
+        log "リモートPostgreSQLのrole/database変更は行いません。接続確認のみ完了しました。"
+        return 0
+    fi
 
-echo
-echo "==================================="
-echo "セットアップ完了！"
-echo "==================================="
-echo
-echo "起動: ./run.sh"
-echo
+    if command -v systemctl >/dev/null 2>&1 && \
+        ! sudo systemctl is-active --quiet postgresql 2>/dev/null; then
+        log "PostgreSQLがsystemd管理のローカルサービスではないため、role/database変更は行いません。"
+        return 0
+    fi
+
+    # ローカルのpostgres管理ユーザーが使える場合だけ、アプリ用role/dbを冪等に整える。
+    if ! command -v sudo >/dev/null 2>&1 || ! id postgres >/dev/null 2>&1; then
+        log "postgres OSユーザーがないため、DB role/db作成は外部管理とみなします。"
+        return 0
+    fi
+    [[ "${POSTGRES_USER:-aoitalk}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "POSTGRES_USER は英数字と _ のみ使用してください。"
+    [[ "${POSTGRES_DB:-aoitalk_memory}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "POSTGRES_DB は英数字と _ のみ使用してください。"
+
+    local user="${POSTGRES_USER:-aoitalk}"
+    local db="${POSTGRES_DB:-aoitalk_memory}"
+    local password="${POSTGRES_PASSWORD:?POSTGRES_PASSWORD がありません}"
+    local sql_password="${password//\'/\'\'}"
+    local psql_admin=(sudo -u postgres psql -v ON_ERROR_STOP=1)
+
+    if ! "${psql_admin[@]}" -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='${user}'" | grep -q 1; then
+        "${psql_admin[@]}" -d postgres -c "CREATE ROLE \"${user}\" LOGIN PASSWORD '${sql_password}';"
+    else
+        "${psql_admin[@]}" -d postgres -c "ALTER ROLE \"${user}\" LOGIN PASSWORD '${sql_password}';"
+    fi
+    if ! "${psql_admin[@]}" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${db}'" | grep -q 1; then
+        "${psql_admin[@]}" -d postgres -c "CREATE DATABASE \"${db}\" OWNER \"${user}\";"
+    fi
+    "${psql_admin[@]}" -d "$db" -c "GRANT USAGE,CREATE ON SCHEMA public TO \"${user}\";"
+    log "PostgreSQL ${host}:${port}/${db} を確認しました。pgvector拡張は必須にしません。"
+}
+
+ensure_frontend() {
+    [ -f frontend/package.json ] || { log "frontend/package.json がないためビルドをスキップします。"; return; }
+    install -m 600 .env frontend/.env
+    # run.sh は canonical な frontend/.next を npm start で配信するため、
+    # セットアップでは検証用の npm run build ではなく本番ビルドを生成する。
+    (cd frontend && npm ci && npm run build:production)
+}
+
+main() {
+    printf '%s\n' '===================================' 'AoiTalk Linux セットアップ開始' '==================================='
+    ensure_env_file
+    load_env
+    ensure_node
+    ensure_postgres
+    ensure_python_venv
+    ensure_frontend
+
+    log "Alembicマイグレーションを実行します。"
+    # shellcheck disable=SC1091
+    . venv/bin/activate
+    python scripts/init_db_schema.py
+    chmod +x setup.sh run.sh 2>/dev/null || true
+    printf '%s\n' '===================================' 'セットアップ完了' '==================================='
+    printf '起動: ./run.sh\n'
+    printf '初回ログイン: admin / .env の AOITALK_BOOTSTRAP_ADMIN_PASSWORD\n'
+}
+
+main "$@"

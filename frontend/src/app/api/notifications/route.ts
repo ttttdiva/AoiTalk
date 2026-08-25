@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { and, desc, eq, inArray, isNull, or } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import { db } from "@/db";
 import {
   notificationDeliveries,
@@ -26,69 +26,12 @@ import {
   parseInputDate,
   serializeDbTimestamp,
 } from "@/lib/server/db-time";
+import {
+  isLegacyPythonInAppReminderDedupeKey,
+  isTaskNotificationSuppressed,
+} from "@/lib/task-notification-policy";
 
-const DEFAULT_REMINDER_OFFSETS = [5];
 const WEB_PRESENCE_ACTIVE_MS = 75_000;
-const CLOSED_STATUSES = new Set(["closed", "done", "cancelled", "canceled"]);
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    !Array.isArray(value) &&
-    Object.getPrototypeOf(value) === Object.prototype
-  );
-}
-
-function normalizeOffsets(value: unknown, fallback: number[]): number[] {
-  const parsed =
-    typeof value === "string"
-      ? (() => {
-          try {
-            return JSON.parse(value) as unknown;
-          } catch {
-            return null;
-          }
-        })()
-      : value;
-
-  if (!Array.isArray(parsed)) return fallback;
-  const offsets = [
-    ...new Set(
-      parsed
-        .map((offset) => Number(offset))
-        .filter((offset) => Number.isFinite(offset) && offset >= 0)
-        .map((offset) => Math.floor(offset)),
-    ),
-  ];
-  return offsets.length > 0 ? offsets : fallback;
-}
-
-function getUserReminderOffsets(settings: unknown): number[] {
-  const raw = isPlainObject(settings)
-    ? settings.task_notification_minutes_before
-    : undefined;
-  const value = Number(raw);
-  return Number.isFinite(value) && value >= 0
-    ? [Math.floor(value)]
-    : DEFAULT_REMINDER_OFFSETS;
-}
-
-function isClosedStatus(status: unknown): boolean {
-  return CLOSED_STATUSES.has(String(status ?? "").toLowerCase());
-}
-
-function formatReminderMessage(taskTitle: string, anchor: Date, offset: number) {
-  const scheduledAt = anchor.toLocaleString("ja-JP", {
-    month: "numeric",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-  return offset > 0
-    ? `${taskTitle} starts in ${offset} minutes (${scheduledAt})`
-    : `${taskTitle} starts now`;
-}
 
 function getNextWeekWindow(now: Date) {
   const nextWeekStart = new Date(now);
@@ -129,210 +72,57 @@ function isDateOnlySchedule(
   return isMidnight(startAt ?? endAt);
 }
 
-async function touchWebNotificationPresence(
-  userId: string,
-  currentSettings: unknown,
-  now: Date,
-) {
-  const settings = isPlainObject(currentSettings) ? currentSettings : {};
-  const activeUntil = new Date(now.getTime() + WEB_PRESENCE_ACTIVE_MS);
-  await db
-    .update(users)
-    .set({
-      userSettings: {
-        ...settings,
-        task_notification_web_presence: {
-          active_until: activeUntil.toISOString(),
-          last_seen_at: now.toISOString(),
-          surface: "web",
-        },
-      },
-      updatedAt: now,
-    })
-    .where(eq(users.id, userId));
+export function isStaleNonRecurringTaskSchedule(input: {
+  occurrenceId: string | null | undefined;
+  occurrenceSourceKind: string | null | undefined;
+  recurrenceRuleTaskId: string | null | undefined;
+}): boolean {
+  // ``task_schedule`` rows are legacy mirrors for non-recurring tasks. The
+  // task row is their canonical anchor; retaining the mirror would expose an
+  // old date after a task edit and can replay a stale reminder.
+  return (
+    !!input.occurrenceId &&
+    input.occurrenceSourceKind === "task_schedule" &&
+    !input.recurrenceRuleTaskId
+  );
 }
 
-async function syncTaskReminderNotifications(user: {
-  id: string;
-  userSettings?: unknown;
-}) {
-  const now = new Date();
-  const userOffsets = getUserReminderOffsets(user.userSettings);
-  const scanFrom = new Date(now.getTime() - 24 * 60 * 60_000);
-  const scanTo = new Date(now.getTime() + 24 * 60 * 60_000);
-
-  const assignedTaskRows = await db
-    .select({ taskId: taskAssignees.taskId })
-    .from(taskAssignees)
-    .where(eq(taskAssignees.userId, user.id));
-  const assignedTaskIds = assignedTaskRows.map((row) => row.taskId);
-
-  const ownershipFilters = [eq(tasks.createdBy, user.id)];
-  if (assignedTaskIds.length > 0) {
-    ownershipFilters.push(inArray(tasks.id, assignedTaskIds));
-  }
-
-  const occurrenceRows = await db
-    .select({
-      occurrenceId: taskOccurrences.id,
-      taskId: tasks.id,
-      projectId: tasks.projectId,
-      title: tasks.title,
-      taskStatus: tasks.status,
-      occurrenceStatus: taskOccurrences.status,
-      startAt: taskOccurrences.startAt,
-      endAt: taskOccurrences.endAt,
-      allDay: taskOccurrences.allDay,
-      sourceKind: taskOccurrences.sourceKind,
-      occurrenceReminderOffsets: taskOccurrences.reminderOffsets,
-      taskReminderOffsets: tasks.reminderOffsets,
-      notificationsEnabled: tasks.notificationsEnabled,
-    })
-    .from(taskOccurrences)
-    .innerJoin(tasks, eq(taskOccurrences.taskId, tasks.id))
-    .where(or(...ownershipFilters));
-
-  const candidates: Array<{
-    keyPrefix: string;
-    taskId: string;
-    occurrenceId: string | null;
-    projectId: string;
-    title: string;
-    startAt: Date | null;
-    endAt: Date | null;
-    allDay: boolean | null;
-    status: string | null;
-    offsets: number[];
-    notificationsEnabled: boolean | null;
-  }> = [];
-
-  const occurrenceKeys = new Set<string>();
-  for (const row of occurrenceRows) {
-    if (isRecurrenceSkipSourceKind(row.sourceKind)) continue;
-    occurrenceKeys.add(`${row.taskId}:${serializeDbTimestamp(row.startAt)}`);
-    candidates.push({
-      keyPrefix: `occurrence:${row.occurrenceId}`,
-      taskId: row.taskId,
-      occurrenceId: row.occurrenceId,
-      projectId: row.projectId,
-      title: row.title,
-      startAt: dbTimestampToLocalDate(row.startAt),
-      endAt: dbTimestampToLocalDate(row.endAt),
-      allDay: row.allDay,
-      status: row.occurrenceStatus || row.taskStatus,
-      offsets: normalizeOffsets(
-        row.occurrenceReminderOffsets ?? row.taskReminderOffsets,
-        userOffsets,
-      ),
-      notificationsEnabled: row.notificationsEnabled,
-    });
-  }
-
-  const taskRows = await db
-    .select({
-      taskId: tasks.id,
-      projectId: tasks.projectId,
-      title: tasks.title,
-      status: tasks.status,
-      startAt: tasks.startAt,
-      endAt: tasks.endAt,
-      allDay: tasks.allDay,
-      reminderOffsets: tasks.reminderOffsets,
-      notificationsEnabled: tasks.notificationsEnabled,
-    })
-    .from(tasks)
-    .where(or(...ownershipFilters));
-
-  for (const task of taskRows) {
-    const taskStartKey = `${task.taskId}:${serializeDbTimestamp(task.startAt)}`;
-    if (occurrenceKeys.has(taskStartKey)) continue;
-    candidates.push({
-      keyPrefix: `task:${task.taskId}`,
-      taskId: task.taskId,
-      occurrenceId: null,
-      projectId: task.projectId,
-      title: task.title,
-      startAt: dbTimestampToLocalDate(task.startAt),
-      endAt: dbTimestampToLocalDate(task.endAt),
-      allDay: task.allDay,
-      status: task.status,
-      offsets: normalizeOffsets(task.reminderOffsets, userOffsets),
-      notificationsEnabled: task.notificationsEnabled,
-    });
-  }
-
-  const activeCandidates: Array<{
-    dedupeKey: string;
-    projectId: string;
-    taskId: string;
-    occurrenceId: string | null;
-    title: string;
-    message: string;
-    scheduledFor: Date;
-  }> = [];
-
-  for (const candidate of candidates) {
-    if (candidate.notificationsEnabled === false) continue;
-    if (isClosedStatus(candidate.status)) continue;
-    if (
-      isDateOnlySchedule(candidate.allDay, candidate.startAt, candidate.endAt)
-    ) {
-      continue;
-    }
-    const anchor = candidate.startAt ?? candidate.endAt;
-    if (!anchor || anchor < scanFrom || anchor > scanTo || anchor < now) {
-      continue;
-    }
-
-    for (const offset of candidate.offsets) {
-      const triggerAt = new Date(anchor.getTime() - offset * 60_000);
-      if (triggerAt > now || triggerAt < scanFrom) continue;
-      const anchorKey = serializeDbTimestamp(anchor) ?? anchor.toISOString();
-      activeCandidates.push({
-        dedupeKey: `reminder:${candidate.keyPrefix}:at:${anchorKey}:offset:${offset}:user:${user.id}`,
-        projectId: candidate.projectId,
-        taskId: candidate.taskId,
-        occurrenceId: candidate.occurrenceId,
-        title: `Upcoming: ${candidate.title}`,
-        message: formatReminderMessage(candidate.title, anchor, offset),
-        scheduledFor: triggerAt,
-      });
-    }
-  }
-
-  if (activeCandidates.length === 0) return;
-
-  const existingRows = await db
-    .select({ dedupeKey: notificationDeliveries.dedupeKey })
-    .from(notificationDeliveries)
-    .where(
-      and(
-        eq(notificationDeliveries.userId, user.id),
-        eq(notificationDeliveries.channel, "in_app"),
-        eq(notificationDeliveries.notificationType, "reminder"),
-      ),
-    );
-  const existingKeys = new Set(existingRows.map((row) => row.dedupeKey));
-
-  for (const candidate of activeCandidates) {
-    if (existingKeys.has(candidate.dedupeKey)) continue;
-    await db.insert(notificationDeliveries).values({
-      projectId: candidate.projectId,
-      taskId: candidate.taskId,
-      occurrenceId: candidate.occurrenceId,
-      userId: user.id,
-      channel: "in_app",
-      notificationType: "reminder",
-      dedupeKey: candidate.dedupeKey,
-      title: candidate.title,
-      message: candidate.message,
-      scheduledFor: candidate.scheduledFor,
-      deliveredAt: now,
-      status: "delivered",
-      payload: { kind: "task_reminder" },
-      createdAt: now,
-      updatedAt: now,
-    });
+async function touchWebNotificationPresence(
+  userId: string,
+  now: Date,
+) {
+  const activeUntil = new Date(now.getTime() + WEB_PRESENCE_ACTIVE_MS);
+  const presence = {
+    active_until: activeUntil.toISOString(),
+    last_seen_at: now.toISOString(),
+    surface: "web",
+  };
+  try {
+    await db
+      .update(users)
+      .set({
+        // Patch only the presence key in PostgreSQL.  Building a replacement
+        // object from getSession() would overwrite a concurrent settings PATCH
+        // with the stale snapshot that authenticated this request.
+        userSettings: sql`
+          jsonb_set(
+            case
+              when jsonb_typeof(${users.userSettings}::jsonb) = 'object'
+                then ${users.userSettings}::jsonb
+              else '{}'::jsonb
+            end,
+            '{task_notification_web_presence}',
+            ${JSON.stringify(presence)}::jsonb,
+            true
+          )::json
+        `,
+        updatedAt: now,
+      })
+      .where(eq(users.id, userId));
+  } catch (error) {
+    // Presence is advisory.  A transient write failure must not prevent the
+    // already-authenticated user from reading notifications.
+    console.error("Failed to update Web notification presence", error);
   }
 }
 
@@ -365,6 +155,7 @@ async function syncHolidayConflictNotifications(userId: string) {
       endCount: taskRecurrenceRules.endCount,
       skipWeekend: taskRecurrenceRules.skipWeekend,
       skipHoliday: taskRecurrenceRules.skipHoliday,
+      skipMode: taskRecurrenceRules.skipMode,
     })
     .from(tasks)
     .innerJoin(taskRecurrenceRules, eq(taskRecurrenceRules.taskId, tasks.id))
@@ -451,6 +242,7 @@ async function syncHolidayConflictNotifications(userId: string) {
       byDay: parsed.byDay,
       skipWeekend: task.skipWeekend ?? false,
       skipHoliday: task.skipHoliday ?? false,
+      skipMode: task.skipMode,
       endCount: task.endCount ?? null,
       endDate: serializeDbTimestamp(task.endDate),
     };
@@ -575,26 +367,97 @@ export async function GET(request: NextRequest) {
   }
 
   const now = new Date();
-  await touchWebNotificationPresence(user.id, user.userSettings, now);
-  await syncTaskReminderNotifications(user);
+  await touchWebNotificationPresence(user.id, now);
+  // Task reminder rows are materialized and delivered by the authoritative
+  // Python scheduler. GET is list-only for task reminders, so a hidden or
+  // background tab can never create one or change its scheduled time. The
+  // separate holiday-conflict advisory remains a calendar preview feature.
   await syncHolidayConflictNotifications(user.id);
 
   const { searchParams } = new URL(request.url);
   const unreadOnly = searchParams.get("unread_only") === "true";
 
-  const conditions = [eq(notificationDeliveries.userId, user.id)];
+  const conditions = [
+    eq(notificationDeliveries.userId, user.id),
+    ne(notificationDeliveries.status, "cancelled"),
+  ];
   if (unreadOnly) {
     conditions.push(isNull(notificationDeliveries.readAt));
   }
 
   const rows = await db
-    .select()
+    .select({
+      delivery: notificationDeliveries,
+      joinedTaskId: tasks.id,
+      taskStatus: tasks.status,
+      taskArchivedAt: tasks.archivedAt,
+      taskDeletedAt: tasks.deletedAt,
+      taskNotificationsEnabled: tasks.notificationsEnabled,
+      taskStartAt: tasks.startAt,
+      taskEndAt: tasks.endAt,
+      taskAllDay: tasks.allDay,
+      joinedOccurrenceId: taskOccurrences.id,
+      occurrenceStatus: taskOccurrences.status,
+      occurrenceDeletedAt: taskOccurrences.deletedAt,
+      occurrenceSourceKind: taskOccurrences.sourceKind,
+      recurrenceRuleTaskId: taskRecurrenceRules.taskId,
+      occurrenceStartAt: taskOccurrences.startAt,
+      occurrenceEndAt: taskOccurrences.endAt,
+      occurrenceAllDay: taskOccurrences.allDay,
+    })
     .from(notificationDeliveries)
+    .leftJoin(tasks, eq(notificationDeliveries.taskId, tasks.id))
+    .leftJoin(
+      taskOccurrences,
+      eq(notificationDeliveries.occurrenceId, taskOccurrences.id),
+    )
+    .leftJoin(taskRecurrenceRules, eq(taskRecurrenceRules.taskId, tasks.id))
     .where(and(...conditions))
     .orderBy(desc(notificationDeliveries.createdAt));
 
   const result = rows
-    .filter((n) => n.notificationType !== "overdue")
+    .filter((row) => {
+      const n = row.delivery;
+      if (n.notificationType === "overdue") return false;
+      if (n.notificationType !== "reminder") return true;
+      if (isLegacyPythonInAppReminderDedupeKey(n.dedupeKey)) return false;
+      if (n.taskId && !row.joinedTaskId) return false;
+      if (n.occurrenceId && !row.joinedOccurrenceId) return false;
+      if (
+        isStaleNonRecurringTaskSchedule({
+          occurrenceId: n.occurrenceId,
+          occurrenceSourceKind: row.occurrenceSourceKind,
+          recurrenceRuleTaskId: row.recurrenceRuleTaskId,
+        })
+      ) {
+        return false;
+      }
+      if (row.taskNotificationsEnabled === false) return false;
+      if (
+        n.occurrenceId
+          ? isDateOnlySchedule(
+              row.occurrenceAllDay || row.taskAllDay,
+              row.occurrenceStartAt,
+              row.occurrenceEndAt,
+            )
+          : isDateOnlySchedule(
+              row.taskAllDay,
+              row.taskStartAt,
+              row.taskEndAt,
+            )
+      ) {
+        return false;
+      }
+      return !isTaskNotificationSuppressed({
+        taskStatus: row.taskStatus,
+        occurrenceStatus: row.occurrenceStatus,
+        taskArchivedAt: row.taskArchivedAt,
+        taskDeletedAt: row.taskDeletedAt,
+        occurrenceDeletedAt: row.occurrenceDeletedAt,
+        sourceKind: row.occurrenceSourceKind,
+      });
+    })
+    .map((row) => row.delivery)
     .map((n) => ({
       id: n.id,
       project_id: n.projectId,

@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from sqlalchemy import select, delete, update, and_
+from sqlalchemy import select, delete, update, and_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import Feedback
@@ -112,6 +112,12 @@ class FeedbackRepository:
         Returns:
             Tuple: (list of feedback, total count)
         """
+        if not 1 <= int(limit) <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        if int(offset) < 0:
+            raise ValueError("offset must be non-negative")
+        limit = int(limit)
+        offset = int(offset)
         conditions = []
         
         if not include_resolved:
@@ -124,11 +130,11 @@ class FeedbackRepository:
             conditions.append(Feedback.category == category)
         
         # Get total count
-        count_query = select(Feedback)
+        count_query = select(func.count()).select_from(Feedback)
         if conditions:
             count_query = count_query.where(and_(*conditions))
         count_result = await session.execute(count_query)
-        total_count = len(count_result.scalars().all())
+        total_count = int(count_result.scalar_one())
         
         # Get paginated results
         query = select(Feedback)
@@ -211,51 +217,105 @@ class FeedbackRepository:
             logger.info("No JSONL file to migrate")
             return 0
         
+        # Move the source to a unique staging name first.  This leaves a stable
+        # snapshot for parsing and prevents an archive collision or overwrite.
+        staged_path = jsonl_path.with_name(
+            f"{jsonl_path.name}.migrating-{uuid.uuid4().hex}"
+        )
+        jsonl_path.rename(staged_path)
         migrated = 0
         try:
-            with open(jsonl_path, "r", encoding="utf-8") as f:
-                for line in f:
+            records = []
+            with open(staged_path, "r", encoding="utf-8") as f:
+                for line_number, line in enumerate(f, start=1):
                     line = line.strip()
                     if not line:
                         continue
-                    
-                    try:
-                        data = json.loads(line)
-                        
-                        # Check if already exists
-                        existing = await FeedbackRepository.get_by_id(session, data.get("id", ""))
-                        if existing:
-                            logger.debug(f"Skipping existing feedback: {data.get('id')}")
-                            continue
-                        
-                        # Create feedback entry
-                        feedback = Feedback(
-                            id=data.get("id") or FeedbackRepository.generate_id(),
-                            session_id=data.get("session_id"),
-                            message=data.get("message", ""),
-                            character=data.get("character"),
-                            user_input=data.get("user_input"),
-                            category=data.get("category", "other"),
-                            comment=data.get("comment"),
-                            resolved=data.get("resolved", False),
-                            created_at=datetime.fromisoformat(data["timestamp"]) if data.get("timestamp") else datetime.utcnow(),
-                            feedback_metadata={}
+                    data = json.loads(line)
+                    if not isinstance(data, dict):
+                        raise ValueError(
+                            f"feedback JSONL line {line_number} must be an object"
                         )
-                        
-                        session.add(feedback)
-                        migrated += 1
-                        
-                    except (json.JSONDecodeError, ValueError) as e:
-                        logger.warning(f"Failed to parse feedback entry: {e}")
-                        continue
-            
+                    created_at = (
+                        datetime.fromisoformat(str(data["timestamp"]))
+                        if data.get("timestamp")
+                        else datetime.utcnow()
+                    )
+                    resolved_at = (
+                        datetime.fromisoformat(str(data["resolved_at"]))
+                        if data.get("resolved_at")
+                        else None
+                    )
+                    records.append(
+                        {
+                            "id": data.get("id") or FeedbackRepository.generate_id(),
+                            "session_id": data.get("session_id"),
+                            "message": data.get("message", ""),
+                            "character": data.get("character"),
+                            "user_input": data.get("user_input"),
+                            "category": data.get("category", "other"),
+                            "comment": data.get("comment"),
+                            "resolved": bool(data.get("resolved", False)),
+                            "resolved_at": resolved_at,
+                            "resolved_by": data.get("resolved_by"),
+                            "created_at": created_at,
+                        }
+                    )
+
+            # Parse and validate every line before touching the DB.  A malformed
+            # line therefore cannot result in a partially migrated dataset.
+            for data in records:
+                existing = await FeedbackRepository.get_by_id(session, data["id"])
+                if existing:
+                    logger.debug("Skipping existing feedback: %s", data["id"])
+                    continue
+                session.add(
+                    Feedback(
+                        id=data["id"],
+                        session_id=data["session_id"],
+                        message=data["message"],
+                        character=data["character"],
+                        user_input=data["user_input"],
+                        category=data["category"],
+                        comment=data["comment"],
+                        resolved=data["resolved"],
+                        resolved_at=data["resolved_at"],
+                        resolved_by=data["resolved_by"],
+                        created_at=data["created_at"],
+                        feedback_metadata={},
+                    )
+                )
+                migrated += 1
+
+            # Secure the archive before committing.  If chmod fails, the
+            # transaction is still rollbackable and the original JSONL can be
+            # restored by the exception path below.
+            staged_path.chmod(0o600)
             if migrated > 0:
                 await session.commit()
-                logger.info(f"Migrated {migrated} feedback entries from JSONL to database")
-            
+                logger.info(
+                    "Migrated %s feedback entries from JSONL to database", migrated
+                )
+
+            # Keep a recoverable, permission-restricted archive.  The UUID
+            # makes the rename non-overwriting even under same-second retries.
+            archive_path = jsonl_path.with_name(
+                f"{jsonl_path.name}.migrated-{uuid.uuid4().hex}"
+            )
+            staged_path.rename(archive_path)
+            logger.info("Archived migrated feedback JSONL at %s", archive_path)
             return migrated
-            
+
         except Exception as e:
-            logger.error(f"Failed to migrate feedback: {e}")
+            logger.error("Failed to migrate feedback: %s", e)
             await session.rollback()
-            return 0
+            # Restore the active source when possible.  Never overwrite a new
+            # source created by a concurrent writer.
+            if staged_path.exists():
+                if not jsonl_path.exists():
+                    staged_path.rename(jsonl_path)
+                else:
+                    logger.error(
+                        "Keeping failed feedback migration staging file at %s", staged_path
+                    )
+            raise

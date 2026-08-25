@@ -13,8 +13,48 @@ import {
   type CtxMenuState,
 } from "./reports-utils";
 
+type ActivePointer = {
+  pointerId: number;
+  target: HTMLElement;
+};
+
+function capturePointer(
+  event: React.PointerEvent<HTMLElement>,
+  activePointerRef: React.MutableRefObject<ActivePointer | null>,
+) {
+  activePointerRef.current = {
+    pointerId: event.pointerId,
+    target: event.currentTarget,
+  };
+  try {
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  } catch {
+    // The pointer may already have been cancelled by the browser.
+  }
+}
+
+function releasePointer(
+  activePointerRef: React.MutableRefObject<ActivePointer | null>,
+) {
+  const activePointer = activePointerRef.current;
+  activePointerRef.current = null;
+  if (!activePointer) return;
+  try {
+    if (
+      !activePointer.target.hasPointerCapture ||
+      activePointer.target.hasPointerCapture(activePointer.pointerId)
+    ) {
+      activePointer.target.releasePointerCapture?.(activePointer.pointerId);
+    }
+  } catch {
+    // The element or pointer can disappear while an interaction is cancelled.
+  }
+}
+
 export function useReportsTimeline({
   remoteReadOnly,
+  createReadOnly,
+  isEntryReadOnly,
   selectedProjectId,
   weekDays,
   timeEntries,
@@ -27,6 +67,8 @@ export function useReportsTimeline({
   setWeekOffset,
 }: {
   remoteReadOnly: boolean;
+  createReadOnly: boolean;
+  isEntryReadOnly: (entry: TimeEntry) => boolean;
   selectedProjectId: string | null;
   weekDays: Date[];
   timeEntries: TimeEntry[];
@@ -61,16 +103,19 @@ export function useReportsTimeline({
   const [dragCreating, setDragCreating] = useState(false);
   const dragFormInputRef = useRef<HTMLInputElement>(null);
   const isDraggingRef = useRef(false);
+  const activeDragPointerRef = useRef<ActivePointer | null>(null);
 
   // リサイズD&D
   const [resizeState, setResizeState] = useState<ResizeState | null>(null);
   const isResizingRef = useRef(false);
   const dayColRefs = useRef<Array<HTMLDivElement | null>>([]);
+  const activeResizePointerRef = useRef<ActivePointer | null>(null);
 
   // 移動D&D
   const [moveState, setMoveState] = useState<MoveState | null>(null);
   const moveStateRef = useRef<MoveState | null>(null);
   const isMovingRef = useRef(false);
+  const activeMovePointerRef = useRef<ActivePointer | null>(null);
 
   // 右クリックコンテキストメニュー
   const [ctxMenu, setCtxMenu] = useState<CtxMenuState | null>(null);
@@ -78,6 +123,43 @@ export function useReportsTimeline({
     ctxMenu ? { x: ctxMenu.x, y: ctxMenu.y } : null,
     { fallbackWidth: 180, fallbackHeight: 150 },
   );
+
+  useEffect(() => {
+    if (!remoteReadOnly) return;
+    releasePointer(activeDragPointerRef);
+    releasePointer(activeResizePointerRef);
+    releasePointer(activeMovePointerRef);
+    isDraggingRef.current = false;
+    isResizingRef.current = false;
+    isMovingRef.current = false;
+    moveStateRef.current = null;
+    setDragState(null);
+    setDragForm(null);
+    setDragTaskName("");
+    setDragSelectedTaskId(null);
+    setResizeState(null);
+    setMoveState(null);
+    setCtxMenu(null);
+  }, [remoteReadOnly]);
+
+  useEffect(
+    () => () => {
+      releasePointer(activeDragPointerRef);
+      releasePointer(activeResizePointerRef);
+      releasePointer(activeMovePointerRef);
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!createReadOnly || remoteReadOnly) return;
+    releasePointer(activeDragPointerRef);
+    isDraggingRef.current = false;
+    setDragState(null);
+    setDragForm(null);
+    setDragTaskName("");
+    setDragSelectedTaskId(null);
+  }, [createReadOnly, remoteReadOnly]);
 
   useEffect(() => {
     if (!dragForm || !selectedProjectId) {
@@ -165,11 +247,13 @@ export function useReportsTimeline({
   );
 
   const handleDragMouseDown = useCallback(
-    (e: React.MouseEvent<HTMLDivElement>, dayIndex: number) => {
-      if (remoteReadOnly) return;
-      if (e.button !== 0) return;
+    (e: React.PointerEvent<HTMLDivElement>, dayIndex: number) => {
+      if (remoteReadOnly || createReadOnly) return;
+      if (e.button !== 0 || e.isPrimary === false) return;
       if ((e.target as HTMLElement).closest("[data-entry]")) return;
       if ((e.target as HTMLElement).closest("[data-drag-form]")) return;
+      e.preventDefault();
+      capturePointer(e, activeDragPointerRef);
       const hour = calcHourFromMouseY(
         e.clientY,
         e.currentTarget as HTMLDivElement,
@@ -178,12 +262,17 @@ export function useReportsTimeline({
       setDragState({ dayIndex, startHour: hour, currentHour: hour });
       setDragForm(null);
     },
-    [calcHourFromMouseY, remoteReadOnly],
+    [calcHourFromMouseY, createReadOnly, remoteReadOnly],
   );
 
   const handleDragMouseMove = useCallback(
-    (e: React.MouseEvent<HTMLDivElement>, dayIndex: number) => {
+    (e: React.PointerEvent<HTMLDivElement>, dayIndex: number) => {
+      const activePointer = activeDragPointerRef.current;
       if (
+        remoteReadOnly ||
+        createReadOnly ||
+        !activePointer ||
+        activePointer.pointerId !== e.pointerId ||
         !isDraggingRef.current ||
         !dragState ||
         dragState.dayIndex !== dayIndex
@@ -195,12 +284,25 @@ export function useReportsTimeline({
       );
       setDragState((prev) => (prev ? { ...prev, currentHour: hour } : null));
     },
-    [dragState, calcHourFromMouseY],
+    [calcHourFromMouseY, createReadOnly, dragState, remoteReadOnly],
   );
 
-  const handleDragMouseUp = useCallback(() => {
+  const handleDragMouseUp = useCallback((e?: React.PointerEvent<HTMLDivElement>) => {
+    const activePointer = activeDragPointerRef.current;
+    if (e && activePointer && activePointer.pointerId !== e.pointerId) return;
+    const cancelled = e?.type === "pointercancel";
+    releasePointer(activeDragPointerRef);
+    if (remoteReadOnly || createReadOnly) {
+      isDraggingRef.current = false;
+      setDragState(null);
+      return;
+    }
     if (!isDraggingRef.current || !dragState) return;
     isDraggingRef.current = false;
+    if (cancelled) {
+      setDragState(null);
+      return;
+    }
 
     const startH = Math.min(dragState.startHour, dragState.currentHour);
     const endH = Math.max(dragState.startHour, dragState.currentHour);
@@ -222,11 +324,11 @@ export function useReportsTimeline({
     setDragTaskName("");
     setDragSelectedTaskId(null);
     setTimeout(() => dragFormInputRef.current?.focus(), 50);
-  }, [dragState]);
+  }, [createReadOnly, dragState, remoteReadOnly]);
 
   const handleDragFormSubmit = useCallback(async () => {
     if (!dragForm) return;
-    if (remoteReadOnly) return;
+    if (remoteReadOnly || createReadOnly) return;
     const targetProjectId = selectedProjectId;
     if (!targetProjectId) {
       alert("プロジェクトを選択してください。");
@@ -283,6 +385,7 @@ export function useReportsTimeline({
     selectedProjectId,
     weekDays,
     fetchReport,
+    createReadOnly,
     remoteReadOnly,
   ]);
 
@@ -295,15 +398,17 @@ export function useReportsTimeline({
   // --- リサイズD&D ---
   const handleResizeMouseDown = useCallback(
     (
-      e: React.MouseEvent<HTMLDivElement>,
+      e: React.PointerEvent<HTMLDivElement>,
       entry: TimeEntry,
       edge: "top" | "bottom",
       dayIndex: number,
     ) => {
       e.stopPropagation();
       e.preventDefault();
-      if (remoteReadOnly) return;
+      if (e.button !== 0 || e.isPrimary === false) return;
       if (!entry.started_at || !entry.ended_at) return;
+      if (remoteReadOnly || isEntryReadOnly(entry)) return;
+      capturePointer(e, activeResizePointerRef);
       const start = new Date(entry.started_at);
       const end = new Date(entry.ended_at);
       const startHour = start.getHours() + start.getMinutes() / 60;
@@ -318,7 +423,7 @@ export function useReportsTimeline({
         currentHour: edge === "top" ? startHour : endHour,
       });
     },
-    [remoteReadOnly],
+    [isEntryReadOnly, remoteReadOnly],
   );
 
   useEffect(() => {
@@ -327,19 +432,31 @@ export function useReportsTimeline({
       setResizeState(null);
       return;
     }
-    const handleMove = (e: MouseEvent) => {
+    const handleMove = (e: PointerEvent) => {
+      if (activeResizePointerRef.current?.pointerId !== e.pointerId) return;
       const col = dayColRefs.current[resizeState.dayIndex];
       if (!col) return;
       const hour = calcHourFromMouseY(e.clientY, col);
       setResizeState((prev) => (prev ? { ...prev, currentHour: hour } : null));
     };
-    const handleUp = async () => {
+    const handleUp = async (e: PointerEvent) => {
+      if (activeResizePointerRef.current?.pointerId !== e.pointerId) return;
+      const cancelled = e.type === "pointercancel";
+      releasePointer(activeResizePointerRef);
       const state = resizeState;
       if (!state) return;
       isResizingRef.current = false;
+      if (cancelled) {
+        setResizeState(null);
+        return;
+      }
 
       const entry = timeEntries.find((x) => x.id === state.entryId);
       if (!entry || !entry.started_at || !entry.ended_at) {
+        setResizeState(null);
+        return;
+      }
+      if (isEntryReadOnly(entry)) {
         setResizeState(null);
         return;
       }
@@ -399,17 +516,20 @@ export function useReportsTimeline({
         console.error("タイムエントリ更新失敗:", err);
       }
     };
-    window.addEventListener("mousemove", handleMove);
-    window.addEventListener("mouseup", handleUp);
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp);
+    window.addEventListener("pointercancel", handleUp);
     return () => {
-      window.removeEventListener("mousemove", handleMove);
-      window.removeEventListener("mouseup", handleUp);
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleUp);
     };
   }, [
     resizeState,
     timeEntries,
     calcHourFromMouseY,
     fetchReport,
+    isEntryReadOnly,
     openEditDialog,
     remoteReadOnly,
   ]);
@@ -417,16 +537,18 @@ export function useReportsTimeline({
   // --- 移動D&D ---
   const handleEntryMouseDown = useCallback(
     (
-      e: React.MouseEvent<HTMLDivElement>,
+      e: React.PointerEvent<HTMLDivElement>,
       entry: TimeEntry,
       dayIndex: number,
     ) => {
-      if (remoteReadOnly) return;
-      if (e.button !== 0) return;
+      if (e.button !== 0 || e.isPrimary === false) return;
       if ((e.target as HTMLElement).closest("[data-resize-handle]")) return;
       if (!entry.started_at || !entry.ended_at) return;
+      if (remoteReadOnly || isEntryReadOnly(entry)) return;
       e.stopPropagation();
       e.preventDefault();
+      e.currentTarget.focus({ preventScroll: true });
+      capturePointer(e, activeMovePointerRef);
       const start = new Date(entry.started_at);
       const end = new Date(entry.ended_at);
       const startHour = start.getHours() + start.getMinutes() / 60;
@@ -452,7 +574,7 @@ export function useReportsTimeline({
       moveStateRef.current = initial;
       setMoveState(initial);
     },
-    [calcHourFromMouseY, remoteReadOnly],
+    [calcHourFromMouseY, isEntryReadOnly, remoteReadOnly],
   );
 
   const moveActive = !!moveState;
@@ -460,7 +582,8 @@ export function useReportsTimeline({
     if (!moveActive) return;
     const THRESHOLD_PX = 4;
 
-    const handleMove = (e: MouseEvent) => {
+    const handleMove = (e: PointerEvent) => {
+      if (activeMovePointerRef.current?.pointerId !== e.pointerId) return;
       const prev = moveStateRef.current;
       if (!prev) return;
       const next = { ...prev };
@@ -499,16 +622,20 @@ export function useReportsTimeline({
       setMoveState(next);
     };
 
-    const handleUp = async () => {
+    const handleUp = async (e: PointerEvent) => {
+      if (activeMovePointerRef.current?.pointerId !== e.pointerId) return;
+      const cancelled = e.type === "pointercancel";
+      releasePointer(activeMovePointerRef);
       const state = moveStateRef.current;
       moveStateRef.current = null;
       isMovingRef.current = false;
       setMoveState(null);
       if (!state) return;
+      if (cancelled) return;
 
       const entry = timeEntries.find((x) => x.id === state.entryId);
       if (!entry) return;
-      if (remoteReadOnly) return;
+      if (remoteReadOnly || isEntryReadOnly(entry)) return;
 
       if (!state.moving) {
         // 実質クリック: 記録編集を開く
@@ -545,11 +672,13 @@ export function useReportsTimeline({
       }
     };
 
-    window.addEventListener("mousemove", handleMove);
-    window.addEventListener("mouseup", handleUp);
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp);
+    window.addEventListener("pointercancel", handleUp);
     return () => {
-      window.removeEventListener("mousemove", handleMove);
-      window.removeEventListener("mouseup", handleUp);
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleUp);
     };
   }, [
     moveActive,
@@ -558,6 +687,7 @@ export function useReportsTimeline({
     calcHourFromMouseY,
     openEditDialog,
     fetchReport,
+    isEntryReadOnly,
     remoteReadOnly,
   ]);
 
@@ -566,17 +696,22 @@ export function useReportsTimeline({
     (e: React.MouseEvent<HTMLDivElement>, entry: TimeEntry) => {
       e.preventDefault();
       e.stopPropagation();
+      if (remoteReadOnly || isEntryReadOnly(entry)) return;
       setCtxMenu({ entry, x: e.clientX, y: e.clientY });
     },
-    [],
+    [isEntryReadOnly, remoteReadOnly],
   );
 
   const handleCtxOpenDetail = useCallback(() => {
     if (!ctxMenu) return;
+    if (remoteReadOnly || isEntryReadOnly(ctxMenu.entry)) {
+      setCtxMenu(null);
+      return;
+    }
     setSelectedEntry(ctxMenu.entry);
     setSelectedTaskId(ctxMenu.entry.task_id);
     setCtxMenu(null);
-  }, [ctxMenu, setSelectedEntry, setSelectedTaskId]);
+  }, [ctxMenu, isEntryReadOnly, remoteReadOnly, setSelectedEntry, setSelectedTaskId]);
 
   const handleCtxEdit = useCallback(() => {
     if (!ctxMenu) return;
@@ -587,7 +722,7 @@ export function useReportsTimeline({
 
   const handleCtxDuplicate = useCallback(async () => {
     if (!ctxMenu) return;
-    if (remoteReadOnly) return;
+    if (remoteReadOnly || isEntryReadOnly(ctxMenu.entry)) return;
     const entry = ctxMenu.entry;
     setCtxMenu(null);
     if (!entry.started_at || !entry.ended_at) {
@@ -606,11 +741,11 @@ export function useReportsTimeline({
       console.error("タイムエントリ複製失敗:", err);
       alert("複製に失敗しました");
     }
-  }, [ctxMenu, fetchReport, remoteReadOnly]);
+  }, [ctxMenu, fetchReport, isEntryReadOnly, remoteReadOnly]);
 
   const handleCtxDelete = useCallback(async () => {
     if (!ctxMenu) return;
-    if (remoteReadOnly) return;
+    if (remoteReadOnly || isEntryReadOnly(ctxMenu.entry)) return;
     const entry = ctxMenu.entry;
     setCtxMenu(null);
     try {
@@ -620,7 +755,7 @@ export function useReportsTimeline({
       console.error("タイムエントリ削除失敗:", err);
       alert("削除に失敗しました");
     }
-  }, [ctxMenu, fetchReport, remoteReadOnly]);
+  }, [ctxMenu, fetchReport, isEntryReadOnly, remoteReadOnly]);
 
   // メニュー外クリック / Esc で閉じる
   useEffect(() => {

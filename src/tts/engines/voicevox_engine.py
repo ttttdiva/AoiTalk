@@ -11,32 +11,55 @@ from typing import Optional, Dict, Any
 import requests
 import aiohttp
 
+from ..engine_startup import (
+    DEFAULT_ENGINE_STARTUP_TIMEOUT_SECONDS,
+    wait_for_http_readiness,
+)
+
 try:
     from voicevox import Client as VoicevoxClient
 except ImportError:
-    from vvclient import Client as VoicevoxClient
+    try:
+        from vvclient import Client as VoicevoxClient
+    except ImportError:
+        # VOICEVOX is an optional local/server-backed engine.  Keep the TTS
+        # manager importable for Linux/Enterprise builds that intentionally
+        # omit the audio extra; selecting this engine still fails explicitly.
+        VoicevoxClient = None
 
 
 class VoicevoxEngine:
     """VOICEVOX Text-to-Speech engine"""
     
-    def __init__(self, engine_path: Optional[str] = None, host: str = "127.0.0.1", port: int = 50021):
+    def __init__(
+        self,
+        engine_path: Optional[str] = None,
+        host: str = "127.0.0.1",
+        port: int = 50021,
+        startup_timeout_seconds: float = DEFAULT_ENGINE_STARTUP_TIMEOUT_SECONDS,
+    ):
         """Initialize VOICEVOX engine
         
         Args:
             engine_path: Path to VOICEVOX engine executable
             host: Host address for VOICEVOX server
             port: Port number for VOICEVOX server
+            startup_timeout_seconds: Absolute startup readiness deadline
         """
         self.engine_path = engine_path
         self.host = host
         self.port = port
+        self.startup_timeout_seconds = max(1.0, float(startup_timeout_seconds))
         self.base_url = f"http://{host}:{port}"
         self.process = None
         self.client = None
         self.session = None  # aiohttp session for connection pooling
 
     def _create_client(self):
+        if VoicevoxClient is None:
+            raise RuntimeError(
+                "VOICEVOX requires the optional voicevox-client or vvclient package"
+            )
         try:
             return VoicevoxClient(base_url=self.base_url)
         except TypeError:
@@ -169,34 +192,38 @@ class VoicevoxEngine:
             )
             
             print(f"Process ID: {self.process.pid}")
-            
-            # Wait for engine to start
-            start_time = time.time()
-            
+
             print("Waiting for VOICEVOX engine to start...")
-            
-            while True:
-                # Check if process died
-                if self.process.poll() is not None:
-                    print(f"VOICEVOX engine failed to start (exit code: {self.process.returncode})")
-                    return False
-                
-                # Test HTTP connection
+            deadline = time.monotonic() + self.startup_timeout_seconds
+            started = wait_for_http_readiness(
+                self.base_url,
+                deadline=deadline,
+                process_alive=lambda: self.process is not None and self.process.poll() is None,
+            )
+            if started:
                 try:
                     response = requests.get(f"{self.base_url}/version", timeout=2)
-                    if response.status_code == 200:
-                        version_info = response.text.strip().replace('"', '')
-                        elapsed_time = int(time.time() - start_time)
-                        print(f"VOICEVOX engine started successfully after {elapsed_time} seconds")
-                        print(f"Version: {version_info}")
-                        return True
+                    version_info = response.text.strip().replace('"', '')
                 except requests.exceptions.RequestException:
-                    pass
-                    
-                time.sleep(1)
+                    version_info = "unknown"
+                elapsed_time = int(time.monotonic() - (deadline - self.startup_timeout_seconds))
+                print(f"VOICEVOX engine started successfully after {elapsed_time} seconds")
+                print(f"Version: {version_info}")
+                return True
+
+            if self.process.poll() is not None:
+                print(f"VOICEVOX engine failed to start (exit code: {self.process.returncode})")
+            else:
+                print(
+                    "VOICEVOX engine startup timed out after "
+                    f"{int(self.startup_timeout_seconds)} seconds"
+                )
+            self.stop_engine()
+            return False
             
         except Exception as e:
             print(f"Failed to start VOICEVOX engine: {e}")
+            self.stop_engine()
             return False
             
     def stop_engine(self):

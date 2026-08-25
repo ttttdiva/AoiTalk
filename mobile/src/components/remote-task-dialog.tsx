@@ -24,14 +24,7 @@ export type RemoteTaskDialogTarget = {
   endAt?: string | null;
 };
 
-const STATUS_OPTIONS = [
-  "open",
-  "in_progress",
-  "review",
-  "on_hold",
-  "closed",
-  "cancelled",
-];
+const STATUS_OPTIONS = ["open", "in_progress", "review", "on_hold", "closed"];
 
 const STATUS_LABELS: Record<string, string> = {
   open: "未着手",
@@ -39,7 +32,8 @@ const STATUS_LABELS: Record<string, string> = {
   review: "レビュー待ち",
   on_hold: "保留",
   closed: "完了",
-  cancelled: "キャンセル",
+  // 選択肢からは外したが、既存データの表示用に残す。
+  cancelled: "取消",
 };
 
 /** "2026-06-12T10:00:00" 形式を分まで（16文字）に整形する。 */

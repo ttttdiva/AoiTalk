@@ -14,7 +14,15 @@
 
 import { and, eq, isNull } from "drizzle-orm";
 import { getDb, schema } from "../db/client";
-import { getToken } from "../lib/auth";
+import { getToken, getTokenAuthScope } from "../lib/auth";
+import {
+  ApiHttpError,
+  ApiTimeoutError,
+  isApiConnectionError,
+  isApiHttpError,
+  isApiTimeoutError,
+} from "../lib/api-client";
+import { enqueueAuthScopeExclusive } from "../lib/auth-scope-queue";
 import { projectApi } from "../lib/project-api";
 import { useNetworkStore } from "../stores/network";
 import type { Project as ApiProject } from "../types/api";
@@ -40,6 +48,7 @@ function toApiShape(row: DbProject): ApiProject {
     metadata,
     owner_id: row.ownerId ?? null,
     space_id: row.spaceId ?? null,
+    is_completed: row.isCompleted ?? false,
     storage_quota_mb: row.storageQuotaMb ?? undefined,
     storage_used_mb: row.storageUsedMb ?? undefined,
     created_at: row.createdAt ?? null,
@@ -73,6 +82,7 @@ async function ensureAnonymousDefaultProject(): Promise<void> {
       description: "匿名モード用のローカルプロジェクト",
       ownerId: null,
       spaceId: null,
+      isCompleted: false,
       storageQuotaMb: null,
       storageUsedMb: null,
       projectMetadata: { local_only: true },
@@ -84,6 +94,7 @@ async function ensureAnonymousDefaultProject(): Promise<void> {
       target: schema.projects.id,
       set: {
         deletedAt: null,
+        isCompleted: false,
         updatedAt: now,
       },
     });
@@ -96,6 +107,8 @@ function buildLocalProject(
     aliases?: string[];
     allow_join_requests?: boolean;
     storage_quota_mb?: number;
+    space_id?: string | null;
+    is_completed?: boolean;
     project_metadata?: Record<string, unknown> | null;
   },
   id = randomId(),
@@ -112,7 +125,8 @@ function buildLocalProject(
         : null,
     metadata: data.project_metadata ?? null,
     owner_id: null,
-    space_id: null,
+    space_id: data.space_id ?? null,
+    is_completed: data.is_completed ?? false,
     storage_quota_mb: data.storage_quota_mb,
     storage_used_mb: undefined,
     created_at: now,
@@ -140,6 +154,7 @@ export async function applyRemoteProjects(list: ApiProject[]): Promise<void> {
         description: (p as { description?: string | null }).description ?? null,
         ownerId: (p as { owner_id?: string }).owner_id ?? null,
         spaceId: (p as { space_id?: string | null }).space_id ?? null,
+        isCompleted: Boolean((p as { is_completed?: boolean }).is_completed),
         storageQuotaMb:
           (p as { storage_quota_mb?: number | null }).storage_quota_mb ?? null,
         storageUsedMb:
@@ -158,6 +173,7 @@ export async function applyRemoteProjects(list: ApiProject[]): Promise<void> {
             (p as { description?: string | null }).description ?? null,
           ownerId: (p as { owner_id?: string }).owner_id ?? null,
           spaceId: (p as { space_id?: string | null }).space_id ?? null,
+          isCompleted: Boolean((p as { is_completed?: boolean }).is_completed),
           storageQuotaMb:
             (p as { storage_quota_mb?: number | null }).storage_quota_mb ??
             null,
@@ -169,6 +185,130 @@ export async function applyRemoteProjects(list: ApiProject[]): Promise<void> {
         },
       });
   }
+}
+
+/**
+ * Only transport failures (and a terminal 401, which is replayed after the
+ * user re-authenticates) may become an offline mutation.  An HTTP response
+ * proves that the server processed the request, so ACL/validation/conflict
+ * and server errors must be surfaced without touching SQLite or the outbox.
+ * Client timeouts are also fail-closed because the server may still be
+ * processing the request after the client stopped waiting.
+ */
+function shouldQueueProjectMutation(error: unknown): boolean {
+  if (error instanceof ApiTimeoutError || isApiTimeoutError(error)) return false;
+  if (error instanceof ApiHttpError || isApiHttpError(error)) {
+    return error.status === 401;
+  }
+  return isApiConnectionError(error);
+}
+
+function authScopeForToken(token: string | null): string | null | undefined {
+  if (!token) return null;
+  // Keep the enqueue scope tied to the token captured before the request. An
+  // auth refresh/logout racing with a failed request must not reattribute the
+  // replay to the newly current account (or leave it unscoped).
+  return typeof getTokenAuthScope === "function"
+    ? getTokenAuthScope(token)
+    : undefined;
+}
+
+type AuthScopeSnapshot = {
+  token: string | null;
+  authScope: string | null | undefined;
+};
+
+class StaleAuthScopeError extends Error {
+  constructor() {
+    super("プロジェクト更新中に認証スコープが変わりました");
+    this.name = "StaleAuthScopeError";
+  }
+}
+
+async function captureAuthScopeSnapshot(): Promise<AuthScopeSnapshot> {
+  const token = await getToken();
+  return { token, authScope: authScopeForToken(token) };
+}
+
+async function isCurrentAuthScope(snapshot: AuthScopeSnapshot): Promise<boolean> {
+  const token = await getToken();
+  return (
+    token === snapshot.token &&
+    authScopeForToken(token) === snapshot.authScope
+  );
+}
+
+function authScopeOption(
+  authScope: string | null | undefined,
+): { authScope?: string | null } {
+  return authScope === undefined ? {} : { authScope };
+}
+
+/**
+ * Hide server-backed projects omitted by a canonical `/api/projects` list.
+ *
+ * A full project refresh is an authoritative visibility boundary: an omitted
+ * project may have been revoked (or deleted) even when its own row timestamp
+ * did not change.  Local-only/offline projects have no owner id yet and must
+ * remain available for their outbox replay, so they are deliberately kept.
+ */
+export function missingRemoteProjectIds(
+  existing: Array<{ id: string; ownerId?: string | null }>,
+  canonical: ApiProject[],
+): string[] {
+  const visibleIds = new Set(canonical.map((project) => project.id));
+  return existing
+    .filter((project) => project.ownerId != null && !visibleIds.has(project.id))
+    .map((project) => project.id);
+}
+
+async function reconcileCanonicalProjects(list: ApiProject[]): Promise<void> {
+  const db = getDb();
+  const existing = await db
+    .select({ id: schema.projects.id, ownerId: schema.projects.ownerId })
+    .from(schema.projects)
+    .where(isNull(schema.projects.deletedAt));
+  const staleIds = missingRemoteProjectIds(existing, list);
+  if (!staleIds.length) return;
+  const deletedAt = new Date().toISOString();
+  // Apply the bounded set one row at a time to preserve compatibility with
+  // the lightweight DB doubles used by repository tests.
+  for (const id of staleIds) {
+    await db
+      .update(schema.projects)
+      .set({ deletedAt, updatedAt: deletedAt })
+      .where(and(eq(schema.projects.id, id), isNull(schema.projects.deletedAt)));
+  }
+}
+
+/**
+ * Fetch and project the canonical project list as one auth-exclusive unit.
+ * null means the captured token/scope was no longer current before the
+ * request or before its SQLite projection, so callers must keep their local
+ * fallback instead of exposing data from the old account.
+ */
+async function refreshRemote(
+  snapshot: AuthScopeSnapshot,
+): Promise<ApiProject[] | null> {
+  return enqueueAuthScopeExclusive(async () => {
+    if (!(await isCurrentAuthScope(snapshot))) return null;
+
+    const list = await projectApi.list();
+    if (!(await isCurrentAuthScope(snapshot))) return null;
+
+    await applyRemoteProjects(list);
+    await reconcileCanonicalProjects(list);
+    return list;
+  });
+}
+
+/**
+ * Re-read after a scope transition has been observed.  Keep this read behind
+ * the same queue as auth transitions so a caller cannot return a pre-clear
+ * local snapshot while the transition is still committing its SQLite changes.
+ */
+function readCurrentLocal(): Promise<ApiProject[]> {
+  return enqueueAuthScopeExclusive(() => projectsRepo.listLocal());
 }
 
 export async function applyProjectTombstones(
@@ -199,25 +339,37 @@ export const projectsRepo = {
 
   /** Online returns fresh data; offline or failed refresh falls back to local cache. */
   async list(): Promise<ApiProject[]> {
+    const snapshot = await captureAuthScopeSnapshot();
     const local = await this.listLocal();
+    if (!(await isCurrentAuthScope(snapshot))) {
+      return readCurrentLocal();
+    }
     if (await canUseServer()) {
       try {
-        return await this.refresh();
+        const remote = await refreshRemote(snapshot);
+        return remote ?? readCurrentLocal();
       } catch (error) {
+        if (!(await isCurrentAuthScope(snapshot))) {
+          return readCurrentLocal();
+        }
         if (local.length === 0) {
           throw error;
         }
         return local;
       }
     }
+    if (!(await isCurrentAuthScope(snapshot))) {
+      return readCurrentLocal();
+    }
     return local;
   },
 
   /** Force a remote fetch and upsert into local cache. Returns fresh list. */
   async refresh(): Promise<ApiProject[]> {
-    const list = await projectApi.list();
-    await applyRemoteProjects(list);
-    return list;
+    const snapshot = await captureAuthScopeSnapshot();
+    const remote = await refreshRemote(snapshot);
+    if (remote === null) throw new StaleAuthScopeError();
+    return remote;
   },
 
   /** Local get by id. */
@@ -238,28 +390,36 @@ export const projectsRepo = {
     aliases?: string[];
     allow_join_requests?: boolean;
     storage_quota_mb?: number;
+    space_id?: string | null;
+    is_completed?: boolean;
     project_metadata?: Record<string, unknown> | null;
   }): Promise<ApiProject> {
+    const token = await getToken();
+    const hasToken = Boolean(token);
+    const authScope = authScopeForToken(token);
     if (await canUseServer()) {
       try {
         const created = await projectApi.create(data);
         await applyRemoteProjects([created]);
         return created;
-      } catch {
-        // Fall back to local-first below.
+      } catch (error) {
+        if (!shouldQueueProjectMutation(error)) throw error;
       }
     }
 
     const local = buildLocalProject(data);
     await applyRemoteProjects([local]);
-    if (await getToken()) {
+    if (hasToken) {
       await enqueueOutbox({
         table: "projects",
         action: "create",
         entityId: local.id,
+        ...authScopeOption(authScope),
         payload: {
           name: local.name,
           description: local.description,
+          space_id: local.space_id ?? null,
+          is_completed: local.is_completed ?? false,
           storage_quota_mb: local.storage_quota_mb ?? null,
           project_metadata: local.metadata ?? null,
         },
@@ -276,16 +436,21 @@ export const projectsRepo = {
       aliases?: string[];
       allow_join_requests?: boolean;
       storage_quota_mb?: number;
+      space_id?: string | null;
+      is_completed?: boolean;
       project_metadata?: Record<string, unknown> | null;
     },
   ): Promise<ApiProject> {
+    const token = await getToken();
+    const hasToken = Boolean(token);
+    const authScope = authScopeForToken(token);
     if (await canUseServer()) {
       try {
         const updated = await projectApi.update(projectId, data);
         await applyRemoteProjects([updated]);
         return updated;
-      } catch {
-        // Fall back to local-first below.
+      } catch (error) {
+        if (!shouldQueueProjectMutation(error)) throw error;
       }
     }
 
@@ -299,6 +464,8 @@ export const projectsRepo = {
     if ("description" in data) patch.description = data.description ?? null;
     if ("storage_quota_mb" in data)
       patch.storageQuotaMb = data.storage_quota_mb ?? null;
+    if ("space_id" in data) patch.spaceId = data.space_id ?? null;
+    if ("is_completed" in data) patch.isCompleted = Boolean(data.is_completed);
     if ("project_metadata" in data) {
       const previousMetadata =
         before?.metadata && typeof before.metadata === "object"
@@ -317,11 +484,12 @@ export const projectsRepo = {
     if (!local) {
       throw new Error("Project not found");
     }
-    if (before && (await getToken())) {
+    if (before && hasToken) {
       await enqueueOutbox({
         table: "projects",
         action: "update",
         entityId: projectId,
+        ...authScopeOption(authScope),
         payload: data,
         baseUpdatedAt: before.updated_at ?? null,
       });
@@ -330,15 +498,18 @@ export const projectsRepo = {
   },
 
   async delete(projectId: string): Promise<void> {
-    let shouldQueue = Boolean(await getToken());
+    const token = await getToken();
+    const hasToken = Boolean(token);
+    const authScope = authScopeForToken(token);
+    let shouldQueue = hasToken;
     const before = await this.getLocal(projectId);
     if (await canUseServer()) {
       try {
         await projectApi.delete(projectId);
         shouldQueue = false;
-      } catch {
-        // Fall back to local-first below.
-        shouldQueue = true;
+      } catch (error) {
+        if (!shouldQueueProjectMutation(error)) throw error;
+        shouldQueue = hasToken;
       }
     }
 
@@ -353,6 +524,7 @@ export const projectsRepo = {
         table: "projects",
         action: "delete",
         entityId: projectId,
+        ...authScopeOption(authScope),
         payload: {},
         baseUpdatedAt: before?.updated_at ?? null,
       });

@@ -1,5 +1,7 @@
 "use client";
 
+import { AppSelect } from "@/components/ui/app-select";
+
 import { useEffect, useState } from "react";
 import { Hash, Plus, Table2 } from "lucide-react";
 import { toast } from "sonner";
@@ -17,6 +19,7 @@ import type {
   DocsSupertag,
 } from "./types";
 import {
+  normalizeSearchQuery,
   readConfigRecord,
   type DocsApiFetch,
   type SearchSort,
@@ -45,6 +48,7 @@ export function SupertagPage({
   onFieldValuesChanged,
   onCreateView,
   onUpdateView,
+  readOnly = false,
 }: {
   apiFetch: DocsApiFetch;
   tag: DocsSupertag | null;
@@ -66,6 +70,8 @@ export function SupertagPage({
   onFieldValuesChanged: (nodeId: string, fieldId: string, fieldValues: DocsFieldValue[]) => void;
   onCreateView: (tag: DocsSupertag, draft: Pick<DocsSavedView, "name" | "layout" | "config_json">) => Promise<DocsSavedView>;
   onUpdateView: (viewId: string, patch: Partial<Pick<DocsSavedView, "name" | "layout" | "config_json" | "sort_order">>) => Promise<DocsSavedView>;
+  /** Definition mutations are restricted to the actor's library. */
+  readOnly?: boolean;
 }) {
   const savedViews = tag ? views.filter((view) => view.supertag_id === tag.id).sort((a, b) => a.sort_order - b.sort_order) : [];
   const defaultLayout = readConfigRecord(tag?.config_json).default_layout === "table" || tag?.base_type === "record"
@@ -77,7 +83,7 @@ export function SupertagPage({
   const defaultViews: DocsSavedView[] = tag
     ? defaultLayouts.map((layout, sortOrder) => ({
         id: `${tag.id}:${layout}`,
-        workspace_id: tag.workspace_id,
+        docs_library_id: tag.docs_library_id,
         supertag_id: tag.id,
         name: layout === "list" ? tag.name : `${tag.name} ${layout}`,
         layout,
@@ -120,7 +126,7 @@ export function SupertagPage({
   if (!tag) {
     const submitTable = async () => {
       const name = newTableName.trim();
-      if (!name || creatingTable) return;
+      if (readOnly || !name || creatingTable) return;
       setCreatingTable(true);
       try {
         await onCreateTable(name);
@@ -137,12 +143,14 @@ export function SupertagPage({
         <div className="mx-auto w-full max-w-3xl">
           <div className="mb-4 flex items-center justify-between gap-3">
             <h1 className="text-2xl font-semibold">Supertags</h1>
-            <Button type="button" size="sm" onClick={() => setShowCreateTable((current) => !current)}>
-              <Table2 className="size-4" />
-              新規テーブル
-            </Button>
+            {!readOnly ? (
+              <Button type="button" size="sm" onClick={() => setShowCreateTable((current) => !current)}>
+                <Table2 className="size-4" />
+                新規テーブル
+              </Button>
+            ) : null}
           </div>
-          {showCreateTable ? (
+          {showCreateTable && !readOnly ? (
             <div className="mb-4 flex gap-2 rounded border bg-muted/20 p-3">
               <Input
                 value={newTableName}
@@ -152,8 +160,9 @@ export function SupertagPage({
                 }}
                 placeholder="例: 申請台帳"
                 autoFocus
+                disabled={readOnly}
               />
-              <Button type="button" onClick={() => void submitTable()} disabled={!newTableName.trim() || creatingTable}>
+              <Button type="button" onClick={() => void submitTable()} disabled={readOnly || !newTableName.trim() || creatingTable}>
                 {creatingTable ? "作成中" : "作成"}
               </Button>
             </div>
@@ -181,21 +190,24 @@ export function SupertagPage({
   const layout = activeView?.layout === "board" || activeView?.layout === "calendar" || activeView?.layout === "table" || activeView?.layout === "cards"
     ? activeView.layout as SearchView
     : "list";
-  const query = readConfigRecord(activeView?.config_json).query ?? { and: [{ tag: tag.id, include_descendants: true }], limit: 200 };
+  const query = normalizeSearchQuery(
+    readConfigRecord(activeView?.config_json).query ?? { and: [{ tag: tag.id, include_descendants: true }], limit: 200 },
+  );
   const defaultNewViewQuery = {
     query: { and: [{ tag: tag.id, include_descendants: true }], limit: 200 },
   };
   const persistActiveViewQuery = (nextQuery: Record<string, unknown>) => {
-    if (!activeViewIsSaved || !activeView) return;
+    if (readOnly || !activeViewIsSaved || !activeView) return;
     void onUpdateView(activeView.id, {
       config_json: {
         ...readConfigRecord(activeView.config_json),
-        query: nextQuery,
+        query: normalizeSearchQuery(nextQuery),
       },
     });
   };
   const persistActiveViewSort = (sort: SearchSort) => {
-    const nextQuery = { ...readConfigRecord(query) };
+    if (readOnly) return;
+    const nextQuery = normalizeSearchQuery(query);
     if (sort) {
       nextQuery.sort = sort;
     } else {
@@ -204,6 +216,10 @@ export function SupertagPage({
     persistActiveViewQuery(nextQuery);
   };
   const persistActiveViewLayout = (view: SearchView) => {
+    if (readOnly) {
+      setActiveViewId(viewList.find((item) => item.layout === view)?.id ?? activeView?.id ?? null);
+      return;
+    }
     if (activeViewIsSaved && activeView) {
       void onUpdateView(activeView.id, { layout: view });
       return;
@@ -217,6 +233,7 @@ export function SupertagPage({
     setShowAddView(true);
   };
   const submitAddView = () => {
+    if (readOnly) return;
     const name = newViewName.trim();
     if (!name) {
       toast.error("ビュー名を入力してください");
@@ -226,6 +243,10 @@ export function SupertagPage({
     try {
       const parsed = JSON.parse(newViewQueryText);
       configJson = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+      const queryConfig = normalizeSearchQuery(configJson.query);
+      if (Object.prototype.hasOwnProperty.call(configJson, "query") || Object.keys(queryConfig).length > 0) {
+        configJson = { ...configJson, query: queryConfig };
+      }
     } catch {
       toast.error("AST JSONを確認してください");
       return;
@@ -237,7 +258,7 @@ export function SupertagPage({
   };
   const searchNode: DocsNode = {
     id: `${tag.id}:${layout}:search`,
-    workspace_id: tag.workspace_id,
+    docs_library_id: tag.docs_library_id,
     parent_id: null,
     root_page_id: null,
     project_id: null,
@@ -288,9 +309,11 @@ export function SupertagPage({
               {view.name}
             </button>
           ))}
-          <button type="button" className="rounded px-2 py-1 text-xs text-muted-foreground hover:bg-accent" onClick={beginAddView}>+ Add view</button>
+          {!readOnly ? (
+            <button type="button" className="rounded px-2 py-1 text-xs text-muted-foreground hover:bg-accent" onClick={beginAddView}>+ Add view</button>
+          ) : null}
         </div>
-        {showAddView ? (
+        {showAddView && !readOnly ? (
           <div className="mb-4 grid gap-2 rounded border bg-muted/20 p-3 text-xs md:grid-cols-[minmax(0,1fr)_150px_auto]">
             <Input
               value={newViewName}
@@ -298,7 +321,7 @@ export function SupertagPage({
               className="h-8 text-xs"
               placeholder="View name"
             />
-            <select
+            <AppSelect
               value={newViewLayout}
               onChange={(event) => setNewViewLayout(event.target.value as SearchView)}
               className="h-8 rounded border bg-background px-2 text-xs"
@@ -309,9 +332,9 @@ export function SupertagPage({
               <option value="board">Board</option>
               <option value="calendar">Calendar</option>
               <option value="cards">Cards</option>
-            </select>
+            </AppSelect>
             <div className="flex gap-1">
-              <Button type="button" size="sm" onClick={submitAddView}>保存</Button>
+              <Button type="button" size="sm" onClick={submitAddView} disabled={readOnly}>保存</Button>
               <Button type="button" variant="ghost" size="sm" onClick={() => setShowAddView(false)}>閉じる</Button>
             </div>
             <textarea
@@ -339,8 +362,8 @@ export function SupertagPage({
           onCreateRow={() => onCreateTableRow(tag)}
           onFieldValuesChanged={onFieldValuesChanged}
           onSetView={persistActiveViewLayout}
-          onSetSort={activeViewIsSaved ? persistActiveViewSort : undefined}
-          onSetQuery={activeViewIsSaved ? persistActiveViewQuery : undefined}
+          onSetSort={!readOnly && activeViewIsSaved ? persistActiveViewSort : undefined}
+          onSetQuery={!readOnly && activeViewIsSaved ? persistActiveViewQuery : undefined}
           onOpenNode={onOpenNode}
         />
       </div>

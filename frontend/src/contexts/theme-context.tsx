@@ -49,7 +49,12 @@ function resolveTheme(theme: ThemeMode): ResolvedTheme {
 
 function getStoredTheme(): ThemeMode {
   if (typeof window === "undefined") return "system";
-  return normalizeTheme(window.localStorage.getItem(THEME_STORAGE_KEY));
+  try {
+    return normalizeTheme(window.localStorage.getItem(THEME_STORAGE_KEY));
+  } catch {
+    // localStorageが無効な環境ではシステム設定を利用する。
+    return "system";
+  }
 }
 
 function applyTheme(theme: ThemeMode): ResolvedTheme {
@@ -94,7 +99,11 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
   }, [theme]);
 
   const setTheme = useCallback((nextTheme: ThemeMode) => {
-    window.localStorage.setItem(THEME_STORAGE_KEY, nextTheme);
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, nextTheme);
+    } catch {
+      // localStorageが無効でもメモリ上のテーマ変更は反映する。
+    }
     setThemeState(nextTheme);
     setResolvedTheme(applyTheme(nextTheme));
   }, []);

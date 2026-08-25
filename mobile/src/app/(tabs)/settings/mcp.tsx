@@ -1,8 +1,10 @@
 import React, { useCallback, useState } from "react";
-import { ScrollView, StyleSheet, View } from "react-native";
+import { StyleSheet, View } from "react-native";
 import { useFocusEffect, useRouter } from "expo-router";
 import { goBackOrReplace } from "../../../lib/navigation";
-import { Button, IconButton, List, Surface, Switch, Text } from "react-native-paper";
+import { Button, List, Surface, Switch, Text } from "react-native-paper";
+import { ScreenHeader } from "../../../components/screen-header";
+import { ScreenShell } from "../../../components/screen-primitives";
 import { useAuth } from "../../../contexts/AuthContext";
 import { settingsApi } from "../../../lib/settings-api";
 import type { AppSettings } from "../../../types/api";
@@ -14,19 +16,59 @@ type ToggleRow = {
   value: boolean;
 };
 
+function getSettingsErrorMessage(
+  error: unknown,
+  fallback: string,
+): string {
+  return error instanceof Error && error.message
+    ? error.message
+    : fallback;
+}
+
 export default function SettingsMcpScreen() {
   const router = useRouter();
   const { isAuthenticated } = useAuth();
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!isAuthenticated) {
       setSettings(null);
+      setSettingsError(null);
       return;
     }
-    const data = await settingsApi.get();
-    setSettings(data.settings);
+    try {
+      const data = await settingsApi.get();
+      setSettings(data.settings);
+      setSettingsError(null);
+    } catch (error) {
+      setSettings(null);
+      setSettingsError(
+        getSettingsErrorMessage(
+          error,
+          "設定を取得できませんでした。通信状態を確認して再読み込みしてください。",
+        ),
+      );
+    }
   }, [isAuthenticated]);
+
+  const updateSetting = useCallback(
+    async (keyPath: string, value: boolean | string) => {
+      try {
+        setSettingsError(null);
+        await settingsApi.update(keyPath, value, true);
+        await load();
+      } catch (error) {
+        setSettingsError(
+          getSettingsErrorMessage(
+            error,
+            "設定を保存できませんでした。通信状態を確認して再試行してください。",
+          ),
+        );
+      }
+    },
+    [load],
+  );
 
   useFocusEffect(
     useCallback(() => {
@@ -81,38 +123,45 @@ export default function SettingsMcpScreen() {
         {
           title: "RAG",
           description: "Enable retrieval-augmented features.",
-          keyPath: "rag.enabled",
-          value: settings.rag.enabled,
+          keyPath: "search.knowledge_enabled",
+          value: settings.search?.knowledge_enabled ?? false,
         },
       ]
     : [];
 
   return (
-    <View style={styles.container}>
-      <Surface style={styles.header} elevation={1}>
-        <View style={styles.headerRow}>
-          <IconButton
-            icon="arrow-left"
-            iconColor="#cdd6f4"
-            onPress={() => goBackOrReplace(router, '/(tabs)/settings')}
-          />
-          <View style={{ flex: 1 }}>
-            <Text variant="titleLarge" style={styles.headerTitle}>
-              MCP & Agents
-            </Text>
-            <Text style={styles.headerSubtext}>
-              Server-side integration toggles.
-            </Text>
-          </View>
-        </View>
-      </Surface>
-
-      <ScrollView contentContainerStyle={styles.content}>
+    <ScreenShell
+      scroll
+      style={styles.container}
+      contentContainerStyle={styles.content}
+      header={
+        <ScreenHeader
+          title="MCP & Agents"
+          subtitle="Server-side integration toggles."
+          onBack={() => goBackOrReplace(router, "/(tabs)/settings")}
+        />
+      }
+    >
         {!isAuthenticated ? (
           <Surface style={styles.card} elevation={0}>
             <Text style={styles.description}>
               MCP とエージェント設定はサーバーログイン中のみ利用できます。
             </Text>
+          </Surface>
+        ) : null}
+        {isAuthenticated && settingsError ? (
+          <Surface style={styles.card} elevation={0}>
+            <Text style={styles.description}>{settingsError}</Text>
+            <Button
+              mode="outlined"
+              textColor="#cdd6f4"
+              onPress={() => {
+                void load();
+              }}
+              style={styles.retryButton}
+            >
+              再読み込み
+            </Button>
           </Surface>
         ) : null}
         {toggles.map((toggle) => (
@@ -125,9 +174,8 @@ export default function SettingsMcpScreen() {
               right={() => (
                 <Switch
                   value={toggle.value}
-                  onValueChange={async (value) => {
-                    await settingsApi.update(toggle.keyPath, value, true);
-                    await load();
+                  onValueChange={(value) => {
+                    void updateSetting(toggle.keyPath, value);
                   }}
                 />
               )}
@@ -159,13 +207,8 @@ export default function SettingsMcpScreen() {
                     }
                     textColor="#cdd6f4"
                     compact
-                    onPress={async () => {
-                      await settingsApi.update(
-                        "reasoning.display_mode",
-                        mode,
-                        true,
-                      );
-                      await load();
+                    onPress={() => {
+                      void updateSetting("reasoning.display_mode", mode);
                     }}
                   >
                     {mode}
@@ -175,22 +218,12 @@ export default function SettingsMcpScreen() {
             </View>
           </Surface>
         ) : null}
-      </ScrollView>
-    </View>
+    </ScreenShell>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b" },
-  header: {
-    paddingTop: 52,
-    paddingHorizontal: 8,
-    paddingBottom: 16,
-    backgroundColor: "#1e1e2e",
-  },
-  headerRow: { flexDirection: "row", alignItems: "center" },
-  headerTitle: { color: "#cdd6f4", fontWeight: "bold" },
-  headerSubtext: { color: "#a6adc8", marginTop: 2 },
   content: { padding: 16, gap: 12, paddingBottom: 32 },
   card: { backgroundColor: "#1e1e2e", borderRadius: 12 },
   buttonGrid: {
@@ -200,6 +233,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingBottom: 16,
   },
+  retryButton: { marginTop: 12, alignSelf: "flex-start" },
   title: { color: "#cdd6f4" },
   description: { color: "#a6adc8" },
 });

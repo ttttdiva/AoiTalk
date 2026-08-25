@@ -215,9 +215,9 @@ export function ComfyUISection() {
   };
 
   return (
-    <Card size="sm">
+      <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0" data-settings-surface="comfyui">
       <CardHeader
-        className="cursor-pointer select-none"
+          className="cursor-pointer select-none border-b border-border dark:border-[#333335] px-3 py-3 transition-colors hover:bg-muted dark:bg-[#242426]"
         onClick={handleToggleExpanded}
       >
           <div className="flex items-center justify-between gap-3">
@@ -253,7 +253,7 @@ export function ComfyUISection() {
           </div>
       </CardHeader>
       {expanded && (
-        <CardContent className="space-y-4">
+        <CardContent className="space-y-4 px-3 py-3">
           {isLoading && !config ? (
             <p className="text-sm text-muted-foreground">読み込み中...</p>
           ) : (

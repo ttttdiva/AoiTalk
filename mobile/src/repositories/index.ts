@@ -9,10 +9,14 @@ export { tasksRepo, OfflineWriteError } from "./tasks";
 export { projectsRepo } from "./projects";
 export { occurrencesRepo } from "./occurrences";
 export {
+  CharacterUpdateNotAllowedError,
   conversationsRepo,
+  dispatchPendingConversationMessage,
   flushPendingConversation,
   flushPendingConversations,
+  getCharacterUpdateEligibility,
   getPromotedConversationSessionId,
+  uploadLocalSession,
 } from "./conversations";
 export {
   timeEntriesRepo,

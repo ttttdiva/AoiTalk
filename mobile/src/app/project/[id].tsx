@@ -5,7 +5,6 @@ import { goBackOrReplace } from "../../lib/navigation";
 import {
   Button,
   Dialog,
-  IconButton,
   Portal,
   Surface,
   Switch,
@@ -13,12 +12,15 @@ import {
   TextInput,
 } from 'react-native-paper';
 import { ProjectColorPicker } from '../../components/project-color-picker';
+import { ScreenHeader } from '../../components/screen-header';
+import { EmptyState, ErrorState, LoadingState } from '../../components/screen-primitives';
+import { useAuth } from '../../contexts/AuthContext';
 import {
   getProjectColor,
   DEFAULT_PROJECT_COLOR,
   normalizeProjectColor,
 } from '../../lib/project-colors';
-import { projectApi } from '../../lib/project-api';
+import { getProjectCapabilities, projectApi } from '../../lib/project-api';
 import { taskApi } from '../../lib/task-api';
 import type {
   Project,
@@ -30,7 +32,10 @@ import type {
 export default function ProjectDetailScreen() {
   const router = useRouter();
   const { id } = useLocalSearchParams<{ id: string }>();
+  const { user } = useAuth();
   const [project, setProject] = useState<Project | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [members, setMembers] = useState<ProjectMember[]>([]);
   const [usage, setUsage] = useState<ProjectStorageUsage | null>(null);
   const [notifications, setNotifications] = useState<ProjectNotificationSetting | null>(null);
@@ -41,26 +46,36 @@ export default function ProjectDetailScreen() {
   const [color, setColor] = useState(DEFAULT_PROJECT_COLOR);
   const [allowJoinRequests, setAllowJoinRequests] = useState(false);
   const [storageQuotaMb, setStorageQuotaMb] = useState('');
+  const capabilities = project ? getProjectCapabilities(project, user) : null;
+  const canManageSettings = capabilities?.canManageSettings === true;
 
   const load = useCallback(async () => {
     if (!id) return;
-    const [nextProject, nextMembers, nextUsage, nextNotifications] = await Promise.all([
-      projectApi.get(id),
-      projectApi.listMembers(id),
-      projectApi.getStorageUsage(id),
-      taskApi.getNotificationSettings(id),
-    ]);
-    setProject(nextProject);
-    setMembers(nextMembers);
-    setUsage(nextUsage);
-    setNotifications(nextNotifications);
-    setName(nextProject.name);
-    setDescription(nextProject.description ?? '');
-    setColor(getProjectColor(nextProject));
-    setAllowJoinRequests(Boolean(nextProject.allow_join_requests));
-    setStorageQuotaMb(
-      nextProject.storage_quota_mb != null ? String(nextProject.storage_quota_mb) : '',
-    );
+    setLoading(true);
+    setLoadError(null);
+    try {
+      const [nextProject, nextMembers, nextUsage, nextNotifications] = await Promise.all([
+        projectApi.get(id),
+        projectApi.listMembers(id),
+        projectApi.getStorageUsage(id),
+        taskApi.getNotificationSettings(id),
+      ]);
+      setProject(nextProject);
+      setMembers(nextMembers);
+      setUsage(nextUsage);
+      setNotifications(nextNotifications);
+      setName(nextProject.name);
+      setDescription(nextProject.description ?? '');
+      setColor(getProjectColor(nextProject));
+      setAllowJoinRequests(Boolean(nextProject.allow_join_requests));
+      setStorageQuotaMb(
+        nextProject.storage_quota_mb != null ? String(nextProject.storage_quota_mb) : '',
+      );
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : 'Projectの読み込みに失敗しました。');
+    } finally {
+      setLoading(false);
+    }
   }, [id]);
 
   useFocusEffect(
@@ -70,7 +85,7 @@ export default function ProjectDetailScreen() {
   );
 
   const handleSave = async () => {
-    if (!id || !name.trim()) return;
+    if (!id || !name.trim() || !canManageSettings) return;
     setSaving(true);
     try {
       const updated = await projectApi.update(id, {
@@ -94,22 +109,35 @@ export default function ProjectDetailScreen() {
 
   return (
     <View style={styles.container}>
-      <Surface style={styles.header} elevation={1}>
-        <View style={styles.headerRow}>
-          <IconButton icon="arrow-left" iconColor="#cdd6f4" onPress={() => goBackOrReplace(router, '/projects')} />
-          <View style={{ flex: 1 }}>
-            <Text variant="titleLarge" style={styles.headerTitle}>
-              {project?.name || 'Project'}
-            </Text>
-            <Text style={styles.headerSubtext}>{project?.slug || ''}</Text>
-          </View>
-          <Button compact mode="outlined" textColor="#89b4fa" onPress={() => setDialogVisible(true)}>
-            Edit
-          </Button>
-        </View>
-      </Surface>
+      <ScreenHeader
+        title={project?.name || 'Project'}
+        subtitle={project?.slug || undefined}
+        onBack={() => goBackOrReplace(router, '/projects')}
+        right={
+          canManageSettings ? (
+            <Button compact mode="outlined" textColor="#89b4fa" onPress={() => setDialogVisible(true)}>
+              Edit
+            </Button>
+          ) : null
+        }
+      />
 
       <ScrollView contentContainerStyle={styles.content}>
+        {loading && !project ? <LoadingState label="Projectを読み込み中…" /> : null}
+        {!loading && loadError && !project ? (
+          <ErrorState
+            message={loadError}
+            action={
+              <Button mode="outlined" onPress={() => void load()}>
+                Retry
+              </Button>
+            }
+          />
+        ) : null}
+        {!loading && !loadError && !project ? (
+          <EmptyState message="Projectが見つかりません。" />
+        ) : null}
+        {project ? <>
         <Surface style={styles.card} elevation={0}>
           <Text style={styles.cardTitle}>Overview</Text>
           <Text style={styles.bodyText}>{project?.description || 'No description'}</Text>
@@ -147,9 +175,11 @@ export default function ProjectDetailScreen() {
           <Text style={styles.metaText}>
             Overdue alerts: {notifications?.notify_overdue ? 'Enabled' : 'Disabled'}
           </Text>
-          <Button mode="outlined" textColor="#89b4fa" onPress={() => router.push('/(tabs)/settings/connection')}>
-            Open Notification Settings
-          </Button>
+          {canManageSettings ? (
+            <Button mode="outlined" textColor="#89b4fa" onPress={() => router.push('/(tabs)/settings/connection')}>
+              Open Notification Settings
+            </Button>
+          ) : null}
         </Surface>
 
         <Surface style={styles.card} elevation={0}>
@@ -164,13 +194,25 @@ export default function ProjectDetailScreen() {
           ))}
           {members.length === 0 ? <Text style={styles.bodyText}>No members listed.</Text> : null}
         </Surface>
+        </> : null}
       </ScrollView>
 
       <Portal>
-        <Dialog visible={dialogVisible} onDismiss={() => setDialogVisible(false)} style={styles.dialog}>
+        <Dialog
+          visible={dialogVisible && canManageSettings}
+          onDismiss={() => setDialogVisible(false)}
+          style={styles.dialog}
+        >
           <Dialog.Title style={styles.dialogTitle}>Edit Project</Dialog.Title>
           <Dialog.Content>
-            <TextInput label="Name" value={name} onChangeText={setName} mode="outlined" style={styles.input} />
+            <TextInput
+              label="Name"
+              value={name}
+              onChangeText={setName}
+              mode="outlined"
+              style={styles.input}
+              disabled={!canManageSettings}
+            />
             <TextInput
               label="Description"
               value={description}
@@ -178,8 +220,12 @@ export default function ProjectDetailScreen() {
               mode="outlined"
               multiline
               style={styles.input}
+              disabled={!canManageSettings}
             />
-            <ProjectColorPicker value={color} onChange={setColor} />
+            <ProjectColorPicker
+              value={color}
+              onChange={setColor}
+            />
             <TextInput
               label="Storage Quota (MB)"
               value={storageQuotaMb}
@@ -187,17 +233,26 @@ export default function ProjectDetailScreen() {
               mode="outlined"
               keyboardType="numeric"
               style={styles.input}
+              disabled={!canManageSettings}
             />
             <View style={styles.switchRow}>
               <Text style={styles.switchLabel}>Allow Join Requests</Text>
-              <Switch value={allowJoinRequests} onValueChange={setAllowJoinRequests} />
+              <Switch
+                value={allowJoinRequests}
+                onValueChange={setAllowJoinRequests}
+                disabled={!canManageSettings}
+              />
             </View>
           </Dialog.Content>
           <Dialog.Actions>
             <Button textColor="#a6adc8" onPress={() => setDialogVisible(false)}>
               Cancel
             </Button>
-            <Button textColor="#7c3aed" onPress={() => void handleSave()} disabled={saving || !name.trim()}>
+            <Button
+              textColor="#7c3aed"
+              onPress={() => void handleSave()}
+              disabled={saving || !name.trim() || !canManageSettings}
+            >
               Save
             </Button>
           </Dialog.Actions>
@@ -209,10 +264,6 @@ export default function ProjectDetailScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#11111b' },
-  header: { paddingTop: 52, paddingHorizontal: 8, paddingBottom: 16, backgroundColor: '#1e1e2e' },
-  headerRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  headerTitle: { color: '#cdd6f4', fontWeight: 'bold' },
-  headerSubtext: { color: '#a6adc8', marginTop: 2 },
   content: { padding: 16, gap: 12, paddingBottom: 32 },
   card: { backgroundColor: '#1e1e2e', borderRadius: 12, padding: 16 },
   cardTitle: { color: '#7c3aed', fontSize: 13, fontWeight: '700', marginBottom: 10 },

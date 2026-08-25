@@ -1,9 +1,10 @@
 "use client";
 
+import { AppSelect } from "@/components/ui/app-select";
+
 import { useEffect, useState, useCallback, useRef } from "react";
 import useSWR from "swr";
 import { usePathname, useRouter } from "next/navigation";
-import Link from "next/link";
 import {
   LogOut,
   FolderOpen,
@@ -13,22 +14,24 @@ import {
   RotateCcw,
   HelpCircle,
   Camera,
-  ChevronLeft,
-  ChevronRight,
-  Bot as BotIcon,
-  Mic,
-  Volume2,
   Moon,
   Sun,
+  Loader2,
+  Search,
+  Home,
+  Settings,
 } from "lucide-react";
 import { useProject } from "@/contexts/project-context";
 import { useTheme } from "@/contexts/theme-context";
 import { taskApi, type TimeEntry } from "@/lib/task-api";
-import { APP_VIEW_TABS } from "@/lib/app-navigation";
-import { getAppNavigationVisibility } from "@/lib/user-settings";
-import { useUserSettings } from "@/contexts/user-settings-context";
+import { toast } from "sonner";
 import { formatTimerClock, getElapsedTimerSeconds } from "@/lib/task-time";
 import { performAdminRestart } from "@/components/layout/global-admin-restart";
+import {
+  clearPersistentCache,
+  discardPendingPersistentWrites,
+} from "@/lib/persistent-cache";
+import { resetChatMessageCacheMemory } from "@/lib/chat-message-cache";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
 import {
@@ -40,277 +43,25 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Separator } from "@/components/ui/separator";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
-
-const AVATAR_STORAGE_KEY = "user-avatar-image";
-
-type LlmEngine = { provider: string; model: string; label: string };
-
-type VoiceStatus = {
-  ready: boolean;
-  rms: number;
-  recording: boolean;
-};
+import { RuntimeUtilityPanel } from "@/components/layout/runtime-utility-panel";
+import { NotificationBellPopover } from "@/components/layout/sidebar/notification-panel";
+import { useShellChrome } from "@/components/layout/shell-context";
+import { useRuntimeContext } from "@/contexts/runtime-context";
+import { ResourceColorDot } from "@/components/projects/resource-color-picker";
 
 type AuthStatus = {
   authenticated?: boolean;
-  user?: { role?: string } | null;
+  user?: {
+    id?: string;
+    username?: string | null;
+    display_name?: string | null;
+    role?: string | null;
+    avatar_url?: string | null;
+  } | null;
 };
 
-type RuntimeFeatures = {
-  features: Record<string, boolean>;
-  discord_bot_service?: {
-    state?: "stopped" | "starting" | "running" | "stopping" | "failed";
-    user?: string | null;
-    guild_count?: number;
-    task_running?: boolean;
-    last_error?: string | null;
-  };
-};
+export const USER_SETTINGS_HREF = "/settings#account";
 
-function useVoiceStatus(pythonConnected: boolean) {
-  const [status, setStatus] = useState<VoiceStatus | null>(null);
-
-  useEffect(() => {
-    if (!pythonConnected) return;
-
-    let mounted = true;
-
-    const poll = async () => {
-      try {
-        const res = await fetch("/api/python-proxy/voice_status", {
-          credentials: "include",
-          signal: AbortSignal.timeout(3000),
-        });
-        if (res.ok && mounted) {
-          setStatus(await res.json());
-        }
-      } catch {
-        if (mounted) setStatus(null);
-      }
-    };
-
-    poll();
-    const interval = setInterval(poll, 3000);
-    return () => {
-      mounted = false;
-      clearInterval(interval);
-    };
-  }, [pythonConnected]);
-
-  return pythonConnected ? status : null;
-}
-
-function usePythonApi() {
-  const [isConnected, setIsConnected] = useState(false);
-  const [characters, setCharacters] = useState<string[]>([]);
-  const [currentCharacter, setCurrentCharacter] = useState("");
-  const [llmEngines, setLlmEngines] = useState<LlmEngine[]>([]);
-  const [currentLlm, setCurrentLlm] = useState<{
-    provider: string;
-    model: string;
-  } | null>(null);
-  const [runtimeFeatures, setRuntimeFeatures] =
-    useState<RuntimeFeatures | null>(null);
-
-  const refreshRuntimeFeatures = useCallback(async () => {
-    try {
-      const res = await fetch("/api/python-proxy/runtime/features", {
-        credentials: "include",
-        signal: AbortSignal.timeout(3000),
-      });
-      if (!res.ok) return null;
-      const data = await res.json();
-      setRuntimeFeatures(data);
-      return data as RuntimeFeatures;
-    } catch {
-      return null;
-    }
-  }, []);
-
-  const fetchExtras = useCallback(async () => {
-    try {
-      const [charRes, llmRes, runtimeRes] = await Promise.all([
-        fetch("/api/python-proxy/characters", {
-          credentials: "include",
-          signal: AbortSignal.timeout(3000),
-        }),
-        fetch("/api/python-proxy/llm/engine", {
-          credentials: "include",
-          signal: AbortSignal.timeout(3000),
-        }),
-        fetch("/api/python-proxy/runtime/features", {
-          credentials: "include",
-          signal: AbortSignal.timeout(3000),
-        }),
-      ]);
-      if (charRes.ok) {
-        const data = await charRes.json();
-        setCharacters(data.characters ?? []);
-        setCurrentCharacter(data.current ?? "");
-      }
-      if (llmRes.ok) {
-        const data = await llmRes.json();
-        setLlmEngines(data.available ?? []);
-        setCurrentLlm({ provider: data.provider, model: data.model });
-      }
-      if (runtimeRes.ok) {
-        const data = await runtimeRes.json();
-        setRuntimeFeatures(data);
-      }
-    } catch {
-      // エラー時は何もしない
-    }
-  }, []);
-
-  useEffect(() => {
-    let mounted = true;
-
-    const check = async () => {
-      try {
-        const res = await fetch("/api/python-proxy/health", {
-          signal: AbortSignal.timeout(3000),
-        });
-        const ok = res.ok;
-        if (mounted) {
-          setIsConnected(ok);
-          if (ok) fetchExtras();
-        }
-      } catch {
-        if (mounted) setIsConnected(false);
-      }
-    };
-
-    check();
-    const interval = setInterval(check, 15000);
-    return () => {
-      mounted = false;
-      clearInterval(interval);
-    };
-  }, [fetchExtras]);
-
-  const changeCharacter = useCallback(async (name: string) => {
-    try {
-      const sessionId =
-        typeof window === "undefined"
-          ? ""
-          : new URLSearchParams(window.location.search).get("s") || "";
-      const query = sessionId
-        ? `?session_id=${encodeURIComponent(sessionId)}`
-        : "";
-      const res = await fetch(
-        `/api/python-proxy/character/${encodeURIComponent(name)}${query}`,
-        {
-          method: "POST",
-          credentials: "include",
-        },
-      );
-      if (res.ok) {
-        const data = await res.json().catch(() => ({}));
-        const selectedCharacter =
-          typeof data?.character === "string" && data.character.trim()
-            ? data.character
-            : name;
-        setCurrentCharacter(selectedCharacter);
-        window.dispatchEvent(
-          new CustomEvent("aoi-character-changed", {
-            detail: {
-              characterName: selectedCharacter,
-              characterSlug:
-                typeof data?.character_slug === "string"
-                  ? data.character_slug
-                  : null,
-              sessionId: sessionId || null,
-            },
-          }),
-        );
-      }
-    } catch (err) {
-      console.error("キャラクター変更失敗:", err);
-    }
-  }, []);
-
-  const changeLlmEngine = useCallback(
-    async (provider: string, model: string) => {
-      try {
-        const res = await fetch("/api/python-proxy/llm/engine", {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ provider, model }),
-        });
-        if (res.ok) setCurrentLlm({ provider, model });
-      } catch (err) {
-        console.error("LLMエンジン変更失敗:", err);
-      }
-    },
-    [],
-  );
-
-  const changeRuntimeFeature = useCallback(
-    async (feature: string, enabled: boolean) => {
-      try {
-        const res = await fetch("/api/python-proxy/runtime/features", {
-          method: "PATCH",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ feature, enabled }),
-        });
-        if (res.ok) {
-          setRuntimeFeatures(await res.json());
-          setTimeout(() => {
-            void refreshRuntimeFeatures();
-          }, 1500);
-        }
-      } catch (err) {
-        console.error("ランタイム機能変更失敗:", err);
-      }
-    },
-    [refreshRuntimeFeatures],
-  );
-
-  const changeRuntimeFeatures = useCallback(
-    async (features: Record<string, boolean>) => {
-      let latest: RuntimeFeatures | null = null;
-      try {
-        for (const [feature, enabled] of Object.entries(features)) {
-          const res = await fetch("/api/python-proxy/runtime/features", {
-            method: "PATCH",
-            credentials: "include",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ feature, enabled }),
-          });
-          if (res.ok) latest = await res.json();
-        }
-        if (latest) setRuntimeFeatures(latest);
-        setTimeout(() => {
-          void refreshRuntimeFeatures();
-        }, 1500);
-      } catch (err) {
-        console.error("ランタイム機能変更失敗:", err);
-      }
-    },
-    [refreshRuntimeFeatures],
-  );
-
-  return {
-    isConnected,
-    characters,
-    currentCharacter,
-    changeCharacter,
-    llmEngines,
-    currentLlm,
-    changeLlmEngine,
-    runtimeFeatures,
-    changeRuntimeFeature,
-    changeRuntimeFeatures,
-  };
-}
 
 function useActiveTimer() {
   const [activeEntry, setActiveEntry] = useState<TimeEntry | null>(null);
@@ -324,6 +75,8 @@ function useActiveTimer() {
     let mounted = true;
 
     const poll = async () => {
+      // タブ非表示中はタイマー同期ポーリングを行わない（低帯域配慮）。
+      if (typeof document !== "undefined" && document.hidden) return;
       const requestedAt = Date.now();
       try {
         const entry = await taskApi.getActiveTimeEntry();
@@ -339,6 +92,10 @@ function useActiveTimer() {
 
     poll();
     const interval = setInterval(poll, 10000);
+    const onVisibility = () => {
+      if (typeof document !== "undefined" && !document.hidden) void poll();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
     const onChange = (event: Event) => {
       const detail = (event as CustomEvent<{ activeEntry?: TimeEntry | null }>)
         .detail;
@@ -353,6 +110,7 @@ function useActiveTimer() {
     return () => {
       mounted = false;
       clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibility);
       window.removeEventListener("timer-changed", onChange);
     };
   }, []);
@@ -404,10 +162,14 @@ function useActiveTimer() {
   const stopTimer = useCallback(async () => {
     if (!activeEntry) return;
     try {
+      const taskId =
+        (activeEntry as { task_id?: string | null } | null)?.task_id ?? null;
       await taskApi.stopTimer(activeEntry.id);
       setActiveEntry(null);
       window.dispatchEvent(
-        new CustomEvent("timer-changed", { detail: { activeEntry: null } }),
+        new CustomEvent("timer-changed", {
+          detail: { activeEntry: null, taskId },
+        }),
       );
     } catch (err) {
       console.error("タイマー停止失敗:", err);
@@ -430,32 +192,42 @@ function useActiveTimer() {
 }
 
 const selectClassName =
-  "h-7 rounded-lg border border-input bg-card px-2 text-xs text-foreground outline-none transition-colors focus-visible:border-ring";
+  "h-7 rounded border border-input bg-surface-charcoal px-2 text-xs text-foreground outline-none transition-colors focus-visible:border-ring";
+
+function getWorkspaceTitle(pathname: string | null): string {
+  if (!pathname) return "Workspace";
+  if (pathname.startsWith("/chat")) return "チャット";
+  if (pathname.startsWith("/tasks")) return "タスク";
+  if (pathname.startsWith("/calendar")) return "カレンダー";
+  if (pathname.startsWith("/docs")) return "Docs";
+  if (pathname.startsWith("/filer")) return "Files";
+  if (pathname.startsWith("/reports")) return "レポート";
+  if (pathname.startsWith("/projects")) return "プロジェクト";
+  if (pathname.startsWith("/scenarios")) return "Story";
+  if (pathname.startsWith("/trpg")) return "TRPG";
+  if (pathname.startsWith("/apps")) return "Apps";
+  if (pathname.startsWith("/settings")) return "設定";
+  return "Workspace";
+}
 
 export function AppHeader() {
-  const { settings: userSettings } = useUserSettings();
-  const navigationVisibility = getAppNavigationVisibility(userSettings);
-  const visibleViewTabs = APP_VIEW_TABS.filter((tab) => {
-    if (tab.href === "/scenarios") return navigationVisibility.scenarios;
-    if (tab.href === "/trpg") return navigationVisibility.trpg;
-    return true;
-  });
   const router = useRouter();
   const pathname = usePathname();
   const { resolvedTheme, setTheme } = useTheme();
   const {
+    runtimePanelOpen,
+    setRuntimePanelOpen,
+    toggleRuntimePanel,
+    setContextRailOpen,
+    setNotificationPanelOpen,
+  } = useShellChrome();
+  const {
     isConnected: pythonConnected,
-    characters,
-    currentCharacter,
-    changeCharacter,
-    llmEngines,
-    currentLlm,
-    changeLlmEngine,
     runtimeFeatures,
     changeRuntimeFeature,
     changeRuntimeFeatures,
-  } = usePythonApi();
-  const voiceStatus = useVoiceStatus(pythonConnected);
+    voiceStatus,
+  } = useRuntimeContext();
   const { activeEntry, elapsed, stopTimer } = useActiveTimer();
   const {
     spaces,
@@ -468,29 +240,16 @@ export function AppHeader() {
   } = useProject();
 
   const [restarting, setRestarting] = useState(false);
-  const [avatarSrc, setAvatarSrc] = useState<string>("");
+  const [avatarUploading, setAvatarUploading] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
   const [themeMounted, setThemeMounted] = useState(false);
   const avatarInputRef = useRef<HTMLInputElement>(null);
-
-  const tabsScrollRef = useRef<HTMLDivElement>(null);
-  const [canScrollTabsLeft, setCanScrollTabsLeft] = useState(false);
-  const [canScrollTabsRight, setCanScrollTabsRight] = useState(false);
-  const hasAutoScrolledTabsRef = useRef(false);
-  const runtimeFeatureFlags = runtimeFeatures?.features ?? {};
-  const discordBotService = runtimeFeatures?.discord_bot_service;
-  const discordBotState = discordBotService?.state ?? "stopped";
-  const discordBotTitle =
-    discordBotState === "running"
-      ? `Discord Bot: 稼働中${discordBotService?.user ? ` (${discordBotService.user})` : ""}`
-      : discordBotState === "starting"
-        ? "Discord Bot: 起動中"
-        : discordBotState === "stopping"
-          ? "Discord Bot: 停止中"
-          : discordBotState === "failed"
-            ? `Discord Bot: 起動失敗${discordBotService?.last_error ? ` - ${discordBotService.last_error}` : ""}`
-            : "Discord Bot/VC";
   const visibleResolvedTheme = themeMounted ? resolvedTheme : "light";
   const nextThemeLabel = visibleResolvedTheme === "dark" ? "ライト" : "ダーク";
+  const selectedSpace = spaces.find((space) => space.id === selectedSpaceId);
+  const selectedProject = projects.find(
+    (project) => project.id === selectedProjectId,
+  );
   const toggleTheme = useCallback(() => {
     setTheme(resolvedTheme === "dark" ? "light" : "dark");
   }, [resolvedTheme, setTheme]);
@@ -499,80 +258,10 @@ export function AppHeader() {
     setThemeMounted(true);
   }, []);
 
-  const updateTabScrollState = useCallback(() => {
-    const el = tabsScrollRef.current;
-    if (!el) return;
-    setCanScrollTabsLeft(el.scrollLeft > 0);
-    setCanScrollTabsRight(el.scrollLeft + el.clientWidth < el.scrollWidth - 1);
-  }, []);
-
-  useEffect(() => {
-    const el = tabsScrollRef.current;
-    if (!el) return;
-    updateTabScrollState();
-    el.addEventListener("scroll", updateTabScrollState, { passive: true });
-    const resizeObs = new ResizeObserver(updateTabScrollState);
-    resizeObs.observe(el);
-    return () => {
-      el.removeEventListener("scroll", updateTabScrollState);
-      resizeObs.disconnect();
-    };
-  }, [updateTabScrollState]);
-
-  useEffect(() => {
-    const frameId = requestAnimationFrame(updateTabScrollState);
-    return () => cancelAnimationFrame(frameId);
-  }, [
-    navigationVisibility.scenarios,
-    navigationVisibility.trpg,
-    updateTabScrollState,
-  ]);
-
-  useEffect(() => {
-    const el = tabsScrollRef.current;
-    if (!el) return;
-    const activeLink = el.querySelector<HTMLElement>(
-      '[data-tab-active="true"]',
-    );
-    if (activeLink) {
-      activeLink.scrollIntoView({
-        block: "nearest",
-        inline: "nearest",
-        behavior: hasAutoScrolledTabsRef.current ? "smooth" : "auto",
-      });
-    }
-    hasAutoScrolledTabsRef.current = true;
-  }, [pathname]);
-
-  const scrollTabsBy = (direction: 1 | -1) => {
-    const el = tabsScrollRef.current;
-    if (!el) return;
-    el.scrollBy({
-      left: direction * Math.max(120, el.clientWidth * 0.6),
-      behavior: "smooth",
-    });
-  };
-
-  useEffect(() => {
-    const stored = localStorage.getItem(AVATAR_STORAGE_KEY);
-    if (stored) setAvatarSrc(stored);
-  }, []);
-
-  const handleAvatarChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      const dataUrl = ev.target?.result as string;
-      localStorage.setItem(AVATAR_STORAGE_KEY, dataUrl);
-      setAvatarSrc(dataUrl);
-    };
-    reader.readAsDataURL(file);
-    e.target.value = "";
-  };
 
   // 認証状態の取得を SWR に委譲（マウント時取得のみ・自動 revalidation なし）。
-  const { data: authStatus } = useSWR<AuthStatus>(
+  // アバターもサーバー側のユーザープロフィールを唯一のソースとして扱う。
+  const { data: authStatus, mutate: mutateAuthStatus } = useSWR<AuthStatus>(
     "auth/status",
     async () =>
       (await fetch("/api/auth/status", { credentials: "include" })).json(),
@@ -582,8 +271,74 @@ export function AppHeader() {
       shouldRetryOnError: false,
     },
   );
+
+  const handleAvatarChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    // 同じファイルを続けて選択できるよう、処理開始時に入力をリセットする。
+    e.target.value = "";
+    if (!file) return;
+
+    if (!file.type.startsWith("image/")) {
+      toast.error("画像ファイルを選択してください");
+      return;
+    }
+    // サーバー側の制限に加えて、明らかに大きすぎるファイルは送信前に弾く。
+    if (file.size > 5 * 1024 * 1024) {
+      toast.error("画像ファイルは5MB以下にしてください");
+      return;
+    }
+
+    setAvatarUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch("/api/users/me/avatar", {
+        method: "POST",
+        credentials: "include",
+        body: formData,
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        avatar_url?: string | null;
+        detail?: string;
+        message?: string;
+      };
+      if (!res.ok) {
+        throw new Error(
+          data.detail || data.message || "アイコン画像の更新に失敗しました",
+        );
+      }
+
+      // 応答をそのまま SWR キャッシュへ反映し、再フェッチを待たずにヘッダーを更新する。
+      await mutateAuthStatus(
+        (current) =>
+          current
+            ? {
+                ...current,
+                user: current.user
+                  ? { ...current.user, avatar_url: data.avatar_url ?? null }
+                  : current.user,
+              }
+            : current,
+        { revalidate: false },
+      );
+      toast.success("アイコン画像を更新しました");
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "アイコン画像の更新に失敗しました",
+      );
+    } finally {
+      setAvatarUploading(false);
+    }
+  };
+
   const isAdmin =
     authStatus?.authenticated === true && authStatus.user?.role === "admin";
+  const avatarUrl = authStatus?.user?.avatar_url || undefined;
+  const avatarFallback = (
+    authStatus?.user?.display_name?.trim() ||
+    authStatus?.user?.username?.trim() ||
+    "U"
+  ).charAt(0).toUpperCase();
 
   const handleRestart = async () => {
     setRestarting(true);
@@ -591,311 +346,268 @@ export function AppHeader() {
   };
 
   const handleLogout = async () => {
+    if (loggingOut) return;
+    setLoggingOut(true);
     try {
-      await fetch("/api/auth/logout", {
+      const response = await fetch("/api/auth/logout", {
         method: "POST",
         credentials: "include",
       });
+      let result: {
+        detail?: string;
+        local_session_cleared?: boolean;
+        global_revocation_required?: boolean;
+        global_revocation?: boolean;
+      } | null = null;
+      try {
+        result = (await response.json()) as {
+          detail?: string;
+          local_session_cleared?: boolean;
+          global_revocation_required?: boolean;
+          global_revocation?: boolean;
+        };
+      } catch {
+        // A malformed response is not proof that the server revoked the session.
+      }
+      const localSessionCleared =
+        result?.local_session_cleared === true ||
+        (result?.local_session_cleared === undefined &&
+          response.ok &&
+          result?.global_revocation === true);
+      if (!localSessionCleared) {
+        throw new Error(
+          result?.detail ||
+            "ログアウトに失敗しました。時間をおいて再試行してください",
+        );
+      }
+
+      // 別ユーザーへ情報が残らないよう、永続キャッシュ（SWR/チャット/Docs）を破棄する。
+      try {
+        await discardPendingPersistentWrites();
+        await clearPersistentCache();
+        resetChatMessageCacheMemory();
+      } catch (error) {
+        console.error("Failed to clear local caches after logout", error);
+      }
+      if (
+        !response.ok ||
+        (result?.global_revocation_required !== false &&
+          result?.global_revocation !== true)
+      ) {
+        toast.warning(
+          result?.detail ||
+            "ローカルではログアウトしましたが、全セッションの失効を確認できませんでした",
+        );
+      }
+      router.replace("/login");
+      router.refresh();
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "ログアウトに失敗しました。時間をおいて再試行してください",
+      );
     } finally {
-      window.location.href = "/login";
+      setLoggingOut(false);
     }
   };
 
   return (
-    <div className="relative shrink-0">
-      <header className="ao-topbar flex h-16 items-center gap-2 px-2 md:px-4">
-        {/* 左: SidebarTrigger + ビュー切替タブ */}
-        <SidebarTrigger className="-ml-1 shrink-0" />
-        <Separator
-          orientation="vertical"
-          className="mr-2 h-4 hidden md:block"
-        />
+    <div className="relative shrink-0" data-shell-region="global-context-shell">
+      <header
+        className="ao-global-context flex min-h-14 h-14 items-center gap-2 border-b border-border bg-background px-2 sm:px-3 md:gap-3 md:px-4"
+        data-shell-region="global-context"
+      >
+          <SidebarTrigger
+            className="size-8 shrink-0"
+            aria-label="Workspace Navigationを切り替え"
+            onClick={() => {
+              // A local drawer is the only secondary surface when it opens;
+              // close shell overlays first to avoid stacked scrims at compact
+              // desktop/mobile breakpoints.
+              setRuntimePanelOpen(false);
+              setContextRailOpen(false);
+              setNotificationPanelOpen(false);
+            }}
+          />
+        <Separator orientation="vertical" className="hidden h-5 md:block" />
 
-        <nav className="flex min-w-0 flex-1 items-center md:flex-initial">
-          <button
-            type="button"
-            onClick={() => scrollTabsBy(-1)}
-            tabIndex={canScrollTabsLeft ? 0 : -1}
-            aria-label="タブを左にスクロール"
-            aria-hidden={!canScrollTabsLeft}
-            className={`shrink-0 rounded-lg p-0.5 text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground ${
-              canScrollTabsLeft
-                ? "opacity-100"
-                : "pointer-events-none opacity-0"
-            }`}
-          >
-            <ChevronLeft className="size-4" />
-          </button>
-          <div
-            ref={tabsScrollRef}
-            className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto whitespace-nowrap [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-          >
-            {visibleViewTabs.map((tab) => {
-              const isActive = pathname.startsWith(tab.href);
-              return (
-                <Link
-                  key={tab.href}
-                  href={tab.href}
-                  data-tab-active={isActive}
-                  className={`shrink-0 rounded-xl px-3 py-1.5 text-xs font-semibold transition-all ${
-                    isActive
-                      ? "bg-primary text-primary-foreground"
-                      : "border border-border bg-card text-muted-foreground hover:bg-accent hover:text-foreground"
-                  }`}
+        <div className="min-w-0 flex-1" data-shell-region="workspace-title">
+          <div className="flex min-w-0 items-center gap-1.5 text-xs">
+            <span className="hidden shrink-0 font-semibold text-foreground sm:inline">
+              AoiTalk
+            </span>
+            <span className="hidden text-muted-foreground sm:inline">/</span>
+            <span className="truncate font-medium text-foreground">
+              {getWorkspaceTitle(pathname)}
+            </span>
+          </div>
+        </div>
+
+        <div
+          className="flex min-w-0 shrink-0 items-center gap-1.5"
+          data-shell-region="context-switchers"
+        >
+          {spaces.length > 0 && (
+            <div className="flex min-w-0 items-center gap-1">
+              <Layers
+                className="size-3.5 shrink-0 text-muted-foreground"
+                aria-hidden="true"
+                data-testid="header-space-icon"
+                style={selectedSpace?.color ? { color: selectedSpace.color } : undefined}
+              />
+              <AppSelect
+                aria-label="スペース選択"
+                value={selectedSpaceId ?? ""}
+                onChange={(event) => setSelectedSpaceId(event.target.value)}
+                triggerContent={
+                  <span className="truncate">
+                    {selectedSpace?.source === "remote" ? "[EP] " : ""}
+                    {selectedSpace?.name ?? ""}
+                  </span>
+                }
+                className={`${selectClassName} max-w-[7rem] md:max-w-[10rem]`}
+              >
+                {spaces.map((space) => (
+                  <option key={space.id} value={space.id}>
+                    <span className="inline-flex items-center gap-1.5">
+                      <ResourceColorDot color={space.color} />
+                      <span>
+                        {space.source === "remote" ? "[EP] " : ""}
+                        {space.name}
+                      </span>
+                    </span>
+                  </option>
+                ))}
+              </AppSelect>
+            </div>
+          )}
+          {projects.length > 0 && (
+            <div className="hidden min-w-0 items-center gap-1 md:flex">
+              <FolderOpen
+                className="size-3.5 shrink-0 text-muted-foreground"
+                aria-hidden="true"
+                data-testid="header-project-icon"
+                style={
+                  selectedProject?.color
+                    ? { color: selectedProject.color }
+                    : undefined
+                }
+              />
+              <AppSelect
+                aria-label="プロジェクト選択"
+                value={selectedProjectId ?? ""}
+                onChange={(event) => setSelectedProjectId(event.target.value)}
+                triggerContent={
+                  <span className="truncate">
+                    {selectedProject?.source === "remote" ? "[EP] " : ""}
+                    {selectedProject?.name ?? ""}
+                  </span>
+                }
+                className={`${selectClassName} max-w-[11rem]`}
+              >
+                {projects.map((project) => (
+                  <option key={project.id} value={project.id}>
+                    <span className="inline-flex items-center gap-1.5">
+                      <ResourceColorDot color={project.color} />
+                      <span>
+                        {project.source === "remote" ? "[EP] " : ""}
+                        {project.name}
+                      </span>
+                    </span>
+                  </option>
+                ))}
+              </AppSelect>
+              {remoteErrors.length > 0 && (
+                <span
+                  className="max-w-28 truncate text-[10px] text-amber-600"
+                  title={remoteErrors.join("\n")}
+                  role="status"
                 >
-                  {tab.title}
-                </Link>
-              );
-            })}
-          </div>
-          <button
-            type="button"
-            onClick={() => scrollTabsBy(1)}
-            tabIndex={canScrollTabsRight ? 0 : -1}
-            aria-label="タブを右にスクロール"
-            aria-hidden={!canScrollTabsRight}
-            className={`shrink-0 rounded-lg p-0.5 text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground ${
-              canScrollTabsRight
-                ? "opacity-100"
-                : "pointer-events-none opacity-0"
-            }`}
-          >
-            <ChevronRight className="size-4" />
-          </button>
-        </nav>
+                  Remote接続エラー
+                </span>
+              )}
+            </div>
+          )}
+        </div>
 
-        <Separator
-          orientation="vertical"
-          className="mx-1 h-4 hidden md:block"
-        />
+        <Button
+          type="button"
+          variant="ghost"
+          size="default"
+          className="ao-search-trigger h-8 w-8 justify-start overflow-hidden rounded border border-border bg-surface-charcoal px-2 text-muted-foreground hover:bg-surface-container hover:text-foreground md:w-64"
+          aria-label="検索・コマンドパレットを開く"
+          title="検索・コマンド (Ctrl/Cmd+K)"
+          onClick={() => window.dispatchEvent(new Event("global-command-palette"))}
+        >
+          <Search className="size-4" />
+          <span className="hidden min-w-0 flex-1 truncate text-left text-xs font-normal md:inline">
+            Search workspace…
+          </span>
+          <kbd className="hidden shrink-0 rounded border border-border bg-surface-container px-1 font-mono text-[10px] text-muted-foreground md:inline">
+            ⌘K
+          </kbd>
+        </Button>
 
-        {/* スペース選択 */}
-        {spaces.length > 0 && (
-          <div className="hidden md:flex shrink-0 items-center gap-1.5">
-            <Layers className="size-3.5 text-muted-foreground" />
-            <select
-              value={selectedSpaceId ?? ""}
-              onChange={(e) => setSelectedSpaceId(e.target.value)}
-              className={selectClassName}
-            >
-              {spaces.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.source === "remote" ? "[EP] " : ""}
-                  {s.name}
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
-
-        {/* プロジェクト選択 */}
-        {projects.length > 0 && (
-          <div className="hidden md:flex shrink-0 items-center gap-1.5">
-            <FolderOpen className="size-3.5 text-muted-foreground" />
-            <select
-              value={selectedProjectId ?? ""}
-              onChange={(e) => setSelectedProjectId(e.target.value)}
-              className={selectClassName}
-            >
-              {projects.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.source === "remote" ? "[EP] " : ""}
-                  {p.name}
-                </option>
-              ))}
-            </select>
-            {remoteErrors.length > 0 && (
-              <span className="max-w-40 truncate text-[10px] text-amber-600" title={remoteErrors.join("\n")}>
-                Remote接続エラー
-              </span>
-            )}
-          </div>
-        )}
-
-        {pythonConnected && (
-          <div className="hidden md:flex shrink-0 items-center gap-2">
-            {runtimeFeatures && (
-              <div className="flex items-center gap-1">
-                {[
-                  { key: "local_mic", icon: Mic, title: "ローカルマイク入力" },
-                  { key: "tts", icon: Volume2, title: "読み上げ" },
-                  { key: "discord", icon: BotIcon, title: discordBotTitle },
-                ].map(({ key, icon: Icon, title }) => {
-                  const enabled =
-                    key === "discord"
-                      ? !!(
-                          runtimeFeatureFlags.discord_bot &&
-                          runtimeFeatureFlags.discord_text &&
-                          runtimeFeatureFlags.discord_vc_input &&
-                          runtimeFeatureFlags.discord_vc_output
-                        )
-                      : !!runtimeFeatureFlags[key];
-                  const discordFailed =
-                    key === "discord" &&
-                    enabled &&
-                    discordBotState === "failed";
-                  const discordChanging =
-                    key === "discord" &&
-                    enabled &&
-                    (discordBotState === "starting" ||
-                      discordBotState === "stopping");
-                  const discordRunning =
-                    key === "discord" &&
-                    enabled &&
-                    discordBotState === "running";
-                  const enabledClass =
-                    key === "discord"
-                      ? discordFailed
-                        ? "border-destructive/60 bg-destructive text-destructive-foreground shadow-sm shadow-red-900/15"
-                        : discordChanging
-                          ? "border-amber-500/70 bg-amber-500 text-white shadow-sm shadow-amber-900/15"
-                          : discordRunning
-                            ? "border-emerald-500/70 bg-emerald-500 text-white shadow-sm shadow-emerald-900/15"
-                            : "border-primary/50 bg-primary text-primary-foreground shadow-sm shadow-cyan-800/15"
-                      : "border-primary/50 bg-primary text-primary-foreground shadow-sm shadow-cyan-800/15";
-                  return (
-                    <button
-                      key={key}
-                      type="button"
-                      onClick={() => {
-                        if (key === "discord") {
-                          const nextEnabled = !enabled;
-                          changeRuntimeFeatures({
-                            discord_bot: nextEnabled,
-                            discord_text: nextEnabled,
-                            discord_vc_input: nextEnabled,
-                            discord_vc_output: nextEnabled,
-                            tts: nextEnabled || !!runtimeFeatureFlags.local_speaker,
-                          });
-                          return;
-                        }
-                        changeRuntimeFeature(key, !enabled);
-                      }}
-                      title={title}
-                      aria-label={title}
-                      className={`relative inline-flex size-7 items-center justify-center rounded border text-xs transition-colors ${
-                        enabled
-                          ? enabledClass
-                          : "border-input bg-card text-muted-foreground hover:bg-accent hover:text-foreground"
-                      }`}
-                    >
-                      <Icon className="size-3.5" />
-                      {key === "discord" && enabled && (
-                        <span
-                          className={`absolute -right-0.5 -top-0.5 size-2 rounded-full border border-background ${
-                            discordFailed
-                              ? "bg-destructive"
-                              : discordChanging
-                                ? "bg-amber-300"
-                                : discordRunning
-                                  ? "bg-emerald-300"
-                                  : "bg-primary-foreground"
-                          }`}
-                        />
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-            {/* キャラクター */}
-            {characters.length > 0 && (
-              <select
-                value={currentCharacter}
-                onChange={(e) => changeCharacter(e.target.value)}
-                className={`${selectClassName} max-w-[140px]`}
-              >
-                {characters.map((c) => (
-                  <option key={c} value={c}>
-                    {c}
-                  </option>
-                ))}
-              </select>
-            )}
-            {/* LLMエンジン */}
-            {llmEngines.length > 0 && currentLlm && (
-              <select
-                value={`${currentLlm.provider}::${currentLlm.model}`}
-                onChange={(e) => {
-                  const [provider, model] = e.target.value.split("::");
-                  changeLlmEngine(provider, model);
-                }}
-                className={`${selectClassName} max-w-[140px]`}
-              >
-                {llmEngines.map((eng) => (
-                  <option
-                    key={`${eng.provider}::${eng.model}`}
-                    value={`${eng.provider}::${eng.model}`}
-                  >
-                    {eng.label}
-                  </option>
-                ))}
-              </select>
-            )}
-          </div>
-        )}
-
-        {/* スペーサー（md以上でのみタブが縮まないよう伸長） */}
-        <div className="hidden md:block md:flex-1" />
-
-        {/* アクティブタイマー */}
         {activeEntry && (
-          <div className="mr-1 flex shrink-0 items-center gap-1.5 rounded-lg border border-input bg-card px-2 py-1">
-            <Timer className="size-3.5 text-yellow-500 animate-pulse" />
+          <div
+            className="flex max-w-[7.5rem] shrink-0 items-center gap-0.5 rounded-md border border-input bg-card px-1 py-1 md:max-w-[13rem] md:gap-1 md:px-1.5"
+            data-shell-region="timer"
+          >
+            <Timer className="size-3.5 shrink-0 animate-pulse text-yellow-500" />
             <button
               type="button"
-              className="flex min-w-0 items-center gap-1.5 rounded-md px-1 py-0.5 text-left hover:bg-accent/75"
+              className="flex min-w-0 items-center gap-1 rounded px-0.5 text-left hover:bg-accent/75 md:px-1"
               onClick={() => {
-                if (activeEntry.task_id) {
-                  router.push(`/tasks/${activeEntry.task_id}`);
-                }
+                if (activeEntry.task_id) router.push(`/tasks/${activeEntry.task_id}`);
               }}
               title="タスクを開く"
             >
-              <span className="hidden md:inline max-w-[120px] truncate text-xs font-medium">
+              <span className="hidden max-w-[7rem] truncate text-xs font-medium lg:inline">
                 {activeEntry.task_title || "タスク"}
               </span>
-              <span className="text-xs tabular-nums text-muted-foreground">
-                {elapsed}
-              </span>
+              <span className="text-xs tabular-nums text-muted-foreground">{elapsed}</span>
             </button>
             <Button
               variant="ghost"
-              size="icon"
-              className="size-5"
-              onClick={(e) => {
-                e.stopPropagation();
+              size="icon-sm"
+              className="size-6 shrink-0"
+              onClick={(event) => {
+                event.stopPropagation();
                 void stopTimer();
               }}
               title="タイマー停止"
+              aria-label="タイマー停止"
             >
               <Square className="size-3 fill-current text-red-500" />
             </Button>
           </div>
         )}
 
-        {/* API/WS ステータス + ユーザーアバター */}
-        <TooltipProvider>
-          <Tooltip>
-            <TooltipTrigger className="flex shrink-0 items-center gap-1.5 mr-2 cursor-default">
-              <span
-                className={`inline-block size-2.5 rounded-full ${
-                  pythonConnected
-                    ? "bg-green-500 shadow-[0_0_6px_rgba(34,197,94,0.5)]"
-                    : "bg-muted-foreground/40"
-                }`}
-              />
-              {!pythonConnected && (
-                <span className="text-xs text-muted-foreground">
-                  オフライン
-                </span>
-              )}
-            </TooltipTrigger>
-            <TooltipContent>
-              {pythonConnected ? "Python API: 接続中" : "Python API: 未接続"}
-            </TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
+        <button
+          type="button"
+          data-runtime-panel-trigger="true"
+          className="hidden size-8 shrink-0 items-center justify-center rounded-md border border-border/70 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring md:inline-flex"
+          aria-label="Runtime設定を開く"
+          title="Runtime設定"
+          onClick={toggleRuntimePanel}
+        >
+          <span
+            className={`size-2.5 rounded-full ${pythonConnected ? "bg-emerald-500" : "bg-muted-foreground/40"}`}
+          />
+        </button>
+
+        <div className="shrink-0 md:hidden">
+          <NotificationBellPopover
+            mobileOnly
+            triggerClassName="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none transition-colors hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+            onOpenChange={(open) => {
+              if (open) {
+                window.dispatchEvent(new Event("global-close-workspace-navigation"));
+              }
+            }}
+          />
+        </div>
 
         <input
           ref={avatarInputRef}
@@ -904,98 +616,107 @@ export function AppHeader() {
           className="hidden"
           onChange={handleAvatarChange}
         />
-
-        <button
-          type="button"
-          className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground outline-none transition-colors hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
-          title={`テーマを${nextThemeLabel}に切り替え`}
-          aria-label={`テーマを${nextThemeLabel}に切り替え`}
-          onClick={toggleTheme}
-        >
-          {visibleResolvedTheme === "dark" ? (
-            <Moon className="size-4" />
-          ) : (
-            <Sun className="size-4" />
-          )}
-        </button>
-
         <Button
           variant="ghost"
-          size="icon"
-          className="hidden md:inline-flex size-7 rounded-full text-muted-foreground hover:bg-accent hover:text-foreground"
+          size="icon-sm"
+          className="hidden size-8 shrink-0 rounded-md text-muted-foreground hover:bg-accent hover:text-foreground md:inline-flex"
           title="ショートカット一覧 (?)"
-          onClick={() =>
-            window.dispatchEvent(new Event("global-shortcuts-help"))
-          }
+          aria-label="ショートカット一覧"
+          onClick={() => window.dispatchEvent(new Event("global-shortcuts-help"))}
         >
           <HelpCircle className="size-4" />
         </Button>
 
         <DropdownMenu>
-          <DropdownMenuTrigger className="shrink-0 rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring">
-            <Avatar className="size-7 ring-1 ring-border">
-              {avatarSrc && (
-                <AvatarImage src={avatarSrc} alt="ユーザーアイコン" />
+          <DropdownMenuTrigger
+            aria-label="ユーザーメニューを開く"
+            className="shrink-0 rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <Avatar className="size-8 ring-1 ring-border">
+              {avatarUrl && (
+                <AvatarImage
+                  src={avatarUrl}
+                  alt={`${authStatus?.user?.display_name || authStatus?.user?.username || "ユーザー"}のアイコン`}
+                />
               )}
-              <AvatarFallback className="text-xs">U</AvatarFallback>
+              <AvatarFallback className="text-xs">{avatarFallback}</AvatarFallback>
             </Avatar>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
             <DropdownMenuItem
+              className="md:hidden"
+              onClick={() => window.dispatchEvent(new Event("global-open-home"))}
+            >
+              <Home className="mr-2 size-4" />
+              Todayを開く
+            </DropdownMenuItem>
+            <DropdownMenuItem className="md:hidden" onClick={toggleRuntimePanel}>
+              <span
+                className={`mr-2 size-2.5 rounded-full ${pythonConnected ? "bg-emerald-500" : "bg-muted-foreground/40"}`}
+              />
+              Runtime設定を開く
+            </DropdownMenuItem>
+            <DropdownMenuItem className="md:hidden" onClick={toggleTheme}>
+              {visibleResolvedTheme === "dark" ? (
+                <Moon className="mr-2 size-4" />
+              ) : (
+                <Sun className="mr-2 size-4" />
+              )}
+              テーマを{nextThemeLabel}に切り替え
+            </DropdownMenuItem>
+            <DropdownMenuSeparator className="md:hidden" />
+            <DropdownMenuItem
               mnemonic="I"
+              disabled={avatarUploading}
               onClick={() => avatarInputRef.current?.click()}
             >
-              <Camera className="mr-2 size-4" />
-              アイコン画像を変更
+              {avatarUploading ? (
+                <Loader2 className="mr-2 size-4 animate-spin" />
+              ) : (
+                <Camera className="mr-2 size-4" />
+              )}
+              {avatarUploading ? "アップロード中..." : "アイコン画像を変更"}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              mnemonic="S"
+              onClick={() => router.push(USER_SETTINGS_HREF)}
+            >
+              <Settings className="mr-2 size-4" />
+              ユーザー設定
             </DropdownMenuItem>
             <DropdownMenuSeparator />
             {isAdmin && (
-              <DropdownMenuItem
-                mnemonic="R"
-                onClick={handleRestart}
-                disabled={restarting}
-              >
-                <RotateCcw
-                  className={`mr-2 size-4 ${restarting ? "animate-spin" : ""}`}
-                />
+              <DropdownMenuItem mnemonic="R" onClick={handleRestart} disabled={restarting}>
+                <RotateCcw className={`mr-2 size-4 ${restarting ? "animate-spin" : ""}`} />
                 {restarting ? "再起動中..." : "再起動"}
               </DropdownMenuItem>
             )}
-            <DropdownMenuItem mnemonic="L" onClick={handleLogout}>
-              <LogOut className="mr-2 size-4" />
-              ログアウト
+            <DropdownMenuItem
+              mnemonic="L"
+              onClick={handleLogout}
+              disabled={loggingOut}
+            >
+              {loggingOut ? (
+                <Loader2 className="mr-2 size-4 animate-spin" />
+              ) : (
+                <LogOut className="mr-2 size-4" />
+              )}
+              {loggingOut ? "ログアウト中..." : "ログアウト"}
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
       </header>
 
-      {/* 音声ステータス: voice_chatモード時のみヘッダー下にオーバーレイ */}
-      {pythonConnected && voiceStatus && voiceStatus.ready && (
-        <div className="absolute left-1/2 top-16 z-50 flex -translate-x-1/2 items-center gap-2 rounded-b-lg border border-t-0 border-border bg-popover px-4 py-1.5 shadow-md">
-          <span
-            className={`inline-block size-2 rounded-full ${
-              voiceStatus.recording
-                ? "bg-red-500 animate-pulse"
-                : voiceStatus.ready
-                  ? "bg-green-500"
-                  : "bg-muted-foreground/40"
-            }`}
-          />
-          <span className="text-xs text-muted-foreground">
-            {voiceStatus.recording
-              ? "録音中"
-              : voiceStatus.ready
-                ? "待機"
-                : "停止"}
-          </span>
-          <div className="w-[80px] h-[3px] rounded-full bg-muted overflow-hidden">
-            <div
-              className="h-full bg-blue-500 transition-all duration-200"
-              style={{ width: `${Math.min(voiceStatus.rms * 100, 100)}%` }}
-            />
-          </div>
-        </div>
-      )}
+      <RuntimeUtilityPanel
+        open={runtimePanelOpen}
+        onClose={() => setRuntimePanelOpen(false)}
+        pythonConnected={pythonConnected}
+        runtimeFeatures={runtimeFeatures}
+        changeRuntimeFeature={changeRuntimeFeature}
+        changeRuntimeFeatures={changeRuntimeFeatures}
+        voiceStatus={voiceStatus}
+      />
+
     </div>
   );
 }

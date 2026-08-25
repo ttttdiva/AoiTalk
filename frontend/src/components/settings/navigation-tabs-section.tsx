@@ -5,24 +5,24 @@ import { PanelTop } from "lucide-react";
 import { toast } from "sonner";
 
 import { useUserSettings } from "@/contexts/user-settings-context";
+import {
+  OPTIONAL_APP_VIEW_TABS,
+  type AppNavigationVisibilityKey,
+} from "@/lib/app-navigation";
 import { getAppNavigationVisibility } from "@/lib/user-settings";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { SettingsDisclosure } from "@/components/settings/settings-disclosure";
 
-type OptionalTab = "scenarios" | "trpg";
-
-const OPTIONAL_TABS: Array<{ id: OptionalTab; label: string }> = [
-  { id: "scenarios", label: "シナリオ" },
-  { id: "trpg", label: "TRPG" },
-];
-
 export function NavigationTabsSection() {
   const { settings, patch } = useUserSettings();
   const visibility = getAppNavigationVisibility(settings);
-  const [saving, setSaving] = useState<OptionalTab | null>(null);
+  const [saving, setSaving] = useState<AppNavigationVisibilityKey | null>(null);
 
-  const updateVisibility = async (id: OptionalTab, visible: boolean) => {
+  const updateVisibility = async (
+    id: AppNavigationVisibilityKey,
+    visible: boolean,
+  ) => {
     setSaving(id);
     try {
       await patch({
@@ -46,29 +46,30 @@ export function NavigationTabsSection() {
     <SettingsDisclosure
       title="タブ表示"
       icon={<PanelTop className="size-4" />}
+      targetId="navigation-tabs"
     >
       <p className="text-xs text-muted-foreground">
         チェックした項目を画面上部のタブに表示します。
       </p>
       <div className="space-y-2">
-        {OPTIONAL_TABS.map((tab) => (
+        {OPTIONAL_APP_VIEW_TABS.map((tab) => (
           <div
-            key={tab.id}
+            key={tab.visibilityKey}
             className="flex items-center gap-2 rounded-md border px-3 py-2"
           >
             <Checkbox
-              id={`navigation-tab-${tab.id}`}
-              checked={visibility[tab.id]}
+              id={`navigation-tab-${tab.visibilityKey}`}
+              checked={visibility[tab.visibilityKey]}
               disabled={saving !== null}
               onCheckedChange={(checked) =>
-                void updateVisibility(tab.id, checked === true)
+                void updateVisibility(tab.visibilityKey, checked === true)
               }
             />
             <Label
-              htmlFor={`navigation-tab-${tab.id}`}
+              htmlFor={`navigation-tab-${tab.visibilityKey}`}
               className="cursor-pointer text-sm"
             >
-              {tab.label}タブを表示
+              {tab.title}タブを表示
             </Label>
           </div>
         ))}

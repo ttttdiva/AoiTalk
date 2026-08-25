@@ -17,6 +17,8 @@ FastAPI の OpenAPI スキーマを frontend/openapi.json へ出力するスク�
 """
 from __future__ import annotations
 
+import argparse
+import asyncio
 import json
 import logging
 import os
@@ -28,8 +30,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# 出力先（frontend 配下。openapi-typescript の入力にする）
-OUTPUT_PATH = REPO_ROOT / "frontend" / "openapi.json"
+# FastAPI OpenAPI の共有正本。frontend/mobile の生成物はこのファイルから派生する。
+CANONICAL_OUTPUT_PATH = REPO_ROOT / "contracts" / "openapi" / "fastapi.json"
+# 既存 frontend パイプラインとの互換出力（内容は共有正本と同一）。
+FRONTEND_OUTPUT_PATH = REPO_ROOT / "frontend" / "openapi.json"
 
 # 実体化を軽くするため、DB 接続やバックグラウンド処理を伴う副作用は
 # ライフスパン（起動時）に閉じ込められている。ここでは app を構築するだけで
@@ -43,6 +47,29 @@ def build_app():
 
     from src.config import Config
     from src.api.server import create_web_interface
+
+    # Enterprise/DB必須プロファイルでは Config が PostgreSQL の正本設定を
+    # 読むため、スキーマ生成プロセス自身も先にマイグレーションを完了させる。
+    # 通常プロファイルでは従来どおりDBを必須にせず、seed設定だけで生成できる。
+    require_database = os.getenv("AOITALK_REQUIRE_DATABASE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    try:
+        from src.features import Features
+
+        require_database = require_database or Features.is_enterprise()
+    except Exception:
+        # Feature判定自体が失敗する環境では、明示的な必須指定だけを尊重する。
+        pass
+    if require_database:
+        from src.memory.database import get_database_manager
+
+        db_manager = get_database_manager()
+        if not asyncio.run(db_manager.initialize()):
+            raise RuntimeError("Database initialization failed before OpenAPI generation")
 
     config = Config()
     # character_name はスキーマ生成に影響しない任意値。
@@ -63,21 +90,61 @@ def sort_keys(value):
     return value
 
 
-def main() -> int:
+def _write_schema(path: Path, schema: dict) -> None:
+    """Write one deterministic JSON artifact."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=True)
+    path.write_text(text + "\n", encoding="utf-8", newline="\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "FastAPI OpenAPI を共有契約へ出力する（frontend/mobile の型生成は "
+            "contracts/openapi/fastapi.json を入力にする）。"
+        )
+    )
+    parser.add_argument(
+        "--canonical-only",
+        action="store_true",
+        help="共有正本 contracts/openapi/fastapi.json のみ更新する",
+    )
+    parser.add_argument(
+        "--frontend-only",
+        action="store_true",
+        help="互換 frontend/openapi.json のみ更新する",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="指定した単一出力先へ書き出す（--canonical-only/--frontend-only と併用不可）",
+    )
+    args = parser.parse_args(argv)
+    if args.canonical_only and args.frontend_only:
+        parser.error("--canonical-only と --frontend-only は同時指定できません")
+    if args.output is not None and (args.canonical_only or args.frontend_only):
+        parser.error("--output は --canonical-only/--frontend-only と同時指定できません")
+
     app = build_app()
 
     schema = app.openapi()
     schema = sort_keys(schema)
 
-    text = json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=True)
-    # 末尾改行を付与（POSIX テキストファイル慣習・差分安定化）
-    text = text + "\n"
-
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT_PATH.write_text(text, encoding="utf-8", newline="\n")
-
     path_count = len(schema.get("paths", {}))
-    print(f"OpenAPI schema written to {OUTPUT_PATH} ({path_count} paths)")
+    if args.output is not None:
+        outputs = [args.output if args.output.is_absolute() else REPO_ROOT / args.output]
+    elif args.canonical_only:
+        outputs = [CANONICAL_OUTPUT_PATH]
+    elif args.frontend_only:
+        outputs = [FRONTEND_OUTPUT_PATH]
+    else:
+        # Default keeps the historical frontend command working while making
+        # the canonical artifact available to both native clients.
+        outputs = [CANONICAL_OUTPUT_PATH, FRONTEND_OUTPUT_PATH]
+    for output in outputs:
+        _write_schema(output, schema)
+        print(f"OpenAPI schema written to {output} ({path_count} paths)")
     return 0
 
 

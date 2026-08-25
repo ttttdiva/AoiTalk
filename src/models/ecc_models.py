@@ -19,13 +19,15 @@ from sqlalchemy import (
     Integer,
     DateTime,
     Float,
+    Numeric,
     JSON,
     ForeignKey,
     Boolean,
     Index,
+    UniqueConstraint,
     Enum as SAEnum,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import configure_mappers, relationship
 
 from ..memory.models import Base
@@ -145,161 +147,8 @@ class Character(Base):
 
 
 # ────────────────────────────────────────────
-# 1c. シナリオ（TRPG / インタラクティブストーリー）
+# 1c. TRPG再利用資産（Story Studioの正本モデルはmemory.models.story）
 # ────────────────────────────────────────────
-
-
-class Scenario(Base):
-    """シナリオ定義。
-
-    scenario_kind="writing" は小説/脚本向けの episode/scene 構造、
-    scenario_kind="trpg" は TRPG 卓向けの ruleset/document/character sheet 構造を使う。
-    """
-
-    __tablename__ = "scenarios"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    title = Column(String(200), nullable=False)
-    scenario_kind = Column(String(20), default="writing")
-    ruleset = Column(String(50), default="")
-    description = Column(Text, default="")
-    genre = Column(String(50), default="")
-    perspective = Column(
-        String(20), default="first_person"
-    )  # first_person / third_person
-    setting = Column(Text, default="")  # 世界観・舞台設定
-    opening_text = Column(Text, default="")  # 冒頭ナレーション
-    gm_instructions = Column(Text, default="")  # GM用指示
-    tags = Column(JSON, default=list)
-    cover_image_path = Column(String(500), default="")
-    is_published = Column(Boolean, default=False)
-    created_by = Column(UUID(as_uuid=True), nullable=True)
-
-    # 執筆ボイス設定
-    voice_tone = Column(Text, default="")
-    voice_tense_rules = Column(Text, default="")
-    voice_vocabulary_register = Column(Text, default="")
-    voice_banned_expressions = Column(JSON, default=list)
-    voice_example_passages = Column(Text, default="")
-
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    # Relationships
-    characters = relationship(
-        "ScenarioCharacter", back_populates="scenario", cascade="all, delete-orphan"
-    )
-    scenes = relationship(
-        "ScenarioScene", back_populates="scenario", cascade="all, delete-orphan"
-    )
-    episodes = relationship(
-        "ScenarioEpisode", back_populates="scenario", cascade="all, delete-orphan"
-    )
-    trpg_documents = relationship(
-        "TRPGScenarioDocument", back_populates="scenario", cascade="all, delete-orphan"
-    )
-
-    __table_args__ = (
-        Index("ix_scenarios_genre", "genre"),
-        Index("ix_scenarios_is_published", "is_published"),
-    )
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "title": self.title,
-            "scenario_kind": self.scenario_kind or "writing",
-            "ruleset": self.ruleset or "",
-            "description": self.description,
-            "genre": self.genre,
-            "perspective": self.perspective,
-            "setting": self.setting,
-            "opening_text": self.opening_text,
-            "gm_instructions": self.gm_instructions,
-            "tags": self.tags or [],
-            "cover_image_path": self.cover_image_path or "",
-            "is_published": self.is_published,
-            "created_by": str(self.created_by) if self.created_by else None,
-            # 執筆ボイス設定
-            "voice_tone": self.voice_tone or "",
-            "voice_tense_rules": self.voice_tense_rules or "",
-            "voice_vocabulary_register": self.voice_vocabulary_register or "",
-            "voice_banned_expressions": self.voice_banned_expressions or [],
-            "voice_example_passages": self.voice_example_passages or "",
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
-
-
-class ScenarioCharacter(Base):
-    """シナリオ内のキャラクター配置"""
-
-    __tablename__ = "scenario_characters"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    scenario_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenarios.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    character_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("characters.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    role = Column(String(20), default="npc")  # npc, ally, enemy, narrator
-    name = Column(String(100), nullable=False)
-    description = Column(Text, default="")
-    personality_override = Column(Text, default="")  # シナリオ固有の性格上書き
-    appearance_tags_override = Column(Text, default="")  # シナリオ固有の外見タグ上書き
-    sort_order = Column(Integer, default=0)
-
-    # 執筆拡張フィールド
-    backstory = Column(Text, default="")
-    psychology = Column(Text, default="")
-    speech_patterns = Column(Text, default="")
-    relationships = Column(JSON, default=list)  # [{target_id, type, description}]
-    character_arc = Column(Text, default="")
-    importance = Column(Integer, default=0)  # 0=major, 1=secondary, 2=minor
-    example_dialogues = Column(Text, default="")
-    trpg_ruleset = Column(String(50), default="")
-    trpg_pc_state = Column(JSON, default=dict)
-
-    scenario = relationship("Scenario", back_populates="characters")
-
-    __table_args__ = (Index("ix_scenario_characters_scenario_id", "scenario_id"),)
-
-    def to_dict(self) -> Dict[str, Any]:
-        relationships = self.relationships or []
-        relationships_text = (
-            relationships
-            if isinstance(relationships, str)
-            else json.dumps(relationships, ensure_ascii=False)
-        )
-        return {
-            "id": str(self.id),
-            "scenario_id": str(self.scenario_id),
-            "character_id": str(self.character_id) if self.character_id else None,
-            "role": self.role,
-            "name": self.name,
-            "description": self.description,
-            "personality_override": self.personality_override or "",
-            "appearance_tags_override": self.appearance_tags_override or "",
-            "sort_order": self.sort_order,
-            "backstory": self.backstory or "",
-            "psychology": self.psychology or "",
-            "speech_patterns": self.speech_patterns or "",
-            "speech_pattern": self.speech_patterns or "",
-            "relationships": relationships_text,
-            "relationships_data": relationships,
-            "character_arc": self.character_arc or "",
-            "arc": self.character_arc or "",
-            "importance": self.importance or 0,
-            "example_dialogues": self.example_dialogues or "",
-            "dialogue_samples": self.example_dialogues or "",
-            "trpg_ruleset": self.trpg_ruleset or "",
-            "trpg_pc_state": self.trpg_pc_state or {},
-        }
 
 
 class TRPGPlayerCharacterSheet(Base):
@@ -314,7 +163,6 @@ class TRPGPlayerCharacterSheet(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     scenario_id = Column(
         UUID(as_uuid=True),
-        ForeignKey("scenarios.id", ondelete="CASCADE"),
         nullable=False,
     )
     user_id = Column(UUID(as_uuid=True), nullable=False)
@@ -343,47 +191,6 @@ class TRPGPlayerCharacterSheet(Base):
             "trpg_pc_state": self.trpg_pc_state or {},
             "sheet_metadata": self.sheet_metadata or {},
             "sheet_source": "trpg_player_character_sheets",
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
-
-
-class TRPGScenarioDocument(Base):
-    """完成済みTRPGシナリオ本文・構造化資料。
-
-    小説/脚本用の episode/scene とは分ける。source_text はインポート本文の
-    保全用で、卓実行時は structure と ScenarioCharacter に展開済みの情報を使う。
-    """
-
-    __tablename__ = "trpg_scenario_documents"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    scenario_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenarios.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    ruleset = Column(String(50), default="")
-    source_label = Column(Text, default="")
-    source_text = Column(Text, default="")
-    structure = Column(JSON, default=dict)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    scenario = relationship("Scenario", back_populates="trpg_documents")
-
-    __table_args__ = (
-        Index("ix_trpg_scenario_documents_scenario_id", "scenario_id"),
-    )
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "scenario_id": str(self.scenario_id),
-            "ruleset": self.ruleset or "",
-            "source_label": self.source_label or "",
-            "source_text": self.source_text or "",
-            "structure": self.structure or {},
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -822,564 +629,32 @@ class TRPGCreatureEntry(Base):
         }
 
 
-class ScenarioScene(Base):
-    """シナリオ内のシーン定義"""
-
-    __tablename__ = "scenario_scenes"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    scenario_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenarios.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    episode_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenario_episodes.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    title = Column(String(200), nullable=False)
-    description = Column(Text, default="")
-    scene_type = Column(
-        String(20), default="normal"
-    )  # normal, combat, dialogue, cutscene
-    gm_instructions = Column(Text, default="")
-    image_prompt = Column(Text, default="")  # シーン画像生成用プロンプト
-    transitions = Column(JSON, default=list)  # [{condition, target_scene_id}]
-    sort_order = Column(Integer, default=0)
-
-    # 執筆拡張フィールド
-    content = Column(Text, default="")  # 本文テキスト
-    content_versions = Column(JSON, default=list)  # [{version, content, created_at}]
-    word_count = Column(Integer, default=0)
-    status = Column(String(20), default="draft")  # draft/in_progress/completed
-    state_snapshot = Column(
-        JSON, default=dict
-    )  # {situation, character_states, knowledge}
-
-    scenario = relationship("Scenario", back_populates="scenes")
-    episode = relationship("ScenarioEpisode", back_populates="scenes")
-
-    __table_args__ = (Index("ix_scenario_scenes_scenario_id", "scenario_id"),)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "scenario_id": str(self.scenario_id),
-            "episode_id": str(self.episode_id) if self.episode_id else None,
-            "title": self.title,
-            "description": self.description,
-            "scene_type": self.scene_type,
-            "gm_instructions": self.gm_instructions,
-            "image_prompt": self.image_prompt or "",
-            "transitions": self.transitions or [],
-            "sort_order": self.sort_order,
-            "order_index": self.sort_order,
-            "content": self.content or "",
-            "body": self.content or "",
-            "content_versions": self.content_versions or [],
-            "word_count": self.word_count or 0,
-            "status": self.status or "draft",
-            "state_snapshot": self.state_snapshot or {},
-        }
-
-
-class ScenarioPlaySession(Base):
-    """シナリオプレイセッション（マルチプレイヤー対応）"""
-
-    __tablename__ = "scenario_play_sessions"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    scenario_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenarios.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    conversation_session_id = Column(UUID(as_uuid=True), nullable=True)
-    current_scene_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenario_scenes.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    player_state = Column(JSON, default=dict)  # パーティ共有: inventory, flags, etc.
-    perspective = Column(String(20), default="first_person")
-    status = Column(String(20), default="in_progress")  # in_progress, paused, completed
-    started_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    # ── マルチプレイヤーTRPG 拡張 ──
-    room_code = Column(String(12), nullable=True, unique=True)  # 入室招待コード
-    room_title = Column(
-        String(200), default=""
-    )  # ルーム表示名（未設定ならシナリオ名を使う）
-    host_user_id = Column(UUID(as_uuid=True), nullable=True)  # セッション主催者
-    max_players = Column(Integer, default=4)
-    gm_mode = Column(String(20), default="ai")  # "ai" | "human"
-    gm_user_id = Column(UUID(as_uuid=True), nullable=True)  # 人間GMの場合
-    is_multiplayer = Column(Boolean, default=False)
-    is_public = Column(Boolean, default=False)  # 一覧に公開するか
-    turn_order = Column(JSON, default=list)  # [participant_id, ...]
-    current_turn_participant_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenario_participants.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    shared_state = Column(JSON, default=dict)  # 天候/時刻/全体フラグ/BGM情報
-    last_gm_activity_at = Column(DateTime, nullable=True)
-
-    participants = relationship(
-        "ScenarioParticipant",
-        back_populates="play_session",
-        cascade="all, delete-orphan",
-        foreign_keys="ScenarioParticipant.play_session_id",
-    )
-    logs = relationship(
-        "ScenarioPlayLog",
-        back_populates="play_session",
-        cascade="all, delete-orphan",
-        order_by="ScenarioPlayLog.created_at",
-    )
-    disclosures = relationship(
-        "TRPGRoomDisclosure",
-        back_populates="play_session",
-        cascade="all, delete-orphan",
-        order_by="TRPGRoomDisclosure.created_at",
-    )
-    private_messages = relationship(
-        "TRPGPrivateMessage",
-        back_populates="play_session",
-        cascade="all, delete-orphan",
-        order_by="TRPGPrivateMessage.created_at",
-    )
-
-    __table_args__ = (
-        Index("ix_scenario_play_sessions_scenario_id", "scenario_id"),
-        Index("ix_scenario_play_sessions_status", "status"),
-        Index("ix_scenario_play_sessions_room_code", "room_code"),
-        Index("ix_scenario_play_sessions_host_user_id", "host_user_id"),
-    )
-
-    def to_dict(self, include_children: bool = False) -> Dict[str, Any]:
-        data: Dict[str, Any] = {
-            "id": str(self.id),
-            "scenario_id": str(self.scenario_id),
-            "conversation_session_id": (
-                str(self.conversation_session_id)
-                if self.conversation_session_id
-                else None
-            ),
-            "current_scene_id": (
-                str(self.current_scene_id) if self.current_scene_id else None
-            ),
-            "player_state": self.player_state or {},
-            "perspective": self.perspective,
-            "status": self.status,
-            "started_at": self.started_at.isoformat() if self.started_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-            "room_code": self.room_code,
-            "room_title": self.room_title or "",
-            "host_user_id": (str(self.host_user_id) if self.host_user_id else None),
-            "max_players": self.max_players or 4,
-            "gm_mode": self.gm_mode or "ai",
-            "gm_user_id": str(self.gm_user_id) if self.gm_user_id else None,
-            "is_multiplayer": bool(self.is_multiplayer),
-            "is_public": bool(self.is_public),
-            "turn_order": self.turn_order or [],
-            "current_turn_participant_id": (
-                str(self.current_turn_participant_id)
-                if self.current_turn_participant_id
-                else None
-            ),
-            "shared_state": self.shared_state or {},
-            "last_gm_activity_at": (
-                self.last_gm_activity_at.isoformat()
-                if self.last_gm_activity_at
-                else None
-            ),
-        }
-        if include_children:
-            data["participants"] = [
-                p.to_dict()
-                for p in sorted(
-                    self.participants or [],
-                    key=lambda x: (x.seat_index or 0),
-                )
-            ]
-            data["logs"] = [log.to_dict() for log in (self.logs or [])]
-        return data
-
-
-class ScenarioParticipant(Base):
-    """プレイセッションの参加者（ユーザー / AIキャラ / GM）"""
-
-    __tablename__ = "scenario_participants"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    play_session_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenario_play_sessions.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    user_id = Column(UUID(as_uuid=True), nullable=True)  # AI席は null
-    character_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("characters.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    # 参加者の表示用情報
-    display_name = Column(String(100), nullable=False)
-    role = Column(String(20), default="player")
-    # "player" | "gm" | "npc" | "observer"
-    participant_kind = Column(String(20), default="human")
-    # "human" | "ai_character" | "system"
-    avatar_url = Column(String(500), default="")
-    color = Column(String(20), default="#60a5fa")  # パネル色
-    seat_index = Column(Integer, default=0)
-
-    # PC（プレイヤーキャラクター）状態
-    pc_state = Column(JSON, default=dict)
-    # {hp, max_hp, mp, max_mp, stats:{str,dex,int,...}, conditions:[], notes, items:[]}
-
-    # AI NPC専用の非公開状態。to_dict には含めず、公開APIへ漏らさない。
-    private_state = Column(JSON, default=dict)
-    last_observed_log_id = Column(UUID(as_uuid=True), nullable=True)
-
-    is_active_participant = Column(Boolean, default=True)
-    is_connected = Column(Boolean, default=False)  # WebSocket 接続中か
-    joined_at = Column(DateTime, default=datetime.utcnow)
-    last_seen_at = Column(DateTime, default=datetime.utcnow)
-
-    play_session = relationship(
-        "ScenarioPlaySession",
-        back_populates="participants",
-        foreign_keys=[play_session_id],
-    )
-
-    __table_args__ = (
-        Index("ix_scenario_participants_play_session_id", "play_session_id"),
-        Index("ix_scenario_participants_user_id", "user_id"),
-    )
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "play_session_id": str(self.play_session_id),
-            "user_id": str(self.user_id) if self.user_id else None,
-            "character_id": (str(self.character_id) if self.character_id else None),
-            "display_name": self.display_name,
-            "role": self.role or "player",
-            "participant_kind": self.participant_kind or "human",
-            "avatar_url": self.avatar_url or "",
-            "color": self.color or "#60a5fa",
-            "seat_index": self.seat_index or 0,
-            "pc_state": self.pc_state or {},
-            "is_active_participant": bool(self.is_active_participant),
-            "is_connected": bool(self.is_connected),
-            "joined_at": self.joined_at.isoformat() if self.joined_at else None,
-            "last_seen_at": (
-                self.last_seen_at.isoformat() if self.last_seen_at else None
-            ),
-        }
-
-
-class ScenarioPlayLog(Base):
-    """プレイセッションのログ（ナレーション・行動・ダイス・シーン変化など）"""
-
-    __tablename__ = "scenario_play_logs"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    play_session_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenario_play_sessions.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    participant_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenario_participants.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    log_type = Column(String(20), nullable=False)
-    # "narration" | "speech" | "action" | "dice" | "scene_change"
-    # | "system" | "image" | "bgm" | "state_change" | "ooc"
-    content = Column(Text, default="")
-    log_metadata = Column(JSON, default=dict)
-    # dice: {expression, rolls, total, target, success}
-    # scene_change: {from_scene_id, to_scene_id, title}
-    # image: {prompt, path}
-    # bgm: {track_id, action}
-    # state_change: {participant_id?, key, before, after}
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    play_session = relationship("ScenarioPlaySession", back_populates="logs")
-
-    __table_args__ = (
-        Index("ix_scenario_play_logs_play_session_id", "play_session_id"),
-        Index("ix_scenario_play_logs_created_at", "created_at"),
-    )
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "play_session_id": str(self.play_session_id),
-            "participant_id": (
-                str(self.participant_id) if self.participant_id else None
-            ),
-            "log_type": self.log_type,
-            "content": self.content or "",
-            "metadata": self.log_metadata or {},
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-        }
-
-
-class TRPGRoomDisclosure(Base):
-    """TRPG卓の開示情報・ハンドアウト・画像・アイテム."""
-
-    __tablename__ = "trpg_room_disclosures"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    play_session_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenario_play_sessions.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    creator_participant_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenario_participants.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    disclosure_type = Column(String(30), default="handout")
-    visibility = Column(String(20), default="public")
-    target_participant_ids = Column(JSON, default=list)
-    title = Column(String(200), nullable=False)
-    content = Column(Text, default="")
-    image_url = Column(String(1000), default="")
-    image_path = Column(String(1000), default="")
-    tags = Column(JSON, default=list)
-    disclosure_metadata = Column(JSON, default=dict)
-    is_pinned = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    play_session = relationship("ScenarioPlaySession", back_populates="disclosures")
-
-    __table_args__ = (
-        Index("ix_trpg_room_disclosures_play_session_id", "play_session_id"),
-        Index("ix_trpg_room_disclosures_visibility", "visibility"),
-        Index("ix_trpg_room_disclosures_created_at", "created_at"),
-    )
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "play_session_id": str(self.play_session_id),
-            "creator_participant_id": (
-                str(self.creator_participant_id) if self.creator_participant_id else None
-            ),
-            "disclosure_type": self.disclosure_type or "handout",
-            "visibility": self.visibility or "public",
-            "target_participant_ids": self.target_participant_ids or [],
-            "title": self.title,
-            "content": self.content or "",
-            "image_url": self.image_url or "",
-            "image_path": self.image_path or "",
-            "tags": self.tags or [],
-            "metadata": self.disclosure_metadata or {},
-            "is_pinned": bool(self.is_pinned),
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
-
-
-class TRPGPrivateMessage(Base):
-    """TRPG卓の秘匿/個別チャット."""
-
-    __tablename__ = "trpg_private_messages"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    play_session_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenario_play_sessions.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    sender_participant_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenario_participants.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    sender_label = Column(String(120), default="")
-    target_participant_ids = Column(JSON, default=list)
-    message_type = Column(String(20), default="private")
-    content = Column(Text, default="")
-    message_metadata = Column(JSON, default=dict)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    play_session = relationship("ScenarioPlaySession", back_populates="private_messages")
-
-    __table_args__ = (
-        Index("ix_trpg_private_messages_play_session_id", "play_session_id"),
-        Index("ix_trpg_private_messages_created_at", "created_at"),
-    )
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "play_session_id": str(self.play_session_id),
-            "sender_participant_id": (
-                str(self.sender_participant_id) if self.sender_participant_id else None
-            ),
-            "sender_label": self.sender_label or "",
-            "target_participant_ids": self.target_participant_ids or [],
-            "message_type": self.message_type or "private",
-            "content": self.content or "",
-            "metadata": self.message_metadata or {},
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-        }
-
-
-class ScenarioEpisode(Base):
-    """シナリオ内の章/エピソード"""
-
-    __tablename__ = "scenario_episodes"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    scenario_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenarios.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    title = Column(String(200), nullable=False)
-    synopsis_sentence = Column(Text, default="")  # 1文要約
-    synopsis_paragraph = Column(Text, default="")  # 段落要約
-    synopsis_full = Column(Text, default="")  # 完全要約
-    beat_sheet = Column(JSON, default=list)  # ビート一覧
-    status = Column(String(20), default="draft")  # draft/in_progress/completed
-    sort_order = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    scenario = relationship("Scenario", back_populates="episodes")
-    scenes = relationship("ScenarioScene", back_populates="episode")
-
-    __table_args__ = (Index("ix_scenario_episodes_scenario_id", "scenario_id"),)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "scenario_id": str(self.scenario_id),
-            "title": self.title,
-            "synopsis_sentence": self.synopsis_sentence or "",
-            "one_line_summary": self.synopsis_sentence or "",
-            "synopsis_paragraph": self.synopsis_paragraph or "",
-            "paragraph_summary": self.synopsis_paragraph or "",
-            "synopsis_full": self.synopsis_full or "",
-            "full_summary": self.synopsis_full or "",
-            "beat_sheet": self.beat_sheet or [],
-            "status": self.status or "draft",
-            "sort_order": self.sort_order or 0,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
-
-
-class ScenarioCanonEntry(Base):
-    """シナリオの確定事実DB"""
-
-    __tablename__ = "scenario_canon_entries"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    scenario_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenarios.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    category = Column(
-        String(50), nullable=False
-    )  # geography/timeline/magic/character_facts/political/cultural/established
-    fact = Column(Text, nullable=False)
-    source_scene_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenario_scenes.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    __table_args__ = (Index("ix_scenario_canon_entries_scenario_id", "scenario_id"),)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "scenario_id": str(self.scenario_id),
-            "category": self.category,
-            "fact": self.fact,
-            "source_scene_id": (
-                str(self.source_scene_id) if self.source_scene_id else None
-            ),
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-        }
-
-
-class ScenarioWritingSession(Base):
-    """シナリオ執筆セッション"""
-
-    __tablename__ = "scenario_writing_sessions"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    scenario_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenarios.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    conversation_session_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("conversation_sessions.id"),
-        nullable=True,
-    )
-    target_episode_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenario_episodes.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    target_scene_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("scenario_scenes.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    writing_prompt = Column(Text, default="")
-    status = Column(String(20), default="in_progress")
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    __table_args__ = (Index("ix_scenario_writing_sessions_scenario_id", "scenario_id"),)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "scenario_id": str(self.scenario_id),
-            "conversation_session_id": (
-                str(self.conversation_session_id)
-                if self.conversation_session_id
-                else None
-            ),
-            "target_episode_id": (
-                str(self.target_episode_id) if self.target_episode_id else None
-            ),
-            "target_scene_id": (
-                str(self.target_scene_id) if self.target_scene_id else None
-            ),
-            "writing_prompt": self.writing_prompt or "",
-            "status": self.status or "in_progress",
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
-
-
-# ────────────────────────────────────────────
 # 2. イベント駆動自動化
 # ────────────────────────────────────────────
 
 
+def _num_str(value: Any) -> Any:
+    """Numeric列（Decimal）をJSON安全な文字列へ変換する。Noneはそのまま返す。"""
+    if value is None:
+        return None
+    return str(value)
+
+
 class TokenUsage(Base):
-    """LLM API呼び出しごとのトークン使用量"""
+    """LLM API呼び出しごとのトークン使用量
+
+    コスト列の位置づけ:
+    - ``input_cost`` / ``output_cost`` / ``total_cost``（DOUBLE PRECISION）は
+      **後方互換のための概算値**であり、正本ではない。既存API・既存画面が参照し続け
+      られるように残しているだけで、新規の計算・集計の根拠に使ってはならない。
+    - 金額の**正本**は ``list_input_cost`` / ``list_output_cost`` / ``list_tool_cost`` /
+      ``list_total_cost``（定価換算、NUMERIC）と、プロバイダが実額を返す場合の
+      ``provider_reported_cost``（NUMERIC）である。料金計算は Decimal のみで行い、
+      float を経由しない。
+    - ``model`` は互換のため ``requested_model`` と同値を書き続ける。モデル名の正本は
+      ``requested_model``（要求時）と ``resolved_model``（プロバイダが実際に処理した
+      モデル）である。
+    """
 
     __tablename__ = "token_usage"
 
@@ -1412,10 +687,38 @@ class TokenUsage(Base):
     cache_active = Column(Boolean, nullable=True)
     metrics_source = Column(String(50), nullable=True)
 
-    # コスト（USD）
+    # コスト（USD）※後方互換の概算値。正本は list_* と provider_reported_cost。
     input_cost = Column(Float, default=0.0)
     output_cost = Column(Float, default=0.0)
     total_cost = Column(Float, default=0.0)
+
+    # 料金計算基盤（正本）
+    requested_model = Column(String(200), nullable=True)
+    resolved_model = Column(String(200), nullable=True)
+    billing_scope_id = Column(String(100), nullable=True)
+    pricing_status = Column(String(30), nullable=True)
+    pricing_catalog_version = Column(String(50), nullable=True)
+    pricing_rule_id = Column(String(200), nullable=True)
+    free_incentive_group = Column(String(10), nullable=True)
+
+    # 適用単価（USD per 1M、長文倍率・段階料金の適用後）
+    applied_input_rate = Column(Numeric(18, 8), nullable=True)
+    applied_cached_input_rate = Column(Numeric(18, 8), nullable=True)
+    applied_cache_write_rate = Column(Numeric(18, 8), nullable=True)
+    applied_output_rate = Column(Numeric(18, 8), nullable=True)
+
+    # 定価換算コスト（USD）
+    list_input_cost = Column(Numeric(20, 10), nullable=True)
+    list_output_cost = Column(Numeric(20, 10), nullable=True)
+    list_tool_cost = Column(Numeric(20, 10), nullable=True)
+    list_total_cost = Column(Numeric(20, 10), nullable=True)
+
+    # プロバイダ申告コスト（OpenRouter等）
+    provider_reported_cost = Column(Numeric(20, 10), nullable=True)
+    provider_reported_cost_details = Column(JSONB, nullable=True)
+
+    # ツール呼び出し回数 {"web_search": 2}
+    tool_invocations = Column(JSONB, nullable=True)
 
     # メタデータ
     request_type = Column(String(50), default="chat")  # chat, embedding, tts, stt
@@ -1426,6 +729,11 @@ class TokenUsage(Base):
     __table_args__ = (
         Index("ix_token_usage_date_model", "created_at", "model"),
         Index("ix_token_usage_project_date", "project_id", "created_at"),
+        Index("ix_token_usage_pricing_status", "pricing_status"),
+        Index("ix_token_usage_scope_created", "billing_scope_id", "created_at"),
+        Index(
+            "ix_token_usage_free_group_created", "free_incentive_group", "created_at"
+        ),
     )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1457,6 +765,24 @@ class TokenUsage(Base):
             "input_cost": self.input_cost,
             "output_cost": self.output_cost,
             "total_cost": self.total_cost,
+            "requested_model": self.requested_model,
+            "resolved_model": self.resolved_model,
+            "billing_scope_id": self.billing_scope_id,
+            "pricing_status": self.pricing_status,
+            "pricing_catalog_version": self.pricing_catalog_version,
+            "pricing_rule_id": self.pricing_rule_id,
+            "free_incentive_group": self.free_incentive_group,
+            "applied_input_rate": _num_str(self.applied_input_rate),
+            "applied_cached_input_rate": _num_str(self.applied_cached_input_rate),
+            "applied_cache_write_rate": _num_str(self.applied_cache_write_rate),
+            "applied_output_rate": _num_str(self.applied_output_rate),
+            "list_input_cost": _num_str(self.list_input_cost),
+            "list_output_cost": _num_str(self.list_output_cost),
+            "list_tool_cost": _num_str(self.list_tool_cost),
+            "list_total_cost": _num_str(self.list_total_cost),
+            "provider_reported_cost": _num_str(self.provider_reported_cost),
+            "provider_reported_cost_details": self.provider_reported_cost_details,
+            "tool_invocations": self.tool_invocations,
             "request_type": self.request_type,
             "latency_ms": self.latency_ms,
             "is_streaming": self.is_streaming,
@@ -1494,6 +820,168 @@ class ModelPricing(Base):
             "effective_from": (
                 self.effective_from.isoformat() if self.effective_from else None
             ),
+        }
+
+
+class PricingRule(Base):
+    """料金カタログの単価ルール（有効期間付き履歴テーブル）
+
+    ``(provider, canonical_model, effective_from)`` が一意。料金改定時は過去行を
+    書き換えず、直前行の ``effective_to`` を閉じて新規行を追加する。
+    """
+
+    __tablename__ = "pricing_rules"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    rule_id = Column(String(200), nullable=False)
+    provider = Column(String(50), nullable=False)
+    canonical_model = Column(String(200), nullable=False)
+    # flat_token | tiered_token | provider_reported | subscription | local
+    pricing_kind = Column(String(30), nullable=False)
+
+    # 単価（USD per 1M tokens）
+    input_price_per_1m = Column(Numeric(18, 8), nullable=True)
+    cached_input_price_per_1m = Column(Numeric(18, 8), nullable=True)
+    cache_write_price_per_1m = Column(Numeric(18, 8), nullable=True)
+    output_price_per_1m = Column(Numeric(18, 8), nullable=True)
+
+    # 長文倍率
+    long_context_threshold = Column(Integer, nullable=True)
+    long_context_input_multiplier = Column(Numeric(10, 4), nullable=True)
+    long_context_output_multiplier = Column(Numeric(10, 4), nullable=True)
+
+    tiers = Column(JSONB, nullable=True)  # tiered_token 用
+    tool_rates = Column(JSONB, nullable=True)  # {"web_search": "0.004"}
+
+    currency = Column(String(3), nullable=False, default="USD")
+    effective_from = Column(DateTime, nullable=False)
+    effective_to = Column(DateTime, nullable=True)  # NULL = 現行
+    source = Column(String(300), nullable=True)
+    catalog_version = Column(String(50), nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "canonical_model",
+            "effective_from",
+            name="uq_pricing_rules_scope",
+        ),
+        Index(
+            "ix_pricing_rules_lookup",
+            "provider",
+            "canonical_model",
+            "effective_from",
+            "effective_to",
+        ),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": str(self.id),
+            "rule_id": self.rule_id,
+            "provider": self.provider,
+            "canonical_model": self.canonical_model,
+            "pricing_kind": self.pricing_kind,
+            "input_price_per_1m": _num_str(self.input_price_per_1m),
+            "cached_input_price_per_1m": _num_str(self.cached_input_price_per_1m),
+            "cache_write_price_per_1m": _num_str(self.cache_write_price_per_1m),
+            "output_price_per_1m": _num_str(self.output_price_per_1m),
+            "long_context_threshold": self.long_context_threshold,
+            "long_context_input_multiplier": _num_str(
+                self.long_context_input_multiplier
+            ),
+            "long_context_output_multiplier": _num_str(
+                self.long_context_output_multiplier
+            ),
+            "tiers": self.tiers,
+            "tool_rates": self.tool_rates,
+            "currency": self.currency,
+            "effective_from": (
+                self.effective_from.isoformat() if self.effective_from else None
+            ),
+            "effective_to": (
+                self.effective_to.isoformat() if self.effective_to else None
+            ),
+            "source": self.source,
+            "catalog_version": self.catalog_version,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class PricingModelAlias(Base):
+    """料金ルールへのモデル名エイリアス（完全一致解決のみ。prefix一致は禁止）"""
+
+    __tablename__ = "pricing_model_aliases"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    rule_uuid = Column(UUID(as_uuid=True), nullable=False)  # pricing_rules.id
+    provider = Column(String(50), nullable=False)
+    alias = Column(String(200), nullable=False)  # 小文字正規化済み
+    canonical_model = Column(String(200), nullable=False)
+    effective_from = Column(DateTime, nullable=False)
+    effective_to = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "provider", "alias", "effective_from", name="uq_pricing_alias_scope"
+        ),
+        Index("ix_pricing_alias_lookup", "provider", "alias"),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": str(self.id),
+            "rule_uuid": str(self.rule_uuid) if self.rule_uuid else None,
+            "provider": self.provider,
+            "alias": self.alias,
+            "canonical_model": self.canonical_model,
+            "effective_from": (
+                self.effective_from.isoformat() if self.effective_from else None
+            ),
+            "effective_to": (
+                self.effective_to.isoformat() if self.effective_to else None
+            ),
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class PricingCatalogState(Base):
+    """料金カタログ取り込み元ごとの同期状態（last-known-good 管理）"""
+
+    __tablename__ = "pricing_catalog_state"
+
+    # "catalog_file" | "openrouter" | "manual_import"
+    source_key = Column(String(50), primary_key=True)
+    catalog_version = Column(String(50), nullable=True)
+    rule_count = Column(Integer, nullable=False, default=0)
+    last_attempt_at = Column(DateTime, nullable=True)
+    last_success_at = Column(DateTime, nullable=True)
+    last_status = Column(String(20), nullable=True)  # "ok" | "error" | "skipped"
+    last_error = Column(Text, nullable=True)
+    payload_digest = Column(String(64), nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "source_key": self.source_key,
+            "catalog_version": self.catalog_version,
+            "rule_count": self.rule_count,
+            "last_attempt_at": (
+                self.last_attempt_at.isoformat() if self.last_attempt_at else None
+            ),
+            "last_success_at": (
+                self.last_success_at.isoformat() if self.last_success_at else None
+            ),
+            "last_status": self.last_status,
+            "last_error": self.last_error,
+            "payload_digest": self.payload_digest,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
 
 
@@ -1614,7 +1102,6 @@ class WorldBook(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     scenario_id = Column(
         UUID(as_uuid=True),
-        ForeignKey("scenarios.id", ondelete="CASCADE"),
         nullable=True,
     )
     name = Column(String(200), nullable=False)

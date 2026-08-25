@@ -7,8 +7,13 @@ import { toast } from "sonner";
 
 import { taskApi, type Task } from "@/lib/task-api";
 import { isTaskCompletionTransition } from "@/lib/task-completion-undo";
-import type { FetchDataOptions } from "@/components/tasks/hooks/use-tasks-data";
+import {
+  hasEffectiveTaskOccurrence,
+  updateEffectiveTaskOccurrenceStatus,
+} from "@/lib/task-occurrence-status";
+import { getTaskDisplayStatus } from "@/lib/tasks-page-utils";
 import type { UndoEntry } from "@/components/tasks/hooks/use-task-undo";
+import { removeTaskSubtrees } from "@/components/tasks/hooks/use-tasks-data";
 
 /**
  * 一括操作（ステータス変更 / 削除 / コピー / 移動）と行単位ステータス変更をまとめたフック。
@@ -19,7 +24,6 @@ export function useBulkTaskActions({
   selectedIds,
   setSelectedIds,
   clearSelection,
-  fetchData,
   pushUndo,
   queueTaskCompletionUndo,
   applyTaskPatchLocally,
@@ -29,6 +33,7 @@ export function useBulkTaskActions({
   focusedTaskId,
   focusTaskById,
   filteredTasksRef,
+  refreshTasks,
   requestRecurringDelete,
 }: {
   tasks: Task[];
@@ -36,7 +41,6 @@ export function useBulkTaskActions({
   selectedIds: Set<string>;
   setSelectedIds: React.Dispatch<React.SetStateAction<Set<string>>>;
   clearSelection: () => void;
-  fetchData: (options?: FetchDataOptions) => Promise<void>;
   pushUndo: (entry: UndoEntry) => void;
   queueTaskCompletionUndo: (entries: Task[]) => void;
   applyTaskPatchLocally: (taskId: string, patch: Partial<Task>) => void;
@@ -46,12 +50,28 @@ export function useBulkTaskActions({
   focusedTaskId: string | null;
   focusTaskById: (taskId: string | null) => void;
   filteredTasksRef: React.RefObject<Task[]>;
+  refreshTasks?: () => Promise<void>;
   requestRecurringDelete?: (task: Task) => boolean;
 }) {
   const handleRowStatusChange = useCallback(
     async (task: Task, status: string) => {
-      if (status === task.status) return;
-      const willComplete = isTaskCompletionTransition(task.status, status);
+      const currentStatus = getTaskDisplayStatus(task);
+      if (status === currentStatus) return;
+      if (hasEffectiveTaskOccurrence(task)) {
+        try {
+          await updateEffectiveTaskOccurrenceStatus({
+            task,
+            status,
+            applyTaskPatchLocally,
+            refreshTasks,
+          });
+        } catch (err) {
+          console.error("繰り返し発生回のステータス更新失敗:", err);
+        }
+        return;
+      }
+
+      const willComplete = isTaskCompletionTransition(currentStatus, status);
       try {
         if (!willComplete) {
           pushUndo({
@@ -66,19 +86,22 @@ export function useBulkTaskActions({
         applyTaskPatchLocally(task.id, { status });
         const updated = await taskApi.updateTask(task.id, { status });
         upsertTaskLocally(updated);
-        await fetchData();
         if (willComplete) {
           queueTaskCompletionUndo([task]);
         }
       } catch (err) {
+        applyTaskPatchLocally(task.id, {
+          status: task.status,
+          completed_at: task.completed_at ?? null,
+        });
         console.error("ステータス更新失敗:", err);
       }
     },
     [
       applyTaskPatchLocally,
-      fetchData,
       pushUndo,
       queueTaskCompletionUndo,
+      refreshTasks,
       upsertTaskLocally,
     ],
   );
@@ -87,15 +110,21 @@ export function useBulkTaskActions({
     async (status: string) => {
       if (selectedIds.size === 0) return;
       setBulkLoading(true);
+      const targets = tasks
+        .filter((task) => selectedIds.has(task.id))
+        .filter((task) => getTaskDisplayStatus(task) !== status);
+      const occurrenceTargets = targets.filter(hasEffectiveTaskOccurrence);
+      const regularTargets = targets.filter(
+        (task) => !hasEffectiveTaskOccurrence(task),
+      );
       try {
-        const targets = tasks.filter((t) => selectedIds.has(t.id));
-        const willComplete = targets.some((task) =>
+        const willComplete = regularTargets.some((task) =>
           isTaskCompletionTransition(task.status, status),
         );
-        if (!willComplete) {
+        if (!willComplete && regularTargets.length > 0) {
           pushUndo({
             type: "bulkUpdate",
-            entries: targets.map((t) => ({
+            entries: regularTargets.map((t) => ({
               taskId: t.id,
               previous: {
                 status: t.status,
@@ -104,25 +133,43 @@ export function useBulkTaskActions({
             })),
           });
         }
-        for (const id of selectedIds) {
-          applyTaskPatchLocally(id, { status });
+        for (const task of regularTargets) {
+          applyTaskPatchLocally(task.id, { status });
         }
         const updatedTasks = await Promise.all(
-          [...selectedIds].map((id) => taskApi.updateTask(id, { status })),
+          regularTargets.map((task) =>
+            taskApi.updateTask(task.id, { status }),
+          ),
         );
         for (const updated of updatedTasks) {
           upsertTaskLocally(updated);
         }
+        for (const task of occurrenceTargets) {
+          await updateEffectiveTaskOccurrenceStatus({
+            task,
+            status,
+            applyTaskPatchLocally,
+          });
+        }
+        if (occurrenceTargets.length > 0) {
+          await refreshTasks?.();
+        }
         clearSelection();
-        await fetchData();
         if (willComplete) {
           queueTaskCompletionUndo(
-            targets.filter((task) =>
+            regularTargets.filter((task) =>
               isTaskCompletionTransition(task.status, status),
             ),
           );
         }
       } catch (err) {
+        for (const task of regularTargets) {
+          applyTaskPatchLocally(task.id, {
+            status: task.status,
+            completed_at: task.completed_at ?? null,
+          });
+        }
+        await refreshTasks?.();
         console.error("一括ステータス更新失敗:", err);
       } finally {
         setBulkLoading(false);
@@ -133,9 +180,9 @@ export function useBulkTaskActions({
       tasks,
       applyTaskPatchLocally,
       clearSelection,
-      fetchData,
       pushUndo,
       queueTaskCompletionUndo,
+      refreshTasks,
       setBulkLoading,
       upsertTaskLocally,
     ],
@@ -165,9 +212,8 @@ export function useBulkTaskActions({
     try {
       pushUndo({ type: "recreate", tasks: targets });
       await Promise.all([...selectedIds].map((id) => taskApi.deleteTask(id)));
-      setTasks((prev) => prev.filter((task) => !selectedIds.has(task.id)));
+      setTasks((prev) => removeTaskSubtrees(prev, selectedIds));
       clearSelection();
-      await fetchData();
     } catch (err) {
       console.error("一括削除失敗:", err);
     } finally {
@@ -177,7 +223,6 @@ export function useBulkTaskActions({
     selectedIds,
     tasks,
     clearSelection,
-    fetchData,
     pushUndo,
     requestRecurringDelete,
     setBulkLoading,
@@ -197,6 +242,7 @@ export function useBulkTaskActions({
             description: t.description || "",
             status: t.status,
             priority: t.priority,
+            ...(t.auto_close_on_due ? { auto_close_on_due: true } : {}),
             notifications_enabled: t.notifications_enabled,
             tag_ids: (t.tags || []).map((tag) => tag.id),
           }),
@@ -204,13 +250,12 @@ export function useBulkTaskActions({
       );
       setTasks((prev) => [...createdTasks, ...prev]);
       clearSelection();
-      await fetchData();
     } catch (err) {
       console.error("一括コピー失敗:", err);
     } finally {
       setBulkLoading(false);
     }
-  }, [selectedIds, tasks, clearSelection, fetchData, setBulkLoading, setTasks]);
+  }, [selectedIds, tasks, clearSelection, setBulkLoading, setTasks]);
 
   const handleBulkMove = useCallback(
     async (targetProjectId: string) => {
@@ -237,7 +282,6 @@ export function useBulkTaskActions({
           upsertTaskLocally(updated);
         }
         clearSelection();
-        await fetchData();
       } catch (err) {
         console.error("一括移動失敗:", err);
       } finally {
@@ -249,7 +293,6 @@ export function useBulkTaskActions({
       tasks,
       applyTaskPatchLocally,
       clearSelection,
-      fetchData,
       pushUndo,
       setBulkLoading,
       upsertTaskLocally,
@@ -291,7 +334,9 @@ export function useBulkTaskActions({
           for (const taskId of deletingIds) next.delete(taskId);
           return next;
         });
-        await fetchData();
+        setTasks((prev) =>
+          prev.filter((task) => !deletingIds.has(task.id)),
+        );
         if (focusedTaskId && deletingIds.has(focusedTaskId)) {
           const nextFocus =
             filteredTasksRef.current.find((task) => !deletingIds.has(task.id))
@@ -305,7 +350,6 @@ export function useBulkTaskActions({
       }
     },
     [
-      fetchData,
       filteredTasksRef,
       focusTaskById,
       focusedTaskId,
@@ -314,6 +358,7 @@ export function useBulkTaskActions({
       setBulkLoading,
       setCutTaskIds,
       setSelectedIds,
+      setTasks,
     ],
   );
 

@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { AppSelect } from "@/components/ui/app-select";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import type { DocsField, DocsNode, DocsProject } from "./types";
@@ -12,11 +14,14 @@ type FieldControlProps = {
   nodes: DocsNode[];
   projects: DocsProject[];
   currentNodeId?: string;
+  controlId?: string;
+  longTextLayout?: "compact" | "document";
   onChange: (value: string) => void;
   onCommit?: (value: string) => void;
   onNavigatePrevious?: () => void;
   onNavigateNext?: () => void;
   onEscape?: () => void;
+  disabled?: boolean;
 };
 
 export function FieldControl({
@@ -25,11 +30,14 @@ export function FieldControl({
   nodes,
   projects,
   currentNodeId,
+  controlId,
+  longTextLayout = "compact",
   onChange,
   onCommit,
   onNavigatePrevious,
   onNavigateNext,
   onEscape,
+  disabled = false,
 }: FieldControlProps) {
   const type = docsFieldType(field);
   const options = fieldOptions(field);
@@ -42,6 +50,7 @@ export function FieldControl({
     field.system_key?.endsWith("_project") === true;
   const valueKey = `${field.id}:${value}`;
   const [draftState, setDraftState] = useState({ key: valueKey, draft: value });
+  const [selectOpen, setSelectOpen] = useState(false);
   const dirtyValueKeyRef = useRef<string | null>(null);
   const draft = draftState.key === valueKey ? draftState.draft : value;
 
@@ -69,7 +78,12 @@ export function FieldControl({
     else onNavigateNext?.();
   };
 
-  const handleSingleLineKeyDown = (event: KeyboardEvent<HTMLInputElement | HTMLSelectElement>) => {
+  const handleSingleLineKeyDown = (event: {
+    currentTarget: EventTarget;
+    key: string;
+    preventDefault: () => void;
+    stopPropagation: () => void;
+  }) => {
     if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();
@@ -83,35 +97,53 @@ export function FieldControl({
     navigate(event.key === "ArrowUp" ? "previous" : "next", event.currentTarget instanceof HTMLInputElement ? event.currentTarget.value : draft);
   };
 
-  const handleSelectKeyDown = (event: KeyboardEvent<HTMLSelectElement>) => {
+  const handleSelectKeyDown = (
+    event: KeyboardEvent<HTMLButtonElement>,
+    orderedValues: string[],
+    renderedValue: string,
+  ) => {
     if (event.key === "Escape") {
+      if (selectOpen) return;
       event.preventDefault();
       event.stopPropagation();
-      commitDraft(event.currentTarget.value);
+      commitDraft(draft);
       onEscape?.();
       return;
     }
     // 通常の上下キーはoption選択に残す。Field間移動はCtrl/Cmd+上下で行う。
     if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
     if (!(event.ctrlKey || event.metaKey)) {
+      if (!selectOpen) {
+        event.preventDefault();
+        event.stopPropagation();
+        const currentIndex = Math.max(0, orderedValues.indexOf(renderedValue));
+        const offset = event.key === "ArrowUp" ? -1 : 1;
+        const nextIndex = Math.max(0, Math.min(orderedValues.length - 1, currentIndex + offset));
+        const next = orderedValues[nextIndex] ?? renderedValue;
+        if (next !== renderedValue) {
+          updateDraft(next);
+          commitDraft(next);
+        }
+      }
       event.stopPropagation();
       return;
     }
     event.preventDefault();
     event.stopPropagation();
-    navigate(event.key === "ArrowUp" ? "previous" : "next", event.currentTarget.value);
+    navigate(event.key === "ArrowUp" ? "previous" : "next", renderedValue);
   };
 
   if (type === "checkbox") {
     return (
-      <label className="flex h-8 items-center gap-2 rounded border bg-background px-2 text-xs">
-        <input
+      <label className="flex h-8 items-center gap-2 rounded-md border bg-background px-2 text-xs">
+        <Checkbox
+          id={controlId}
           data-docs-field-control
-          type="checkbox"
           aria-label={label}
           checked={draft === "true"}
-          onChange={(event) => {
-            const next = event.target.checked ? "true" : "false";
+          disabled={disabled}
+          onCheckedChange={(checked) => {
+            const next = checked === true ? "true" : "false";
             updateDraft(next);
             commitDraft(next);
           }}
@@ -124,17 +156,24 @@ export function FieldControl({
   }
 
   if ((type === "options" || type === "options_from_supertag") && options.length > 0) {
+    const renderedValue = options.includes(draft) ? draft : "";
+    const orderedValues = ["", ...options];
     return (
-      <select
+      <AppSelect
+        id={controlId}
         data-docs-field-control
         aria-label={label}
-        value={draft}
+        value={renderedValue}
+        open={selectOpen}
+        onOpenChange={setSelectOpen}
         onChange={(event) => {
           updateDraft(event.target.value);
           commitDraft(event.target.value);
         }}
-        onKeyDown={handleSelectKeyDown}
-        className={inputClass}
+        onKeyDown={(event) => handleSelectKeyDown(event, orderedValues, renderedValue)}
+        className={`${inputClass} rounded-md border border-input bg-background/70 px-2 shadow-none hover:bg-accent/40`}
+        size="sm"
+        disabled={disabled}
       >
         <option value="">None</option>
         {options.map((option) => (
@@ -142,7 +181,7 @@ export function FieldControl({
             {option}
           </option>
         ))}
-      </select>
+      </AppSelect>
     );
   }
 
@@ -154,41 +193,39 @@ export function FieldControl({
           label: project.name,
         }))
       : referenceOptions(nodes, projects, currentNodeId);
-    const selectedProject = isProjectReference
-      ? projects.find((project) => project.id === draft)
-      : null;
+    const renderedValue = options.some((option) => option.value === draft) ? draft : "";
+    const orderedValues = ["", ...options.map((option) => option.value)];
     return (
-      <div className="space-y-1">
-        {isProjectReference && draft ? (
-          <span className="inline-flex max-w-full items-center rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
-            <span className="truncate">{selectedProject?.name ?? "案件を選択してください"}</span>
-          </span>
-        ) : null}
-        <select
-          data-docs-field-control
-          aria-label={label}
-          value={options.some((option) => option.value === draft) ? draft : ""}
-          onChange={(event) => {
-            updateDraft(event.target.value);
-            commitDraft(event.target.value);
-          }}
-          onKeyDown={handleSelectKeyDown}
-          className={inputClass}
-        >
-          <option value="">None</option>
-          {options.map((option) => (
-            <option key={option.id} value={option.value}>
-              {option.label}
-            </option>
-          ))}
-        </select>
-      </div>
+      <AppSelect
+        id={controlId}
+        data-docs-field-control
+        aria-label={label}
+        value={renderedValue}
+        open={selectOpen}
+        onOpenChange={setSelectOpen}
+        onChange={(event) => {
+          updateDraft(event.target.value);
+          commitDraft(event.target.value);
+        }}
+        onKeyDown={(event) => handleSelectKeyDown(event, orderedValues, renderedValue)}
+        className={`${inputClass} rounded-md border border-input bg-background/70 px-2 shadow-none hover:bg-accent/40`}
+        size="sm"
+        disabled={disabled}
+      >
+        <option value="">None</option>
+        {options.map((option) => (
+          <option key={option.id} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </AppSelect>
     );
   }
 
   if (type === "long_text") {
     return (
       <Textarea
+        id={controlId}
         data-docs-field-control
         aria-label={label}
         value={draft}
@@ -203,6 +240,13 @@ export function FieldControl({
             return;
           }
           if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+          if (longTextLayout === "document") {
+            if (!event.ctrlKey && !event.metaKey) return;
+            event.preventDefault();
+            event.stopPropagation();
+            navigate(event.key === "ArrowUp" ? "previous" : "next", event.currentTarget.value);
+            return;
+          }
           const cursor = event.currentTarget.selectionStart;
           const value = event.currentTarget.value;
           const atBoundary = event.key === "ArrowUp"
@@ -213,15 +257,19 @@ export function FieldControl({
           event.stopPropagation();
           navigate(event.key === "ArrowUp" ? "previous" : "next", value);
         }}
-        rows={1}
-        wrap="off"
-        className="h-7 min-h-7 max-h-7 resize-none overflow-x-auto overflow-y-hidden whitespace-nowrap border-0 bg-transparent px-1 py-1 text-sm leading-5 shadow-none focus:h-7 focus:min-h-7 focus:max-h-7 focus:resize-none focus:overflow-x-auto focus:overflow-y-hidden focus:whitespace-nowrap focus-visible:ring-1"
+        rows={longTextLayout === "document" ? 4 : 1}
+        disabled={disabled}
+        wrap={longTextLayout === "document" ? "soft" : "off"}
+        className={longTextLayout === "document"
+          ? "min-h-24 max-h-80 resize-y overflow-x-hidden overflow-y-auto whitespace-pre-wrap break-words [overflow-wrap:anywhere] border-0 bg-transparent px-1 py-1 text-sm leading-5 shadow-none focus-visible:ring-1"
+          : "h-7 min-h-7 max-h-7 resize-none overflow-x-auto overflow-y-hidden whitespace-nowrap border-0 bg-transparent px-1 py-1 text-sm leading-5 shadow-none focus:h-7 focus:min-h-7 focus:max-h-7 focus:resize-none focus:overflow-x-auto focus:overflow-y-hidden focus:whitespace-nowrap focus-visible:ring-1"}
       />
     );
   }
 
   return (
     <Input
+      id={controlId}
       data-docs-field-control
       aria-label={label}
       type={
@@ -239,6 +287,7 @@ export function FieldControl({
       onChange={(event) => updateDraft(event.target.value)}
       onBlur={(event) => commitDraft(event.target.value)}
       onKeyDown={(event) => handleSingleLineKeyDown(event)}
+      disabled={disabled}
       className="h-7 border-0 bg-transparent px-1 shadow-none focus-visible:ring-1"
       placeholder={type === "options_from_supertag" ? "comma separated" : undefined}
     />

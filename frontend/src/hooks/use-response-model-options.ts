@@ -1,20 +1,27 @@
 "use client";
 
+import { useMemo } from "react";
 import useSWR from "swr";
+import type { UserSettings } from "@/lib/user-settings";
 import {
   getLlmModelCatalog,
+  type LlmDeploymentMetadata,
   type ChatResponseModelOption,
   type LlmCatalogModelOption,
   type LlmCatalogProvider,
   type LlmModelCatalogResponse,
 } from "@/lib/chat-api";
+import {
+  filterAvailableProviders,
+  isProviderAvailable,
+} from "@/lib/llm-provider-visibility";
 
 // SWR キャッシュキー。チャット画面で一意なので固定文字列を使う。
 const RESPONSE_MODEL_OPTIONS_SWR_KEY = "chat/response-model-options";
 
 const EMPTY_OPTIONS: ChatResponseModelOption[] = [];
 
-const API_KEY_REQUIRED_PROVIDERS = new Set(["openai", "gemini", "openrouter", "kimi"]);
+const API_KEY_REQUIRED_PROVIDERS = new Set(["openai", "gemini", "openrouter", "deepseek", "deepinfra", "kimi"]);
 
 function modelLabel(
   model: LlmCatalogModelOption | undefined,
@@ -30,11 +37,21 @@ function modelLabel(
  */
 export function buildResponseModelOptions(
   catalog: LlmModelCatalogResponse,
+  _settings?: UserSettings | null,
 ): ChatResponseModelOption[] {
+  // User-level hidden-provider settings intentionally do not affect rerun
+  // options; backend deployment availability is the authoritative filter.
+  void _settings;
   const currentProvider = catalog.current.provider;
   const currentModel = catalog.current.model;
+  const availableProviders = filterAvailableProviders(
+    catalog.providers,
+    catalog.deployment as LlmDeploymentMetadata | null | undefined,
+    (provider) => provider.id,
+    (provider) => provider,
+  );
   const providers = new Map(
-    catalog.providers.map((provider) => [provider.id, provider]),
+    availableProviders.map((provider) => [provider.id, provider]),
   );
   const result: ChatResponseModelOption[] = [];
   const seen = new Set<string>();
@@ -68,17 +85,40 @@ export function buildResponseModelOptions(
     });
   };
 
-  const currentCatalogProvider = providers.get(currentProvider) ?? {
-    id: currentProvider,
-    label: currentProvider,
-    models: [],
-  };
-  const currentCatalogModel = currentCatalogProvider?.models.find(
-    (model) => model.id === currentModel,
+  const persistedCurrentProvider = catalog.providers.find(
+    (provider) => provider.id === currentProvider,
   );
-  addOption(currentCatalogProvider, currentModel, currentCatalogModel);
+  const currentCatalogProvider = providers.get(currentProvider);
+  if (
+    currentCatalogProvider &&
+    isProviderAvailable(
+      currentProvider,
+      catalog.deployment as LlmDeploymentMetadata | null | undefined,
+      persistedCurrentProvider,
+    )
+  ) {
+    const currentCatalogModel = currentCatalogProvider.models.find(
+      (model) => model.id === currentModel,
+    );
+    addOption(currentCatalogProvider, currentModel, currentCatalogModel);
+  } else if (
+    !catalog.deployment &&
+    isProviderAvailable(currentProvider, undefined, persistedCurrentProvider)
+  ) {
+    // Older personal responses may omit the provider from the catalog while
+    // still exposing it as the current selection. Keep the old fallback.
+    addOption(
+      {
+        id: currentProvider,
+        label: currentProvider,
+        models: [],
+      },
+      currentModel,
+      undefined,
+    );
+  }
 
-  for (const provider of catalog.providers) {
+  for (const provider of availableProviders) {
     if (
       API_KEY_REQUIRED_PROVIDERS.has(provider.id) &&
       provider.settings?.api_key_configured === false &&
@@ -112,11 +152,10 @@ export function buildResponseModelOptions(
  * effect 内 fetch）と不変。フォーカス/再接続などの自動 revalidation は無効化する。
  */
 export function useResponseModelOptions() {
-  const { data, isLoading } = useSWR<ChatResponseModelOption[]>(
+  const { data: catalog, isLoading } = useSWR<LlmModelCatalogResponse>(
     RESPONSE_MODEL_OPTIONS_SWR_KEY,
     async () => {
-      const catalog = await getLlmModelCatalog();
-      return buildResponseModelOptions(catalog);
+      return getLlmModelCatalog();
     },
     {
       // 従来どおりマウント時に必ず取得する（初期 loading=true → 取得完了で false）。
@@ -129,10 +168,14 @@ export function useResponseModelOptions() {
       onError: (err) => console.warn("再生成モデル一覧の取得に失敗:", err),
     },
   );
+  const responseModelOptions = useMemo(
+    () => (catalog ? buildResponseModelOptions(catalog) : EMPTY_OPTIONS),
+    [catalog],
+  );
 
   return {
     // 取得失敗時は data が undefined のままとなり、従来同様に空配列を返す。
-    responseModelOptions: data ?? EMPTY_OPTIONS,
+    responseModelOptions,
     responseModelOptionsLoading: isLoading,
   };
 }

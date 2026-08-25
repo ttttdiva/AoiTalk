@@ -1,5 +1,11 @@
 import "server-only";
 
+/**
+ * @deprecated Legacy process/.env adapter retained only for migrations.
+ * Production HF integrations use `user-store.ts` and never read or write
+ * process-wide HF tokens.  Do not call this module from request handlers.
+ */
+
 import { promises as fs } from "node:fs";
 import fsSync from "node:fs";
 import path from "node:path";
@@ -8,9 +14,7 @@ import { updateEnvText } from "./env-text";
 
 export { updateEnvText } from "./env-text";
 
-const ACCOUNTS_KEY = "HF_ACCOUNTS";
 const REFERENCES_KEY = "HF_REFERENCE_REPOS";
-const TOKEN_PREFIX = "HF_TOKEN_";
 
 export interface HfReferenceRepo {
   repoId: string;
@@ -96,22 +100,9 @@ export function listReferenceRepos(): HfReferenceRepo[] {
 }
 
 export async function saveHfToken(username: string, token: string): Promise<void> {
-  await persistEnv(() => {
-    const current = (process.env[ACCOUNTS_KEY] ?? "")
-      .split(",")
-      .map((value) => value.trim())
-      .filter(Boolean);
-    const existingUsername = current.find(
-      (value) => value.toLowerCase() === username.toLowerCase(),
-    );
-    if (!existingUsername) {
-      current.push(username);
-    }
-    return {
-      [ACCOUNTS_KEY]: current.join(","),
-      [`${TOKEN_PREFIX}${existingUsername ?? username}`]: token,
-    };
-  });
+  void username;
+  void token;
+  throw new Error("HFのグローバル環境変数資格情報は廃止されています。ユーザー設定から登録してください。");
 }
 
 export async function addReferenceRepos(entries: HfReferenceRepo[]): Promise<void> {

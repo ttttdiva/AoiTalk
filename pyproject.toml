@@ -18,12 +18,14 @@ dependencies = [
     # LLM & AI
     "openai>=2.0.0",
     "google-generativeai>=0.3.0",
-    "mcp[cli]>=1.0.0",
+    "mcp[cli]>=1.0.0,<2.0.0",
 
     # Web Interface (FastAPI)
     "fastapi>=0.109.0",
+    "python-multipart>=0.0.9",
     "uvicorn[standard]>=0.27.0",
     "websockets>=12.0",
+    "playwright>=1.55.0",
 
     # Memory Management (PostgreSQL)
     "sqlalchemy>=2.0.0",
@@ -57,6 +59,7 @@ dependencies = [
     # Office File Reading
     "markitdown[docx,pptx,xlsx,pdf]>=0.0.1",
     "openpyxl>=3.1.0",
+    "oletools>=0.60.2",
     "extract-msg>=0.55.0",
 
     # Knowledge Note Frontmatter
@@ -78,6 +81,8 @@ dependencies = [
     "numpy>=1.26.0",
     "requests>=2.31.0",
     "httpx>=0.24.0",
+    "pywebpush>=2.0.0",
+    "certifi>=2026.1.4",
     "aiofiles>=23.0.0",
     "py7zr>=1.1.0,<2.0.0",
     "beautifulsoup4>=4.12.0",
@@ -97,7 +102,11 @@ audio = [
     # Basic Audio
     "voicevox-client",
     "sounddevice>=0.4.6",
+    # recorder.py imports the upstream ``pyaudio`` module on every platform.
+    # PyAudioWPatch is additive on Windows (it installs ``pyaudiowpatch`` and
+    # ``_portaudiowpatch`` without replacing the upstream pyaudio package).
     "pyaudio",
+    "PyAudioWPatch>=0.2.12.8; sys_platform == 'win32'",
     "pydub>=0.25.1",
     "pygame>=2.0.0",
 
@@ -130,10 +139,20 @@ test = [
     "pytest-mock>=3.11.0",
     "pytest-xdist>=3.0.0",
     "pytest-timeout>=2.1.0",
+    "ruff>=0.9.0",
+    "aiosqlite>=0.19.0",
+    "aiohttp>=3.9.0",
+    "discord.py>=2.0.0",
+    "h2>=4.3.0,<5.0.0",
 ]
 
 # Irodori-TTS dependencies (Irodori-TTS関連)
 irodori = [
+    # DACVAE itself is installed by setup.bat/setup.sh with its runtime
+    # dependencies explicitly listed.  Its descript-audiotools dependency
+    # declares protobuf<3.20, which conflicts with the application's
+    # mem0ai protobuf>=5.29.6 requirement; putting DACVAE in this extra would
+    # make pip downgrade protobuf and break the existing memory stack.
     "datasets>=3.0.0",
     "huggingface-hub>=0.34.0,<1.0",
     "llvmlite>=0.43.0",
@@ -141,12 +160,20 @@ irodori = [
     "peft>=0.18.0",
     "safetensors>=0.7.0",
     "soundfile>=0.12.0",
+    # Fast ModernBERT/LLM-JP tokenizer JSON assets do not use the legacy
+    # SentencePiece ABI.  Keep the project-wide >=0.2.1 range shared with
+    # MioTTS so combined extras have a single resolver solution.
     "sentencepiece>=0.2.1,<0.3",
     "silentcipher @ git+https://github.com/SesameAILabs/silentcipher.git@d46d7d0893a583d8968ab3a6626e2289faec9152",
     "torch>=2.10.0,<2.11.0",
     "torchaudio>=2.10.0,<2.11.0",
     "torchcodec>=0.10.0,<0.11.0",
-    "transformers<5",
+    # v4.1-Small uses ModernBERT and runs on transformers 4.57+ as well as the
+    # current 5.x API.  The <6 upper bound allows the official v5 runtime when
+    # installed alone, while MioTTS/yomi's existing <5 constraints resolve to
+    # the tested 4.x compatibility path instead of an impossible dependency
+    # intersection.
+    "transformers>=4.57.6,<6",
     "tqdm>=4.67.3",
 ]
 
@@ -191,12 +218,18 @@ exclude = [
 select = ["E9", "F63", "F7", "F82"]
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = {"" = "."}
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["src", "src.*"]
 
 [tool.setuptools.package-data]
-"vendor.irodori_tts" = ["LICENSE", "VENDORED.md"]
+"src.vendor.irodori_tts" = ["LICENSE", "VENDORED.md"]
 
-# pytest設定は pytest.ini で一元管理
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-ra -v --tb=short --ignore=tests/test_image_gen_tool.py"

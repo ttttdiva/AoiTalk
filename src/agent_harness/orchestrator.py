@@ -55,7 +55,7 @@ class AgentHarnessOrchestrator:
                     "state": entry.work_item.state,
                     "attempt": entry.attempt,
                     "workspace_path": str(entry.workspace_path),
-                    "session_id": entry.session_id,
+                    "provider_session_id": entry.provider_session_id,
                     "turn_count": entry.turn_count,
                     "last_event": entry.last_event,
                     "last_message": entry.last_message,
@@ -122,6 +122,13 @@ class AgentHarnessOrchestrator:
         self.codex_totals.input_tokens += max(0, result.input_tokens + entry.codex_input_tokens)
         self.codex_totals.output_tokens += max(0, result.output_tokens + entry.codex_output_tokens)
         self.codex_totals.total_tokens += max(0, result.total_tokens + entry.codex_total_tokens)
+        # Some runners only learn the provider continuation handle in their
+        # final result (rather than in a progress event).  Capture it before
+        # the entry is removed so the in-memory state remains internally
+        # consistent and custom runners can migrate independently.
+        result_provider_session_id = _result_provider_session_id(result)
+        if result_provider_session_id:
+            self._set_provider_session_id(entry, result_provider_session_id)
         if result.success:
             self.completed.add(item_id)
             self._release_claim(item_id)
@@ -219,10 +226,9 @@ class AgentHarnessOrchestrator:
             entry.last_event = str(event.get("event") or "")
             entry.last_message = event.get("message")
             entry.last_event_at = datetime.utcnow()
-            if event.get("session_id"):
-                if entry.session_id != event["session_id"]:
-                    entry.turn_count += 1
-                entry.session_id = str(event["session_id"])
+            provider_session_id = _event_provider_session_id(event)
+            if provider_session_id:
+                self._set_provider_session_id(entry, provider_session_id)
             usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
             entry.codex_input_tokens += max(0, int(usage.get("input_tokens") or 0))
             entry.codex_output_tokens += max(0, int(usage.get("output_tokens") or 0))
@@ -330,8 +336,19 @@ class AgentHarnessOrchestrator:
             "identifier": entry.work_item.identifier,
             "workspace_path": str(entry.workspace_path),
             "last_event": entry.last_event,
-            "session_id": entry.session_id,
+            "provider_session_id": entry.provider_session_id,
         }
+
+    @staticmethod
+    def _set_provider_session_id(entry: RunningEntry, provider_session_id: str) -> None:
+        """Update a running entry's provider handle and turn counter."""
+
+        normalized = str(provider_session_id or "").strip()
+        if not normalized:
+            return
+        if entry.provider_session_id != normalized:
+            entry.turn_count += 1
+            entry.provider_session_id = normalized
 
 
 def sort_work_items_for_dispatch(items: list[WorkItem]) -> list[WorkItem]:
@@ -359,3 +376,34 @@ def _priority_rank(priority: Any) -> int:
 
 def _normalize_state(state: str) -> str:
     return str(state or "").strip().lower()
+
+
+def _event_provider_session_id(event: dict[str, Any]) -> str | None:
+    """Read the normalized provider handle from a runner event.
+
+    ``provider_session_id`` is the public event contract.  Accepting a
+    legacy top-level ``session_id`` here keeps existing custom runners
+    working during migration without leaking that spelling through
+    snapshots/details.
+    """
+
+    for key in ("provider_session_id", "session_id"):
+        value = event.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _result_provider_session_id(result: Any) -> str | None:
+    """Read a provider handle from new or legacy runner result objects."""
+
+    value = getattr(result, "provider_session_id", None)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    # A third-party runner may still return an object from the pre-rename
+    # contract.  Keep this fallback private to the orchestrator; all public
+    # state uses ``provider_session_id``.
+    value = getattr(result, "session_id", None)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None

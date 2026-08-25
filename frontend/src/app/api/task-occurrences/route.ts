@@ -8,7 +8,7 @@ import {
   taskTags,
   tags,
 } from "@/db/schema";
-import { eq, and, inArray, gte, lte, isNotNull } from "drizzle-orm";
+import { eq, and, inArray, gte, lte, isNotNull, isNull } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
 import { computeOccurrencesInRange } from "@/lib/recurrence-preview";
 import type { RecurrencePreviewConfig } from "@/lib/recurrence-preview";
@@ -23,7 +23,7 @@ import {
 } from "@/lib/recurrence-exceptions";
 import { normalizeTaskStatus } from "@/lib/task-status";
 import { estimateOccurrenceCount, parseRrule } from "@/lib/recurrence-rrule";
-import { getReadableProjectIds } from "@/lib/server/task-route-utils";
+import { getParticipatingProjectIds } from "@/lib/server/task-route-utils";
 import {
   dbTimestampToLocalDate,
   localDateToDbTimestampDate,
@@ -168,7 +168,7 @@ export async function GET(request: NextRequest) {
   const rangeEnd = rangeEndDb;
   const now = new Date();
 
-  const scopedProjectIds = await getReadableProjectIds(user.id, {
+  const scopedProjectIds = await getParticipatingProjectIds(user.id, {
     projectId,
     spaceId: projectId ? null : spaceId,
   });
@@ -194,11 +194,21 @@ export async function GET(request: NextRequest) {
       })
       .from(taskOccurrences)
       .innerJoin(tasks, eq(taskOccurrences.taskId, tasks.id))
-      .leftJoin(taskRecurrenceRules, eq(taskRecurrenceRules.taskId, tasks.id))
+      // 繰り返しルールを持つタスクだけを対象にする。
+      // 非繰り返しタスクは tasks 本体の start_at / end_at が予定の正本で、
+      // カレンダーもタスク本体をそのままイベント化している（calendar-view.tsx の
+      // `!task.has_recurrence` フィルタ）。一方 Python 側の materialize は
+      // 繰り返しなしのタスクにも source_kind="task_schedule" のミラー行を1件作るため、
+      // ここで一緒に返すとタスク本体とミラーの二重表示になる。
+      // Web UI からの日付変更はミラー行を更新しないので、ミラーが古い日付のまま
+      // 別日に居残るケース（同じタスクが離れた日に2回出る）も同じ原因。
+      // タスク一覧 API (app/api/tasks/route.ts) も同様に繰り返しタスクへ限定済み。
+      .innerJoin(taskRecurrenceRules, eq(taskRecurrenceRules.taskId, tasks.id))
       .innerJoin(projects, eq(tasks.projectId, projects.id))
       .where(
         and(
           inArray(tasks.projectId, scopedProjectIds),
+          isNull(tasks.deletedAt),
           lte(taskOccurrences.startAt, toDbLocalTimestamp(rangeEndDb)),
           gte(taskOccurrences.endAt, toDbLocalTimestamp(rangeStartDb)),
         ),
@@ -224,12 +234,17 @@ export async function GET(request: NextRequest) {
         endDate: taskRecurrenceRules.endDate,
         skipWeekend: taskRecurrenceRules.skipWeekend,
         skipHoliday: taskRecurrenceRules.skipHoliday,
+        skipMode: taskRecurrenceRules.skipMode,
       })
       .from(tasks)
       .innerJoin(taskRecurrenceRules, eq(taskRecurrenceRules.taskId, tasks.id))
       .innerJoin(projects, eq(tasks.projectId, projects.id))
       .where(
-        and(inArray(tasks.projectId, scopedProjectIds), isNotNull(tasks.endAt)),
+        and(
+          inArray(tasks.projectId, scopedProjectIds),
+          isNull(tasks.deletedAt),
+          isNotNull(tasks.endAt),
+        ),
       );
 
     const taskIds = [
@@ -377,6 +392,7 @@ export async function GET(request: NextRequest) {
         byDay: parsed.byDay,
         skipWeekend: task.skipWeekend ?? false,
         skipHoliday: task.skipHoliday ?? false,
+        skipMode: task.skipMode,
         endCount: task.endCount ?? null,
         endDate: task.endDate ? serializeDbTimestamp(task.endDate) : null,
       };

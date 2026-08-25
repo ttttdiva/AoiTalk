@@ -1,14 +1,26 @@
-"""Agent Team configuration helpers."""
+"""Agent Team configuration and runtime helpers.
+
+The persisted Agent Team contract is schema v3 (Team -> Subagent, with
+Team-scoped Execution Profiles).  Legacy conversion is isolated in the
+dedicated migration module and is never consulted by normal runtime helpers.
+"""
 
 from __future__ import annotations
 
 import copy
+import contextvars
+import hashlib
+import json
+import re
+from dataclasses import dataclass, field
 from typing import Any
 
 
 AGENT_TEAM_PROVIDERS = {
     "openai",
     "openrouter",
+    "deepseek",
+    "deepinfra",
     "kimi",
     "gemini",
     "ollama",
@@ -19,217 +31,19 @@ AGENT_TEAM_PROVIDERS = {
     "codex-cli",
     "grok-cli",
 }
-
-MODEL_ROUTE_CLASS_BY_ROUTE = {
-    "advanced_reasoning": "heavy",
-    "architect": "heavy",
-    "explorer": "light",
-    "implementer": "light",
-    "reviewer": "light",
-    "utility": "light",
-    "media": "light",
-    "spotify": "light",
-    "import": "light",
-}
-
-BUILTIN_AGENT_TEAM_MODEL_GROUPS = {
-    "heavy": {"name": "高負荷", "effort_policy": "same"},
-    "light": {"name": "軽量", "effort_policy": "lower"},
-}
-RESERVED_AGENT_TEAM_MODEL_GROUP_IDS = {"heavy", "light", "auto"}
-AUTO_AGENT_TEAM_GROUP_ID = "auto"
-
-MODEL_ROUTING_PROVIDERS = AGENT_TEAM_PROVIDERS | {
-    "claude",
-    "grok",
-}
-
+MODEL_ROUTING_PROVIDERS = AGENT_TEAM_PROVIDERS | {"claude", "grok"}
 AGENT_HARNESS_PROVIDERS = {"codex-cli", "claude-cli"}
-
-SCALABLE_MEMBER_KEYS = {
-    "architect",
-    "explorer",
-    "implementer",
-    "reviewer",
-}
-
-SPECIALIST_MEMBER_KEYS = {
-    "utility",
-    "media",
-    "spotify",
-    "scenario",
-    "writing",
-    "import",
-}
-
-SINGLETON_MEMBER_KEYS = SPECIALIST_MEMBER_KEYS | {
-    "advanced_reasoning",
-    "agent_harness",
-}
-
-AGENT_TEAM_MEMBER_KEYS = SCALABLE_MEMBER_KEYS | SINGLETON_MEMBER_KEYS
-
 AGENT_TEAM_EXTERNAL_APPROVAL_PROVIDERS = {
     "openai",
     "openrouter",
+    "deepseek",
+    "deepinfra",
     "kimi",
     "gemini",
     "antigravity-cli",
     "claude-cli",
     "codex-cli",
     "grok-cli",
-}
-
-AGENT_TEAM_MEMBER_LABELS = {
-    "agent_team": "Agent Team",
-    "advanced_reasoning": "高度推論",
-    "architect": "設計",
-    "explorer": "調査",
-    "implementer": "実装",
-    "reviewer": "レビュー",
-    "utility": "ユーティリティ",
-    "media": "メディア",
-    "spotify": "Spotify",
-    "scenario": "TRPG_GM",
-    "writing": "執筆",
-    "import": "シナリオ素材取り込み",
-    "agent_harness": "作業エージェント",
-}
-
-AGENT_TEAM_DEFAULT_ROLES: dict[str, dict[str, Any]] = {
-    "advanced_reasoning": {
-        "enabled": False,
-        "provider": "openai",
-        "model": "gpt-4o",
-        "mode": "medium",
-        "role": "judge",
-        "tools": [],
-        "scalable": False,
-        "default_instances": 0,
-        "max_instances": 1,
-    },
-    "architect": {
-        "enabled": True,
-        "provider": "openai",
-        "model": "gpt-4o-mini",
-        "mode": "medium",
-        "role": "architect",
-        "tools": ["workspace_read", "repo_map"],
-        "scalable": True,
-        "default_instances": 1,
-        "max_instances": 2,
-    },
-    "explorer": {
-        "enabled": True,
-        "provider": "openai",
-        "model": "gpt-4o-mini",
-        "mode": "fast",
-        "role": "explorer",
-        "tools": ["workspace_read", "repo_map"],
-        "scalable": True,
-        "default_instances": 1,
-        "max_instances": 6,
-    },
-    "implementer": {
-        "enabled": True,
-        "provider": "openai",
-        "model": "gpt-4o-mini",
-        "mode": "medium",
-        "role": "worker",
-        "tools": ["workspace_read", "repo_map"],
-        "scalable": True,
-        "default_instances": 1,
-        "max_instances": 4,
-    },
-    "reviewer": {
-        "enabled": True,
-        "provider": "openai",
-        "model": "gpt-4o-mini",
-        "mode": "medium",
-        "role": "reviewer",
-        "tools": ["workspace_read", "repo_map"],
-        "scalable": True,
-        "default_instances": 1,
-        "max_instances": 4,
-    },
-    "utility": {
-        "enabled": True,
-        "provider": "openai",
-        "model": "gpt-4o-mini",
-        "mode": "fast",
-        "role": "utility",
-        "tools": ["utility"],
-        "scalable": False,
-        "default_instances": 1,
-        "max_instances": 1,
-    },
-    "media": {
-        "enabled": True,
-        "provider": "openai",
-        "model": "gpt-4o-mini",
-        "mode": "fast",
-        "role": "media",
-        "tools": ["media"],
-        "scalable": False,
-        "default_instances": 1,
-        "max_instances": 1,
-    },
-    "spotify": {
-        "enabled": True,
-        "provider": "openai",
-        "model": "gpt-4o-mini",
-        "mode": "fast",
-        "role": "spotify",
-        "tools": ["spotify"],
-        "scalable": False,
-        "default_instances": 1,
-        "max_instances": 1,
-    },
-    "scenario": {
-        "enabled": True,
-        "provider": "openai",
-        "model": "gpt-4o-mini",
-        "mode": "fast",
-        "role": "TRPG_GM",
-        "tools": ["scenario"],
-        "scalable": False,
-        "default_instances": 1,
-        "max_instances": 1,
-    },
-    "writing": {
-        "enabled": True,
-        "provider": "openai",
-        "model": "gpt-4o-mini",
-        "mode": "fast",
-        "role": "writing",
-        "tools": ["writing"],
-        "scalable": False,
-        "default_instances": 1,
-        "max_instances": 1,
-    },
-    "import": {
-        "enabled": True,
-        "provider": "openai",
-        "model": "gpt-4o-mini",
-        "mode": "fast",
-        "role": "scenario_import",
-        "tools": ["import"],
-        "scalable": False,
-        "default_instances": 1,
-        "max_instances": 1,
-    },
-    "agent_harness": {
-        "enabled": True,
-        "provider": "codex-cli",
-        "model": "gpt-5-codex",
-        "mode": "medium",
-        "role": "work_agent",
-        "tools": ["codex_exec", "claude_code", "custom_command"],
-        "runner": "codex_exec",
-        "scalable": False,
-        "default_instances": 1,
-        "max_instances": 1,
-    },
 }
 
 
@@ -247,49 +61,13 @@ def _raw_config_get(config: Any, key: str, default: Any = None) -> Any:
 
 
 def config_get(config: Any, key: str, default: Any = None) -> Any:
-    """無料Team選択中だけ専用Agent Team overlayを合成して読む。"""
+    """Read App Config without synthesizing a legacy Team topology.
 
-    if key.startswith("agent_team."):
-        provider = str(_raw_config_get(config, "llm_provider", "") or "").lower()
-        model = str(_raw_config_get(config, "llm_model", "") or "").lower()
-        if provider == "routing-profile" and model == "free-team":
-            from .free_team_defaults import free_team_profile_template
+    Free Team owns only routing-profile/LLM Profile overlays.  It does not
+    replace the canonical ``agent_team`` Team/Subagent graph, so reads are
+    always served from the App Config root.
+    """
 
-            profile = free_team_profile_template()
-            stored = _raw_config_get(config, "routing_profiles.free-team", {}) or {}
-            if isinstance(stored, dict):
-                stored_team = stored.get("agent_team")
-                profile.update(
-                    {key: value for key, value in stored.items() if key != "agent_team"}
-                )
-                if isinstance(stored_team, dict):
-                    merged_team = dict(profile.get("agent_team") or {})
-                    for section in ("model_groups", "members"):
-                        stored_section = stored_team.get(section)
-                        if isinstance(stored_section, dict):
-                            merged_team[section] = {
-                                **dict(merged_team.get(section) or {}),
-                                **stored_section,
-                            }
-                    merged_team.update(
-                        {
-                            key: value
-                            for key, value in stored_team.items()
-                            if key not in {"model_groups", "members"}
-                        }
-                    )
-                    profile["agent_team"] = merged_team
-            if not bool(profile.get("enabled", True)):
-                return _raw_config_get(config, key, default)
-            if key == "agent_team.delegation_enabled":
-                return bool(profile.get("agent_team_enabled", True))
-            overlay = profile.get("agent_team") or {}
-            value: Any = overlay
-            for part in key.removeprefix("agent_team.").split("."):
-                if not isinstance(value, dict) or part not in value:
-                    return _raw_config_get(config, key, default)
-                value = value[part]
-            return value
     return _raw_config_get(config, key, default)
 
 
@@ -309,72 +87,94 @@ def config_set(config: Any, key: str, value: Any) -> None:
         target[parts[-1]] = value
 
 
-def _clean_member_key(member_key: str) -> str:
-    return str(member_key or "").strip()
+def _catalog_main_effort(config: Any, provider: str, model: str) -> str:
+    """Return the configured Main effort only when the active model accepts it.
 
+    Agent Team ``same``/``lower`` policies are relative to the *resolved Chat
+    Main* route.  Main effort used to be exposed here for OpenAI only, which
+    meant a DeepSeek/DeepInfra/CLI Main silently lost its configured catalog
+    value before the policy resolver ran.  Keep this boundary provider
+    agnostic: read the provider's existing config key, then validate the raw
+    value against the shared model catalog.  No provider/model-specific effort
+    list is maintained here.
+    """
 
-def _route_from_model_routing(config: Any, route: str) -> dict[str, Any] | None:
-    route = _clean_member_key(route)
-    raw = config_get(config, f"model_routing.overrides.{route}", None)
-    return raw if isinstance(raw, dict) else None
+    provider_id = str(provider or "").strip().lower()
+    model_id = str(model or "").strip()
+    if not provider_id or not model_id:
+        return ""
+    effort_keys = {
+        "openai": "openai.reasoning_effort",
+        "deepseek": "deepseek.reasoning_effort",
+        "deepinfra": "deepinfra.reasoning_effort",
+        "kimi": "kimi.reasoning_effort",
+        "codex-cli": "codex_cli.reasoning_effort",
+        "claude-cli": "claude_cli.reasoning_effort",
+        "openai_compatible_local": "openai_compatible_local.llama_cpp.reasoning_effort",
+    }
+    key = effort_keys.get(provider_id)
+    if not key:
+        return ""
+    effort = str(_raw_config_get(config, key, "") or "").strip()
+    # The non-Team DeepSeek request path treats an unset/empty setting as its
+    # provider default (high).  Expose that same effective value to Main route
+    # resolution so inherit same/lower policies are based on what the request
+    # will actually send, rather than silently losing the effort at this
+    # catalog boundary.
+    if not effort and provider_id == "deepseek":
+        effort = "high"
+    # gpt-5.6-luna is the configured OpenAI Main fallback.  Preserve the
+    # existing fallback, but still pass it through the catalog check below.
+    if not effort and provider_id == "openai":
+        model_leaf = model_id.lower().rsplit("/", 1)[-1]
+        if model_leaf.startswith("gpt-5.6-luna"):
+            effort = "max"
+    if not effort and provider_id == "openai_compatible_local":
+        try:
+            from .llm_model_catalog import reasoning_effort_default_for_model
 
+            effort = str(
+                reasoning_effort_default_for_model(provider_id, model_id) or ""
+            ).strip()
+        except Exception:
+            effort = ""
+    if not effort:
+        return ""
+    try:
+        from .llm_model_catalog import reasoning_effort_options_for_model
 
-def _group_route_by_id(config: Any, group_id: str) -> dict[str, Any] | None:
-    """Resolve a group_id from the single Agent Team model-group store."""
-    group_id = str(group_id or "").strip()
-    if not group_id:
-        return None
-    raw = config_get(config, f"agent_team.model_groups.{group_id}", None)
-    if isinstance(raw, dict):
-        return raw
-    return None
-
-
-def agent_team_member_configured_group_id(config: Any, member_key: str) -> str:
-    """Return the persisted group ID, preserving explicit main inheritance."""
-    key = _clean_member_key(member_key)
-    member = config_get(config, f"agent_team.members.{key}", {}) or {}
-    if isinstance(member, dict) and "group_id" in member:
-        return str(member.get("group_id") or "").strip()
-    return MODEL_ROUTE_CLASS_BY_ROUTE.get(key, "")
-
-
-def agent_team_member_group_id(
-    config: Any,
-    member_key: str,
-    *,
-    delegation_group_id: str | None = None,
-) -> str:
-    """Return the effective group ID for a concrete execution."""
-    configured = agent_team_member_configured_group_id(config, member_key)
-    if configured != AUTO_AGENT_TEAM_GROUP_ID:
-        return configured
-    selected = str(delegation_group_id or "").strip()
-    return selected if selected in BUILTIN_AGENT_TEAM_MODEL_GROUPS else ""
-
-
-def _model_group_route(
-    config: Any,
-    route: str,
-    *,
-    delegation_group_id: str | None = None,
-) -> dict[str, Any] | None:
-    group_id = agent_team_member_group_id(
-        config,
-        route,
-        delegation_group_id=delegation_group_id,
-    )
-    return _group_route_by_id(config, group_id) if group_id else None
+        options = [
+            str(item).strip()
+            for item in reasoning_effort_options_for_model(provider_id, model_id)
+            if str(item).strip()
+        ]
+    except Exception:
+        options = []
+    if effort in options:
+        return effort
+    # OpenAI deployments can expose private/tenant model IDs that are absent
+    # from the static catalog.  Preserve the pre-existing configured Main
+    # value for that unknown model; explicit Agent Team routes still fail
+    # closed in ``_apply_explicit_route_effort`` once their target model is
+    # resolved.  Providers with a formal catalog return an empty value when a
+    # configured effort is not supported.
+    if not options and provider_id == "openai":
+        return effort
+    return ""
 
 
 def _main_route(config: Any) -> dict[str, Any]:
-    provider = str(config_get(config, "llm_provider", "openai") or "openai").strip().lower()
-    model = str(config_get(config, "llm_model", "") or "").strip()
+    """Resolve the configured main provider/model for Profile inheritance."""
+
+    provider = str(_raw_config_get(config, "llm_provider", "openai") or "openai").strip().lower()
+    model = str(_raw_config_get(config, "llm_model", "") or "").strip()
     if not model:
         provider_model_keys = {
             "openai": ("openai.model",),
             "gemini": ("gemini.model",),
             "openrouter": ("openrouter.model",),
+            "deepseek": ("deepseek.model",),
+            "deepinfra": ("deepinfra.model",),
             "kimi": ("kimi.model",),
             "ollama": ("ollama.model",),
             "sglang": ("sglang.model",),
@@ -385,577 +185,390 @@ def _main_route(config: Any) -> dict[str, Any]:
             "grok-cli": ("grok_cli.model",),
         }
         for key in provider_model_keys.get(provider, ()):
-            model = str(config_get(config, key, "") or "").strip()
+            model = str(_raw_config_get(config, key, "") or "").strip()
             if model:
                 break
-    return {"provider": provider, "model": model}
+    route: dict[str, Any] = {"provider": provider, "model": model}
+    effort = _catalog_main_effort(config, provider, model)
+    if effort:
+        route["effort"] = effort
+        route["reasoning_effort"] = effort
+    return route
 
 
-def _provider_configured(config: Any, provider: str, route: dict[str, Any], *, main: bool = False) -> bool:
-    provider = str(provider or "").strip().lower()
-    if not provider:
-        return False
-    if main:
-        return True
-    if provider in {"codex-cli", "claude-cli", "antigravity-cli", "grok-cli"}:
-        return True
-    if str(route.get("api_key") or "").strip() or str(route.get("base_url") or "").strip():
-        return True
-    if provider in {"openai", "gemini", "openrouter", "kimi", "grok", "claude"}:
-        env_names = {
-            "openai": ("OPENAI_API_KEY", "openai_api_key"),
-            "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY", "gemini_api_key"),
-            "openrouter": ("OPENROUTER_API_KEY", "openrouter_api_key"),
-            "kimi": ("MOONSHOT_API_KEY", "kimi_api_key"),
-            "grok": ("XAI_API_KEY", "xai_api_key", "grok_api_key"),
-            "claude": ("ANTHROPIC_API_KEY", "anthropic_api_key"),
-        }.get(provider, ())
-        import os
-
-        if any(os.getenv(name) for name in env_names if name.isupper()):
-            return True
-        if any(config_get(config, name, None) for name in env_names if not name.isupper()):
-            return True
-    if provider in {"ollama", "sglang", "openai_compatible_local"}:
-        return bool(
-            config_get(config, f"{provider}.base_url", None)
-            or config_get(config, f"{provider}.host", None)
-            or config_get(config, f"{provider}.model", None)
-        )
-    return False
-
-
-def _normalize_route_target(config: Any, raw: dict[str, Any] | None, *, route: str, main: bool = False) -> dict[str, Any] | None:
-    if not isinstance(raw, dict):
-        return None
-    provider = str(raw.get("provider") or "").strip().lower()
-    model = str(raw.get("model") or "").strip()
-    if route == "agent_harness":
-        provider = provider or "codex-cli"
-        model = model or "gpt-5-codex"
-    static_target = provider in MODEL_ROUTING_PROVIDERS and bool(model)
-    if not static_target:
-        target_type = str(raw.get("target_type") or "").strip().lower()
-        if target_type == "pool" or (
-            provider == "routing-profile" and model == "free-team"
-        ):
-            pool_id = str(raw.get("pool_id") or "").strip()
-            if not pool_id:
-                pool_id = str(
-                    config_get(
-                        config,
-                        "routing_profiles.free-team.main_pool_id",
-                        "coordinator",
-                    )
-                    or "coordinator"
-                )
-            result = {
-                "kind": "pool",
-                "provider": "routing-profile",
-                "model": "free-team",
-                "routing_profile_id": str(
-                    raw.get("routing_profile_id") or "free-team"
-                ),
-                "pool_id": pool_id,
-            }
-            effort_policy = str(raw.get("effort_policy") or "").strip()
-            effort = str(
-                raw.get("effort") or raw.get("reasoning_effort") or ""
-            ).strip()
-            if effort_policy:
-                result["effort_policy"] = effort_policy
-            if effort:
-                result["effort"] = effort
-                result["reasoning_effort"] = effort
-            return result
-        return None
-    if route == "agent_harness" and provider not in AGENT_HARNESS_PROVIDERS:
-        return None
-    if not _provider_configured(config, provider, raw, main=main):
-        return None
-    result: dict[str, str] = {"provider": provider, "model": model}
-    mode = str(raw.get("mode") or raw.get("reasoning_effort") or "").strip()
-    if mode:
-        result["mode"] = mode
-        result["reasoning_effort"] = mode
-    runner = str(raw.get("runner") or "").strip()
-    if route == "agent_harness":
-        if not runner:
-            runner = "claude_code" if provider == "claude-cli" else "codex_exec"
-        result["runner"] = runner
-    elif runner:
-        result["runner"] = runner
-    return result
-
-
-def _merge_route_layer(
-    base: dict[str, Any],
-    layer: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Overlay one route while treating blank target fields as inheritance."""
-    merged = dict(base)
-    for field, value in (layer or {}).items():
-        if field in {"provider", "model", "runner"} and not str(value or "").strip():
-            continue
-        merged[field] = value
-    return merged
-
-
-def resolve_model_route(
-    config: Any,
-    route: str,
-    *,
-    delegation_group_id: str | None = None,
-) -> dict[str, Any] | None:
-    """Resolve one route by member override, selected/fixed group, then main."""
-    key = _clean_member_key(route)
-    if key not in AGENT_TEAM_MEMBER_KEYS:
-        return None
-    member = config_get(config, f"agent_team.members.{key}", {}) or {}
-    member_override = member.get("override") if isinstance(member, dict) else None
-    if key == "agent_harness":
-        return _normalize_route_target(
-            config,
-            member_override or _route_from_model_routing(config, key) or {"provider": "codex-cli", "model": "gpt-5-codex", "runner": "codex_exec"},
-            route=key,
-        )
-    main_route = _main_route(config)
-    group_route = _model_group_route(
-        config,
-        key,
-        delegation_group_id=delegation_group_id,
-    ) or {}
-    legacy_or_override = member_override if isinstance(member_override, dict) else (_route_from_model_routing(config, key) or {})
-    merged_group = _merge_route_layer(main_route, group_route)
-    merged_override = _merge_route_layer(merged_group, legacy_or_override)
-    for raw, is_main in ((merged_override, not bool(group_route or legacy_or_override)), (merged_group, not bool(group_route)), (main_route, True)):
-        target = _normalize_route_target(config, raw, route=key, main=is_main)
-        if target is not None:
-            return target
-    return None
-
-
-def model_route_is_explicit(
-    config: Any,
-    route: str,
-    *,
-    delegation_group_id: str | None = None,
-) -> bool:
-    """Return whether a route resolved from model_routing rather than main defaults."""
-    key = _clean_member_key(route)
-    if key not in AGENT_TEAM_MEMBER_KEYS:
-        return False
-    member = agent_team_member_configured(config, key)
-    if isinstance(member.get("override"), dict) and any(member["override"].get(field) for field in ("provider", "model", "effort_policy")):
-        return True
-    group_id = agent_team_member_group_id(
-        config,
-        key,
-        delegation_group_id=delegation_group_id,
-    )
-    if group_id and isinstance(_group_route_by_id(config, group_id), dict):
-        return True
-    override_target = _normalize_route_target(
-        config,
-        _route_from_model_routing(config, key),
-        route=key,
-    )
-    if override_target is not None:
-        return True
-    group_target = _normalize_route_target(
-        config,
-        _model_group_route(
-            config,
-            key,
-            delegation_group_id=delegation_group_id,
-        ),
-        route=key,
-    )
-    return group_target is not None
-
-
-def _default_member_settings(member_key: str) -> dict[str, Any]:
-    base = copy.deepcopy(AGENT_TEAM_DEFAULT_ROLES.get(member_key, {}))
-    if not base:
-        return {}
-    base.setdefault("id", member_key)
-    base.setdefault("member_key", member_key)
-    base.setdefault("label", AGENT_TEAM_MEMBER_LABELS.get(member_key, member_key))
-    base.setdefault("reasoning_effort", base.get("mode", "medium"))
-    return base
-
-
-def _normalize_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _normalize_int(value: Any, default: int) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _normalize_roster_item(raw: dict[str, Any], fallback_key: str | None = None) -> dict[str, Any]:
-    key = _clean_member_key(
-        raw.get("member_key")
-        or raw.get("key")
-        or raw.get("id")
-        or raw.get("role")
-        or fallback_key
-    )
-    if key not in AGENT_TEAM_MEMBER_KEYS:
-        key = fallback_key or key
-
-    default = _default_member_settings(key) if key in AGENT_TEAM_MEMBER_KEYS else {}
-    item = {**default, **copy.deepcopy(raw)}
-    item["member_key"] = key
-    item["id"] = str(item.get("id") or key)
-    item["label"] = str(item.get("label") or AGENT_TEAM_MEMBER_LABELS.get(key, key))
-    item["enabled"] = _normalize_bool(item.get("enabled"), default.get("enabled", False))
-
-    provider = str(item.get("provider") or default.get("provider") or "").strip().lower()
-    item["provider"] = provider
-    item["model"] = str(item.get("model") or default.get("model") or "").strip()
-    mode = str(
-        item.get("mode")
-        or item.get("reasoning_effort")
-        or default.get("mode")
-        or "medium"
-    ).strip()
-    item["mode"] = mode
-    item["reasoning_effort"] = mode
-    item["role"] = str(item.get("role") or default.get("role") or key).strip()
-    tools = item.get("tools", default.get("tools", []))
-    item["tools"] = [str(tool) for tool in tools] if isinstance(tools, list) else []
-    item["scalable"] = _normalize_bool(item.get("scalable"), bool(default.get("scalable")))
-    max_default = _normalize_int(default.get("max_instances"), 1)
-    max_instances = max(1, _normalize_int(item.get("max_instances"), max_default))
-    if not item["scalable"]:
-        max_instances = 1
-    item["max_instances"] = max_instances
-    default_instances = _normalize_int(
-        item.get("default_instances"),
-        _normalize_int(default.get("default_instances"), 1 if item["enabled"] else 0),
-    )
-    item["default_instances"] = max(0, min(default_instances, max_instances))
-    item["spawn_policy"] = str(item.get("spawn_policy") or "adaptive").strip()
-    item["runner"] = str(item.get("runner") or default.get("runner") or "").strip()
-    return item
-
-
-def agent_team_enabled(config: Any) -> bool:
-    return agent_team_delegation_enabled(config)
-
-
-def agent_team_delegation_enabled(config: Any) -> bool:
-    """委譲ツール（作業系サブエージェント）の公開スイッチ。デフォルトOFF。"""
-    return _normalize_bool(config_get(config, "agent_team.delegation_enabled", False), False)
-
-
-def agent_team_member_configured(config: Any, member_key: str) -> dict[str, Any]:
-    raw = config_get(config, f"agent_team.members.{_clean_member_key(member_key)}", {}) or {}
+def _agent_team_section(config: Any) -> dict[str, Any]:
+    raw = _raw_config_get(config, "agent_team", {}) if config is not None else {}
     return raw if isinstance(raw, dict) else {}
 
 
-def agent_team_confirm_prompt(config: Any) -> bool:
-    return bool(config_get(config, "agent_team.confirm_prompt", True))
+# ---------------------------------------------------------------------------
+# Context resolver compatibility entrypoint
 
 
-def agent_team_notify(config: Any) -> bool:
-    return bool(config_get(config, "agent_team.notify", True))
+def _legacy_agent_team_scope_active(
+    config: Any,
+    *,
+    user: Any = None,
+    project: Any = None,
+    session: Any = None,
+    generation_profile: str | None = None,
+    app_target_id: str | None = None,
+    development_status: str | None = None,
+    story_mode: str | None = None,
+) -> dict[str, Any]:
+    from .agent_team_v3 import agent_team_scope_active
+
+    return agent_team_scope_active(
+        config,
+        user=user,
+        project=project,
+        session=session,
+        generation_profile=generation_profile,
+        app_target_id=app_target_id,
+        development_status=development_status,
+        story_mode=story_mode,
+    )
 
 
-def agent_team_roster(config: Any) -> list[dict[str, Any]]:
-    roster: list[dict[str, Any]] = []
-    for member_key in sorted(AGENT_TEAM_MEMBER_KEYS):
-        defaults = _default_member_settings(member_key)
-        member_config = agent_team_member_configured(config, member_key)
-        override = {
-            **member_config,
-            **(member_config.get("override") or _route_from_model_routing(config, member_key) or {}),
+# ---------------------------------------------------------------------------
+# Runtime resilience: normalized failures, circuit breaker, and interruption
+# continuation state.  These are in-memory/request-scoped by design; no DB
+# table or migration is required.
+
+_NON_CIRCUIT_ERROR_CODES = {"not_found", "ambiguous_target", "user_validation", "validation", "cancelled"}
+
+
+def tool_failure_family(tool_name: Any) -> str:
+    """Normalize concrete tool names to a retry/circuit family.
+
+    A model may vary ``docs_search``/``docs_read`` arguments (or move from a
+    read to a query helper) while the underlying Docs service is failing for
+    the same reason.  Keeping this mapping deterministic prevents those
+    cosmetic changes from bypassing the per-turn failure budget.
+    """
+
+    name = str(tool_name or "unknown").strip().lower()
+    if name.startswith(("docs_", "doc_")) or name in {"search_docs", "read_doc"}:
+        return "docs"
+    if name.startswith(("project_", "task_", "wbs_", "issue_", "record_")):
+        return "project"
+    if name.startswith(("workspace_", "filesystem_", "file_")) or name in {
+        "read_file",
+        "search_files",
+        "list_directory",
+    }:
+        return "workspace"
+    if name.startswith(("media_", "spotify_")):
+        return "media"
+    return name or "unknown"
+
+
+@dataclass(frozen=True)
+class ToolFailureSignature:
+    tool_family: str
+    error_code: str
+    root_cause: str
+
+    @property
+    def key(self) -> str:
+        return f"{self.tool_family}:{self.error_code}:{self.root_cause}"
+
+
+def _normalize_root_cause(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    # Search/query parameters are request noise, not a new root cause.
+    text = re.sub(r"(?:query|q|limit|depth|offset)\s*[:=]\s*[^\s,;]+", "", text)
+    text = re.sub(r"[0-9a-f]{8}-[0-9a-f-]{27,}", "<uuid>", text)
+    text = re.sub(r"\b\d+\b", "<n>", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()[:240] or "unknown"
+
+
+def normalize_tool_failure_signature(tool_family: Any, error_code: Any = "", root_cause: Any = "") -> ToolFailureSignature:
+    family = re.sub(r"[^a-z0-9_.-]+", "_", str(tool_family or "unknown").strip().lower()) or "unknown"
+    code = re.sub(r"[^a-z0-9_.-]+", "_", str(error_code or "unknown").strip().lower()) or "unknown"
+    return ToolFailureSignature(family, code, _normalize_root_cause(root_cause))
+
+
+def parse_structured_tool_failure(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        payload = value
+    elif isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            # Provider adapters sometimes prefix a high-level Docs tool's
+            # structured envelope with a short natural-language ``Error:``
+            # label.  Retain the non-retryable classification so the parent
+            # circuit breaker cannot be bypassed by cosmetic wording.
+            text = str(value or "")
+            if "docs" in text.casefold() and "内部処理" in text:
+                return {
+                    "error_code": "docs_access_internal",
+                    "retryable": False,
+                    "error": "Docsの内部処理に失敗しました。",
+                }
+            return None
+        payload = parsed if isinstance(parsed, dict) else {}
+    else:
+        payload = {}
+    if payload.get("success", True) is not False:
+        return None
+    return {
+        "error_code": str(payload.get("error_code") or payload.get("code") or "tool_error"),
+        "retryable": bool(payload.get("retryable", False)),
+        "error": str(payload.get("error") or payload.get("message") or ""),
+    }
+
+
+@dataclass(frozen=True)
+class ToolFailureDecision:
+    allowed: bool
+    retryable: bool
+    signature: ToolFailureSignature | None = None
+    count: int = 0
+    failed_tool_count: int = 0
+    reason: str = ""
+    circuit_opened: bool = False
+
+
+class ToolFailureCircuitBreaker:
+    """Bound repeated non-retryable tool failures per delegation turn."""
+
+    def __init__(self, *, max_same_failure: int = 2, failed_tool_budget: int = 8) -> None:
+        self.max_same_failure = max(1, int(max_same_failure))
+        self.failed_tool_budget = max(1, int(failed_tool_budget))
+        self._counts: dict[str, int] = {}
+        self._opened: set[str] = set()
+        self._failed_tool_count = 0
+        self._suppressed: dict[str, int] = {}
+
+    @property
+    def failed_tool_count(self) -> int:
+        return self._failed_tool_count
+
+    def check(self, tool_family: str, failure: Any = None, *, error_code: str = "", retryable: bool | None = None, root_cause: str = "") -> ToolFailureDecision:
+        parsed = parse_structured_tool_failure(failure)
+        if parsed:
+            error_code = parsed["error_code"]
+            retryable = parsed["retryable"]
+            root_cause = parsed["error"]
+        if retryable is None:
+            retryable = False
+        signature = normalize_tool_failure_signature(tool_family, error_code, root_cause)
+        code = signature.error_code
+        if code in _NON_CIRCUIT_ERROR_CODES:
+            return ToolFailureDecision(True, bool(retryable), signature=signature, reason="user-resolvable failure")
+        if bool(retryable):
+            return ToolFailureDecision(True, True, signature=signature, reason="retryable failure")
+        if signature.key in self._opened:
+            self._suppressed[signature.key] = self._suppressed.get(signature.key, 0) + 1
+            return ToolFailureDecision(False, False, signature=signature, count=self._counts.get(signature.key, 0), failed_tool_count=self._failed_tool_count, reason="circuit open", circuit_opened=True)
+        self._failed_tool_count += 1
+        count = self._counts.get(signature.key, 0) + 1
+        self._counts[signature.key] = count
+        if count >= self.max_same_failure or self._failed_tool_count >= self.failed_tool_budget:
+            self._opened.add(signature.key)
+            return ToolFailureDecision(False, False, signature=signature, count=count, failed_tool_count=self._failed_tool_count, reason="circuit opened", circuit_opened=True)
+        return ToolFailureDecision(True, False, signature=signature, count=count, failed_tool_count=self._failed_tool_count, reason="failure budget available")
+
+    def allow(self, tool_family: str, failure: Any = None, **kwargs: Any) -> bool:
+        return self.check(tool_family, failure, **kwargs).allowed
+
+    def is_open(self, tool_family: str) -> bool:
+        """Return whether any normalized failure in ``tool_family`` is open."""
+
+        family = str(tool_family or "unknown").strip().lower()
+        return any(key.startswith(f"{family}:") for key in self._opened)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {"failed_tool_count": self._failed_tool_count, "counts": dict(self._counts), "opened": sorted(self._opened), "suppressed": dict(self._suppressed)}
+
+
+@dataclass
+class AgentContinuationState:
+    original_goal: str = ""
+    selected_project_id: str | None = None
+    scope: dict[str, Any] = field(default_factory=dict)
+    resolved_node_ids: tuple[str, ...] = ()
+    # Bounded read context retained for a continuation.  This is deliberately
+    # opaque text (not a full corpus dump) so a cancelled Docs write can carry
+    # the source facts into the resumed child without re-searching the steer
+    # wording or persisting huge payloads in AgentRun metadata.
+    resolved_context: tuple[str, ...] = ()
+    successful_tool_identities: tuple[str, ...] = ()
+    pending_mutation_target_ids: tuple[str, ...] = ()
+    pending_destination_parent_id: str | None = None
+    mutation_state: str = "not_started"
+    cancelled_tool_events: list[dict[str, Any]] = field(default_factory=list)
+    explicit_cancelled: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "original_goal": self.original_goal,
+            "selected_project_id": self.selected_project_id,
+            "scope": copy.deepcopy(self.scope),
+            "resolved_node_ids": list(self.resolved_node_ids),
+            "resolved_context": list(self.resolved_context),
+            "successful_tool_identities": list(self.successful_tool_identities),
+            "pending_mutation_target_ids": list(self.pending_mutation_target_ids),
+            "pending_destination_parent_id": self.pending_destination_parent_id,
+            "mutation_state": self.mutation_state,
+            "cancelled_tool_events": copy.deepcopy(self.cancelled_tool_events),
+            "explicit_cancelled": self.explicit_cancelled,
         }
-        target = resolve_model_route(config, member_key)
-        item = _normalize_roster_item({**defaults, **override}, member_key)
-        item["enabled"] = _normalize_bool(member_config.get("enabled"), defaults.get("enabled", False))
-        item["group_id"] = agent_team_member_configured_group_id(config, member_key)
-        if target:
-            item.update(target)
-        if member_key in SCALABLE_MEMBER_KEYS:
-            item["scalable"] = True
-            item["max_instances"] = max(
-                1,
-                _normalize_int(
-                    override.get("max_instances"),
-                    _normalize_int(defaults.get("max_instances"), 1),
-                ),
-            )
-            item["default_instances"] = max(
-                1,
-                min(
-                    _normalize_int(
-                        override.get("default_instances"),
-                        _normalize_int(defaults.get("default_instances"), 1),
-                    ),
-                    item["max_instances"],
-                ),
-            )
-        roster.append(item)
-    return roster
 
-
-def agent_team_member_declared(config: Any, member_key: str) -> bool:
-    key = _clean_member_key(member_key)
-    if key not in AGENT_TEAM_MEMBER_KEYS:
-        return False
-    return bool(agent_team_member_configured(config, key))
-
-
-def agent_team_member_settings(config: Any, member_key: str) -> dict[str, Any]:
-    key = _clean_member_key(member_key)
-    if key not in AGENT_TEAM_MEMBER_KEYS:
-        return {}
-    for item in agent_team_roster(config):
-        if item.get("member_key") == key or item.get("id") == key:
-            return item
-    return _normalize_roster_item(_default_member_settings(key), key)
-
-
-def agent_team_member_enabled(config: Any, member_key: str) -> bool:
-    key = _clean_member_key(member_key)
-    if key not in AGENT_TEAM_MEMBER_KEYS:
-        return False
-    configured = _normalize_bool(
-        agent_team_member_configured(config, key).get("enabled"),
-        _default_member_settings(key).get("enabled", False),
-    )
-    if key in SPECIALIST_MEMBER_KEYS:
-        return configured
-    return agent_team_delegation_enabled(config) and configured
-
-
-def agent_team_member_for(
-    config: Any,
-    member_key: str,
-    *,
-    delegation_group_id: str | None = None,
-) -> dict[str, str] | None:
-    """Return a validated provider/model target for one Agent Team member."""
-    key = _clean_member_key(member_key)
-    if key not in AGENT_TEAM_MEMBER_KEYS:
-        return None
-    if not agent_team_member_enabled(config, key):
-        return None
-    return resolve_model_route(
-        config,
-        key,
-        delegation_group_id=delegation_group_id,
-    )
-
-
-def agent_team_active_roster(config: Any) -> list[dict[str, Any]]:
-    if not agent_team_delegation_enabled(config):
-        return []
-    return [item for item in agent_team_roster(config) if item.get("enabled")]
-
-
-def agent_team_scalable_members(config: Any) -> list[dict[str, Any]]:
-    return [
-        item
-        for item in agent_team_active_roster(config)
-        if item.get("member_key") in SCALABLE_MEMBER_KEYS and item.get("scalable")
-    ]
-
-
-def agent_team_delegate_member(
-    config: Any,
-    role: str,
-    *,
-    delegation_group_id: str | None = None,
-) -> dict[str, Any] | None:
-    clean_role = _clean_member_key(role)
-    if clean_role not in AGENT_TEAM_MEMBER_KEYS:
-        alias = {
-            "design": "architect",
-            "research": "explorer",
-            "implementation": "implementer",
-            "review": "reviewer",
-        }.get(clean_role)
-        clean_role = alias or clean_role
-    if clean_role not in AGENT_TEAM_MEMBER_KEYS:
-        return None
-    if not agent_team_member_enabled(config, clean_role):
-        return None
-    member = agent_team_member_settings(config, clean_role)
-    configured_group_id = agent_team_member_configured_group_id(config, clean_role)
-    effective_group_id = agent_team_member_group_id(
-        config,
-        clean_role,
-        delegation_group_id=delegation_group_id,
-    )
-    target = resolve_model_route(
-        config,
-        clean_role,
-        delegation_group_id=delegation_group_id,
-    )
-    if target:
-        member.update(target)
-        mode = resolve_agent_team_member_mode(
-            config,
-            member_key=clean_role,
-            provider=str(target.get("provider") or ""),
-            model=str(target.get("model") or ""),
-            delegation_group_id=delegation_group_id,
+    @classmethod
+    def from_dict(cls, value: Any) -> "AgentContinuationState":
+        raw = value if isinstance(value, dict) else {}
+        return cls(
+            original_goal=str(raw.get("original_goal") or ""),
+            selected_project_id=str(raw.get("selected_project_id") or "") or None,
+            scope=copy.deepcopy(raw.get("scope") or {}) if isinstance(raw.get("scope"), dict) else {},
+            resolved_node_ids=tuple(str(item) for item in (raw.get("resolved_node_ids") or []) if str(item)),
+            resolved_context=tuple(
+                str(item)[:2000]
+                for item in (raw.get("resolved_context") or [])
+                if str(item).strip()
+            )[:8],
+            successful_tool_identities=tuple(str(item) for item in (raw.get("successful_tool_identities") or []) if str(item)),
+            pending_mutation_target_ids=tuple(str(item) for item in (raw.get("pending_mutation_target_ids") or []) if str(item)),
+            pending_destination_parent_id=str(raw.get("pending_destination_parent_id") or "") or None,
+            mutation_state=str(raw.get("mutation_state") or "not_started"),
+            cancelled_tool_events=copy.deepcopy(raw.get("cancelled_tool_events") or []) if isinstance(raw.get("cancelled_tool_events"), list) else [],
+            explicit_cancelled=bool(raw.get("explicit_cancelled", False)),
         )
-        member["mode"] = mode
-        member["reasoning_effort"] = mode
-    member["configured_group_id"] = configured_group_id
-    member["group_id"] = effective_group_id or configured_group_id
-    return member
+
+    def apply_delta(self, message: Any) -> "AgentContinuationState":
+        text = str(message or "").strip()
+        if text and any(token in text.lower() for token in ("やめて", "中止", "キャンセル", "cancel", "stop")):
+            self.explicit_cancelled = True
+        return self
+
+    @property
+    def can_resume(self) -> bool:
+        return not self.explicit_cancelled and self.mutation_state not in {"completed", "cancelled"}
 
 
-def agent_team_clamp_instances(config: Any, role: str, requested: Any) -> int:
-    member = agent_team_delegate_member(config, role)
-    if not member:
-        return 0
-    default_instances = _normalize_int(member.get("default_instances"), 1)
-    max_instances = max(1, _normalize_int(member.get("max_instances"), 1))
-    count = _normalize_int(requested, default_instances)
-    if not member.get("scalable"):
-        return 1
-    return max(1, min(count, max_instances))
+_CURRENT_CONTINUATION_STATE: contextvars.ContextVar[AgentContinuationState | None] = (
+    contextvars.ContextVar("aoitalk_current_continuation_state", default=None)
+)
 
 
-def agent_team_member_requires_external_approval(
-    member: dict[str, str] | None,
-) -> bool:
-    if not member:
-        return False
-    provider = str(member.get("provider") or "").strip().lower()
-    return provider in AGENT_TEAM_EXTERNAL_APPROVAL_PROVIDERS
+def set_current_continuation_state(
+    state: AgentContinuationState | None,
+) -> contextvars.Token:
+    """Bind the active Agent Team continuation to the current turn.
+
+    The binding intentionally lives for the generation attempt (rather than
+    being reset at the end of the delegate call).  ``GenerationInterrupted``
+    is caught one frame above the tool loop, so the response retry can include
+    the deterministic state even when the delegate coroutine was cancelled.
+    ContextVars keep this turn-local and do not leak to another conversation.
+    """
+
+    return _CURRENT_CONTINUATION_STATE.set(state)
 
 
-def agent_team_member_mode(
-    config: Any,
-    member_key: str,
-    default: str = "",
+def reset_current_continuation_state(token: contextvars.Token) -> None:
+    """Restore the continuation binding that preceded a generation attempt."""
+
+    _CURRENT_CONTINUATION_STATE.reset(token)
+
+
+def get_current_continuation_state() -> AgentContinuationState | None:
+    return _CURRENT_CONTINUATION_STATE.get()
+
+
+def continuation_state_for_prompt(
+    state: AgentContinuationState | None = None,
 ) -> str:
-    route = resolve_model_route(config, member_key)
-    if route:
-        mode = str(route.get("mode") or route.get("reasoning_effort") or "").strip()
-        if mode:
-            return mode
-    member = agent_team_member_settings(config, member_key)
-    return str(
-        member.get("mode")
-        or member.get("reasoning_effort")
-        or default
-        or ""
-    ).strip()
+    """Render a bounded, provider-neutral continuation snapshot for retry."""
 
-
-def resolve_agent_team_member_mode(
-    config: Any,
-    *,
-    member_key: str,
-    provider: str,
-    model: str,
-    delegation_group_id: str | None = None,
-) -> str:
-    from .llm_model_catalog import default_llm_mode_for_options, reasoning_effort_options_for_model
-
-    options = reasoning_effort_options_for_model(provider, model)
-    if not options:
+    current = state if state is not None else get_current_continuation_state()
+    if current is None:
         return ""
-
-    member = agent_team_member_configured(config, member_key)
-    override = member.get("override") if isinstance(member.get("override"), dict) else {}
-    group = _model_group_route(
-        config,
-        member_key,
-        delegation_group_id=delegation_group_id,
-    ) or {}
-    if not member and not group:
-        mode = agent_team_member_mode(config, member_key)
-        return mode if mode in options else default_llm_mode_for_options(options)
-    policy_source = override if override.get("effort_policy") else group
-    policy = str(policy_source.get("effort_policy") or "same").strip().lower()
-    if policy in {"default", "none"}:
-        return ""
-    if policy == "explicit":
-        selected = str(policy_source.get("effort") or policy_source.get("reasoning_effort") or "").strip()
-        return selected if selected in options else ""
-    main = _main_route(config)
-    main_key = {"openai": "openai.reasoning_effort", "kimi": "kimi.reasoning_effort", "codex-cli": "codex_cli.reasoning_effort", "claude-cli": "claude_cli.reasoning_effort"}.get(main.get("provider", ""), "")
-    main_mode_value = (
-        config_get(config, main_key, "")
-        if main_key
-        else config_get(config, "llm_runtime_mode", "")
-    )
-    main_mode = str(main_mode_value or "").strip()
-    if main_mode not in options:
-        main_mode = default_llm_mode_for_options(options)
-    if policy == "lower":
-        return options[max(0, options.index(main_mode) - 1)] if main_mode in options else ""
-    if policy == "same":
-        return main_mode if main_mode in options else ""
-    mode = agent_team_member_mode(config, member_key)
-    if mode not in options:
-        mode = default_llm_mode_for_options(options)
-    return mode
+    payload = current.to_dict()
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-def apply_agent_team_member_mode(
-    config: Any,
-    *,
-    member_key: str,
-    provider: str,
-    model: str,
-    client: Any = None,
-    delegation_group_id: str | None = None,
-) -> str:
-    mode = resolve_agent_team_member_mode(
-        config,
-        member_key=member_key,
-        provider=provider,
-        model=model,
-        delegation_group_id=delegation_group_id,
-    )
-    if mode and client is not None and hasattr(client, "set_llm_mode"):
-        client.set_llm_mode(mode)
-    return mode
+def make_continuation_state(**kwargs: Any) -> AgentContinuationState:
+    return AgentContinuationState.from_dict(kwargs)
 
 
-def agent_team_members_by_provider(config: Any) -> dict[str, list[dict[str, str]]]:
-    result: dict[str, list[dict[str, str]]] = {}
-    configured: dict[str, Any] = {}
-    legacy = config_get(config, "model_routing.overrides", {}) or {}
-    if isinstance(legacy, dict):
-        configured.update(legacy)
-    members = config_get(config, "agent_team.members", {}) or {}
-    if isinstance(members, dict):
-        for key, member in members.items():
-            if isinstance(member, dict) and isinstance(member.get("override"), dict):
-                configured[str(key)] = member["override"]
-    groups = config_get(config, "agent_team.model_groups", {}) or {}
-    if isinstance(groups, dict):
-        configured.update({f"group:{key}": value for key, value in groups.items()})
-    for member_key, member in configured.items():
-        if not isinstance(member, dict):
-            continue
-        provider = str(member.get("provider") or "").strip()
-        model = str(member.get("model") or "").strip()
-        member_key = str(member_key or "").strip()
-        if not provider or not model or not member_key:
-            continue
-        result.setdefault(provider, []).append(
-            {
-                "member_key": member_key,
-                "model": model,
-            }
-        )
-    return result
+def cancelled_tool_terminal_event(tool_name: str, *, reason: str = "user_interrupt", state: AgentContinuationState | None = None) -> dict[str, Any]:
+    payload = {"event_type": "tool_end", "tool": str(tool_name), "status": "cancelled", "reason": str(reason or "user_interrupt")}
+    if state is not None:
+        payload["continuation_state"] = state.to_dict()
+        state.cancelled_tool_events.append(dict(payload))
+    return payload
+
+
+def apply_continuation_delta(state: AgentContinuationState | dict[str, Any], message: Any) -> AgentContinuationState:
+    result = state if isinstance(state, AgentContinuationState) else AgentContinuationState.from_dict(state)
+    return result.apply_delta(message)
+
+# ---------------------------------------------------------------------------
+# Canonical schema-v3 runtime surface
+# ---------------------------------------------------------------------------
+
+from .agent_team_v3 import (  # noqa: E402,F401
+    AGENT_TEAM_CAPABILITY_CATALOG,
+    AGENT_TEAM_CONTEXT_TAGS,
+    AGENT_TEAM_SCHEMA_VERSION,
+    AGENT_TEAM_SUBAGENT_CATALOG,
+    agent_team_scope_active,
+    agent_team_teams,
+    agent_team_subagents,
+    agent_team_subagent,
+    agent_team_llm_profiles,
+    resolve_subagent_route,
+    resolve_agent_team_scope,
+    filter_subagent_capabilities,
+    agent_team_v3_enabled as _agent_team_schema_v3_enabled,
+    agent_team_v3_delegation_enabled as _agent_team_v3_delegation_enabled,
+    agent_team_v3_context_tags,
+    agent_team_v3_profiles,
+    agent_team_v3_subagents,
+    agent_team_v3_teams,
+    agent_team_v3_visible_subagents,
+    filter_agent_team_capabilities,
+    subagent_requires_external_approval,
+    apply_subagent_mode,
+    normalize_agent_team_v3,
+    resolve_agent_execution_backend,
+    resolve_agent_team_v3_route,
+)
+
+def agent_team_schema_v3_enabled(config: Any) -> bool:
+    return bool(_agent_team_schema_v3_enabled(config))
+
+
+agent_team_v3_enabled = agent_team_schema_v3_enabled
+agent_team_v3_delegation_enabled = _agent_team_v3_delegation_enabled
+
+
+def agent_team_enabled(config: Any) -> bool:
+    """Canonical Agent Team v3 topology gate.
+
+    The old service exposed a second, settings-driven switch alongside the
+    Team graph.  Runtime callers now use the schema-v3 gate directly so an
+    invalid/pre-v3 section cannot accidentally enable the v3 routing path.
+    """
+
+    return bool(agent_team_v3_enabled(config))
+
+
+def agent_team_delegation_enabled(config: Any) -> bool:
+    """Return the persisted schema-v3 delegation switch."""
+
+    return bool(agent_team_v3_delegation_enabled(config))
+
+
+def agent_team_orchestration_mode(config: Any) -> str:
+    """Return the canonical orchestration mode for terminal/API callers."""
+
+    if not agent_team_v3_enabled(config):
+        return "standard"
+    section = _agent_team_section(config)
+    return "director" if section.get("orchestration_mode") == "director" else "standard"

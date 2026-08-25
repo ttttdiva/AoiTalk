@@ -2,11 +2,11 @@
 Embedding generation and management for conversation memory
 """
 
-import json
 import asyncio
+import json
 import os
-from typing import List, Optional, Union
-from sentence_transformers import SentenceTransformer
+from typing import Any, List, Optional, Union
+
 import numpy as np
 
 
@@ -20,7 +20,7 @@ class EmbeddingManager:
             model_name: Name of the sentence transformer model
         """
         self.model_name = model_name
-        self.model: Optional[SentenceTransformer] = None
+        self.model: Optional[Any] = None
         self._lock = asyncio.Lock()
     
     async def _load_model(self):
@@ -28,6 +28,13 @@ class EmbeddingManager:
         async with self._lock:
             if self.model is None:
                 print(f"[EmbeddingManager] Loading model: {self.model_name}")
+                try:
+                    from sentence_transformers import SentenceTransformer
+                except (ImportError, ModuleNotFoundError) as exc:
+                    raise RuntimeError(
+                        "Embedding generation requires the optional "
+                        "sentence-transformers runtime dependencies."
+                    ) from exc
                 loop = asyncio.get_event_loop()
                 # Use default cache location to avoid re-downloading
                 self.model = await loop.run_in_executor(

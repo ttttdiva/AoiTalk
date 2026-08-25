@@ -8,7 +8,7 @@ AoiTalk は MioTTS と MioCodec を同一 Python プロセス内で読み込み�
 pip install -e ".[audio,miotts]"
 ```
 
-モデル本体は初回合成時に Hugging Face から自動取得されます。取得済みファイルは `tts_settings.miotts.cache_dir` と Hugging Face のキャッシュに保存されます。
+モデル本体は初回合成時に Hugging Face から自動取得されます。取得済みファイルは Hugging Face の標準 cache に保存されます。
 
 ```yaml
 tts_settings:
@@ -17,7 +17,6 @@ tts_settings:
     codec_model_id: Aratako/MioCodec-25Hz-44.1kHz-v2
     refs_dir: config/miotts_refs
     presets_dir: config/miotts_presets
-    cache_dir: cache/miotts
     device: auto
     dtype: auto
 ```

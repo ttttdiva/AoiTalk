@@ -14,19 +14,24 @@ import yaml
 
 DEFAULT_CONFIG_YAML = r"""
 default_character: 案件管理アシスタント
-llm_model: gemini-3-flash-preview
-llm_provider: gemini
+app_config_schema_version: 2
+llm_model: gpt-5.6-luna
+llm_provider: openai
 gemini:
   model: gemini-3-flash-preview
 openai:
-  model: gpt-5.5
+  model: gpt-5.6-luna
+  reasoning_effort: max
   conversation_state_mode: stateless
   prompt_cache_retention: ''
+  data_sharing_incentive_enabled: false
+  usage_tier: tier_1_2
+  billing_scope_id: ''
 sglang:
   auto_start: true
   model: default
   port: 30000
-  host: 0.0.0.0
+  host: 127.0.0.1
   mem_fraction_static: 0.9
   tensor_parallel_size: 1
   max_model_len: null
@@ -60,8 +65,6 @@ openai_compatible_local:
     mode: auto
     extra_body: {}
   keep_alive: null
-  qwopus:
-    auto_start: true
   exo:
     auto_start: true
     command: ''
@@ -69,8 +72,29 @@ openai_compatible_local:
   mlx_lm:
     auto_start: true
     command: ''
+  # Generic llama.cpp/llama-server runtime.  The model is selected through
+  # the existing openai_compatible_local provider; no model is downloaded by
+  # AoiTalk.  Set model_path (or MUSE_GLIMMER_MODEL_PATH) to enable startup.
+  llama_cpp:
+    executable: ''
+    model_path: ''
+    # Optional directory roots for exact profile GGUF auto-discovery.
+    # Existing profile_runtime paths and the checkout-drive default remain
+    # fallback candidates.  AoiTalk never downloads model files itself.
+    model_root: ''
+    model_alias: ''
+    host: 127.0.0.1
+    port: 8080
+    gpu_layers: 999
+    extra_args: []
+    auto_start: true
+    readiness_timeout: 180
+    readiness_timeout_seconds: 180
 context_compression:
   enabled: false
+  history_compaction_enabled: true
+  history_tool_result_max_chars: 2400
+  history_tool_result_total_chars: 24000
   mode: auto
   min_chars: 3000
   tool_result_max_chars: null
@@ -91,9 +115,14 @@ context_compression:
 openrouter:
   base_url: https://openrouter.ai/api/v1
   model: openai/gpt-4o-mini
+  model_provider_options: {}
   enable_tools: false
   app_name: AoiTalk
   site_url: ''
+deepinfra:
+  base_url: https://api.deepinfra.com/v1/openai
+  model: deepseek-ai/DeepSeek-V4-Flash
+  reasoning_effort: high
 kimi:
   base_url: https://api.moonshot.ai/v1
   model: kimi-k3
@@ -109,9 +138,21 @@ grok_cli:
   model: grok-build
 antigravity_cli:
   model: default
+llm_cli:
+  managed_workspace_timeout_seconds: 120
+  managed_workspace_max_tool_rounds: 3
+  # CLI provider calls are more expensive than in-process/API tool rounds.
+  # Keep profile-specific budgets bounded instead of inheriting the native
+  # autonomous-work ceiling (120) directly.
+  chat_max_tool_rounds: 5
+  assisted_work_max_tool_rounds: 12
+  autonomous_work_max_tool_rounds: 12
+  review_max_tool_rounds: 2
+  # Aggregate tool-result context sent to each CLI follow-up (characters).
+  # The runtime clamps user values to a safe upper bound.
+  tool_result_context_max_chars: 32000
 runtime_feature_permissions:
-  allowed_discord_user_ids:
-  - '217450236879044609'
+  allowed_discord_user_ids: []
 runtime_features:
   web_ui: true
   local_mic: false
@@ -127,6 +168,12 @@ external_llm:
   auto_approve: true
   tools:
   - web_search
+  permission_policy_overrides:
+    chat: ''
+    assisted_work: ''
+    autonomous_work: ''
+    review: ''
+  session_approval_cache: true
 model_routing:
   classes:
     vision:
@@ -142,30 +189,279 @@ model_routing:
       model: ''
       base_url: ''
       api_key: ''
+    clip_ingest:
+      inherit: true
+      provider: ''
+      model: ''
+      base_url: ''
+      api_key: ''
+      reasoning_effort: ''
+    writing:
+      inherit: true
+      provider: ''
+      model: ''
+      base_url: ''
+      api_key: ''
+      reasoning_effort: ''
+    video:
+      inherit: false
+      provider: mage_vl
+      model: microsoft/Mage-VL
+      base_url: http://127.0.0.1:30000/v1
+      api_key: ''
   media:
     image_mode: auto
+    video_mode: auto
   overrides: {}
+mage_vl:
+  enabled: true
+  managed: true
+  preload_on_start: false
+  model: microsoft/Mage-VL
+  base_url: http://127.0.0.1:30000/v1
+  api_key: ''
+  server_command: ''
+  startup_timeout_seconds: 300
+  inference_timeout_seconds: 600
+  max_video_bytes: 52428800
+  max_video_duration_seconds: 300
+  video_backend: frames
+  codec_engine: traditional
+  num_frames: 32
+  max_pixels: 150000
+  max_new_tokens: 256
 agent_team:
+  schema_version: 3
+  orchestration_mode: standard
   delegation_enabled: false
-  member_settings_initialized: false
-  model_groups:
-    heavy:
-      name: 高負荷
-      provider: ''
-      model: ''
-      effort_policy: same
-      effort: ''
-    light:
-      name: 軽量
-      provider: ''
-      model: ''
-      effort_policy: lower
-      effort: ''
-  members: {}
-  confirm_prompt: true
+  teams:
+    general:
+      team_id: general
+      name: General
+      description: AoiTalkの通常利用を担う常用Team。
+      enabled: true
+      sort_order: 10
+      activation:
+        mode: always
+        contexts: []
+      subagent_ids:
+      - general_worker
+      - general_researcher
+      - docs_operator
+      - project_operator
+      - workspace_operator
+      execution_profiles: {}
+    app_development:
+      team_id: app_development
+      name: App Development
+      description: アプリ開発の探索、設計、実装、レビュー。
+      enabled: true
+      sort_order: 20
+      activation:
+        mode: contextual
+        contexts:
+        - app_development
+      subagent_ids:
+      - code_explorer
+      - architecture_planner
+      - code_implementer
+      - code_reviewer
+      execution_profiles: {}
+    story:
+      team_id: story
+      name: Story
+      description: Storyの執筆、取り込み、整合性・キャラクター口調レビュー。
+      enabled: true
+      sort_order: 30
+      activation:
+        mode: contextual
+        contexts:
+        - story
+      subagent_ids:
+      - story_writer
+      - story_consistency_reviewer
+      - character_voice_reviewer
+      - story_import
+      - general_worker
+      execution_profiles: {}
+  subagents:
+    general_worker:
+      subagent_id: general_worker
+      name: 汎用作業
+      description: 特定分野へ固定しない一般作業。比較、整理、要約、補助調査、小規模なファイル作業等。
+      instructions: 特定分野へ固定せず、比較、整理、要約、補助調査、小規模なファイル作業等を行う。CLI Agentを選択した場合はnative toolsを利用可能。
+      enabled: true
+      capability_ids: [workspace_read, workspace_write, repo_map, aoi_tools]
+      scalable: true
+      default_instances: 1
+      max_instances: 4
+      max_workspace_access: write
+      allow_cli_native_tools: true
+    general_researcher:
+      subagent_id: general_researcher
+      name: 汎用調査
+      description: Web・Workspace を直接調査し、Docs/Project は専用 operator へ委譲する横断調査。
+      instructions: Web検索とWorkspace/repo mapのread-only調査を行う。DocsやProject/Tasksの詳細は docs_operator / project_operator への委譲を前提とし、自分で high-level Docs/Project tools を直接使わない。根拠を添えて報告する。
+      enabled: true
+      capability_ids: [workspace_read, repo_map, web_read, aoi_tools]
+      scalable: true
+      default_instances: 1
+      max_instances: 6
+      max_workspace_access: read
+      allow_cli_native_tools: true
+    docs_operator:
+      subagent_id: docs_operator
+      name: Docs操作
+      description: Docsノードの検索、読み取り、整理、再構成、更新。
+      instructions: AoiTalk high-level Docs toolsのみ使用する。AoiTalk DBを直接触らせない。canonical nodeを確認し、曖昧な対象を推測して更新せず、書き込み前に対象を確認する。
+      enabled: true
+      capability_ids: [docs_read, docs_write]
+      scalable: true
+      default_instances: 1
+      max_instances: 4
+      max_workspace_access: none
+      allow_cli_native_tools: false
+    project_operator:
+      subagent_id: project_operator
+      name: 案件・タスク操作
+      description: Projects、Tasks、Calendar、WBS、Record Tables、課題・案件情報などProject管理系AoiTalk dataを扱う。
+      instructions: Projects、Tasks、Calendar、WBS、Record Tables、課題管理、案件情報等をAoiTalk high-level tools経由で確認・更新する。タスクを新規作成する前に対象Projectの既存タスクをsearch_task_candidates（必要ならsearch付き）で確認し、詳細が必要な候補だけget_taskで開く。parent_task_id階層を尊重する。明確な既存root/containerが同じ成果を包含する場合はそのsubtaskにし、適切なrootがなければ同一目的を1つのrootと実行可能なsubtasksにまとめる。独立成果だけを別rootにする。タイトルの曖昧な類似だけで統合せず、横断的な関連や依存をparent/child containmentと混同せず、重複containerを作らない。Project更新はmanaged AoiTalk toolsで行い、filesystem/native writeは使わない。
+      enabled: true
+      capability_ids: [project_read, project_write, aoi_tools]
+      scalable: true
+      default_instances: 1
+      max_instances: 4
+      max_workspace_access: read
+      allow_cli_native_tools: false
+    workspace_operator:
+      subagent_id: workspace_operator
+      name: Workspace操作
+      description: Workspaces、ファイラー上のファイル認識、ファイル検索、ファイル読込、ファイル操作、整理、必要な変更を行う。
+      instructions: 割り当てられたWorkspaceのファイル認識、検索、読込、複数ファイル操作、整理、必要な変更を行う。CLI providerの場合はnative filesystem/search/edit/shell等を利用可能。
+      enabled: true
+      capability_ids: [workspace_read, workspace_write, repo_map, command_execute, aoi_tools]
+      scalable: true
+      default_instances: 1
+      max_instances: 4
+      max_workspace_access: write
+      allow_cli_native_tools: true
+    code_explorer:
+      subagent_id: code_explorer
+      name: コード調査
+      description: コードベース、依存関係、データフロー、既存実装等を調査するread-only Agent。
+      instructions: コードベース、依存関係、データフロー、既存実装を調査し、ファイルを変更しない。
+      enabled: true
+      capability_ids: [workspace_read, repo_map]
+      scalable: true
+      default_instances: 1
+      max_instances: 6
+      max_workspace_access: read
+      allow_cli_native_tools: true
+    architecture_planner:
+      subagent_id: architecture_planner
+      name: 設計
+      description: 実装方針、責務境界、影響範囲等を整理するread-only Agent。
+      instructions: 実装方針、責務境界、影響範囲等を整理し、実装計画を提案する。
+      enabled: true
+      capability_ids: [workspace_read, repo_map]
+      scalable: true
+      default_instances: 1
+      max_instances: 4
+      max_workspace_access: read
+      allow_cli_native_tools: true
+    code_implementer:
+      subagent_id: code_implementer
+      name: 実装
+      description: 実際にWorkspaceで変更を行うAgent。
+      instructions: 割り当てられた変更をWorkspace sandboxで実装する。API providerではAoiTalk Workspace mutation tools、CLI providerではCLI native filesystem/search/shell/edit/test/build等を利用する。
+      enabled: true
+      capability_ids: [workspace_read, workspace_write, repo_map, command_execute, aoi_tools]
+      scalable: true
+      default_instances: 1
+      max_instances: 4
+      max_workspace_access: write
+      allow_cli_native_tools: true
+    code_reviewer:
+      subagent_id: code_reviewer
+      name: コードレビュー
+      description: diff、コード、関連状態をread-onlyでレビューする。
+      instructions: diff、コード、関連状態をread-onlyでレビューし、実行可能な指摘だけを報告する。存在することと毎回自動起動することは別である。
+      enabled: true
+      capability_ids: [workspace_read, repo_map]
+      scalable: true
+      default_instances: 1
+      max_instances: 4
+      max_workspace_access: read
+      allow_cli_native_tools: true
+    story_writer:
+      subagent_id: story_writer
+      name: 執筆
+      description: Story contextを読み、本文や設定資料を作成・更新する。
+      instructions: Story contextを読み、本文や設定資料を作成・更新する。
+      enabled: true
+      capability_ids: [story_read, story_write]
+      scalable: false
+      default_instances: 1
+      max_instances: 1
+      max_workspace_access: none
+      allow_cli_native_tools: false
+    story_consistency_reviewer:
+      subagent_id: story_consistency_reviewer
+      name: 設定整合性レビュー
+      description: 世界設定、時系列、キャラクター設定、過去シーン、用語、既存Story情報の整合性を確認するread-only Agent。
+      instructions: 世界設定、時系列、キャラクター設定、過去シーン、用語、既存Story情報をread-onlyで確認し、矛盾を報告する。
+      enabled: true
+      capability_ids: [story_read]
+      scalable: true
+      default_instances: 1
+      max_instances: 4
+      max_workspace_access: none
+      allow_cli_native_tools: false
+    character_voice_reviewer:
+      subagent_id: character_voice_reviewer
+      name: キャラクター・口調レビュー
+      description: キャラクターの人格、性格、口調、設定、既存発言との整合性を確認するread-only Agent。
+      instructions: キャラクターの人格、性格、口調、設定、既存発言との整合性をread-onlyで確認し、逸脱を報告する。
+      enabled: true
+      capability_ids: [story_read]
+      scalable: true
+      default_instances: 1
+      max_instances: 4
+      max_workspace_access: none
+      allow_cli_native_tools: false
+    story_import:
+      subagent_id: story_import
+      name: Story取り込み
+      description: 既存のStory素材取り込み機能を担当する。
+      instructions: 既存のStory素材を取り込み、無関係な変更を避けて正規化する。
+      enabled: true
+      capability_ids: [story_read, story_import]
+      scalable: false
+      default_instances: 1
+      max_instances: 1
+      max_workspace_access: none
+      allow_cli_native_tools: false
+integrations:
+  spotify:
+    enabled: false
+external_model_privacy:
+  # Personal installations preserve the historical direct transport path.
+  # Enterprise overlays may override this to protected without changing the
+  # main model route.
+  mode: direct
+  review_policy: high_risk
   notify: true
+  semantic_redaction_enabled: true
+  local_provider: openai_compatible_local
+  local_model: ''
   redaction_terms: []
-  strategy: adaptive
+  trusted_local_hosts: []
+  raw_media_policy: block
+  cache_enabled: true
+chatgpt_web:
+  profile_dir: '%LOCALAPPDATA%\AoiTalk\chatgpt-web-profile'
+  response_timeout_seconds: 900
+  max_rounds_per_turn: 20
 routing_profiles:
   free-team:
     display_name: 無料Team
@@ -175,6 +471,7 @@ routing_profiles:
     max_fallbacks: 6
 search:
   provider: openai
+  openai_model: gpt-5.6-luna
   x_enabled: false
   grok_x_enabled: false
   knowledge_enabled: false
@@ -211,6 +508,14 @@ discord:
   default_mode: text
   max_history_length: 20
   memory_prefill_message_count: 12
+  # Discord同一ユーザーの短時間連投を1論理ターンにまとめる待機幅
+  coalesce_window_ms: 250
+  queue:
+    coalesce_window_ms: 250
+    max_images: 4
+    reply_timeout_seconds: 30
+    image_timeout_seconds: 15
+    max_image_bytes: 10485760
   session:
     cleanup_interval: 300
     inactive_timeout: 3600
@@ -224,7 +529,7 @@ discord:
     sample_rate: 48000
 keyword_detection:
   enabled: true
-  llm_model: gpt-5-mini
+  llm_model: gpt-5.6-luna
   speech_rate:
     confidence_threshold: 0.7
     enabled: true
@@ -241,9 +546,34 @@ keyword_detection:
 skills:
   enabled: true
   directory: config/skills
-app_factory:
+voice_sessions:
+  default_mode: realtime_native
+  allowed_modes:
+    - realtime_native
+    - realtime_character_tts
+  realtime:
+    provider: openai_realtime
+    model: gpt-realtime-2.1
+    native_voice: marin
+    turn_detection:
+      type: semantic_vad
+      interrupt_response: true
+    input_transcription:
+      enabled: true
+      model: gpt-4o-transcribe
+    tools_profile: voice
+  character_tts:
+    segment_max_chars: 180
+    segment_max_wait_ms: 450
+    queue_depth: 2
+apps:
   enabled: true
-  artifact_dir: cache/app_factory
+  jobs:
+    server_execution_enabled: false
+    require_system_admin: true
+    isolation:
+      memory_limit_mb: 512
+      require_network_isolation: true
 heartbeat:
   enabled: true
   directory: config/heartbeats
@@ -295,11 +625,13 @@ agent_harness:
     before_remove: null
 
 agentic_completion:
-  max_rounds: 2
+  max_rounds: 12
+  max_tool_rounds: 24
+  managed_workspace_max_rounds: 2
   work_max_rounds: 120
   assisted_work_max_rounds: 120
   autonomous_work_max_rounds: 120
-  review_max_rounds: 120
+  review_max_rounds: 2
   project_progress_max_rounds: 120
 mcp_enabled: false
 mcp:
@@ -470,7 +802,6 @@ tts:
     quantization: int8
     confidence_threshold: 0.5
     log_detections: true
-    cache_dir: cache/yomi_linter
     policies:
       voicevox: dictionary
       aivisspeech: dictionary
@@ -489,20 +820,20 @@ tts_settings:
     port: 10101
     use_gpu: false
   irodori_tts:
-    hf_checkpoint: Aratako/Irodori-TTS-600M-v3-VoiceDesign
+    hf_checkpoint: Aratako/Irodori-TTS-v4.1-Small
     codec_repo: Aratako/Semantic-DACVAE-Japanese-32dim
     refs_dir: config/irodori_refs
-    cache_dir: cache/irodori_tts
     model_device: cuda
     codec_device: cuda
     model_precision: fp32
     codec_precision: fp32
     use_gpu: true
-    num_steps: 6
-    t_schedule_mode: sway
+    num_steps: 40
+    t_schedule_mode: linear
     sway_coeff: -1.0
     duration_scale: 1.0
-    max_ref_seconds: 30.0
+    # null delegates the reference cap to checkpoint metadata (120s for v4.1)
+    max_ref_seconds: null
     ref_normalize_db: -16.0
     ref_ensure_max: true
   miotts:
@@ -510,7 +841,6 @@ tts_settings:
     codec_model_id: Aratako/MioCodec-25Hz-44.1kHz-v2
     refs_dir: config/miotts_refs
     presets_dir: config/miotts_presets
-    cache_dir: cache/miotts
     device: auto
     dtype: auto
     trust_remote_code: false
@@ -558,40 +888,48 @@ rag:
     exclude_patterns:
     - .*
     - __pycache__
-spotify:
-  enabled: true
 web_interface:
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 3000
   auto_open_browser: true
   video_http_server:
-    enabled: true
+    enabled: false
+    host: 127.0.0.1
     port: 3001
   auth:
     enabled: true
     username: ''
     password: ''
     secret: ''
-    session_ttl_minutes: 15768000
+    session_ttl_minutes: 1440
 os_operations:
   protected_paths:
-  - C:\
-  - D:\
-  - E:\
-  - F:\
-  - G:\
+  - C:\Windows
+  - C:\Program Files
+  - C:\Program Files (x86)
+  - C:\ProgramData\Microsoft
+  - /etc
+  - /boot
+  - /proc
+  - /run/secrets
+  - /sys
+  - /bin
+  - /sbin
+  - /usr/bin
+  - /usr/sbin
   allowed_workspace_dirs:
   - _users
   - _projects
+  command:
+    shell: auto
+    timeout_seconds: 120
+    max_output_bytes: 32768
+    background_enabled: true
+    max_background_jobs: 8
+    background_buffer_bytes: 1048576
 agents:
   filesystem:
     enabled: true
-  utility:
-    enabled: true
-  media:
-    enabled: true
-  spotify:
-    enabled: false
 comfyui:
   url: http://127.0.0.1:8188
   default_workflow: config/comfyui_workflows/aoitalk_auto_sdxl.json
@@ -638,4 +976,18 @@ mobile_ui:
 
 def load_default_config() -> Dict[str, Any]:
     sanitized = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", DEFAULT_CONFIG_YAML)
-    return yaml.safe_load(sanitized) or {}
+    config = yaml.safe_load(sanitized) or {}
+    # Keep the persisted seed profile-independent while projecting the
+    # Enterprise default to protected transport at bootstrap.  Existing DB
+    # values (including an explicit Personal ``direct`` choice) are handled
+    # by app_config_store migration and are never rewritten here.
+    try:
+        from .features import Features
+
+        if Features.is_enterprise():
+            privacy = config.setdefault("external_model_privacy", {})
+            if isinstance(privacy, dict):
+                privacy["mode"] = "protected"
+    except Exception:
+        pass
+    return config

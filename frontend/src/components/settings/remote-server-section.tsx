@@ -13,6 +13,7 @@ import { toast } from "sonner";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Badge } from "@/components/ui/badge";
 import {
   createRemoteServer,
@@ -174,6 +175,7 @@ export function RemoteServerSection() {
     <SettingsDisclosure
       title="外部AoiTalkサーバー接続"
       icon={<Server className="size-4" />}
+      targetId="remote-server"
       summary={
         profiles.length > 0 ? (
           <span className="text-xs font-normal text-muted-foreground">
@@ -185,11 +187,10 @@ export function RemoteServerSection() {
       contentClassName="space-y-4"
     >
         <label className="flex cursor-pointer items-start gap-3 rounded-md border p-3">
-          <input
-            type="checkbox"
+          <Checkbox
             className="mt-0.5 size-4 accent-primary"
             checked={remoteConnectionEnabled}
-            onChange={(event) => void handleConnectionSettingChange(event.target.checked)}
+            onCheckedChange={(checked) => void handleConnectionSettingChange(checked === true)}
             disabled={savingConnectionSetting}
           />
           <span className="space-y-1">

@@ -2,108 +2,9 @@
 // ベストエフォート実装で、skip_weekend / skip_holiday の可視化を目的とする。
 
 import { parseLocalDateTime } from "@/lib/date-time";
+import { isJapaneseHoliday } from "@/lib/japanese-holidays";
 
-const JAPAN_HOLIDAYS: ReadonlySet<string> = new Set<string>([
-  // 2025
-  "2025-01-01",
-  "2025-01-13",
-  "2025-02-11",
-  "2025-02-23",
-  "2025-02-24",
-  "2025-03-20",
-  "2025-04-29",
-  "2025-05-03",
-  "2025-05-04",
-  "2025-05-05",
-  "2025-05-06",
-  "2025-07-21",
-  "2025-08-11",
-  "2025-09-15",
-  "2025-09-23",
-  "2025-10-13",
-  "2025-11-03",
-  "2025-11-23",
-  "2025-11-24",
-  // 2026
-  "2026-01-01",
-  "2026-01-12",
-  "2026-02-11",
-  "2026-02-23",
-  "2026-03-20",
-  "2026-04-29",
-  "2026-05-03",
-  "2026-05-04",
-  "2026-05-05",
-  "2026-05-06",
-  "2026-07-20",
-  "2026-08-11",
-  "2026-09-21",
-  "2026-09-22",
-  "2026-09-23",
-  "2026-10-12",
-  "2026-11-03",
-  "2026-11-23",
-  // 2027
-  "2027-01-01",
-  "2027-01-11",
-  "2027-02-11",
-  "2027-02-23",
-  "2027-03-21",
-  "2027-03-22",
-  "2027-04-29",
-  "2027-05-03",
-  "2027-05-04",
-  "2027-05-05",
-  "2027-07-19",
-  "2027-08-11",
-  "2027-09-20",
-  "2027-09-23",
-  "2027-10-11",
-  "2027-11-03",
-  "2027-11-23",
-  // 2028
-  "2028-01-01",
-  "2028-01-10",
-  "2028-02-11",
-  "2028-02-23",
-  "2028-03-20",
-  "2028-04-29",
-  "2028-05-03",
-  "2028-05-04",
-  "2028-05-05",
-  "2028-07-17",
-  "2028-08-11",
-  "2028-09-18",
-  "2028-09-22",
-  "2028-10-09",
-  "2028-11-03",
-  "2028-11-23",
-  // 2029
-  "2029-01-01",
-  "2029-01-08",
-  "2029-02-11",
-  "2029-02-12",
-  "2029-02-23",
-  "2029-03-20",
-  "2029-04-29",
-  "2029-05-03",
-  "2029-05-04",
-  "2029-05-05",
-  "2029-07-16",
-  "2029-08-11",
-  "2029-09-17",
-  "2029-09-23",
-  "2029-10-08",
-  "2029-11-03",
-  "2029-11-23",
-]);
-
-function toDateKey(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
+export { isJapaneseHoliday } from "@/lib/japanese-holidays";
 
 function copyTimeFrom(date: Date, timeSource: Date): Date {
   const next = new Date(date);
@@ -116,10 +17,6 @@ function copyTimeFrom(date: Date, timeSource: Date): Date {
   return next;
 }
 
-export function isJapaneseHoliday(d: Date): boolean {
-  return JAPAN_HOLIDAYS.has(toDateKey(d));
-}
-
 function isWeekend(d: Date): boolean {
   const day = d.getDay();
   return day === 0 || day === 6;
@@ -127,12 +24,34 @@ function isWeekend(d: Date): boolean {
 
 const DAY_KEYS = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
 
+/** 土日・祝日に当たった回の扱い。 */
+export type RecurrenceSkipMode = "shift_forward" | "omit";
+
+export const RECURRENCE_SKIP_MODES: readonly RecurrenceSkipMode[] = [
+  "shift_forward",
+  "omit",
+];
+
+export const DEFAULT_RECURRENCE_SKIP_MODE: RecurrenceSkipMode = "shift_forward";
+
+/** 未知・未設定・旧 shift_backward の skip_mode は翌営業日へずらす。 */
+export function normalizeSkipMode(
+  value: string | null | undefined,
+): RecurrenceSkipMode {
+  if (value === "shift_backward") return "shift_forward";
+  return RECURRENCE_SKIP_MODES.includes(value as RecurrenceSkipMode)
+    ? (value as RecurrenceSkipMode)
+    : DEFAULT_RECURRENCE_SKIP_MODE;
+}
+
 export interface RecurrencePreviewConfig {
   freq: string;
   interval: number;
   byDay: string[];
   skipWeekend: boolean;
   skipHoliday: boolean;
+  /** 未指定は shift_forward（従来挙動）。 */
+  skipMode?: RecurrenceSkipMode | string | null;
   endCount: number | null;
   endDate: string | null;
 }
@@ -149,12 +68,23 @@ function addDays(d: Date, days: number): Date {
   return next;
 }
 
-function applySkip(d: Date, cfg: RecurrencePreviewConfig): Date {
+/**
+ * 土日・祝日に当たった発生日を skipMode に従って処理する。
+ * - shift_forward: 条件を満たす最初の翌日へずらす（既定）
+ * - 旧 shift_backward: shift_forward として条件を満たす最初の翌日へずらす
+ * - omit: その回を発生させない（null を返す）
+ * src/services/task_management/_shared.py の apply_occurrence_skip と同じ挙動。
+ */
+function applySkip(d: Date, cfg: RecurrencePreviewConfig): Date | null {
+  if (!shouldSkip(d, cfg)) return new Date(d);
+
+  const mode = normalizeSkipMode(cfg.skipMode);
+  if (mode === "omit") return null;
+
   let cur = new Date(d);
-  let guard = 0;
-  while (shouldSkip(cur, cfg) && guard < 14) {
+  for (let guard = 0; guard < 14; guard++) {
     cur = addDays(cur, 1);
-    guard++;
+    if (!shouldSkip(cur, cfg)) return cur;
   }
   return cur;
 }
@@ -229,10 +159,13 @@ export function computeUpcomingOccurrences(
   const result: Date[] = [];
   let cursor = new Date(anchor);
   let guard = 0;
+  let lastShiftedTime: number | null = null;
+  // omit で消えた回も回数としては消費する（サーバーの RRULE 展開と同じ数え方）。
+  let budget = remaining;
 
   const guardLimit = Math.min(20000, Math.max(400, limit * 4));
 
-  while (result.length < limit && guard < guardLimit) {
+  while (result.length < limit && budget > 0 && guard < guardLimit) {
     guard++;
     let nextBase: Date;
     if (cfg.freq === "WEEKLY" && cfg.byDay.length > 0) {
@@ -246,8 +179,19 @@ export function computeUpcomingOccurrences(
     if (until && cursor.getTime() > until.getTime()) break;
 
     const shifted = applySkip(cursor, normCfg);
+    if (shifted === null) {
+      budget--;
+      continue;
+    }
     if (until && shifted.getTime() > until.getTime()) break;
 
+    // スキップは「発生させない」ではなく「後ろへずらす」ため、複数回が同じ日に
+    // 着地することがある（毎日+土日スキップだと 土・日・月 がすべて月曜へ寄る）。
+    // 同じ日時を重複して返さない。
+    if (lastShiftedTime === shifted.getTime()) continue;
+    lastShiftedTime = shifted.getTime();
+
+    budget--;
     result.push(shifted);
   }
 
@@ -363,6 +307,7 @@ export function computeOccurrencesInRange(
   const result: Date[] = [];
   let cursor = fastForwardCursor(anchor, rangeStart, normCfg);
   let guard = 0;
+  let lastShiftedTime: number | null = null;
   const guardLimit = Math.min(20000, Math.max(400, maxCount * 4));
 
   while (result.length < maxCount && guard < guardLimit) {
@@ -377,8 +322,17 @@ export function computeOccurrencesInRange(
     cursor = nextBase;
     if (cursor.getTime() > effectiveEnd.getTime()) break;
 
-    const shifted = copyTimeFrom(applySkip(cursor, normCfg), startDate);
+    const skipped = applySkip(cursor, normCfg);
+    if (skipped === null) continue;
+    const shifted = copyTimeFrom(skipped, startDate);
     if (shifted.getTime() > effectiveEnd.getTime()) break;
+
+    // computeUpcomingOccurrences と同じくスキップの寄せによる重複を落とす。
+    // 範囲外で捨てる分も含めて直前の着地点と比較する必要があるため、
+    // result の末尾ではなく lastShiftedTime を使う。
+    if (lastShiftedTime === shifted.getTime()) continue;
+    lastShiftedTime = shifted.getTime();
+
     if (shifted.getTime() >= rangeStart.getTime()) {
       result.push(shifted);
     }

@@ -4,7 +4,6 @@ import { useEffect, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Checkbox } from "@/components/ui/checkbox";
 import {
   Command,
   CommandDialog,
@@ -15,12 +14,24 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import {
+  clipIngestFallbackId,
   ClipIngestTarget,
+  formatClipIngestBreadcrumb,
+  isAllowedClipIngestTarget,
   normalizeClipIngestTargets,
   parseClipIngestTargets,
+  removeClipIngestTarget,
   selectClipIngestFallback,
+  setClipIngestTargetEnabled,
 } from "@/lib/clip-ingest-settings";
 import { cn } from "@/lib/utils";
 import { ChevronRight, FileText, Loader2, Plus, Tags, Trash2 } from "lucide-react";
@@ -81,13 +92,21 @@ export function ClipIngestTargetsSection() {
         signal: controller.signal,
       })
         .then((response) => response.ok ? response.json() as Promise<{ pages: PageHit[] }> : { pages: [] })
-        .then((data) => setPages(data.pages ?? []))
+        .then((data) => setPages(
+          (data.pages ?? []).filter((page) =>
+            isAllowedClipIngestTarget(page),
+          ),
+        ))
         .catch(() => { if (!controller.signal.aborted) setPages([]); });
     }, 80);
     return () => { controller.abort(); window.clearTimeout(timer); };
   }, [pickerOpen, query]);
 
   const addPage = (page: PageHit) => {
+    if (!isAllowedClipIngestTarget(page)) {
+      toast.error("Film配下はクリップ取り込み先にできません");
+      return;
+    }
     if (targets.some((target) => target.node_id === page.id)) {
       toast.info("このDocsノードは登録済みです");
       return;
@@ -110,6 +129,8 @@ export function ClipIngestTargetsSection() {
     setTargets((current) => current.map((target) => target.node_id === nodeId ? { ...target, ...patch } : target));
   };
 
+  const fallbackId = clipIngestFallbackId(targets);
+
   const save = async () => {
     setSaving(true);
     try {
@@ -119,7 +140,7 @@ export function ClipIngestTargetsSection() {
         body: JSON.stringify({ clip_ingest: { targets: normalized } }),
       });
       setTargets(parseClipIngestTargets(result.settings));
-      toast.success("/clip 取り込み先を保存しました");
+      toast.success("クリップ取り込み先を保存しました");
     } catch (error) {
       toast.error(`保存できません: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -140,8 +161,8 @@ export function ClipIngestTargetsSection() {
         <div className="flex min-w-0 items-start gap-2">
           <ChevronRight className={cn("mt-1 size-4 shrink-0 text-muted-foreground transition-transform", sectionOpen && "rotate-90")} />
           <div className="min-w-0">
-            <CardTitle className="flex items-center gap-2 text-base">/clip 取り込み先{!loading && targets.length ? <Badge variant="secondary">{targets.length}件</Badge> : null}</CardTitle>
-            <p className="mt-1 text-xs text-muted-foreground">/clip が保存先として選べるDocsノードを限定します。</p>
+            <CardTitle className="flex items-center gap-2 text-base">クリップ取り込み先{!loading && targets.length ? <Badge variant="secondary">{targets.length}件</Badge> : null}</CardTitle>
+            <p className="mt-1 text-xs text-muted-foreground">クリップを自動分類して保存するDocsノードを設定します。</p>
           </div>
         </div>
         <Button variant="outline" size="sm" onClick={(event) => { event.stopPropagation(); setSectionOpen(true); setPickerOpen(true); }} disabled={loading}>
@@ -149,57 +170,98 @@ export function ClipIngestTargetsSection() {
         </Button>
       </CardHeader>
       {sectionOpen ? (
-      <CardContent className="space-y-4">
+      <CardContent className="space-y-3">
         {loading ? (
           <div className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" />読み込み中...</div>
         ) : targets.length === 0 ? (
-          <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">取り込み先は未登録です。この状態では /clip はDocsを変更しません。</p>
-        ) : targets.map((target) => {
-          const isOpen = expanded.has(target.node_id);
-          return (
-          <div key={target.node_id} className="rounded-lg border">
+          <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">取り込み先は未登録です。この状態ではクリップ取り込みはDocsを変更しません。</p>
+        ) : (
+          <div className="overflow-hidden rounded-lg border">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b bg-muted/20 px-3 py-2">
+              <Label htmlFor="clip-ingest-fallback" className="text-sm">分類できなかった場合</Label>
+              <Select
+                value={fallbackId ?? "none"}
+                onValueChange={(value) => setTargets((current) =>
+                  selectClipIngestFallback(current, value && value !== "none" ? value : null),
+                )}
+              >
+                <SelectTrigger id="clip-ingest-fallback" data-testid="clip-ingest-fallback-select" className="w-full max-w-64">
+                  <SelectValue>
+                    {targets.find((target) => target.node_id === fallbackId)?.label ?? "保存しない"}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">保存しない</SelectItem>
+                  {targets.filter((target) => target.enabled).map((target) => (
+                    <SelectItem key={target.node_id} value={target.node_id}>{target.label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="divide-y">
+            {targets.map((target) => {
+           const isOpen = expanded.has(target.node_id);
+           const breadcrumb = formatClipIngestBreadcrumb(target);
+           return (
+          <div key={target.node_id} data-testid={`clip-ingest-target-${target.node_id}`}>
             <div
               role="button"
               tabIndex={0}
               aria-expanded={isOpen}
               onClick={() => toggleExpanded(target.node_id)}
               onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggleExpanded(target.node_id); } }}
-              className="flex cursor-pointer items-start justify-between gap-3 rounded-lg p-4 hover:bg-muted/40"
+              className="flex min-h-11 cursor-pointer items-center justify-between gap-2 px-3 py-2 hover:bg-muted/40"
             >
-              <div className="flex min-w-0 items-start gap-2">
-                <ChevronRight className={cn("mt-0.5 size-4 shrink-0 text-muted-foreground transition-transform", isOpen && "rotate-90")} />
-                <div className="min-w-0">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="font-medium">{target.label}</span>
-                    {target.fallback ? <Badge variant="secondary">未分類時</Badge> : null}
-                    {!target.enabled ? <Badge variant="outline">無効</Badge> : null}
-                  </div>
-                  <p className="truncate text-xs text-muted-foreground">{[...target.breadcrumb, target.label].join(" / ")}</p>
-                  {isOpen ? <p className="mt-1 font-mono text-[10px] text-muted-foreground">{target.node_id}</p> : null}
+              <div className="flex min-w-0 flex-1 items-center gap-2">
+                <ChevronRight className={cn("size-4 shrink-0 text-muted-foreground transition-transform", isOpen && "rotate-90")} />
+                <div className="flex min-w-0 flex-1 flex-col gap-0.5 sm:flex-row sm:items-center sm:gap-3">
+                  <span className="shrink-0 font-medium">{target.label}</span>
+                  <p className="truncate text-xs text-muted-foreground" title={breadcrumb}>{breadcrumb}</p>
                 </div>
               </div>
-              <Button variant="ghost" size="icon-sm" aria-label={`${target.label}を削除`} onClick={(event) => { event.stopPropagation(); setTargets((current) => current.filter((item) => item.node_id !== target.node_id)); }}><Trash2 className="size-4" /></Button>
+              <div className="flex shrink-0 items-center gap-1">
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={target.enabled}
+                  aria-label={`${target.label}を${target.enabled ? "無効" : "有効"}にする`}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setTargets((current) => setClipIngestTargetEnabled(current, target.node_id, !target.enabled));
+                  }}
+                  className={cn(
+                    "relative h-5 w-9 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                    target.enabled ? "bg-primary" : "bg-muted-foreground/35",
+                  )}
+                >
+                  <span className={cn(
+                    "absolute top-0.5 size-4 rounded-full bg-background shadow transition-transform",
+                    target.enabled ? "left-[18px]" : "left-0.5",
+                  )} />
+                </button>
+                <Button variant="ghost" size="icon-sm" aria-label={`${target.label}を削除`} onClick={(event) => { event.stopPropagation(); setTargets((current) => removeClipIngestTarget(current, target.node_id)); }}><Trash2 className="size-4" /></Button>
+              </div>
             </div>
             {isOpen ? (
-              <div className="space-y-3 border-t p-4 pt-3">
+              <div className="space-y-1.5 border-t bg-muted/10 px-3 py-2">
                 <div className="space-y-1.5">
-                  <Label htmlFor={`clip-hint-${target.node_id}`}>ルーティング説明</Label>
+                  <Label htmlFor={`clip-hint-${target.node_id}`}>保存先判定用の説明</Label>
                   <Textarea id={`clip-hint-${target.node_id}`} value={target.routing_hint} onChange={(event) => updateTarget(target.node_id, { routing_hint: event.target.value })} placeholder="この保存先に適した話題や情報を説明してください" rows={2} />
-                </div>
-                <div className="flex flex-wrap gap-5 text-sm">
-                  <Label className="flex items-center gap-2"><Checkbox checked={target.enabled} onCheckedChange={(checked) => updateTarget(target.node_id, { enabled: checked === true })} />有効</Label>
-                  <Label className="flex items-center gap-2"><Checkbox checked={target.fallback} onCheckedChange={(checked) => setTargets((current) => selectClipIngestFallback(current, checked === true ? target.node_id : null))} />未分類時の保存先</Label>
+                  <p className="text-xs text-muted-foreground">この説明は保存先の判定にだけ使用されます。保存される見出しやノード階層の生成規則は変更しません。</p>
                 </div>
               </div>
             ) : null}
           </div>
-          );
+           );
         })}
+            </div>
+          </div>
+        )}
         <div className="flex justify-end"><Button onClick={save} disabled={loading || saving}>{saving ? <Loader2 className="size-4 animate-spin" /> : null}{saving ? "保存中..." : "保存"}</Button></div>
       </CardContent>
       ) : null}
 
-      <CommandDialog open={pickerOpen} onOpenChange={setPickerOpen} title="/clip 取り込み先を追加" description="既存のDocsノードをタイトルまたはエイリアスで検索します">
+      <CommandDialog open={pickerOpen} onOpenChange={setPickerOpen} title="クリップ取り込み先を追加" description="既存のDocsノードをタイトルまたはエイリアスで検索します">
         <Command shouldFilter={false}>
           <CommandInput value={query} onValueChange={setQuery} placeholder="ページ名またはエイリアス..." />
           <CommandList><CommandEmpty>該当するページがありません</CommandEmpty><CommandGroup heading={query.trim() ? "ページを検索" : "最近のDocsページ"}>

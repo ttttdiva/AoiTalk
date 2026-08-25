@@ -9,6 +9,7 @@ export default function FilerLayout() {
       }}
     >
       <Stack.Screen name="index" options={{ headerShown: false }} />
+      <Stack.Screen name="text" options={{ headerShown: false }} />
     </Stack>
   );
 }

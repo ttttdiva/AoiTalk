@@ -39,8 +39,10 @@ import {
 } from "@/lib/server/db-time";
 import {
   canWriteProjectId,
+  canReadProjectId,
   extractProjectColor,
   getReadableProjectIds,
+  getParticipatingProjectIds,
   normalizeOptionalUuid,
   isDateOnlyTaskInput,
   parseTaskWallClockDate,
@@ -49,6 +51,7 @@ import {
   stripGoogleCalendarMetadata,
   taskToSnake,
 } from "@/lib/server/task-route-utils";
+
 import { getTaskNotificationsDefaultEnabled } from "@/lib/user-settings";
 import { estimateOccurrenceCount, parseRrule } from "@/lib/recurrence-rrule";
 import {
@@ -60,8 +63,28 @@ import {
   occurrenceOverlapsRange,
   shouldIncludeTaskScheduleOccurrence,
 } from "@/lib/task-list-effective-occurrence";
+import { jsonWithConditional } from "@/lib/server/http-cache";
+import { lockTaskProjectIds } from "@/lib/server/project-move-dependency-invariant";
 
 const TASK_LIST_OCCURRENCE_LOOKAHEAD_DAYS = 366;
+
+class TaskParentProjectInvariantError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "TaskParentProjectInvariantError";
+  }
+}
+
+function serializeAutoCloseOnDue(
+  row: typeof tasks.$inferSelect,
+  result: Record<string, unknown>,
+): Record<string, unknown> {
+  result.auto_close_on_due = row.autoCloseOnDue === true;
+  return result;
+}
 
 type TaskListRow = typeof tasks.$inferSelect;
 type TaskRecurrenceRow = typeof taskRecurrenceRules.$inferSelect;
@@ -166,8 +189,17 @@ async function resolveTaskListEffectiveOccurrences(
       hiddenOccurrences.add(originalKey);
     }
 
-    if (!occurrenceOverlapsRange(rowStartAt, rowEndAt, rangeStart, rangeEnd))
+    if (
+      !shouldIncludeTaskScheduleOccurrence({
+        start: rowStartAt,
+        end: rowEndAt,
+        status: row.status,
+        rangeStart,
+        rangeEnd,
+      })
+    ) {
       continue;
+    }
 
     setOccurrence(row.taskId, occurrenceKey(row.taskId, row.startAt), {
       id: row.id,
@@ -225,6 +257,7 @@ async function resolveTaskListEffectiveOccurrences(
       byDay: parsed.byDay,
       skipWeekend: rule.skipWeekend,
       skipHoliday: rule.skipHoliday,
+      skipMode: rule.skipMode,
       endCount: rule.recurForever ? null : rule.endCount,
       endDate: rule.recurForever
         ? null
@@ -294,12 +327,12 @@ export async function GET(request: NextRequest) {
   const projectId = searchParams.get("project_id");
   const spaceId = searchParams.get("space_id");
 
-  const readableProjectIds = await getReadableProjectIds(user.id, {
+  const readableProjectIds = await getParticipatingProjectIds(user.id, {
     projectId,
     spaceId: projectId ? null : spaceId,
   });
   if (readableProjectIds.length === 0) {
-    return NextResponse.json([]);
+    return jsonWithConditional(request, []);
   }
 
   const taskRows = await db
@@ -320,7 +353,7 @@ export async function GET(request: NextRequest) {
     );
 
   if (taskRows.length === 0) {
-    return NextResponse.json([]);
+    return jsonWithConditional(request, []);
   }
 
   const taskIds = taskRows.map((t) => t.id);
@@ -488,7 +521,10 @@ export async function GET(request: NextRequest) {
   }
 
   const result = taskRows.map((t) => {
-    const base = taskToSnake(t as unknown as Record<string, unknown>);
+    const base = serializeAutoCloseOnDue(
+      t,
+      taskToSnake(t as unknown as Record<string, unknown>),
+    );
     base.assignees = assigneesByTask.get(t.id) || [];
     base.tags = tagsByTask.get(t.id) || [];
     base.active_time_entry = activeByTask.get(t.id) || null;
@@ -524,7 +560,7 @@ export async function GET(request: NextRequest) {
     return base;
   });
 
-  return NextResponse.json(result);
+  return jsonWithConditional(request, result);
 }
 
 export async function POST(request: NextRequest) {
@@ -551,6 +587,7 @@ export async function POST(request: NextRequest) {
     parent_task_id,
     estimated_hours,
     metadata,
+    auto_close_on_due,
   } = body;
   const normalizedStatus = normalizeTaskStatus(status || "todo");
 
@@ -562,7 +599,11 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  if (!(await canWriteProjectId(user, project_id))) {
+  const [canWrite, canRead] = await Promise.all([
+    canWriteProjectId(user, project_id),
+    canReadProjectId(user, project_id),
+  ]);
+  if (!canWrite || !canRead) {
     return NextResponse.json({ detail: "権限がありません" }, { status: 403 });
   }
 
@@ -584,9 +625,13 @@ export async function POST(request: NextRequest) {
   try {
     // トップレベルの新規タスクは ALL 表示の先頭に置く。
     // サブタスクは親配下だけの順序なので、従来通り同じ親の先頭に置く。
+    // Operational ordering is scoped to projects the actor participates in.
+    // A global admin may still create a task via direct project permission,
+    // but must not perturb the cross-project "ALL" ordering for projects they
+    // have not joined.
     const readableSortProjectIds = normalizedParentTaskId
       ? []
-      : await getReadableProjectIds(user.id);
+      : await getParticipatingProjectIds(user.id);
     const sortProjectIds =
       !normalizedParentTaskId && readableSortProjectIds.includes(project_id)
         ? readableSortProjectIds
@@ -620,35 +665,75 @@ export async function POST(request: NextRequest) {
       taskMetadata.agent_triage_status = "pending";
     }
 
-    const [task] = await db
-      .insert(tasks)
-      .values({
-        projectId: project_id,
-        knowledgeNodeId: normalizeOptionalUuid(knowledge_node_id),
-        title: normalizedTitle,
-        description: description || null,
-        status: normalizedStatus,
-        priority: priority || "medium",
-        startAt: parsedStartAt ? toDbLocalTimestamp(parsedStartAt) : null,
-        endAt: parsedEndAt ? toDbLocalTimestamp(parsedEndAt) : null,
-        allDay: inferredAllDay,
-        reminderOffsets: Array.isArray(reminder_offsets)
-          ? reminder_offsets
-          : null,
-        notificationsEnabled:
-          notifications_enabled === undefined
-            ? defaultNotificationsEnabled
-            : !!notifications_enabled,
-        createdBy: user.id,
-        taskMetadata,
-        estimatedHours:
-          estimated_hours != null ? Number(estimated_hours) : null,
-        sortOrder: newSortOrder,
-        parentTaskId: normalizedParentTaskId,
-        completedAt:
-          normalizedStatus === "closed" ? toDbLocalTimestamp(new Date()) : null,
-      })
-      .returning();
+    const taskInsertValues = {
+      projectId: project_id,
+      knowledgeNodeId: normalizeOptionalUuid(knowledge_node_id),
+      title: normalizedTitle,
+      description: description || null,
+      status: normalizedStatus,
+      priority: priority || "medium",
+      startAt: parsedStartAt ? toDbLocalTimestamp(parsedStartAt) : null,
+      endAt: parsedEndAt ? toDbLocalTimestamp(parsedEndAt) : null,
+      allDay: inferredAllDay,
+      reminderOffsets: Array.isArray(reminder_offsets)
+        ? reminder_offsets
+        : null,
+      notificationsEnabled:
+        notifications_enabled === undefined
+          ? defaultNotificationsEnabled
+          : !!notifications_enabled,
+      createdBy: user.id,
+      taskMetadata,
+      estimatedHours:
+        estimated_hours != null ? Number(estimated_hours) : null,
+      sortOrder: newSortOrder,
+      parentTaskId: normalizedParentTaskId,
+      completedAt:
+        normalizedStatus === "closed" ? toDbLocalTimestamp(new Date()) : null,
+      autoCloseOnDue:
+        auto_close_on_due === undefined ? false : Boolean(auto_close_on_due),
+    };
+    const task = normalizedParentTaskId
+      ? await db.transaction(async (tx) => {
+          // Parent creation and project moves share sorted project advisory
+          // locks. Revalidate the parent row while it is locked, then insert
+          // the child before releasing the transaction lock.
+          await lockTaskProjectIds(tx, [project_id]);
+          const [parent] = await tx
+            .select({ id: tasks.id, projectId: tasks.projectId })
+            .from(tasks)
+            .where(
+              and(
+                eq(tasks.id, normalizedParentTaskId),
+                isNull(tasks.deletedAt),
+              ),
+            )
+            .for("update")
+            .limit(1);
+          if (!parent) {
+            throw new TaskParentProjectInvariantError(
+              404,
+              "parent_task_id must reference an active task",
+            );
+          }
+          if (String(parent.projectId) !== String(project_id)) {
+            throw new TaskParentProjectInvariantError(
+              400,
+              "parent_task_id must belong to the same project",
+            );
+          }
+          const [inserted] = await tx
+            .insert(tasks)
+            .values(taskInsertValues)
+            .returning();
+          return inserted;
+        })
+      : (
+          await db
+            .insert(tasks)
+            .values(taskInsertValues)
+            .returning()
+        )[0];
 
     // タグ関連付け
     if (normalizedTagIds.length > 0) {
@@ -671,7 +756,10 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const result = taskToSnake(task as unknown as Record<string, unknown>);
+    const result = serializeAutoCloseOnDue(
+      task,
+      taskToSnake(task as unknown as Record<string, unknown>),
+    );
     result.assignees = normalizedAssigneeIds.map(
       (userId: string, i: number) => ({
         id: crypto.randomUUID(),
@@ -710,6 +798,12 @@ export async function POST(request: NextRequest) {
     enqueueAutoSyncGoogleCalendarForTask(task.id, user);
     return NextResponse.json(result);
   } catch (err) {
+    if (err instanceof TaskParentProjectInvariantError) {
+      return NextResponse.json(
+        { detail: err.message },
+        { status: err.status },
+      );
+    }
     console.error("Task creation error:", err);
     return NextResponse.json({ detail: String(err) }, { status: 500 });
   }

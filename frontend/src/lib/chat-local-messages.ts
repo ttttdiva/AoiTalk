@@ -33,6 +33,27 @@ export function createLocalAttachmentMetadata(
   }));
 }
 
+/**
+ * 保存済みメッセージのメタデータから添付一覧を取り出す。
+ *
+ * 再実行では元の添付を引き継ぐ必要があるが、保存済みメタデータには
+ * バイナリ(`data_url`)が含まれない。バックエンドが保存済みのプロジェクト内
+ * パスから実体を読み直すため、path 情報を落とさずに渡す。
+ */
+export function attachmentsFromMessageMetadata(
+  metadata: unknown,
+): ChatAttachmentMetadata[] {
+  if (!metadata || typeof metadata !== "object") return [];
+  const attachments = (metadata as { attachments?: unknown }).attachments;
+  if (!Array.isArray(attachments)) return [];
+  return attachments.filter(
+    (attachment): attachment is ChatAttachmentMetadata =>
+      attachment != null &&
+      typeof attachment === "object" &&
+      typeof (attachment as ChatAttachmentMetadata).name === "string",
+  );
+}
+
 export function createLocalMessage(
   sessionId: string,
   role: "user" | "assistant",
@@ -58,9 +79,11 @@ export function createLocalUserMessage(
   clientMessageId: string,
   files?: File[],
   commandCapabilities?: ChatCommandCapability[],
+  extraMetadata: Record<string, unknown> = {},
 ): ConversationMessage {
   const metadata: ConversationMessage["metadata"] = {
     client_message_id: clientMessageId,
+    ...extraMetadata,
   };
   if (commandCapabilities?.length) {
     metadata.command_capabilities = commandCapabilities;

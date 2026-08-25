@@ -2,6 +2,8 @@ import { NextRequest } from "next/server";
 import { randomUUID } from "node:crypto";
 import { db } from "@/db";
 import { webuiLoginLogs } from "@/db/schema";
+import { resolveLoginClientIp } from "@/lib/server/login-throttle";
+import type { LoginThrottleTransaction } from "@/lib/server/login-throttle";
 
 type LoginLogAction = "login" | "logout";
 
@@ -12,18 +14,16 @@ type LoginLogOptions = {
   success?: boolean;
   failureReason?: string | null;
   sessionDurationSeconds?: number | null;
+  executor?: LoginLogExecutor;
 };
 
-function getClientIp(request: NextRequest): string | null {
-  const forwardedFor = request.headers.get("x-forwarded-for");
-  if (forwardedFor) {
-    const [first] = forwardedFor.split(",");
-    const ip = first?.trim();
-    if (ip) return ip;
-  }
+type LoginLogExecutor = typeof db | LoginThrottleTransaction;
 
-  const realIp = request.headers.get("x-real-ip")?.trim();
-  return realIp || null;
+export function isEnterpriseProfile(): boolean {
+  return (
+    process.env.AOITALK_PROFILE?.trim().toLowerCase() === "enterprise" ||
+    process.env.AIVTUBER_ENV?.trim().toLowerCase() === "enterprise"
+  );
 }
 
 export async function recordWebUILoginLog({
@@ -33,21 +33,34 @@ export async function recordWebUILoginLog({
   success = true,
   failureReason = null,
   sessionDurationSeconds = null,
-}: LoginLogOptions): Promise<void> {
+  executor = db,
+}: LoginLogOptions): Promise<boolean> {
   try {
-    await db.insert(webuiLoginLogs).values({
+    const values = {
       id: randomUUID(),
       username: username?.trim() || "(unknown)",
       action,
-      ipAddress: getClientIp(request),
+      ipAddress: resolveLoginClientIp(request),
       userAgent: request.headers.get("user-agent") || null,
       success,
       failureReason,
       sessionDurationSeconds,
       createdAt: new Date(),
       loginMetadata: {},
-    });
+    };
+    if ("rollback" in executor) {
+      // A failed statement aborts a PostgreSQL transaction until its savepoint
+      // is rolled back. Keep audit availability observable as false without
+      // poisoning the enclosing login transaction.
+      await executor.transaction(async (savepoint) => {
+        await savepoint.insert(webuiLoginLogs).values(values);
+      });
+    } else {
+      await executor.insert(webuiLoginLogs).values(values);
+    }
+    return true;
   } catch (error) {
     console.error("Failed to record WebUI login log", error);
+    return false;
   }
 }

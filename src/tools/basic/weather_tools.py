@@ -6,6 +6,35 @@ import random
 import datetime
 import requests
 from ..core import tool
+from ...services.outbound_privacy_service import (
+    OutboundPrivacyGateway,
+    PrivacyError,
+    get_privacy_policy_context,
+)
+from ...services.turn_context import get_turn_context
+
+
+def _weather_gateway() -> OutboundPrivacyGateway:
+    """Resolve persisted/effective policy for OpenWeather egress."""
+
+    try:
+        from ...config import Config
+
+        config = Config()
+    except Exception as exc:
+        raise PrivacyError("天気APIのプライバシー設定を解決できません") from exc
+    try:
+        turn = get_turn_context()
+    except Exception:
+        turn = None
+    inherited = get_privacy_policy_context()
+    return OutboundPrivacyGateway(
+        config,
+        user_id=str(getattr(turn, "user_id", None) or ""),
+        session_id=str(getattr(turn, "session_id", None) or ""),
+        session_context=inherited.session_context,
+        project_metadata=inherited.project_metadata,
+    )
 
 
 def get_weather_info_impl(location: str = "東京", when: str = "今") -> str:
@@ -87,8 +116,22 @@ def get_weather_info_impl(location: str = "東京", when: str = "今") -> str:
         # Try each location variant
         response = None
         for loc in location_to_try:
+            try:
+                protected = _weather_gateway().protect_sync(
+                    {"q": loc},
+                    provider="openweather",
+                    base_url=base_url,
+                    source_kind="weather_query",
+                )
+                safe_location = (
+                    str(protected.payload.get("q") or loc)
+                    if isinstance(protected.payload, dict)
+                    else loc
+                )
+            except Exception as exc:
+                return f"天気情報の取得はプライバシーポリシーにより停止しました: {exc}"
             params = {
-                "q": loc,
+                "q": safe_location,
                 "appid": api_key,
                 "units": "metric",
                 "lang": "ja"
@@ -104,7 +147,21 @@ def get_weather_info_impl(location: str = "東京", when: str = "今") -> str:
         
         if response is None or response.status_code != 200:
             # Last resort: try with "Japan" suffix
-            last_try = f"{location_to_try[0]},JP"
+            try:
+                protected = _weather_gateway().protect_sync(
+                    {"q": f"{location_to_try[0]},JP"},
+                    provider="openweather",
+                    base_url=base_url,
+                    source_kind="weather_query",
+                )
+                safe_last = (
+                    str(protected.payload.get("q") or f"{location_to_try[0]},JP")
+                    if isinstance(protected.payload, dict)
+                    else f"{location_to_try[0]},JP"
+                )
+            except Exception as exc:
+                return f"天気情報の取得はプライバシーポリシーにより停止しました: {exc}"
+            last_try = safe_last
             params["q"] = last_try
             print(f"[Tool] get_weather_info 最終試行: {last_try}")
             response = requests.get(base_url, params=params, timeout=5)

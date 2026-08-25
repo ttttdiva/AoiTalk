@@ -14,7 +14,7 @@ export function PropertyRow({
 }) {
   return (
     <div className="flex items-center gap-2 py-2 min-h-[36px]">
-      <div className="flex items-center gap-1.5 w-24 shrink-0 text-xs text-muted-foreground">
+      <div className="flex items-center gap-1.5 w-24 shrink-0 text-[11px] font-medium text-muted-foreground">
         {icon}
         <span>{label}</span>
       </div>

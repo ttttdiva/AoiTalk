@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSession } from "@/lib/auth";
+import { proxyExplorerDownload } from "@/lib/server/explorer-download-proxy";
 import { proxyRequestToPythonApi } from "@/lib/server/python-api-proxy";
 
 export const dynamic = "force-dynamic";
@@ -14,10 +15,26 @@ async function proxyToPython(
     return NextResponse.json({ detail: "認証が必要です" }, { status: 401 });
   }
 
+  const normalizedPath = params.path[0] === "api" ? params.path.slice(1) : params.path;
+  if (
+    normalizedPath.length === 2 &&
+    normalizedPath[0] === "explorer" &&
+    normalizedPath[1] === "download"
+  ) {
+    return proxyExplorerDownload(request, user);
+  }
+
   return proxyRequestToPythonApi(request, { path: params.path, user });
 }
 
 export async function GET(
+  request: NextRequest,
+  { params }: { params: Promise<{ path: string[] }> },
+) {
+  return proxyToPython(request, await params);
+}
+
+export async function HEAD(
   request: NextRequest,
   { params }: { params: Promise<{ path: string[] }> },
 ) {

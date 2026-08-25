@@ -114,6 +114,7 @@ class TimeTrackingMixin:
     ) -> dict[str, Any]:
         result = await session.execute(
             select(TimeEntry)
+            .join(Task, Task.id == TimeEntry.task_id)
             .options(
                 selectinload(TimeEntry.task)
                 .selectinload(Task.project)
@@ -121,7 +122,11 @@ class TimeTrackingMixin:
                 selectinload(TimeEntry.user),
                 selectinload(TimeEntry.occurrence),
             )
-            .where(TimeEntry.id == entry_id)
+            .where(
+                TimeEntry.id == entry_id,
+                TimeEntry.deleted_at.is_(None),
+                Task.deleted_at.is_(None),
+            )
         )
         entry = result.scalar_one()
         return self._build_time_entry_payload(entry)
@@ -135,6 +140,7 @@ class TimeTrackingMixin:
     ) -> Optional[dict[str, Any]]:
         stmt = (
             select(TimeEntry)
+            .join(Task, Task.id == TimeEntry.task_id)
             .options(
                 selectinload(TimeEntry.task)
                 .selectinload(Task.project)
@@ -146,6 +152,7 @@ class TimeTrackingMixin:
                 TimeEntry.user_id == user_id,
                 TimeEntry.ended_at.is_(None),
                 TimeEntry.deleted_at.is_(None),
+                Task.deleted_at.is_(None),
             )
             .order_by(TimeEntry.started_at.desc())
         )
@@ -172,10 +179,13 @@ class TimeTrackingMixin:
         )
 
         active_result = await session.execute(
-            select(TimeEntry).where(
+            select(TimeEntry)
+            .join(Task, Task.id == TimeEntry.task_id)
+            .where(
                 TimeEntry.user_id == user_id,
                 TimeEntry.ended_at.is_(None),
                 TimeEntry.deleted_at.is_(None),
+                Task.deleted_at.is_(None),
             )
         )
         active_entry = active_result.scalar_one_or_none()
@@ -203,7 +213,14 @@ class TimeTrackingMixin:
         task.status = "in_progress"
         if occurrence_id:
             occurrence_result = await session.execute(
-                select(TaskOccurrence).where(TaskOccurrence.id == occurrence_id)
+                select(TaskOccurrence)
+                .join(Task, Task.id == TaskOccurrence.task_id)
+                .where(
+                    TaskOccurrence.id == occurrence_id,
+                    TaskOccurrence.task_id == task.id,
+                    TaskOccurrence.deleted_at.is_(None),
+                    Task.deleted_at.is_(None),
+                )
             )
             occurrence = occurrence_result.scalar_one_or_none()
             if occurrence:
@@ -393,19 +410,25 @@ class TimeTrackingMixin:
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None,
     ) -> list[dict[str, Any]]:
-        accessible_project_ids = await self._get_accessible_project_ids(
+        participating_project_ids = await self._get_participating_project_ids(
             session, user_id
         )
         if project_id is not None:
             await self.require_project_permission(
                 session, project_id=project_id, user_id=user_id, permission="read"
             )
-            accessible_project_ids = [project_id]
-        elif space_id is not None:
-            accessible_project_ids = await self._filter_project_ids_by_space(
-                session, project_ids=accessible_project_ids, space_id=space_id
+            participating_project_ids = (
+                [project_id]
+                if project_id in participating_project_ids
+                else []
             )
-        if not accessible_project_ids:
+        elif space_id is not None:
+            participating_project_ids = await self._filter_project_ids_by_space(
+                session,
+                project_ids=participating_project_ids,
+                space_id=space_id,
+            )
+        if not participating_project_ids:
             return []
 
         stmt = (
@@ -419,7 +442,7 @@ class TimeTrackingMixin:
                 selectinload(TimeEntry.occurrence),
             )
             .where(
-                Task.project_id.in_(accessible_project_ids),
+                Task.project_id.in_(participating_project_ids),
                 Task.deleted_at.is_(None),
                 TimeEntry.deleted_at.is_(None),
             )
@@ -449,19 +472,25 @@ class TimeTrackingMixin:
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None,
     ) -> dict[str, Any]:
-        accessible_project_ids = await self._get_accessible_project_ids(
+        participating_project_ids = await self._get_participating_project_ids(
             session, user_id
         )
         if project_id is not None:
             await self.require_project_permission(
                 session, project_id=project_id, user_id=user_id, permission="read"
             )
-            accessible_project_ids = [project_id]
-        elif space_id is not None:
-            accessible_project_ids = await self._filter_project_ids_by_space(
-                session, project_ids=accessible_project_ids, space_id=space_id
+            participating_project_ids = (
+                [project_id]
+                if project_id in participating_project_ids
+                else []
             )
-        if not accessible_project_ids:
+        elif space_id is not None:
+            participating_project_ids = await self._filter_project_ids_by_space(
+                session,
+                project_ids=participating_project_ids,
+                space_id=space_id,
+            )
+        if not participating_project_ids:
             return build_time_report([])
 
         stmt = (
@@ -472,7 +501,7 @@ class TimeTrackingMixin:
                 selectinload(TimeEntry.task).selectinload(Task.project),
             )
             .where(
-                Task.project_id.in_(accessible_project_ids),
+                Task.project_id.in_(participating_project_ids),
                 Task.deleted_at.is_(None),
                 TimeEntry.deleted_at.is_(None),
             )
@@ -506,4 +535,3 @@ class TimeTrackingMixin:
                 }
             )
         return build_time_report(rows)
-

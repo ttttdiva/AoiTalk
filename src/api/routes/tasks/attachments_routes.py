@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import mimetypes
+import stat
 from datetime import datetime
-from pathlib import Path
 from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from sqlalchemy import select
 
 from ...uuid_http import parse_uuid_or_400
 from ....memory.models import TaskAttachment, TaskComment
+from ....memory.project_repository import ProjectRepository
+from ....tools.file_explorer.storage_context import calculate_storage_usage
 from ....services.task_management_service import TaskManagementError
 from ._shared import TaskRouterContext
 
@@ -24,6 +27,7 @@ logger = logging.getLogger(__name__)
 def register_attachment_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
     require_auth_dependency = ctx.require_auth_dependency
     get_db_manager = ctx.get_db_manager
+    service = ctx.service
     _get_current_user = ctx.get_current_user
     _translate_service_error = ctx.translate_service_error
     _load_task_for_attachment = ctx.load_task_for_attachment
@@ -32,9 +36,10 @@ def register_attachment_routes(router: APIRouter, ctx: TaskRouterContext) -> Non
     _sanitize_file_name = ctx.sanitize_file_name
     _project_storage_root = ctx.project_storage_root
     _resolve_attachment_file = ctx.resolve_attachment_file
+    _is_safe_storage_path = ctx.is_safe_workspace_path
     _unique_target_path = ctx.unique_target_path
+    _write_unique_target_file = ctx.write_unique_target_file
     _attachment_kind = ctx.attachment_kind
-    blocked_attachment_extensions = ctx.blocked_attachment_extensions
 
     @router.post("/tasks/{task_id}/agent-triage")
     async def run_task_agent_triage(
@@ -156,21 +161,55 @@ def register_attachment_routes(router: APIRouter, ctx: TaskRouterContext) -> Non
     ):
         user_id, _ = await _get_current_user(request)
         session = await get_db_manager().get_session()
+        created_path = None
+        committed = False
         try:
             task = await _load_task_for_attachment(
                 session, user_id=user_id, task_id=task_id, permission="write"
             )
             file_name = _sanitize_file_name(file.filename or "uploaded-file")
-            ext = Path(file_name).suffix.lower()
-            if ext in blocked_attachment_extensions:
-                raise HTTPException(status_code=400, detail="This file extension cannot be uploaded")
+
+            content = await file.read(50 * 1024 * 1024 + 1)
+            if len(content) > 50 * 1024 * 1024:
+                raise HTTPException(
+                    status_code=413,
+                    detail="ファイルサイズは 50 MB までです",
+                )
+
+            # Every project storage writer uses this row lock.  Re-check the
+            # permission after waiting for the lock so a membership revoke or
+            # role downgrade cannot race an upload already admitted above.
+            project = await ProjectRepository.get_by_id_for_update(
+                session, task.project_id
+            )
+            if project is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            await service.require_project_permission(
+                session,
+                project_id=task.project_id,
+                user_id=user_id,
+                permission="write",
+            )
 
             _, root_path = await _project_storage_root(task.project_id)
             target_dir = root_path / "attachments" / "tasks" / str(task.id)
+            if not _is_safe_storage_path(root_path, target_dir):
+                raise HTTPException(status_code=400, detail="Invalid attachment path")
             target_dir.mkdir(parents=True, exist_ok=True)
-            content = await file.read()
-            target_path = _unique_target_path(target_dir, file_name)
-            target_path.write_bytes(content)
+            usage = await asyncio.to_thread(
+                calculate_storage_usage,
+                root_path,
+                strict=True,
+            )
+            quota_mb = 1000 if project.storage_quota_mb is None else project.storage_quota_mb
+            quota_bytes = max(0, int(quota_mb)) * 1024 * 1024
+            if usage["total_bytes"] + len(content) > quota_bytes:
+                raise HTTPException(status_code=413, detail="Project storage quota exceeded")
+
+            target_path = _write_unique_target_file(target_dir, file_name, content)
+            created_path = target_path
+            if not _is_safe_storage_path(root_path, target_path):
+                raise HTTPException(status_code=400, detail="Invalid attachment path")
 
             relative_path = target_path.relative_to(root_path).as_posix()
             mime_type = file.content_type or mimetypes.guess_type(file_name)[0]
@@ -186,15 +225,42 @@ def register_attachment_routes(router: APIRouter, ctx: TaskRouterContext) -> Non
                 attachment_metadata={},
             )
             session.add(attachment)
+            final_usage = await asyncio.to_thread(
+                calculate_storage_usage,
+                root_path,
+                strict=True,
+            )
+            project.storage_used_mb = final_usage["total_bytes"] / (1024 * 1024)
             await session.commit()
+            committed = True
             await session.refresh(attachment)
             return _serialize_attachment(attachment)
         except TaskManagementError as exc:
+            await session.rollback()
+            if created_path is not None and not committed:
+                try:
+                    if created_path.is_file() and not created_path.is_symlink():
+                        created_path.unlink()
+                except OSError:
+                    logger.warning("Failed to remove orphaned task attachment: %s", created_path)
             raise _translate_service_error(exc)
         except HTTPException:
+            await session.rollback()
+            if created_path is not None and not committed:
+                try:
+                    if created_path.is_file() and not created_path.is_symlink():
+                        created_path.unlink()
+                except OSError:
+                    logger.warning("Failed to remove orphaned task attachment: %s", created_path)
             raise
         except Exception as exc:
             await session.rollback()
+            if created_path is not None and not committed:
+                try:
+                    if created_path.is_file() and not created_path.is_symlink():
+                        created_path.unlink()
+                except OSError:
+                    logger.warning("Failed to remove orphaned task attachment: %s", created_path)
             logger.exception("Task attachment upload failed")
             try:
                 from ....services.failure_recorder import record_failure_event
@@ -236,21 +302,36 @@ def register_attachment_routes(router: APIRouter, ctx: TaskRouterContext) -> Non
                 raise HTTPException(status_code=404, detail="Attachment not found")
             _, root_path = await _project_storage_root(task.project_id)
             target = _resolve_attachment_file(root_path, attachment.file_path)
-            if not target.exists() or not target.is_file():
+            try:
+                target_stat = target.lstat()
+            except OSError:
+                raise HTTPException(status_code=404, detail="File not found")
+            if stat.S_ISLNK(target_stat.st_mode) or not stat.S_ISREG(target_stat.st_mode):
                 raise HTTPException(status_code=404, detail="File not found")
             # Web BFF と同じく ASCII フォールバック + RFC5987 の filename* を併記する
             ascii_name = attachment.display_name.replace('"', "").encode(
                 "ascii", "replace"
             ).decode("ascii")
             encoded_name = quote(attachment.display_name)
-            return Response(
-                content=target.read_bytes(),
-                media_type=attachment.mime_type or "application/octet-stream",
+            stored_mime_type = (attachment.mime_type or "").split(";", 1)[0].strip().lower()
+            inline_mime_types = {
+                "image/png",
+                "image/jpeg",
+                "image/gif",
+                "image/webp",
+                "image/bmp",
+            }
+            can_render_inline = stored_mime_type in inline_mime_types
+            return FileResponse(
+                path=target,
+                media_type=stored_mime_type if can_render_inline else "application/octet-stream",
+                stat_result=target_stat,
                 headers={
                     "Content-Disposition": (
-                        f'inline; filename="{ascii_name}"; '
+                        f'{"inline" if can_render_inline else "attachment"}; filename="{ascii_name}"; '
                         f"filename*=UTF-8''{encoded_name}"
                     ),
+                    "X-Content-Type-Options": "nosniff",
                 },
             )
         except TaskManagementError as exc:
@@ -280,7 +361,37 @@ def register_attachment_routes(router: APIRouter, ctx: TaskRouterContext) -> Non
             attachment = result.scalar_one_or_none()
             if attachment is None:
                 raise HTTPException(status_code=404, detail="Attachment not found")
+
+            project = await ProjectRepository.get_by_id_for_update(
+                session, task.project_id
+            )
+            if project is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            await service.require_project_permission(
+                session,
+                project_id=task.project_id,
+                user_id=user_id,
+                permission="write",
+            )
+            _, root_path = await _project_storage_root(task.project_id)
+            target = _resolve_attachment_file(root_path, attachment.file_path)
+            try:
+                target_stat = target.lstat()
+            except FileNotFoundError:
+                target_stat = None
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail="Attachment cleanup failed") from exc
+            if target_stat is not None:
+                if stat.S_ISLNK(target_stat.st_mode) or not stat.S_ISREG(target_stat.st_mode):
+                    raise HTTPException(status_code=400, detail="Invalid attachment path")
+                target.unlink()
             await session.delete(attachment)
+            usage = await asyncio.to_thread(
+                calculate_storage_usage,
+                root_path,
+                strict=True,
+            )
+            project.storage_used_mb = usage["total_bytes"] / (1024 * 1024)
             await session.commit()
             return Response(status_code=204)
         except TaskManagementError as exc:

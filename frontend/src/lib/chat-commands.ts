@@ -1,7 +1,6 @@
 export type ChatCommandCapability =
   | "web_search"
   | "image_generation"
-  | "docs_ingest"
   | "work_intake"
   | "project_db_update"
   | "project_progress_review"
@@ -34,7 +33,6 @@ export type ActiveChatCommand = Extract<
 const VALID_CHAT_COMMAND_CAPABILITIES = new Set<string>([
   "web_search",
   "image_generation",
-  "docs_ingest",
   "work_intake",
   "project_db_update",
   "project_progress_review",
@@ -45,17 +43,10 @@ const VALID_CHAT_COMMAND_CAPABILITIES = new Set<string>([
 export const CHAT_COMMANDS: ChatCommandDefinition[] = [
   {
     command: "/inbox",
-    label: "Work Inbox",
-    description: "メールやテキストを整理し、メールは保存して必要なものだけタスク化する",
+    label: "Inbox",
+    description: "問い合わせ・依頼・情報を1件のInbox項目として整理し、必要な対応だけタスク化する",
     kind: "capability",
     capability: "work_intake",
-  },
-  {
-    command: "/clip",
-    label: "Docs取り込み",
-    description: "貼り付けた情報を調査し、既存Docsへ整理して統合する",
-    kind: "capability",
-    capability: "docs_ingest",
   },
   {
     command: "/search",
@@ -174,22 +165,19 @@ export function resolveChatCommandSubmission(
   hasAttachments = false,
 ): ChatCommandSubmission {
   const lines = String(value ?? "").split(/\r?\n/);
-  const inlineClip = lines.length > 0 && lines[0].trim().toLowerCase() === "/clip";
   const inlineInbox = lines.length > 0 && lines[0].trim().toLowerCase() === "/inbox";
   const activeCapabilities = commandCapabilitiesForActiveCommand(activeCommand);
-  const inlineCapabilities: ChatCommandCapability[] = inlineClip
-    ? ["docs_ingest"]
-    : inlineInbox
-      ? ["work_intake"]
-      : [];
+  const inlineCapabilities: ChatCommandCapability[] = inlineInbox
+    ? ["work_intake"]
+    : [];
   const capabilities = sanitizeChatCommandCapabilities([
     ...activeCapabilities,
     ...inlineCapabilities,
   ]);
-  const content = (inlineClip || inlineInbox ? lines.slice(1).join("\n") : value).trim();
+  const content = (inlineInbox ? lines.slice(1).join("\n") : value).trim();
 
   if (
-    (inlineClip || inlineInbox) &&
+    inlineInbox &&
     activeCommand &&
     activeCommand.capability !== inlineCapabilities[0]
   ) {
@@ -199,18 +187,11 @@ export function resolveChatCommandSubmission(
       error: "複数の組み込みコマンドを同時には実行できません",
     };
   }
-  if (capabilities.includes("docs_ingest") && !content) {
-    return {
-      content,
-      capabilities,
-      error: "取り込む情報を入力してください",
-    };
-  }
   if (capabilities.includes("work_intake") && !content && !hasAttachments) {
     return {
       content,
       capabilities,
-      error: "処理するテキストまたはメールを入力してください",
+      error: "処理するテキストまたは添付ファイルを入力してください",
     };
   }
   return { content, capabilities, error: null };

@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import logging
 import platform
+import os
 from typing import Any, Dict, List, Optional
+
+from ..utils.subprocess_env import build_aoitalk_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -240,8 +243,6 @@ class MCPManagementService:
             logger.warning("セッション削除中にエラー（続行します）: %s", e)
 
         # 2. プラットフォーム固有設定を解決
-        import os
-
         shared_env = {}
         if isinstance(raw_config, dict) and (
             "windows" in raw_config or "linux" in raw_config
@@ -256,16 +257,20 @@ class MCPManagementService:
         else:
             actual_config = dict(raw_config)
 
-        # 3. 環境変数の構築
+        # 3. 環境変数の構築。親AoiTalk process全体は継承せず、設定に
+        # 明示された値だけを子MCPへ渡す。
         env = {**shared_env, **actual_config.get("env", {})}
-        expanded_env = dict(os.environ)
-        expanded_env["PYTHONIOENCODING"] = "utf-8"
+        expanded_env: Dict[str, str] = {}
         for key, value in env.items():
             if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
                 env_var_name = value[2:-1]
                 expanded_env[key] = os.getenv(env_var_name, "")
             else:
                 expanded_env[key] = value
+        child_env = build_aoitalk_subprocess_env(
+            extra_env=expanded_env,
+            sensitive_env_keys=expanded_env,
+        )
 
         # 4. サーバーを再接続
         try:
@@ -273,7 +278,7 @@ class MCPManagementService:
                 name=server_name,
                 command=actual_config.get("command"),
                 args=actual_config.get("args", []),
-                env=expanded_env,
+                env=child_env,
             )
             if success:
                 logger.info("MCPサーバー '%s' の再起動に成功しました", server_name)

@@ -4,6 +4,7 @@
 
 import { getToken } from './auth';
 import { getBaseUrl } from './api-client';
+import { conversationPerformanceDiagnostics } from '../features/conversation/performance-diagnostics';
 import type {
   ChatResponseModelSelection,
   WSMessage,
@@ -17,7 +18,30 @@ export class ChatWebSocket {
   private onMessage: MessageHandler | null = null;
   private onConnectionChange: ((connected: boolean) => void) | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private stopTrackingActiveSocket: (() => void) | null = null;
+  private stopTrackingReconnectTimer: (() => void) | null = null;
   private sessionId: string | null = null;
+  private connectionEpoch = 0;
+
+  private cancelReconnectTimer(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.stopTrackingReconnectTimer?.();
+    this.stopTrackingReconnectTimer = null;
+  }
+
+  private closeActiveSocket(): void {
+    const socket = this.ws;
+    this.ws = null;
+    this.stopTrackingActiveSocket?.();
+    this.stopTrackingActiveSocket = null;
+    if (socket) {
+      socket.onclose = null;
+      socket.close();
+    }
+  }
 
   /** メッセージハンドラ設定 */
   setOnMessage(handler: MessageHandler): void {
@@ -31,11 +55,19 @@ export class ChatWebSocket {
 
   /** WebSocket接続 */
   async connect(sessionId: string): Promise<void> {
+    const epoch = ++this.connectionEpoch;
+    this.cancelReconnectTimer();
+    this.closeActiveSocket();
     this.sessionId = sessionId;
-    this.disconnect();
 
     const token = await getToken();
     const apiUrl = await getBaseUrl();
+    if (
+      epoch !== this.connectionEpoch ||
+      this.sessionId !== sessionId
+    ) {
+      return;
+    }
 
     // HTTP(S) → WS(S) 変換
     const protocol = apiUrl.startsWith('https') ? 'wss' : 'ws';
@@ -45,32 +77,99 @@ export class ChatWebSocket {
 
     const url = `${protocol}://${host}/ws?${params.toString()}`;
 
-    this.ws = new WebSocket(url);
+    const socket = new WebSocket(url);
+    const stopTrackingSocket = conversationPerformanceDiagnostics.trackActive(
+      'socket',
+      'conversation',
+    );
+    let socketTrackingStopped = false;
+    const stopSocketTracking = () => {
+      if (socketTrackingStopped) return;
+      socketTrackingStopped = true;
+      stopTrackingSocket();
+      if (this.stopTrackingActiveSocket === stopSocketTracking) {
+        this.stopTrackingActiveSocket = null;
+      }
+    };
+    this.ws = socket;
+    this.stopTrackingActiveSocket = stopSocketTracking;
 
-    this.ws.onopen = () => {
+    socket.onopen = () => {
+      if (
+        epoch !== this.connectionEpoch ||
+        this.sessionId !== sessionId ||
+        this.ws !== socket
+      ) {
+        return;
+      }
       this.onConnectionChange?.(true);
     };
 
-    this.ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
+      if (
+        epoch !== this.connectionEpoch ||
+        this.sessionId !== sessionId ||
+        this.ws !== socket
+      ) {
+        return;
+      }
       try {
         const msg: WSMessage = JSON.parse(event.data);
+        if (msg.type === 'stream_token') {
+          conversationPerformanceDiagnostics.increment(
+            'stream',
+            'received-token',
+          );
+        }
         this.onMessage?.(msg);
       } catch {
         // JSON解析失敗は無視
       }
     };
 
-    this.ws.onclose = () => {
+    socket.onclose = () => {
+      stopSocketTracking();
+      if (
+        epoch !== this.connectionEpoch ||
+        this.sessionId !== sessionId ||
+        this.ws !== socket
+      ) {
+        return;
+      }
+      this.ws = null;
       this.onConnectionChange?.(false);
       // 自動再接続（5秒後）
-      if (this.sessionId) {
-        this.reconnectTimer = setTimeout(() => {
-          if (this.sessionId) this.connect(this.sessionId);
-        }, 5000);
-      }
+      const stopTrackingTimer = conversationPerformanceDiagnostics.trackActive(
+        'timer',
+        'websocket-reconnect',
+      );
+      let timerTrackingStopped = false;
+      const stopTimerTracking = () => {
+        if (timerTrackingStopped) return;
+        timerTrackingStopped = true;
+        stopTrackingTimer();
+        if (this.stopTrackingReconnectTimer === stopTimerTracking) {
+          this.stopTrackingReconnectTimer = null;
+        }
+      };
+      const reconnectTimer = setTimeout(() => {
+        if (this.reconnectTimer === reconnectTimer) {
+          this.reconnectTimer = null;
+        }
+        stopTimerTracking();
+        if (
+          epoch !== this.connectionEpoch ||
+          this.sessionId !== sessionId
+        ) {
+          return;
+        }
+        void this.connect(sessionId);
+      }, 5000);
+      this.reconnectTimer = reconnectTimer;
+      this.stopTrackingReconnectTimer = stopTimerTracking;
     };
 
-    this.ws.onerror = () => {
+    socket.onerror = () => {
       // onclose が呼ばれるのでここでは何もしない
     };
   }
@@ -115,17 +214,26 @@ export class ChatWebSocket {
     );
   }
 
+  /** サーバー側で進行中の応答生成を停止する。 */
+  stopGeneration(): boolean {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.sessionId) {
+      return false;
+    }
+    this.ws.send(
+      JSON.stringify({
+        type: "stop_generation",
+        data: { session_id: this.sessionId },
+      }),
+    );
+    return true;
+  }
+
   /** 切断 */
   disconnect(): void {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    if (this.ws) {
-      this.ws.onclose = null; // 再接続を防止
-      this.ws.close();
-      this.ws = null;
-    }
+    this.connectionEpoch += 1;
+    this.sessionId = null;
+    this.cancelReconnectTimer();
+    this.closeActiveSocket();
     this.onConnectionChange?.(false);
   }
 

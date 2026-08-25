@@ -1,0 +1,123 @@
+# Enterprise Linux/WSL profile.
+# Runtime secrets and deployment-specific hostnames stay in the untracked .env.
+
+llm_provider: openai_compatible_local
+llm_model: google/gemma-4-E4B-it
+default_character: project_manager
+openai_compatible_local_base_url: http://gemma-vllm:8000/v1
+
+# The launcher treats these values as the persisted/default contract.  The
+# effective runtime contract is supplied by the selected Enterprise backend
+# overlay and is fail-closed when it does not match the handoff manifest.
+enterprise_deployment:
+  backend: gemma-vllm
+  transport: https
+  active_backend: gemma-vllm
+  persisted_provider: openai_compatible_local
+  persisted_model: google/gemma-4-E4B-it
+  persisted_base_url: http://gemma-vllm:8000/v1
+  effective_provider: openai_compatible_local
+  effective_model: google/gemma-4-E4B-it
+  effective_base_url: http://gemma-vllm:8000/v1
+  server_profile: vllm
+
+openai_compatible_local:
+  server_profile: vllm
+  model: google/gemma-4-E4B-it
+  base_url: http://gemma-vllm:8000/v1
+  tools: true
+
+gemma_vllm:
+  image: "${AOITALK_GEMMA_VLLM_IMAGE}"
+  model: google/gemma-4-E4B-it
+  served_model_name: google/gemma-4-E4B-it
+  model_revision: ee0ef6023621cff504d758262d4e04895a5af4a2
+  model_path: /var/lib/aoitalk/huggingface/gemma-4E4B-it
+  model_file: model.safetensors
+  model_size_bytes: 15992595884
+  base_url: http://gemma-vllm:8000/v1
+  host: gemma-vllm
+  port: 8000
+  dtype: bfloat16
+  context_length: 32768
+  gpu_architecture: gfx1151
+  accelerator: amd-rocm
+  tools: true
+
+# Generic NVIDIA SGLang remains available only through the explicit
+# `sglang-cuda` overlay. It is not the Enterprise/company default.
+sglang_base_url: http://sglang:30000/v1
+
+sglang:
+  auto_start: false
+  model: google/gemma-4-E4B-it
+  base_url: http://127.0.0.1:30000/v1
+  port: 30000
+  host: 127.0.0.1
+  dtype: bfloat16
+  mem_fraction_static: 0.8
+  reasoning_parser: gemma4
+  tool_call_parser: gemma4
+  cache:
+    enabled: true
+    extra_args: []
+
+# Gemma 4 E4B is the initial text model. Disable the unrelated Mage-VL
+# managed server so it cannot contend for port 30000 or GPU memory.
+mage_vl:
+  enabled: false
+  managed: false
+model_routing:
+  classes:
+    video:
+      inherit: false
+      provider: ''
+      model: ''
+      base_url: ''
+
+web_interface:
+  host: 127.0.0.1
+  port: 3000
+  auto_open_browser: false
+  auth:
+    enabled: true
+    session_ttl_minutes: 1440
+
+runtime_features:
+  web_ui: true
+  local_mic: false
+  local_speaker: false
+  tts: false
+  discord_bot: false
+  discord_text: false
+  discord_vc_input: false
+  discord_vc_output: false
+  console_input: false
+
+mcp_enabled: false
+agents:
+  filesystem:
+    enabled: true
+  project_management:
+    enabled: true
+  media:
+    enabled: false
+  skills:
+    enabled: true
+  spotify:
+    enabled: false
+  scenario:
+    enabled: false
+  writing:
+    enabled: false
+  import:
+    enabled: false
+
+spotify:
+  enabled: false
+
+# ComfyUIのユーザーワークフローはread-onlyの設定ツリー外へ保存する。
+comfyui:
+  enabled: false
+  workflows_dir: workspaces/comfyui_workflows
+  default_workflow: workspaces/comfyui_workflows/aoitalk_auto_sdxl.json
