@@ -1,8 +1,8 @@
 {
-    "mobile":  {
-                   "date":  "2026-09-03",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.161/aoitalk-mobile.apk",
-                   "version":  "0.1.161",
-                   "notes":  "v0.1.161 リリース"
-               }
+  "mobile": {
+    "url": "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.162/aoitalk-mobile.apk",
+    "date": "2026-09-06",
+    "version": "0.1.162",
+    "notes": "モバイルアプリのサーバー接続先設定を修正しました。\n\n- Androidエミュレーター専用URLと個人環境の公開URLを通常の初期値から除去しました。\n- 基本API URLとWi-Fi・その他ネットワーク用URLを分離し、モバイル回線やSSID取得不能時の接続先選択を改善しました。\n- 保存済み設定を保持し、設定の読み込み・保存が重なる場合や保存失敗時の誤接続を防止しました。\n\nAndroidビルド・署名検証と関連テストは確認済みです。物理Android端末での動作確認は、端末不在のため未実施です。"
+  }
 }
