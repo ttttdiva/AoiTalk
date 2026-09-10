@@ -1,8 +1,8 @@
 {
     "mobile":  {
-                   "date":  "2026-09-07",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.163/aoitalk-mobile.apk",
-                   "version":  "0.1.163",
-                   "notes":  "Files（ファイラー）のダークUIで、テキスト編集・検索・作成/名前変更入力のキャレットを純白に固定し、視認性を改善しました。既存のIME入力・貼り付け・保存・検索・作成/名前変更動作は維持しています。"
+                   "date":  "2026-09-11",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.165/aoitalk-mobile.apk",
+                   "version":  "0.1.165",
+                   "notes":  "v0.1.165 リリース"
                }
 }
