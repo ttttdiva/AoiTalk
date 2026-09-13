@@ -1,8 +1,8 @@
 {
     "mobile":  {
                    "date":  "2026-09-14",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.168/aoitalk-mobile.apk",
-                   "version":  "0.1.168",
-                   "notes":  "Docs同期とチャットの端末DB書き込み競合を修正しました。チャットの送信中表示、送信失敗時の下書き保持、タイトルの復元を改善しました。"
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.169/aoitalk-mobile.apk",
+                   "version":  "0.1.169",
+                   "notes":  "通信復帰時に新規タスクが消える競合、Docs同期中のチャットDB競合、送信失敗時の下書き消失を修正しました。タイトル復元とコンテキスト診断のスクロール表示も改善しました。"
                }
 }
