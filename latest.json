@@ -1,8 +1,8 @@
 {
     "mobile":  {
-                   "date":  "2026-09-12",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.166/aoitalk-mobile.apk",
-                   "version":  "0.1.166",
-                   "notes":  "v0.1.166 リリース"
+                   "date":  "2026-09-13",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.167/aoitalk-mobile.apk",
+                   "version":  "0.1.167",
+                   "notes":  "一時的な通信障害後に同期が停止する問題を修正しました。認証情報を保持して次回同期で再試行し、応答本文のタイムアウト処理も改善しました。\n既にログイン状態が失われている場合は、更新後に同じサーバー・アカウントで再ログインしてください。"
                }
 }
