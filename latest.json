@@ -1,8 +1,8 @@
 {
     "mobile":  {
-                   "date":  "2026-09-14",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.177/aoitalk-mobile.apk",
-                   "version":  "0.1.177",
-                   "notes":  "- スペースとプロジェクトの所属表示・検索・スクロールを改善しました。\n- 他ユーザー専用Inboxの混入を修正し、正当に使える同名プロジェクトは保持します。\n- サーバー未接続時のDirect会話で、キャラクターと端末の実タスクを利用できるようにしました。\n- 未送信・失敗したメッセージを重複させず再試行でき、未取得データを0件と断定しないよう改善しました。\n- GPT-5.6のmax設定での送信と、Effortを反映した接続テストに対応しました。"
+                   "date":  "2026-09-15",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.179/aoitalk-mobile.apk",
+                   "version":  "0.1.179",
+                   "notes":  "v0.1.179 リリース"
                }
 }
