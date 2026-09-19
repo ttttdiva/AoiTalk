@@ -1,8 +1,8 @@
 {
     "mobile":  {
-                   "date":  "2026-09-15",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.179/aoitalk-mobile.apk",
-                   "version":  "0.1.179",
-                   "notes":  "v0.1.179 リリース"
+                   "date":  "2026-09-19",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.180/aoitalk-mobile.apk",
+                   "version":  "0.1.180",
+                   "notes":  "モバイルFilesタブ上部に表示されていた白い余白を修正し、ストレージ操作をFilesヘッダー直下のダークな横1列に整理しました。"
                }
 }
