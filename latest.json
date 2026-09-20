@@ -1,8 +1,8 @@
 {
-    "mobile":  {
-                   "date":  "2026-09-20",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.183/aoitalk-mobile.apk",
-                   "version":  "0.1.183",
-                   "notes":  "Files画面のモバイル向けレイアウトを改善しました。\n・戻る／上へ／ホーム／新規作成を常設し、補助操作は「その他」に整理。\n・ブックマークは現在のProject／Userだけを表示し、上部の折り返し行を廃止。\n・Localのブックマークを端末内保存に分離。\n・ストレージ設定を歯車アイコン化し、設定画面のSafe Area・閉じる・キーボード操作を改善。"
-               }
+  "mobile": {
+    "notes": "タスクの表示範囲と「すべてのプロジェクト」を参加中のプロジェクトに限定しました。管理者の閲覧権限と参加状態を区別し、未参加プロジェクトと端末に残る関連タスクの混入を防ぎます。既存データを保持したまま更新できます。",
+    "version": "0.1.184",
+    "date": "2026-09-20",
+    "url": "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.184/aoitalk-mobile.apk"
+  }
 }
